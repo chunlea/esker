@@ -126,6 +126,8 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
         // so the narrower width costs no compatibility and is what `pg_type.typlen` says it is.
         Datum::Int4(v) | Datum::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
+        // Four bytes, unsigned — its own width, like the `int4` it is not.
+        Datum::Oid(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Sixteen bytes, fixed, so no length precedes them.
         Datum::Uuid(v) => out.extend_from_slice(v),
@@ -331,6 +333,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
+        ColumnType::Oid => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            (Datum::Oid(u32::from_le_bytes(*head)), rest)
+        }
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -503,6 +509,9 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
             days,
             micros,
         } => codec::encode_i64(interval_total(*months, *days, *micros), out),
+        // Widened to the `i64` key encoding, whose order is the unsigned's for every value
+        // an `oid` can hold — they are all non-negative.
+        Datum::Oid(v) => codec::encode_i64(i64::from(*v), out),
         Datum::Int2(v) => codec::encode_i64(i64::from(*v), out),
         // Four bytes, its own width, in the order `sort_bits_of_f32` puts floats.
         Datum::Real(v) => out.extend_from_slice(&crate::value::sort_bits_of_f32(*v).to_be_bytes()),
@@ -657,6 +666,12 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 },
                 rest,
             )
+        }
+        ColumnType::Oid => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            let value = u32::try_from(value)
+                .map_err(|_| corrupt(format!("index key holds {value}, which is not an oid")))?;
+            (Datum::Oid(value), rest)
         }
         ColumnType::Int2 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
@@ -1270,6 +1285,7 @@ mod tests {
             // The whole closed range, both ends included, because `24:00:00` is a value.
             ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             ColumnType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),
+            ColumnType::Oid => any::<u32>().prop_map(Datum::Oid).boxed(),
             // Bounded so the total in microseconds cannot overflow, which is what the key holds.
             ColumnType::Interval => (-100_000i32..100_000, -100_000i32..100_000, any::<i32>())
                 .prop_map(|(months, days, micros)| Datum::Interval {

@@ -408,6 +408,10 @@ fn literal(rng: &mut Pcg32, ty: ColumnType) -> Value {
             let pool = [0i32, 1, -1, i32::MIN, i32::MAX, 42, -42, 7];
             Value::Int4(pool[rng.below(pool.len() as u32) as usize])
         }
+        ColumnType::Oid => {
+            let pool = [0u32, 1, 26, 1186, u32::MAX];
+            Value::Oid(pool[rng.below(pool.len() as u32) as usize])
+        }
         ColumnType::Int2 => {
             let pool = [0i16, 1, -1, i16::MIN, i16::MAX, 42, -42, 7];
             Value::Int2(pool[rng.below(pool.len() as u32) as usize])

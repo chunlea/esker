@@ -2472,19 +2472,15 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::Text(value::format_type(ty, NO_TYPMOD)),
             ))))
         }
-        // `'23'::oid`. An `oid` reads digits and nothing else — a type *name* here is `22P02` on a
-        // real server, which is why the pair above exists.
+        // `'23'::oid`. **This is a cast to a real type now**, not a special form that happens to
+        // read digits: `oid` is `ColumnType::Oid` since its own unit, so the reading is
+        // `value::oid::from_text` and a negative one wraps instead of being refused. The two
+        // arms above still come first, because `'x'::regtype::oid` is asking a different
+        // question — what OID does this *name* have — and answers before any value is read.
         (CastTarget::Oid, _) => {
             let text = cast_operand(expr, data_type)?;
-            let value =
-                text.trim()
-                    .parse::<u32>()
-                    .map_err(|_| SqlError::InvalidTextRepresentation {
-                        ty: "oid",
-                        value: text,
-                    })?;
-            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
-                value,
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Oid(value::oid::from_text(&text)?),
             ))))
         }
     }
@@ -3565,6 +3561,13 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         // it. `time(p)` is the caller's, and carries a typmod.
         DataType::Time(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             ColumnType::Time
+        }
+        // `oid` is not one of `sqlparser`'s data types, so a declared `o oid` column arrives as
+        // a custom name — the same road `serial` takes below.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("oid") =>
+        {
+            ColumnType::Oid
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

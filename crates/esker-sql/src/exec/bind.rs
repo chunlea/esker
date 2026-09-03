@@ -493,6 +493,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Int8 => Datum::Int8(0),
         ColumnType::Time => Datum::Time(0),
         ColumnType::Uuid => Datum::Uuid([0; 16]),
+        ColumnType::Oid => Datum::Oid(0),
         ColumnType::Interval => Datum::Interval {
             months: 0,
             days: 0,

@@ -571,6 +571,7 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::Time => Col::Time,
         Row::Uuid => Col::Uuid,
         Row::Interval => Col::Interval,
+        Row::Oid => Col::Oid,
         Row::Int4 => Col::Int4,
         Row::Int2 => Col::Int2,
         Row::Real => Col::Real,
@@ -608,6 +609,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         Datum::Numeric(value) => Value::Numeric(crate::value::numeric::to_text(value)),
         Datum::Time(micros) => Value::Time(*micros),
         Datum::Uuid(bytes) => Value::Uuid(*bytes),
+        Datum::Oid(v) => Value::Oid(*v),
         Datum::Interval {
             months,
             days,
@@ -631,6 +633,7 @@ fn value_to_datum(value: &WireValue) -> Datum {
         WireValue::Date(day) => Datum::Date(*day),
         WireValue::Time(micros) => Datum::Time(*micros),
         WireValue::Uuid(bytes) => Datum::Uuid(*bytes),
+        WireValue::Oid(v) => Datum::Oid(*v),
         WireValue::Interval(bytes) => Datum::Interval {
             months: i32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4])),
             days: i32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4])),

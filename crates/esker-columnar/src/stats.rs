@@ -109,6 +109,9 @@ impl Bound {
             ColumnType::Int4 => Value::Int4(i32::from_le_bytes(
                 <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
             )),
+            ColumnType::Oid => Value::Oid(u32::from_le_bytes(
+                <[u8; 4]>::try_from(self.bytes.as_slice()).ok()?,
+            )),
             ColumnType::Int2 => Value::Int2(i16::from_le_bytes(
                 <[u8; 2]>::try_from(self.bytes.as_slice()).ok()?,
             )),
@@ -275,7 +278,7 @@ impl ColumnStats {
             | ColumnType::Time
             | ColumnType::Double => Some(8),
             // Each at its own width, which is what makes it a different type.
-            ColumnType::Int4 | ColumnType::Real | ColumnType::Date => Some(4),
+            ColumnType::Int4 | ColumnType::Real | ColumnType::Date | ColumnType::Oid => Some(4),
             ColumnType::Int2 => Some(2),
             ColumnType::Bool => Some(1),
             ColumnType::Text
@@ -437,6 +440,11 @@ fn double_bounds(values: &[f64]) -> (Option<Bound>, Option<Bound>) {
 fn int_bound(value: i64, ty: ColumnType) -> Vec<u8> {
     match ty {
         ColumnType::Int4 => i32::try_from(value).map_or_else(
+            |_| value.to_le_bytes().to_vec(),
+            |narrow| narrow.to_le_bytes().to_vec(),
+        ),
+        // Four bytes at its own width, like an `int4`, and unsigned.
+        ColumnType::Oid => u32::try_from(value).map_or_else(
             |_| value.to_le_bytes().to_vec(),
             |narrow| narrow.to_le_bytes().to_vec(),
         ),
@@ -791,6 +799,7 @@ mod tests {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+            ColumnType::Oid => any::<u32>().prop_map(Value::Oid).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
             ColumnType::Real => prop_oneof![
@@ -874,6 +883,13 @@ mod tests {
                 Value::Int4(v) => {
                     let read = |bound: &Bound| match bound.as_value(ColumnType::Int4) {
                         Some(Value::Int4(value)) => Some(value),
+                        _ => None,
+                    };
+                    read(min) <= Some(*v) && Some(*v) <= read(max)
+                }
+                Value::Oid(v) => {
+                    let read = |bound: &Bound| match bound.as_value(ColumnType::Oid) {
+                        Some(Value::Oid(value)) => Some(value),
                         _ => None,
                     };
                     read(min) <= Some(*v) && Some(*v) <= read(max)

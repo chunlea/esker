@@ -151,6 +151,7 @@ pub fn decode_column(
         | ColumnType::Timestamp
         | ColumnType::Int4
         | ColumnType::Int2
+        | ColumnType::Oid
         | ColumnType::Date
         | ColumnType::Time => ColumnData::Ints(integer::decode(encoding, &mut cursor, present)?),
         ColumnType::Double => ColumnData::Doubles(double::decode(encoding, &mut cursor, present)?),
@@ -266,6 +267,7 @@ mod tests {
         let present = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+            ColumnType::Oid => any::<u32>().prop_map(Value::Oid).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
             // Both ends of the closed range, and midnight, which is where a run-length encoding

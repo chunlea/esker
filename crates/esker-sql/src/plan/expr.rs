@@ -765,6 +765,10 @@ impl Literal {
                     | ColumnType::Int2
                     | ColumnType::Double
                     | ColumnType::Real
+                    // Measured: `26::oid = 26` is `t` on a real server — there is an implicit
+                    // cast from an integer to an `oid`, which is how every catalog query
+                    // compares one against a plain number.
+                    | ColumnType::Oid
                     | ColumnType::Numeric
             ),
             Literal::Decimal(_) => matches!(
@@ -816,6 +820,9 @@ impl Literal {
                 ColumnType::Int4 => i32::try_from(*value)
                     .map(Datum::Int4)
                     .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int4.name())),
+                // **An `oid` takes an integer literal**, which is what makes it usable at
+                // all: every catalog identifier is written as a plain number.
+                ColumnType::Oid => crate::value::oid::from_text(&value.to_string()).map(Datum::Oid),
                 ColumnType::Int2 => i16::try_from(*value)
                     .map(Datum::Int2)
                     .map_err(|_| SqlError::IntegerLiteralOutOfRange(ColumnType::Int2.name())),
@@ -909,6 +916,7 @@ impl Literal {
                 | ColumnType::Time
                 | ColumnType::Uuid
                 | ColumnType::Interval
+                | ColumnType::Oid
                 | ColumnType::Timestamp => mismatch(),
             },
 
@@ -939,6 +947,7 @@ impl Literal {
                 | ColumnType::Time
                 | ColumnType::Uuid
                 | ColumnType::Interval
+                | ColumnType::Oid
                 | ColumnType::Real => mismatch(),
             },
         }

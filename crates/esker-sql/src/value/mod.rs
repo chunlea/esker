@@ -34,6 +34,7 @@ pub(crate) mod float;
 pub mod interval;
 pub(crate) mod json;
 pub mod numeric;
+pub mod oid;
 pub mod time;
 mod timestamp;
 pub mod uuid;
@@ -362,6 +363,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Double
         | ColumnType::Real
         | ColumnType::Uuid
+        | ColumnType::Oid
         | ColumnType::Date => false,
     }
 }
@@ -466,6 +468,7 @@ impl PgType for ColumnType {
             ColumnType::Time => 1083,
             ColumnType::Uuid => 2950,
             ColumnType::Interval => 1186,
+            ColumnType::Oid => 26,
         }
     }
 
@@ -490,13 +493,15 @@ impl PgType for ColumnType {
             ColumnType::Time => "time without time zone",
             ColumnType::Uuid => "uuid",
             ColumnType::Interval => "interval",
+            ColumnType::Oid => "oid",
         }
     }
 
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
-            ColumnType::Int4 | ColumnType::Real | ColumnType::Date => 4,
+            // Four bytes, unsigned, which is the whole of what makes it not an `int4`.
+            ColumnType::Int4 | ColumnType::Real | ColumnType::Date | ColumnType::Oid => 4,
             ColumnType::Int2 => 2,
             // Sixteen fixed bytes, which is what `pg_type.typlen` says.
             // Sixteen fixed bytes each: a uuid is one value, an interval is three fields.
@@ -601,6 +606,7 @@ impl PgDatum for Datum {
             Datum::Date(v) => date::to_text(*v),
             Datum::Time(v) => time::to_text(*v),
             Datum::Uuid(v) => uuid::to_text(v),
+            Datum::Oid(v) => oid::to_text(*v),
             Datum::Interval {
                 months,
                 days,
@@ -643,6 +649,7 @@ impl PgDatum for Datum {
             ColumnType::Date => Datum::Date(date::from_text(text, 0)?),
             ColumnType::Time => Datum::Time(time::from_text(text)?),
             ColumnType::Uuid => Datum::Uuid(uuid::from_text(text)?),
+            ColumnType::Oid => Datum::Oid(oid::from_text(text)?),
             ColumnType::Interval => {
                 let value = interval::from_text(text)?;
                 Datum::Interval {
@@ -663,6 +670,8 @@ impl PgDatum for Datum {
             // guessed. See the contract above for why the two share one answer.
             // A uuid's binary form is its sixteen bytes, which is what `uuid_send` writes —
             // the same bytes the row holds, in the same order.
+            // Four big-endian bytes, which is what `oidsend` writes.
+            Datum::Oid(v) => v.to_be_bytes().to_vec(),
             Datum::Uuid(v) => v.to_vec(),
             // `interval_send` writes microseconds, days and months in that order, big-endian.
             Datum::Interval {
@@ -722,6 +731,10 @@ impl PgDatum for Datum {
             ColumnType::Int4 => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
                 Datum::Int4(i32::from_be_bytes(head))
+            }
+            ColumnType::Oid => {
+                let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
+                Datum::Oid(u32::from_be_bytes(head))
             }
             ColumnType::Real => {
                 let head: [u8; 4] = fixed(4)?.try_into().unwrap_or([0; 4]);
@@ -841,6 +854,17 @@ impl PgDatum for Datum {
             }
             (Datum::Int4(a), Datum::Int4(b)) | (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
             // `uuid_cmp` is a `memcmp`, so this is the type's whole ordering.
+            // **An `oid` is a number and compares as one.** Without these it would fall through
+            // to the variant rank — which it shares with the integers — and every pair would
+            // come back equal, which is the bug the `time` unit shipped and its ordering fixture
+            // caught. Widened to `i64`, where every `u32` and every `i32` both fit exactly.
+            (Datum::Oid(a), Datum::Oid(b)) => a.cmp(b),
+            (Datum::Oid(a), Datum::Int8(b)) => i64::from(*a).cmp(b),
+            (Datum::Int8(a), Datum::Oid(b)) => a.cmp(&i64::from(*b)),
+            (Datum::Oid(a), Datum::Int4(b)) => i64::from(*a).cmp(&i64::from(*b)),
+            (Datum::Int4(a), Datum::Oid(b)) => i64::from(*a).cmp(&i64::from(*b)),
+            (Datum::Oid(a), Datum::Int2(b)) => i64::from(*a).cmp(&i64::from(*b)),
+            (Datum::Int2(a), Datum::Oid(b)) => i64::from(*a).cmp(&i64::from(*b)),
             (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
             // **Converted, not compared field by field**: a month is thirty days and a day is
             // twenty-four hours, so `'1 mon'` and `'30 days'` are equal here and different rows.
@@ -889,7 +913,9 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Bool(_) => 0,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
-        Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) => 1,
+        // An `oid` shares the integers' rank: it is one, and `pg_cmp` answers every pairing
+        // above rather than falling through to here.
+        Datum::Int8(_) | Datum::Int4(_) | Datum::Int2(_) | Datum::Oid(_) => 1,
         Datum::Double(_) | Datum::Real(_) => 2,
         Datum::TimestampTz(_) | Datum::Timestamp(_) | Datum::Date(_) => 3,
         Datum::Numeric(_) => 7,

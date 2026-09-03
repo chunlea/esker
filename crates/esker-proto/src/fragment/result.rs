@@ -109,6 +109,8 @@ pub enum ValueType {
     Uuid,
     /// PostgreSQL's `interval`: months, days and microseconds.
     Interval,
+    /// PostgreSQL's `oid`: a four-byte unsigned.
+    Oid,
     /// A 32-bit signed integer.
     ///
     /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
@@ -119,7 +121,7 @@ pub enum ValueType {
 
 impl ValueType {
     /// Every type, so a test cannot silently skip one.
-    pub const ALL: [ValueType; 15] = [
+    pub const ALL: [ValueType; 16] = [
         ValueType::Int8,
         ValueType::Int4,
         ValueType::Int2,
@@ -135,6 +137,7 @@ impl ValueType {
         ValueType::Time,
         ValueType::Uuid,
         ValueType::Interval,
+        ValueType::Oid,
     ];
 
     /// The tag byte. Frozen — see the type's docs.
@@ -156,6 +159,7 @@ impl ValueType {
             ValueType::Time => 13,
             ValueType::Uuid => 14,
             ValueType::Interval => 15,
+            ValueType::Oid => 16,
         }
     }
 
@@ -177,6 +181,7 @@ impl ValueType {
             13 => ValueType::Time,
             14 => ValueType::Uuid,
             15 => ValueType::Interval,
+            16 => ValueType::Oid,
             _ => return Err(DecodeError::invalid("result.type", "unknown type tag")),
         })
     }
@@ -221,6 +226,8 @@ pub enum Value {
     Uuid([u8; 16]),
     /// [`ValueType::Interval`], as the sixteen bytes its fields occupy.
     Interval([u8; 16]),
+    /// [`ValueType::Oid`], as the unsigned it is.
+    Oid(u32),
 }
 
 impl Value {
@@ -244,6 +251,7 @@ impl Value {
             Value::Time(_) => ValueType::Time,
             Value::Uuid(_) => ValueType::Uuid,
             Value::Interval(_) => ValueType::Interval,
+            Value::Oid(_) => ValueType::Oid,
         })
     }
 
@@ -295,6 +303,10 @@ impl Value {
             }
             // Two bytes, its own width: the tag already says how to read them, and widening would
             // make this frame disagree with `pg_type.typlen`.
+            Value::Oid(v) => {
+                out.put_u8(ValueType::Oid.tag());
+                out.put_u32(*v);
+            }
             Value::Int2(v) => {
                 out.put_u8(ValueType::Int2.tag());
                 out.put_u16(u16::from_le_bytes(v.to_le_bytes()));
@@ -357,6 +369,7 @@ impl Value {
             ValueType::Int4 => Value::Int4(i32::from_le_bytes(
                 input.get_u32("result.value.int4")?.to_le_bytes(),
             )),
+            ValueType::Oid => Value::Oid(input.get_u32("result.value.oid")?),
             ValueType::Int2 => Value::Int2(i16::from_le_bytes(
                 input.get_u16("result.value.int2")?.to_le_bytes(),
             )),

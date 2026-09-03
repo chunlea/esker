@@ -64,6 +64,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::Int4(v) | Value::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Oid(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -136,6 +137,12 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 four.copy_from_slice(&bytes[at..at + 4]);
                 at += 4;
                 Value::Date(i32::from_le_bytes(four))
+            }
+            ColumnType::Oid => {
+                let mut four = [0u8; 4];
+                four.copy_from_slice(&bytes[at..at + 4]);
+                at += 4;
+                Value::Oid(u32::from_le_bytes(four))
             }
             ColumnType::Int2 => {
                 let mut two = [0u8; 2];

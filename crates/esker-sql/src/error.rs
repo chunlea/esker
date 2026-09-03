@@ -802,6 +802,14 @@ pub enum SqlError {
     #[error("type modifier is not allowed for type \"{0}\"")]
     TypeModifierNotAllowed(String),
 
+    /// A number past what a four-byte **unsigned** holds: `22003`.
+    ///
+    /// Its own message, quoting the text: `value "4294967296" is out of range for type oid`. A
+    /// *negative* number is not this — it wraps into the unsigned range, which is why
+    /// `(-1)::oid` is `4294967295` and not an error.
+    #[error("value \"{0}\" is out of range for type oid")]
+    OidOutOfRange(String),
+
     /// One **field** of an interval past its own width: `22015`.
     ///
     /// `'2147483648 months'` is this, where `'178956971 years'` — the same magnitude reached
@@ -1140,6 +1148,7 @@ impl SqlError {
             | SqlError::IntegerLiteralOutOfRange(_)
             | SqlError::BigintOutOfRange
             | SqlError::NumericFieldOverflow { .. }
+            | SqlError::OidOutOfRange(_)
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,

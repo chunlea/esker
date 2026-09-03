@@ -75,6 +75,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Time => 17,
         ColumnType::Uuid => 18,
         ColumnType::Interval => 19,
+        ColumnType::Oid => 20,
         ColumnType::Numeric => 16,
     }
 }
@@ -99,6 +100,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         17 => ColumnType::Time,
         18 => ColumnType::Uuid,
         19 => ColumnType::Interval,
+        20 => ColumnType::Oid,
         16 => ColumnType::Numeric,
         other => {
             return Err(RowError::Corrupt(format!(

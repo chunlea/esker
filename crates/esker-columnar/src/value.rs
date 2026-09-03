@@ -89,6 +89,8 @@ pub enum ColumnType {
     Uuid,
     /// PostgreSQL's `interval`: months, days and microseconds, sixteen bytes.
     Interval,
+    /// PostgreSQL's `oid`: a four-byte unsigned.
+    Oid,
     /// PostgreSQL's `numeric`: an arbitrary-precision decimal, carried as its **text**.
     ///
     /// Variable-length like a `Text`, and the text is lossless for this type — the scale is in
@@ -108,7 +110,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 19] = [
+    pub const ALL: [ColumnType; 20] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -127,6 +129,7 @@ impl ColumnType {
         ColumnType::Time,
         ColumnType::Uuid,
         ColumnType::Interval,
+        ColumnType::Oid,
         ColumnType::Numeric,
     ];
 
@@ -153,6 +156,7 @@ impl ColumnType {
             ColumnType::Time => 17,
             ColumnType::Uuid => 18,
             ColumnType::Interval => 19,
+            ColumnType::Oid => 20,
             ColumnType::Numeric => 16,
         }
     }
@@ -178,6 +182,7 @@ impl ColumnType {
             17 => ColumnType::Time,
             18 => ColumnType::Uuid,
             19 => ColumnType::Interval,
+            20 => ColumnType::Oid,
             16 => ColumnType::Numeric,
             other => {
                 return Err(Error::corruption(
@@ -210,6 +215,7 @@ impl ColumnType {
             ColumnType::Time => "time without time zone",
             ColumnType::Uuid => "uuid",
             ColumnType::Interval => "interval",
+            ColumnType::Oid => "oid",
             ColumnType::Numeric => "numeric",
         }
     }
@@ -262,6 +268,8 @@ pub enum Value {
     Uuid([u8; 16]),
     /// A [`ColumnType::Interval`], as the sixteen bytes its three fields occupy.
     Interval([u8; 16]),
+    /// A [`ColumnType::Oid`], as the unsigned it is.
+    Oid(u32),
     /// A [`ColumnType::Numeric`], as its text.
     Numeric(String),
 }
@@ -295,6 +303,7 @@ impl Value {
             Value::Time(_) => ty == ColumnType::Time,
             Value::Uuid(_) => ty == ColumnType::Uuid,
             Value::Interval(_) => ty == ColumnType::Interval,
+            Value::Oid(_) => ty == ColumnType::Oid,
             Value::Numeric(_) => ty == ColumnType::Numeric,
         }
     }
@@ -324,6 +333,7 @@ impl Value {
             Value::Time(_) => ColumnType::Time,
             Value::Uuid(_) => ColumnType::Uuid,
             Value::Interval(_) => ColumnType::Interval,
+            Value::Oid(_) => ColumnType::Oid,
             Value::Numeric(_) => ColumnType::Numeric,
         })
     }
@@ -338,6 +348,8 @@ impl Value {
             }
             // A day is an integer to the encoder, the way a timestamp is: the schema says which.
             Value::Int4(v) | Value::Date(v) => ValueRef::Int(i64::from(*v)),
+            // Widened into the shared integer run, as every narrow integer here is.
+            Value::Oid(v) => ValueRef::Int(i64::from(*v)),
             Value::Int2(v) => ValueRef::Int(i64::from(*v)),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Double(v) => ValueRef::Double(*v),
@@ -439,6 +451,12 @@ impl ValueRef<'_> {
             (ValueRef::Null, _) => Value::Null,
             (ValueRef::Int(v), ColumnType::Int8) => Value::Int8(v),
             (ValueRef::Int(v), ColumnType::TimestampTz) => Value::TimestampTz(v),
+            // Back out of the widened run at its own width, and **unsigned**: a value that is
+            // not a `u32` did not come from an oid column.
+            (ValueRef::Int(v), ColumnType::Oid) => Value::Oid(
+                u32::try_from(v)
+                    .map_err(|_| Error::corruption("column", "an oid outside four bytes"))?,
+            ),
             (ValueRef::Int(v), ColumnType::Timestamp) => Value::Timestamp(v),
             (ValueRef::Int(v), ColumnType::Time) => Value::Time(v),
             // Narrowed back from the widened run it rides in. A value outside `i32` cannot have
@@ -640,6 +658,7 @@ mod tests {
         assert_eq!(ColumnType::Time.tag(), 17);
         assert_eq!(ColumnType::Uuid.tag(), 18);
         assert_eq!(ColumnType::Interval.tag(), 19);
+        assert_eq!(ColumnType::Oid.tag(), 20);
 
         for ty in ColumnType::ALL {
             assert_eq!(ColumnType::from_tag(ty.tag()).unwrap(), ty);

@@ -100,6 +100,9 @@ fn column_type(name: &str) -> ColumnType {
         // converts a month to thirty days — so the test's stronger half, that a tie encodes to
         // one key, is what proves the index encoding converts where the row does not.
         "interval" => ColumnType::Interval,
+        // `4294967295` is in the fixture because it is the value that separates this type from
+        // `int4`: unsigned, so it sorts *above* everything and is not negative.
+        "oid" => ColumnType::Oid,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,

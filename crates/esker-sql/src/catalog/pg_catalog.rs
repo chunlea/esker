@@ -634,6 +634,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Time => "time",
         ColumnType::Uuid => "uuid",
         ColumnType::Interval => "interval",
+        ColumnType::Oid => "oid",
     }
 }
 
@@ -650,7 +651,9 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Int2
         | ColumnType::Double
         | ColumnType::Real
-        | ColumnType::Numeric => "N",
+        | ColumnType::Numeric
+        // A number, and PostgreSQL groups it with them despite being an identifier.
+        | ColumnType::Oid => "N",
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => "S",
         ColumnType::Bool => "B",
         ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
@@ -689,5 +692,6 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Time => "time_in",
         ColumnType::Uuid => "uuid_in",
         ColumnType::Interval => "interval_in",
+        ColumnType::Oid => "oidin",
     }
 }
