@@ -1799,6 +1799,17 @@ fn returning_fields(
 }
 
 impl Execute for Executor {
+    /// What this session set, or the boot value — which is `0`, meaning no limit.
+    ///
+    /// Read through `Executor::parameter` — a private method, so this is a code span rather than
+    /// a link — instead of from the map directly, so that a session
+    /// that never set it gets the same answer as one that reset it.
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        let parameter = crate::parameter::lookup("idle_in_transaction_session_timeout").ok()?;
+        crate::parameter::duration_ms(&self.parameter(parameter))
+            .map(std::time::Duration::from_millis)
+    }
+
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).

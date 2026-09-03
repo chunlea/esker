@@ -1,6 +1,10 @@
 //! `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, deadlock detection
 //! and serialization failure — **the file run 47 hung on**.
 //!
+//! Of the five, one is **built** rather than declared: `idle_in_transaction_session_timeout` now
+//! ends the session, `25P03` and `FATAL`, at the bottom of this file. It is the only one of the
+//! five that was a missing feature rather than a missing wait.
+//!
 //! `adapters/postgresql/transaction_test.rb` sat for twenty minutes on one `ESTABLISHED`
 //! connection with both sides at 0% CPU. Its tests synchronise two connections on *one side
 //! blocking*: A takes a row, B waits for it, and the assertion is about how the wait ends. This
@@ -29,6 +33,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use esker_sql::backend::{Backend, MemoryBackend};
 use esker_sql::catalog::Catalog;
@@ -145,12 +151,14 @@ impl Session {
     fn answer(&mut self, sql: &str) -> String {
         match self.run(sql) {
             Err(error) => {
+                use std::fmt::Write as _;
+
                 let mut message = format!("!{} {error}", error.sqlstate());
                 if let Some(detail) = error.detail() {
-                    message.push_str(&format!(" DETAIL: {detail}"));
+                    let _ = write!(message, " DETAIL: {detail}");
                 }
                 if let Some(hint) = error.hint() {
-                    message.push_str(&format!(" HINT: {hint}"));
+                    let _ = write!(message, " HINT: {hint}");
                 }
                 message
             }
@@ -298,15 +306,20 @@ const DIVERGENCES: &[(char, &str, &str)] = &[
         'B',
         "SELECT 'after idling'",
         "PostgreSQL has **terminated the session** by now: `idle_in_transaction_session_timeout` \
-         fired, so this is a libpq-level `FATAL: terminating connection due to \
-         idle-in-transaction timeout` and not an answer at all. This node has no idle timer, so \
-         the session is alive and answers the string. The next unit is what closes it.",
+         fired, so this is a libpq-level `FATAL: terminating connection due to idle-in-transaction \
+         timeout` and not an answer at all. **This node does that too** — see \
+         `idling_inside_a_block_terminates_the_session` below — and the line still diverges for a \
+         reason worth naming rather than hiding: the timer is on the **connection**, because what \
+         it does is close a socket, and this harness is a pair of executors rather than a pair of \
+         connections. A corpus replay never idles. What is measured here is the statement's \
+         answer; what is measured over a pipe is the session's end.",
     ),
     (
         'B',
         "ROLLBACK",
-        "The same: PostgreSQL's connection is gone and libpq cannot even find a socket. Here the \
-         block is open and rolls back.",
+        "The same, and the same reason: over a real connection there is no socket left for it. \
+         The rollback itself does happen here — the connection abandons the open block before it \
+         closes, which is asserted over the pipe.",
     ),
 ];
 
@@ -645,4 +658,281 @@ fn the_two_sessions_share_one_store() {
         [["2"]],
         "and sees it once A commits"
     );
+}
+
+// --- `idle_in_transaction_session_timeout`, which ends the session rather than the statement ---
+//
+// Everything above drives the executor directly, which is the right level for a corpus: it is what
+// a statement answers. This one cannot be tested there at all, because the thing it does is close
+// a **socket** — so it is driven through the real listener over a pipe, the way
+// `tests/psql_smoke.rs` drives the handshake.
+
+/// An executor that opens blocks and hands the connection a very short idle limit.
+///
+/// The limit is a property of the *session*, so it belongs on the executor even though the wait it
+/// bounds belongs to the connection — see `Execute::idle_in_transaction_timeout`.
+struct Idling {
+    limit: Duration,
+    rolled_back: Arc<AtomicBool>,
+}
+
+impl Execute for Idling {
+    fn execute(
+        &mut self,
+        _parsed: &esker_sql::parse::Parsed,
+        _params: &Params<'_>,
+    ) -> esker_sql::Result<Outcome> {
+        Ok(Outcome::done("SELECT 1"))
+    }
+
+    fn rollback(&mut self) -> esker_sql::Result<()> {
+        self.rolled_back.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn idle_in_transaction_timeout(&self) -> Option<Duration> {
+        Some(self.limit)
+    }
+}
+
+/// A startup packet, then whatever else the caller wants to send.
+fn startup_packet() -> Vec<u8> {
+    let mut body = 0x0003_0000u32.to_be_bytes().to_vec();
+    for (name, value) in [("user", "esker"), ("database", "esker")] {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut packet = u32::try_from(body.len() + 4)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    packet.extend_from_slice(&body);
+    packet
+}
+
+/// A simple `Query` message.
+fn query(sql: &str) -> Vec<u8> {
+    let mut out = vec![b'Q'];
+    let body_len = u32::try_from(sql.len() + 5).unwrap();
+    out.extend_from_slice(&body_len.to_be_bytes());
+    out.extend_from_slice(sql.as_bytes());
+    out.push(0);
+    out
+}
+
+/// `(tag, body)` for every complete message in a reply.
+fn frames(bytes: &[u8]) -> Vec<(char, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 5 <= bytes.len() {
+        let length =
+            u32::from_be_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]])
+                as usize;
+        if at + 1 + length > bytes.len() {
+            break;
+        }
+        out.push((bytes[at] as char, bytes[at + 5..at + 1 + length].to_vec()));
+        at += 1 + length;
+    }
+    out
+}
+
+/// **The whole of what the parameter does**, over a real connection: open a block, say nothing,
+/// and the server ends the session.
+///
+/// Three things are asserted and each is a way of getting it wrong. The reply is an
+/// `ErrorResponse` whose severity is **`FATAL`** and whose code is `25P03` — a node that sent
+/// `ERROR` would leave a client believing one statement failed on a live connection. The socket is
+/// then **closed**, which is what a client actually detects. And the open block is **rolled back**
+/// before the socket goes, so nothing it wrote is left half-open behind a connection nobody can
+/// reach.
+#[tokio::test]
+async fn idling_inside_a_block_terminates_the_session() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let rolled_back = Arc::new(AtomicBool::new(false));
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let executor = Idling {
+        limit: Duration::from_millis(80),
+        rolled_back: Arc::clone(&rolled_back),
+    };
+    tokio::spawn(async move {
+        let mut connection = esker_sql::pgwire::server::Connection::new(
+            server,
+            esker_sql::pgwire::server::Config::default(),
+        );
+        let _ = connection.run(Box::new(executor)).await;
+    });
+
+    let mut input = startup_packet();
+    input.extend_from_slice(&query("BEGIN"));
+    client.write_all(&input).await.unwrap();
+    client.flush().await.unwrap();
+
+    // Read to end of stream: the server answers the `BEGIN`, then waits, then terminates us.
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut reply))
+        .await
+        .expect("the server never closed the connection: the idle timeout did not fire")
+        .unwrap();
+
+    let last_error = frames(&reply)
+        .into_iter()
+        .rfind(|(tag, _)| *tag == 'E')
+        .expect("an ErrorResponse must arrive before the socket closes");
+    // An `ErrorResponse` body is NUL-terminated `<type><value>` fields, so a substring match on
+    // the whole of it would pass on `S` alone and read the *localised* severity as the wire one.
+    // Each field is read by its type byte: `S` severity, `V` the never-localised severity, `C`
+    // the SQLSTATE, `M` the message.
+    let fields: Vec<&[u8]> = last_error.1.split(|byte| *byte == 0).collect();
+    let field = |kind: u8| {
+        fields
+            .iter()
+            .find(|entry| entry.first() == Some(&kind))
+            .map(|entry| String::from_utf8_lossy(&entry[1..]).into_owned())
+    };
+    let whole = String::from_utf8_lossy(&last_error.1).replace('\0', "|");
+    assert_eq!(
+        field(b'S').as_deref(),
+        Some("FATAL"),
+        "the severity must be FATAL, not ERROR: {whole}"
+    );
+    assert_eq!(
+        field(b'V').as_deref(),
+        Some("FATAL"),
+        "and `V`, which is the one a client must not have to translate: {whole}"
+    );
+    assert_eq!(
+        field(b'C').as_deref(),
+        Some("25P03"),
+        "the code must be 25P03: {whole}"
+    );
+    assert_eq!(
+        field(b'M').as_deref(),
+        Some("terminating connection due to idle-in-transaction timeout"),
+        "PostgreSQL's own sentence, whole: {whole}"
+    );
+    assert!(
+        rolled_back.load(Ordering::SeqCst),
+        "the abandoned block must be rolled back before the socket goes"
+    );
+}
+
+/// **A session idling with no block open is left alone**, which is the other half of the rule and
+/// the one an implementation that timed every read would break: `idle_in_transaction_session_timeout`
+/// is about a transaction, and a connection sitting at the prompt is not idling in one.
+#[tokio::test]
+async fn idling_outside_a_block_is_not_a_timeout() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let executor = Idling {
+        limit: Duration::from_millis(50),
+        rolled_back: Arc::new(AtomicBool::new(false)),
+    };
+    tokio::spawn(async move {
+        let mut connection = esker_sql::pgwire::server::Connection::new(
+            server,
+            esker_sql::pgwire::server::Config::default(),
+        );
+        let _ = connection.run(Box::new(executor)).await;
+    });
+
+    client.write_all(&startup_packet()).await.unwrap();
+    client.flush().await.unwrap();
+
+    // Well past the limit, and the connection must still be there.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut sink = Vec::new();
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(250), client.read_to_end(&mut sink)).await;
+    assert!(
+        outcome.is_err(),
+        "the server closed a connection that was idle but not in a transaction"
+    );
+}
+
+/// **What the stub above cannot prove: that a real `SET` reaches the connection's clock.**
+///
+/// `idling_inside_a_block_terminates_the_session` drives an executor that hands back a limit it
+/// was built with, so it measures the connection and nothing else. This measures the other seam —
+/// the parameter registry to the trait — and it is where the two ways of getting it wrong live:
+/// reading the settings map directly, so that a `RESET` leaves the last value in place, and
+/// reading the digits without the unit, so that `'2s'` becomes two milliseconds.
+///
+/// The stored spellings are PostgreSQL's, not the caller's: `'250'` is stored `250ms` and
+/// `'2000ms'` is stored `2s` (`crate::parameter::normalise_duration`), so this is also the test
+/// that the clock reads what that function writes rather than what a user typed.
+#[test]
+fn a_set_idle_timeout_is_what_the_connection_waits_for() {
+    let mut cluster = Cluster::new(&['A']);
+    let session = cluster.session('A');
+
+    // The boot value is `0`, and `0` is not a duration at all: no limit.
+    assert_eq!(
+        session.rows("SHOW idle_in_transaction_session_timeout"),
+        [["0"]]
+    );
+    assert_eq!(session.executor.idle_in_transaction_timeout(), None);
+
+    for (set, shown, expected) in [
+        ("10ms", "10ms", Some(Duration::from_millis(10))),
+        ("2s", "2s", Some(Duration::from_secs(2))),
+        ("1min", "1min", Some(Duration::from_secs(60))),
+        ("1h", "1h", Some(Duration::from_secs(3_600))),
+        ("24d", "24d", Some(Duration::from_secs(24 * 86_400))),
+        // A bare count is milliseconds, and gains the unit on the way in.
+        ("250", "250ms", Some(Duration::from_millis(250))),
+        // Re-printed in the largest unit that divides it, and the clock is unmoved by that.
+        ("2000ms", "2s", Some(Duration::from_secs(2))),
+        ("120s", "2min", Some(Duration::from_secs(120))),
+        // **Below half a millisecond is `0`, which is *off* rather than "very short".** The
+        // dangerous rounding is the other way: a limit of nearly nothing would end every session
+        // in a block the moment it opened one.
+        ("500us", "0", None),
+        ("1500us", "2ms", Some(Duration::from_millis(2))),
+    ] {
+        session
+            .run(&format!(
+                "SET idle_in_transaction_session_timeout = '{set}'"
+            ))
+            .unwrap();
+        assert_eq!(
+            session.rows("SHOW idle_in_transaction_session_timeout"),
+            [[shown]],
+            "SHOW after SET … = '{set}'"
+        );
+        assert_eq!(
+            session.executor.idle_in_transaction_timeout(),
+            expected,
+            "the clock after SET … = '{set}'"
+        );
+    }
+
+    // A `RESET` gives the same answer as a session that never set it, which is the reason the read
+    // goes through the boot value rather than through the settings map.
+    session
+        .run("SET idle_in_transaction_session_timeout = '30s'")
+        .unwrap();
+    assert_eq!(
+        session.executor.idle_in_transaction_timeout(),
+        Some(Duration::from_secs(30))
+    );
+    session
+        .run("RESET idle_in_transaction_session_timeout")
+        .unwrap();
+    assert_eq!(session.executor.idle_in_transaction_timeout(), None);
+
+    // And `0` turns the clock back off mid-session, which is what a client that is done with it
+    // sends.
+    session
+        .run("SET idle_in_transaction_session_timeout = '5s'")
+        .unwrap();
+    session
+        .run("SET idle_in_transaction_session_timeout = 0")
+        .unwrap();
+    assert_eq!(session.executor.idle_in_transaction_timeout(), None);
 }

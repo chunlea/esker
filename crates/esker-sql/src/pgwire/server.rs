@@ -151,7 +151,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             out: std::mem::take(&mut self.out),
         };
         loop {
-            let Some((tag, body)) = self.read_message().await? else {
+            // **A session idling inside a transaction block is on a clock.** PostgreSQL's
+            // `idle_in_transaction_session_timeout` does not cancel a statement, it **terminates
+            // the session** — so it belongs here, around the wait for the client's next message,
+            // and nowhere else: the executor is not running while this fires. Measured on the
+            // oracle (`tests/corpus/pg19_transaction_timeouts.txt`): after it fires the next
+            // statement is a connection-level `FATAL` and the `ROLLBACK` after that cannot find a
+            // socket.
+            //
+            // A block that has *failed* is idling too — PostgreSQL reports it as "idle in
+            // transaction (aborted)" and times it out the same way, which is why the test is
+            // "not idle" rather than "in transaction".
+            let waiting_in_a_block = work.session.status() != TransactionStatus::Idle;
+            let deadline = waiting_in_a_block
+                .then(|| work.executor.idle_in_transaction_timeout())
+                .flatten();
+            let next = match deadline {
+                Some(limit) => match tokio::time::timeout(limit, self.read_message()).await {
+                    Ok(next) => next?,
+                    Err(_elapsed) => {
+                        // The block is abandoned before the socket goes, so nothing it wrote is
+                        // left half-open behind a connection nobody can reach any more.
+                        let _ = work.executor.rollback();
+                        self.send_error(&SqlError::IdleInTransactionTimeout).await?;
+                        return Ok(());
+                    }
+                },
+                None => self.read_message().await?,
+            };
+            let Some((tag, body)) = next else {
                 return Ok(());
             };
             let message = match decode(tag, &body) {

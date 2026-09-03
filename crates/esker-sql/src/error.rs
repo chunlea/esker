@@ -1491,6 +1491,22 @@ pub enum SqlError {
     #[error("parameter \"{0}\" requires a Boolean value")]
     NonBooleanParameter(&'static str),
 
+    /// A `SET` of a duration parameter whose count, converted to the parameter's base unit, will
+    /// not fit a C `int`: `'2147483648'`, `'25d'`.
+    ///
+    /// **The sentence is [`SqlError::InvalidParameterValue`]'s, character for character**, and the
+    /// `HINT` is the whole of what separates them — measured, which is why this is a condition of
+    /// its own rather than a flag on that one. A value that is merely *outside the range* is a
+    /// third answer again ([`SqlError::ParameterOutOfRange`]), so `'25d'` and `'-1'` do not get
+    /// the same message.
+    #[error("invalid value for parameter \"{name}\": \"{value}\"")]
+    ParameterValueExceedsIntegerRange {
+        /// The parameter, in its canonical spelling.
+        name: &'static str,
+        /// The text it would not take, quoted back as written.
+        value: String,
+    },
+
     /// A `SET` of a parameter that exists and is fixed. `55P02`, and the reason it is not `42704`:
     /// a parameter that cannot be changed is a different answer from one that is not there.
     #[error("parameter \"{0}\" cannot be changed")]
@@ -1551,6 +1567,17 @@ pub enum SqlError {
     /// A query needs more of a bounded resource than this node will give it.
     #[error("{0}")]
     ConfigurationLimitExceeded(String),
+
+    /// The session sat idle inside a transaction block for longer than
+    /// `idle_in_transaction_session_timeout`, and the server is ending the connection.
+    ///
+    /// **`FATAL`, not `ERROR`**, and that is the whole of what makes it work: PostgreSQL does not
+    /// cancel the statement, it terminates the session, so the next thing a client does is find a
+    /// closed socket. A node that reported this as a statement error and kept the connection would
+    /// leave a client waiting for a server that had agreed to go — which is the shape of the
+    /// twenty-minute stall this parameter's tests were written to catch.
+    #[error("terminating connection due to idle-in-transaction timeout")]
+    IdleInTransactionTimeout,
 
     /// The frontend sent something the protocol does not allow.
     #[error("{0}")]
@@ -1782,6 +1809,7 @@ impl SqlError {
             | SqlError::FloatPrecisionTooLarge
             | SqlError::InvalidSnapshotIdentifier(_)
             | SqlError::InvalidParameterValue { .. }
+            | SqlError::ParameterValueExceedsIntegerRange { .. }
             | SqlError::NonBooleanParameter(_)
             | SqlError::NumericPrecisionOutOfRange(_)
             | SqlError::NumericScaleOutOfRange(_)
@@ -1792,6 +1820,7 @@ impl SqlError {
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
             }
+            SqlError::IdleInTransactionTimeout => sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
             SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
             }
@@ -1822,7 +1851,9 @@ impl SqlError {
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock => Severity::Warning,
-            SqlError::ProtocolViolation(_) | SqlError::InvalidPassword(_) => Severity::Fatal,
+            SqlError::ProtocolViolation(_)
+            | SqlError::InvalidPassword(_)
+            | SqlError::IdleInTransactionTimeout => Severity::Fatal,
             _ => Severity::Error,
         }
     }
@@ -2033,6 +2064,11 @@ impl SqlError {
             ),
             // PostgreSQL lists the values an enum parameter takes, and the list is the parameter's
             // rather than the error's — looked up so the two can never say different things.
+            // PostgreSQL's own, and the only thing that tells this apart from a value the
+            // parameter could not read at all — the sentence above it is identical.
+            SqlError::ParameterValueExceedsIntegerRange { .. } => {
+                Some("Value exceeds integer range.".to_owned())
+            }
             SqlError::InvalidParameterValue { name, .. } => match crate::parameter::lookup(name) {
                 Ok(crate::parameter::Parameter {
                     values: crate::parameter::Values::Enum(allowed),
