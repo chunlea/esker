@@ -1,0 +1,19 @@
+docs/plans/phase-9-rails.md
+  s_bab816e8030609::t_0e4a1861387bf8 1513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "993cebc3163468d153bd173615cc45748352a2cd",
+  "prompts": {},
+  "sessions": {
+    "s_bab816e8030609": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f13066b-3f0f-48c7-baf4-ef821f6ad1bb",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
