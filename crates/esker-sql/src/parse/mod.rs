@@ -89,6 +89,33 @@ const INLINE_PARSE_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_NESTING_LEVEL;
 pub(crate) const DEEP_PARSE_STACK_BYTES: usize =
     MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
 
+/// How much stack one level of a `plan::Expr` walk costs, by profile.
+///
+/// **Measured against the whole client path**, not against one walker: parse, lower, resolve, type
+/// and evaluate a boolean chain of increasing length on a 2 MiB thread. It overflowed at **138**
+/// levels in a debug build, which is about 15 KiB a level; the release figure is scaled by the
+/// same ratio [`STACK_PER_NESTING_LEVEL`] uses, and both are rounded up by half again.
+const STACK_PER_PLAN_LEVEL: usize = if cfg!(debug_assertions) {
+    24 * 1024
+} else {
+    5 * 1024
+};
+
+/// The deepest `plan::Expr` this node will build.
+///
+/// **The bound is on the tree, not on the walkers**, and that is the whole point. There are forty
+/// or so recursive walks over `plan::Expr` — the resolver, the type pass, the evaluator, the
+/// binder, the columnar pushdown, the printer — and giving each its own counter would mean the
+/// forty-first silently has none. A tree that cannot be deeper than this cannot overflow any of
+/// them, including the ones not written yet.
+///
+/// It is smaller than [`MAX_NESTING_DEPTH`], which is the *parser's* limit and is enforced on a
+/// stack sized for it. A statement between the two parses and is then `54001` at lowering: this
+/// node accepts a shallower expression than PostgreSQL does, and says so, rather than crashing on
+/// the difference. Half the 2 MiB a `tokio` worker gets, over the per-level cost above — 42 levels
+/// in debug and 204 in release, against a measured 138 in debug.
+pub const MAX_PLAN_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_PLAN_LEVEL;
+
 /// The recursion limit handed to `sqlparser` itself.
 ///
 /// Its own default is **50**, which rejects `SELECT ((((...1...))))` at 51 parentheses with a parser

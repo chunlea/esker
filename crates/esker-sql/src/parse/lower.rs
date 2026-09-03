@@ -62,7 +62,7 @@ impl Parsed {
                 .name("esker-sql-lower".into())
                 .stack_size(crate::parse::DEEP_PARSE_STACK_BYTES)
                 .spawn_scoped(scope, || {
-                    LOWER_LIMIT.with(|cell| cell.set(crate::parse::MAX_NESTING_DEPTH));
+                    LOWER_LIMIT.with(|cell| cell.set(crate::parse::MAX_PLAN_DEPTH));
                     self.lower_inline()
                 })
                 .map_err(|error| {
@@ -2252,10 +2252,12 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
 /// which is about 35 KiB of frame per level — `lower_expr` is one large match and every arm's
 /// locals get a slot. Half of that measurement, so the guard fires with the stack half used.
 ///
-/// A statement past it is not refused: it is lowered again on a thread sized for
-/// [`crate::parse::MAX_NESTING_DEPTH`] levels, which is what `crate::parse` already does for a
-/// deeply nested *parse* and for the same reason. Only a statement past **that** is `54001`, so
-/// the set of statements this node accepts is the parser's set and not the worker stack's.
+/// A statement past it is not refused: it is lowered again on a thread with room to spare, which
+/// is what `crate::parse` already does for a deeply nested *parse*. Only a statement past
+/// [`crate::parse::MAX_PLAN_DEPTH`] is `54001` — and that limit is set by what the **executor**
+/// can walk on a worker's stack, because a plan this crate builds and then cannot execute would
+/// only move the crash a layer along. It did, once: guarding lowering alone left a 500-term chain
+/// lowering happily and overflowing in the resolver.
 const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
 
 thread_local! {
