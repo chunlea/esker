@@ -1,0 +1,50 @@
+# `DROP FUNCTION`, against PostgreSQL 19beta1 — statement 757 of
+# `postgresql_specific_schema.rb`: `DROP FUNCTION IF EXISTS partitioned_insert_trigger()`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`DROP FUNCTION` is not a no-op for a server with no user functions.** A *built-in* is
+#     `2BP01 cannot drop function lower(text) because it is required by the database system`, and
+#     `IF EXISTS` does **not** cover that — it covers absence, not protection. A node that
+#     answered success to everything would let a schema drop `lower` and report that it had.
+#   * **The message prints the function's own canonical signature, not what the user wrote.**
+#     `concat(VARIADIC "any")` comes back as `concat("any")` and `convert_to(text, name)` as
+#     `convert_to(text,name)` — the `VARIADIC` gone and the space after the comma gone with it.
+#   * **The signature has to match, not just the name**: `lower(integer)` is `42883` where
+#     `lower(text)` is `2BP01`, and `concat(text)` is `42883` because the real signature is
+#     `concat("any")`.
+#   * **Writing no argument list is a different statement**, not a shorthand. On a name that
+#     exists once it selects that one; on an overloaded name it is `42725 … is not unique` with a
+#     HINT, which `IF EXISTS` does not cover either; on a name that is nothing at all it is a
+#     *different* `42883` — `could not find a function named "x"` rather than "function x() does
+#     not exist", because with no argument list there is no signature to name.
+#   * An unknown **schema** is still just absence: `IF EXISTS nosuch.f()` is a success.
+DROP FUNCTION IF EXISTS partitioned_insert_trigger()		-
+DROP FUNCTION IF EXISTS partitioned_insert_trigger		-
+DROP FUNCTION IF EXISTS nosuchfunc(integer, text)		-
+DROP FUNCTION partitioned_insert_trigger()	!42883 function partitioned_insert_trigger() does not exist
+DROP FUNCTION nosuchfunc	!42883 could not find a function named "nosuchfunc"
+DROP FUNCTION IF EXISTS f1(), f2()		-
+DROP FUNCTION IF EXISTS lower(text)	!2BP01 cannot drop function lower(text) because it is required by the database system
+DROP FUNCTION lower(text)	!2BP01 cannot drop function lower(text) because it is required by the database system
+DROP FUNCTION IF EXISTS pg_catalog.lower(text)	!2BP01 cannot drop function lower(text) because it is required by the database system
+SELECT 'g', count(*) FROM pg_proc WHERE proname = 'partitioned_insert_trigger'	text,bigint	g|0
+DROP FUNCTION lower(integer)	!42883 function lower(integer) does not exist
+DROP FUNCTION IF EXISTS lower(integer)		-
+DROP FUNCTION lower	!42725 function name "lower" is not unique HINT: Specify the argument list to select the function unambiguously.
+DROP FUNCTION IF EXISTS lower	!42725 function name "lower" is not unique HINT: Specify the argument list to select the function unambiguously.
+DROP FUNCTION random()	!2BP01 cannot drop function random() because it is required by the database system
+DROP FUNCTION concat(text)	!42883 function concat(text) does not exist
+DROP FUNCTION IF EXISTS "Weird Name"()		-
+DROP FUNCTION IF EXISTS nosuch.f()		-
+DROP FUNCTION concat("any")	!2BP01 cannot drop function concat("any") because it is required by the database system
+DROP FUNCTION concat(VARIADIC "any")	!2BP01 cannot drop function concat("any") because it is required by the database system
+DROP FUNCTION convert_to(text, name)	!2BP01 cannot drop function convert_to(text,name) because it is required by the database system
+DROP FUNCTION now()	!2BP01 cannot drop function now() because it is required by the database system
+DROP FUNCTION upper(text)	!2BP01 cannot drop function upper(text) because it is required by the database system
+DROP FUNCTION nextval(regclass)	!2BP01 cannot drop function nextval(regclass) because it is required by the database system
+DROP FUNCTION IF EXISTS lower(text), nosuchfunc()	!2BP01 cannot drop function lower(text) because it is required by the database system

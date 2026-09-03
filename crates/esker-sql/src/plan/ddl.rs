@@ -115,6 +115,22 @@ pub enum ColumnDefault {
     },
 }
 
+/// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropFunction {
+    /// The functions named, each with its argument types **as written** or `None` for a statement
+    /// that gave no list at all.
+    ///
+    /// The two are different statements rather than long and short spellings of one: with a list
+    /// PostgreSQL selects a signature, and without one it selects *the* function of that name and
+    /// is `42725` when there is more than one.
+    pub functions: Vec<(String, Option<Vec<String>>)>,
+    /// `IF EXISTS`: a function that is not there is a notice rather than a `42883`.
+    ///
+    /// **It covers absence only.** A built-in is `2BP01` with the clause and without it.
+    pub if_exists: bool,
+}
+
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {

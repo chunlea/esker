@@ -64,6 +64,9 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::CreateIndex(create) => {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
+        Statement::DropFunction(drop) => {
+            Ok(plan::Statement::DropFunction(lower_drop_function(drop)?))
+        }
         Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(alter)?)),
         Statement::CreateSequence {
             temporary,
@@ -940,6 +943,39 @@ fn sequence_literal_name(argument: &Expr) -> Option<String> {
         },
         _ => None,
     }
+}
+
+/// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
+///
+/// The argument types are kept **as the user wrote them**, lower-cased, because matching happens
+/// against a signature and a type this node has never heard of is simply one that does not match.
+/// Resolving them to `ColumnType` here would refuse `DROP FUNCTION f(hstore)` as an unknown type
+/// where a real server answers that no such function exists — a wrong answer rather than a gap.
+fn lower_drop_function(drop: &sqlparser::ast::DropFunction) -> Result<plan::DropFunction> {
+    let mut functions = Vec::with_capacity(drop.func_desc.len());
+    for desc in &drop.func_desc {
+        // A schema qualifier is taken and dropped: `pg_catalog.lower(text)` is `lower(text)`, and
+        // the message a real server gives does not repeat the qualifier either. An *unknown*
+        // schema is absence, not an error, which is what `relation_name` cannot express — so the
+        // last part is the name and the rest is discarded.
+        let name = desc
+            .name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| fold_identifier(&ident.value, ident.quote_style.is_some()).0)
+            .ok_or_else(|| SqlError::unsupported("DROP FUNCTION with no name"))?;
+        let args = desc.args.as_ref().map(|args| {
+            args.iter()
+                .map(|arg| arg.data_type.to_string().to_ascii_lowercase())
+                .collect()
+        });
+        functions.push((name, args));
+    }
+    Ok(plan::DropFunction {
+        functions,
+        if_exists: drop.if_exists,
+    })
 }
 
 /// A columnar-replica count: a plain non-negative integer, and nothing else.

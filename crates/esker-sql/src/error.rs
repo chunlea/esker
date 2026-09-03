@@ -799,6 +799,33 @@ pub enum SqlError {
     #[error("function {0} does not exist")]
     UndefinedQualifiedFunction(String),
 
+    /// `DROP FUNCTION` on a **built-in**: `2BP01`, and `IF EXISTS` does not cover it.
+    ///
+    /// The clause covers absence and this is not absence — the function is there and is protected.
+    /// A node that answered success here would let a schema drop `lower` and report that it had.
+    /// The name printed is the function's own canonical signature, not what the user wrote:
+    /// `concat(VARIADIC "any")` comes back as `concat("any")`. Measured.
+    #[error("cannot drop function {0} because it is required by the database system")]
+    FunctionRequiredBySystem(String),
+
+    /// `DROP FUNCTION f(<types>)` on a signature that is nothing: `42883`, **with no `DETAIL`**.
+    ///
+    /// Separate from [`SqlError::UndefinedFunction`] for exactly that reason. That one is a *call*
+    /// that found no signature and carries "No function of that name accepts the given number of
+    /// arguments"; a `DROP` naming a signature gets the bare sentence, measured. Same code, same
+    /// words, one fewer line — and a client that parses `DETAIL` sees the difference.
+    #[error("function {0} does not exist")]
+    FunctionToDropNotFound(String),
+
+    /// `DROP FUNCTION f` with **no argument list**, on a name that is nothing: `42883`.
+    ///
+    /// A different sentence from [`SqlError::UndefinedFunction`] and the difference is not
+    /// cosmetic: with an argument list there is a signature to name and without one there is not,
+    /// so PostgreSQL says `could not find a function named "f"` instead of `function f() does not
+    /// exist`. Reusing either sentence for both is wrong half the time.
+    #[error("could not find a function named \"{0}\"")]
+    UnnamedFunctionNotFound(String),
+
     /// A function this node has under a name but not with that signature: `42883`.
     ///
     /// PostgreSQL resolves a function by name **and** argument types, so the wrong arity is not a
@@ -1270,6 +1297,8 @@ impl SqlError {
             SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
+            | SqlError::UnnamedFunctionNotFound(_)
+            | SqlError::FunctionToDropNotFound(_)
             | SqlError::UndefinedQualifiedFunction(_)
             | SqlError::UndefinedFunctionTypes(_)
             | SqlError::UndefinedFunctionName(_)
@@ -1305,7 +1334,8 @@ impl SqlError {
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
             SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentTable { .. }
-            | SqlError::DependentSequence { .. } => {
+            | SqlError::DependentSequence { .. }
+            | SqlError::FunctionRequiredBySystem(_) => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
             SqlError::DuplicateConstraint { .. } | SqlError::DuplicateExtension(_) => {

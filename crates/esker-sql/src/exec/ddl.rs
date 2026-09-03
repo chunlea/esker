@@ -440,6 +440,96 @@ fn set_column_default(
     Ok(())
 }
 
+/// **Every function this node has, with the signature `DROP FUNCTION` names it by.**
+///
+/// This node has no `CREATE FUNCTION`, so the whole function namespace is this list — which is
+/// exactly what makes `DROP FUNCTION` implementable rather than a no-op: a name in it is
+/// *protected*, and a name outside it does not exist. A test below checks the list against the
+/// function enums, so a function added to the language and forgotten here becomes a failure rather
+/// than a `DROP FUNCTION` that reports success for something still callable.
+///
+/// The types are PostgreSQL's spellings, and they are what the `2BP01` prints back — **not** what
+/// the user wrote: `concat(VARIADIC "any")` is answered as `concat("any")`, and
+/// `convert_to(text, name)` as `convert_to(text,name)` with no space. Measured, both.
+const BUILT_IN_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("lower", &["text"]),
+    ("upper", &["text"]),
+    ("random", &[]),
+    ("concat", &["\"any\""]),
+    ("convert_to", &["text", "name"]),
+    ("now", &[]),
+    ("gen_random_uuid", &[]),
+    ("uuid_generate_v4", &[]),
+    ("nextval", &["regclass"]),
+    ("currval", &["regclass"]),
+    ("lastval", &[]),
+    ("setval", &["regclass", "bigint"]),
+    ("format_type", &["oid", "integer"]),
+    ("pg_get_expr", &["pg_node_tree", "oid"]),
+    ("pg_get_indexdef", &["oid"]),
+    ("pg_get_constraintdef", &["oid"]),
+    ("pg_get_partkeydef", &["oid"]),
+    ("obj_description", &["oid", "name"]),
+    ("col_description", &["oid", "integer"]),
+    ("current_schema", &[]),
+    ("current_schemas", &["boolean"]),
+    ("array_length", &["anyarray", "integer"]),
+    ("array_lower", &["anyarray", "integer"]),
+    ("array_upper", &["anyarray", "integer"]),
+    ("array_position", &["anyarray", "anyelement"]),
+    ("generate_subscripts", &["anyarray", "integer"]),
+];
+
+/// One function's canonical signature, as the `2BP01` prints it.
+fn built_in_signature(name: &str, args: &[&str]) -> String {
+    format!("{name}({})", args.join(","))
+}
+
+/// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
+///
+/// **Not a no-op, even though nothing here can create a function.** Three outcomes, and `IF EXISTS`
+/// changes only one of them:
+///
+/// * a **built-in** is `2BP01 … because it is required by the database system`, with or without
+///   the clause — the clause covers absence, not protection, and a node answering success would
+///   let a schema drop `lower` and report that it had;
+/// * a name and signature that match nothing are `42883` without the clause and a success with it;
+/// * a statement with **no argument list** is a different statement, not a shorthand: it selects
+///   *the* function of that name, and its "not found" sentence is its own, because with no
+///   argument list there is no signature to name.
+pub(super) fn drop_function(executor: &mut Executor, drop: &plan::DropFunction) -> Result<Outcome> {
+    for (name, args) in &drop.functions {
+        let matched = BUILT_IN_FUNCTIONS.iter().find(|(built_in, signature)| {
+            *built_in == name
+                && args
+                    .as_ref()
+                    .is_none_or(|written| written.as_slice() == *signature)
+        });
+        if let Some((built_in, signature)) = matched {
+            return Err(SqlError::FunctionRequiredBySystem(built_in_signature(
+                built_in, signature,
+            )));
+        }
+        if drop.if_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "function",
+                name: name.clone(),
+            });
+            continue;
+        }
+        // **Two sentences, and which one depends on whether a signature was written.** With an
+        // argument list there is one to name; without one there is not, and a real server says so
+        // in different words.
+        return Err(match args {
+            Some(written) => {
+                SqlError::FunctionToDropNotFound(format!("{name}({})", written.join(", ")))
+            }
+            None => SqlError::UnnamedFunctionNotFound(name.clone()),
+        });
+    }
+    Ok(Outcome::done("DROP FUNCTION"))
+}
+
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c]`.
 ///
 /// **`OWNED BY` does not give the column a default.** It records that the sequence goes when the
