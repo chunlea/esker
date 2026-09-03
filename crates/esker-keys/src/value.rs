@@ -187,6 +187,18 @@ pub enum ColumnType {
     /// *comparison* converts a month to 30 days and a day to 24 hours — so two intervals can be
     /// equal and print differently. Signs are per field: `1 day -12:00:00` is a real value.
     Interval,
+    /// `bigint[]`. **An array is a constructor over one element type**, not a scalar of its own,
+    /// and the four here are the ones `ActiveRecord`'s schemas declare. A recursive
+    /// `Array(Box<ColumnType>)` would say that better and would cost a `Box` at every one of the
+    /// hundreds of places this `Copy` type is passed by value
+    /// ([ADR 0047](../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)).
+    Int8Array,
+    /// `integer[]`.
+    Int4Array,
+    /// `numeric[]`.
+    NumericArray,
+    /// `text[]`.
+    TextArray,
     /// PostgreSQL's `oid`: a **four-byte unsigned** integer that prints as a plain number.
     ///
     /// Unsigned is the whole of what makes it not an `int4`: `(-1)::oid` is `4294967295` — it
@@ -197,7 +209,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 20] = [
+    pub const ALL: [ColumnType; 24] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -218,6 +230,10 @@ impl ColumnType {
         ColumnType::Uuid,
         ColumnType::Interval,
         ColumnType::Oid,
+        ColumnType::Int8Array,
+        ColumnType::Int4Array,
+        ColumnType::NumericArray,
+        ColumnType::TextArray,
     ];
 }
 
@@ -270,6 +286,12 @@ pub enum Datum {
     Uuid([u8; 16]),
     /// [`ColumnType::Oid`], as the unsigned it is.
     Oid(u32),
+    /// One of the four array types: its elements, their shape, and where they are subscripted
+    /// from (`crate::array`).
+    ///
+    /// **An element that is NULL is not a NULL array.** `'{NULL}'::int[] IS NULL` is false, and
+    /// the two states are told apart here by `Datum::Null` against a `None` inside the value.
+    Array(crate::array::ArrayValue),
     /// [`ColumnType::Interval`]: months, days and microseconds, each with its own sign.
     Interval {
         /// Whole months. Years are twelve of these; nothing else carries into them.
@@ -297,6 +319,10 @@ impl PartialEq for Datum {
             (Datum::Timestamp(a), Datum::Timestamp(b)) | (Datum::Time(a), Datum::Time(b)) => a == b,
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
             (Datum::Oid(a), Datum::Oid(b)) => a == b,
+            // Representation equality, element by element: two arrays that print the same are
+            // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
+            // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
+            (Datum::Array(a), Datum::Array(b)) => a == b,
             // Representation equality, not value equality: `1 mon` and `30 days` are equal
             // *values* and different rows. `pg_cmp` is where the number of them is compared.
             (
@@ -343,6 +369,11 @@ impl Datum {
             Datum::Interval { .. } => ColumnType::Interval,
             Datum::Oid(_) => ColumnType::Oid,
             Datum::Numeric(_) => ColumnType::Numeric,
+            // The array's own element type decides which of the four it is, so a value always
+            // knows what it is without being told.
+            Datum::Array(value) => {
+                return crate::array::ArrayValue::array_of(value.element);
+            }
             Datum::Int2(_) => ColumnType::Int2,
             Datum::Real(_) => ColumnType::Real,
             Datum::Timestamp(_) => ColumnType::Timestamp,

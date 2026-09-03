@@ -77,6 +77,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Interval => 19,
         ColumnType::Oid => 20,
         ColumnType::Numeric => 16,
+        ColumnType::Int8Array => 21,
+        ColumnType::Int4Array => 22,
+        ColumnType::NumericArray => 23,
+        ColumnType::TextArray => 24,
     }
 }
 
@@ -102,6 +106,10 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         19 => ColumnType::Interval,
         20 => ColumnType::Oid,
         16 => ColumnType::Numeric,
+        21 => ColumnType::Int8Array,
+        22 => ColumnType::Int4Array,
+        23 => ColumnType::NumericArray,
+        24 => ColumnType::TextArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

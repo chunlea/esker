@@ -276,7 +276,12 @@ fn consider(
     // One columnar type per projection slot, for the comparison check below.
     let slot_types: Vec<esker_columnar::ColumnType> = columns
         .iter()
-        .filter_map(|column| table.columns.get(*column).map(|def| column_type(def.ty)))
+        .filter_map(|column| {
+            table
+                .columns
+                .get(*column)
+                .and_then(|def| column_type(def.ty))
+        })
         .collect();
     if slot_types.len() != columns.len() {
         return Err(Decision::rows(Reason::NotExpressible(
@@ -569,11 +574,11 @@ fn comparable(
 /// A total match, so a ninth type on either side is a compile error here rather than a column that
 /// silently stops being comparable — the same rule `esker_store::columnar::wire` keeps for the
 /// value vocabulary, and for the same reason.
-fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
+fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnType> {
     use crate::value::ColumnType as Row;
     use esker_columnar::ColumnType as Col;
 
-    match ty {
+    Some(match ty {
         Row::Int8 => Col::Int8,
         Row::Time => Col::Time,
         Row::Uuid => Col::Uuid,
@@ -594,14 +599,22 @@ fn column_type(ty: crate::value::ColumnType) -> esker_columnar::ColumnType {
         Row::Double => Col::Double,
         Row::Date => Col::Date,
         Row::Numeric => Col::Numeric,
-    }
+        // **The columnar format has no array run yet**, so a table with an array column is read
+        // by the row engine — which is the answer the caller's length check already produces,
+        // and a `NotExpressible` rather than a wrong one. The alternative is an array run in
+        // `esker-columnar`'s own vocabulary, which is a unit of its own.
+        Row::Int8Array | Row::Int4Array | Row::NumericArray | Row::TextArray => return None,
+    })
 }
 
 /// A row-side datum as a columnar value. Total on both sides by construction.
 fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
     use esker_columnar::Value;
     match datum {
-        Datum::Null => Value::Null,
+        // An array never reaches this: `column_type` refuses the column, so no fragment is built
+        // over one. `Null` rather than a panic — a total function over a value vocabulary, where
+        // a wrong *answer* would be a filter that silently matched.
+        Datum::Null | Datum::Array(_) => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),

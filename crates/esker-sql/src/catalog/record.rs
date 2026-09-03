@@ -154,6 +154,13 @@ const TAG_INTERVAL: u8 = 19;
 /// `oid`.
 const TAG_OID: u8 = 20;
 
+/// The four array types. Appended, never renumbered, for the reason every tag above is: a record
+/// written by an older build has no tag above 20 and reads unchanged.
+const TAG_INT8_ARRAY: u8 = 21;
+const TAG_INT4_ARRAY: u8 = 22;
+const TAG_NUMERIC_ARRAY: u8 = 23;
+const TAG_TEXT_ARRAY: u8 = 24;
+
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
 const TAG_ABSENT: u8 = 0;
@@ -208,6 +215,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Uuid => TAG_UUID,
         ColumnType::Interval => TAG_INTERVAL,
         ColumnType::Oid => TAG_OID,
+        ColumnType::Int8Array => TAG_INT8_ARRAY,
+        ColumnType::Int4Array => TAG_INT4_ARRAY,
+        ColumnType::NumericArray => TAG_NUMERIC_ARRAY,
+        ColumnType::TextArray => TAG_TEXT_ARRAY,
     }
 }
 
@@ -276,6 +287,10 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_UUID => ColumnType::Uuid,
         TAG_INTERVAL => ColumnType::Interval,
         TAG_OID => ColumnType::Oid,
+        TAG_INT8_ARRAY => ColumnType::Int8Array,
+        TAG_INT4_ARRAY => ColumnType::Int4Array,
+        TAG_NUMERIC_ARRAY => ColumnType::NumericArray,
+        TAG_TEXT_ARRAY => ColumnType::TextArray,
         other => return Err(corrupt(format!("column type tag {other}"))),
     })
 }

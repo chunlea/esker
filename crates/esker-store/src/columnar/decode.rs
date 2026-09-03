@@ -94,14 +94,22 @@ impl TableDecoder {
                 types.len()
             )));
         }
-        let columns = Schema::new(
-            names
-                .iter()
-                .zip(types)
-                .map(|(name, ty)| ColumnDef::new(name.clone(), columnar_type(*ty)))
-                .collect(),
-        )
-        .map_err(|error| StoreError::Bootstrap(format!("the table's columns: {error}")))?;
+        // **A table with an array column has no columnar replica**, and it is refused here
+        // rather than approximated: the columnar format has no array run, and mapping one onto
+        // some other type would give the replica a column whose values are not the table's.
+        // The SQL side already routes such a query to the row engine (`exec::fragment`), so this
+        // is the second of two doors on the same rule.
+        let mut mapped = Vec::with_capacity(types.len());
+        for (name, ty) in names.iter().zip(types) {
+            let Some(columnar) = columnar_type(*ty) else {
+                return Err(StoreError::Bootstrap(format!(
+                    "the column {name} is a {ty:?}, which has no columnar representation"
+                )));
+            };
+            mapped.push(ColumnDef::new(name.clone(), columnar));
+        }
+        let columns = Schema::new(mapped)
+            .map_err(|error| StoreError::Bootstrap(format!("the table's columns: {error}")))?;
         Ok(Self {
             columns,
             row: RowSchema::new(types.to_vec(), missing.to_vec()),
@@ -162,8 +170,8 @@ impl RowDecoder for TableDecoder {
 /// Two enums of the same shapes, which ADR 0030 leaves deliberately unconverged — a dedup for
 /// somebody not in the middle of a milestone. A **total** match, so that a seventh type added to
 /// either side is a compile error here rather than a column that silently reads NULL.
-fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
-    match ty {
+fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
+    Some(match ty {
         StoredType::Int8 => esker_columnar::ColumnType::Int8,
         StoredType::Int4 => esker_columnar::ColumnType::Int4,
         StoredType::Int2 => esker_columnar::ColumnType::Int2,
@@ -184,13 +192,19 @@ fn columnar_type(ty: StoredType) -> esker_columnar::ColumnType {
         StoredType::Uuid => esker_columnar::ColumnType::Uuid,
         StoredType::Interval => esker_columnar::ColumnType::Interval,
         StoredType::Oid => esker_columnar::ColumnType::Oid,
-    }
+        StoredType::Int8Array
+        | StoredType::Int4Array
+        | StoredType::NumericArray
+        | StoredType::TextArray => return None,
+    })
 }
 
 /// Likewise for a value. Total, for the same reason.
+///
+/// An array never reaches it: [`columnar_type`] refuses the column before a decoder exists.
 fn value_of(datum: &Datum) -> Value {
     match datum {
-        Datum::Null => Value::Null,
+        Datum::Null | Datum::Array(_) => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),

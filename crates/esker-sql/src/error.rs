@@ -555,6 +555,21 @@ pub enum SqlError {
         operand: &'static str,
     },
 
+    /// An array literal PostgreSQL's `array_in` will not read: `22P02`, with a `DETAIL` saying
+    /// what is wrong with it.
+    ///
+    /// **Not the same failure as a bad element.** `'{1,x}'::int[]` is `int4`'s own
+    /// `invalid input syntax`, because the element type answers for its own values; this is the
+    /// *literal's* shape — an unmatched brace, a doubled comma, ragged sub-arrays, a quote in the
+    /// wrong place. Four DETAILs, measured.
+    #[error("malformed array literal: \"{value}\"")]
+    MalformedArrayLiteral {
+        /// The literal as written.
+        value: String,
+        /// PostgreSQL's own sentence about what is wrong with it.
+        detail: String,
+    },
+
     /// A division or a modulo by zero: `22012`, for the integers **and** the floats.
     ///
     /// A float divided by zero raises here as it does on a real server; it does not yield
@@ -1333,6 +1348,7 @@ impl SqlError {
             | SqlError::SetvalOutOfBounds { .. }
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
+            SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
@@ -1473,7 +1489,8 @@ impl SqlError {
             | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
             }
-            SqlError::NumericFieldOverflow { detail }
+            SqlError::MalformedArrayLiteral { detail, .. }
+            | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. } => Some(detail.clone()),

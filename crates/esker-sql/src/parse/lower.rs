@@ -2805,6 +2805,18 @@ fn function_arguments<'a>(
         .collect()
 }
 
+/// The element type inside an `ArrayElemTypeDef`, or `None` for the two spellings that carry no
+/// type — `int[]` written as a bare `ARRAY` has nothing to be an array *of*.
+fn array_element(inner: &sqlparser::ast::ArrayElemTypeDef) -> Option<&DataType> {
+    use sqlparser::ast::ArrayElemTypeDef;
+    match inner {
+        ArrayElemTypeDef::AngleBracket(ty)
+        | ArrayElemTypeDef::SquareBracket(ty, _)
+        | ArrayElemTypeDef::Parenthesis(ty) => Some(ty),
+        ArrayElemTypeDef::None => None,
+    }
+}
+
 /// The type name PostgreSQL would print for one argument in a `42883`.
 fn argument_type_name(arg: &FunctionArg) -> String {
     let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
@@ -2870,16 +2882,22 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
         return Ok(plan::Expr::Literal(plan::Literal::Null));
     }
-    // **A cast to an array type is the identity on the text.** `'{a,b}'::text[]` is `{a,b}`, which
-    // is already the array's own canonical form and already what the array operators read
-    // (`crate::value::vector`). There is no array *column* type here, so this is not a cast to a
-    // stored type and never becomes one: it is how a literal array reaches the operators, and the
-    // same no-op `= ANY` has always made of it. A cast of anything but a literal is refused below
-    // with the type named, because a per-row cast to an array would have to build one.
-    if matches!(data_type, DataType::Array(_))
+    // **A cast to an array type reads the literal**, and used to be the identity on its text.
+    // It was the identity because there was no array *column* type to cast to and the array
+    // operators read their arrays out of text anyway; the cost was that nothing ever checked the
+    // literal, so `'{a,,b}'::text[]` answered `{a,,b}` where a real server raises `22P02`, and
+    // `'{a,b}'::text[]` reported its type as `text`. Now that an array is a type, this is an
+    // ordinary cast to a stored type: `Datum::from_text` is `array_in`, and it is the element
+    // type that answers for a bad element.
+    if let DataType::Array(inner) = data_type
+        && let Some(element) = array_element(inner)
+        && let Ok((element, NO_TYPMOD)) = lower_type(element)
+        && let Some(array) = esker_keys::array::ArrayValue::array_of(element)
         && let Some(text) = cast_literal_text(expr)?
     {
-        return Ok(plan::Expr::Literal(plan::Literal::String(text)));
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::from_text(array, &text)?,
+        ))));
     }
     let Some(target) = cast_target(data_type) else {
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it
@@ -3994,6 +4012,22 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     match data_type {
+        // **`int8[]` is a column type**, over one of the four element types this node has an
+        // array of. The element's own declaration is read first, so `numeric(10,2)[]` is refused
+        // by naming the typmod rather than by silently dropping it — an array takes none here.
+        DataType::Array(inner) => {
+            let Some(element) = array_element(inner) else {
+                return Err(SqlError::unsupported(format!("the type {data_type}")));
+            };
+            let (element, typmod) = lower_type(element)?;
+            if typmod != NO_TYPMOD {
+                return Err(SqlError::unsupported(format!("the type {data_type}")));
+            }
+            let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
+                return Err(SqlError::unsupported(format!("the type {data_type}")));
+            };
+            plain(array)
+        }
         // The three that take a number. Each is checked against PostgreSQL's own limit, because a
         // length this node accepted and a real server refused would be a table that exists here
         // and not there.

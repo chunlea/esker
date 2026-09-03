@@ -514,6 +514,14 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
 
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
+        // An empty array of the right element type: the shape a parameter takes before its value
+        // arrives, and one that answers `column_type` correctly while it stands in.
+        ColumnType::Int8Array
+        | ColumnType::Int4Array
+        | ColumnType::NumericArray
+        | ColumnType::TextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+            esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
+        )),
         ColumnType::Int8 => Datum::Int8(0),
         ColumnType::Time => Datum::Time(0),
         ColumnType::Uuid => Datum::Uuid([0; 16]),

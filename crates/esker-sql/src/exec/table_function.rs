@@ -47,7 +47,7 @@ pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>
     };
     // **A NULL array is zero rows**, which is the first of the five "nothing to do" cases and the
     // one an implementation is most likely to turn into an error.
-    let (Datum::Text(text), Datum::Int8(dimension)) = (&value, &dimension) else {
+    let Datum::Int8(dimension) = &dimension else {
         if matches!(value, Datum::Null) || matches!(dimension, Datum::Null) {
             return Ok(Vec::new());
         }
@@ -55,7 +55,20 @@ pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>
             "generate_subscripts".to_owned(),
         ));
     };
-    let Some(bounds) = subscripts(text, *dimension) else {
+    // **A real array knows its own bounds**, which is what an array column and an array cast
+    // produce now. The text form beside it is the catalog's `int2vector`s, which are held as text
+    // and reach this function through the same door (`crate::value::vector`).
+    let bounds = match &value {
+        Datum::Array(array) => array_subscripts(array, *dimension),
+        Datum::Text(text) => subscripts(text, *dimension),
+        Datum::Null => return Ok(Vec::new()),
+        _ => {
+            return Err(SqlError::UndefinedFunctionTypes(
+                "generate_subscripts".to_owned(),
+            ));
+        }
+    };
+    let Some(bounds) = bounds else {
         return Ok(Vec::new());
     };
     let mut subscripts: Vec<i32> = bounds.collect();
@@ -66,6 +79,22 @@ pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>
         .into_iter()
         .map(|at| vec![Datum::Int4(at)])
         .collect())
+}
+
+/// The subscripts of a real array's `dimension`, or `None` when it has none.
+///
+/// Every "nothing to do" case is here rather than at the caller: a dimension the array does not
+/// have, and the empty array, which has no dimensions at all.
+fn array_subscripts(
+    array: &esker_keys::array::ArrayValue,
+    dimension: i64,
+) -> Option<std::ops::RangeInclusive<i32>> {
+    let at = usize::try_from(dimension).ok().filter(|at| *at >= 1)?;
+    let length = *array.dims.get(at - 1)?;
+    // The lower bound belongs to the first dimension; every other starts at one, which is what a
+    // real server reports for an array whose bounds were not written out.
+    let lower = if at == 1 { array.lower } else { 1 };
+    (length > 0).then(|| lower..=lower + length - 1)
 }
 
 /// The subscripts of `text`'s `dimension`, or `None` when there are none.

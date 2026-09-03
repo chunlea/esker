@@ -33,23 +33,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// one. It closes one type at a time as types arrive.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)",
-            "the same, for the three types this node deliberately does not have: `oid`, `name` and \
+    answers: &[(
+        "SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)",
+        "the same, for the three types this node deliberately does not have: `oid`, `name` and \
              `regtype` are the ones `pg_catalog`'s own columns are declared as on a real server, \
              and this node reports those columns as `bigint` and `text` (declared in \
              `tests/pg_catalog.rs`). A `format_type` that named them would name types no \
              `RowDescription` from here ever carries.",
-        ),
-        (
-            "SELECT format_type(1007, NULL), format_type(1009, NULL)",
-            "an array type carries its element's typmod and prints the brackets outside — \
-             `format_type(1015, 1028)` is `character varying(1024)[]` on a real server. This node \
-             has no array types at all, so both are `???`. It is the array lane's to close, and \
-             it is named here so a reader finds the gap rather than a wrong answer.",
-        ),
-    ],
+    )],
 };
 
 #[test]

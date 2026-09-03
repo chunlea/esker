@@ -1109,7 +1109,35 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             index,
             element,
         } => {
-            let Some(array) = read_array(&evaluate_in(operand, row, env)?)? else {
+            let operand = evaluate_in(operand, row, env)?;
+            // **A real array's element is already a value**, of the element type, so it is taken
+            // rather than re-read from text: `('{1,2,3}'::int[])[1]` is an `integer` and not the
+            // characters `1`. The text path below is the catalog's `int2vector`s.
+            if let Datum::Array(array) = &operand {
+                let index = match evaluate_in(index, row, env)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Int8(at) => at,
+                    Datum::Int4(at) => i64::from(at),
+                    Datum::Int2(at) => i64::from(at),
+                    other => {
+                        return Err(SqlError::DatatypeMismatch(format!(
+                            "array subscript must be type integer, not {other:?}"
+                        )));
+                    }
+                };
+                // **One subscript of a multi-dimensional array is NULL**, not its first row —
+                // measured, and the reason a slice is the operator that returns an array.
+                if array.dims.len() > 1 {
+                    return Ok(Datum::Null);
+                }
+                let at = index - i64::from(array.lower);
+                return Ok(usize::try_from(at)
+                    .ok()
+                    .and_then(|at| array.values.get(at))
+                    .and_then(Clone::clone)
+                    .unwrap_or(Datum::Null));
+            }
+            let Some(array) = read_array(&operand)? else {
                 return Ok(Datum::Null);
             };
             let index = match evaluate_in(index, row, env)? {
@@ -1491,6 +1519,18 @@ fn three_valued_match(operand: &Datum, values: &[Datum], negated: bool) -> Datum
 fn read_array(value: &Datum) -> Result<Option<crate::value::vector::Array>> {
     match value {
         Datum::Null => Ok(None),
+        // **A real array value**, which is what an array column and an array cast produce now.
+        // The text form below is still here and still needed: `pg_index.indkey` and
+        // `pg_constraint.conkey` are `int2vector`s that this node holds as text, and they reach
+        // the same operators (`crate::value::vector`).
+        Datum::Array(array) => Ok(Some(crate::value::vector::Array {
+            elements: array
+                .values
+                .iter()
+                .map(|element| element.as_ref().and_then(PgDatum::to_text))
+                .collect(),
+            lower: array.lower,
+        })),
         Datum::Text(text) => crate::value::vector::Array::read(text)
             .map(Some)
             .ok_or_else(|| {
@@ -1520,18 +1560,40 @@ fn array_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
     // **Only three of the five take a dimension.** `cardinality(a)` has one argument, and
     // `array_position(a, value)`'s second argument is the value it is looking for — reading that
     // as a dimension answers NULL for every needle that is not `1`, which is a wrong answer and
-    // not a gap. Of the three that do take one, only the first dimension of a one-dimensional
-    // array has an answer; a real server gives NULL for every other.
-    let first_dimension = !matches!(
+    // not a gap.
+    let takes_dimension = matches!(
         func,
         CatalogFunc::ArrayLower | CatalogFunc::ArrayUpper | CatalogFunc::ArrayLength
-    ) || matches!(
-        args.get(1),
-        Some(Datum::Int8(1) | Datum::Int4(1) | Datum::Int2(1))
     );
-    let length = i32::try_from(array.elements.len()).unwrap_or(i32::MAX);
+    let wanted = match args.get(1) {
+        Some(Datum::Int8(at)) => i32::try_from(*at).unwrap_or(i32::MAX),
+        Some(Datum::Int4(at)) => *at,
+        Some(Datum::Int2(at)) => i32::from(*at),
+        _ => 1,
+    };
+    // **The shape decides which dimensions exist**, and a real array carries one:
+    // `array_length('{{1,2},{3,4}}', 2)` is 2 where the same call on a one-dimensional array is
+    // NULL. A text `int2vector` from the catalog has no shape, so its one dimension is its length
+    // — which is what it has always been.
+    let shape: Vec<i32> = match args.first() {
+        Some(Datum::Array(value)) => value.dims.clone(),
+        _ if array.elements.is_empty() => Vec::new(),
+        _ => vec![i32::try_from(array.elements.len()).unwrap_or(i32::MAX)],
+    };
+    let dimension_length = usize::try_from(wanted)
+        .ok()
+        .filter(|at| *at >= 1)
+        .and_then(|at| shape.get(at - 1))
+        .copied();
+    let first_dimension = !takes_dimension || dimension_length.is_some();
+    let length =
+        dimension_length.unwrap_or_else(|| i32::try_from(array.elements.len()).unwrap_or(i32::MAX));
     Ok(match func {
-        CatalogFunc::Cardinality => Datum::Int4(length),
+        // Every element of every dimension, which is what makes it 4 for a two-by-two where
+        // `array_length(a, 1)` is 2.
+        CatalogFunc::Cardinality => {
+            Datum::Int4(i32::try_from(array.elements.len()).unwrap_or(i32::MAX))
+        }
         _ if !first_dimension => Datum::Null,
         // An empty array has **no dimensions**, so its bounds and its length are NULL where its
         // cardinality is 0. Measured, and it is the shape that breaks a `LIMIT` computed from it.

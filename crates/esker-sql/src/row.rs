@@ -32,10 +32,39 @@ mod tests {
     };
 
     /// Every value a column of `ty` can hold, NULL included.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one strategy per column type; the list is the vocabulary"
+    )]
     fn values_of(ty: ColumnType) -> BoxedStrategy<Datum> {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            // An array of the element type's own values, NULL elements and a lower bound that is
+            // sometimes not one — the parts of the value an index key has to order by.
+            ColumnType::Int8Array
+            | ColumnType::Int4Array
+            | ColumnType::NumericArray
+            | ColumnType::TextArray => {
+                let element = esker_keys::array::ArrayValue::element_of(ty)
+                    .unwrap_or(ColumnType::Text);
+                (
+                    proptest::collection::vec(
+                        proptest::option::of(values_of(element).prop_filter(
+                            "a NULL element is the `None`, not a `Datum::Null`",
+                            |value| !matches!(value, Datum::Null),
+                        )),
+                        0..5,
+                    ),
+                    -2i32..3,
+                )
+                    .prop_map(move |(values, lower)| {
+                        Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                            element, lower, values,
+                        ))
+                    })
+                    .boxed()
+            }
             // The whole closed range, `24:00:00` included.
             ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             ColumnType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),

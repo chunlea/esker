@@ -1083,7 +1083,14 @@ impl Literal {
                 // Neither takes a number or a boolean: `INSERT INTO t (j) VALUES (1)` is a type
                 // mismatch on a real server, not a one-element document.
                 | ColumnType::Json
-                | ColumnType::Jsonb => mismatch(),
+                | ColumnType::Jsonb
+                // **A scalar constant is not a one-element array.** PostgreSQL says
+                // `column "a" is of type integer[] but expression is of type integer` and offers
+                // a cast; writing `{1}` for `1` here would be inventing the user's intent.
+                | ColumnType::Int8Array
+                | ColumnType::Int4Array
+                | ColumnType::NumericArray
+                | ColumnType::TextArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1140,7 +1147,14 @@ impl Literal {
                 | ColumnType::Uuid
                 | ColumnType::Interval
                 | ColumnType::Oid
-                | ColumnType::Timestamp => mismatch(),
+                | ColumnType::Timestamp
+                // **A scalar constant is not a one-element array.** PostgreSQL says
+                // `column "a" is of type integer[] but expression is of type integer` and offers
+                // a cast; writing `{1}` for `1` here would be inventing the user's intent.
+                | ColumnType::Int8Array
+                | ColumnType::Int4Array
+                | ColumnType::NumericArray
+                | ColumnType::TextArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1171,7 +1185,14 @@ impl Literal {
                 | ColumnType::Uuid
                 | ColumnType::Interval
                 | ColumnType::Oid
-                | ColumnType::Real => mismatch(),
+                | ColumnType::Real
+                // **A scalar constant is not a one-element array.** PostgreSQL says
+                // `column "a" is of type integer[] but expression is of type integer` and offers
+                // a cast; writing `{1}` for `1` here would be inventing the user's intent.
+                | ColumnType::Int8Array
+                | ColumnType::Int4Array
+                | ColumnType::NumericArray
+                | ColumnType::TextArray => mismatch(),
             },
         }
     }
