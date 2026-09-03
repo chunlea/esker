@@ -590,6 +590,7 @@ impl CatalogView {
                         parents: Vec::new(),
                         children: Vec::new(),
                         triggers: Vec::new(),
+                        excludes: Vec::new(),
                         child_scans: Vec::new(),
                     })
                 })

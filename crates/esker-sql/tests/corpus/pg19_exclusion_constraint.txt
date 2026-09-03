@@ -1,0 +1,126 @@
+# `EXCLUDE` constraints — `USING gist`, a `daterange` expression, `WITH &&`, a partial `WHERE`,
+# and `DEFERRABLE` — as a real PostgreSQL 19beta1 answers them.
+#
+# **Statement 777 of `postgresql_specific_schema.rb`**, verbatim as `ActiveRecord` emits it: three
+# `EXCLUDE` constraints on one table, one plain, one `DEFERRABLE INITIALLY IMMEDIATE`, one
+# `DEFERRABLE INITIALLY DEFERRED`. Nothing in the corpus covered `EXCLUDE`, `gist`, `daterange` or
+# `&&` before this file. It is the second thing rung 4 stops on after the plpgsql function at 762.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The two `SELECT count(*)` lines at the end prove it left nothing behind, and both answer `0`.
+# The `\gdesc` pass runs after the rollback, so statements naming these tables have an **empty**
+# declared-types column; the range and operator expressions keep theirs, and the `pg_typeof` line
+# pins `daterange` and `boolean`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`information_schema.table_constraints` does not list an `EXCLUDE` constraint at all.** This
+#     table has three of them and the view returns two rows — the `PRIMARY KEY` and the
+#     `bigserial`'s not-null, the latter typed **`CHECK`**. Anything that reads exclusion
+#     constraints has to read `pg_constraint`, where `contype = 'x'`.
+#   * **`USING gist` is load-bearing, not decoration.** `EXCLUDE (r WITH &&)` with no `USING`
+#     defaults to **btree** and is then refused: `42809 operator &&(anyrange,anyrange) is not a
+#     member of operator family "range_ops"`. Spelling `USING btree` explicitly gives the identical
+#     error, which is how you can tell what the default was.
+#   * **A scalar column cannot be excluded without `btree_gist`.** `EXCLUDE USING gist (id WITH =)`
+#     on a `bigint` is `42704 data type bigint has no default operator class for access method
+#     "gist"` with a HINT. The suite sidesteps this by excluding on a `daterange(...)` **expression**
+#     rather than on a column — that choice is what makes the statement work without an extension.
+#   * **`daterange` is half-open, so the suite's adjacent ranges do not conflict.**
+#     `[2026-01-01,2026-02-01)` and `[2026-02-01,2026-03-01)` are `&&` **false**, and both rows
+#     insert. An implementation that treats a range as closed refuses a row PostgreSQL admits.
+#   * **An empty range overlaps nothing, including itself.**
+#     `isempty(daterange('2026-01-01','2026-01-01'))` is `t` and `&&` against a range containing it
+#     is `f`.
+#   * **`daterange(NULL, x)` is an *unbounded* range, not NULL.** It prints `(,2026-02-01)`, and
+#     `daterange(NULL,NULL)` overlaps everything.
+#   * **The partial `WHERE` is what makes NULLs legal — and it makes duplicates legal too.** Two
+#     rows of `(NULL, NULL)` and **two identical rows** of `('2026-01-10', NULL)` all insert,
+#     because `end_date IS NOT NULL` fails and the row is not in the index. Without the `WHERE`
+#     those are four conflicts.
+#   * **The SQLSTATE is `23P01`, not `23505`**, and the DETAIL prints **both** keys as rendered
+#     ranges: `Key (daterange(start_date, end_date))=([2026-01-15,2026-02-15)) conflicts with
+#     existing key (daterange(start_date, end_date))=([2026-01-01,2026-02-01)).`
+#   * **`pg_get_constraintdef` and `pg_get_indexdef` parenthesise the same `WHERE` differently, and
+#     neither matches the input.** Written `WHERE (start_date IS NOT NULL AND end_date IS NOT NULL)`,
+#     it comes back **triple**-parenthesised from `pg_get_constraintdef`
+#     (`WHERE (((start_date IS NOT NULL) AND (end_date IS NOT NULL)))`) and **double** from
+#     `pg_get_indexdef`. Three spellings of one predicate.
+#   * **The backing index is a plain `CREATE INDEX` and the operator is not in it.**
+#     `pg_get_indexdef` gives `CREATE INDEX … USING gist (daterange(start_date, end_date)) WHERE …`
+#     — no `UNIQUE`, no `WITH &&`. `indisunique` is `f` and `indisexclusion` is `t`; the `&&` lives
+#     only in `pg_constraint`.
+#   * **`DEFERRABLE INITIALLY IMMEDIATE` prints as bare `DEFERRABLE`**, the same "keep only what
+#     differs from the default" rule `pg19_unique_constraint.txt` records — and deferral behaves the
+#     same way here: the row inserts, `count(*)` sees it, and the `23P01` arrives on
+#     `SET CONSTRAINTS … IMMEDIATE`.
+#   * **`UPDATE` is checked, and only when the new range really overlaps.** Moving `end_date`
+#     forward to `2026-02-20` is accepted; moving `start_date` back to `2026-01-15` is `23P01`.
+BEGIN		-
+CREATE TABLE "test_exclusion_constraints" ("id" bigserial primary key, "start_date" date, "end_date" date, "valid_from" date, "valid_to" date, "transaction_from" date, "transaction_to" date, CONSTRAINT "test_exclusion_constraints_date_overlap" EXCLUDE USING gist (daterange(start_date, end_date) WITH &&) WHERE (start_date IS NOT NULL AND end_date IS NOT NULL), CONSTRAINT "test_exclusion_constraints_valid_overlap" EXCLUDE USING gist (daterange(valid_from, valid_to) WITH &&) WHERE (valid_from IS NOT NULL AND valid_to IS NOT NULL) DEFERRABLE INITIALLY IMMEDIATE, CONSTRAINT "test_exclusion_constraints_transaction_overlap" EXCLUDE USING gist (daterange(transaction_from, transaction_to) WITH &&) WHERE (transaction_from IS NOT NULL AND transaction_to IS NOT NULL) DEFERRABLE INITIALLY DEFERRED)		-
+SELECT 'r', conname, contype, condeferrable, condeferred FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass ORDER BY conname		r|test_exclusion_constraints_date_overlap|x|f|f ; r|test_exclusion_constraints_id_not_null|n|f|f ; r|test_exclusion_constraints_pkey|p|f|f ; r|test_exclusion_constraints_transaction_overlap|x|t|t ; r|test_exclusion_constraints_valid_overlap|x|t|f
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x' ORDER BY conname		r|test_exclusion_constraints_date_overlap|EXCLUDE USING gist (daterange(start_date, end_date) WITH &&) WHERE (((start_date IS NOT NULL) AND (end_date IS NOT NULL))) ; r|test_exclusion_constraints_transaction_overlap|EXCLUDE USING gist (daterange(transaction_from, transaction_to) WITH &&) WHERE (((transaction_from IS NOT NULL) AND (transaction_to IS NOT NULL))) DEFERRABLE INITIALLY DEFERRED ; r|test_exclusion_constraints_valid_overlap|EXCLUDE USING gist (daterange(valid_from, valid_to) WITH &&) WHERE (((valid_from IS NOT NULL) AND (valid_to IS NOT NULL))) DEFERRABLE
+SELECT 'r', i.relname, am.amname, x.indisunique, x.indisexclusion FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_am am ON am.oid = i.relam WHERE x.indrelid = 'test_exclusion_constraints'::regclass ORDER BY i.relname		r|test_exclusion_constraints_date_overlap|gist|f|t ; r|test_exclusion_constraints_pkey|btree|t|f ; r|test_exclusion_constraints_transaction_overlap|gist|f|t ; r|test_exclusion_constraints_valid_overlap|gist|f|t
+SELECT 'r', pg_get_indexdef('test_exclusion_constraints_date_overlap'::regclass)		r|CREATE INDEX test_exclusion_constraints_date_overlap ON public.test_exclusion_constraints USING gist (daterange(start_date, end_date)) WHERE ((start_date IS NOT NULL) AND (end_date IS NOT NULL))
+SELECT 'r', constraint_name, constraint_type, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name = 'test_exclusion_constraints' ORDER BY constraint_name	text,name,character varying,character varying(3),character varying(3)	r|test_exclusion_constraints_id_not_null|CHECK|NO|NO ; r|test_exclusion_constraints_pkey|PRIMARY KEY|NO|NO
+SELECT 'r', daterange('2026-01-01','2026-02-01'), daterange('2026-01-01','2026-02-01') && daterange('2026-02-01','2026-03-01'), daterange('2026-01-01','2026-02-01') && daterange('2026-01-15','2026-03-01')	text,daterange,boolean,boolean	r|[2026-01-01,2026-02-01)|f|t
+SELECT 'r', isempty(daterange('2026-01-01','2026-01-01')), daterange('2026-01-01','2026-01-01') && daterange('2026-01-01','2026-02-01')	text,boolean,boolean	r|t|f
+SELECT 'r', daterange(NULL,'2026-02-01'), daterange('2026-01-01',NULL), daterange(NULL,NULL) && daterange('2026-01-01','2026-02-01')	text,daterange,daterange,boolean	r|(,2026-02-01)|[2026-01-01,)|t
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-01-01','2026-02-01')		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-02-01','2026-03-01')		-
+SELECT 'r', count(*) FROM "test_exclusion_constraints"		r|2
+SAVEPOINT s1		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-01-15','2026-02-15')	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_date_overlap" DETAIL: Key (daterange(start_date, end_date))=([2026-01-15,2026-02-15)) conflicts with existing key (daterange(start_date, end_date))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-01-01','2026-02-01')	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_date_overlap" DETAIL: Key (daterange(start_date, end_date))=([2026-01-01,2026-02-01)) conflicts with existing key (daterange(start_date, end_date))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s2		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES (NULL,NULL)		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES (NULL,NULL)		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-01-10',NULL)		-
+INSERT INTO "test_exclusion_constraints" ("start_date","end_date") VALUES ('2026-01-10',NULL)		-
+SELECT 'r', count(*) FROM "test_exclusion_constraints"		r|6
+SAVEPOINT s3		-
+UPDATE "test_exclusion_constraints" SET "end_date" = '2026-02-20' WHERE "start_date" = '2026-02-01'		-
+ROLLBACK TO s3		-
+SAVEPOINT s3b		-
+UPDATE "test_exclusion_constraints" SET "start_date" = '2026-01-15' WHERE "start_date" = '2026-02-01'	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_date_overlap" DETAIL: Key (daterange(start_date, end_date))=([2026-01-15,2026-03-01)) conflicts with existing key (daterange(start_date, end_date))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s3b		-
+INSERT INTO "test_exclusion_constraints" ("valid_from","valid_to") VALUES ('2026-01-01','2026-02-01')		-
+SAVEPOINT s4		-
+INSERT INTO "test_exclusion_constraints" ("valid_from","valid_to") VALUES ('2026-01-15','2026-02-15')	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_valid_overlap" DETAIL: Key (daterange(valid_from, valid_to))=([2026-01-15,2026-02-15)) conflicts with existing key (daterange(valid_from, valid_to))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SET CONSTRAINTS "test_exclusion_constraints_valid_overlap" DEFERRED		-
+INSERT INTO "test_exclusion_constraints" ("valid_from","valid_to") VALUES ('2026-01-15','2026-02-15')		-
+SELECT 'r', count(*) FROM "test_exclusion_constraints" WHERE "valid_from" IS NOT NULL		r|2
+SET CONSTRAINTS "test_exclusion_constraints_valid_overlap" IMMEDIATE	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_valid_overlap" DETAIL: Key (daterange(valid_from, valid_to))=([2026-01-15,2026-02-15)) conflicts with existing key (daterange(valid_from, valid_to))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s5		-
+INSERT INTO "test_exclusion_constraints" ("transaction_from","transaction_to") VALUES ('2026-01-01','2026-02-01')		-
+SAVEPOINT s6		-
+INSERT INTO "test_exclusion_constraints" ("transaction_from","transaction_to") VALUES ('2026-01-15','2026-02-15')		-
+SELECT 'r', count(*) FROM "test_exclusion_constraints" WHERE "transaction_from" IS NOT NULL		r|2
+SET CONSTRAINTS "test_exclusion_constraints_transaction_overlap" IMMEDIATE	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_transaction_overlap" DETAIL: Key (daterange(transaction_from, transaction_to))=([2026-01-15,2026-02-15)) conflicts with existing key (daterange(transaction_from, transaction_to))=([2026-01-01,2026-02-01)).
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+CREATE TABLE tec_scalar (id int8, CONSTRAINT tec_scalar_x EXCLUDE USING gist (id WITH =))	!42704 data type bigint has no default operator class for access method "gist" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+CREATE TABLE tec_btree (r daterange, CONSTRAINT tec_btree_x EXCLUDE USING btree (r WITH &&))	!42809 operator &&(anyrange,anyrange) is not a member of operator family "range_ops" DETAIL: The exclusion operator must be related to the index operator class for the constraint.
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+CREATE TABLE tec_plain (r daterange, CONSTRAINT tec_plain_x EXCLUDE (r WITH &&))	!42809 operator &&(anyrange,anyrange) is not a member of operator family "range_ops" DETAIL: The exclusion operator must be related to the index operator class for the constraint.
+ROLLBACK TO s9		-
+CREATE TABLE tec_gist (r daterange, CONSTRAINT tec_gist_x EXCLUDE USING gist (r WITH &&))		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'tec_gist_x'	text,name,text	r|tec_gist_x|EXCLUDE USING gist (r WITH &&)
+SELECT 'r', am.amname, x.indisexclusion FROM pg_class i JOIN pg_am am ON am.oid = i.relam JOIN pg_index x ON x.indexrelid = i.oid WHERE i.relname = 'tec_gist_x'	text,name,boolean	r|gist|t
+SELECT 'r', pg_typeof(daterange('2026-01-01','2026-02-01')), pg_typeof(daterange('2026-01-01','2026-02-01') && daterange('2026-01-01','2026-02-01'))	text,regtype,regtype	r|daterange|boolean
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'test_exclusion_constraints%' OR relname LIKE 'tec_%'	bigint	0
+SELECT count(*) FROM pg_constraint WHERE contype = 'x'	bigint	0

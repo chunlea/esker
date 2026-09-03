@@ -677,6 +677,8 @@ pub struct TableDef {
     pub parents: Vec<u64>,
     /// See [`TableDef::parents`].
     pub children: Vec<u64>,
+    /// The `EXCLUDE` constraints on this table.
+    pub excludes: Vec<ExcludeDef>,
     /// The triggers registered on this table, in creation order.
     ///
     /// **Stored and never fired.** `ALTER TABLE … DISABLE TRIGGER ALL` is a separate flag
@@ -761,6 +763,41 @@ pub struct ChildScan {
     /// By name rather than by position, because the two differ the moment a child has a row id
     /// the parent does not, or a column of its own.
     pub project: Vec<usize>,
+}
+
+/// One `EXCLUDE` constraint: a key expression, an operator, and the rows it applies to.
+///
+/// **No index behind it.** PostgreSQL builds a `GiST` index and this node scans the table instead —
+/// `USING gist` is recorded because `pg_get_indexdef` prints it and `ActiveRecord` reads it, and
+/// the access method is the one thing about an exclusion constraint that is a *performance*
+/// decision rather than an answer. What is not negotiable is the answer: a row that overlaps an
+/// existing one is refused with the same `23P01` either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludeDef {
+    /// Its name, as written or as PostgreSQL derives one.
+    pub name: String,
+    /// The key expression, stored as text the way a `CHECK` is — `daterange(start_date, end_date)`.
+    pub key: String,
+    /// The operator two keys are compared with. `&&` is the one this node has.
+    pub operator: String,
+    /// The access method named, recorded and not used: `gist`.
+    pub method: String,
+    /// `WHERE (…)` — the partial predicate, or `None`.
+    ///
+    /// **It is what makes NULLs legal, and duplicates too**: a row the predicate rejects is not in
+    /// the index at all, so two identical ones both insert. Four rows of `(NULL, NULL)` are four
+    /// conflicts without it.
+    pub predicate: Option<String>,
+    /// `DEFERRABLE`.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`.
+    ///
+    /// **Recorded and not yet honoured**: the check runs at the statement, where a real server
+    /// would hold it to `COMMIT`. End-of-transaction checking is a transaction-layer unit of its
+    /// own and plugs in here; until it lands, a transaction that breaks the constraint in the
+    /// middle and repairs it before committing is refused where PostgreSQL commits it. Recorded
+    /// rather than refused so that the schema this appears in can load.
+    pub deferred: bool,
 }
 
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
@@ -2264,6 +2301,7 @@ mod tests {
             parents: Vec::new(),
             children: Vec::new(),
             triggers: Vec::new(),
+            excludes: Vec::new(),
             child_scans: Vec::new(),
         }
     }
@@ -2289,7 +2327,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "12",               // catalog format version
+                "13",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2382,7 +2420,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "12",       // catalog format version
+                "13",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2415,7 +2453,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "12",                 // catalog format version
+                "13",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2471,6 +2509,9 @@ mod tests {
                 // `UNIQUE` constraint, so it gets no `pg_constraint` row and no `DEFERRABLE`.
                 "00",
                 // Version 18. No triggers, which is every table until `CREATE TRIGGER` runs.
+                "00",
+                // Version 19. No `EXCLUDE` constraints, which is every table until one parses —
+                // and until this version it could not, being a syntax error rather than a refusal.
                 "00",
             )
         );
@@ -3430,7 +3471,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "12",               // catalog format version
+                "13",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

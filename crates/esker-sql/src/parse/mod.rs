@@ -180,6 +180,12 @@ pub struct Parsed {
     /// asked for the concurrent one, which is precisely the class of failure `crate::plan`'s
     /// lowering exists to make impossible.
     concurrently: bool,
+    /// The `EXCLUDE` constraints cut out of a `CREATE TABLE` so it would parse.
+    ///
+    /// `sqlparser` 0.62.0 cannot read one, so the statement is rewritten without them and the
+    /// clause texts travel here — the same arrangement `concurrently` uses for a keyword the
+    /// parser cannot carry ([`strip_exclude_constraints`]).
+    exclude: Vec<String>,
 }
 
 impl Parsed {
@@ -218,6 +224,12 @@ impl Parsed {
         self.concurrently
     }
 
+    /// The `EXCLUDE` constraint clauses this statement was rewritten without.
+    #[must_use]
+    pub fn exclude_constraints(&self) -> &[String] {
+        &self.exclude
+    }
+
     /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
     #[must_use]
     pub fn rendered(&self) -> String {
@@ -232,7 +244,13 @@ impl Parsed {
 pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // `parse` does the rewriting; this only has to *notice*, because the keyword it removes is a
     // fact about the statement that the parsed tree cannot carry.
-    let concurrently = strip_drop_index_concurrently(sql, &scan(sql)).is_some();
+    let scanned = scan(sql);
+    let concurrently = strip_drop_index_concurrently(sql, &scanned).is_some();
+    // The clause texts, taken the same way `parse` takes them — this only has to *notice*, because
+    // what was removed is a fact about the statement that the parsed tree cannot carry.
+    let exclude = strip_exclude_constraints(sql, &scanned)
+        .map(|(_, clauses)| clauses)
+        .unwrap_or_default();
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
@@ -241,9 +259,158 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 statement,
                 class,
                 concurrently,
+                exclude: exclude.clone(),
             }
         })
         .collect())
+}
+
+/// Every `EXCLUDE` table constraint cut out of a `CREATE TABLE`, and the statement without them.
+///
+/// **`sqlparser` 0.62.0 cannot read an `EXCLUDE` constraint at all** — its only `EXCLUDE` keywords
+/// are `UNPIVOT`'s `EXCLUDE NULLS` and a window frame's — so statement 777 of
+/// `postgresql_specific_schema.rb` is a *syntax error* from the parser rather than a clause the
+/// lowering declines. That is contract C1's shortfall, and the fix is this module's standing one:
+/// rewrite the source so it parses and carry what was taken out beside the tree
+/// ([`strip_drop_index_concurrently`] does the same for one keyword).
+///
+/// What comes back is the clause text of each constraint, from `CONSTRAINT` or `EXCLUDE` through
+/// its last balanced parenthesis and any `WHERE`/`DEFERRABLE` after it — enough for
+/// [`crate::parse::lower`] to re-parse the pieces with the real parser.
+///
+/// **Parenthesis-balanced rather than comma-split**, because the clause is full of commas:
+/// `EXCLUDE USING gist (daterange(start_date, end_date) WITH &&)` has three, and a split on the
+/// first would cut the constraint in half.
+fn strip_exclude_constraints(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec<String>)> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    // Only inside a `CREATE TABLE`: `EXCLUDE` is an ordinary word elsewhere, and a window frame's
+    // `EXCLUDE TIES` must not be mistaken for one.
+    if !first.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    if !second.eq_ignore_ascii_case("TABLE") && !second.eq_ignore_ascii_case("UNLOGGED") {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    if !upper.contains("EXCLUDE") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut clauses = Vec::new();
+    let mut kept = String::with_capacity(sql.len());
+    let mut at = 0;
+    while let Some(found) = find_exclude_clause(&upper, bytes, at) {
+        let (start, end) = found;
+        kept.push_str(sql.get(at..start)?);
+        clauses.push(sql.get(start..end)?.trim().to_owned());
+        // The comma that separated it from the next item goes too, or the column list would keep
+        // an empty slot: `(a int, CONSTRAINT c EXCLUDE …, b int)` must become `(a int, b int)`.
+        let mut after = end;
+        while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+            after += 1;
+        }
+        if bytes.get(after) == Some(&b',') {
+            after += 1;
+        } else {
+            // It was the last item, so the comma **before** it is the one to drop.
+            let trimmed = kept.trim_end();
+            if let Some(without) = trimmed.strip_suffix(',') {
+                kept.truncate(without.len());
+            }
+        }
+        at = after;
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    kept.push_str(sql.get(at..)?);
+    Some((kept, clauses))
+}
+
+/// The byte range of one `EXCLUDE` table constraint, starting at or after `from`.
+///
+/// The clause runs from its `CONSTRAINT` keyword — or from `EXCLUDE` when it has no name — to the
+/// end of the last thing that belongs to it: the key list, then an optional `WHERE (…)` and an
+/// optional `DEFERRABLE …`. Anything after that is the next table item or the closing paren.
+fn find_exclude_clause(upper: &str, bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let keyword = upper.get(from..)?.find("EXCLUDE")? + from;
+    // `EXCLUDE USING`, which is what a table constraint always writes — a window frame's
+    // `EXCLUDE CURRENT ROW` and `UNPIVOT`'s `EXCLUDE NULLS` never do.
+    let after_keyword = keyword + "EXCLUDE".len();
+    if !upper
+        .get(after_keyword..)?
+        .trim_start()
+        .starts_with("USING")
+    {
+        return None;
+    }
+    // Back up over a `CONSTRAINT <name>` that names it, so the name is cut out with the clause.
+    let start = upper
+        .get(..keyword)?
+        .rfind("CONSTRAINT")
+        .filter(|&at| {
+            // Only if nothing but the name lies between: a `CONSTRAINT` belonging to an earlier
+            // item has a comma after it.
+            !upper
+                .get(at..keyword)
+                .is_some_and(|between| between.contains(','))
+        })
+        .unwrap_or(keyword);
+    // The key list, balanced.
+    let mut at = upper.get(after_keyword..)?.find('(')? + after_keyword;
+    let mut end = balanced_end(bytes, at)?;
+    // `WHERE (…)`, which is one more balanced group.
+    let rest = upper.get(end..)?;
+    let trimmed = rest.trim_start();
+    if trimmed.starts_with("WHERE") {
+        let where_at = end + (rest.len() - trimmed.len());
+        at = upper.get(where_at..)?.find('(')? + where_at;
+        end = balanced_end(bytes, at)?;
+    }
+    // `[NOT] DEFERRABLE [INITIALLY IMMEDIATE|DEFERRED]`, which is words rather than parentheses.
+    for tail in [
+        "NOT DEFERRABLE",
+        "DEFERRABLE INITIALLY IMMEDIATE",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "DEFERRABLE",
+    ] {
+        let rest = upper.get(end..)?;
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with(tail) {
+            end += (rest.len() - trimmed.len()) + tail.len();
+            break;
+        }
+    }
+    Some((start, end))
+}
+
+/// The byte just past the parenthesis that closes the one at `open`.
+fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    for (at, &byte) in bytes.iter().enumerate().skip(open) {
+        // A parenthesis inside a string literal is a character, not a nesting level.
+        if byte == b'\'' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `DROP INDEX CONCURRENTLY x` with the keyword taken out, or `None` if that is not what this is.
@@ -273,6 +440,128 @@ fn strip_drop_index_concurrently(sql: &str, scanned: &Scan<'_>) -> Option<String
     rewritten.push_str(sql.get(..at)?);
     rewritten.push_str(sql.get(at + "CONCURRENTLY".len()..)?);
     Some(rewritten)
+}
+
+/// One `EXCLUDE` clause, parsed from the text [`strip_exclude_constraints`] cut out.
+///
+/// The clause never reached `sqlparser`, so its pieces are handed back to it one at a time: the
+/// key expression and the `WHERE` predicate are ordinary expressions and go through the real
+/// parser, and only the keywords around them are read here. That keeps the hand-written part to
+/// the shape of the clause and leaves every expression inside it to the parser that knows them.
+pub(crate) fn parse_exclude_constraint(
+    clause: &str,
+    table: &str,
+) -> Result<crate::catalog::ExcludeDef> {
+    let upper = clause.to_ascii_uppercase();
+    let bad = || SqlError::unsupported(format!("the EXCLUDE constraint {clause}"));
+
+    // `CONSTRAINT "name"`, or a name PostgreSQL derives from the table and the key's columns.
+    let named = upper.starts_with("CONSTRAINT");
+    let exclude_at = upper.find("EXCLUDE").ok_or_else(bad)?;
+    let given = named
+        .then(|| clause.get("CONSTRAINT".len()..exclude_at))
+        .flatten()
+        .map(|name| {
+            let name = name.trim();
+            let unquoted = name.strip_prefix('"').and_then(|n| n.strip_suffix('"'));
+            crate::catalog::fold_identifier(unquoted.unwrap_or(name), unquoted.is_some()).0
+        });
+
+    // `USING <method>`.
+    let after = clause.get(exclude_at + "EXCLUDE".len()..).ok_or_else(bad)?;
+    let after = after.trim_start();
+    let method_rest = after
+        .get("USING".len()..)
+        .filter(|_| after.to_ascii_uppercase().starts_with("USING"))
+        .ok_or_else(bad)?;
+    let method: String = method_rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+
+    // `(<expr> WITH <op>)`, whose parentheses the stripper already balanced.
+    let open = clause.find('(').ok_or_else(bad)?;
+    let close = matching_paren(clause.as_bytes(), open).ok_or_else(bad)?;
+    let inside = clause.get(open + 1..close - 1).ok_or_else(bad)?;
+    let with_at = inside
+        .to_ascii_uppercase()
+        .rfind(" WITH ")
+        .ok_or_else(bad)?;
+    let key = inside.get(..with_at).ok_or_else(bad)?.trim().to_owned();
+    let operator = inside
+        .get(with_at + " WITH ".len()..)
+        .ok_or_else(bad)?
+        .trim()
+        .to_owned();
+    // Through the real parser: a key this crate cannot read is a refusal here rather than a
+    // surprise at the first insert.
+    lower::parse_expr_text(&key)?;
+
+    // `WHERE (<predicate>)`, one more balanced group.
+    let tail = clause.get(close..).ok_or_else(bad)?;
+    let upper_tail = tail.to_ascii_uppercase();
+    let predicate = match upper_tail.find("WHERE") {
+        None => None,
+        Some(where_at) => {
+            let open = tail
+                .get(where_at..)
+                .ok_or_else(bad)?
+                .find('(')
+                .ok_or_else(bad)?
+                + where_at;
+            let close = matching_paren(tail.as_bytes(), open).ok_or_else(bad)?;
+            let text = tail
+                .get(open + 1..close - 1)
+                .ok_or_else(bad)?
+                .trim()
+                .to_owned();
+            lower::parse_expr_text(&text)?;
+            Some(text)
+        }
+    };
+
+    // `[NOT] DEFERRABLE [INITIALLY IMMEDIATE|DEFERRED]`. **`INITIALLY DEFERRED` is recorded, not
+    // refused**: the check still runs at the statement, and holding it to `COMMIT` is a
+    // transaction-layer unit that plugs in where this flag is read.
+    let deferrable = upper_tail.contains("DEFERRABLE") && !upper_tail.contains("NOT DEFERRABLE");
+    let deferred = deferrable && upper_tail.contains("INITIALLY DEFERRED");
+
+    Ok(crate::catalog::ExcludeDef {
+        name: given.unwrap_or_else(|| format!("{table}_excl")),
+        key,
+        operator,
+        method,
+        predicate,
+        deferrable,
+        deferred,
+    })
+}
+
+/// The byte just past the parenthesis closing the one at `open`, for a clause already balanced.
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    for (at, &byte) in bytes.iter().enumerate().skip(open) {
+        if byte == b'\'' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// One column `DEFAULT`, parsed from text and folded against the column's type.
@@ -338,8 +627,9 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     // *keyword* the parser cannot read. Both are source rewrites for the same reason: the statement
     // is valid PostgreSQL and the gap is the parser's, so the honest fix is to make it parse rather
     // than to report a syntax error about correct SQL (contract C1).
-    let rewritten =
-        rewrite_synonym(sql, &scanned).or_else(|| strip_drop_index_concurrently(sql, &scanned));
+    let rewritten = rewrite_synonym(sql, &scanned)
+        .or_else(|| strip_drop_index_concurrently(sql, &scanned))
+        .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept));
     let text = rewritten.as_deref().unwrap_or(sql);
 
     let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {

@@ -42,6 +42,16 @@ impl Parsed {
         if let plan::Statement::DropIndex(drop) = &mut lowered {
             drop.concurrently = self.is_concurrently();
         }
+        // And the clauses it could not read at all: an `EXCLUDE` constraint is cut out of the
+        // source so the statement parses, and re-attached here from its own text.
+        if let plan::Statement::CreateTable(create) = &mut lowered {
+            for clause in self.exclude_constraints() {
+                create.excludes.push(crate::parse::parse_exclude_constraint(
+                    clause,
+                    &create.name,
+                )?);
+            }
+        }
         Ok(lowered)
     }
 }
@@ -1144,6 +1154,15 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
     })
 }
 
+/// One expression's text, lowered — for a clause the parser had to be handed in pieces.
+///
+/// An `EXCLUDE` constraint never reaches `sqlparser` whole, so its key and its `WHERE` come back
+/// through here: reading them with the real parser is what makes an expression this node cannot
+/// evaluate a refusal at `CREATE TABLE` rather than a surprise at the first insert.
+pub(crate) fn parse_expr_text(text: &str) -> Result<plan::Expr> {
+    crate::parse::parse_stored_expr(text)
+}
+
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
 ///
 /// No interval grammar, no `'forever'`, no `DEFAULT` — it is a replica count, so the only thing
@@ -1362,6 +1381,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns,
         primary_key,
         primary_key_name,
+        // Filled by `Parsed::lower`, from the clauses the parser was never given.
+        excludes: Vec::new(),
         // Names only: a parent's columns come from the catalog and the catalog is the executor's.
         inherits: create
             .inherits

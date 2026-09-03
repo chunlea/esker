@@ -122,6 +122,7 @@ pub(super) fn create_table(
         // Filled by the parents, not here: this table is nobody's parent yet.
         children: Vec::new(),
         triggers: Vec::new(),
+        excludes: create.excludes.clone(),
         child_scans: Vec::new(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
