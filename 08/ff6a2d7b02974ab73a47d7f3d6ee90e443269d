@@ -1,0 +1,37 @@
+crates/esker-sql/tests/derived.rs
+  s_a48acfca6122c0::t_79f55ba1d6e022 67
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_a48acfca6122c0::t_b330892cdb1b5b 148-157,181,199-200,232-233,269-270,458-480,515-516,642-643,985-1052
+crates/esker-sql/src/exec/bind.rs
+  s_a48acfca6122c0::t_3b3c05b3a89e84 318,485
+crates/esker-sql/src/exec/cursor.rs
+  s_a48acfca6122c0::t_801bd8bcb6d083 1480-1483,1580-1604
+crates/esker-sql/src/exec/mod.rs
+  s_a48acfca6122c0::t_af041e12568859 932-952,957-972,1536-1540
+crates/esker-sql/src/parse/lower.rs
+  s_a48acfca6122c0::t_6fa5896d379a41 4417-4446
+crates/esker-sql/src/plan/expr.rs
+  s_a48acfca6122c0::t_c7272ec078005d 552-558,716-718,741,775,812
+crates/esker-sql/tests/corpus/pg19_reset_pk_sequence.txt
+  s_a48acfca6122c0::t_c0b68d9cc13d56 1-98
+crates/esker-sql/tests/reset_pk_sequence.rs
+  s_a48acfca6122c0::t_e67561f4300765 1-35
+crates/esker-sql/tests/subquery.rs
+  s_a48acfca6122c0::t_4ec17a4f54c095 320-322,324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "08ff6a2d7b02974ab73a47d7f3d6ee90e443269d",
+  "prompts": {},
+  "sessions": {
+    "s_a48acfca6122c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ce89436-fd98-49c2-bdf7-60ef343bd273",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
