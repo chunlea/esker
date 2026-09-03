@@ -2563,7 +2563,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "14",               // catalog format version
+                "13",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2656,7 +2656,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "14",       // catalog format version
+                "13",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2689,7 +2689,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "14",                 // catalog format version
+                "13",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2750,8 +2750,9 @@ mod tests {
                 // anything nor is a partition, which is every table until `PARTITION BY` runs.
                 "00",
                 "00",
-                // Version 20. One list per index, and the one index here includes nothing —
-                // which is every index until `CREATE INDEX ... INCLUDE` runs.
+                // Version 19, still: one list per index, and the one index here includes
+                // nothing — which is every index until `CREATE INDEX ... INCLUDE` runs. Two
+                // sections under one number, because they arrived in one release.
                 "00",
             )
         );
@@ -3713,7 +3714,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "14",               // catalog format version
+                "13",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 19;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1168,9 +1168,14 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         }
     }
 
-    // Version 20. One list per index: the `INCLUDE (…)` columns, by position, in the order
-    // written — the eighth section on the end, in version order like every one before it. An
-    // index written before 20 has none, which is what every index had while `INCLUDE` was `0A000`.
+    // Version 19, still: one list per index, the `INCLUDE (…)` columns by position in the order
+    // written — the eighth section on the end, after the partition key and bound.
+    //
+    // **Two sections under one version number, because they arrived in one release.** A version
+    // is what a *reader* branches on, and no reader can ever see a record with the partitioning
+    // section and not this one; giving them separate numbers would claim a state that has never
+    // existed on disk and would spend a number another lane needs. A table written before 19 has
+    // neither, which is what every table had while `PARTITION BY` and `INCLUDE` were both `0A000`.
     for index in &table.indexes {
         varint::put_u64(index.include.len() as u64, &mut out);
         for &at in &index.include {
@@ -1181,12 +1186,13 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The version 20 section: each index's `INCLUDE (…)` columns.
+/// The second half of the version 19 section: each index's `INCLUDE (…)` columns.
 ///
 /// Read into the indexes that have already been decoded, the way the version 17 byte is: one list
-/// per index, in the order the indexes were written.
+/// per index, in the order the indexes were written. It shares 19 with the partitioning section
+/// above because the two arrived in one release and no record can carry one without the other.
 fn read_index_include(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result<()> {
-    if reader.version < 20 {
+    if reader.version < 19 {
         return Ok(());
     }
     for index in indexes {
