@@ -397,9 +397,6 @@ pub(super) struct Planned {
 /// is not changing still have to be written back, and the index entries it is replacing were built
 /// from the old ones.
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
-    if let Some(filter) = filter {
-        crate::exec::subquery::refuse_in(filter, "the WHERE of a statement that writes")?;
-    }
     let mut node = access_path(filter, tenant, table)?;
     if let Some(filter) = filter {
         let scope = Scope::single(table);

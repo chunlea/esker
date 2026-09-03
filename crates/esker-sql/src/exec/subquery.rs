@@ -74,8 +74,34 @@ pub(super) fn refuse_in(expr: &Expr, clause: &'static str) -> Result<()> {
     }
 }
 
+/// Plans every subquery in the `WHERE` of a statement that **writes**.
+///
+/// [`plan_subqueries`]'s counterpart for the write path, and the difference is what it has to work
+/// with: an `UPDATE` or a `DELETE` carries a filter rather than a `Select`, so there is no target
+/// list to walk and no `FROM` to build a scope from. The scope is the one table the statement
+/// writes, which is exactly what a correlated subquery in its `WHERE` resolves against —
+/// `DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)`.
+///
+/// **The subquery reads the pre-statement snapshot**, and that falls out of when this runs rather
+/// than from a rule: it is planned and then `resolve`d before the cursor opens, so
+/// `DELETE FROM t WHERE id IN (SELECT id FROM t LIMIT 1)` reads the rows as they were and deletes
+/// exactly one. A node that streamed the subquery while deleting could delete a different number.
+pub(super) fn plan_in_write_filter(
+    filter: &mut Expr,
+    tenant: u64,
+    txn: &dyn Txn,
+    tables: &dyn Tables,
+    table: &crate::catalog::TableDef,
+) -> Result<()> {
+    let scope = crate::exec::query::Scope::single(table);
+    walk_mut(filter, &mut |expr| match expr {
+        Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(&scope)),
+        _ => Ok(()),
+    })
+}
+
 /// Whether this expression, or one under it, is a subquery.
-fn contains_subquery(expr: &Expr) -> bool {
+pub(super) fn contains_subquery(expr: &Expr) -> bool {
     let mut found = false;
     walk(expr, &mut |expr| {
         found = found || matches!(expr, Expr::Subquery(_));

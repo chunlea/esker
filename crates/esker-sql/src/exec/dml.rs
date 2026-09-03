@@ -1247,7 +1247,37 @@ fn collect(
     filter: Option<&crate::plan::Expr>,
     table: &TableDef,
 ) -> Result<Vec<Vec<Datum>>> {
-    let node = query::matching_rows(filter, executor.tenant, table)?;
+    // **The write path plans its own subqueries**, because nothing above it does: a statement that
+    // writes never reaches `plan_select`, which is why a subquery in an `UPDATE`'s or a `DELETE`'s
+    // `WHERE` used to be `0A000` by name. `delete_all` and `update_all` on a relation carrying a
+    // `LIMIT` or a `JOIN` send exactly that shape — ActiveRecord cannot express either on a
+    // `DELETE`, so it wraps the selection in a subquery.
+    //
+    // `Cow`-shaped by hand the way `plan_select` is: a filter with no subquery in it is used as
+    // the caller's own and nothing is cloned.
+    let mut owned;
+    let filter = match filter {
+        Some(filter) if super::subquery::contains_subquery(filter) => {
+            owned = filter.clone();
+            super::subquery::plan_in_write_filter(
+                &mut owned,
+                executor.tenant,
+                txn,
+                &super::Catalogued {
+                    exec: executor,
+                    txn,
+                },
+                table,
+            )?;
+            Some(&owned)
+        }
+        other => other,
+    };
+    let mut node = query::matching_rows(filter, executor.tenant, table)?;
+    // **Before the cursor opens**, which is what makes the subquery read the pre-statement
+    // snapshot: `DELETE FROM t WHERE id IN (SELECT id FROM t LIMIT 1)` is not circular and does
+    // not loop, and its rows are the ones that were there when it started.
+    super::subquery::resolve(&mut node, txn, executor.tenant)?;
     let mut cursor = cursor::Cursor::open(txn, executor.tenant, &node)?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {
