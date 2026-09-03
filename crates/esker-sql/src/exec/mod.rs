@@ -786,7 +786,11 @@ impl Executor {
 
     /// A sequence by name, or the two refusals a real server gives: `42P01` for a name that is
     /// nothing and `42809` for one that is something else.
-    fn require_sequence(&self, txn: &dyn Txn, name: &str) -> Result<crate::catalog::SequenceDef> {
+    pub(super) fn require_sequence(
+        &self,
+        txn: &dyn Txn,
+        name: &str,
+    ) -> Result<crate::catalog::SequenceDef> {
         let view = self.catalog_view(txn)?;
         match view.relation(name)? {
             // **Read straight from the record, not through the table**: a sequence no column

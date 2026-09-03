@@ -1725,6 +1725,18 @@ pub fn create_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) -
     bump_version(txn)
 }
 
+/// Overwrites one sequence's record in place, keeping its name entry as it is.
+///
+/// The name is not rewritten because it did not change: this exists for moving which column a
+/// sequence fills, which is what `ALTER COLUMN … SET DEFAULT nextval(…)` does to two sequences at
+/// once — the one that filled the column stops, and the named one starts.
+pub fn replace_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) {
+    txn.put(
+        &record::sequence_key(tenant, sequence.table_id, sequence.id),
+        &record::encode_sequence(sequence),
+    );
+}
+
 /// One sequence by the pair its name resolves to, read straight from its record.
 ///
 /// Not through the table: a sequence no column owns is filed under

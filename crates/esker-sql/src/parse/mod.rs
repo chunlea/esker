@@ -275,6 +275,34 @@ fn strip_drop_index_concurrently(sql: &str, scanned: &Scan<'_>) -> Option<String
     Some(rewritten)
 }
 
+/// One column `DEFAULT`, parsed from text and folded against the column's type.
+///
+/// The seam exists because folding needs **both** halves and they are known in different places: a
+/// plan is lowered without the catalog, so `ALTER COLUMN … SET DEFAULT 7` cannot know whether `7`
+/// is going into an `int4` or a `text` until the executor has the column. `CREATE TABLE` has the
+/// type in hand and folds where it lowers; this is the same function reached the other way round.
+///
+/// The text is re-parsed rather than carried as a tree, which costs one parse per `ALTER` and
+/// keeps `plan::AlterTableAction` free of a `sqlparser` type — the same trade `CHECK` and a
+/// generation expression already make.
+pub(crate) fn fold_column_default(
+    expr: &str,
+    ty: crate::value::ColumnType,
+) -> Result<(Option<crate::value::Datum>, Option<String>)> {
+    let not_one = || SqlError::Internal("a stored default is not one expression".to_owned());
+    let statements = parse(&format!("SELECT {expr}"))?;
+    let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() else {
+        return Err(not_one());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(not_one());
+    };
+    match select.projection.as_slice() {
+        [sqlparser::ast::SelectItem::UnnamedExpr(expr)] => lower::column_default(expr, ty),
+        _ => Err(not_one()),
+    }
+}
+
 /// One stored expression, parsed and lowered — a `CHECK`, an index predicate, or an index key.
 ///
 /// It goes through the real parser rather than a second one: the text came from a statement this

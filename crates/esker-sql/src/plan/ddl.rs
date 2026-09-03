@@ -100,6 +100,21 @@ pub struct CreateExtension {
     pub if_not_exists: bool,
 }
 
+/// What `SET DEFAULT` was given: a sequence to draw from, or an ordinary default.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnDefault {
+    /// `nextval('s')` — the sequence's name, unresolved.
+    Sequence(String),
+    /// Everything else, in the two halves `catalog::ColumnDef` keeps: the folded value and the
+    /// expression text (`crate::parse::lower`'s `column_default`).
+    Value {
+        /// The folded constant, when it folds.
+        folded: Option<crate::value::Datum>,
+        /// The expression text, when it stays one.
+        expr: Option<String>,
+    },
+}
+
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {
@@ -408,7 +423,7 @@ mod tests {
 /// PostgreSQL takes a list of actions in one statement and applies them together
 /// (`ALTER TABLE t ADD COLUMN a text, ADD COLUMN b text` is one atomic change), so this carries a
 /// list rather than a single action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AlterTable {
     /// The table's name, folded.
     pub name: String,
@@ -424,7 +439,7 @@ pub struct AlterTable {
 /// (contract C2) — `DROP COLUMN` and a type change because the row format carries a column
 /// *count* and not column identity ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
 /// and the rest because nothing below this crate implements them yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
     /// `ADD [COLUMN] [IF NOT EXISTS] <column> <type>`, nullable and with no default — the only
     /// shape that needs no row rewritten.
@@ -433,6 +448,18 @@ pub enum AlterTableAction {
         column: Column,
         /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
         if_not_exists: bool,
+    },
+    /// `ALTER COLUMN c SET DEFAULT <expr>` and `ALTER COLUMN c DROP DEFAULT`.
+    SetDefault {
+        /// The column, folded.
+        column: String,
+        /// The default, or `None` for `DROP DEFAULT`.
+        ///
+        /// **`nextval('s')` is its own arm and not an expression.** A sequence *is* a column's
+        /// default in this catalog, so pointing a column at one moves which sequence fills it
+        /// rather than storing text to evaluate — and that move is what frees the sequence the
+        /// column used to draw from.
+        default: Option<ColumnDefault>,
     },
     /// `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`.
     AddCheck(crate::catalog::CheckDef),

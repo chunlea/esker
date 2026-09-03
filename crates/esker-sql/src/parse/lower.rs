@@ -671,7 +671,10 @@ fn lower_storage_parameters(
 ///
 /// `DEFAULT NULL` normalises to neither — the same thing as no default, which is what PostgreSQL
 /// makes of it too.
-fn column_default(expr: &Expr, ty: ColumnType) -> Result<(Option<Datum>, Option<String>)> {
+pub(super) fn column_default(
+    expr: &Expr,
+    ty: ColumnType,
+) -> Result<(Option<Datum>, Option<String>)> {
     let expr = unwrap_nested(expr);
     refuse_default_shapes(expr)?;
     // A literal, with the sign or the cast a user wrote around it: what PostgreSQL's coercion
@@ -893,6 +896,50 @@ fn sequence_number(expr: &Expr, clause: &str) -> Result<i64> {
     let text = unwrap_nested(expr).to_string();
     text.parse::<i64>()
         .map_err(|_| SqlError::unsupported(format!("CREATE SEQUENCE ... {clause} {text}")))
+}
+
+/// What `SET DEFAULT` was given: a sequence to draw from, or an ordinary default.
+///
+/// **`nextval('s')` is matched here rather than lowered as an expression**, because a sequence *is*
+/// a column's default in this catalog: pointing a column at one moves which sequence fills it, and
+/// that move is what frees the sequence the column used to draw from — the whole point of the
+/// statement. Lowering it as an ordinary call would leave the old sequence filling the column and
+/// evaluate a second one beside it, so the column would draw twice per row from two counters.
+///
+/// The column's type is not in reach here, so an ordinary default keeps its expression and is
+/// folded where the executor has the column.
+fn lower_set_default(value: &Expr) -> Result<plan::ColumnDefault> {
+    let expr = unwrap_nested(value);
+    if let Expr::Function(function) = expr
+        && let Ok(name) = unqualified_function_name(function)
+        && name.eq_ignore_ascii_case("nextval")
+        && let Ok([argument]) = <[&Expr; 1]>::try_from(function_arguments(function, "nextval")?)
+        && let Some(sequence) = sequence_literal_name(argument)
+    {
+        return Ok(plan::ColumnDefault::Sequence(sequence));
+    }
+    // Not a sequence: the ordinary `DEFAULT` rules, three refusals and all.
+    refuse_default_shapes(expr)?;
+    lower_expr(expr)?;
+    Ok(plan::ColumnDefault::Value {
+        folded: None,
+        expr: Some(expr.to_string()),
+    })
+}
+
+/// The sequence a `nextval` argument names: `'s'` and `'s'::regclass` are the same thing.
+fn sequence_literal_name(argument: &Expr) -> Option<String> {
+    let inner = match unwrap_nested(argument) {
+        Expr::Cast { expr, .. } => unwrap_nested(expr),
+        other => other,
+    };
+    match inner {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) => Some(sequence_reference(text)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
@@ -1150,6 +1197,26 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         {
             let disabled = matches!(operation, AlterTableOperation::DisableTrigger { .. });
             actions.push(lower_trigger_state(&table_name, name, disabled)?);
+            continue;
+        }
+        // `ALTER COLUMN c SET DEFAULT <expr>` and `DROP DEFAULT`. The **type is not known here** —
+        // a plan is lowered without the catalog — so a literal is not folded until the executor
+        // has the column, which is also where `22P02` for one the type will not take comes from.
+        if let AlterTableOperation::AlterColumn { column_name, op } = operation {
+            use sqlparser::ast::AlterColumnOperation;
+            let default = match op {
+                AlterColumnOperation::DropDefault => None,
+                AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
+                other => {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER TABLE ... ALTER COLUMN ... {other}"
+                    )));
+                }
+            };
+            actions.push(plan::AlterTableAction::SetDefault {
+                column: ident(column_name),
+                default,
+            });
             continue;
         }
         let AlterTableOperation::AddColumn {

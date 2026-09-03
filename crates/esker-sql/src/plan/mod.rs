@@ -31,9 +31,9 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterTable, AlterTableAction, Column, CreateExtension, CreateIndex, CreateSequence,
-    CreateTable, DropIndex, DropSequence, DropTable, ForeignKey, IndexKeyPart, KeyPartName,
-    UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
+    AlterTable, AlterTableAction, Column, ColumnDefault, CreateExtension, CreateIndex,
+    CreateSequence, CreateTable, DropIndex, DropSequence, DropTable, ForeignKey, IndexKeyPart,
+    KeyPartName, UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
     unique_constraint_name,
 };
 pub use dml::{Delete, Insert, Returning, Update};

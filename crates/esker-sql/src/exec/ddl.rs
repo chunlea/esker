@@ -371,6 +371,75 @@ fn sequence_start(start: i64) -> Result<u64> {
         .map_err(|_| SqlError::unsupported(format!("CREATE SEQUENCE ... START {start}")))
 }
 
+/// `ALTER TABLE … ALTER COLUMN c SET DEFAULT <expr>` and `… DROP DEFAULT`.
+///
+/// **A sequence default replaces whatever the column had, including another sequence**, and that
+/// replacement is the point of the statement: `pg_attrdef` holds one row for the column before and
+/// after, and the sequence the column *used* to draw from stops filling it — which is what makes
+/// that one droppable without `CASCADE` on the very next line. A node that added the new sequence
+/// beside the old one would leave the column drawing from two counters and would answer `2BP01`
+/// to the drop, which is PostgreSQL's own correct answer to a state it should not be in.
+fn set_column_default(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    updated: &mut TableDef,
+    column: &str,
+    default: Option<&plan::ColumnDefault>,
+) -> Result<()> {
+    let at = updated
+        .column(column)
+        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+            column: column.to_owned(),
+            relation: updated.name.clone(),
+        })?;
+    // Resolved before anything is written, so a `nextval` naming nothing leaves the column alone.
+    let sequence = match default {
+        Some(plan::ColumnDefault::Sequence(name)) => Some(executor.require_sequence(txn, name)?),
+        _ => None,
+    };
+
+    // Whatever filled this column stops filling it — a sequence, a folded value, an expression.
+    // All three are cleared together because a column has **one** default, not one of each.
+    for owned in &mut updated.sequences {
+        if owned.column == Some(at) {
+            owned.column = None;
+            catalog::replace_sequence(txn, executor.tenant, owned);
+        }
+    }
+    updated.columns[at].default = None;
+    updated.columns[at].default_expr = None;
+
+    match default {
+        None => {}
+        Some(plan::ColumnDefault::Sequence(_)) => {
+            let mut sequence = sequence.expect("resolved above for this arm");
+            sequence.column = Some(at);
+            catalog::replace_sequence(txn, executor.tenant, &sequence);
+            // The table's own copy, so the cached definition agrees with the records.
+            if let Some(held) = updated
+                .sequences
+                .iter_mut()
+                .find(|held| held.id == sequence.id)
+            {
+                held.column = Some(at);
+            } else {
+                updated.sequences.push(sequence);
+            }
+        }
+        Some(plan::ColumnDefault::Value { expr, .. }) => {
+            // **Folded here and not where it was lowered**, because folding needs the column's
+            // type and a plan is built without the catalog — which is also where `22P02` for a
+            // literal the type will not take comes from, exactly as a `CREATE TABLE` default does.
+            let ty = updated.columns[at].ty;
+            let written = expr.as_deref().unwrap_or("NULL");
+            let (folded, unfolded) = crate::parse::fold_column_default(written, ty)?;
+            updated.columns[at].default = folded;
+            updated.columns[at].default_expr = unfolded;
+        }
+    }
+    Ok(())
+}
+
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c]`.
 ///
 /// **`OWNED BY` does not give the column a default.** It records that the sequence goes when the
@@ -1295,6 +1364,11 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+            continue;
+        }
+        if let AlterTableAction::SetDefault { column, default } = action {
+            set_column_default(txn, executor, &mut updated, column, default.as_ref())?;
+            changed = true;
             continue;
         }
         let AlterTableAction::AddColumn {

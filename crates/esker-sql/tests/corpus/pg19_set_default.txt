@@ -1,0 +1,52 @@
+# `ALTER TABLE … ALTER COLUMN … SET DEFAULT`, against PostgreSQL 19beta1 — statement 755 of
+# `postgresql_specific_schema.rb`, and the statement that makes the one before it mean anything.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`SET DEFAULT nextval(…)` replaces the `bigserial`'s own default; it does not add one.**
+#     `pg_attrdef` holds **one** row for the column throughout — `nextval('sd_id_seq'::regclass)`
+#     before and `nextval('sdseq'::regclass)` after — and the next `INSERT` draws from the *new*
+#     sequence, which is how `101` gets into a column whose original counter was at 1.
+#   * **That is what makes the original sequence droppable.** `DROP SEQUENCE sd_id_seq` is `2BP01`
+#     while it is the column's default and a plain success one statement later, without `CASCADE`.
+#     The suite drops it on the next line, and a node that left the old default in place would
+#     answer `2BP01` there — PostgreSQL's own correct answer to a state it should not be in.
+#   * **`DROP DEFAULT` is idempotent** and removes the `pg_attrdef` row; the column then takes
+#     NULL, not the value it had been defaulting to.
+#   * **A `bigserial` is not an identity column**: `attidentity` is empty for every column here,
+#     including the one a sequence fills.
+#   * The refusals are four different codes: `42703` for the column, `42P01` for the table *and*
+#     for a sequence `nextval` cannot find, `22P02` for a literal the type will not take, and
+#     `0A000` for a column reference — the same three-rule test any other `DEFAULT` gets.
+CREATE TABLE sd (id bigserial primary key, n integer, t text)		-
+CREATE SEQUENCE sdseq START 101 OWNED BY sd.id		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'sd'::regclass AND a.attname = 'id'	text	nextval('sd_id_seq'::regclass)
+ALTER TABLE sd ALTER COLUMN id SET DEFAULT nextval('sdseq')		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'sd'::regclass AND a.attname = 'id'	text	nextval('sdseq'::regclass)
+SELECT 'g', count(*) FROM pg_attrdef WHERE adrelid = 'sd'::regclass	text,bigint	g|1
+INSERT INTO sd (t) VALUES ('a')		-
+SELECT 'g', id, t FROM sd	text,bigint,text	g|101|a
+DROP SEQUENCE IF EXISTS sd_id_seq		-
+SELECT 'g', count(*) FROM pg_class WHERE relname = 'sd_id_seq'	text,bigint	g|0
+ALTER TABLE sd ALTER COLUMN n SET DEFAULT 7		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'sd'::regclass AND a.attname = 'n'	text	7
+INSERT INTO sd (t) VALUES ('b')		-
+SELECT 'g', n, t FROM sd WHERE t = 'b'	text,integer,text	g|7|b
+ALTER TABLE sd ALTER COLUMN t SET DEFAULT concat('x', 'y')		-
+INSERT INTO sd (n) VALUES (3)		-
+SELECT 'g', n, t FROM sd WHERE n = 3	text,integer,text	g|3|xy
+ALTER TABLE sd ALTER COLUMN n DROP DEFAULT		-
+SELECT 'g', count(*) FROM pg_attrdef WHERE adrelid = 'sd'::regclass	text,bigint	g|2
+INSERT INTO sd (t) VALUES ('c')		-
+SELECT 'g', n FROM sd WHERE t = 'c'	text,integer	g|\N
+ALTER TABLE sd ALTER COLUMN n DROP DEFAULT		-
+ALTER TABLE sd ALTER COLUMN nosuchcol SET DEFAULT 1	!42703 column "nosuchcol" of relation "sd" does not exist
+ALTER TABLE nosuchtable ALTER COLUMN n SET DEFAULT 1	!42P01 relation "nosuchtable" does not exist
+ALTER TABLE sd ALTER COLUMN n SET DEFAULT nextval('nosuchseq')	!42P01 relation "nosuchseq" does not exist
+ALTER TABLE sd ALTER COLUMN n SET DEFAULT 'not a number'	!22P02 invalid input syntax for type integer: "not a number"
+ALTER TABLE sd ALTER COLUMN n SET DEFAULT id	!0A000 cannot use column reference in DEFAULT expression
+SELECT attname, attidentity, atthasdef FROM pg_attribute WHERE attrelid = 'sd'::regclass AND attnum > 0 ORDER BY attnum	name,"char",boolean	id||t ; n||f ; t||t
