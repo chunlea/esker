@@ -16,6 +16,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fmt::Write as _;
+
 use std::process::Command;
 
 #[path = "parity_harness/mod.rs"]
@@ -36,7 +38,7 @@ fn or_chain(depth: usize) -> String {
         if term > 0 {
             sql.push_str(" OR ");
         }
-        sql.push_str(&format!("a = {term}"));
+        let _ = write!(sql, "a = {term}");
     }
     sql
 }
@@ -137,7 +139,7 @@ fn the_probe_entry_point() {
 
 /// **A chain deep enough to overflow a worker's stack is refused, not fatal.**
 ///
-/// 100_000 terms is far past anything a guard could admit and far past what 2 MiB can hold — it is
+/// `100_000` terms is far past anything a guard could admit and far past what 2 MiB can hold — it is
 /// the shape that aborted run 46's node. The claim is only that the process survives to tell us.
 #[test]
 fn a_boolean_chain_too_deep_to_lower_is_refused_rather_than_fatal() {
@@ -180,8 +182,7 @@ fn the_deepest_plan_this_node_builds_executes_on_a_worker_stack() {
     assert_eq!(
         run_probe_executing(deepest).as_deref(),
         Some("EXECUTED"),
-        "a chain at the limit did not survive the whole path on a {}-byte stack",
-        WORKER_STACK_BYTES
+        "a chain at the limit did not survive the whole path on a {WORKER_STACK_BYTES}-byte stack"
     );
 }
 

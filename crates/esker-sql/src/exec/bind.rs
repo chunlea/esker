@@ -14,6 +14,49 @@
 //! A type the client *declared* in `Parse` wins over any inference. It said what it is sending; the
 //! server's job is to read it that way, not to argue.
 
+/// The two ways a `Bind`'s values can fail to line up with the statement, in PostgreSQL's order.
+///
+/// **Type resolution happens at `Parse` and the count is checked at `Bind`**, so a position nothing
+/// mentions is `42P18` even when the count is also wrong — measured, `SELECT … WHERE n = $2` with
+/// one value is `could not determine data type of parameter $1` and not a count error.
+///
+/// Neither applies to the simple query protocol, which never binds: a `$1` there is
+/// `42P02 there is no parameter $1`, and [`Params::bound`] is what tells the two paths apart.
+pub(super) fn refuse_unmatched_parameters(
+    statement: &Statement,
+    params: &Params<'_>,
+) -> Result<()> {
+    if !params.bound {
+        return Ok(());
+    }
+    let mut referenced: Vec<bool> = Vec::new();
+    for_each_expr(statement, &mut |expr| {
+        if let Expr::Parameter(number) = expr {
+            let at = (*number as usize).saturating_sub(1);
+            if referenced.len() <= at {
+                referenced.resize(at + 1, false);
+            }
+            referenced[at] = true;
+        }
+    });
+    let required = referenced.len();
+    // Every position up to whichever of the two is higher: a value supplied past the last one the
+    // statement mentions is as untypable as a gap before it.
+    for at in 0..required.max(params.values.len()) {
+        if !referenced.get(at).copied().unwrap_or(false) {
+            let number = u32::try_from(at + 1).unwrap_or(u32::MAX);
+            return Err(SqlError::IndeterminateParameterType(number));
+        }
+    }
+    if params.values.len() < required {
+        return Err(SqlError::BindParameterCount {
+            supplied: params.values.len(),
+            required,
+        });
+    }
+    Ok(())
+}
+
 use crate::catalog::TableDef;
 use crate::error::{Result, SqlError};
 use crate::pgwire::session::Params;
@@ -132,8 +175,32 @@ fn walk(
             }
         }
         Statement::Select(select) => {
-            if let Some(filter) = &select.filter {
-                walk_predicate(filter, tables, seen);
+            // **Every predicate, not only the `WHERE`.** A `HAVING` and a join's `ON` are
+            // predicates over the same columns, and a parameter in one is typed by the column it
+            // is compared against exactly as in a `WHERE`.
+            for predicate in select
+                .filter
+                .iter()
+                .chain(select.having.iter())
+                .chain(select.joins.iter().filter_map(|join| join.on.as_ref()))
+                // A `GROUP BY` expression is typed the same way: `GROUP BY n > $1` compares a
+                // column against a parameter exactly as a `WHERE` does.
+                .chain(select.group_by.iter())
+            {
+                walk_predicate(predicate, tables, seen);
+            }
+            // **A derived table's predicates too.** Its parameters are numbered in the same
+            // statement, so `SELECT … FROM (SELECT … WHERE n > $1) AS x` types `$1` from `n` —
+            // the relations are already all in `tables`, which is the whole statement's.
+            for table in select
+                .from
+                .iter()
+                .chain(select.joins.iter().map(|join| &join.table))
+                .chain(select.ctes.iter())
+            {
+                if let Some(derived) = &table.derived {
+                    walk(&Statement::Select(derived.select.clone()), tables, seen);
+                }
             }
             // `LIMIT $1` is a count, whatever else is going on.
             for clause in [select.limit.as_ref(), select.offset.as_ref()]
@@ -200,6 +267,20 @@ fn walk_predicate(
             if op.is_comparison() || *op == BinaryOp::And || *op == BinaryOp::Or =>
         {
             if op.is_comparison() {
+                // **`count(…) > $1` types `$1` as `bigint`.** `count` is the one aggregate whose
+                // result type is fixed whatever it counts, so this is a fact rather than a guess —
+                // and it is the shape `HAVING count(*) > $1` sends, which is `calculations_test.rb`
+                // twenty times over. Another aggregate's type needs its argument resolved, which
+                // is the planner's job and not this one's; it keeps the `text` fallback.
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Aggregate(call), Expr::Parameter(number))
+                    | (Expr::Parameter(number), Expr::Aggregate(call))
+                        if call.func == crate::plan::AggregateFunc::Count =>
+                    {
+                        seen(*number, ColumnType::Int8);
+                    }
+                    _ => {}
+                }
                 let pair = match (left.as_ref(), right.as_ref()) {
                     (Expr::Column { table, name }, Expr::Parameter(number))
                     | (Expr::Parameter(number), Expr::Column { table, name }) => {
@@ -238,8 +319,21 @@ fn walk_predicate(
             walk_predicate(right, tables, seen);
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, tables, seen),
+        // **`n IN ($1, $2, $3)` types every one of them from `n`.** Walking the list as
+        // independent predicates types none — a bare `$1` matches no arm — and the statement then
+        // compares an `integer` against `text`: `42883 operator does not exist: integer = text`,
+        // which is what `ActiveRecord`'s `where(id: [1,2,3])` sends on every association load.
         Expr::InList { operand, list, .. } => {
             walk_predicate(operand, tables, seen);
+            if let Expr::Column { table, name } = operand.as_ref()
+                && let Some(ty) = column_type(tables, table.as_deref(), name)
+            {
+                for item in list {
+                    if let Expr::Parameter(number) = item {
+                        seen(*number, ty);
+                    }
+                }
+            }
             for item in list {
                 walk_predicate(item, tables, seen);
             }
@@ -248,7 +342,129 @@ fn walk_predicate(
     }
 }
 
+/// One column's type, by name and an optional qualifier.
+///
+/// **An ambiguous bare name types nothing** rather than the first match: the planner will refuse
+/// the statement anyway, and guessing here would put a `ParameterDescription` on the wire for a
+/// query that is about to fail.
+fn column_type(
+    tables: &[std::sync::Arc<TableDef>],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<ColumnType> {
+    let mut found = None;
+    for candidate in tables {
+        if qualifier.is_some_and(|qualifier| qualifier != candidate.name) {
+            continue;
+        }
+        if let Some(at) = candidate.column(name) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(candidate.columns[at].ty);
+        }
+    }
+    found
+}
+
 /// Visits every expression in a statement, for substitution.
+/// Every expression of a `SELECT` a parameter can stand in — **all** of them.
+///
+/// This walked the projection, the `WHERE`, the `LIMIT`, the `OFFSET` and the `ORDER BY`, and a
+/// parameter anywhere else survived substitution and reached the row evaluator, where it is
+/// `42P02 there is no parameter $n`. That is the message run 46 counted **98 times across 19
+/// files**: `HAVING count(*) > $1` is `calculations_test.rb` alone, twenty of them, and a join
+/// condition or a derived table is most of the rest.
+///
+/// A clause added to `plan::Select` and not added here is the same bug again, which is why this is
+/// written out field by field rather than as a catch-all.
+fn walk_select_mut(select: &mut crate::plan::Select, visit: &mut impl FnMut(&mut Expr)) {
+    for item in &mut select.projection {
+        if let crate::plan::SelectItem::Expr { expr, .. } = item {
+            walk_expr_mut(expr, visit);
+        }
+    }
+    for expr in select
+        .filter
+        .iter_mut()
+        .chain(select.having.iter_mut())
+        .chain(select.limit.iter_mut())
+        .chain(select.offset.iter_mut())
+    {
+        walk_expr_mut(expr, visit);
+    }
+    for expr in &mut select.group_by {
+        walk_expr_mut(expr, visit);
+    }
+    for item in &mut select.order_by {
+        walk_expr_mut(&mut item.expr, visit);
+    }
+    // A join's `ON`, and the relation on either side: a derived table is a `SELECT` of its own and
+    // its parameters are numbered in the same statement.
+    for join in &mut select.joins {
+        if let Some(on) = &mut join.on {
+            walk_expr_mut(on, visit);
+        }
+        walk_table_ref_mut(&mut join.table, visit);
+    }
+    if let Some(from) = &mut select.from {
+        walk_table_ref_mut(from, visit);
+    }
+    for cte in &mut select.ctes {
+        walk_table_ref_mut(cte, visit);
+    }
+}
+
+/// A `FROM` entry: a derived table is a `SELECT`, walked as one.
+fn walk_table_ref_mut(table: &mut crate::plan::TableRef, visit: &mut impl FnMut(&mut Expr)) {
+    if let Some(derived) = &mut table.derived {
+        walk_select_mut(&mut derived.select, visit);
+    }
+}
+
+/// The read-only twin of [`walk_select_mut`], and it has to agree with it clause for clause.
+///
+/// This one **sizes** the parameter list (`infer` takes the highest `$n` it sees) and the other
+/// substitutes. A clause in one and not the other is a parameter counted and never filled, or
+/// filled and never counted — so they are written as a pair and reviewed as a pair.
+fn for_each_in_select(select: &crate::plan::Select, each: &mut impl FnMut(&Expr)) {
+    for item in &select.projection {
+        if let crate::plan::SelectItem::Expr { expr, .. } = item {
+            each(expr);
+        }
+    }
+    select
+        .filter
+        .iter()
+        .chain(select.having.iter())
+        .chain(select.limit.iter())
+        .chain(select.offset.iter())
+        .for_each(&mut *each);
+    select.group_by.iter().for_each(&mut *each);
+    for item in &select.order_by {
+        each(&item.expr);
+    }
+    for join in &select.joins {
+        if let Some(on) = &join.on {
+            each(on);
+        }
+        for_each_in_table_ref(&join.table, each);
+    }
+    if let Some(from) = &select.from {
+        for_each_in_table_ref(from, each);
+    }
+    for cte in &select.ctes {
+        for_each_in_table_ref(cte, each);
+    }
+}
+
+/// A `FROM` entry, for [`for_each_in_select`].
+fn for_each_in_table_ref(table: &crate::plan::TableRef, each: &mut impl FnMut(&Expr)) {
+    if let Some(derived) = &table.derived {
+        for_each_in_select(&derived.select, each);
+    }
+}
+
 pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Expr)) {
     match statement {
         Statement::Insert(insert) => {
@@ -257,25 +473,19 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
                     walk_expr_mut(expr, visit);
                 }
             }
-        }
-        Statement::Select(select) => {
-            for item in &mut select.projection {
-                if let crate::plan::SelectItem::Expr { expr, .. } = item {
-                    walk_expr_mut(expr, visit);
+            // `ON CONFLICT … DO UPDATE SET c = $1` — `upsert_all`'s shape, and a parameter here is
+            // as ordinary as one in an `UPDATE`'s assignments.
+            if let Some(crate::plan::OnConflict {
+                action: crate::plan::ConflictAction::DoUpdate(assignments),
+                ..
+            }) = &mut insert.on_conflict
+            {
+                for (_, value) in assignments {
+                    walk_expr_mut(value, visit);
                 }
             }
-            for expr in select
-                .filter
-                .iter_mut()
-                .chain(select.limit.iter_mut())
-                .chain(select.offset.iter_mut())
-            {
-                walk_expr_mut(expr, visit);
-            }
-            for item in &mut select.order_by {
-                walk_expr_mut(&mut item.expr, visit);
-            }
         }
+        Statement::Select(select) => walk_select_mut(select, visit),
         Statement::Update(update) => {
             for (_, value) in &mut update.assignments {
                 walk_expr_mut(value, visit);
@@ -312,6 +522,27 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
+    }
+}
+
+/// Every relation a `SELECT` names, **including inside a derived table**.
+///
+/// A parameter in `FROM (SELECT … WHERE n > $1) AS x` is typed from `n`, and `n` belongs to the
+/// inner relation — so the inner relation has to be in the list the inference is given, or the
+/// parameter falls back to `text` and the statement compares an `integer` against one.
+fn collect_table_names<'a>(select: &'a crate::plan::Select, into: &mut Vec<&'a str>) {
+    for table in select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+        .chain(select.ctes.iter())
+    {
+        if !table.name.is_empty() && !into.contains(&table.name.as_str()) {
+            into.push(table.name.as_str());
+        }
+        if let Some(derived) = &table.derived {
+            collect_table_names(&derived.select, into);
+        }
     }
 }
 
@@ -378,12 +609,11 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
     match statement {
         Statement::Insert(insert) => vec![insert.table.as_str()],
         // A join's two tables, outer first, which is the order their columns appear in a row.
-        Statement::Select(select) => select
-            .from
-            .iter()
-            .map(|table| table.name.as_str())
-            .chain(select.joins.iter().map(|join| join.table.name.as_str()))
-            .collect(),
+        Statement::Select(select) => {
+            let mut names = Vec::new();
+            collect_table_names(select, &mut names);
+            names
+        }
         Statement::Update(update) => vec![update.table.as_str()],
         Statement::Delete(delete) => vec![delete.table.as_str()],
         Statement::Explain(inner, _) => table_names(inner),
@@ -440,23 +670,17 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
             for row in &insert.rows {
                 row.iter().for_each(&mut each);
             }
-        }
-        Statement::Select(select) => {
-            for item in &select.projection {
-                if let crate::plan::SelectItem::Expr { expr, .. } = item {
-                    each(expr);
+            if let Some(crate::plan::OnConflict {
+                action: crate::plan::ConflictAction::DoUpdate(assignments),
+                ..
+            }) = &insert.on_conflict
+            {
+                for (_, value) in assignments {
+                    each(value);
                 }
             }
-            select
-                .filter
-                .iter()
-                .chain(select.limit.iter())
-                .chain(select.offset.iter())
-                .for_each(&mut each);
-            for item in &select.order_by {
-                each(&item.expr);
-            }
         }
+        Statement::Select(select) => for_each_in_select(select, &mut each),
         Statement::Update(update) => {
             for (_, value) in &update.assignments {
                 each(value);
