@@ -2501,10 +2501,10 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let ty = value::type_by_name(&name)?
+            let named = value::named_type(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
-                ty.oid(),
+                named.oid(),
             ))))
         }
         // `'cb'::regclass::oid` — the same value, since a `regclass` here already *is* the oid.
@@ -2535,10 +2535,10 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let ty = value::type_by_name(&name)?
+            let named = value::named_type(&name)?
                 .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(value::format_type(ty, NO_TYPMOD)),
+                Datum::Text(named.printed()),
             ))))
         }
         // `'23'::oid`. **This is a cast to a real type now**, not a special form that happens to

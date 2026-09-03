@@ -83,6 +83,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'double precision'::regtype::oid",
         "SELECT 'INTEGER'::regtype::oid",
         "SELECT '23'::oid",
+        // **Array names resolve now**, so these answer the right OID and declare `bigint` where a
+        // real server declares `oid` — the same one trade as every line above, and no longer the
+        // "no such type" they were listed under. There is still no array *storage*: nothing can
+        // create a column of one, and only the name is being asked for here.
+        "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, 'text[]'::regtype::oid",
+        "SELECT 'integer[][]'::regtype::oid, 'integer[3]'::regtype::oid",
+        "SELECT '_int4'::regtype::oid",
+        "SELECT 'int4[]'::regtype::oid",
         // Every remaining spelling the corpus asks for, answering the right OID and declaring
         // `bigint` where a real server declares `oid` — the same one trade as the lines above,
         // and the reason this list is long rather than deep. `numeric`, `decimal`, `date` and
@@ -157,15 +165,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ("SELECT '\"integer\"'::regtype::oid", NAME_SYNTAX),
         ("SELECT 'pg_catalog.int4'::regtype::oid", NAME_SYNTAX),
         (
-            "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, 'text[]'::regtype::oid",
-            NO_SUCH_TYPE,
-        ),
-        (
-            "SELECT 'integer[][]'::regtype::oid, 'integer[3]'::regtype::oid",
-            NO_SUCH_TYPE,
-        ),
-        ("SELECT '_int4'::regtype::oid", NO_SUCH_TYPE),
-        (
             "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \
              'jsonb'::regtype, 'interval'::regtype",
             NO_SUCH_TYPE,
@@ -198,12 +197,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              statement is `42703` before any row is built. `date`, `time`, `numeric`, `json` and \
              `jsonb` all have correct rows — `tests/pg_catalog.rs` asserts them in ActiveRecord's \
              own query — and `uuid` and `interval` would be absent in any case.",
-        ),
-        (
-            "SELECT 'int4[]'::regtype::oid",
-            "`1007` on a real server, and `42704` here for the same reason as `numeric`: there \
-             are no array types on this node. Arrays are tier 2's last item in ADR 0033's \
-             roadmap, and this line closes with them.",
         ),
     ],
 };
@@ -284,4 +277,70 @@ fn the_statement_that_stopped_every_suite_file() {
         assert_eq!(error.sqlstate(), sqlstate, "{statement}");
         assert_eq!(error.to_string(), message, "{statement}");
     }
+}
+
+/// Statement 766 of `schema.rb`: an **array name** resolves, for every type this node has.
+///
+/// There is no array *storage* here and nothing can create a column of one. What resolves is the
+/// name, because `ActiveRecord` asks `pg_type` for it before it asks for anything else — and
+/// `'decimal[]'::regtype` is where the suite stopped.
+///
+/// The element name goes through the same `ColumnType::ALL`-derived resolution the scalar does,
+/// so `decimal[]` works for the same reason `decimal` does; the only hand-written part is
+/// `value::array_oid`, an exhaustive match a new type has to answer. The numbers are not
+/// derivable — `_int4` is 1007 and `_int8` is 1016, out of order with their elements, and `_json`
+/// is 199 where `json` is 114 — so each one is measured.
+#[test]
+fn an_array_name_resolves_for_every_type_this_node_has() {
+    let mut node = parity::Node::new(&[]);
+
+    // The statement the suite stopped on, and its internal spelling.
+    assert_eq!(
+        node.rows("SELECT 'decimal[]'::regtype::oid"),
+        vec![vec!["1231"]]
+    );
+    assert_eq!(
+        node.rows("SELECT 'numeric[]'::regtype::oid"),
+        vec![vec!["1231"]]
+    );
+    assert_eq!(
+        node.rows("SELECT '_numeric'::regtype::oid"),
+        vec![vec!["1231"]]
+    );
+
+    // The ones the corpus already pinned, which used to be `42704`.
+    for (name, oid) in [
+        ("integer[]", "1007"),
+        ("int4[]", "1007"),
+        ("_int4", "1007"),
+        ("text[]", "1009"),
+        ("bigint[]", "1016"),
+        ("uuid[]", "2951"),
+        ("interval[]", "1187"),
+        ("oid[]", "1028"),
+        ("json[]", "199"),
+        ("jsonb[]", "3807"),
+        ("timestamp[]", "1115"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT '{name}'::regtype::oid")),
+            vec![vec![oid]],
+            "{name}"
+        );
+    }
+
+    // **A shape is not part of the type**: dimensions are read and thrown away.
+    for name in ["integer[][]", "integer[3]", "integer[3][4]"] {
+        assert_eq!(
+            node.rows(&format!("SELECT '{name}'::regtype::oid")),
+            vec![vec!["1007"]],
+            "{name}"
+        );
+    }
+
+    // And it prints back the way a real server prints it: the element's name with `[]`.
+    assert_eq!(
+        node.rows("SELECT '_int4'::regtype, 'numeric[]'::regtype"),
+        vec![vec!["integer[]", "numeric[]"]]
+    );
 }
