@@ -35,6 +35,17 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TEMPORARY TABLE",
         ),
         ("CREATE TABLE t AS SELECT 1", "CREATE TABLE ... AS"),
+        // **`OR REPLACE` is a modifier, not the name of anything.** These were refused as
+        // "CREATE OR is not supported" — a truncated token pair that names no feature and tells a
+        // user nothing about which statement was declined. ADR 0031 wants the construct named.
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "CREATE OR REPLACE VIEW",
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+            "CREATE OR REPLACE FUNCTION",
+        ),
         ("CREATE UNLOGGED TABLE t (a int8)", "UNLOGGED"),
         // **Nothing about a column `DEFAULT` is on this list any more.** It took an arbitrary
         // expression from the `DEFAULT`-is-an-expression unit, and the last thing it could not
@@ -98,10 +109,10 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8 UNIQUE NULLS NOT DISTINCT)",
             "NULLS NOT DISTINCT",
         ),
-        (
-            "CREATE TABLE t (a int8, UNIQUE NULLS NOT DISTINCT (a))",
-            "NULLS [NOT] DISTINCT",
-        ),
+        // **The table-constraint spelling left this list** with statement 779: it parses, it runs,
+        // and its index carries the flag. The *column-option* spelling is still refused — by the
+        // construct recognizer rather than here, because `sqlparser` 0.62.0 cannot parse it at
+        // all, which makes it a C1 gap rather than a clause this node declines.
         // `EXPLAIN ANALYZE SELECT` is **executed** since ADR 0022 milestone 4 — it is how the
         // `ScanStats` a columnar answer carries reaches a user. What stays refused is the form
         // that would *write*: `ANALYZE` runs the statement, and an `EXPLAIN` that inserts a row

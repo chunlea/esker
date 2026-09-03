@@ -459,12 +459,29 @@ fn feature_name(statement: &Statement) -> String {
     // wrote them, so "already upper case" selects the keywords without transforming anything.
     // Selecting rather than upper-casing is the point: `SAVEPOINT s` must not come back as
     // "SAVEPOINT S is not supported", which puts a name the user did not write into their log.
-    let words = rendered
+    let keywords: Vec<&str> = rendered
         .split_whitespace()
         .take_while(|word| {
             !word.is_empty() && word.chars().all(|c| c.is_ascii_uppercase() || c == '_')
         })
-        .take(2)
+        .collect();
+    // Two keywords name almost every statement — `CREATE TABLE`, `DROP INDEX`, `SAVEPOINT`. The
+    // exception is a **modifier** in front of the name: `CREATE OR REPLACE FUNCTION` spends three
+    // words before reaching the noun, and stopping at two answered "CREATE OR is not supported",
+    // which names no feature and leaves a user unable to tell which statement was declined.
+    //
+    // Widened here rather than everywhere, because the cap is what keeps an upper-case
+    // *identifier* out of the message: `SAVEPOINT S` must not come back as the feature
+    // "SAVEPOINT S". `OR REPLACE` cannot be an identifier in this position, so the four words
+    // after it are keywords by construction.
+    let take = if keywords.starts_with(&["CREATE", "OR", "REPLACE"]) {
+        4
+    } else {
+        2
+    };
+    let words = keywords
+        .into_iter()
+        .take(take)
         .collect::<Vec<_>>()
         .join(" ");
     if words.is_empty() {
