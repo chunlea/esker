@@ -1,0 +1,60 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 156-165,578-584,765-777,2662-2663,2674,2685,2700,2739,2832,2890,2958-2966,3428,3439,3450,3681,3742,3886,3933
+crates/esker-sql/src/catalog/pg_attribute.rs
+  h_44076b318daf9c 161,198
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 673,691-692
+crates/esker-sql/src/catalog/pg_relations.rs
+  h_44076b318daf9c 208-247
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 75-78,84,99-104,1280-1293,1297-1325,1728,1764,1813,1819-1820
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 207-218,1570,1763-1765,1939-1942
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 151-157,367-370,443-523,579-604,608-624,695-702,711-724,738-750,801-804,882,948-949,956-973
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 182,307,400,470
+crates/esker-sql/src/exec/comment.rs
+  h_44076b318daf9c 1-131
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 1580-1603
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 47-50,105,156-157,228,386,688,1818,2338
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 29,555,1554
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 179,196-197,274,299-300
+crates/esker-sql/src/exec/values.rs
+  h_44076b318daf9c 51,73-74
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 261-266,2298-2308,5274-5280,5291-5342
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 432-490
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 34-38,96-97,142-144,185-186,230-232
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 201-203,359
+crates/esker-sql/tests/aggregate_type.rs
+  h_44076b318daf9c 1-116
+crates/esker-sql/tests/comment.rs
+  h_44076b318daf9c 1-88
+crates/esker-sql/tests/corpus/pg19_aggregate_type.txt
+  h_44076b318daf9c 1-75
+crates/esker-sql/tests/corpus/pg19_comment.txt
+  h_44076b318daf9c 1-92
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 62-67,70-75
+docs/adr/0049-a-comment-is-a-field-of-the-object-it-is-about.md
+  h_44076b318daf9c 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "65ac6a0f76e0143c38daa22e5ffa651838a9f08c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
