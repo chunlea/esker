@@ -44,6 +44,7 @@ pub mod redrive;
 mod savepoint;
 mod subquery;
 mod table_function;
+mod typedef;
 mod values;
 mod verbs;
 
@@ -553,6 +554,8 @@ impl Executor {
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
             Statement::Comment(statement) => comment::comment(self, txn, statement),
+            Statement::CreateType(create) => typedef::create(self, txn, create),
+            Statement::DropType(drop) => typedef::drop(self, txn, drop),
             Statement::AlterTable(alter) => ddl::alter_table(self, txn, alter),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
@@ -1552,6 +1555,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
         Statement::Comment(statement) => vec![format!("Comment on {}", statement.name)],
+        Statement::CreateType(create) => vec![format!("Create Type on {}", create.name)],
+        Statement::DropType(drop) => vec![format!("Drop Type on {}", drop.names.join(", "))],
         Statement::AlterTable(alter) => vec![format!("Alter Table on {}", alter.name)],
         // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
         // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.

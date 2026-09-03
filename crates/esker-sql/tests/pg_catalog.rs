@@ -369,19 +369,20 @@ fn a_star_expands_to_every_column_of_the_view() {
     // reason: `SELECT *` expands in the declared order, so a column added anywhere else moves
     // every one after it and every client reading by position reads the wrong value. `11` is
     // `typnamespace`, added the same way for boot statement 26 — this node has one namespace and
-    // every type reports it, as every relation's `relnamespace` does. The `8` and `N` at the end
-    // are `typlen` and `typcategory`, appended last again for the uuid unit, which is the third
-    // capture to ask for them.
+    // every type reports it, as every relation's `relnamespace` does. The `8` and `N` are `typlen`
+    // and `typcategory`, appended last again for the uuid unit. `1016` and `0` are `typarray` and
+    // `typrelid`, appended last for the **fourth** time by `CREATE TYPE`: `_int8` really is 1016
+    // on a real server, and nothing but a composite owns a `pg_class` row.
     assert_eq!(
         node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
         ]]
     );
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
         ]]
     );
     assert_eq!(

@@ -26,6 +26,7 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
+use crate::catalog::{TypeField, TypeKind};
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
@@ -207,6 +208,11 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                ObjectType::Type => plan::Statement::DropType(plan::DropType {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 ObjectType::Index => plan::Statement::DropIndex(plan::DropIndex {
                     names,
                     // `sqlparser` 0.62.0's `Drop` has no `concurrently` field, so the word is read
@@ -258,6 +264,10 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             )?;
             Ok(plan::Statement::Explain(Box::new(inner), *analyze))
         }
+        Statement::CreateType {
+            name,
+            representation,
+        } => lower_create_type(name, representation.as_ref()),
         Statement::Comment {
             object_type,
             object_name,
@@ -5286,6 +5296,82 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         }
     }
     object_name(name)
+}
+
+/// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
+///
+/// **Three shapes, and the row that asked for them wants ranges nine times out of ten**:
+/// `adapters/postgresql/range_test.rb` is 46 of the 51 tests, `composite_test.rb` 4 and
+/// `timestamp_test.rb` 1. All three are read here; what a type can then be *used* for is a
+/// separate question and a narrower one.
+fn lower_create_type(
+    name: &ObjectName,
+    representation: Option<&sqlparser::ast::UserDefinedTypeRepresentation>,
+) -> Result<plan::Statement> {
+    use sqlparser::ast::{
+        UserDefinedTypeRangeOption as RangeOption, UserDefinedTypeRepresentation,
+    };
+    let name = relation_name(name)?;
+    let kind = match representation {
+        Some(UserDefinedTypeRepresentation::Range { options }) => {
+            let mut subtype = None;
+            let mut subtype_diff = None;
+            for option in options {
+                match option {
+                    RangeOption::Subtype(data_type) => subtype = Some(lower_type(data_type)?.0),
+                    // Carried verbatim: `pg_range.rngsubdiff` prints the name back and nothing
+                    // here calls it, which is what the capture measured — `float8mi` is a real
+                    // server's own function and this node has no function to point at.
+                    RangeOption::SubtypeDiff(function) => {
+                        subtype_diff = Some(function.to_string());
+                    }
+                    other => {
+                        return Err(SqlError::unsupported(format!(
+                            "CREATE TYPE ... AS RANGE ( {other} )"
+                        )));
+                    }
+                }
+            }
+            // `42704 type "nosuchtype" does not exist` comes out of `lower_type` above; a range
+            // with no `subtype` at all is PostgreSQL's own `42P16`, which this node has not
+            // measured, so it is named rather than guessed.
+            let subtype = subtype.ok_or_else(|| {
+                SqlError::unsupported("CREATE TYPE ... AS RANGE without a subtype")
+            })?;
+            TypeKind::Range {
+                subtype,
+                subtype_diff,
+            }
+        }
+        Some(UserDefinedTypeRepresentation::Composite { attributes }) => {
+            let mut fields = Vec::with_capacity(attributes.len());
+            for attribute in attributes {
+                refuse_if(
+                    attribute.collation.is_some(),
+                    "CREATE TYPE ... AS ( ... COLLATE )",
+                )?;
+                let (ty, typmod) = lower_type(&attribute.data_type)?;
+                fields.push(TypeField {
+                    name: ident(&attribute.name),
+                    ty,
+                    typmod,
+                });
+            }
+            TypeKind::Composite { fields }
+        }
+        // **An empty label list is legal**, measured: `CREATE TYPE emptyenum AS ENUM ()`
+        // succeeds and its `typtype` is `e`.
+        Some(UserDefinedTypeRepresentation::Enum { labels }) => TypeKind::Enum {
+            labels: labels.iter().map(|label| label.value.clone()).collect(),
+        },
+        Some(UserDefinedTypeRepresentation::SqlDefinition { .. }) => {
+            return Err(SqlError::unsupported("CREATE TYPE with a SQL definition"));
+        }
+        // `CREATE TYPE name` with no body is a **shell type**, which exists to be filled in by a
+        // C function. There is nothing this node could put in one.
+        None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
+    };
+    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

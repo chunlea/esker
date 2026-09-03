@@ -180,6 +180,8 @@ fn walk(
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -305,6 +307,8 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -398,6 +402,8 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
         | Statement::AlterTable(_)
@@ -468,6 +474,8 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
