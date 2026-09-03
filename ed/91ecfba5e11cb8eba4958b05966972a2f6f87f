@@ -1,0 +1,29 @@
+crates/esker-sql/src/exec/dml.rs
+  s_bab816e8030609::t_57d8fba4fcecdc 1250-1280
+crates/esker-sql/src/exec/mod.rs
+  s_bab816e8030609::t_b434726bad9f02 1956-1958
+crates/esker-sql/src/exec/subquery.rs
+  s_bab816e8030609::t_f24389f21309c4 77-102,104
+crates/esker-sql/tests/corpus/pg19_write_in_subquery.txt
+  s_bab816e8030609::t_adb92879d40796 1-83
+crates/esker-sql/tests/subquery.rs
+  s_bab816e8030609::t_a8e4793e9eb58a 350,352-360
+crates/esker-sql/tests/write_in_subquery.rs
+  s_bab816e8030609::t_3cd658205a7716 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ed91ecfba5e11cb8eba4958b05966972a2f6f87f",
+  "prompts": {},
+  "sessions": {
+    "s_bab816e8030609": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f13066b-3f0f-48c7-baf4-ef821f6ad1bb",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
