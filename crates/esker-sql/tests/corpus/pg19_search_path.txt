@@ -1,0 +1,86 @@
+# `search_path` — what an unqualified name finds, and what the two `current_schema` functions
+# answer — as a real PostgreSQL 19beta1 answers it.
+#
+# The half `pg19_schema.txt` left: relations live in schemas already, and this is the rule that
+# says which one a bare name means. `ActiveRecord` sets the path in `with_schema_search_path` all
+# through `schema_test.rb`, and reads it back through `current_schemas(false)` in every
+# `data_source_sql` it builds.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. `\gdesc` runs
+# inline, so every statement has its declared types pinned.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`SHOW` gives the path as *set*; `current_schemas` gives it as *resolved*.** They are two
+#     different answers to the same question and both are read: `SET search_path TO nosuchschema,
+#     sp_b` makes `SHOW search_path` say `nosuchschema, sp_b` and `current_schemas(false)` say
+#     `{sp_b}`. An entry naming no schema is **dropped**, not refused — which is what makes the
+#     default `"$user", public` resolve to `{public}` on a server with no role schema.
+#   * **`current_schema()` is NULL when nothing resolves.** `SET search_path TO nosuchschema` gives
+#     `current_schema()` = NULL and `current_schemas(false)` = `{}` — an empty array, not `{public}`
+#     and not an error. A bare name then finds nothing: `42P01 relation "t" does not exist`, with
+#     the **bare** name in the message even though the path is what failed.
+#   * **`current_schemas(true)` prepends `pg_catalog`**, and only that one: `{pg_catalog,public}`
+#     against `{public}`. It is the *implicit* schema the argument names.
+#   * **Order decides, and it is the order written.** With `sp_b, sp_a` a bare `t` is `sp_b`'s row
+#     and with `sp_a, sp_b` it is `sp_a`'s — the same query, twice, two answers.
+#   * **`CREATE` goes to the first schema of the path**, not to `public`: with `sp_a, sp_b` a
+#     `CREATE TABLE made_here` lands in `sp_a`. With `nosuchschema, sp_b` it still succeeds — the
+#     first entry that *resolves* is what it uses.
+#   * **`RESET search_path` and `SET search_path TO DEFAULT` are the same statement**, and both
+#     restore `"$user", public` — the boot value, quotes and all, as `SHOW` prints it.
+#   * **`SET search_path TO 'sp_a'` takes a string literal** and `SHOW` gives back `sp_a`, unquoted:
+#     the quotes are the SQL literal's and not part of the value.
+#   * `pg_typeof(current_schema())` is `name` and `current_schemas(false)` is `name[]`.
+BEGIN		-
+SHOW search_path	text	"$user", public
+SELECT 'r', current_schema(), current_schemas(false), current_schemas(true)	text,name,name[],name[]	r|public|{public}|{pg_catalog,public}
+CREATE SCHEMA sp_a CREATE TABLE t (id integer)		-
+CREATE SCHEMA sp_b CREATE TABLE t (id integer)		-
+INSERT INTO sp_a.t (id) VALUES (1)		-
+INSERT INTO sp_b.t (id) VALUES (2)		-
+SET search_path TO sp_a		-
+SHOW search_path	text	sp_a
+SELECT 'r', current_schema(), current_schemas(false)	text,name,name[]	r|sp_a|{sp_a}
+SELECT 'r', id FROM t	text,integer	r|1
+SET search_path TO sp_b, sp_a		-
+SHOW search_path	text	sp_b, sp_a
+SELECT 'r', current_schemas(false)	text,name[]	r|{sp_b,sp_a}
+SELECT 'r', id FROM t	text,integer	r|2
+SET search_path TO sp_a, sp_b		-
+SELECT 'r', id FROM t	text,integer	r|1
+CREATE TABLE made_here (id integer)		-
+SELECT 'r', n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'made_here'	text,name	r|sp_a
+SET search_path TO nosuchschema, sp_b		-
+SELECT 'r', current_schemas(false)	text,name[]	r|{sp_b}
+SELECT 'r', id FROM t	text,integer	r|2
+SAVEPOINT s1		-
+CREATE TABLE also_here (id integer)		-
+ROLLBACK TO s1		-
+SET search_path TO nosuchschema		-
+SELECT 'r', current_schema(), current_schemas(false)	text,name,name[]	r|\N|{}
+SAVEPOINT s2		-
+SELECT 'r', id FROM t	!42P01 relation "t" does not exist
+ROLLBACK TO s2		-
+RESET search_path		-
+SHOW search_path	text	"$user", public
+SELECT 'r', current_schema()	text,name	r|public
+SET search_path TO DEFAULT		-
+SHOW search_path	text	"$user", public
+SET search_path TO 'sp_a'		-
+SHOW search_path	text	sp_a
+SELECT 'r', current_schema()	text,name	r|sp_a
+SET search_path TO public, sp_a		-
+SELECT 'r', current_schemas(false), current_schemas(true)	text,name[],name[]	r|{public,sp_a}|{pg_catalog,public,sp_a}
+SELECT 'r', pg_typeof(current_schema()), pg_typeof(current_schemas(false))	text,regtype,regtype	r|name|name[]
+RESET search_path		-
+SELECT 'r', count(*) FROM sp_a.t	text,bigint	r|1
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'sp_%'	bigint	0

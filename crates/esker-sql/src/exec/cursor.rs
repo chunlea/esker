@@ -1220,6 +1220,14 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             )));
         }
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
+        // Resolved before the plan was built (`crate::exec::Executor::bound`), exactly as a
+        // `::regclass` is. One here means the resolution was skipped, and answering it from the
+        // row would be reading a session this evaluator cannot see.
+        Expr::CurrentSchema { .. } => {
+            return Err(SqlError::Internal(
+                "a current_schema reached the row evaluator unresolved".to_owned(),
+            ));
+        }
         // A value of a group, not of a row. The planner replaces every one of these with an
         // `Ordinal` into the aggregated row, so one arriving here is a planner bug and says so
         // rather than returning a number nobody can check.

@@ -86,7 +86,8 @@ const INLINE_PARSE_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_NESTING_LEVEL;
 /// committed memory, so a thread that does not descend does not pay for it.
 /// `the_deepest_admissible_statement_parses` is the test that keeps this honest -- it parses
 /// nested subqueries at exactly [`MAX_NESTING_DEPTH`], which needed 256 MiB when measured directly.
-const DEEP_PARSE_STACK_BYTES: usize = MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
+pub(crate) const DEEP_PARSE_STACK_BYTES: usize =
+    MAX_NESTING_DEPTH * STACK_PER_NESTING_LEVEL + 4 * 1024 * 1024;
 
 /// The recursion limit handed to `sqlparser` itself.
 ///
@@ -139,6 +140,17 @@ pub enum StatementClass {
         names: Vec<String>,
         /// `DEFERRED`, as against `IMMEDIATE`.
         deferred: bool,
+    },
+    /// `ALTER TABLE <name> SET { LOGGED | UNLOGGED }`, carrying which.
+    ///
+    /// Read off the words rather than parsed, for the reason [`StatementClass::SetConstraints`] is:
+    /// `sqlparser` 0.62.0 has no `LOGGED` keyword at all, so the statement is a syntax error where
+    /// PostgreSQL accepts it, and the grammar is four words.
+    SetPersistence {
+        /// The table, folded the way an identifier is folded.
+        table: String,
+        /// `LOGGED` gives permanent, `UNLOGGED` gives unlogged.
+        persistence: crate::catalog::Persistence,
     },
     /// `SAVEPOINT <name>`, carrying the name.
     Savepoint(String),
@@ -200,6 +212,11 @@ pub struct Parsed {
     /// clause texts travel here — the same arrangement `concurrently` uses for a keyword the
     /// parser cannot carry ([`strip_exclude_constraints`]).
     exclude: Vec<String>,
+    /// Whether `CREATE TABLE` was written `CREATE UNLOGGED TABLE`.
+    ///
+    /// `sqlparser` 0.62.0 reads `TEMP`/`TEMPORARY` before `TABLE` and not `UNLOGGED`, so the word
+    /// is cut out of the source and travels here ([`strip_unlogged`]).
+    unlogged: bool,
 }
 
 impl Parsed {
@@ -207,6 +224,16 @@ impl Parsed {
     #[must_use]
     pub fn class(&self) -> &StatementClass {
         &self.class
+    }
+
+    /// Whether the `CREATE TABLE` said `UNLOGGED`.
+    ///
+    /// The keyword is cut out of the source before the parse (`strip_unlogged`), because
+    /// `sqlparser` 0.62.0 reads `TEMP` before `TABLE` and not this — so the tree cannot carry it
+    /// and this is where it travels.
+    #[must_use]
+    pub fn is_unlogged(&self) -> bool {
+        self.unlogged
     }
 
     /// Whether this `BEGIN` asked for a **read-only** transaction.
@@ -260,12 +287,13 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // fact about the statement that the parsed tree cannot carry.
     let scanned = scan(sql);
     let concurrently = strip_drop_index_concurrently(sql, &scanned).is_some();
-    let constraints = set_constraints(sql, &scanned);
+    let constraints = set_constraints(sql, &scanned).or_else(|| set_persistence(sql, &scanned));
     // The clause texts, taken the same way `parse` takes them — this only has to *notice*, because
     // what was removed is a fact about the statement that the parsed tree cannot carry.
     let exclude = strip_exclude_constraints(sql, &scanned)
         .map(|(_, clauses)| clauses)
         .unwrap_or_default();
+    let unlogged = strip_unlogged(sql, &scanned).is_some();
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
@@ -276,9 +304,41 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 class,
                 concurrently,
                 exclude: exclude.clone(),
+                unlogged,
             }
         })
         .collect())
+}
+
+/// `CREATE UNLOGGED TABLE …` with the keyword removed, or `None` for anything else.
+///
+/// **`sqlparser` reads `TEMP` and `TEMPORARY` before `TABLE` and not `UNLOGGED`**, so the whole
+/// statement is a syntax error where PostgreSQL accepts it — a contract C1 gap, and the same one
+/// `EXCLUDE` had. The word is cut out so the rest parses as the ordinary `CREATE TABLE` it is, and
+/// [`Parsed::unlogged`] carries the fact the tree cannot.
+///
+/// **Only before `TABLE`.** `CREATE UNLOGGED VIEW` is not rewritten: a view has no storage and a
+/// real server refuses it with a sentence of its own, so letting it through here would turn a
+/// `42601` that explains itself into a view that quietly ignored the keyword.
+fn strip_unlogged(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, second, third, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("CREATE")
+        || !second.eq_ignore_ascii_case("UNLOGGED")
+        || !third.eq_ignore_ascii_case("TABLE")
+    {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let at = upper.find("UNLOGGED")?;
+    let mut kept = String::with_capacity(sql.len());
+    kept.push_str(sql.get(..at)?);
+    // The word and the single space after it, so `CREATE UNLOGGED TABLE t` becomes
+    // `CREATE TABLE t` rather than `CREATE  TABLE t`.
+    let rest = sql.get(at + "UNLOGGED".len()..)?;
+    kept.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+    Some(kept)
 }
 
 /// Every `EXCLUDE` table constraint cut out of a `CREATE TABLE`, and the statement without them.
@@ -693,6 +753,16 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     // *keyword* the parser cannot read. Both are source rewrites for the same reason: the statement
     // is valid PostgreSQL and the gap is the parser's, so the honest fix is to make it parse rather
     // than to report a syntax error about correct SQL (contract C1).
+    // **Before the parser**, because its own message would be about the token `UNLOGGED` rather
+    // than about what is wrong: a view has no storage, so there is nothing for the keyword to mean.
+    if let [first, second, third, ..] = scanned.words.as_slice()
+        && first.eq_ignore_ascii_case("CREATE")
+        && second.eq_ignore_ascii_case("UNLOGGED")
+        && third.eq_ignore_ascii_case("VIEW")
+    {
+        return Err(SqlError::UnloggedView);
+    }
+
     // **`CREATE SCHEMA s CREATE TABLE t (…)` is one statement PostgreSQL reads and `sqlparser`
     // 0.62.0 cannot** — it stops at the first nested `CREATE`. Split rather than rewritten,
     // because there is no single statement to rewrite it into, and each element is qualified with
@@ -708,6 +778,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
 
     let rewritten = rewrite_synonym(sql, &scanned)
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
+        .or_else(|| strip_unlogged(sql, &scanned))
         .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept));
     let text = rewritten.as_deref().unwrap_or(sql);
 
@@ -974,8 +1045,6 @@ const UNSUPPORTED: &[Unsupported] = &[
         &[],
         &["DETACH", "PARTITION"],
     ),
-    u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
-    u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
     // `sqlparser` 0.62.0 reads four `ALTER TABLE` actions and PostgreSQL has some thirty
     // (G32-G39). None of the rest is executed here either, so each is named the way the lowering
     // names the ones that *do* parse -- a user gets one sentence for a construct whether the gap
@@ -1032,7 +1101,15 @@ const UNSUPPORTED: &[Unsupported] = &[
         &["ALTER", "TABLE"],
         &[ANY, "OF"],
     ),
-    u("CREATE UNLOGGED TABLE", &["CREATE", "UNLOGGED"], &[]),
+    // **This table is consulted only when the parse fails**, which is what lets these three stay
+    // beside the forms that now work. `ALTER TABLE t SET LOGGED` is read off the words and never
+    // reaches here; `ALTER TABLE t SET LOGGED, SET (fillfactor = 50)` is a multi-action statement
+    // this node cannot read, and without a name it would come back as a syntax error about valid
+    // SQL. `CREATE UNLOGGED TABLE` likewise parses now — what still lands here is `CREATE UNLOGGED
+    // SEQUENCE` and its relatives, which is why the name stayed general.
+    u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
+    u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
+    u("CREATE UNLOGGED", &["CREATE", "UNLOGGED"], &[]),
     // **`CREATE TABLE` is not here**: an `EXCLUDE` constraint is cut out of the source and read on
     // its own (`strip_exclude_constraints`). What stays a refusal is `ALTER TABLE ... ADD
     // CONSTRAINT ... EXCLUDE`, which has no such path.
@@ -1237,6 +1314,42 @@ fn set_constraints(sql: &str, scanned: &Scan<'_>) -> Option<StatementClass> {
     Some(StatementClass::SetConstraints { names, deferred })
 }
 
+/// `ALTER TABLE <name> SET { LOGGED | UNLOGGED }`, read off the words.
+///
+/// Read here rather than parsed for the reason [`set_constraints`] is: `sqlparser` 0.62.0 has no
+/// `LOGGED` keyword, so this is a syntax error where PostgreSQL accepts it — contract C1. Four
+/// words and a name, which is small enough to read exactly.
+///
+/// **`ONLY` is not accepted.** `ALTER TABLE ONLY t SET LOGGED` is legal PostgreSQL and means
+/// something about inheritance this node does not implement, so it falls through to the parser's
+/// error rather than being silently treated as the plain form.
+fn set_persistence(sql: &str, scanned: &Scan<'_>) -> Option<StatementClass> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("ALTER") || !second.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+    let persistence = match scanned.words.last()? {
+        last if last.eq_ignore_ascii_case("LOGGED") => crate::catalog::Persistence::Permanent,
+        last if last.eq_ignore_ascii_case("UNLOGGED") => crate::catalog::Persistence::Unlogged,
+        _ => return None,
+    };
+    // `SET` has to be the word before it, or this is some other statement ending in the same word.
+    let before = scanned.words.get(scanned.words.len().checked_sub(2)?)?;
+    if !before.eq_ignore_ascii_case("SET") {
+        return None;
+    }
+    // The name, read from the source for the reason `set_constraints` reads its names there: a
+    // quoted identifier is deliberately not a `Scan` word, and `ActiveRecord` quotes every table.
+    let after_table = sql.get(sql.to_ascii_uppercase().find("TABLE")? + "TABLE".len()..)?;
+    let name = constraint_names(after_table).into_iter().next()?;
+    Some(StatementClass::SetPersistence {
+        table: name,
+        persistence,
+    })
+}
+
 /// The comma-separated names between `CONSTRAINTS` and the mode, quoted or bare.
 ///
 /// A quoted name keeps its case and its spaces and loses its quotes, which is what a quoted
@@ -1281,7 +1394,7 @@ fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     // A `SET CONSTRAINTS` is rewritten **whole**, because nothing of it survives: what it said is
     // carried on the class instead ([`set_constraints`]), and the statement the parser gets is a
     // placeholder that never runs — the executor dispatches on the class first.
-    if set_constraints(sql, scanned).is_some() {
+    if set_constraints(sql, scanned).is_some() || set_persistence(sql, scanned).is_some() {
         return Some("SELECT 1".to_owned());
     }
     let replacement = match scanned.words.first()? {
@@ -1448,6 +1561,9 @@ fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str
 /// * brackets — `(`, `[`, and `CASE`, which pairs with `END` exactly as a bracket does;
 /// * runs of prefix operators — `NOT NOT NOT x` descends three levels without a bracket in sight,
 ///   and so does `- - - 1`, so the length of the current run is added to the bracket depth;
+/// * chains of `AND`/`OR` — `a OR b OR c` has **one** bracket and builds a three-level tree, which
+///   is the shape that crashed a node: the parser accepted it, and walking it overflowed the
+///   stack. A chain is as deep as a nest and is counted the same way;
 /// * nothing at all inside a string, a quoted identifier, a dollar-quoted body or a comment.
 ///
 /// An unterminated string or comment ends the scan rather than failing it: the statement is
@@ -1483,6 +1599,8 @@ fn scan(sql: &str) -> Scan<'_> {
     let mut index = 0;
     let mut depth: usize = 0;
     let mut max: usize = 0;
+    // How many `AND`/`OR` operators have chained at the current bracket level.
+    let mut chain: usize = 0;
     let mut run: usize = 0;
 
     while index < bytes.len() {
@@ -1539,14 +1657,23 @@ fn scan(sql: &str) -> Scan<'_> {
                         depth += 1;
                         max = max.max(depth + run);
                         run = 0;
+                        chain = 0;
                     }
                     Keyword::End => {
                         depth = depth.saturating_sub(1);
                         run = 0;
+                        chain = 0;
                     }
                     Keyword::Not => {
                         run += 1;
                         max = max.max(depth + run);
+                    }
+                    // **Not reset by the operands between them.** `a = 1 OR a = 2 OR a = 3` is
+                    // three levels with five ordinary words in between, so the chain is counted on
+                    // its own rather than folded into `run`, which any word clears.
+                    Keyword::Chain => {
+                        chain += 1;
+                        max = max.max(depth + chain);
                     }
                     Keyword::Other => run = 0,
                 }
@@ -1565,8 +1692,15 @@ fn scan(sql: &str) -> Scan<'_> {
     }
 }
 
-/// The three keywords that move the depth. Everything else resets the prefix run.
+/// The keywords that move the depth. Everything else resets the prefix run.
 enum Keyword {
+    /// `AND` / `OR`: a **left-deep chain**, one tree level per operator.
+    ///
+    /// Counted because bracket depth does not see it. `a OR b OR c OR …` has one bracket and
+    /// builds an N-deep tree — which is how run 46's node parsed a boolean chain from
+    /// `ActiveRecord`'s `.or()` and then died walking it. A chain is as deep as a nest, so it is
+    /// measured the same way.
+    Chain,
     Case,
     End,
     Not,
@@ -1575,6 +1709,8 @@ enum Keyword {
 
 fn keyword(word: &[u8]) -> Keyword {
     match word.len() {
+        2 if word.eq_ignore_ascii_case(b"OR") => Keyword::Chain,
+        3 if word.eq_ignore_ascii_case(b"AND") => Keyword::Chain,
         3 if word.eq_ignore_ascii_case(b"NOT") => Keyword::Not,
         3 if word.eq_ignore_ascii_case(b"END") => Keyword::End,
         4 if word.eq_ignore_ascii_case(b"CASE") => Keyword::Case,

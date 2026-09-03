@@ -80,9 +80,10 @@ fn client_min_messages_actually_suppresses_a_notice() {
 
 /// A value this node cannot mean is refused **by name**, never accepted and ignored.
 ///
-/// Both of these a real server takes. Taking them here would honour the setting in `SHOW` and
-/// nowhere else: an instant would still print in UTC, and an unqualified name would still resolve
-/// where PostgreSQL would find nothing.
+/// A real server takes the zone; taking it here would honour the setting in `SHOW` and nowhere
+/// else, because an instant still prints in UTC. **`search_path` left this test** with the
+/// namespace unit: it is now honoured for real, so the value is no longer one this node cannot
+/// mean — an entry naming no schema is *skipped*, which is what a real server does with it too.
 #[test]
 fn a_value_this_node_cannot_mean_is_refused_by_name() {
     let mut node = parity::Node::new(FIXTURE);
@@ -94,12 +95,11 @@ fn a_value_this_node_cannot_mean_is_refused_by_name() {
         "the time zone \"America/New_York\" is not supported"
     );
 
-    let error = node.run("SET search_path TO other").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(
-        error.to_string(),
-        "a search_path of \"other\" is not supported"
-    );
+    // A path naming a schema that is not there is **accepted** and resolves to nothing, which is
+    // what a real server does — `SHOW` gives it back as written and `current_schemas` drops it.
+    node.run("SET search_path TO other").unwrap();
+    assert_eq!(node.rows("SHOW search_path"), vec![vec!["other"]]);
+    assert_eq!(node.rows("SELECT current_schemas(false)"), vec![vec!["{}"]]);
 
     // The two spellings ActiveRecord sends are both `public`, and both run.
     node.run("SET search_path TO public").unwrap();

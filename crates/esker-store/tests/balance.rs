@@ -350,17 +350,69 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
             );
         }
     }
-    let led: std::collections::BTreeSet<u64> = nodes
-        .iter()
-        .flat_map(|node| node.store.region_statuses())
-        .filter(|status: &RegionStatus| status.is_leader)
-        .map(|status| status.region.id)
-        .collect();
+    // **Placement is not leadership.** The two waits above stop when every region has a learner on
+    // store 2 and when store 2 hosts them all — neither of which says anybody has *elected*. A
+    // region that has just been split or just gained a peer still has to hold an election, and an
+    // election is counted in ticks, so under load it lands later than the placement it followed.
+    // Waiting here rather than asserting straight away is the difference between "no leader yet"
+    // and "no leader ever", and only the second is a bug.
+    let leaders = || -> std::collections::BTreeSet<u64> {
+        nodes
+            .iter()
+            .flat_map(|node| node.store.region_statuses())
+            .filter(|status: &RegionStatus| status.is_leader)
+            .map(|status| status.region.id)
+            .collect()
+    };
+    let elected_by = Instant::now();
+    let mut led = leaders();
+    while !regions.iter().all(|region| led.contains(&region.id)) {
+        if elected_by.elapsed() >= AWAIT_DEADLINE {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        led = leaders();
+    }
     for region in &regions {
-        assert!(
-            led.contains(&region.id),
-            "region {} has no leader anywhere; its data is unreadable",
-            region.id
+        if led.contains(&region.id) {
+            continue;
+        }
+        // **What a region without a leader looks like from each store that hosts it.** A region
+        // that cannot elect and one that has not yet elected are different failures: the first
+        // has a membership that makes a quorum impossible — no voters, or peers on stores that
+        // are not there — and the second has a sound one and no election yet. Only the state says
+        // which, so it is printed rather than guessed at.
+        let seen: Vec<String> = nodes
+            .iter()
+            .flat_map(|node| {
+                let store_id = node.store.store_id();
+                node.store
+                    .region_statuses()
+                    .into_iter()
+                    .filter(|status| status.region.id == region.id)
+                    .map(move |status| {
+                        format!(
+                            "store {store_id}: believes leader is peer {}, applied {}, peers {:?}",
+                            status.leader_peer_id,
+                            status.applied_index,
+                            status
+                                .region
+                                .peers
+                                .iter()
+                                .map(|peer| (peer.store_id, peer.peer_id, peer.role))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        panic!(
+            "region {} has no leader anywhere after {:?}; its data is unreadable\n  {}\n  \
+             regions: {:?}\n  led:     {led:?}",
+            region.id,
+            elected_by.elapsed(),
+            seen.join("\n  "),
+            regions.iter().map(|r| r.id).collect::<Vec<_>>(),
         );
     }
 

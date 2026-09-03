@@ -165,6 +165,8 @@ pub(super) fn table_function_def(
         _ => ColumnType::Int4,
     };
     std::sync::Arc::new(crate::catalog::TableDef {
+        // Synthetic and never stored, so its persistence is the default.
+        persistence: crate::catalog::Persistence::Permanent,
         id: crate::catalog::DERIVED_TABLE_ID,
         name: name.clone(),
         columns: vec![crate::catalog::ColumnDef {
@@ -275,6 +277,8 @@ fn plan_derived(
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
+        // Synthetic and never stored, so its persistence is the default.
+        persistence: crate::catalog::Persistence::Permanent,
         id: crate::catalog::DERIVED_TABLE_ID,
         name,
         columns,
@@ -650,6 +654,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         | Expr::Literal(_)
         | Expr::Uuid(_)
         | Expr::Parameter(_)
+        | Expr::CurrentSchema { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Default
@@ -1108,6 +1113,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Literal(_)
         | Expr::Uuid(_)
         | Expr::Parameter(_)
+        | Expr::CurrentSchema { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Outer { .. }
@@ -1182,6 +1188,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         Expr::Literal(_)
         | Expr::Uuid(_)
         | Expr::Parameter(_)
+        | Expr::CurrentSchema { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Outer { .. }

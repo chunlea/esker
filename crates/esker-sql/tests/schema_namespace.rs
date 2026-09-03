@@ -29,21 +29,26 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', c.relname, n.nspname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' AND c.relkind IN ('r','v','m','p','f') ORDER BY n.nspname",
         "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
         "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
+        "SELECT 'r', nspname FROM pg_namespace WHERE nspname LIKE 'test_schema%' ORDER BY nspname",
+        "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'test_schema%' ORDER BY n.nspname, c.relname",
     ],
-    answers: &[(
-        "SET search_path TO test_schema",
-        "**The one thing still refused, and deliberately.** `current_schema` and \
-         `current_schemas` are folded to `public` where a statement is lowered, and an unqualified \
-         name resolves in `public`, so accepting a path that named another schema would answer \
-         `public` where a real server answers `test_schema` — a wrong answer, which ADR 0031 ranks \
-         worse than the refusal. Making it real is its own unit: the two functions have to become \
-         session-aware (which means resolving them in `Executor::bound`, where the session is, \
-         rather than folding them at lowering, and moving the `= ANY (current_schemas(false))` \
-         expansion with them) and an unqualified name has to be looked for along the path in \
-         order. It is the first statement this node refuses, so the forty after it are swallowed \
-         by the aborted block and counted — `DROP SCHEMA … CASCADE` among them, which is asserted \
-         directly in `dropping_a_schema_needs_cascade_once_something_is_in_it` instead",
-    )],
+    answers: &[
+        (
+            "DROP SCHEMA test_schema",
+            "**Which dependent the `DETAIL` names.** Both refuse, with the same code and the same \
+             sentence; PostgreSQL names `things` and this node names `Things`, because the schema \
+             holds four relations and the two pick a different one — a real server walks its \
+             dependency entries and this walks the name records, which are in byte order and put a \
+             capital `T` first. Neither order is a contract, and both name a relation that really \
+             is in the way",
+        ),
+        (
+            "SELECT 'r', pg_typeof(current_schema), pg_typeof(current_schemas(false))",
+            "The standing catalog trade made visible as a **row**, because `pg_typeof` returns the \
+             type as a value: `name` and `name[]` there against `text` and `text` here. The values \
+             those functions answer are identical, which every other line in this file shows",
+        ),
+    ],
 };
 
 #[test]
@@ -299,11 +304,12 @@ fn a_named_schema_is_refused_rather_than_answered_wrongly() {
     // The one schema this node has answers for itself, and both spellings are exact.
     assert_eq!(node.rows("SELECT current_schema"), [["public"]]);
     assert_eq!(node.rows("SELECT current_schemas(false)"), [["{public}"]]);
-    // A `search_path` that resolves to `public` is honoured; one that names another schema is
-    // `0A000` quoting the path back, rather than being accepted and quietly meaning `public`.
+    // A path is **not validated**: an entry naming no schema is skipped, so the default resolves
+    // to `{public}` and one naming nothing at all resolves to `{}`.
     node.run("SET search_path TO \"$user\", public").unwrap();
-    let error = node.run("SET search_path TO test_schema").unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
+    assert_eq!(node.rows("SELECT current_schemas(false)"), [["{public}"]]);
+    node.run("SET search_path TO test_schema").unwrap();
+    assert_eq!(node.rows("SELECT current_schemas(false)"), [["{}"]]);
     // A schema-qualified relation whose schema is not there is `3F000` — the *schema* is what is
     // missing, and it is a different answer from a missing relation.
     let error = node

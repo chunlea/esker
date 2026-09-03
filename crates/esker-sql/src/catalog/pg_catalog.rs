@@ -356,6 +356,11 @@ impl CatalogView {
                 // a table — the join `pg_am am ON am.oid = i.relam` then finds nothing for one,
                 // which is how a client filters indexes by method.
                 ("relam", ColumnType::Int8),
+                // **Last again.** A `"char"` on a real server and `text` here, with the same
+                // single character in it. The one column that tells an `UNLOGGED` table from an
+                // ordinary one — `information_schema.tables` calls both `BASE TABLE`, so a client
+                // that reads the standard view cannot see persistence at all.
+                ("relpersistence", ColumnType::Text),
             ],
             // Exactly the three a client reads. `amname` is a `name` on a real server and `amtype`
             // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
@@ -666,6 +671,8 @@ impl CatalogView {
                 .iter()
                 .map(|view| {
                     Arc::new(TableDef {
+                        // Synthetic and never stored, so its persistence is the default.
+                        persistence: crate::catalog::Persistence::Permanent,
                         id: view.id(),
                         name: view.name().to_owned(),
                         columns: view
@@ -1188,6 +1195,8 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Bool(false),
             Datum::Null,
             Datum::Int8(0),
+            // A catalog view is not stored at all, and a real server reports `p` for one.
+            Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
         ]
     });
     let schemas = super::schema_names(txn, tenant)?;
@@ -1243,6 +1252,18 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                         Datum::Text(super::partition_bound_definition(bound))
                     }),
                 Datum::Int8(access_method_oid(relation.kind)),
+                // **The owning table's, for every relation it owns.** A `bigserial`'s sequence
+                // and every index — the primary key's included — report the table's persistence
+                // on a real server, and `ALTER TABLE … SET LOGGED` moves all of them in one
+                // statement. Reading it from the table rather than storing a copy per relation is
+                // what makes both true at once and leaves nothing that can drift.
+                Datum::Text(
+                    relations
+                        .table(relation)
+                        .map_or(super::Persistence::Permanent, |table| table.persistence)
+                        .relpersistence()
+                        .to_owned(),
+                ),
             ]
         })
         .chain(views)

@@ -62,6 +62,11 @@ pub(super) fn create_table(
         return Err(SqlError::DuplicateTable(create.name.clone()));
     }
 
+    // **An unqualified `CREATE` goes to the first schema of the path**, not to `public`: measured,
+    // with `sp_a, sp_b` a `CREATE TABLE made_here` lands in `sp_a`. The name is qualified here, so
+    // everything below — the record, the derived key and index names, the messages — is about the
+    // relation where it actually is.
+    let create = &qualified_create(&*txn, executor, create)?;
     refuse_missing_schema(&*txn, executor, &create.name)?;
     let declared = declared_columns(create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
@@ -133,6 +138,7 @@ pub(super) fn create_table(
     let sequences = sequences_for(executor, txn, create, table_id)?;
     let table = TableDef {
         id: table_id,
+        persistence: create.persistence,
         name: create.name.clone(),
         columns,
         primary_key,
@@ -1409,6 +1415,15 @@ fn resolve_foreign_key(
             parent_def.name.clone(),
         ));
     }
+    // **A permanent table may not reference an unlogged one**, and the rule is one-directional:
+    // the reverse is accepted, because losing the child's rows on a crash breaks nothing about the
+    // parent while the other way round leaves a constraint pointing at rows that are gone.
+    // Measured both ways; a symmetric check would refuse half the statements a real server takes.
+    if child.persistence == catalog::Persistence::Permanent
+        && parent_def.persistence == catalog::Persistence::Unlogged
+    {
+        return Err(SqlError::PermanentReferencesUnlogged);
+    }
     Ok(catalog::ForeignKeyDef {
         name: key.name.clone(),
         columns,
@@ -1479,6 +1494,28 @@ fn sequences_for(
         }
     }
     Ok(sequences)
+}
+
+/// A `CREATE TABLE` whose name has been put in the schema it will live in.
+///
+/// A qualified name is left alone; an unqualified one takes the first schema of the `search_path`
+/// that resolves, which is `public` when none does — so every existing statement lands exactly
+/// where it did.
+fn qualified_create(
+    txn: &dyn Txn,
+    executor: &Executor,
+    create: &CreateTable,
+) -> Result<CreateTable> {
+    if create.name.contains(catalog::SCHEMA_SEPARATOR) {
+        return Ok(create.clone());
+    }
+    let schema = executor.creation_schema(txn)?;
+    if schema == catalog::PUBLIC_SCHEMA {
+        return Ok(create.clone());
+    }
+    let mut qualified = create.clone();
+    qualified.name = catalog::qualify(&schema, &create.name);
+    Ok(qualified)
 }
 
 /// The schema a relation names must exist: `3F000`, **before** anything else is looked at.
@@ -2029,6 +2066,10 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // rather than panicked on, because this is a catalog write and not a place to abort.
         Expr::Column { name, .. } => name.clone(),
         Expr::Parameter(number) => format!("${number}"),
+        Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
+        Expr::CurrentSchema {
+            all: Some(implicit),
+        } => format!("current_schemas({implicit})"),
         Expr::Outer { at, .. } => format!("<outer {at}>"),
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => format!("{}()", call.func.name()),
@@ -2308,6 +2349,15 @@ pub(super) fn alter_table(
             set_columnar_replicas(txn, executor, &updated, *replicas)?;
             continue;
         }
+        // **One field on the table and nothing else.** Every relation reads its persistence from
+        // the table it belongs to, so the indexes and the owned sequence move with it in this same
+        // statement and there is no second place to keep in step.
+        if let AlterTableAction::SetPersistence(persistence) = action {
+            updated.persistence = *persistence;
+            catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+            changed = true;
+            continue;
+        }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
             continue;
@@ -2399,6 +2449,7 @@ fn existing_relation(
     txn: &dyn Txn,
     name: &str,
 ) -> Result<Option<catalog::Relation>> {
+    let name = &executor.resolve_unqualified(txn, name)?;
     // A `pg_catalog` relation is a relation, and every verb that asks this question should see one
     // — so a `DROP INDEX pg_type` is `42809 "pg_type" is not an index` and a `CREATE TABLE
     // pg_type` is `42P07`, which is what a real server answers for the qualified spelling.

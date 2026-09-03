@@ -38,6 +38,56 @@ impl Parsed {
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
+        // **Deep once, then deep properly.** `lower_expr` stops at `INLINE_LOWER_DEPTH` on the
+        // caller's stack, which is a tokio worker's 2 MiB. A statement past it is not refused —
+        // it is lowered again on a thread with room for `MAX_NESTING_DEPTH` levels, exactly as
+        // `crate::parse` re-parses a deeply nested statement on one. So the limit a client meets
+        // is the parser's, and the worker's stack decides only *where* the work happens.
+        match self.lower_inline() {
+            Err(SqlError::StatementTooComplex) => self.lower_on_a_deep_stack(),
+            other => other,
+        }
+    }
+
+    /// [`Parsed::lower`] on a thread sized for the full depth, and only for a statement that needs
+    /// it. A thread spawn costs tens of microseconds; the statement is about to become a
+    /// distributed transaction.
+    fn lower_on_a_deep_stack(&self) -> Result<plan::Statement> {
+        // **Borrowed, not cloned.** `Parsed` holds `sqlparser`'s tree, and `Clone` on that tree is
+        // as recursive as lowering it — cloning a 500-term chain to hand it to the deep thread
+        // overflowed the very stack this exists to get off. A scoped thread borrows it instead, so
+        // nothing walks the tree on the caller's stack.
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("esker-sql-lower".into())
+                .stack_size(crate::parse::DEEP_PARSE_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    LOWER_LIMIT.with(|cell| cell.set(crate::parse::MAX_NESTING_DEPTH));
+                    self.lower_inline()
+                })
+                .map_err(|error| {
+                    SqlError::Internal(format!("could not spawn a lowering thread: {error}"))
+                })?;
+            // A panic here is a bug in this crate and not something the client did, so it is an
+            // internal error rather than a dropped connection — the reading
+            // `parse_on_a_deep_stack` takes, and for the same invariant.
+            worker
+                .join()
+                .map_err(|_| SqlError::Internal("the lowering thread panicked".into()))?
+        })
+    }
+
+    fn lower_inline(&self) -> Result<plan::Statement> {
+        // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
+        // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
+        // from what the class recorded — and then travels the ordinary `ALTER TABLE` path.
+        if let crate::parse::StatementClass::SetPersistence { table, persistence } = &self.class {
+            return Ok(plan::Statement::AlterTable(plan::AlterTable {
+                name: table.clone(),
+                if_exists: false,
+                actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
+            }));
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -46,6 +96,9 @@ impl Parsed {
         // And the clauses it could not read at all: an `EXCLUDE` constraint is cut out of the
         // source so the statement parses, and re-attached here from its own text.
         if let plan::Statement::CreateTable(create) = &mut lowered {
+            if self.is_unlogged() {
+                create.persistence = catalog::Persistence::Unlogged;
+            }
             for clause in self.exclude_constraints() {
                 create.excludes.push(crate::parse::parse_exclude_constraint(
                     clause,
@@ -1558,6 +1611,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     )?;
 
     Ok(plan::CreateTable {
+        // Overridden in `Parsed::lower`, which is where the stripped keyword is in reach.
+        persistence: catalog::Persistence::Permanent,
         name,
         checks,
         foreign_keys,
@@ -2191,7 +2246,64 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
     clippy::too_many_lines,
     reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
 )]
+/// How deep [`lower_expr`] may descend on the caller's own stack.
+///
+/// **Measured, not chosen**: an `OR` chain overflows a 2 MiB stack at 59 terms in a debug build,
+/// which is about 35 KiB of frame per level — `lower_expr` is one large match and every arm's
+/// locals get a slot. Half of that measurement, so the guard fires with the stack half used.
+///
+/// A statement past it is not refused: it is lowered again on a thread sized for
+/// [`crate::parse::MAX_NESTING_DEPTH`] levels, which is what `crate::parse` already does for a
+/// deeply nested *parse* and for the same reason. Only a statement past **that** is `54001`, so
+/// the set of statements this node accepts is the parser's set and not the worker stack's.
+const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
+
+thread_local! {
+    /// How many [`lower_expr`] frames this thread is inside.
+    static LOWER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The ceiling this thread is working to: the inline budget, or the full limit on a thread
+    /// spawned with a stack for it.
+    static LOWER_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(INLINE_LOWER_DEPTH) };
+}
+
+/// Counts one level of [`lower_expr`] and gives it back on the way out.
+///
+/// A guard object rather than a depth parameter, because `lower_expr` is reached from a dozen
+/// sibling walkers — the query lowerer, the `CASE` arms, the function arguments — and a parameter
+/// would have to be threaded through every one of them, where any missed call site silently
+/// resets the count to zero.
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<Self> {
+        let limit = LOWER_LIMIT.with(std::cell::Cell::get);
+        let depth = LOWER_DEPTH.with(std::cell::Cell::get);
+        if depth >= limit {
+            return Err(SqlError::StatementTooComplex);
+        }
+        LOWER_DEPTH.with(|cell| cell.set(depth + 1));
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        LOWER_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per `sqlparser` expression node, in the parser's own order; splitting it \
+              would put half the tree's shapes in a function named after nothing"
+)]
 fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    // **Invariant 9, at the one place that was missing it.** The parser has been guarded since
+    // phase 6a, and its guard counts *brackets* — which is why it never saw this: `a OR b OR c`
+    // has one bracket and builds an N-deep tree, so run 46's node parsed a boolean chain happily
+    // and then overflowed a tokio worker's stack lowering it. Counted here rather than inferred
+    // from the source, because the tree's depth is what this function descends.
+    let _depth = DepthGuard::enter()?;
     let expr_ref = expr;
     match expr {
         Expr::Value(value) => lower_value(&value.value, false),
@@ -2360,9 +2472,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Identifier(name)
             if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_schema") =>
         {
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-            ))))
+            Ok(plan::Expr::CurrentSchema { all: None })
         }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
@@ -2708,19 +2818,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // gap — and it did, until r1's capture replay caught it.
     if name.eq_ignore_ascii_case("current_schema") {
         refuse_wrong_arity(function, "current_schema", 0)?;
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(PUBLIC_SCHEMA.to_owned()),
-        ))));
+        return Ok(plan::Expr::CurrentSchema { all: None });
     }
-    // **The array, written out.** `= ANY (current_schemas(false))` is still expanded into an `IN`
-    // list where it is lowered — that is what lets a catalog query keep the plan it has — and this
-    // is the same value in its other spelling, for the places a list cannot go:
-    // `SELECT current_schemas(false)` and `array_length(current_schemas(false), 1)`.
-    if let Some(schemas) = schema_function(function)? {
-        let elements: Vec<Option<String>> = schemas.into_iter().map(Some).collect();
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(value::vector::Array::write(&elements)),
-        ))));
+    // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
+    // the only schema; now the value is the session's `search_path` and a lowering has no session,
+    // so it becomes an expression `crate::exec::Executor::bound` fills in. The `= ANY (…)`
+    // expansion into an `IN` list moved with it, for the same reason: the list is not known here.
+    if let Some(implicit) = schema_function(function)? {
+        return Ok(plan::Expr::CurrentSchema {
+            all: Some(implicit),
+        });
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -3230,15 +3337,15 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
             .map(lower_expr)
             .collect::<Result<Vec<_>>>()?,
         Expr::Nested(inner) => return lower_array(inner),
-        Expr::Function(function) => match schema_function(function)? {
-            Some(schemas) => schemas
-                .into_iter()
-                .map(|name| plan::Expr::Literal(plan::Literal::String(name)))
-                .collect(),
-            // Any other function is an ordinary expression whose value is an array, and the row
-            // evaluator reads it.
-            None => return Ok(None),
-        },
+        // **`current_schemas(…)` is no longer a list this lowering can see.** Its value is the
+        // session's `search_path`, which arrives at `crate::exec::Executor::bound`, so it stays an
+        // expression and the row evaluator reads it — the same road a column takes below. The
+        // `IN`-list expansion it used to get was an index-seek optimisation, and every statement
+        // that writes it reads a catalog view, which has no index to seek.
+        Expr::Function(function) => {
+            let _ = schema_function(function)?;
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),
@@ -3334,7 +3441,7 @@ fn parse_array_literal(text: &str) -> Result<Vec<Option<String>>> {
 /// `{pg_catalog,public}` — the `true` form includes the implicitly-searched catalog schema. This
 /// node has exactly one schema and no `search_path` to vary it, so both answers are constants;
 /// what would make them not constants is schema support, which is a unit of its own.
-fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<String>>> {
+fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<bool>> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
     if !function
         .name
@@ -3365,11 +3472,7 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
         }
         _ => return Err(SqlError::unsupported("current_schemas with that argument")),
     };
-    Ok(Some(if include_implicit {
-        vec!["pg_catalog".to_owned(), PUBLIC_SCHEMA.to_owned()]
-    } else {
-        vec![PUBLIC_SCHEMA.to_owned()]
-    }))
+    Ok(Some(include_implicit))
 }
 
 /// `42883` when a function is called with the wrong number of arguments.

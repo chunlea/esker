@@ -216,6 +216,21 @@ pub enum Expr {
         /// The `*` half of the pair: fold while matching.
         case_insensitive: bool,
     },
+    /// `current_schema()` and `current_schemas(bool)` — **the session\'s, resolved**.
+    ///
+    /// Not folded where the statement is lowered, because the answer is the session\'s
+    /// `search_path` and a lowering has no session. It is replaced with the value in
+    /// `crate::exec::Executor::bound`, once per statement, the way `::regclass` is — so the row
+    /// evaluator never meets one.
+    ///
+    /// **The path is answered as *resolved*, not as set**: an entry naming no schema is dropped,
+    /// which is what makes the default `"$user", public` answer `{public}`. `current_schema()` is
+    /// the first that resolves, and **NULL when none do**.
+    CurrentSchema {
+        /// `None` for the scalar `current_schema()`; `Some(implicit)` for `current_schemas`, where
+        /// `implicit` is its argument — `true` prepends `pg_catalog` and nothing else.
+        all: Option<bool>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -1413,6 +1428,8 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
+        Expr::CurrentSchema { all: None } => "current_schema",
+        Expr::CurrentSchema { .. } => "current_schemas",
         Expr::Like {
             case_insensitive: false,
             ..
