@@ -62,8 +62,22 @@ A four-column table `dc (id bigint PRIMARY KEY, keep text, gone int, tail text)`
   `DETAIL: view dcv depends on column gone of table dc` and PostgreSQL's `HINT: Use DROP ...
   CASCADE`. `DROP COLUMN gone CASCADE` drops the view and says `NOTICE: drop cascades to view dcv`.
 * `DROP COLUMN nosuch` is `42703`; `DROP COLUMN IF EXISTS nosuch` is a `NOTICE … skipping` and
-  succeeds.
-* **Dropping every column is legal.** A table with zero live columns still answers `SELECT *`.
+  succeeds. `DROP COLUMN` on a table that is not there is `42P01`.
+* **Dropping every column is legal.** A table with zero live columns still answers `SELECT *`, and
+  `SELECT count(*)` over it still counts its rows.
+
+r1's capture (`captures/pg19_drop_column.txt`, run 47's ranking) adds three that this ADR's design
+has to take as requirements rather than details:
+
+* **`remove_columns` is one statement with several clauses** —
+  `ALTER TABLE "x" DROP COLUMN "updated_at", DROP COLUMN "created_at"` — and `change_table` can put
+  an `ADD COLUMN` and a `DROP COLUMN` in the same one. A parser that takes a single action per
+  `ALTER TABLE` refuses half of the eleven files.
+* **Dropping a `serial` column drops the sequence it owned.** `dc_id_seq` is gone after
+  `DROP COLUMN "id"`, which does not follow from the statement's wording.
+* **`ActiveRecord` filters on the flag itself**: `column_definitions` says `AND NOT a.attisdropped`
+  (`postgresql_adapter.rb:1069`), so `pg_attribute` must carry the tombstone row for the adapter's
+  own query to be the one PostgreSQL answers.
 
 The shape of all of it: the column is not removed, it is **tombstoned**, and the row bytes are
 never touched.
@@ -155,8 +169,14 @@ building now rather than later.
   them, or the learner rewrites, is a decision for the columnar lane; naming it here means it is
   found rather than discovered. Until it is settled, a columnar table is the case to test first.
 
-- **The `2BP01` dependency check needs a dependency graph this node does not have.** Views are the
-  only measured dependent, so the first implementation can find them by scanning view definitions
-  for the column; if that is not possible, the honest answer is the refusal PostgreSQL gives, never
-  a silent drop of a view's source column. This is the one part of the measured behaviour that may
-  ship as a named refusal, and it must be recorded as a divergence if so.
+- **The `2BP01` dependency check needs a dependency graph this node does not have.** The line is
+  clean and is worth stating as the rule rather than as a list: **a dependent that lives on this
+  table goes silently; a dependent that lives on another object raises.** Two of the second kind are
+  measured — a view over the column, and *another table's* foreign key referencing it
+  (`DETAIL: constraint c_pu_fkey on table c depends on column u of table p`). A foreign key
+  declared **on** the dropped column is the first kind and goes silently, which is the distinction
+  r1's capture header blurs and its body settles. The first implementation can find both by
+  scanning view definitions and other tables' constraints; if it cannot, the honest answer is the
+  refusal PostgreSQL gives, never a silent drop of a view's source column. This is the one part of
+  the measured behaviour that may ship as a named refusal, and it must be recorded as a divergence
+  if so.
