@@ -1477,6 +1477,10 @@ fn convert_to(text: Option<&Datum>, encoding: Option<&Datum>) -> Result<Datum> {
     Err(SqlError::InvalidDestinationEncoding(encoding))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per catalog function; the list being in one place is what it is for"
+)]
 fn catalog_function(
     call: &crate::plan::CatalogFuncCall,
     row: &[Datum],
@@ -1573,6 +1577,31 @@ fn catalog_function(
                 None => Datum::Text(oid.to_string()),
             },
         },
+        // **The sequence a column's default draws from, schema-qualified.** Its arguments are
+        // names rather than oids, which is why it is the one catalog function here that looks a
+        // relation up by name — and a table or a column that is not there is NULL, not an error,
+        // like the rest of this surface.
+        CatalogFunc::PgGetSerialSequence => {
+            let (Some(Datum::Text(table)), Some(Datum::Text(column))) = (args.first(), args.get(1))
+            else {
+                return Ok(Datum::Null);
+            };
+            let relations = env.relations()?;
+            let sequence = relations
+                .by_name(table)
+                .and_then(|row| relations.table(row))
+                .and_then(|table| {
+                    let at = table.column(column)?;
+                    table
+                        .sequences
+                        .iter()
+                        .find(|sequence| sequence.column == Some(at))
+                });
+            match sequence {
+                Some(sequence) => Datum::Text(format!("public.{}", sequence.name)),
+                None => Datum::Null,
+            }
+        }
         CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
             env.relations()?,
             oid_argument(args.first())?,

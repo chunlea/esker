@@ -549,6 +549,13 @@ pub enum CatalogFunc {
     /// Like `pg_get_indexdef` its argument is a column, and like it, an oid that names no
     /// constraint is NULL rather than an error.
     PgGetConstraintdef,
+    /// `pg_get_serial_sequence(table, column)`: the sequence a column's default draws from.
+    ///
+    /// **Schema-qualified `text`** — `public.posts_id_seq` — where the name `ActiveRecord` then
+    /// passes to `setval` is the quoted bare name. Both resolve, and the qualified spelling is
+    /// what a real server returns. Its arguments are *names*, not oids, which is what makes it the
+    /// one catalog function here that looks a relation up by name at evaluation time.
+    PgGetSerialSequence,
     /// `col_description(oid, attnum)`: a column's comment.
     ///
     /// **Always NULL here, and that is the answer rather than a stub**: a comment is a row in
@@ -706,6 +713,9 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_get_constraintdef") => {
                 Some(CatalogFunc::PgGetConstraintdef)
             }
+            () if name.eq_ignore_ascii_case("pg_get_serial_sequence") => {
+                Some(CatalogFunc::PgGetSerialSequence)
+            }
             () if name.eq_ignore_ascii_case("col_description") => Some(CatalogFunc::ColDescription),
             () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
             () if name.eq_ignore_ascii_case("array_position") => Some(CatalogFunc::ArrayPosition),
@@ -728,6 +738,7 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => "pg_get_expr",
             CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::PgGetConstraintdef => "pg_get_constraintdef",
+            CatalogFunc::PgGetSerialSequence => "pg_get_serial_sequence",
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
@@ -761,6 +772,7 @@ impl CatalogFunc {
     pub fn arities(self) -> &'static [usize] {
         match self {
             CatalogFunc::FormatType
+            | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
             | CatalogFunc::ArrayPosition
             | CatalogFunc::ArrayLower
@@ -797,6 +809,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::DateRange
             | CatalogFunc::ColDescription
+            | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ObjDescription
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
             // is what it prints as. The one place the difference shows is the declared type.

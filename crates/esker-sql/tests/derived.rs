@@ -64,13 +64,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `sum(bigint)` is `numeric` there and `int8` here — ADR 0031, because the text agrees for
         // every input that does not overflow.
     ],
-    answers: &[(
-        "SELECT * FROM (SELECT id FROM dt_a WHERE id = a.id) AS t, dt_a a",
-        "a comma-separated `FROM` list is `0A000` naming itself and was before this unit — refused \
-         rather than lowered to a cross join, because the comma form usually means a `WHERE` was \
-         meant to join them. PostgreSQL stops one step earlier, on the `a.id` that no `LATERAL` \
-         makes visible; both refuse the statement and neither runs it.",
-    )],
+    answers: &[],
 };
 
 #[test]

@@ -929,23 +929,47 @@ impl Executor {
             ));
         }
         let mut resolved = select.clone();
+        // **Every call, wherever it sits**, and not only a bare one in the target list.
+        // `pg_typeof(setval('s', 3, true))` and `nextval('s') + 1` are both ordinary statements on
+        // a real server, and a call this pass did not reach used to arrive at the row evaluator,
+        // which has no session to draw a value from and answered `XX000`. Two passes rather than
+        // one because running a call needs `&mut self` and rewriting the tree needs `&mut expr`:
+        // the walks visit in the same order, so the nth call collected is the nth replaced.
+        let mut calls = Vec::new();
+        for item in &resolved.projection {
+            if let SelectItem::Expr { expr, .. } = item {
+                bind::descend(expr, &mut |expr: &Expr| {
+                    if let Expr::Sequence(call) = expr {
+                        calls.push(call.clone());
+                    }
+                });
+            }
+        }
+        let mut values = Vec::with_capacity(calls.len());
+        for call in &calls {
+            values.push(self.run_sequence_call(txn, call)?);
+        }
+        let mut at = 0;
         for item in &mut resolved.projection {
             let SelectItem::Expr { expr, alias } = item else {
                 continue;
             };
-            let Expr::Sequence(call) = expr else {
-                // A call *inside* a larger expression -- `nextval('s') + 1` -- needs arithmetic
-                // this crate does not have, so it is refused where the operator already is.
-                continue;
-            };
-            let value = self.run_sequence_call(txn, call)?;
-            // PostgreSQL names the column after the function, so the alias the user did not write
-            // is the one the function gives it.
-            let name = alias.clone().unwrap_or_else(|| call.func.name().to_owned());
-            *item = SelectItem::Expr {
-                expr: Expr::Literal(Literal::Typed(Box::new(Datum::Int8(value)))),
-                alias: Some(name),
-            };
+            // PostgreSQL names the column after the function, so a bare call the user did not
+            // alias takes the function's own name. A call *inside* an expression names nothing:
+            // the enclosing function does.
+            if let Expr::Sequence(call) = expr
+                && alias.is_none()
+            {
+                *alias = Some(call.func.name().to_owned());
+            }
+            bind::walk_expr_mut(expr, &mut |expr: &mut Expr| {
+                if matches!(expr, Expr::Sequence(_)) {
+                    if let Some(value) = values.get(at) {
+                        *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(*value))));
+                    }
+                    at += 1;
+                }
+            });
         }
         Ok(SelectRef::Owned(Box::new(resolved)))
     }
@@ -1509,16 +1533,11 @@ impl SelectRef<'_> {
 
 /// Whether an expression contains a sequence function anywhere in it.
 fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
-    use crate::plan::Expr;
-    match expr {
-        Expr::Sequence(_) => true,
-        Expr::Binary { left, right, .. } => has_sequence_call(left) || has_sequence_call(right),
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => has_sequence_call(operand),
-        Expr::InList { operand, list, .. } => {
-            has_sequence_call(operand) || list.iter().any(has_sequence_call)
-        }
-        _ => false,
-    }
+    let mut found = false;
+    bind::descend(expr, &mut |expr| {
+        found |= matches!(expr, crate::plan::Expr::Sequence(_));
+    });
+    found
 }
 
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the

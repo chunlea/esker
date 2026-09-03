@@ -4414,11 +4414,36 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
             }
             (Some(left), joins)
         }
-        // `FROM a, b` is a cross join in PostgreSQL, and writing it that way is how a user asks
-        // for one. Refused by name rather than lowered to a cross join, because the comma form
-        // usually means a `WHERE` was meant to join them and saying so is more useful than
-        // running the cartesian product.
-        _ => return Err(SqlError::unsupported("a comma-separated FROM list")),
+        // **`FROM a, b` is a cross join**, and it is lowered to one rather than refused. It was
+        // refused on the argument that the comma form usually means a `WHERE` was meant to join
+        // the tables and saying so is more useful than running the cartesian product — which is
+        // true of a person's typo and false of generated SQL. `ActiveRecord`'s
+        // `pk_and_sequence_for` is **five tables in one comma list** with the join conditions in
+        // the `WHERE`, and it is what `reset_pk_sequence!` calls before it can fix a sequence:
+        // run 46's largest row, 199 tests over 29 files, all stopped here.
+        //
+        // The `WHERE` does the joining either way — a cross join with an equality above it is what
+        // the comma form *means* — so nothing is approximated by writing it as one.
+        [first, rest @ ..] => {
+            let left = table_reference(&first.relation)?;
+            let mut joins = first
+                .joins
+                .iter()
+                .map(lower_join)
+                .collect::<Result<Vec<_>>>()?;
+            for entry in rest {
+                joins.push(plan::Join {
+                    table: table_reference(&entry.relation)?,
+                    kind: plan::JoinKind::Inner,
+                    on: None,
+                    using: Vec::new(),
+                });
+                for join in &entry.joins {
+                    joins.push(lower_join(join)?);
+                }
+            }
+            (Some(left), joins)
+        }
     };
 
     let projection = lower_projection(&select.projection)?;
