@@ -25,8 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Sessions;
 
 impl Executors for Sessions {
-    fn for_session(&self) -> Box<dyn Execute + Send> {
-        Box::new(NotYetExecuting)
+    fn for_session(&self, _database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+        Ok(Box::new(NotYetExecuting))
     }
 }
 
@@ -95,12 +95,51 @@ fn tags(bytes: &[u8]) -> String {
     frames(bytes).into_iter().map(|(tag, _)| tag).collect()
 }
 
+/// An `Executors` that has no such database, which is what a cluster answers a client asking for
+/// one it has never been told to create.
+struct NoSuchDatabase;
+
+impl Executors for NoSuchDatabase {
+    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+        Err(esker_sql::SqlError::UndefinedDatabase(database.to_owned()))
+    }
+}
+
+/// **The startup packet's `database` is looked up before the session begins**, so a name the
+/// cluster does not have ends the connection with `3D000` — which is exactly what `rake db:create`
+/// reads to know it has work to do.
+///
+/// The rule this pins is the ordering: the executor is made *after* the handshake, because the
+/// database it serves is not known until the packet arrives.
+#[tokio::test]
+async fn a_database_the_cluster_does_not_have_is_refused_at_startup() {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut connection = Connection::new(server, Config::default());
+        let _ = connection.run(&NoSuchDatabase).await;
+    });
+    client.write_all(&startup_packet(0, &[])).await.unwrap();
+    client.flush().await.unwrap();
+
+    let reply = read_until_ready(&mut client).await;
+    let error = frames(&reply)
+        .into_iter()
+        .find(|(tag, _)| *tag == 'E')
+        .expect("an ErrorResponse");
+    let text = String::from_utf8_lossy(&error.1).to_string();
+    assert!(text.contains("3D000"), "{text}");
+    assert!(text.contains("database \"esker\" does not exist"), "{text}");
+    // **`FATAL`, not `ERROR`**: the connection is over, and a client that read a plain `ERROR`
+    // here would go on waiting for a `ReadyForQuery` that is never coming.
+    assert!(text.contains("FATAL"), "{text}");
+}
+
 /// Runs a connection over a pipe, feeding it `input` and returning everything it wrote.
 async fn over_a_pipe(input: Vec<u8>) -> Vec<u8> {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(Box::new(NotYetExecuting)).await;
+        let _ = connection.run(&Sessions).await;
     });
     client.write_all(&input).await.unwrap();
     client.flush().await.unwrap();
@@ -164,7 +203,7 @@ async fn an_ssl_request_is_refused_and_the_connection_continues() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(Box::new(NotYetExecuting)).await;
+        let _ = connection.run(&Sessions).await;
     });
 
     let mut ssl_request = 8u32.to_be_bytes().to_vec();
@@ -188,7 +227,7 @@ async fn a_statement_is_refused_by_name_and_the_session_carries_on() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(Box::new(NotYetExecuting)).await;
+        let _ = connection.run(&Sessions).await;
     });
     client.write_all(&startup_packet(0, &[])).await.unwrap();
     read_until_ready(&mut client).await;
@@ -517,11 +556,10 @@ impl RealSessions {
 }
 
 impl Executors for RealSessions {
-    fn for_session(&self) -> Box<dyn Execute + Send> {
-        Box::new(esker_sql::exec::Executor::new(
-            Arc::clone(&self.backend),
-            Arc::clone(&self.catalog),
-            1,
+    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+        Ok(Box::new(
+            esker_sql::exec::Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), 1)
+                .serving_database(database),
         ))
     }
 }

@@ -2144,6 +2144,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Column { name, .. } => name.clone(),
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
+        Expr::CurrentDatabase => "current_database()".to_owned(),
         Expr::CurrentSchema {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),

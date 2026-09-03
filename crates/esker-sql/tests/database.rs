@@ -192,3 +192,87 @@ fn every_option_postgresql_takes_is_refused_by_name_and_never_as_syntax() {
     node.run("CREATE DATABASE IF NOT EXISTS d").unwrap();
     node.run("DROP DATABASE d").unwrap();
 }
+
+/// **Two databases on one cluster are two tenants, and the isolation is the key encoding rather
+/// than a check.**
+///
+/// This is the whole of what run 46's seventh row needs: `schema.rb` creates `dogs` with four
+/// association columns on `arunit` and a bare `dogs` on `arunit2`, and against one namespace the
+/// second `create_table … force: true` drops and recreates the first. Here it does not, because
+/// `'t' ++ tenant ++ table_id` puts them in different key ranges.
+#[test]
+fn two_databases_hold_two_tables_of_one_name() {
+    use std::sync::Arc;
+
+    let backend: Arc<dyn esker_sql::backend::Backend> =
+        Arc::new(esker_sql::backend::MemoryBackend::new());
+    let catalog = Arc::new(esker_sql::catalog::Catalog::new());
+
+    let mut arunit = parity::Node::on(Arc::clone(&backend), Arc::clone(&catalog), 1, SERVING, &[]);
+    arunit.run("CREATE DATABASE arunit2").unwrap();
+    let id: u64 = arunit.rows("SELECT oid FROM pg_database WHERE datname = 'arunit2'")[0][0]
+        .parse()
+        .unwrap();
+    let mut arunit2 = parity::Node::on(backend, catalog, id, "arunit2", &[]);
+
+    arunit
+        .run("CREATE TABLE dogs (id bigserial primary key, trainer_id integer, alias varchar)")
+        .unwrap();
+    // The last line of `schema.rb`, on the other connection. On a node with one namespace this is
+    // a `DROP TABLE` of the four-column `dogs` above; here it is a table of its own.
+    arunit2.run("DROP TABLE IF EXISTS dogs").unwrap();
+    arunit2
+        .run("CREATE TABLE dogs (id bigserial primary key)")
+        .unwrap();
+
+    assert_eq!(
+        arunit.rows(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'dogs'::regclass AND attnum > 0"
+        ),
+        vec![vec!["3".to_owned()]],
+        "the fixture's columns are still there — the failure the 103 tests report is this number \
+         going to 1"
+    );
+    assert_eq!(
+        arunit2.rows(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'dogs'::regclass AND attnum > 0"
+        ),
+        vec![vec!["1".to_owned()]]
+    );
+
+    // Rows do not cross either, and neither does a name: each session sees its own `dogs`.
+    arunit
+        .run("INSERT INTO dogs (trainer_id, alias) VALUES (1, 'rex')")
+        .unwrap();
+    assert_eq!(
+        arunit.rows("SELECT count(*) FROM dogs"),
+        vec![vec!["1".to_owned()]]
+    );
+    assert_eq!(
+        arunit2.rows("SELECT count(*) FROM dogs"),
+        vec![vec!["0".to_owned()]]
+    );
+
+    // **`current_database()` is the session's, not the server's.** A constant here would report
+    // `esker` to the second session, which is a wrong answer rather than a missing feature.
+    assert_eq!(
+        arunit.rows("SELECT current_database()"),
+        vec![vec![SERVING.to_owned()]]
+    );
+    assert_eq!(
+        arunit2.rows("SELECT current_database()"),
+        vec![vec!["arunit2".to_owned()]]
+    );
+    // And `pg_database` is the cluster's, so both sessions see both — which is what makes
+    // `WHERE datname = current_database()` pick out the right row on each.
+    for node in [&mut arunit, &mut arunit2] {
+        assert_eq!(
+            node.rows("SELECT count(*) FROM pg_database"),
+            vec![vec!["2".to_owned()]]
+        );
+    }
+    assert_eq!(
+        arunit2.rows("SELECT datname FROM pg_database WHERE datname = current_database()"),
+        vec![vec!["arunit2".to_owned()]]
+    );
+}

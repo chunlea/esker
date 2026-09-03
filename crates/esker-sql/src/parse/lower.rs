@@ -2905,15 +2905,14 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         refuse_wrong_arity(function, "current_schema", 0)?;
         return Ok(plan::Expr::CurrentSchema { all: None });
     }
-    // **The database this node has.** Folded here like `current_schema()` because it is the same
-    // kind of answer: a constant of the server, not a property of the row. `ActiveRecord`'s adapter
-    // runs it four times while connecting — once alone and three times joined to `pg_database` for
-    // the encoding, the collation and the ctype.
+    // **The database this session is connected to.** Left unresolved here exactly as
+    // `current_schema()` is, and for the same reason: the answer is a property of the session and
+    // a lowering has no session. `ActiveRecord`'s adapter runs it four times while connecting —
+    // once alone and three times joined to `pg_database` for the encoding, the collation and the
+    // ctype.
     if name.eq_ignore_ascii_case("current_database") {
         refuse_wrong_arity(function, "current_database", 0)?;
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(DATABASE_NAME.to_owned()),
-        ))));
+        return Ok(plan::Expr::CurrentDatabase);
     }
     // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
     // the only schema; now the value is the session's `search_path` and a lowering has no session,

@@ -41,16 +41,24 @@ struct Sessions {
 }
 
 impl Executors for Sessions {
-    fn for_session(&self) -> Box<dyn Execute + Send> {
+    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+        // **The directory decides the tenant**, and it is read once per connection rather than
+        // per statement: the answer cannot change under a session, because dropping the database
+        // it is serving is `55006` (ADR 0052).
+        let txn = self.backend.begin()?;
+        let tenant = esker_sql::catalog::database_id(&*txn, database)?
+            .ok_or_else(|| esker_sql::SqlError::UndefinedDatabase(database.to_owned()))?;
+        let _ = txn.rollback();
         let mut executor =
-            Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT);
+            Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), tenant)
+                .serving_database(database);
         if let Some(report) = &self.columnar {
             executor = executor.reporting_columnar_to(Arc::clone(report));
         }
         if let Some(source) = &self.fragments {
             executor = executor.asking_fragments_of(Arc::clone(source));
         }
-        Box::new(executor)
+        Ok(Box::new(executor))
     }
 }
 
