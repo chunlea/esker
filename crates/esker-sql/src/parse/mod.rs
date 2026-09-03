@@ -512,18 +512,22 @@ pub(crate) fn parse_exclude_constraint(
             crate::catalog::fold_identifier(unquoted.unwrap_or(name), unquoted.is_some()).0
         });
 
-    // `USING <method>`.
+    // `USING <method>`, **optional** — and its absence is not the same as `USING gist`. Written
+    // without one the constraint gets a btree, which the check below then refuses; treating the
+    // missing clause as a parse failure made that refusal a `0A000` naming the whole constraint
+    // instead of the `42809` naming the operator, which is what a real server answers.
     let after = clause.get(exclude_at + "EXCLUDE".len()..).ok_or_else(bad)?;
     let after = after.trim_start();
-    let method_rest = after
+    let method: String = after
         .get("USING".len()..)
         .filter(|_| after.to_ascii_uppercase().starts_with("USING"))
-        .ok_or_else(bad)?;
-    let method: String = method_rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
+        .map(|rest| {
+            rest.trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        })
+        .unwrap_or_default();
 
     // `(<expr> WITH <op>)`, whose parentheses the stripper already balanced.
     let open = clause.find('(').ok_or_else(bad)?;
