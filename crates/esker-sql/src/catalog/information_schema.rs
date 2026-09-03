@@ -146,6 +146,14 @@ pub fn table_constraints(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> 
         let (Some(Datum::Text(name)), Some(Datum::Text(contype))) = (row.get(1), row.get(3)) else {
             continue;
         };
+        // **An `EXCLUDE` constraint is not listed at all.** Measured on 19beta1: a table with
+        // three of them returns two rows here, the primary key and the `bigserial`'s not-null.
+        // The standard has no exclusion constraint, so PostgreSQL leaves it out rather than
+        // reporting it under one of the four names — and anything reading exclusions has to read
+        // `pg_constraint`, where `contype = 'x'`.
+        if contype == "x" {
+            continue;
+        }
         let Some(Datum::Int8(conrelid)) = row.get(7) else {
             continue;
         };
@@ -208,6 +216,8 @@ fn constraint_type(contype: &str) -> &'static str {
         "p" => "PRIMARY KEY",
         "u" => "UNIQUE",
         "f" => "FOREIGN KEY",
+        // `x` never reaches here — an exclusion constraint is filtered out above, because the
+        // standard has no such thing and PostgreSQL omits it rather than renaming it.
         _ => "CHECK",
     }
 }

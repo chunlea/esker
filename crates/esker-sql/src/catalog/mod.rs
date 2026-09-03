@@ -800,6 +800,53 @@ pub struct ExcludeDef {
     pub deferred: bool,
 }
 
+/// Each operand of a top-level `AND`/`OR` chain in its own parentheses — PostgreSQL's rule for
+/// re-printing a boolean expression.
+///
+/// `a IS NOT NULL AND b IS NOT NULL` comes back `(a IS NOT NULL) AND (b IS NOT NULL)`; a predicate
+/// that is a single comparison is returned unchanged, which is why `CHECK ((p > 0))` has only the
+/// two pairs `pg_get_constraintdef` adds around it. Measured, both.
+///
+/// Split on the **top level only**: a keyword inside parentheses or inside a string literal is
+/// part of an operand, not a separator.
+pub(crate) fn parenthesised_operands(predicate: &str) -> String {
+    let bytes = predicate.as_bytes();
+    let upper = predicate.to_ascii_uppercase();
+    let upper = upper.as_bytes();
+    let mut operands = Vec::new();
+    let mut separators = Vec::new();
+    let (mut depth, mut quoted, mut start, mut at) = (0_i32, false, 0, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ if quoted || depth != 0 => {}
+            _ => {
+                for keyword in [" AND ", " OR "] {
+                    if upper[at..].starts_with(keyword.as_bytes()) {
+                        operands.push(predicate[start..at].trim());
+                        separators.push(keyword.trim());
+                        start = at + keyword.len();
+                        at += keyword.len() - 1;
+                        break;
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+    if operands.is_empty() {
+        return predicate.to_owned();
+    }
+    operands.push(predicate[start..].trim());
+    let mut out = format!("({})", operands[0]);
+    for (operand, separator) in operands[1..].iter().zip(&separators) {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} ({operand})"));
+    }
+    out
+}
+
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at
 /// something.
 #[derive(Debug, Clone, PartialEq, Eq)]

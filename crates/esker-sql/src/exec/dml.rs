@@ -433,6 +433,7 @@ pub(super) fn write_row(
     // The row it points at has to exist, and this is where a `CHECK` is enforced too — before
     // anything is stored, so a violation leaves nothing behind.
     super::foreign_key::check_references(executor, txn, table, row)?;
+    check_exclusions(executor, txn, table, row)?;
 
     for index in &table.indexes {
         // **Write-only and public write an entry; delete-only and absent do not.** One state later
@@ -772,6 +773,102 @@ fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
         row[at] = cursor::evaluate(&resolved, row)?;
     }
     Ok(())
+}
+
+/// Every `EXCLUDE` constraint on the table, against the row about to be written.
+///
+/// **A scan, not an index.** A real server backs an exclusion constraint with a `GiST` index and
+/// probes it; this node records `USING gist` and has no `GiST`, so it reads the table and compares
+/// the key against every stored row's. That is O(rows) per write and honest about it — the
+/// alternative is an access method, which is a phase of its own. The catalog still reports the
+/// index as `gist` with `indisexclusion`, because that is what the constraint *is*.
+///
+/// **Called from [`write_row`], which is after the old row is gone.** An `UPDATE` removes and
+/// re-writes, so the row being moved is not in the table when its new key is checked and cannot
+/// conflict with itself — measured: moving `end_date` forward is accepted where the new range
+/// still overlaps the old one.
+///
+/// **A row the `WHERE` rejects is not in the index at all**, so it neither conflicts nor is
+/// conflicted with. That is what makes the suite's NULL rows legal — and identical rows too.
+fn check_exclusions(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    row: &[Datum],
+) -> Result<()> {
+    if table.excludes.is_empty() {
+        return Ok(());
+    }
+    let scope = query::Scope::single(table);
+    let stored = |text: &str, what: &str| -> Result<crate::plan::Expr> {
+        let parsed = crate::parse::parse_stored_expr(text).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored EXCLUDE {what} of {} no longer parses: {error}",
+                table.name
+            ))
+        })?;
+        query::resolve(&parsed, &scope)
+    };
+
+    for exclude in &table.excludes {
+        // The predicate first: a row it rejects is not in the index, so nothing else is evaluated.
+        // NULL is not true, and only true puts the row in — the opposite of a `CHECK`'s rule.
+        if let Some(predicate) = &exclude.predicate
+            && !matches!(
+                cursor::evaluate(&stored(predicate, "WHERE")?, row)?,
+                Datum::Bool(true)
+            )
+        {
+            continue;
+        }
+        let key = stored(&exclude.key, "key")?;
+        let value = cursor::evaluate(&key, row)?;
+        // A NULL key overlaps nothing, the way a NULL does everywhere else.
+        if matches!(value, Datum::Null) {
+            continue;
+        }
+        for existing in collect(executor, &*txn, None, table)? {
+            if let Some(predicate) = &exclude.predicate
+                && !matches!(
+                    cursor::evaluate(&stored(predicate, "WHERE")?, &existing)?,
+                    Datum::Bool(true)
+                )
+            {
+                continue;
+            }
+            let against = cursor::evaluate(&key, &existing)?;
+            // `&&` is the only operator this node has, and it is decided by the same
+            // `DateRange::overlaps` the SQL operator is — so what the catalog records is what is
+            // enforced. Any other operator was refused when the constraint was read.
+            if overlap(&value, &against) {
+                return Err(SqlError::ExclusionViolation {
+                    constraint: exclude.name.clone(),
+                    key: exclude.key.clone(),
+                    // Neither is NULL: a NULL key was skipped above, and a NULL never overlaps.
+                    value: value.to_text().unwrap_or_default(),
+                    existing: against.to_text().unwrap_or_default(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two keys under `&&`. Anything that is not a range is not a conflict — the parser refused every
+/// other operator, so a non-range here would be a key expression of some other type entirely.
+fn overlap(left: &Datum, right: &Datum) -> bool {
+    match (left, right) {
+        (Datum::Text(left), Datum::Text(right)) => {
+            match (
+                crate::value::range::DateRange::from_text(left),
+                crate::value::range::DateRange::from_text(right),
+            ) {
+                (Some(left), Some(right)) => left.overlaps(right),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {

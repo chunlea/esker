@@ -272,15 +272,26 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
     let mut cascaded = 0_usize;
     let mut type_mismatched = Vec::new();
     let mut agreed_after_all = Vec::new();
+    // **One entry, however many times the statement appears.** A capture can run the same text
+    // twice and expect two different answers — an insert under an immediate constraint and the
+    // same insert under a deferred one — and the entry that covers the second is not stale merely
+    // because the first now agrees. So rule 2 is decided per *entry* after the whole file: an
+    // entry fails only when **every** occurrence agreed. `(entry, line, statement)`.
+    let mut listed_agreements: Vec<(usize, usize, String)> = Vec::new();
+    let mut listed_seen: Vec<usize> = Vec::new();
 
     for (line_number, statement, expected) in parse(corpus) {
-        let listed = divergences.answers.iter().any(|(sql, _)| *sql == statement);
+        let listed = divergences
+            .answers
+            .iter()
+            .position(|(sql, _)| *sql == statement);
         let actual = node.answer(&statement);
         checked += 1;
 
-        if listed {
+        if let Some(entry) = listed {
+            listed_seen.push(entry);
             if actual == expected {
-                agreed_after_all.push(format!("line {line_number}: {statement}"));
+                listed_agreements.push((entry, line_number, statement.clone()));
             }
             continue;
         }
@@ -348,6 +359,22 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
         type_mismatched.len(),
         type_mismatched.join("\n\n")
     );
+    // Rule 2, decided per entry: an entry is stale only when **every** occurrence of its statement
+    // agreed. One that still covers a second occurrence stays.
+    for (at, (sql, _)) in divergences.answers.iter().enumerate() {
+        let occurrences = listed_seen.iter().filter(|&&seen| seen == at).count();
+        let agreements = listed_agreements
+            .iter()
+            .filter(|(entry, ..)| *entry == at)
+            .count();
+        if occurrences > 0 && agreements == occurrences {
+            let line = listed_agreements
+                .iter()
+                .find(|(entry, ..)| *entry == at)
+                .map_or(0, |(_, line, _)| *line);
+            agreed_after_all.push(format!("line {line}: {sql}"));
+        }
+    }
     assert!(
         agreed_after_all.is_empty(),
         "{} statements are listed as divergences and now agree with PostgreSQL -- delete the \

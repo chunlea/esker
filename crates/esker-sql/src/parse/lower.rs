@@ -2141,6 +2141,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::GtEq => plan::BinaryOp::GtEq,
                 BinaryOperator::And => plan::BinaryOp::And,
                 BinaryOperator::Or => plan::BinaryOp::Or,
+                // **`&&` is carried as a call, not as a comparison.** Two ranges are not ordered
+                // — `pg_cmp` says nothing about them — so it cannot be a `BinaryOp`, and every
+                // walker already descends into a call's arguments
+                // (`crate::plan::expr::CatalogFunc::RangeOverlaps`).
+                BinaryOperator::PGOverlap => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::RangeOverlaps,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 other => {
                     return Err(SqlError::unsupported(format!("the operator {other}")));
                 }

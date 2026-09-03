@@ -103,6 +103,10 @@ pub const NOT_NULL_VIOLATION: &str = "23502";
 pub const UNIQUE_VIOLATION: &str = "23505";
 /// A row a `CHECK` constraint refuses.
 pub const CHECK_VIOLATION: &str = "23514";
+/// Class 23 — a row two `EXCLUDE` keys conflict over. **Not `23505`**: a unique index refuses an
+/// equal key, an exclusion constraint refuses one an operator relates, and PostgreSQL keeps them
+/// apart so a client can tell which kind of index it hit.
+pub const EXCLUSION_VIOLATION: &str = "23P01";
 /// A row that points at a parent row that is not there, and a parent row something still points
 /// at. **One code for both directions**, which is why the two messages differ so much: the second
 /// names the child table as well as the parent.

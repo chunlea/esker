@@ -329,6 +329,36 @@ fn strip_exclude_constraints(sql: &str, scanned: &Scan<'_>) -> Option<(String, V
     Some((kept, clauses))
 }
 
+/// The last `CONSTRAINT` **keyword** in `prefix`, ignoring the word inside an identifier.
+///
+/// A plain `rfind` is wrong here and the statement this unit exists for is what proves it:
+/// `CONSTRAINT "test_exclusion_constraints_date_overlap"` contains the letters `constraint` inside
+/// its own quoted name, later than the keyword, so backing up to the last match cut the name in
+/// half and left an unterminated quote. Both boundaries are checked and quoted text is skipped.
+fn last_constraint_keyword(prefix: &str) -> Option<usize> {
+    const KEYWORD: &str = "CONSTRAINT";
+    let bytes = prefix.as_bytes();
+    let word = |byte: Option<&u8>| byte.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    let (mut found, mut quoted, mut literal, mut at) = (None, false, false, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' if !literal => quoted = !quoted,
+            b'\'' if !quoted => literal = !literal,
+            _ if quoted || literal => {}
+            _ if prefix.get(at..)?.starts_with(KEYWORD)
+                && !word(at.checked_sub(1).and_then(|before| bytes.get(before)))
+                && !word(bytes.get(at + KEYWORD.len())) =>
+            {
+                found = Some(at);
+                at += KEYWORD.len() - 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
 /// The byte range of one `EXCLUDE` table constraint, starting at or after `from`.
 ///
 /// The clause runs from its `CONSTRAINT` keyword — or from `EXCLUDE` when it has no name — to the
@@ -336,20 +366,19 @@ fn strip_exclude_constraints(sql: &str, scanned: &Scan<'_>) -> Option<(String, V
 /// optional `DEFERRABLE …`. Anything after that is the next table item or the closing paren.
 fn find_exclude_clause(upper: &str, bytes: &[u8], from: usize) -> Option<(usize, usize)> {
     let keyword = upper.get(from..)?.find("EXCLUDE")? + from;
-    // `EXCLUDE USING`, which is what a table constraint always writes — a window frame's
-    // `EXCLUDE CURRENT ROW` and `UNPIVOT`'s `EXCLUDE NULLS` never do.
+    // `EXCLUDE USING <am> (…)` or a bare `EXCLUDE (…)`, which is what a table constraint writes —
+    // a window frame's `EXCLUDE CURRENT ROW` and `UNPIVOT`'s `EXCLUDE NULLS` write neither.
+    //
+    // **The bare form is not a shortcut for `USING gist`.** It defaults to btree and a real server
+    // then refuses it; the point of parsing it is to reach that refusal rather than a syntax error
+    // (`parse_exclude_constraint`).
     let after_keyword = keyword + "EXCLUDE".len();
-    if !upper
-        .get(after_keyword..)?
-        .trim_start()
-        .starts_with("USING")
-    {
+    let after = upper.get(after_keyword..)?.trim_start();
+    if !after.starts_with("USING") && !after.starts_with('(') {
         return None;
     }
     // Back up over a `CONSTRAINT <name>` that names it, so the name is cut out with the clause.
-    let start = upper
-        .get(..keyword)?
-        .rfind("CONSTRAINT")
+    let start = last_constraint_keyword(upper.get(..keyword)?)
         .filter(|&at| {
             // Only if nothing but the name lies between: a `CONSTRAINT` belonging to an earlier
             // item has a comma after it.
@@ -497,6 +526,23 @@ pub(crate) fn parse_exclude_constraint(
     // Through the real parser: a key this crate cannot read is a refusal here rather than a
     // surprise at the first insert.
     lower::parse_expr_text(&key)?;
+    // **`USING gist` is load-bearing, not decoration.** Written without one, or with `USING btree`
+    // spelled out, the constraint gets a btree — and `&&` is not in `range_ops`, which is what a
+    // real server says, in those words, for both spellings. Measured: the two are indistinguishable
+    // in the answer, which is how you can tell what the default was.
+    if !method.eq_ignore_ascii_case("gist") {
+        return Err(SqlError::ExclusionOperatorNotInFamily {
+            operator: format!("{operator}(anyrange,anyrange)"),
+            family: "range_ops".to_owned(),
+        });
+    }
+    // `&&` is the operator this node enforces, through `crate::value::range`. Any other is a
+    // refusal by name rather than a constraint that would admit a row a real server refuses.
+    if operator != "&&" {
+        return Err(SqlError::unsupported(format!(
+            "an EXCLUDE constraint WITH {operator}"
+        )));
+    }
 
     // `WHERE (<predicate>)`, one more balanced group.
     let tail = clause.get(close..).ok_or_else(bad)?;
@@ -955,7 +1001,10 @@ const UNSUPPORTED: &[Unsupported] = &[
         &[ANY, "OF"],
     ),
     u("CREATE UNLOGGED TABLE", &["CREATE", "UNLOGGED"], &[]),
-    u("an EXCLUDE constraint", &[], &["EXCLUDE", "USING"]),
+    // **`CREATE TABLE` is not here**: an `EXCLUDE` constraint is cut out of the source and read on
+    // its own (`strip_exclude_constraints`). What stays a refusal is `ALTER TABLE ... ADD
+    // CONSTRAINT ... EXCLUDE`, which has no such path.
+    u("an EXCLUDE constraint", &["ALTER", "TABLE"], &["EXCLUDE"]),
     u(
         "CREATE TABLE ... LIKE",
         &["CREATE", "TABLE"],

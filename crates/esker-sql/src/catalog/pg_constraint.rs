@@ -96,6 +96,37 @@ fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
     format!("{{{}}}", numbers.join(","))
 }
 
+/// Where an `EXCLUDE` constraint's synthetic oid starts: the fifth region.
+///
+/// An exclusion constraint is not a relation on this node — its `USING gist` index is recorded and
+/// never built — so like a `CHECK` it has no relation oid to borrow, and the table plus its
+/// position in `TableDef::excludes` is what identifies it. Below `FOREIGN_KEY_OID_BASE` and far
+/// above a tenant's relation ids, so the five regions cannot collide.
+const EXCLUDE_OID_BASE: u64 = 0x0800_0000_0000_0000;
+
+/// Bits reserved for an exclusion's position within its table, mirroring [`CHECK_INDEX_BITS`].
+const EXCLUDE_INDEX_BITS: u32 = 16;
+
+/// The oid of the `at`-th `EXCLUDE` on `table_id`.
+///
+/// **Shared with its index relation** ([`pg_relations::RelKind::Exclusion`]): the constraint *is*
+/// its index here, the arrangement a primary key and a `UNIQUE` constraint already have.
+pub(super) fn exclude_oid(table_id: u64, at: usize) -> i64 {
+    let at = u64::try_from(at).unwrap_or(0);
+    i64::try_from(EXCLUDE_OID_BASE + (table_id << EXCLUDE_INDEX_BITS) + at).unwrap_or(i64::MAX)
+}
+
+/// The table and position an `EXCLUDE` oid names, or `None` for an oid outside that region.
+fn exclude_of(oid: i64) -> Option<(u64, usize)> {
+    let oid = u64::try_from(oid).ok()?;
+    let below = oid.checked_sub(EXCLUDE_OID_BASE)?;
+    if below >= FOREIGN_KEY_OID_BASE - EXCLUDE_OID_BASE {
+        return None;
+    }
+    let at = usize::try_from(below & ((1 << EXCLUDE_INDEX_BITS) - 1)).ok()?;
+    Some((below >> EXCLUDE_INDEX_BITS, at))
+}
+
 /// How many bits the attnum occupies at the bottom of a `NOT NULL` constraint's oid.
 const NOT_NULL_COLUMN_BITS: u32 = 16;
 
@@ -157,11 +188,12 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 Datum::Text(constraint.name),
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(constraint.contype.to_owned()),
-                // `condeferrable` is what was written; `condeferred` is **always `f`**, because
-                // `INITIALLY DEFERRED` is refused by name and `DEFERRABLE INITIALLY IMMEDIATE` —
-                // the only deferrable form here — is `t`/`f` on a real server too. Measured.
+                // `condeferrable` is what was written, and `condeferred` too — an `EXCLUDE` is the
+                // one constraint here that can carry `INITIALLY DEFERRED`, which it **records and
+                // does not yet honour**: the check runs at the statement. Everything else is
+                // `INITIALLY IMMEDIATE` because `INITIALLY DEFERRED` is refused by name on it.
                 Datum::Bool(constraint.condeferrable),
-                Datum::Bool(false),
+                Datum::Bool(constraint.condeferred),
                 // Every constraint here is validated: there is no `NOT VALID` to leave one behind.
                 Datum::Bool(true),
                 Datum::Int8(relation.oid),
@@ -245,6 +277,13 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
     {
         return Datum::Text(foreign_key_definition(relations, table, key));
     }
+    // An `EXCLUDE`: the oid is the table and the constraint's position in its list.
+    if let Some((table_id, at)) = exclude_of(oid)
+        && let Some(table) = table_of(relations, table_id)
+        && let Some(exclude) = table.excludes.get(at)
+    {
+        return Datum::Text(exclude_definition(exclude));
+    }
     // A `NOT NULL`: the oid is the table and the column, and this is where it is read back.
     let Some((table_id, attnum)) = not_null_of(oid) else {
         return Datum::Null;
@@ -280,9 +319,12 @@ struct Constraint {
     /// A `FOREIGN KEY`'s columns, or `None` for every other kind.
     foreign: Option<ForeignColumns>,
     /// `condeferrable`. A `UNIQUE` constraint carries it as well as a `FOREIGN KEY`, and it says
-    /// nothing about *when* the check runs here — `INITIALLY DEFERRED` is refused by name, so
-    /// every constraint this node holds is checked at the statement.
+    /// nothing about *when* the check runs here — every constraint this node holds is checked at
+    /// the statement.
     condeferrable: bool,
+    /// `condeferred` — `INITIALLY DEFERRED`, which only an `EXCLUDE` can carry here. Recorded and
+    /// not yet honoured; see [`crate::catalog::ExcludeDef::deferred`].
+    condeferred: bool,
 }
 
 /// What a `FOREIGN KEY` row carries that no other constraint does.
@@ -309,6 +351,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: Some(attnum_vector(table, &[at])),
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         })
         .collect();
     if !table.primary_key_name.is_empty() {
@@ -326,6 +369,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: Some(attnum_vector(table, &table.primary_key)),
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         });
     }
     // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
@@ -339,6 +383,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: None,
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         });
     }
     // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint
@@ -366,6 +411,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
                 }),
             }),
             condeferrable: key.deferrable,
+            condeferred: false,
         });
     }
     // `UNIQUE`, contype `u`. **Only an index a constraint made**: `CREATE UNIQUE INDEX` builds an
@@ -390,9 +436,60 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: index.key_columns().map(|keys| attnum_vector(table, &keys)),
             foreign: None,
             condeferrable: kind == UniqueKind::Deferrable,
+            condeferred: false,
+        });
+    }
+    // `EXCLUDE`, contype `x`. The constraint **is** its index, so the oid and `conindid` are one
+    // value — the arrangement a primary key and a `UNIQUE` constraint already have here. The
+    // **operator lives only in this row**, which is what makes `pg_constraint` the one place an
+    // exclusion can be read from: `pg_get_indexdef` prints no `WITH &&`, measured.
+    for (at, exclude) in table.excludes.iter().enumerate() {
+        let oid = exclude_oid(table.id, at);
+        out.push(Constraint {
+            oid,
+            name: exclude.name.clone(),
+            contype: "x",
+            conindid: oid,
+            // The key is an expression, not a column, so there is nothing to name — the reading a
+            // `CHECK`'s `conkey` takes, and for the same reason.
+            conkey: None,
+            foreign: None,
+            condeferrable: exclude.deferrable,
+            condeferred: exclude.deferred,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// `EXCLUDE USING gist (daterange(a, b) WITH &&) WHERE (((…))) DEFERRABLE INITIALLY DEFERRED`.
+///
+/// **Triple parentheses around the `WHERE`**, and they are not a typo: PostgreSQL prints the
+/// predicate with each operand parenthesised, wraps that, and `pg_get_constraintdef` wraps it
+/// again — where `pg_get_indexdef` stops one level earlier. Written
+/// `WHERE (a IS NOT NULL AND b IS NOT NULL)`, it comes back
+/// `WHERE (((a IS NOT NULL) AND (b IS NOT NULL)))`. Three spellings of one predicate, measured.
+///
+/// `DEFERRABLE INITIALLY IMMEDIATE` prints as bare `DEFERRABLE` — the same "keep only what differs
+/// from the default" rule a deferrable `UNIQUE` follows.
+fn exclude_definition(exclude: &crate::catalog::ExcludeDef) -> String {
+    let mut out = format!(
+        "EXCLUDE USING {} ({} WITH {})",
+        exclude.method, exclude.key, exclude.operator
+    );
+    if let Some(predicate) = &exclude.predicate {
+        let _ = write!(
+            out,
+            " WHERE (({}))",
+            super::parenthesised_operands(predicate)
+        );
+    }
+    if exclude.deferrable {
+        out.push_str(" DEFERRABLE");
+        if exclude.deferred {
+            out.push_str(" INITIALLY DEFERRED");
+        }
+    }
     out
 }
 

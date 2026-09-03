@@ -912,6 +912,28 @@ impl Env<'_> {
 }
 
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
+/// A range argument, or `None` for NULL — and `42883` for a value that is not one.
+fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::DateRange>> {
+    match value {
+        Some(Datum::Null) | None => Ok(None),
+        Some(Datum::Text(text)) => match crate::value::range::DateRange::from_text(text) {
+            Some(range) => Ok(Some(range)),
+            None => Err(SqlError::UndefinedOperator {
+                op: "&&",
+                left: "text",
+                right: "text",
+            }),
+        },
+        Some(other) => Err(SqlError::UndefinedOperator {
+            op: "&&",
+            left: other
+                .column_type()
+                .map_or("unknown", crate::value::PgType::name),
+            right: "unknown",
+        }),
+    }
+}
+
 /// A `LIKE` operand as text, or `None` for NULL — and `42883` for anything that is not a string.
 ///
 /// **A number has no `LIKE` operator**: `100 LIKE '1%'` is
@@ -1464,6 +1486,40 @@ fn catalog_function(
         | CatalogFunc::PgGetPartkeydef => Datum::Null,
         // **`EXECUTE PROCEDURE` prints back as `EXECUTE FUNCTION`**, so the text out is not the
         // text in — statement 762 writes the first spelling and statement 790 the second.
+        // **`daterange(low, high)`** — a NULL bound is *unbounded*, not NULL, so the call answers a
+        // range either way and is never NULL itself. That is the fact that makes
+        // `daterange(NULL, NULL)` overlap everything rather than nothing.
+        CatalogFunc::DateRange => {
+            // A bare `'2026-01-01'` reaches here as text, the way an unknown literal reaches a
+            // real server's `daterange(unknown, unknown)` — so it is coerced rather than refused.
+            let day = |value: Option<&Datum>| match value {
+                Some(Datum::Date(day)) => Ok(Some(*day)),
+                Some(Datum::Null) | None => Ok(None),
+                Some(Datum::Text(text)) => Ok(Some(crate::value::date::from_text(text, 0)?)),
+                Some(other) => Err(SqlError::UndefinedFunctionTypes(format!(
+                    "daterange({})",
+                    other
+                        .column_type()
+                        .map_or("unknown", crate::value::PgType::name)
+                ))),
+            };
+            Datum::Text(
+                crate::value::range::DateRange::new(day(args.first())?, day(args.get(1))?)
+                    .to_text(),
+            )
+        }
+        CatalogFunc::IsEmpty => match range_argument(args.first())? {
+            None => Datum::Null,
+            Some(range) => Datum::Bool(range.empty),
+        },
+        // Strict on both sides: a NULL range makes the answer unknown, the way every other
+        // operator over a NULL does.
+        CatalogFunc::RangeOverlaps => {
+            match (range_argument(args.first())?, range_argument(args.get(1))?) {
+                (Some(left), Some(right)) => Datum::Bool(left.overlaps(right)),
+                _ => Datum::Null,
+            }
+        }
         CatalogFunc::PgGetTriggerdef => {
             crate::catalog::trigger_definition(env.relations()?, oid_argument(args.first())?)
         }
