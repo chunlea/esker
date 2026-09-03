@@ -1009,7 +1009,7 @@ fn plan_chain(
     // The first table's own conjuncts, before a single pair has been built. This is the step that
     // matters most in a comma list: `seq.relkind = 'S'` here is the difference between joining
     // every relation and joining the sequences.
-    node = pushdown(node, &mut pending, &entries[..1], enclosing)?;
+    node = pushdown(node, &mut pending, &entries[..1], enclosing);
 
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
@@ -1048,7 +1048,7 @@ fn plan_chain(
             .iter()
             .any(|join| join.kind == crate::plan::JoinKind::Left)
         {
-            node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing)?;
+            node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing);
         }
     }
 
@@ -1139,14 +1139,14 @@ fn is_pushable(expr: &Expr) -> bool {
 /// a table further right, and it stays pending for a later step or for the filter on top, which is
 /// where a genuinely undefined column is reported against the whole scope with the message it
 /// always had. Nothing is pushed on a failure, so no error is swallowed and none is moved.
-fn pushdown<'a>(
+fn pushdown(
     node: Node,
-    pending: &mut Vec<&'a Expr>,
+    pending: &mut Vec<&Expr>,
     entries: &[(&TableDef, String)],
     enclosing: Option<&Scope<'_>>,
-) -> Result<Node> {
+) -> Node {
     if pending.is_empty() {
-        return Ok(node);
+        return node;
     }
     let scope = Scope::chain(entries).under(enclosing);
     let mut ready = Vec::new();
@@ -1163,7 +1163,7 @@ fn pushdown<'a>(
         }
     });
     let Some(first) = ready.first() else {
-        return Ok(node);
+        return node;
     };
     let mut predicate = first.clone();
     for next in &ready[1..] {
@@ -1173,10 +1173,10 @@ fn pushdown<'a>(
             right: Box::new(next.clone()),
         };
     }
-    Ok(Node::Filter {
+    Node::Filter {
         input: Box::new(node),
         predicate,
-    })
+    }
 }
 
 /// The order to join a **plain comma list** in, or the identity for every other chain.

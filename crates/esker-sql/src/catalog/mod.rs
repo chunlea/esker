@@ -47,7 +47,7 @@ pub mod pg_index;
 pub mod pg_relations;
 mod record;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::Txn;
@@ -746,7 +746,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
+        enums: BTreeMap::new(),
     })
 }
 
@@ -898,7 +898,7 @@ pub struct TableDef {
     /// This is what makes an enum's label a label. The row holds the `int2` of the label's
     /// position — which is what gives it PostgreSQL's ordering — and the labels here are how it is
     /// written back out and how a literal on the way in is read.
-    pub enums: std::collections::BTreeMap<u64, TypeDef>,
+    pub enums: BTreeMap<u64, TypeDef>,
     /// `CHECK` constraints, in the order `pg_constraint` lists them — by name.
     ///
     /// Each holds its predicate as **text**, not as a parsed tree, and is re-lowered when the
@@ -1996,15 +1996,15 @@ fn column_user_types(
     txn: &dyn Txn,
     tenant: u64,
     table: &TableDef,
-) -> Result<std::collections::BTreeMap<u64, TypeDef>> {
+) -> Result<BTreeMap<u64, TypeDef>> {
     if table
         .columns
         .iter()
         .all(|column| column.user_type.is_none())
     {
-        return Ok(std::collections::BTreeMap::new());
+        return Ok(BTreeMap::new());
     }
-    let wanted: std::collections::BTreeSet<u64> = table
+    let wanted: BTreeSet<u64> = table
         .columns
         .iter()
         .filter_map(|column| column.user_type)

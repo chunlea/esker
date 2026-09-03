@@ -264,7 +264,7 @@ fn declared_columns(
 fn resolve_user_type(
     txn: &dyn Txn,
     executor: &Executor,
-    column: &crate::plan::Column,
+    column: &plan::Column,
 ) -> Result<(ColumnType, Option<u64>)> {
     let Some(name) = &column.user_type_name else {
         return Ok((column.ty, None));
