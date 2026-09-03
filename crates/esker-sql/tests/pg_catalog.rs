@@ -133,8 +133,8 @@ fn every_catalog_answer_is_postgresql_19_s() {
 fn activerecord_s_four_type_map_queries_answer() {
     let mut node = parity::Node::new(&[]);
 
-    // 4 — the first query `AbstractAdapter` ever sends. **Six** of its ten names are types this
-    // node has, and the other four are the declared divergence. The count has risen with each of
+    // 4 — the first query `AbstractAdapter` ever sends. **All ten** of its names are types this
+    // node has, as of the `oid` unit; it was six at the end of tier 1. The count has risen with each of
     // tier 1's types and the rows were never edited to match: `CatalogView::rows` is derived from
     // `ColumnType::ALL`, so the catalog grows on its own and this assertion is what notices.
     assert_eq!(
@@ -148,6 +148,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `smallint` arrived with tier 1's fourth type, and is in ActiveRecord's list of ten.
             vec!["21", "int2"],
             vec!["23", "int4"],
+            // **The tenth and last of `ActiveRecord`'s ten names.** The comment above has said
+            // "six of its ten" since tier 1; every one of them is answered now.
+            vec!["26", "oid"],
             // `float4` is `real` in a `CREATE TABLE`, and is what `ActiveRecord` maps to `Float`.
             vec!["700", "float4"],
             vec!["701", "float8"],
@@ -181,6 +184,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
             vec!["25", "text", "0", ",", "textin", "\\N", "b", "0"],
+            vec!["26", "oid", "0", ",", "oidin", "\\N", "b", "0"],
             // Tier 2's first pair, and `ActiveRecord`'s list of forty names holds both.
             vec!["114", "json", "0", ",", "json_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
@@ -217,6 +221,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             ],
             // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
             // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
+            vec!["1186", "interval", "0", ",", "interval_in", "\\N", "b", "0"],
             vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
             // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
             // refusals in `postgresql_specific_schema.rb`.

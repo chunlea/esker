@@ -123,6 +123,7 @@ impl ColumnData {
             | ColumnType::Timestamp
             | ColumnType::Int4
             | ColumnType::Int2
+            | ColumnType::Oid
             | ColumnType::Date
             | ColumnType::Time => ColumnData::Ints(Vec::new()),
             ColumnType::Double => ColumnData::Doubles(Vec::new()),
@@ -139,6 +140,7 @@ impl ColumnData {
             | ColumnType::Jsonb
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: vec![0],
                 data: Vec::new(),
@@ -176,6 +178,7 @@ impl ColumnData {
                     | ColumnType::Timestamp
                     | ColumnType::Int4
                     | ColumnType::Int2
+                    | ColumnType::Oid
                     | ColumnType::Date
                     | ColumnType::Time
             ) | (ColumnData::Doubles(_), ColumnType::Double)
@@ -192,6 +195,7 @@ impl ColumnData {
                         // string; `stats::fit` says why its *bounds* are not a number's.
                         | ColumnType::Numeric
                         | ColumnType::Uuid
+                        | ColumnType::Interval
                         | ColumnType::Bytea
                 )
         )
@@ -427,12 +431,13 @@ impl ColumnBuilder {
             }
             // A day is an integer to the encoder, the way a timestamp is: the schema says which.
             Value::Int4(v) | Value::Date(v) => self.ints.push(i64::from(*v)),
+            Value::Oid(v) => self.ints.push(i64::from(*v)),
             Value::Int2(v) => self.ints.push(i64::from(*v)),
             Value::Double(v) => self.doubles.push(*v),
             Value::Real(v) => self.floats.push(*v),
             Value::Bool(v) => self.bools.push(*v),
             Value::Text(v) | Value::Numeric(v) => self.push_bytes(v.as_bytes())?,
-            Value::Uuid(v) => self.push_bytes(&v[..])?,
+            Value::Uuid(v) | Value::Interval(v) => self.push_bytes(&v[..])?,
             Value::Bytea(v) => self.push_bytes(v)?,
         }
         Ok(())
@@ -480,6 +485,7 @@ impl ColumnBuilder {
             | ColumnType::Timestamp
             | ColumnType::Int4
             | ColumnType::Int2
+            | ColumnType::Oid
             | ColumnType::Date
             | ColumnType::Time => ColumnData::Ints(std::mem::take(&mut self.ints)),
             ColumnType::Double => ColumnData::Doubles(std::mem::take(&mut self.doubles)),
@@ -492,6 +498,7 @@ impl ColumnBuilder {
             | ColumnType::Jsonb
             | ColumnType::Numeric
             | ColumnType::Uuid
+            | ColumnType::Interval
             | ColumnType::Bytea => ColumnData::Bytes {
                 offsets: std::mem::replace(&mut self.offsets, vec![0]),
                 data: std::mem::take(&mut self.data),

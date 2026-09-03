@@ -56,6 +56,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::Int4(v) | Value::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Oid(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -66,7 +67,9 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
             }
             // A uuid is sixteen fixed bytes with no length before them; the corpus has no
             // uuid column, and a guessed encoding here would measure the wrong thing.
-            Value::Uuid(_) => unimplemented!("the corpus has no uuid column"),
+            Value::Uuid(_) | Value::Interval(_) => {
+                unimplemented!("the corpus has no uuid or interval column")
+            }
             Value::Bytea(v) => {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v);

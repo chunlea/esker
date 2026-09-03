@@ -1537,6 +1537,28 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
             negated: *negated,
         }),
+        // `INTERVAL '1 day'` and `INTERVAL '1' DAY`: SQL's typed-literal spelling for this one
+        // type, which `sqlparser` gives its own node rather than a `TypedString`. A **leading
+        // field** names the unit the bare number is in — `INTERVAL '1' DAY` is one day — and a
+        // trailing one bounds the range, which is the typmod this node drops.
+        Expr::Interval(interval) => {
+            let text = cast_literal_text(&interval.value)?
+                .ok_or_else(|| SqlError::unsupported("an INTERVAL over a non-literal"))?;
+            let spelled = match &interval.leading_field {
+                // Already carries its own units, so the field adds nothing.
+                _ if text.contains(|c: char| c.is_ascii_alphabetic()) => text.clone(),
+                Some(field) => format!("{text} {field}"),
+                None => text.clone(),
+            };
+            let value = value::interval::from_text(&spelled)?;
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Interval {
+                    months: value.months,
+                    days: value.days,
+                    micros: value.micros,
+                },
+            ))))
+        }
         Expr::Function(function) => lower_function(function),
         Expr::Cast {
             expr, data_type, ..
@@ -2519,19 +2541,15 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::Text(value::format_type(ty, NO_TYPMOD)),
             ))))
         }
-        // `'23'::oid`. An `oid` reads digits and nothing else — a type *name* here is `22P02` on a
-        // real server, which is why the pair above exists.
+        // `'23'::oid`. **This is a cast to a real type now**, not a special form that happens to
+        // read digits: `oid` is `ColumnType::Oid` since its own unit, so the reading is
+        // `value::oid::from_text` and a negative one wraps instead of being refused. The two
+        // arms above still come first, because `'x'::regtype::oid` is asking a different
+        // question — what OID does this *name* have — and answers before any value is read.
         (CastTarget::Oid, _) => {
             let text = cast_operand(expr, data_type)?;
-            let value =
-                text.trim()
-                    .parse::<u32>()
-                    .map_err(|_| SqlError::InvalidTextRepresentation {
-                        ty: "oid",
-                        value: text,
-                    })?;
-            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
-                value,
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Oid(value::oid::from_text(&text)?),
             ))))
         }
     }
@@ -2686,6 +2704,15 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
         // **A uuid casts to a string and to `bytea`, and to nothing else.** Measured: `::int` and
         // `::json` are `42846 cannot cast type uuid to …`, where `::bytea` is the sixteen raw
         // bytes. The value is bytes and never a number.
+        // An interval casts to a string and to `time`; `::int` and `::json` are `42846`.
+        (Some(ColumnType::Interval), Some(to))
+            if !stringy(to) && !matches!(to, ColumnType::Time | ColumnType::Interval) =>
+        {
+            Some(SqlError::CannotCast {
+                from: ColumnType::Interval.name(),
+                to: to.name(),
+            })
+        }
         (Some(ColumnType::Uuid), Some(to))
             if !stringy(to) && to != ColumnType::Bytea && to != ColumnType::Uuid =>
         {
@@ -2704,7 +2731,12 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
         // clock of the instant — so only the types with no path at all are refused here.
         (Some(from), Some(ColumnType::Time))
             if !stringy(from)
-                && !matches!(from, ColumnType::Timestamp | ColumnType::TimestampTz)
+                && !matches!(
+                    from,
+                    // An interval casts to a time too — it is the clock part of it — which the
+                    // time unit could not know when it wrote this list.
+                    ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Interval
+                )
                 && from != ColumnType::Time =>
         {
             Some(SqlError::CannotCast {
@@ -3589,10 +3621,22 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         // nowhere to come from and nothing here produces one.
         DataType::Date => ColumnType::Date,
         DataType::Uuid => ColumnType::Uuid,
+        // The fields and the precision are the **typmod**, which this node does not carry for
+        // this type: `interval day to hour` is a bitmask on a real server (`0x408ffff`), not a
+        // number, and it restricts what the value keeps. Accepted and dropped here, which is
+        // declared in `tests/interval.rs` — the column stores every field either way.
+        DataType::Interval { .. } => ColumnType::Interval,
         // `time` with no precision: six digits, the default and the maximum, as `timestamp` has
         // it. `time(p)` is the caller's, and carries a typmod.
         DataType::Time(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             ColumnType::Time
+        }
+        // `oid` is not one of `sqlparser`'s data types, so a declared `o oid` column arrives as
+        // a custom name — the same road `serial` takes below.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("oid") =>
+        {
+            ColumnType::Oid
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

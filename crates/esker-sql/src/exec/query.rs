@@ -1751,6 +1751,8 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // int8` and `numeric = float8` are all real operators on a real server, and
             // `pg_cmp` has an arm for each pairing. Keeping it apart would refuse `WHERE n > 0`,
             // which is the commonest thing anybody writes about a decimal column.
+            // An `oid` is a number and compares with the integers: `26::oid = 26` is `t`.
+            | ColumnType::Oid
             | ColumnType::Numeric => 0,
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
@@ -1773,9 +1775,12 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Its own family too: `uuid = text` and `uuid = integer` are both `42883` on a real
             // server, and its only comparisons are with another uuid.
             ColumnType::Uuid => 7,
+            // Its own family: `interval = integer` is `42883` on a real server, and an interval
+            // compares with another interval and with nothing else here.
+            ColumnType::Interval => 8,
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
-            // type added here is a compile error rather than a silent family 8.
-            ColumnType::Json => 8,
+            // type added here is a compile error rather than a silent family 9.
+            ColumnType::Json => 9,
         }
     }
     if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {

@@ -89,6 +89,7 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
     let present = match ty {
         ColumnType::Int8 => any::<i64>().prop_map(Value::Int8).boxed(),
         ColumnType::Int4 => any::<i32>().prop_map(Value::Int4).boxed(),
+        ColumnType::Oid => any::<u32>().prop_map(Value::Oid).boxed(),
         ColumnType::Int2 => any::<i16>().prop_map(Value::Int2).boxed(),
         ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
         ColumnType::Real => any::<u32>()
@@ -115,6 +116,9 @@ fn value_of(ty: ColumnType) -> impl Strategy<Value = Value> {
         | ColumnType::Json
         | ColumnType::Jsonb => (0usize..5)
             .prop_map(|pick| Value::Text(["", "a", "beta", "gamma", "\u{1f600}"][pick].to_owned()))
+            .boxed(),
+        ColumnType::Interval => prop::collection::vec(any::<u8>(), 16..=16)
+            .prop_map(|b| Value::Interval(<[u8; 16]>::try_from(b.as_slice()).unwrap_or([0; 16])))
             .boxed(),
         ColumnType::Uuid => prop::collection::vec(any::<u8>(), 16..=16)
             .prop_map(|bytes| {

@@ -227,8 +227,10 @@ midnight, tag 17 — a range **closed at both ends**, so `24:00:00` is a value a
 reach it, and its own comparison family because `time = timestamp` is `42883` where
 `date = timestamp` is an operator), `numeric(p, s)` (**landed**, ADR 0045), `uuid` (**landed**: sixteen fixed bytes, tag 18 — five
 spellings read as one value where only one is ever written, and `min`/`max` refuse it although
-`<` and `ORDER BY` work, which is the `min(boolean)` rule a second time), `json` / `jsonb`,
-`interval`, and **arrays** (`text[]` and `integer[]` columns *and* `= ANY($1)`, which
+`<` and `ORDER BY` work, which is the `min(boolean)` rule a second time), `json` / `jsonb`, `oid` (**landed**: four bytes and
+**unsigned**, tag 20 — `(-1)::oid` wraps to `4294967295` where an `int4` would refuse, and it is
+what every catalog identifier and every `regtype` really is),
+`interval` (**landed**: months, days and microseconds as three independent fields, tag 19 — equal is not identical, so the index key holds the converted total and the row holds what was written), and **arrays** (`text[]` and `integer[]` columns *and* `= ANY($1)`, which
 `ActiveRecord` uses for every `IN` with binds — four of its 36 boot statements). Two of them carry
 the hard part: `numeric`'s text parity, because PostgreSQL prints the *declared* scale exactly and
 this is the type ADR 0031 has been refusing on those grounds since unit 0; and `jsonb`'s stored

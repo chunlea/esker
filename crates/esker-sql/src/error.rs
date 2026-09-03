@@ -802,6 +802,26 @@ pub enum SqlError {
     #[error("type modifier is not allowed for type \"{0}\"")]
     TypeModifierNotAllowed(String),
 
+    /// A number past what a four-byte **unsigned** holds: `22003`.
+    ///
+    /// Its own message, quoting the text: `value "4294967296" is out of range for type oid`. A
+    /// *negative* number is not this — it wraps into the unsigned range, which is why
+    /// `(-1)::oid` is `4294967295` and not an error.
+    #[error("value \"{0}\" is out of range for type oid")]
+    OidOutOfRange(String),
+
+    /// One **field** of an interval past its own width: `22015`.
+    ///
+    /// `'2147483648 months'` is this, where `'178956971 years'` — the same magnitude reached
+    /// through a field that fits — is [`SqlError::IntervalOutOfRange`]'s `22008`. Two codes for
+    /// two overflows, and `22015` appears nowhere else in this project.
+    #[error("interval field value out of range: \"{0}\"")]
+    IntervalFieldOutOfRange(String),
+
+    /// The whole interval past what sixteen bytes hold: `22008`.
+    #[error("interval out of range")]
+    IntervalOutOfRange,
+
     /// A type name with nothing in it: `42601 invalid type name ""`. Not `42704` — PostgreSQL
     /// refuses to look it up rather than failing to find it.
     #[error("invalid type name \"{0}\"")]
@@ -1160,12 +1180,14 @@ impl SqlError {
             | SqlError::IntegerLiteralOutOfRange(_)
             | SqlError::BigintOutOfRange
             | SqlError::NumericFieldOverflow { .. }
+            | SqlError::OidOutOfRange(_)
             | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
-            SqlError::DatetimeFieldOutOfRange { .. } | SqlError::DatetimeOutOfRange { .. } => {
-                sqlstate::DATETIME_FIELD_OVERFLOW
-            }
+            SqlError::DatetimeFieldOutOfRange { .. }
+            | SqlError::IntervalOutOfRange
+            | SqlError::DatetimeOutOfRange { .. } => sqlstate::DATETIME_FIELD_OVERFLOW,
+            SqlError::IntervalFieldOutOfRange(_) => sqlstate::INTERVAL_FIELD_OVERFLOW,
             SqlError::TimeZoneDisplacementOutOfRange(_) => {
                 sqlstate::INVALID_TIME_ZONE_DISPLACEMENT_VALUE
             }

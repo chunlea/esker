@@ -106,6 +106,8 @@ fn type_of(value: &Value) -> Option<ValueType> {
         Value::Numeric(_) => ValueType::Numeric,
         Value::Time(_) => ValueType::Time,
         Value::Uuid(_) => ValueType::Uuid,
+        Value::Interval(_) => ValueType::Interval,
+        Value::Oid(_) => ValueType::Oid,
     })
 }
 
@@ -126,6 +128,8 @@ fn value_of(value: &Value) -> WireValue {
         Value::Numeric(text) => WireValue::Numeric(text.clone()),
         Value::Time(micros) => WireValue::Time(*micros),
         Value::Uuid(bytes) => WireValue::Uuid(*bytes),
+        Value::Interval(bytes) => WireValue::Interval(*bytes),
+        Value::Oid(v) => WireValue::Oid(*v),
     }
 }
 

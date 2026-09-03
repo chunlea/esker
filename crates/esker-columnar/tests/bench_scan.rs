@@ -64,6 +64,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::Int4(v) | Value::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Value::Oid(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
             Value::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -78,7 +79,9 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
             Value::Numeric(_) => unimplemented!("the bench corpus has no numeric column"),
             // A uuid is sixteen fixed bytes with no length before them; the corpus has no
             // uuid column, and a guessed encoding here would measure the wrong thing.
-            Value::Uuid(_) => unimplemented!("the corpus has no uuid column"),
+            Value::Uuid(_) | Value::Interval(_) => {
+                unimplemented!("the bench corpus has no uuid or interval column")
+            }
             Value::Bytea(v) => {
                 varint::put_u64(v.len() as u64, &mut out);
                 out.extend_from_slice(v);
@@ -89,6 +92,7 @@ fn encode_row(values: &[Value]) -> Vec<u8> {
 }
 
 /// Reads one back, given the columns the table has. The mirror of the above.
+#[allow(clippy::too_many_lines, reason = "one arm per column type")]
 fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
     let mut at = 1;
     let (count, used) = varint::get_u64(&bytes[at..]).unwrap();
@@ -114,7 +118,9 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 at += 8;
                 value
             }
-            ColumnType::Uuid => unimplemented!("the bench corpus has no uuid column"),
+            ColumnType::Uuid | ColumnType::Interval => {
+                unimplemented!("the bench corpus has no uuid or interval column")
+            }
             ColumnType::Time => {
                 let value = Value::Time(i64::from_le_bytes(fixed(at)));
                 at += 8;
@@ -131,6 +137,12 @@ fn decode_row(types: &[ColumnType], bytes: &[u8]) -> Vec<Value> {
                 four.copy_from_slice(&bytes[at..at + 4]);
                 at += 4;
                 Value::Date(i32::from_le_bytes(four))
+            }
+            ColumnType::Oid => {
+                let mut four = [0u8; 4];
+                four.copy_from_slice(&bytes[at..at + 4]);
+                at += 4;
+                Value::Oid(u32::from_le_bytes(four))
             }
             ColumnType::Int2 => {
                 let mut two = [0u8; 2];

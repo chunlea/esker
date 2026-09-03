@@ -39,6 +39,14 @@ mod tests {
             // The whole closed range, `24:00:00` included.
             ColumnType::Time => (0i64..=86_400_000_000).prop_map(Datum::Time).boxed(),
             ColumnType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),
+            ColumnType::Oid => any::<u32>().prop_map(Datum::Oid).boxed(),
+            ColumnType::Interval => (-100_000i32..100_000, -100_000i32..100_000, any::<i32>())
+                .prop_map(|(months, days, micros)| Datum::Interval {
+                    months,
+                    days,
+                    micros: i64::from(micros),
+                })
+                .boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
             // Weighted towards the ties, as `Double` is: PostgreSQL has fewer floats than IEEE

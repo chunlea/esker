@@ -96,6 +96,13 @@ fn column_type(name: &str) -> ColumnType {
         // `23:59:59.999999` rather than being the bound a range scan stops at.
         "time" => ColumnType::Time,
         "uuid" => ColumnType::Uuid,
+        // `1 mon` and `30 days` are in the fixture on purpose: they are **equal** — comparison
+        // converts a month to thirty days — so the test's stronger half, that a tie encodes to
+        // one key, is what proves the index encoding converts where the row does not.
+        "interval" => ColumnType::Interval,
+        // `4294967295` is in the fixture because it is the value that separates this type from
+        // `int4`: unsigned, so it sorts *above* everything and is not negative.
+        "oid" => ColumnType::Oid,
         "bool" => ColumnType::Bool,
         "bytea" => ColumnType::Bytea,
         "timestamptz" => ColumnType::TimestampTz,

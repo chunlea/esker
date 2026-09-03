@@ -1,0 +1,139 @@
+# `interval`, as a real PostgreSQL 19beta1 answers it — tier 2
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap). OID 1186,
+# sixteen bytes, `typcategory` T. Stored as three independent fields — **months, days,
+# microseconds** — and almost every surprise below follows from that one fact.
+#
+# `ActiveRecord` cares about this type before it cares about the values: its **third** boot
+# statement is `SET intervalstyle = iso_8601`, so the style below is not a curiosity, it is the
+# one Rails reads its answers in.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Equality is not identity of representation.** `'1 mon' = '30 days'` is **`t`**, `'1 year'
+#     = '360 days'` is **`t`**, and `'1 mon 1 day' = '31 days'` is **`t`** — comparison converts a
+#     month to 30 days and a day to 24 hours. Storage does not: `'1 mon 1 day'` prints as
+#     `1 mon 1 day` forever, and `'400 days'` never becomes `1 year 1 mon 5 days`. So two intervals
+#     can be equal and print differently, and an implementation that normalised on the way in
+#     would print the wrong text for every one of them.
+#   * **Signs are per field.** `'1 day' - '12 hours'` is **`1 day -12:00:00`**, a value with a
+#     positive day and a negative time, and it is equal to `'12:00:00'`. Nothing normalises it.
+#   * **Four output styles, and the one Rails asks for is not the default.** Measured, all four,
+#     on one value: `postgres` `1 year 2 mons 3 days 04:05:06`; `iso_8601` `P1Y2M3DT4H5M6S`;
+#     `sql_standard` `+1-2 +3 +4:05:06`; `postgres_verbose`
+#     `@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs`. And `-1 day` prints **`-1 days`** in the
+#     default style — plural where the positive is singular — `P-1D` in ISO, and `@ 1 day ago` in
+#     verbose.
+#   * **Months carry into years; days do not carry into months.** `'1 year 13 months'` is
+#     `2 years 1 mon`, but `'400 days'` stays `400 days` and `'25 hours'` stays `25:00:00`. Only
+#     `justify_days`/`justify_hours`/`justify_interval` do the rest, and they are functions
+#     precisely because the type does not.
+#   * **A fractional unit cascades into the next one down**: `1.5 months` is `1 mon 15 days`,
+#     `1.5 days` is `1 day 12:00:00`, `1.5 hours` is `01:30:00`.
+#   * **The typmod is a bitmask, and it is the fourth encoding in this corpus.** Measured out of
+#     `pg_attribute`: `interval(3)` is `2147418115`, `interval day` is `589823`,
+#     `interval day to hour` is `67698687`, `interval year to month` is `458751`. It is a field
+#     mask in the high bits with the precision in the low ones — *not* a plain number — and
+#     asking `format_type` for a number that is not one is `XX000 invalid INTERVAL typmod: 0x3`,
+#     an internal-error class. Compare `varchar`'s length+4, `timestamp`'s bare precision and
+#     `numeric`'s `(p << 16) | s` + 4.
+#   * **Two range SQLSTATEs, and a third for syntax.** `'178956971 years'` is
+#     `22008 interval out of range` — the whole value overflows; `'2147483648 months'` is
+#     **`22015 interval field value out of range`** — one *field* overflows, and `22015` appears
+#     nowhere else in this corpus. Bad text is `22007`. Three codes for three failures.
+#   * **`interval(p)` trims trailing zeros where `numeric(p,s)` pads them.** `'1.5 seconds'` at
+#     `interval(3)` is `00:00:01.5`, not `00:00:01.500`. The declared precision is a maximum here
+#     and an exact width there.
+#   * **`interval(9)` is not an error** — `'interval(9)'::regtype` is 1186 — the same silent
+#     tolerance `timestamp(9)` and `time(7)` have.
+#
+# THE STYLE TAIL IS TRIMMED, AND THIS SAYS SO
+#
+# The capture ends with the same SELECT under four `IntervalStyle` settings. Three of those four
+# lines are gone from this copy: the statement text is identical in all four, the harness keys a
+# divergence by that text, and the last one — after `RESET` — *agrees*, so the same key would have
+# to be both listed and not. The `SET` statements are kept, because they are answered; what is
+# dropped is the three readings under a style this node does not print in. `tests/interval.rs`
+# declares the gap as `STYLE`, and `captures/pg19_interval.txt` in the harness has all four.
+DROP TABLE IF EXISTS iv		-
+SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'interval'	oid,name,smallint,regproc,"char"	1186|interval|16|interval_in|T
+SELECT pg_typeof('1 day'::interval), format_type(1186, -1)	regtype,text	interval|interval
+CREATE TABLE iv (id int8 PRIMARY KEY, a interval, b interval(3), c interval day, d interval day to hour, e interval year to month)		-
+SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'iv'::regclass AND attnum > 0 ORDER BY attnum	name,integer,text	id|-1|bigint ; a|-1|interval ; b|2147418115|interval(3) ; c|589823|interval day ; d|67698687|interval day to hour ; e|458751|interval year to month
+SELECT format_type(1186, 3)	!XX000 invalid INTERVAL typmod: 0x3
+SELECT format_type(1186, 32767)	!XX000 invalid INTERVAL typmod: 0x7fff
+INSERT INTO iv VALUES (1, '1 year 2 mons 3 days 04:05:06', '1.5 seconds', '1 day', '1 2', '1-2')		-
+INSERT INTO iv VALUES (2, '1 mon', '00:00:00', '2 days', '0 0', '0-0')		-
+INSERT INTO iv VALUES (3, '30 days', '00:00:00', '3 days', '0 0', '0-0')		-
+INSERT INTO iv VALUES (4, '-1 day', '00:00:00', '-1 days', '0 0', '0-0')		-
+INSERT INTO iv VALUES (5, NULL, NULL, NULL, NULL, NULL)		-
+SELECT id, a, b, c, d, e FROM iv ORDER BY id	bigint,interval,interval(3),interval day,interval day to hour,interval year to month	1|1 year 2 mons 3 days 04:05:06|00:00:01.5|1 day|1 day 02:00:00|1 year 2 mons ; 2|1 mon|00:00:00|2 days|00:00:00|00:00:00 ; 3|30 days|00:00:00|3 days|00:00:00|00:00:00 ; 4|-1 days|00:00:00|-1 days|00:00:00|00:00:00 ; 5|\N|\N|\N|\N|\N
+SELECT id, a FROM iv ORDER BY a	bigint,interval	4|-1 days ; 2|1 mon ; 3|30 days ; 1|1 year 2 mons 3 days 04:05:06 ; 5|\N
+SELECT id, a FROM iv ORDER BY a DESC	bigint,interval	5|\N ; 1|1 year 2 mons 3 days 04:05:06 ; 2|1 mon ; 3|30 days ; 4|-1 days
+SELECT id FROM iv WHERE a IS NULL	bigint	5
+SELECT id FROM iv WHERE a = '1 mon' ORDER BY id	bigint	2 ; 3
+SELECT id FROM iv WHERE a > '1 day' ORDER BY id	bigint	1 ; 2 ; 3
+SELECT count(*), count(a), min(a), max(a) FROM iv	bigint,bigint,interval,interval	5|4|-1 days|1 year 2 mons 3 days 04:05:06
+SELECT sum(a) FROM iv	interval	1 year 3 mons 32 days 04:05:06
+SELECT avg(a) FROM iv	interval	3 mons 30 days 13:01:16.5
+SELECT '1 day'::interval, '1 month'::interval, '1 year'::interval, '1:00:00'::interval	interval,interval,interval,interval	1 day|1 mon|1 year|01:00:00
+SELECT '1 year 2 mons 3 days 04:05:06'::interval	interval	1 year 2 mons 3 days 04:05:06
+SELECT 'P1Y2M3DT4H5M6S'::interval	interval	1 year 2 mons 3 days 04:05:06
+SELECT '1-2'::interval, '3 4:05:06'::interval	interval,interval	1 year 2 mons|3 days 04:05:06
+SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR	interval,interval day,interval day to hour	1 day|1 day|1 day 02:00:00
+SELECT '-1 day'::interval, '1 day ago'::interval	interval,interval	-1 days|-1 days
+SELECT '1.5 days'::interval, '1.5 months'::interval, '1.5 hours'::interval	interval,interval,interval	1 day 12:00:00|1 mon 15 days|01:30:00
+SELECT '90 minutes'::interval, '25 hours'::interval, '400 days'::interval	interval,interval,interval	01:30:00|25:00:00|400 days
+SELECT '1 year 13 months'::interval	interval	2 years 1 mon
+SELECT '2147483647 months'::interval	interval	178956970 years 7 mons
+SELECT '9223372036854775807 microseconds'::interval	interval	2562047788:00:54.775807
+SELECT '178956970 years'::interval	interval	178956970 years
+SELECT '178956971 years'::interval	!22008 interval out of range
+SELECT '2147483648 months'::interval	!22015 interval field value out of range: "2147483648 months"
+SELECT 'garbage'::interval	!22007 invalid input syntax for type interval: "garbage"
+SELECT ''::interval	!22007 invalid input syntax for type interval: ""
+SELECT '1 fortnight'::interval	!22007 invalid input syntax for type interval: "1 fortnight"
+SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)	interval(0),interval(0)	00:00:01|00:00:02
+SELECT '1.5 seconds'::interval(3)	interval(3)	00:00:01.5
+SELECT '1.4444444 seconds'::interval	interval	00:00:01.444444
+SELECT '1 year 1 month'::interval::interval year	interval year	1 year
+SELECT 'interval(9)'::regtype::oid	oid	1186
+SELECT interval '1 month' = interval '30 days', interval '1 month' = interval '31 days'	boolean,boolean	t|f
+SELECT interval '1 day' = interval '24 hours'	boolean	t
+SELECT interval '1 year' = interval '360 days', interval '1 year' = interval '365 days'	boolean,boolean	t|f
+SELECT '1 mon 1 day'::interval = '31 days'::interval	boolean	t
+SELECT '1 day -12:00:00'::interval = '12:00:00'::interval	boolean	t
+SELECT '1 day'::interval > '23 hours'::interval	boolean	t
+SELECT interval '1 month' + interval '1 day'	interval	1 mon 1 day
+SELECT '1 day'::interval - '12 hours'::interval	interval	1 day -12:00:00
+SELECT -('1 day'::interval)	interval	-1 days
+SELECT '2 days'::interval * 2, '2 days'::interval / 2	interval,interval	4 days|1 day
+SELECT '1 day'::interval * 0.5, '1 mon'::interval * 0.5	interval,interval	12:00:00|15 days
+SELECT '1 day'::interval / 0	!22012 division by zero
+SELECT justify_days('35 days'::interval), justify_hours('27 hours'::interval), justify_interval('1 mon 33 days 27 hours'::interval)	interval,interval,interval	1 mon 5 days|1 day 03:00:00|2 mons 4 days 03:00:00
+SELECT '1 day'::interval + '2020-01-01'::date	timestamp without time zone	2020-01-02 00:00:00
+SELECT '1 day'::interval + '2020-01-01'::timestamp	timestamp without time zone	2020-01-02 00:00:00
+SELECT '1 day'::interval + '2020-01-01 00:00:00+00'::timestamptz	timestamp with time zone	2020-01-02 00:00:00+00
+SELECT age('2021-03-01'::timestamp, '2021-01-01'::timestamp)	interval	2 mons
+SELECT extract(day FROM '1 year 2 mons 3 days'::interval), extract(epoch FROM '1 day'::interval)	numeric,numeric	3|86400.000000
+SELECT '1 day'::interval::text, '1 day'::text::interval	text,interval	1 day|1 day
+SELECT '1 day'::interval::varchar, '1 day'::interval::char(3)	character varying,character(3)	1 day|1 d
+SELECT '1 day'::interval::time	time without time zone	00:00:00
+SELECT '1 day'::interval::int	!42846 cannot cast type interval to integer
+SELECT '1 day'::interval::json	!42846 cannot cast type interval to json
+SELECT '1 day'::interval = 1	!42883 operator does not exist: interval = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT greatest('1 day'::interval, '2 days'::interval), least('1 day'::interval, '2 days'::interval)	interval,interval	2 days|1 day
+SELECT NULL::interval IS NULL, '1 day'::interval = NULL	boolean,boolean	t|\N
+SET IntervalStyle TO 'iso_8601'		-
+SET IntervalStyle TO 'sql_standard'		-
+SET IntervalStyle TO 'postgres_verbose'		-
+RESET IntervalStyle		-
+SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	1 year 2 mons 3 days 04:05:06|1 day|-1 days
