@@ -788,15 +788,15 @@ impl Executor {
     fn require_sequence(&self, txn: &dyn Txn, name: &str) -> Result<crate::catalog::SequenceDef> {
         let view = self.catalog_view(txn)?;
         match view.relation(name)? {
-            Some(crate::catalog::Relation::Sequence { table_id, column }) => {
-                let table = view
-                    .table_by_id(table_id)?
-                    .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))?;
-                table
-                    .sequence_for(column)
-                    .cloned()
-                    .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
-            }
+            // **Read straight from the record, not through the table**: a sequence no column
+            // owns is filed under `STANDALONE_SEQUENCE_OWNER`, which has no `TableDef` behind it,
+            // and a column may own more than one — neither of which the old lookup, which asked
+            // the table for the sequence *filling* a column, could express.
+            Some(crate::catalog::Relation::Sequence {
+                table_id,
+                sequence_id,
+            }) => crate::catalog::sequence_by_id(txn, self.tenant, table_id, sequence_id)?
+                .ok_or_else(|| SqlError::UndefinedTable(name.to_owned())),
             // No `HINT`: PostgreSQL sends one only for the `DROP` statements, where there is
             // another verb to point at. `nextval` over a table has nothing to suggest.
             Some(_) => Err(SqlError::WrongObjectType {

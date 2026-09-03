@@ -220,19 +220,26 @@ fn row_of(
                 column: None,
             }
         }
-        Relation::Sequence { table_id, column } => {
-            load_table(txn, tenant, table_id, tables)?;
-            // **The sequence's own id, which was there all along.** It is in the sequence record
-            // rather than the name record, so `pg_class` reported the table's id instead and every
-            // `bigserial` table had two relations with one oid.
-            let id = sequence_id(txn, tenant, table_id, column)?;
+        Relation::Sequence {
+            table_id,
+            sequence_id,
+        } => {
+            // A sequence no column owns has no table to load, and `pg_class` still lists it.
+            if table_id != crate::catalog::STANDALONE_SEQUENCE_OWNER {
+                load_table(txn, tenant, table_id, tables)?;
+            }
+            // **The sequence's own id, which the name record now carries.** It used to live only
+            // in the sequence record, so `pg_class` reported the table's id instead and every
+            // `bigserial` table had two relations with one oid; the version 15 name entry holds
+            // the id where the column ordinal used to be.
+            let id = sequence_id;
             RelationRow {
                 oid: as_oid(id),
                 name,
                 kind: RelKind::Sequence,
                 table_id,
                 index_at: None,
-                column: Some(column),
+                column: None,
             }
         }
     })
@@ -261,18 +268,6 @@ fn load_table<'a>(
     tables
         .get(&table_id)
         .ok_or_else(|| SqlError::Internal("a table record that was just inserted is gone".into()))
-}
-
-/// One sequence's own id, out of the record keyed by the column it fills.
-fn sequence_id(txn: &dyn Txn, tenant: u64, table_id: u64, column: usize) -> Result<u64> {
-    let key = super::record::sequence_key(tenant, table_id, column);
-    let Some(bytes) = txn.get(&key)? else {
-        return Err(SqlError::DataCorrupted(format!(
-            "a name points at the sequence on column {column} of table {table_id}, whose record is \
-             not there"
-        )));
-    };
-    Ok(super::record::decode_sequence(&bytes, table_id, column)?.id)
 }
 
 /// A relation id as `pg_class.oid` carries it.
@@ -315,5 +310,5 @@ pub fn sequence_for(table: &TableDef, column: usize) -> Option<&SequenceDef> {
     table
         .sequences
         .iter()
-        .find(|sequence| sequence.column == column)
+        .find(|sequence| sequence.column == Some(column))
 }

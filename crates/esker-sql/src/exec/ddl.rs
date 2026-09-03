@@ -381,8 +381,11 @@ pub(super) fn drop_sequence(
     // error and changed the database anyway.
     let mut targets = Vec::with_capacity(drop.names.len());
     for name in &drop.names {
-        let (table_id, column) = match existing_relation(executor, txn, name)? {
-            Some(catalog::Relation::Sequence { table_id, column }) => (table_id, column),
+        let (table_id, sequence_id) = match existing_relation(executor, txn, name)? {
+            Some(catalog::Relation::Sequence {
+                table_id,
+                sequence_id,
+            }) => (table_id, sequence_id),
             // The name resolves and is the wrong kind, which is `42809` and not `42P01`: the
             // `HINT` says which verb would have worked. A `DROP TABLE` over a sequence gets the
             // mirror of this.
@@ -411,47 +414,51 @@ pub(super) fn drop_sequence(
                 return Err(SqlError::UndefinedSequenceForDrop(name.clone()));
             }
         };
-        let table = executor.table_by_id(txn, table_id)?;
-        let Some(sequence) = table
-            .sequences
-            .iter()
-            .find(|sequence| sequence.column == column)
+        let Some(sequence) = catalog::sequence_by_id(txn, executor.tenant, table_id, sequence_id)?
         else {
             continue;
         };
-        targets.push((name, (*table).clone(), sequence.clone()));
+        targets.push((name, table_id, sequence));
     }
 
     // **Existence for every name first, dependencies after** — which is the order a real server
     // reports in and not an implementation detail: `DROP SEQUENCE a, b` where `a` has a dependent
     // default and `b` does not exist answers `42P01` about `b`, not `2BP01` about `a`. Checking
     // each name's dependency as the first loop reached it named the wrong one.
-    for (name, table, sequence) in &targets {
-        // The column's default is this sequence, so dropping it without `CASCADE` is the same
-        // refusal a referenced table gets — and the `DETAIL` names the column, which is what tells
-        // a reader *which* default is in the way.
+    for (name, table_id, sequence) in &targets {
+        // **Only a sequence that *fills* a column has a dependent.** One a column merely owns
+        // does not: `DROP SEQUENCE s` succeeds while `s` is `OWNED BY t.c`, measured, because
+        // ownership points the other way — it says the sequence goes when the *column* does. The
+        // `DETAIL` names the column, which is what tells a reader which default is in the way.
+        let Some(column) = sequence.column else {
+            continue;
+        };
         if !drop.cascade {
+            let table = executor.table_by_id(txn, *table_id)?;
             return Err(SqlError::DependentSequence {
                 sequence: (*name).clone(),
-                column: table.columns[sequence.column].name.clone(),
+                column: table.columns[column].name.clone(),
                 table: table.name.clone(),
             });
         }
     }
 
-    for (_, table, sequence) in targets {
-        catalog::drop_sequence(txn, executor.tenant, table.id, &sequence);
+    for (_, table_id, sequence) in targets {
+        catalog::drop_sequence(txn, executor.tenant, table_id, &sequence);
+        // A sequence no column owns has no table record to rewrite, and nothing caches it.
+        if table_id == catalog::STANDALONE_SEQUENCE_OWNER {
+            continue;
+        }
+        let table = executor.table_by_id(txn, table_id)?;
         // **The table record is rewritten and its schema version bumped**, and without that the
         // drop is invisible: a `TableDef` is cached per node and keyed by this version, the
         // sequence records live beside the table rather than in it, and deleting them left every
         // reader still holding a definition that says the column has a sequence. The next `INSERT`
         // then filled the column from a counter that had been dropped — reported success, and the
         // corpus caught it on the `23502` that should have followed.
-        let mut updated = table.clone();
+        let mut updated = (*table).clone();
         updated.schema_version += 1;
-        updated
-            .sequences
-            .retain(|kept| kept.column != sequence.column);
+        updated.sequences.retain(|kept| kept.id != sequence.id);
         catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     }
     Ok(Outcome::done("DROP SEQUENCE"))
@@ -613,8 +620,13 @@ fn sequences_for(
                 id: catalog::allocate_id(txn, executor.tenant)?,
                 name: plan::sequence_name(&create.name, &column.name),
                 table_id,
-                column: ordinal,
+                // A `bigserial` both fills and owns the column: it *is* the default, and it goes
+                // when the column does. `CREATE SEQUENCE … OWNED BY` sets only the second.
+                column: Some(ordinal),
+                owner_column: Some(ordinal),
                 identity,
+                start: 1,
+                increment: 1,
             });
         }
     }

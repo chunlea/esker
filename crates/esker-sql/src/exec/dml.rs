@@ -275,10 +275,16 @@ pub(super) fn insert(
         // number and does not consume one — which is what a real server does, and the reason the
         // next insert can collide with it.
         for sequence in &table.sequences {
+            // **Only a sequence that fills a column writes one.** A table may own a sequence that
+            // fills nothing — `CREATE SEQUENCE s OWNED BY t.c` makes one — and it has no column
+            // to put a value in.
+            let Some(fills) = sequence.column else {
+                continue;
+            };
             if targets
                 .iter()
                 .take(values.len())
-                .position(|at| *at == sequence.column)
+                .position(|at| *at == fills)
                 .is_some_and(|at| !matches!(values[at], crate::plan::Expr::Default))
             {
                 continue;
@@ -287,8 +293,8 @@ pub(super) fn insert(
             // so an `integer` identity column has to be told — and running past 2^31 is the same
             // `22003` a constant that far out gets, which is what a real server answers when a
             // `serial` runs out.
-            row[sequence.column] = sequence_datum(
-                table.columns[sequence.column].ty,
+            row[fills] = sequence_datum(
+                table.columns[fills].ty,
                 executor.next_sequence_value(sequence.id)?,
             )?;
         }
@@ -491,9 +497,11 @@ pub(super) fn update(
             let evaluated = match value {
                 // `SET a = DEFAULT` is the column's own default, which for a sequence column is
                 // the next value and for every other one is the constant the catalog holds.
+                // `sequence_for` answers only for a sequence that *fills* this column, so an
+                // owned-but-unused one cannot capture a `SET c = DEFAULT`.
                 crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
                     Some(sequence) => sequence_datum(
-                        table.columns[sequence.column].ty,
+                        table.columns[*ordinal].ty,
                         executor.next_sequence_value(sequence.id)?,
                     )?,
                     None => column_default_value(

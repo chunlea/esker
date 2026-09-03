@@ -76,7 +76,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 14;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 15;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -702,11 +702,11 @@ pub(super) fn row_id_key(tenant: u64, table_id: u64) -> Vec<u8> {
 /// A prefix of `'m' ++ "sql" ++ 'q' ++ tenant ++ table_id` is exactly one table's sequences, in
 /// column order, which is how a `TableDef` gets them at load without the table record knowing.
 #[must_use]
-pub(super) fn sequence_key(tenant: u64, table_id: u64, column: usize) -> Vec<u8> {
+pub(super) fn sequence_key(tenant: u64, table_id: u64, sequence_id: u64) -> Vec<u8> {
     let mut suffix = [SQL, &[KIND_SEQUENCE]].concat();
     codec::encode_u64(tenant, &mut suffix);
     codec::encode_u64(table_id, &mut suffix);
-    codec::encode_u64(column as u64, &mut suffix);
+    codec::encode_u64(sequence_id, &mut suffix);
     prefix::meta_key(&suffix)
 }
 
@@ -731,43 +731,91 @@ pub(super) fn sequence_value_key(tenant: u64, sequence_id: u64) -> Vec<u8> {
     prefix::meta_key(&suffix)
 }
 
-/// One sequence: `version ++ id ++ name ++ identity`.
+/// One sequence: `version ++ id ++ name ++ identity`, and from version 15 the four fields
+/// `CREATE SEQUENCE` brought.
 ///
-/// The column it fills is in the **key**, so it is not written twice; a record whose key and body
-/// disagreed would be a thing the format allowed and nothing checked.
+/// **The key held the column until version 15 and now holds the id.** A column can own more than
+/// one sequence — `CREATE SEQUENCE s OWNED BY t.c` on a table whose `c` is already a `bigserial`
+/// is accepted by a real server, measured — so keying by column could not represent the statement
+/// this format version exists for. The column moved into the body, where it is now two separate
+/// facts that a single ordinal used to conflate:
+///
+/// * `column` is the one this sequence **fills** — its `nextval` is that column's default;
+/// * `owner_column` is the one that **owns** it — dropping that column drops the sequence.
+///
+/// A `bigserial` sets both to the same column. `CREATE SEQUENCE … OWNED BY t.c` sets only the
+/// second, and `pg_attrdef` proves the difference: creating one leaves the column's default alone.
 pub(super) fn encode_sequence(sequence: &SequenceDef) -> Vec<u8> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     out.extend_from_slice(&sequence.id.to_le_bytes());
     put_str(&sequence.name, &mut out);
     out.push(sequence.identity.as_u8());
+    // Version 15. An ordinal plus one, so that `0` is `None` and every older record — which had
+    // no bytes here at all — reads as the column its key carried.
+    varint::put_u64(optional_ordinal(sequence.column), &mut out);
+    varint::put_u64(optional_ordinal(sequence.owner_column), &mut out);
+    out.extend_from_slice(&sequence.start.to_le_bytes());
+    out.extend_from_slice(&sequence.increment.to_le_bytes());
     out
 }
 
-/// Reads a sequence. `table_id` and `column` come from the key the caller read it under.
-pub(super) fn decode_sequence(bytes: &[u8], table_id: u64, column: usize) -> Result<SequenceDef> {
+/// An optional column ordinal as a varint: `0` for none, and the ordinal plus one otherwise.
+fn optional_ordinal(column: Option<usize>) -> u64 {
+    column.map_or(0, |at| at as u64 + 1)
+}
+
+fn ordinal_of(raw: u64, columns: usize) -> Result<Option<usize>> {
+    let Some(at) = raw.checked_sub(1) else {
+        return Ok(None);
+    };
+    let at = usize::try_from(at).map_err(|_| corrupt("a sequence column that is not a usize"))?;
+    if columns > 0 && at >= columns {
+        return Err(corrupt("a sequence column past the end of its table"));
+    }
+    Ok(Some(at))
+}
+
+/// Reads a sequence. `table_id` comes from the key the caller read it under, and `column` too for
+/// a record written before version 15 — which is why the caller passes the key's ordinal in.
+pub(super) fn decode_sequence(
+    bytes: &[u8],
+    table_id: u64,
+    key_column: usize,
+) -> Result<SequenceDef> {
     let mut reader = Reader::new(bytes)?;
     let id = reader.u64_le()?;
     let name = reader.string()?;
     let identity = Identity::from_u8(reader.byte()?)?;
+    // A record written before version 15 was keyed by the column it filled, and that column both
+    // filled and owned it — a `bigserial`'s is the only kind that existed.
+    let (column, owner_column, start, increment) = if reader.version >= 15 {
+        let column = ordinal_of(reader.varint()?, 0)?;
+        let owner_column = ordinal_of(reader.varint()?, 0)?;
+        (column, owner_column, reader.i64_le()?, reader.i64_le()?)
+    } else {
+        (Some(key_column), Some(key_column), 1, 1)
+    };
     reader.finish()?;
     Ok(SequenceDef {
         id,
         name,
         table_id,
         column,
+        owner_column,
         identity,
+        start,
+        increment,
     })
 }
 
-/// The column ordinal a sequence key ends with.
-pub(super) fn sequence_column_of(tenant: u64, table_id: u64, key: &[u8]) -> Result<usize> {
+/// The sequence id a sequence key ends with.
+pub(super) fn sequence_id_of(tenant: u64, table_id: u64, key: &[u8]) -> Result<u64> {
     let (start, _) = table_sequence_range(tenant, table_id);
     let rest = key
         .strip_prefix(start.as_slice())
         .ok_or_else(|| corrupt("a sequence key outside the range it was read from"))?;
-    let (column, _) =
-        codec::decode_u64(rest).map_err(|_| corrupt("a sequence key with no column ordinal"))?;
-    usize::try_from(column).map_err(|_| corrupt("a sequence column ordinal that is not a usize"))
+    let (id, _) = codec::decode_u64(rest).map_err(|_| corrupt("a sequence key with no id"))?;
+    Ok(id)
 }
 
 /// A monotone counter as stored: little-endian, like every other record body here.
@@ -1255,10 +1303,13 @@ pub(super) fn encode_relation(relation: &Relation) -> Vec<u8> {
         }
         // A sequence's name resolves to the column it fills rather than to an id of its own,
         // because that is the key its record lives under.
-        Relation::Sequence { table_id, column } => {
+        Relation::Sequence {
+            table_id,
+            sequence_id,
+        } => {
             out.push(KIND_SEQUENCE);
             out.extend_from_slice(&table_id.to_le_bytes());
-            out.extend_from_slice(&(*column as u64).to_le_bytes());
+            out.extend_from_slice(&sequence_id.to_le_bytes());
         }
     }
     out
@@ -1278,10 +1329,14 @@ pub(super) fn decode_relation(bytes: &[u8]) -> Result<Relation> {
         KIND_PRIMARY_KEY => Relation::PrimaryKey {
             table_id: reader.u64_le()?,
         },
+        // **The second number was a column ordinal before version 15 and is a sequence id now.**
+        // A name entry is rewritten whenever the sequence is, and the two are read together, so
+        // there is no record that pairs an old entry with a new sequence — a `bigserial`'s
+        // sequence id and its column ordinal are both small numbers and would not have been
+        // told apart by a check.
         KIND_SEQUENCE => Relation::Sequence {
             table_id: reader.u64_le()?,
-            column: usize::try_from(reader.u64_le()?)
-                .map_err(|_| corrupt("a sequence column ordinal that is not a usize"))?,
+            sequence_id: reader.u64_le()?,
         },
         other => return Err(corrupt(format!("relation kind byte {other}"))),
     };
@@ -1363,6 +1418,15 @@ impl<'a> Reader<'a> {
             1 => Ok(true),
             other => Err(corrupt(format!("flag byte {other} is neither 0 nor 1"))),
         }
+    }
+
+    /// A little-endian `i64`, which is what a sequence's start and increment are.
+    fn i64_le(&mut self) -> Result<i64> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "the two's-complement round trip is exact and is how the value was written"
+        )]
+        Ok(self.u64_le()? as i64)
     }
 
     fn u64_le(&mut self) -> Result<u64> {

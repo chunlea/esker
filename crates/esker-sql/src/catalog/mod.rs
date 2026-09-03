@@ -760,7 +760,9 @@ impl TableDef {
     /// The sequence that fills column `at`, if one does.
     #[must_use]
     pub fn sequence_for(&self, at: usize) -> Option<&SequenceDef> {
-        self.sequences.iter().find(|sequence| sequence.column == at)
+        self.sequences
+            .iter()
+            .find(|sequence| sequence.column == Some(at))
     }
 
     /// The position of a column by name, or `None`.
@@ -911,13 +913,36 @@ pub struct SequenceDef {
     pub id: u64,
     /// `<table>_<column>_seq`, folded, and a name in the same namespace as tables and indexes.
     pub name: String,
-    /// The table it belongs to.
+    /// The table whose record range holds it: the table that **owns** it, or
+    /// [`STANDALONE_SEQUENCE_OWNER`] for one that no column does.
     pub table_id: u64,
-    /// The column it fills, by position.
-    pub column: usize,
+    /// The column this sequence **fills** — its `nextval` is that column's default.
+    ///
+    /// `None` for a sequence that fills nothing, which is every sequence `CREATE SEQUENCE` makes:
+    /// creating one leaves the column's default alone, measured on `pg_attrdef`, and it takes an
+    /// `ALTER COLUMN … SET DEFAULT` to point a column at it.
+    pub column: Option<usize>,
+    /// The column that **owns** it: dropping that column drops the sequence.
+    ///
+    /// A different fact from [`SequenceDef::column`], and PostgreSQL keeps them apart — a
+    /// `bigserial` sets both to the same column, and `OWNED BY` sets only this one. Conflating
+    /// them is what the single ordinal in the key did before catalog version 15, and it could not
+    /// hold the statement this exists for: a column may own more than one sequence.
+    pub owner_column: Option<usize>,
     /// What it does with a value the user wrote.
     pub identity: Identity,
+    /// `START n`: the **first** value `nextval` answers, not the one before it. Measured —
+    /// `START 101` gives `101` and then `102`.
+    pub start: i64,
+    /// `INCREMENT BY n`, `1` unless one was written.
+    pub increment: i64,
 }
+
+/// The owner id a sequence no column owns is filed under.
+///
+/// A real relation id is never `0` — they come from a counter that starts above it — so this
+/// cannot collide with a table, and it keeps every sequence in one key space with one scan.
+pub const STANDALONE_SEQUENCE_OWNER: u64 = 0;
 
 /// What a name resolves to. Tables, indexes and sequences share one namespace, as they do in
 /// PostgreSQL's `pg_class`: creating an index over a table's name answers `42P07`, confirmed
@@ -938,10 +963,10 @@ pub enum Relation {
     },
     /// A sequence, by the column it fills — which is what its record is keyed by.
     Sequence {
-        /// The table the column belongs to.
+        /// The table that owns it, or [`STANDALONE_SEQUENCE_OWNER`].
         table_id: u64,
-        /// The column's position.
-        column: usize,
+        /// Its own id.
+        sequence_id: u64,
     },
     /// A primary key constraint's name — `<table>_pkey`.
     ///
@@ -1683,17 +1708,37 @@ pub fn create_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) -
         return Err(SqlError::DuplicateTable(sequence.name.clone()));
     }
     txn.put(
-        &record::sequence_key(tenant, sequence.table_id, sequence.column),
+        &record::sequence_key(tenant, sequence.table_id, sequence.id),
         &record::encode_sequence(sequence),
     );
     txn.put(
         &record::name_key(tenant, &sequence.name),
         &record::encode_relation(&Relation::Sequence {
             table_id: sequence.table_id,
-            column: sequence.column,
+            sequence_id: sequence.id,
         }),
     );
     Ok(())
+}
+
+/// One sequence by the pair its name resolves to, read straight from its record.
+///
+/// Not through the table: a sequence no column owns is filed under
+/// [`STANDALONE_SEQUENCE_OWNER`], which has no `TableDef` behind it, and going via one would make
+/// every unowned sequence unreachable.
+pub fn sequence_by_id(
+    txn: &dyn Txn,
+    tenant: u64,
+    table_id: u64,
+    sequence_id: u64,
+) -> Result<Option<SequenceDef>> {
+    let Some(bytes) = txn.get(&record::sequence_key(tenant, table_id, sequence_id))? else {
+        return Ok(None);
+    };
+    // The key ordinal only matters for a record written before version 15, and one of those is
+    // keyed by the column it fills — which is the id read back here.
+    let key_column = usize::try_from(sequence_id).unwrap_or(0);
+    record::decode_sequence(&bytes, table_id, key_column).map(Some)
 }
 
 /// Every sequence one table owns, in column order.
@@ -1705,8 +1750,11 @@ pub fn table_sequences(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Vec<
     let mut out = Vec::new();
     // A table cannot have more columns than a row can hold, so one page is every sequence it has.
     for (key, value) in txn.scan(&start, &end, u32::MAX)? {
-        let column = record::sequence_column_of(tenant, table_id, &key)?;
-        out.push(record::decode_sequence(&value, table_id, column)?);
+        let id = record::sequence_id_of(tenant, table_id, &key)?;
+        // A record written before version 15 was keyed by the column it filled, so for those the
+        // id read out of the key *is* that ordinal. `decode_sequence` uses it only in that case.
+        let key_column = usize::try_from(id).unwrap_or(0);
+        out.push(record::decode_sequence(&value, table_id, key_column)?);
     }
     out.sort_by_key(|sequence| sequence.column);
     Ok(out)
@@ -1720,7 +1768,7 @@ pub fn table_sequences(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Vec<
 /// `DROP SEQUENCE … CASCADE` a real server has no `pg_attrdef` row for the table and the column is
 /// still there.
 pub fn drop_sequence(txn: &mut dyn Txn, tenant: u64, table_id: u64, sequence: &SequenceDef) {
-    txn.delete(&record::sequence_key(tenant, table_id, sequence.column));
+    txn.delete(&record::sequence_key(tenant, table_id, sequence.id));
     txn.delete(&record::name_key(tenant, &sequence.name));
     txn.delete(&record::sequence_value_key(tenant, sequence.id));
 }
@@ -1728,7 +1776,7 @@ pub fn drop_sequence(txn: &mut dyn Txn, tenant: u64, table_id: u64, sequence: &S
 /// Removes one table's sequences: their records, their names and their counters.
 fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
     for sequence in &table.sequences {
-        txn.delete(&record::sequence_key(tenant, table.id, sequence.column));
+        txn.delete(&record::sequence_key(tenant, table.id, sequence.id));
         txn.delete(&record::name_key(tenant, &sequence.name));
         txn.delete(&record::sequence_value_key(tenant, sequence.id));
     }
@@ -1910,23 +1958,27 @@ mod tests {
     }
 
     /// The golden. A catalog record is an on-disk format like any other, and these bytes are it.
-    /// The sequence record, byte for byte. Its own kind byte, its own key, and **no field for the
-    /// column it fills** — that is in the key, so a record whose key and body disagreed is a state
-    /// the format cannot get into.
+    ///
+    /// **The column it fills was in the key and is in the body from version 15**, beside the
+    /// column that *owns* it — two facts one ordinal used to conflate, and the key is the id now,
+    /// because a column may own more than one sequence.
     #[test]
     fn a_sequence_record_is_a_version_an_id_a_name_and_a_kind() {
         let sequence = SequenceDef {
             id: 9,
             name: "accounts_id_seq".into(),
             table_id: 7,
-            column: 0,
+            column: Some(0),
+            owner_column: Some(0),
             identity: Identity::Always,
+            start: 1,
+            increment: 1,
         };
         let encoded = record::encode_sequence(&sequence);
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0e",               // catalog format version
+                "0f",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -1934,18 +1986,44 @@ mod tests {
                 // GENERATED ALWAYS. The one thing that distinguishes the three identity kinds is
                 // what an explicit value does, so it is a byte rather than something derived.
                 "02",
+                // Version 15. The column it fills and the column that owns it, each as the
+                // ordinal **plus one** so that `0` is `None` -- a `bigserial` is both.
+                "01",
+                "01",
+                "0100000000000000", // START 1
+                "0100000000000000", // INCREMENT BY 1
             )
         );
         assert_eq!(record::decode_sequence(&encoded, 7, 0).unwrap(), sequence);
     }
 
-    /// A sequence's key carries the owner, and the column ordinal reads back out of it.
+    /// **A record written before version 15 reads back as the `bigserial` it could only have
+    /// been.** Its key carried the column, its body had no ordinals, and the only sequence that
+    /// format could hold both filled and owned that column.
     #[test]
-    fn a_sequence_is_keyed_by_the_column_it_fills() {
+    fn a_version_14_sequence_reads_as_a_bigserial() {
+        let mut old = vec![14u8];
+        old.extend_from_slice(&9u64.to_le_bytes());
+        old.push(15);
+        old.extend_from_slice(b"accounts_id_seq");
+        old.push(Identity::Always.as_u8());
+        let decoded = record::decode_sequence(&old, 7, 3).unwrap();
+        assert_eq!(
+            decoded.column,
+            Some(3),
+            "the key's ordinal, which it filled"
+        );
+        assert_eq!(decoded.owner_column, Some(3), "and owned");
+        assert_eq!((decoded.start, decoded.increment), (1, 1));
+    }
+
+    /// A sequence's key carries the owner, and its own id reads back out of it.
+    #[test]
+    fn a_sequence_is_keyed_by_its_own_id() {
         let (start, end) = record::table_sequence_range(1, 7);
         let key = record::sequence_key(1, 7, 3);
         assert!(key >= start && key < end, "the key is inside the range");
-        assert_eq!(record::sequence_column_of(1, 7, &key).unwrap(), 3);
+        assert_eq!(record::sequence_id_of(1, 7, &key).unwrap(), 3);
         // Another table's sequence is outside this table's range, which is what makes the scan
         // one table's and not the tenant's.
         assert!(!(record::sequence_key(1, 8, 0) < end && record::sequence_key(1, 8, 0) >= start));
@@ -1960,10 +2038,19 @@ mod tests {
             id: 1,
             name: "s".into(),
             table_id: 1,
-            column: 0,
+            column: Some(0),
+            owner_column: Some(0),
             identity: Identity::Default,
+            start: 1,
+            increment: 1,
         });
-        *encoded.last_mut().unwrap() = 9;
+        // **The identity byte, by position rather than by `last`.** It was the last byte until
+        // version 15 put four fields after it, and corrupting the last one now corrupts the
+        // increment — which is a `i64` that takes any bit pattern, so the test would have passed
+        // by asserting nothing.
+        let identity_at = 1 + 8 + 1 + "s".len();
+        assert_eq!(encoded[identity_at], Identity::Default.as_u8());
+        encoded[identity_at] = 9;
         assert_eq!(
             record::decode_sequence(&encoded, 1, 0)
                 .unwrap_err()
@@ -1984,7 +2071,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0e",       // catalog format version
+                "0f",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2017,7 +2104,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0e",                 // catalog format version
+                "0f",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3021,7 +3108,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "0e",               // catalog format version
+                "0f",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
