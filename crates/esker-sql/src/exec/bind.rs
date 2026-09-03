@@ -180,6 +180,8 @@ fn walk(
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -305,6 +307,8 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -398,6 +402,8 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
         | Statement::AlterTable(_)
@@ -410,6 +416,14 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
 }
 
 /// Whether a statement mentions a parameter at all, so the common case costs no walk of its own.
+pub(super) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool {
+    let mut found = false;
+    for_each_expr(statement, &mut |expr| {
+        found = found || wanted(expr);
+    });
+    found
+}
+
 pub(super) fn has_parameters(statement: &Statement) -> bool {
     let mut found = false;
     for_each_expr(statement, &mut |expr| {
@@ -468,6 +482,8 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}

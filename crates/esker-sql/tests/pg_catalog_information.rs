@@ -137,10 +137,12 @@ fn a_bare_information_schema_name_is_not_a_relation() {
         vec![vec!["qn"]]
     );
 
-    // A schema this node does not have stays refused by name rather than being ignored: answering
-    // `other.qn` with `qn`'s rows would be a wrong answer, not a missing feature.
+    // A schema this node does not have is `42P01` **with the schema inside the quotes**, which is
+    // what a real server answers — measured in `pg19_schema.txt`. It was `0A000` until schemas
+    // existed; now the relation really is looked for, in a namespace that is not there.
     let error = node.run("SELECT * FROM other.qn").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
+    assert_eq!(error.to_string(), "relation \"other.qn\" does not exist");
 }
 
 /// `key_column_usage` answers what `primary_keys()` asks and `pg_index` cannot.

@@ -216,6 +216,7 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
         Expr::Literal(_)
         | Expr::Uuid(_)
         | Expr::Parameter(_)
+        | Expr::CurrentSchema { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Outer { .. }

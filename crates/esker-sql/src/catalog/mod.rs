@@ -654,6 +654,86 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// counter would be a number in the output of `EXPLAIN` that changed with the statement around it.
 pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 
+/// A user-defined type: what `CREATE TYPE` made, by name.
+///
+/// **Its oid comes from the tenant's relation-id sequence**, the same counter tables and indexes
+/// draw from, so a type and a relation can never share one. That is PostgreSQL's arrangement too —
+/// `pg_class` and `pg_type` are two catalogs over one oid space — and it is what lets
+/// `'floatrange'::regtype` and `'people'::regclass` be numbers a client can compare.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    /// As the user wrote it, folded like every other identifier.
+    pub name: String,
+    /// From the tenant's relation-id sequence.
+    pub oid: u64,
+    /// Which of the three `CREATE TYPE` shapes it is.
+    pub kind: TypeKind,
+}
+
+/// One field of a composite type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeField {
+    /// The field's name.
+    pub name: String,
+    /// Its type.
+    pub ty: ColumnType,
+    /// Its typmod, so `format_type` prints `character varying(90)` and not `character varying`.
+    pub typmod: i32,
+}
+
+/// The three shapes `CREATE TYPE` takes, and the three `typtype` codes they answer.
+///
+/// **`typtype` and `typcategory` are different one-letter codes and both matter**: a range is
+/// `r`/`R`, a composite `c`/`C` and an enum `e`/`E`. Measured; an implementation that answered one
+/// of them for both would pass a `typtype` probe and fail a `typcategory` one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeKind {
+    /// `CREATE TYPE r AS RANGE (subtype = …)`.
+    Range {
+        /// The element type the range is over, which `pg_range.rngsubtype` reports.
+        subtype: ColumnType,
+        /// The `subtype_diff` function's name, verbatim — `pg_range.rngsubdiff` prints it back and
+        /// nothing here calls it. `None` when the clause was not written.
+        subtype_diff: Option<String>,
+    },
+    /// `CREATE TYPE c AS (field type, …)`.
+    Composite {
+        /// The fields, in declaration order, which is the order `pg_attribute` reports them in.
+        fields: Vec<TypeField>,
+    },
+    /// `CREATE TYPE e AS ENUM ('a', 'b')` — and **an empty label list is legal**, measured.
+    Enum {
+        /// The labels, in declaration order. That order **is** the sort order: `'past' < 'future'`
+        /// is true for `('past','present','future')` because of where they were declared, not
+        /// because of the alphabet.
+        labels: Vec<String>,
+    },
+}
+
+impl TypeKind {
+    /// `pg_type.typtype`: `r`, `c` or `e`.
+    #[must_use]
+    pub fn typtype(&self) -> &'static str {
+        match self {
+            TypeKind::Range { .. } => "r",
+            TypeKind::Composite { .. } => "c",
+            TypeKind::Enum { .. } => "e",
+        }
+    }
+
+    /// `pg_type.typcategory`: `R`, `C` or `E`. **Not the upper case of `typtype` by accident** —
+    /// they are two different columns of one-letter codes, and only these three pairs happen to
+    /// look alike.
+    #[must_use]
+    pub fn typcategory(&self) -> &'static str {
+        match self {
+            TypeKind::Range { .. } => "R",
+            TypeKind::Composite { .. } => "C",
+            TypeKind::Enum { .. } => "E",
+        }
+    }
+}
+
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
@@ -1757,6 +1837,40 @@ pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &s
     );
 }
 
+/// Writes a user-defined type. The caller has already checked that the name is free.
+pub fn put_type(txn: &mut dyn Txn, tenant: u64, def: &TypeDef) {
+    txn.put(
+        &record::type_key(tenant, &def.name),
+        &record::encode_type(def),
+    );
+}
+
+/// One user-defined type by name, or `None`.
+pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<TypeDef>> {
+    match txn.get(&record::type_key(tenant, name))? {
+        Some(bytes) => record::decode_type(name, &bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Every user-defined type of one tenant, in name order — which is the order the key space returns
+/// them in, and the order `pg_type` lists them.
+pub fn user_types(txn: &dyn Txn, tenant: u64) -> Result<Vec<TypeDef>> {
+    let (start, end) = record::type_range(tenant);
+    txn.scan(&start, &end, 0)?
+        .into_iter()
+        .map(|(key, value)| {
+            let name = record::type_name_of(tenant, &key)?;
+            record::decode_type(&name, &value)
+        })
+        .collect()
+}
+
+/// Removes one. The caller has already checked that nothing depends on it.
+pub fn drop_type(txn: &mut dyn Txn, tenant: u64, name: &str) {
+    txn.delete(&record::type_key(tenant, name));
+}
+
 /// Every extension this tenant has installed, by name, in name order.
 ///
 /// One prefix scan. The **available** set is a property of the build and is not stored — which of
@@ -2393,6 +2507,108 @@ pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
 
 /// The one schema every tenant has.
 pub const PUBLIC_SCHEMA: &str = "public";
+
+/// What separates a schema from a relation name **as stored**.
+///
+/// **A NUL, not a dot.** A dot is ambiguous: `schema_test.rb`'s own `setup` creates
+/// `test_schema."things.table"`, so `"a.b.c"` could be the relation `b.c` in schema `a` or the
+/// relation `c` in schema `a.b`. A NUL cannot appear in a PostgreSQL identifier at all, so it
+/// separates the two without a length prefix — which is what lets the name record's key keep its
+/// shape, where "the name is the whole tail" is the property the scan relies on.
+///
+/// **A relation in `public` is stored with no separator at all**, so every key and every record
+/// written before schemas existed reads back unchanged and every answer about `public` is
+/// byte-identical to what it was.
+pub const SCHEMA_SEPARATOR: char = '\0';
+
+/// The stored name of a relation: bare in `public`, `schema ++ NUL ++ name` anywhere else.
+#[must_use]
+pub fn qualify(schema: &str, name: &str) -> String {
+    if schema == PUBLIC_SCHEMA {
+        return name.to_owned();
+    }
+    format!("{schema}{SCHEMA_SEPARATOR}{name}")
+}
+
+/// The schema and the bare name out of a stored one.
+#[must_use]
+pub fn split_qualified(stored: &str) -> (&str, &str) {
+    match stored.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, name)) => (schema, name),
+        None => (PUBLIC_SCHEMA, stored),
+    }
+}
+
+/// A stored name as a **message** spells it: `schema.name`, or the bare name in `public`.
+///
+/// The separator is a NUL on disk and a dot in a sentence, because that is what PostgreSQL quotes
+/// back: `42P01 relation "nosuchschema.t" does not exist`, with the schema **inside** the quotes.
+#[must_use]
+pub fn display_name(stored: &str) -> String {
+    match stored.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, name)) => format!("{schema}.{name}"),
+        None => stored.to_owned(),
+    }
+}
+
+/// A name **as a user wrote it** — `schema.relation` — turned into the stored form.
+///
+/// This is `::regclass`'s input and nothing else: everywhere else a qualified name arrives already
+/// split by the parser, which knows which halves were quoted. Here it is one string, so the rule is
+/// PostgreSQL's own for an unquoted one — the first dot separates — and the two schemas this node
+/// spells *into* a name keep theirs:
+///
+/// * `pg_catalog.x` is the relation `x`, which is how it is stored;
+/// * `information_schema.x` **is** the stored name, dot and all (`catalog::information_schema`).
+///
+/// A name carrying a quote is left whole, because splitting `test_schema."things.table"` correctly
+/// needs the parser and `::regclass` does not have it. That is a gap in one spelling of one cast,
+/// and it answers `42P01` rather than the wrong relation.
+#[must_use]
+pub fn parse_qualified(written: &str) -> String {
+    if written.contains('"') {
+        return written.to_owned();
+    }
+    let Some((schema, name)) = written.split_once('.') else {
+        return written.to_owned();
+    };
+    if schema.eq_ignore_ascii_case("information_schema") {
+        return written.to_owned();
+    }
+    if schema.eq_ignore_ascii_case("pg_catalog") {
+        return name.to_owned();
+    }
+    qualify(schema, name)
+}
+
+/// Every relation stored in one schema, as stored names.
+///
+/// A prefix scan of the name records: `schema ++ NUL` is a prefix no other schema's names share,
+/// which is what makes `DROP SCHEMA … CASCADE` a range rather than a filter over everything.
+pub fn relations_in_schema(txn: &dyn Txn, tenant: u64, schema: &str) -> Result<Vec<String>> {
+    if schema == PUBLIC_SCHEMA {
+        // `public`'s names have no prefix to scan for — they are every name without a separator.
+        let (start, end) = record::name_range(tenant);
+        let mut out = Vec::new();
+        for (key, _) in txn.scan(&start, &end, u32::MAX)? {
+            let name = record::name_of(tenant, &key)?;
+            if !name.contains(SCHEMA_SEPARATOR) {
+                out.push(name);
+            }
+        }
+        return Ok(out);
+    }
+    let prefix = format!("{schema}{SCHEMA_SEPARATOR}");
+    let (start, end) = record::name_range(tenant);
+    let mut out = Vec::new();
+    for (key, _) in txn.scan(&start, &end, u32::MAX)? {
+        let name = record::name_of(tenant, &key)?;
+        if name.starts_with(&prefix) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
 
 /// `public`'s oid, which a real server also fixes rather than allocating.
 pub const PUBLIC_SCHEMA_ID: u64 = 11;

@@ -51,7 +51,7 @@ use crate::catalog::{
     CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
     IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, Persistence,
     RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
-    UniqueKind,
+    TypeDef, TypeField, TypeKind, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -72,6 +72,11 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// version 10 the table's `FOREIGN KEY` constraints, and version 11 each index's
 /// `NULLS NOT DISTINCT`. Each is appended at the end, so a record of
 /// every earlier version is a prefix of a later one's and the goldens below still decode.
+///
+/// Version 22 added a record kind rather than a section: a **user-defined type**, keyed by name
+/// under `'y'` (`CREATE TYPE`). No table record changed, which is the point of putting it in its
+/// own key space — a reader older than 22 sees a key it does not know rather than a table record it
+/// misparses.
 ///
 /// Version 21 added the **comments**: the table's, one per column and one per index, in that
 /// order and at the very end like every section before it. A table written before 21 has none,
@@ -108,6 +113,14 @@ const OLDEST_SCHEMA_VERSION: u8 = 22;
 /// extension's is: a reader newer than 18 must still accept what 18 wrote.
 const OLDEST_FUNCTION_VERSION: u8 = 18;
 
+/// The version a **type** record was introduced at, its own floor for the same reason.
+const OLDEST_TYPE_VERSION: u8 = 22;
+
+/// The three shapes `CREATE TYPE` takes, as stored. Appended, never renumbered.
+const TYPE_KIND_RANGE: u8 = 1;
+const TYPE_KIND_COMPOSITE: u8 = 2;
+const TYPE_KIND_ENUM: u8 = 3;
+
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
 
@@ -143,6 +156,11 @@ const KIND_FK_BACKREF: u8 = b'k';
 const KIND_EXTENSION: u8 = b'x';
 /// A stored function, keyed by name.
 const KIND_FUNCTION: u8 = b'f';
+/// A **user-defined type**, keyed by name, for the same reason an extension is: `CREATE TYPE` and
+/// `DROP TYPE` name it, `'floatrange'::regtype` resolves it and `pg_type` lists it by name. Its
+/// oid comes from the tenant's relation-id sequence, so a type and a table can never share one —
+/// which is PostgreSQL's arrangement too, where both live in the same oid space.
+const KIND_TYPE: u8 = b'y';
 /// A **schema**, keyed by name. `public` is not stored: it is a property of the build, the way the
 /// available extensions are, and a tenant that has created nothing still has it.
 const KIND_SCHEMA: u8 = b'g';
@@ -496,6 +514,113 @@ pub(super) fn decode_extension(bytes: &[u8]) -> Result<String> {
     let version = reader.string()?;
     reader.finish()?;
     Ok(version)
+}
+
+/// One user-defined type, keyed by name.
+#[must_use]
+pub(super) fn type_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_TYPE]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every user-defined type of one tenant: the range [`type_key`] writes into.
+#[must_use]
+pub(super) fn type_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let start = type_key(tenant, "");
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The name out of a key [`type_key`] wrote.
+pub(super) fn type_name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = type_key(tenant, "");
+    let name = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a type key outside its own range"))?;
+    String::from_utf8(name.to_vec()).map_err(|_| corrupt("a type name that is not UTF-8"))
+}
+
+/// One type record: a version byte, its oid, a kind tag, and the kind's own body.
+///
+/// The three kinds are written under one key space rather than three, because every statement that
+/// looks a type up — `DROP TYPE`, `::regtype`, `pg_type` — asks by name and does not know the kind
+/// yet. The tag is what tells them apart once the record is read.
+#[must_use]
+pub(super) fn encode_type(def: &TypeDef) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&def.oid.to_le_bytes());
+    match &def.kind {
+        TypeKind::Range {
+            subtype,
+            subtype_diff,
+        } => {
+            out.push(TYPE_KIND_RANGE);
+            out.push(tag_of(*subtype));
+            put_str(subtype_diff.as_deref().unwrap_or(""), &mut out);
+        }
+        TypeKind::Composite { fields } => {
+            out.push(TYPE_KIND_COMPOSITE);
+            varint::put_u64(fields.len() as u64, &mut out);
+            for field in fields {
+                put_str(&field.name, &mut out);
+                out.push(tag_of(field.ty));
+                out.extend_from_slice(&field.typmod.to_le_bytes());
+            }
+        }
+        TypeKind::Enum { labels } => {
+            out.push(TYPE_KIND_ENUM);
+            varint::put_u64(labels.len() as u64, &mut out);
+            for label in labels {
+                put_str(label, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Reads one back.
+pub(super) fn decode_type(name: &str, bytes: &[u8]) -> Result<TypeDef> {
+    let mut reader = Reader::at_least(bytes, OLDEST_TYPE_VERSION)?;
+    let oid = reader.u64_le()?;
+    let kind = match reader.byte()? {
+        TYPE_KIND_RANGE => {
+            let subtype = type_of(reader.byte()?)?;
+            let diff = reader.string()?;
+            TypeKind::Range {
+                subtype,
+                subtype_diff: (!diff.is_empty()).then_some(diff),
+            }
+        }
+        TYPE_KIND_COMPOSITE => {
+            let count = reader.count()?;
+            let mut fields = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = reader.string()?;
+                let ty = type_of(reader.byte()?)?;
+                let typmod = reader.i32_le()?;
+                fields.push(TypeField { name, ty, typmod });
+            }
+            TypeKind::Composite { fields }
+        }
+        TYPE_KIND_ENUM => {
+            let count = reader.count()?;
+            let mut labels = Vec::with_capacity(count);
+            for _ in 0..count {
+                labels.push(reader.string()?);
+            }
+            TypeKind::Enum { labels }
+        }
+        other => return Err(corrupt(format!("an unknown type kind tag {other}"))),
+    };
+    reader.finish()?;
+    Ok(TypeDef {
+        name: name.to_owned(),
+        oid,
+        kind,
+    })
 }
 
 /// One stored function, keyed by name — a record of its own, as an extension is.

@@ -432,6 +432,29 @@ pub struct ForeignKey {
     pub deferrable: bool,
 }
 
+/// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
+///
+/// One statement for three shapes, as PostgreSQL parses it. What each shape *means* is
+/// [`crate::catalog::TypeKind`]; this is only what was written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateType {
+    /// The type's name, folded.
+    pub name: String,
+    /// Which shape, already read into the catalog's own form.
+    pub kind: crate::catalog::TypeKind,
+}
+
+/// `DROP TYPE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropType {
+    /// One or more, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`: a name that is not there is a **notice**, not `42704`.
+    pub if_exists: bool,
+    /// `CASCADE`, which would drop the columns that depend on the type.
+    pub cascade: bool,
+}
+
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.
 ///
 /// One statement for three objects, exactly as PostgreSQL parses it, because the differences are

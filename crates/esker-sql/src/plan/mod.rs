@@ -33,9 +33,10 @@ pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
     CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence, CreateTable,
-    CreateTrigger, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
-    ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint,
-    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
+    CreateTrigger, CreateType, DropFunction, DropIndex, DropSchema, DropSequence, DropTable,
+    DropTrigger, DropType, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd,
+    UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
+    unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -95,6 +96,10 @@ pub enum Statement {
     DropIndex(DropIndex),
     /// `COMMENT ON TABLE | COLUMN | INDEX`.
     Comment(Comment),
+    /// `CREATE TYPE`.
+    CreateType(CreateType),
+    /// `DROP TYPE`.
+    DropType(DropType),
     /// `ALTER TABLE`, of which only `ADD COLUMN` is executed.
     AlterTable(AlterTable),
     /// `INSERT`.
@@ -184,6 +189,8 @@ impl Statement {
             Statement::DropTable(_) => Some("DROP TABLE"),
             // A catalog write like the rest: it rewrites the table record the comment lives in.
             Statement::Comment(_) => Some("COMMENT"),
+            Statement::CreateType(_) => Some("CREATE TYPE"),
+            Statement::DropType(_) => Some("DROP TYPE"),
             Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
             Statement::DropFunction(_) => Some("DROP FUNCTION"),
@@ -230,6 +237,8 @@ impl Statement {
             // **`COMMENT`, not `COMMENT ON`** — PostgreSQL's tag is the first word alone, which
             // `psql` prints back and a script may branch on.
             Statement::Comment(_) => "COMMENT",
+            Statement::CreateType(_) => "CREATE TYPE",
+            Statement::DropType(_) => "DROP TYPE",
             Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",
             Statement::DropFunction(_) => "DROP FUNCTION",

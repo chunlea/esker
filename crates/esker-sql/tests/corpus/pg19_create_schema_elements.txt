@@ -1,0 +1,99 @@
+# `CREATE SCHEMA … <schema_element>` — a `CREATE SCHEMA` carrying nested `CREATE TABLE`/`VIEW`/
+# `INDEX` with **no semicolon between them** — as a real PostgreSQL 19beta1 answers it.
+#
+# **This is run 45's ranking row 4, and the only ADR 0031 category (a) entry in the top of that
+# table**: 48 tests in one file, `adapters/postgresql/schema_test.rb`, every one of them stopped by
+#
+#     PG::SyntaxError: ERROR:  syntax error: sql parser error:
+#     Expected: end of statement, found: CREATE at Line: 1, Column: 27
+#
+# Contract C2 is that every statement either executes or is refused **by name**, never with a syntax
+# error. Column 27 is where the second `CREATE` starts in `schema_test.rb`'s setup line 90, which is
+# the statement pinned first below, verbatim (`COLUMNS.join(",")` gives the bare commas):
+#
+#     CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),…)
+#
+# It is not a multi-statement string. It is one statement in PostgreSQL's grammar, and the whole of
+# `schema_test.rb` depends on it running in `setup`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. The `\gdesc` pass
+# runs after the rollback, so statements naming these schemas have an **empty** declared-types
+# column; the `pg_typeof` line pins `name` for `current_schema()` and `nspname`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The nested `CREATE TABLE` lands in the NEW schema, and `search_path` does not move.**
+#     After the statement, `test_schema.things` exists, `public.things` does **not** (count `0`), and
+#     `current_schema()` is still `public`. An implementation that desugars this into two statements
+#     has to qualify the inner one itself — running `CREATE TABLE things (…)` as written would put it
+#     in `public` and every one of the 48 tests would then look in the wrong place.
+#   * **Two schemas may each hold a `things`**, which is the point of the test file: the second
+#     `CREATE SCHEMA test_schema2 CREATE TABLE things (…)` succeeds beside the first.
+#   * **Any number of elements, and they are not only tables.** `CREATE SCHEMA se_multi CREATE TABLE
+#     a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one` produces `a`/`r`, `b`/`r`,
+#     `v`/`v`. An index element works too and lands in the new schema:
+#     `pg_get_indexdef` gives `CREATE UNIQUE INDEX t_i_idx ON se_idx.t USING btree (i)`.
+#   * **The statement is atomic.** `CREATE SCHEMA se_bad CREATE TABLE t (i nosuchtype)` is
+#     `42704 type "nosuchtype" does not exist` and **the schema is not created** — `pg_namespace`
+#     count is `0`. A desugaring that creates the schema first and then fails leaves a schema
+#     PostgreSQL would not have left.
+#   * **A semicolon ends the schema-element list rather than extending it.**
+#     `CREATE SCHEMA se_semi CREATE TABLE t (i int); CREATE TABLE u (j int)` puts `t` in `se_semi`
+#     and `u` in **`public`** — the part after the `;` is an ordinary second statement. So the
+#     grammar cannot be approximated by "split on semicolons and qualify everything".
+#   * **`DROP SCHEMA` on a schema with objects is `2BP01`**, with a DETAIL naming the table and the
+#     usual `CASCADE` hint; `DROP SCHEMA … CASCADE` succeeds. A missing schema is **`3F000`**, not
+#     `42P01`, and `DROP SCHEMA IF EXISTS` on it is a plain success.
+#   * **A duplicate schema is `42P06`**, and `CREATE SCHEMA IF NOT EXISTS` on an existing one is a
+#     plain success with no notice row.
+#   * **`current_schema()` and `nspname` are both `name`**, not `text`.
+BEGIN		-
+CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())		-
+SELECT 'r', nspname FROM pg_namespace WHERE nspname = 'test_schema'	text,name	r|test_schema
+SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' ORDER BY c.relname	text,name,name,"char"	r|test_schema|things|r
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'test_schema.things'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|integer ; r|name|character varying(50) ; r|email|character varying(50) ; r|description|character varying(100) ; r|name_vector|tsvector ; r|moment|timestamp without time zone
+SELECT 'r', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'things'	text,bigint	r|0
+SELECT 'r', current_schema()	text,name	r|public
+CREATE SCHEMA test_schema2 CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())		-
+SELECT 'r', n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' ORDER BY n.nspname	text,name,name	r|test_schema|things ; r|test_schema2|things
+CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one		-
+SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_multi' ORDER BY c.relname	text,name,"char"	r|a|r ; r|b|r ; r|v|v
+CREATE SCHEMA se_idx CREATE TABLE t (i int) CREATE UNIQUE INDEX t_i_idx ON t (i)		-
+SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_idx' ORDER BY c.relname	text,name,"char"	r|t|r ; r|t_i_idx|i
+SELECT 'r', pg_get_indexdef('se_idx.t_i_idx'::regclass)		r|CREATE UNIQUE INDEX t_i_idx ON se_idx.t USING btree (i)
+CREATE SCHEMA IF NOT EXISTS test_schema		-
+CREATE SCHEMA se_empty		-
+SELECT 'r', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_empty'	text,bigint	r|0
+SAVEPOINT s1		-
+CREATE SCHEMA test_schema	!42P06 schema "test_schema" already exists
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE SCHEMA se_bad CREATE TABLE t (i nosuchtype)	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s2		-
+SELECT 'r', count(*) FROM pg_namespace WHERE nspname = 'se_bad'	text,bigint	r|0
+SAVEPOINT s3		-
+CREATE SCHEMA se_semi CREATE TABLE t (i int); CREATE TABLE u (j int)		-
+SELECT 'r', n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_semi' ORDER BY c.relname	text,name,name	r|se_semi|t
+SELECT 'r', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'u'	text,bigint	r|1
+ROLLBACK TO s3		-
+DROP SCHEMA se_empty		-
+SELECT 'r', count(*) FROM pg_namespace WHERE nspname = 'se_empty'	text,bigint	r|0
+SAVEPOINT s4		-
+DROP SCHEMA test_schema	!2BP01 cannot drop schema test_schema because other objects depend on it DETAIL: table test_schema.things depends on schema test_schema HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s4		-
+DROP SCHEMA test_schema CASCADE		-
+SELECT 'r', count(*) FROM pg_namespace WHERE nspname = 'test_schema'	text,bigint	r|0
+SAVEPOINT s5		-
+DROP SCHEMA nosuchschema	!3F000 schema "nosuchschema" does not exist
+ROLLBACK TO s5		-
+DROP SCHEMA IF EXISTS nosuchschema		-
+SELECT 'r', pg_typeof(current_schema()), pg_typeof(nspname) FROM pg_namespace LIMIT 1	text,regtype,regtype	r|name|name
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('test_schema','test_schema2','se_multi','se_idx','se_empty','se_semi','se_bad')	bigint	0

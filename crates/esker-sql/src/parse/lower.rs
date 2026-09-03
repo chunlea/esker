@@ -26,6 +26,7 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
+use crate::catalog::{TypeField, TypeKind};
 use crate::error::{Result, SqlError};
 use crate::parse::{Parsed, feature_name};
 use crate::plan;
@@ -260,6 +261,11 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                ObjectType::Type => plan::Statement::DropType(plan::DropType {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 ObjectType::Index => plan::Statement::DropIndex(plan::DropIndex {
                     names,
                     // `sqlparser` 0.62.0's `Drop` has no `concurrently` field, so the word is read
@@ -311,6 +317,10 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             )?;
             Ok(plan::Statement::Explain(Box::new(inner), *analyze))
         }
+        Statement::CreateType {
+            name,
+            representation,
+        } => lower_create_type(name, representation.as_ref()),
         Statement::Comment {
             object_type,
             object_name,
@@ -2462,9 +2472,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Identifier(name)
             if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("current_schema") =>
         {
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-            ))))
+            Ok(plan::Expr::CurrentSchema { all: None })
         }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
@@ -2810,19 +2818,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // gap — and it did, until r1's capture replay caught it.
     if name.eq_ignore_ascii_case("current_schema") {
         refuse_wrong_arity(function, "current_schema", 0)?;
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(PUBLIC_SCHEMA.to_owned()),
-        ))));
+        return Ok(plan::Expr::CurrentSchema { all: None });
     }
-    // **The array, written out.** `= ANY (current_schemas(false))` is still expanded into an `IN`
-    // list where it is lowered — that is what lets a catalog query keep the plan it has — and this
-    // is the same value in its other spelling, for the places a list cannot go:
-    // `SELECT current_schemas(false)` and `array_length(current_schemas(false), 1)`.
-    if let Some(schemas) = schema_function(function)? {
-        let elements: Vec<Option<String>> = schemas.into_iter().map(Some).collect();
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::Text(value::vector::Array::write(&elements)),
-        ))));
+    // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
+    // the only schema; now the value is the session's `search_path` and a lowering has no session,
+    // so it becomes an expression `crate::exec::Executor::bound` fills in. The `= ANY (…)`
+    // expansion into an `IN` list moved with it, for the same reason: the list is not known here.
+    if let Some(implicit) = schema_function(function)? {
+        return Ok(plan::Expr::CurrentSchema {
+            all: Some(implicit),
+        });
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -3332,15 +3337,15 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
             .map(lower_expr)
             .collect::<Result<Vec<_>>>()?,
         Expr::Nested(inner) => return lower_array(inner),
-        Expr::Function(function) => match schema_function(function)? {
-            Some(schemas) => schemas
-                .into_iter()
-                .map(|name| plan::Expr::Literal(plan::Literal::String(name)))
-                .collect(),
-            // Any other function is an ordinary expression whose value is an array, and the row
-            // evaluator reads it.
-            None => return Ok(None),
-        },
+        // **`current_schemas(…)` is no longer a list this lowering can see.** Its value is the
+        // session's `search_path`, which arrives at `crate::exec::Executor::bound`, so it stays an
+        // expression and the row evaluator reads it — the same road a column takes below. The
+        // `IN`-list expansion it used to get was an index-seek optimisation, and every statement
+        // that writes it reads a catalog view, which has no index to seek.
+        Expr::Function(function) => {
+            let _ = schema_function(function)?;
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),
@@ -3436,7 +3441,7 @@ fn parse_array_literal(text: &str) -> Result<Vec<Option<String>>> {
 /// `{pg_catalog,public}` — the `true` form includes the implicitly-searched catalog schema. This
 /// node has exactly one schema and no `search_path` to vary it, so both answers are constants;
 /// what would make them not constants is schema support, which is a unit of its own.
-fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<String>>> {
+fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<bool>> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
     if !function
         .name
@@ -3467,11 +3472,7 @@ fn schema_function(function: &sqlparser::ast::Function) -> Result<Option<Vec<Str
         }
         _ => return Err(SqlError::unsupported("current_schemas with that argument")),
     };
-    Ok(Some(if include_implicit {
-        vec!["pg_catalog".to_owned(), PUBLIC_SCHEMA.to_owned()]
-    } else {
-        vec![PUBLIC_SCHEMA.to_owned()]
-    }))
+    Ok(Some(include_implicit))
 }
 
 /// `42883` when a function is called with the wrong number of arguments.
@@ -5397,7 +5398,92 @@ fn relation_name(name: &ObjectName) -> Result<String> {
             ));
         }
     }
+    // **A user schema is part of the stored name**, separated by a NUL rather than a dot — see
+    // `catalog::SCHEMA_SEPARATOR` for why a dot cannot do it. Each half is folded on its own,
+    // because each was quoted or not on its own: `test_schema."Things"` is `Things` in
+    // `test_schema`.
+    if let [schema, relation] = name.0.as_slice()
+        && let (Some(schema), Some(relation)) = (schema.as_ident(), relation.as_ident())
+    {
+        return Ok(catalog::qualify(&ident(schema), &ident(relation)));
+    }
     object_name(name)
+}
+
+/// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
+///
+/// **Three shapes, and the row that asked for them wants ranges nine times out of ten**:
+/// `adapters/postgresql/range_test.rb` is 46 of the 51 tests, `composite_test.rb` 4 and
+/// `timestamp_test.rb` 1. All three are read here; what a type can then be *used* for is a
+/// separate question and a narrower one.
+fn lower_create_type(
+    name: &ObjectName,
+    representation: Option<&sqlparser::ast::UserDefinedTypeRepresentation>,
+) -> Result<plan::Statement> {
+    use sqlparser::ast::{
+        UserDefinedTypeRangeOption as RangeOption, UserDefinedTypeRepresentation,
+    };
+    let name = relation_name(name)?;
+    let kind = match representation {
+        Some(UserDefinedTypeRepresentation::Range { options }) => {
+            let mut subtype = None;
+            let mut subtype_diff = None;
+            for option in options {
+                match option {
+                    RangeOption::Subtype(data_type) => subtype = Some(lower_type(data_type)?.0),
+                    // Carried verbatim: `pg_range.rngsubdiff` prints the name back and nothing
+                    // here calls it, which is what the capture measured — `float8mi` is a real
+                    // server's own function and this node has no function to point at.
+                    RangeOption::SubtypeDiff(function) => {
+                        subtype_diff = Some(function.to_string());
+                    }
+                    other => {
+                        return Err(SqlError::unsupported(format!(
+                            "CREATE TYPE ... AS RANGE ( {other} )"
+                        )));
+                    }
+                }
+            }
+            // `42704 type "nosuchtype" does not exist` comes out of `lower_type` above; a range
+            // with no `subtype` at all is PostgreSQL's own `42P16`, which this node has not
+            // measured, so it is named rather than guessed.
+            let subtype = subtype.ok_or_else(|| {
+                SqlError::unsupported("CREATE TYPE ... AS RANGE without a subtype")
+            })?;
+            TypeKind::Range {
+                subtype,
+                subtype_diff,
+            }
+        }
+        Some(UserDefinedTypeRepresentation::Composite { attributes }) => {
+            let mut fields = Vec::with_capacity(attributes.len());
+            for attribute in attributes {
+                refuse_if(
+                    attribute.collation.is_some(),
+                    "CREATE TYPE ... AS ( ... COLLATE )",
+                )?;
+                let (ty, typmod) = lower_type(&attribute.data_type)?;
+                fields.push(TypeField {
+                    name: ident(&attribute.name),
+                    ty,
+                    typmod,
+                });
+            }
+            TypeKind::Composite { fields }
+        }
+        // **An empty label list is legal**, measured: `CREATE TYPE emptyenum AS ENUM ()`
+        // succeeds and its `typtype` is `e`.
+        Some(UserDefinedTypeRepresentation::Enum { labels }) => TypeKind::Enum {
+            labels: labels.iter().map(|label| label.value.clone()).collect(),
+        },
+        Some(UserDefinedTypeRepresentation::SqlDefinition { .. }) => {
+            return Err(SqlError::unsupported("CREATE TYPE with a SQL definition"));
+        }
+        // `CREATE TYPE name` with no body is a **shell type**, which exists to be filled in by a
+        // C function. There is nothing this node could put in one.
+        None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
+    };
+    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

@@ -21,10 +21,10 @@
 //! * `TimeZone` is honoured **only where it means UTC**, because `timestamptz` is printed in UTC
 //!   and nowhere else (`crate::value::timestamp`). A real server takes `America/New_York`; this
 //!   one refuses it by name rather than print an instant in the wrong zone.
-//! * `search_path` is honoured **only where it means `public`**, because a schema qualifier is
-//!   `0A000` here and there is exactly one place a name can be. `SET search_path TO other` is
-//!   accepted by a real server and would make an unqualified name resolve to nothing; refusing it
-//!   is the safe direction.
+//! * `search_path` is **not validated**, on a real server or here: an entry naming no schema is
+//!   *skipped* rather than refused, which is what makes the default `"$user", public` resolve to
+//!   `{public}`. `SHOW` gives the path as **set** and `current_schemas` gives it as **resolved**,
+//!   and the resolving is `crate::exec::Executor`'s, where the catalog is.
 //! * `max_identifier_length` is **read-only**, as it is on a real server — `55P02`, which is a
 //!   different answer from `42704` and means a different thing.
 //! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
@@ -209,15 +209,10 @@ impl Parameter {
             ("timezone", zone) if !is_utc(zone) => {
                 Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
             }
-            // **Still one schema for *resolution*, even though `CREATE SCHEMA` now makes more.**
-            // `current_schema` and `current_schemas` are folded to `public` where a statement is
-            // lowered, and an unqualified name resolves in `public` — so accepting a path that
-            // names another schema would answer `public` where a real server answers the other
-            // one, which ADR 0031 ranks worse than the refusal. It is lifted by the unit that
-            // makes both session-aware, and not before.
-            ("search_path", path) if !is_public(path) => Err(SqlError::unsupported(format!(
-                "a search_path of \"{path}\""
-            ))),
+            // **A `search_path` is not validated**, on a real server or here: an entry naming no
+            // schema is *skipped* rather than refused, which is what makes the default
+            // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
+            // `current_schemas` gives it as **resolved**, and both are measured.
             // What is left is what this node means. `client_min_messages` is honoured for real —
             // `Executor::take_notices` filters against it — and `IntervalStyle` is inert and
             // measured to be: it decides how an `interval` prints and there is none here.
@@ -235,18 +230,11 @@ fn is_utc(value: &str) -> bool {
     )
 }
 
-/// A `search_path` whose every entry resolves to the one schema this node has.
-///
-/// `"$user"` is a schema named after the connected role, which does not exist here — and on a real
-/// server a `search_path` entry that names no schema is skipped rather than refused, so
-/// `"$user", public` *is* `public`. That is why `ActiveRecord`'s two spellings are one value.
-fn is_public(value: &str) -> bool {
-    let mut entries = value
-        .split(',')
-        .map(|entry| entry.trim().trim_matches('"'))
-        .filter(|entry| !entry.is_empty() && *entry != "$user")
-        .peekable();
-    // An empty path is not `public`: on a real server it leaves an unqualified name resolving to
-    // nothing, where this node would still find the table.
-    entries.peek().is_some() && entries.all(|entry| entry == "public")
+/// The `search_path` parameter, for the executor that resolves it.
+#[must_use]
+pub fn search_path() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "search_path")
+        .unwrap_or(&PARAMETERS[0])
 }

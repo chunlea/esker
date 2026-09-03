@@ -309,6 +309,12 @@ impl CatalogView {
                 // describes.
                 ("typlen", ColumnType::Int2),
                 ("typcategory", ColumnType::Text),
+                // **Last for the fourth time**, and the reason has not changed. `typarray` is the
+                // oid of the array type paired with this one — a user-defined type gets one made
+                // for it by `CREATE TYPE`, with no statement asking — and `typrelid` is the
+                // `pg_class` row a **composite** owns and every other type reports as `0`.
+                ("typarray", ColumnType::Int8),
+                ("typrelid", ColumnType::Int8),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
@@ -471,6 +477,7 @@ impl CatalogView {
     /// ignore both.
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
+            CatalogView::PgType => pg_type_rows(txn, tenant),
             CatalogView::PgClass => pg_class_rows(txn, tenant),
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
             CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant),
@@ -567,46 +574,6 @@ impl CatalogView {
     #[must_use]
     fn rows(self) -> Vec<Vec<Datum>> {
         match self {
-            // Derived from `ColumnType::ALL` rather than written out, so a type cannot be added
-            // to this node and left out of its own `pg_type`.
-            CatalogView::PgType => {
-                let mut rows: Vec<Vec<Datum>> = ColumnType::ALL
-                    .iter()
-                    .map(|ty| {
-                        vec![
-                            Datum::Int8(i64::from(ty.oid())),
-                            Datum::Text(typname(*ty).to_owned()),
-                            // **`typelem` is the element type's OID**, and zero for everything
-                            // that is not an array — which is how a client reads what an array is
-                            // over. `typtype` stays `b` for an array too: `b` is "base", as
-                            // against `r`ange, `e`num, `d`omain and `c`omposite, and an array is
-                            // none of those.
-                            Datum::Int8(
-                                ArrayValue::element_of(*ty)
-                                    .map_or(0, |element| i64::from(element.oid())),
-                            ),
-                            Datum::Text(",".to_owned()),
-                            Datum::Text(typinput(*ty).to_owned()),
-                            Datum::Text("b".to_owned()),
-                            Datum::Int8(0),
-                            // No collation on any type here, which is what makes
-                            // `a.attcollation <> t.typcollation` false for every column — the
-                            // same answer a real server gives, by the same comparison.
-                            Datum::Int8(0),
-                            // The one namespace this node has, the same one every relation
-                            // reports.
-                            Datum::Int8(PUBLIC_NAMESPACE_OID),
-                            Datum::Int2(ty.type_len()),
-                            Datum::Text(typcategory(*ty).to_owned()),
-                        ]
-                    })
-                    .collect();
-                rows.sort_by_key(|row| match row.first() {
-                    Some(Datum::Int8(oid)) => *oid,
-                    _ => 0,
-                });
-                rows
-            }
             // **The available set is a property of the build**, and which of them is installed is
             // state — so the rows are constants and their `installed_version` is not. `plpgsql`
             // is installed from the start, as it is on every PostgreSQL database; `hstore` is
@@ -635,6 +602,7 @@ impl CatalogView {
             | CatalogView::PgClass
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute
+            | CatalogView::PgType
             | CatalogView::PgAttrdef
             | CatalogView::PgIndex
             | CatalogView::PgConstraint
@@ -747,6 +715,20 @@ pub fn refuse_write(name: &str) -> Result<()> {
 const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
+
+/// The oid of a schema by name, for `relnamespace` and its kin.
+///
+/// `public`'s is fixed the way a real server fixes it; every other schema's is the id its record
+/// was allocated. A name with no schema — nothing can produce one — falls back to `public`, which
+/// is the answer that cannot mislead.
+fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
+    schemas
+        .iter()
+        .find(|(name, _)| name == schema)
+        .map_or(PUBLIC_NAMESPACE_OID, |(_, id)| {
+            super::pg_relations::as_oid(*id)
+        })
+}
 
 /// The extensions this build offers, with the version each installs at.
 ///
@@ -964,6 +946,105 @@ fn inherits_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
     }
     Ok(rows)
 }
+/// Every `pg_type` row: the built-in types, then this tenant's own.
+///
+/// The built-ins are derived from `ColumnType::ALL` rather than written out, so a type cannot be
+/// added to this node and left out of its own `pg_type`. The user types are read from the catalog
+/// for the same reason `pg_class` is a view over the name records: there is no second copy to keep
+/// in step.
+fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let mut rows: Vec<Vec<Datum>> = ColumnType::ALL
+        .iter()
+        .map(|ty| {
+            vec![
+                Datum::Int8(i64::from(ty.oid())),
+                Datum::Text(typname(*ty).to_owned()),
+                // **`typelem` is the element type's OID**, and zero for everything
+                // that is not an array — which is how a client reads what an array is
+                // over. `typtype` stays `b` for an array too: `b` is "base", as
+                // against `r`ange, `e`num, `d`omain and `c`omposite, and an array is
+                // none of those.
+                Datum::Int8(
+                    ArrayValue::element_of(*ty).map_or(0, |element| i64::from(element.oid())),
+                ),
+                Datum::Text(",".to_owned()),
+                Datum::Text(typinput(*ty).to_owned()),
+                Datum::Text("b".to_owned()),
+                Datum::Int8(0),
+                // No collation on any type here, which is what makes
+                // `a.attcollation <> t.typcollation` false for every column — the
+                // same answer a real server gives, by the same comparison.
+                Datum::Int8(0),
+                // The one namespace this node has, the same one every relation
+                // reports.
+                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                Datum::Int2(ty.type_len()),
+                Datum::Text(typcategory(*ty).to_owned()),
+                // Derived from the same table `'x[]'::regtype` reads, so the two can
+                // never disagree about which array a type is paired with.
+                Datum::Int8(i64::from(crate::value::array_oid(*ty))),
+                // No built-in type owns a `pg_class` row: only a composite does.
+                Datum::Int8(0),
+            ]
+        })
+        .collect();
+    rows.extend(user_type_rows(txn, tenant)?);
+    rows.sort_by_key(|row| match row.first() {
+        Some(Datum::Int8(oid)) => *oid,
+        _ => 0,
+    });
+    Ok(rows)
+}
+
+/// One row per user-defined type, and **one more for the array type `CREATE TYPE` made with it**.
+///
+/// The array is not asked for by any statement and exists all the same — `typarray` of `floatrange`
+/// is `floatrange[]`, measured — so it is derived here rather than stored: its oid is the type's
+/// plus one, taken from the same sequence at creation.
+fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let mut rows = Vec::new();
+    for def in super::user_types(txn, tenant)? {
+        let oid = super::pg_relations::as_oid(def.oid);
+        rows.push(vec![
+            Datum::Int8(oid),
+            Datum::Text(def.name.clone()),
+            // Not an array, so no element type — the array row below is the one with one.
+            Datum::Int8(0),
+            Datum::Text(",".to_owned()),
+            Datum::Text(format!("{}_in", def.name)),
+            Datum::Text(def.kind.typtype().to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            Datum::Int2(-1),
+            Datum::Text(def.kind.typcategory().to_owned()),
+            Datum::Int8(oid + 1),
+            // **A composite owns a `pg_class` row and the other two do not.** It is how its
+            // fields are stored on a real server, and the one column that tells the three kinds
+            // apart beyond their letters.
+            Datum::Int8(match def.kind {
+                super::TypeKind::Composite { .. } => oid + 2,
+                _ => 0,
+            }),
+        ]);
+        rows.push(vec![
+            Datum::Int8(oid + 1),
+            Datum::Text(format!("_{}", def.name)),
+            Datum::Int8(oid),
+            Datum::Text(",".to_owned()),
+            Datum::Text("array_in".to_owned()),
+            Datum::Text("b".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            Datum::Int2(-1),
+            Datum::Text("A".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+        ]);
+    }
+    Ok(rows)
+}
 
 fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = super::pg_relations::Relations::read(txn, tenant)?;
@@ -1007,13 +1088,17 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
         ]
     });
+    let schemas = super::schema_names(txn, tenant)?;
     Ok(relations
         .rows()
         .map(|relation| {
             vec![
                 Datum::Int8(relation.oid),
                 Datum::Text(relation.name.clone()),
-                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                // **The schema the relation is in**, not a constant: `relnamespace` is what joins
+                // `pg_class` to `pg_namespace`, and two tables of one name in two schemas are told
+                // apart by exactly this column.
+                Datum::Int8(namespace_oid(&schemas, &relation.schema)),
                 // **Four `relkind`s in one feature, and one is a capital letter.** A partitioned
                 // table is `p` where an ordinary one is `r`, and an index *on* a partitioned table
                 // is `I` where an ordinary one is `i` — so the letter is not a function of the

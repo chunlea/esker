@@ -75,17 +75,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT unnest(current_schemas(true))",
             "`unnest` likewise, and it is set-returning, which is a second feature again.",
         ),
-        (
-            "SET search_path TO public, pg_catalog",
-            "A `search_path` this node cannot honour is refused by name rather than accepted and \
-             ignored — accepting it would make `current_schemas` answer for a path nobody set. \
-             Three lines here are that refusal and the two `current_schemas` reads after it.",
-        ),
-        (
-            "SET search_path TO nosuchschema, public",
-            "The same refusal. A real server takes a path naming a schema that does not exist, \
-             which is worth knowing and is not something to imitate before there are schemas.",
-        ),
     ],
 };
 

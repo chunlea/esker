@@ -44,6 +44,7 @@ pub mod redrive;
 mod savepoint;
 mod subquery;
 mod table_function;
+mod typedef;
 mod values;
 mod verbs;
 
@@ -553,6 +554,8 @@ impl Executor {
             Statement::CreateIndex(create) => ddl::create_index(self, txn, create),
             Statement::DropIndex(drop) => ddl::drop_index(self, txn, drop),
             Statement::Comment(statement) => comment::comment(self, txn, statement),
+            Statement::CreateType(create) => typedef::create(self, txn, create),
+            Statement::DropType(drop) => typedef::drop(self, txn, drop),
             Statement::AlterTable(alter) => ddl::alter_table(self, txn, alter),
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
@@ -1279,9 +1282,108 @@ impl Executor {
             let types = bind::infer(&statement, &tables, params.declared);
             bind::substitute(&mut statement, params, &types)?;
         }
+        self.resolve_current_schema(txn, &mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
+    }
+
+    /// The `search_path` **as resolved**: the entries that name a schema this tenant has, in the
+    /// order written, without repeats.
+    ///
+    /// `SHOW search_path` gives the path as *set* and this gives it as resolved, and they are two
+    /// different answers to the same question — both measured. An entry naming no schema is
+    /// **dropped**, not refused, which is what makes the default `"$user", public` resolve to
+    /// `{public}` on a server that has no schema named for the role.
+    pub(crate) fn resolved_search_path(&self, txn: &dyn Txn) -> Result<Vec<String>> {
+        let written = self.parameter(crate::parameter::search_path());
+        let mut out: Vec<String> = Vec::new();
+        for entry in written.split(',') {
+            let entry = entry.trim().trim_matches('"');
+            // `$user` names a schema after the connected role, and there are no roles here — so it
+            // resolves to nothing and is dropped, exactly as a missing schema is.
+            if entry.is_empty() || entry == "$user" || out.iter().any(|held| held == entry) {
+                continue;
+            }
+            if crate::catalog::schema_exists(txn, self.tenant, entry)? {
+                out.push(entry.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The stored name an **unqualified** relation name resolves to.
+    ///
+    /// Each schema on the path in order, and the first that has it wins: with `sp_b, sp_a` a bare
+    /// `t` is `sp_b`'s and with `sp_a, sp_b` it is `sp_a`'s — the same query, two answers,
+    /// measured. A name that is found nowhere comes back **unchanged**, so the `42P01` quotes the
+    /// bare name the user wrote rather than a schema they did not.
+    pub(crate) fn resolve_unqualified(&self, txn: &dyn Txn, name: &str) -> Result<String> {
+        if name.contains(crate::catalog::SCHEMA_SEPARATOR) {
+            return Ok(name.to_owned());
+        }
+        let view = self.catalog_view(txn)?;
+        for schema in self.resolved_search_path(txn)? {
+            let candidate = crate::catalog::qualify(&schema, name);
+            if view.relation(&candidate)?.is_some() {
+                return Ok(candidate);
+            }
+        }
+        Ok(name.to_owned())
+    }
+
+    /// The schema a `CREATE` with no qualifier puts its relation in: the **first** entry of the
+    /// path that resolves, and `public` when none does.
+    ///
+    /// Measured: with `sp_a, sp_b` a `CREATE TABLE made_here` lands in `sp_a`, and with
+    /// `nosuchschema, sp_b` it still succeeds — the first entry that *resolves* is what it uses.
+    pub(crate) fn creation_schema(&self, txn: &dyn Txn) -> Result<String> {
+        Ok(self
+            .resolved_search_path(txn)?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| crate::catalog::PUBLIC_SCHEMA.to_owned()))
+    }
+
+    /// Replaces every `current_schema()` and `current_schemas(…)` with the session's own.
+    ///
+    /// **Once per statement**, here rather than in the row evaluator, for the reason `::regclass`
+    /// is: the value is the session's and a row has no session. It was folded to `public` where the
+    /// statement is lowered while `public` was the only schema there was.
+    fn resolve_current_schema(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| matches!(expr, Expr::CurrentSchema { .. })) {
+            return Ok(());
+        }
+        let path = self.resolved_search_path(txn)?;
+        let mut resolve = |expr: &mut Expr| {
+            let Expr::CurrentSchema { all } = expr else {
+                return;
+            };
+            *expr = match all {
+                // **NULL when nothing resolves**, not `public` and not an error: measured, `SET
+                // search_path TO nosuchschema` makes `current_schema()` NULL.
+                None => match path.first() {
+                    None => Expr::Literal(Literal::Null),
+                    Some(first) => Expr::Literal(Literal::String(first.clone())),
+                },
+                // `current_schemas(true)` prepends `pg_catalog`, and only that one — it is the
+                // *implicit* schema the argument names.
+                Some(implicit) => {
+                    let mut all = Vec::new();
+                    if *implicit {
+                        all.push(Some("pg_catalog".to_owned()));
+                    }
+                    all.extend(path.iter().map(|name| Some(name.clone())));
+                    Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+                        crate::value::vector::Array::write(&all),
+                    ))))
+                }
+            };
+        };
+        bind::walk_mut(statement, &mut resolve);
+        Ok(())
     }
 
     /// Replaces every `'name'::regclass` with the oid that name has.
@@ -1372,10 +1474,14 @@ impl Executor {
         if let Some(view) = crate::catalog::pg_catalog::view(name) {
             return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
         }
+        // **`::regclass` takes a name as a *string***, so a schema in it is a dot rather than the
+        // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
+        // `se_idx`, and looking it up whole would find nothing.
+        let stored = crate::catalog::parse_qualified(name);
         crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
-            .by_name(name)
+            .by_name(&stored)
             .map(|relation| relation.oid)
-            .ok_or_else(|| SqlError::UndefinedTable(name.to_owned()))
+            .ok_or(SqlError::UndefinedTable(stored))
     }
 
     /// The tables a statement is about, in the order their columns appear in a row.
@@ -1407,8 +1513,13 @@ impl Executor {
     }
 
     /// A table by name, or `42P01`.
+    ///
+    /// **An unqualified name is looked for along the `search_path`**, in order, and the first
+    /// schema that has it wins ([`Executor::resolve_unqualified`]). A name found nowhere keeps the
+    /// spelling the user wrote, so the `42P01` quotes that rather than a schema they did not name.
     fn require_table(&self, txn: &dyn Txn, name: &str) -> Result<Arc<crate::catalog::TableDef>> {
-        self.catalog_view(txn)?.require_table(name)
+        let resolved = self.resolve_unqualified(txn, name)?;
+        self.catalog_view(txn)?.require_table(&resolved)
     }
 
     /// A table by id. A name that resolved to an id whose record is missing is corruption, not a
@@ -1552,6 +1663,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateIndex(create) => vec![format!("Create Index on {}", create.table)],
         Statement::DropIndex(drop) => vec![format!("Drop Index on {}", drop.names.join(", "))],
         Statement::Comment(statement) => vec![format!("Comment on {}", statement.name)],
+        Statement::CreateType(create) => vec![format!("Create Type on {}", create.name)],
+        Statement::DropType(drop) => vec![format!("Drop Type on {}", drop.names.join(", "))],
         Statement::AlterTable(alter) => vec![format!("Alter Table on {}", alter.name)],
         // A `SELECT`'s plan is the interesting one, and it needs the catalog to be built, so
         // `EXPLAIN SELECT` is handled where the catalog is in reach rather than here.
