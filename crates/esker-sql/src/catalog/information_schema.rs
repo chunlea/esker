@@ -158,12 +158,24 @@ pub fn table_constraints(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> 
             Datum::Text(PUBLIC_SCHEMA.to_owned()),
             Datum::Text(table.name.clone()),
             Datum::Text(constraint_type(contype).to_owned()),
-            // Nothing here is deferrable, and `initially_deferred` follows it.
-            Datum::Text(NO.to_owned()),
-            Datum::Text(NO.to_owned()),
+            // **`YES`/`NO` here is `t`/`f` there**, read from the same two `pg_constraint`
+            // columns rather than assumed: this view is a view over that one, and a constraint
+            // that reports `condeferrable` and does not report `is_deferrable` would be two
+            // answers to one question.
+            Datum::Text(yes_no(row.get(4)).to_owned()),
+            Datum::Text(yes_no(row.get(5)).to_owned()),
         ]);
     }
     Ok(rows)
+}
+
+/// `YES`/`NO` for a `pg_constraint` boolean, which is how `information_schema` spells one.
+fn yes_no(value: Option<&Datum>) -> &'static str {
+    if matches!(value, Some(Datum::Bool(true))) {
+        YES
+    } else {
+        NO
+    }
 }
 
 /// Every `information_schema.key_column_usage` row: a primary key's columns, one each.

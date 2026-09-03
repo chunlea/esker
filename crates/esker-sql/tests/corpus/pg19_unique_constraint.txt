@@ -1,0 +1,137 @@
+# Inline `UNIQUE` table constraints — `NULLS [NOT] DISTINCT` and `DEFERRABLE` — as a real
+# PostgreSQL 19beta1 answers them.
+#
+# **Statement 779 of `postgresql_specific_schema.rb`**, verbatim as `ActiveRecord` emits it, and the
+# second thing rung 4 stops on once the plpgsql function at 762 lands. `pg19_nulls_not_distinct.txt`
+# already pins the **index** form and the `ALTER TABLE … ADD CONSTRAINT` form; the suite sends
+# neither. It sends four `CONSTRAINT … UNIQUE` clauses *inside* `CREATE TABLE`, three of them
+# `DEFERRABLE`, and `DEFERRABLE` appears nowhere in the corpus except `pg19_foreign_key.txt`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`.** Error probes sit in `SAVEPOINT` /
+# `ROLLBACK TO` so one refusal does not turn every line after it into `25P02`. The two
+# `SELECT count(*)` lines at the end prove it left nothing behind, and both answer `0`.
+#
+# **The price of that rule, stated rather than hidden:** `sesscap.py` fills the declared-types
+# column from a `\gdesc` pass in a *second* session, which runs after the `ROLLBACK` — so every
+# statement naming `test_unique_constraints` has an **empty** types column. Statements that read
+# only `pg_constraint` or `information_schema` still have theirs, and the `pg_typeof` line near the
+# end pins `boolean`, `boolean`, `text` for the three columns an implementation has to produce.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`DEFERRABLE` does not change *whether* a row is refused — it changes *which statement*
+#     carries the refusal.** The `INITIALLY DEFERRED` constraint accepts the offending `INSERT`
+#     with no error at all, the row is really there (`count(*)` answers `2`), and the `23505`
+#     arrives on the **`SET CONSTRAINTS … IMMEDIATE`** that follows. Same SQLSTATE, same DETAIL,
+#     different statement. An implementation that checks uniqueness at `INSERT` time gets the right
+#     answer at the wrong moment, and the suite's three constraints exist precisely to tell those
+#     apart.
+#   * **`SET CONSTRAINTS ALL DEFERRED` does not defer a non-deferrable constraint.** `ALL` means
+#     all *deferrable* ones. The plain `UNIQUE (position_1)` still raises at `INSERT` with `ALL
+#     DEFERRED` in force — while naming that same constraint explicitly is **`42809 constraint
+#     "…" is not deferrable`**, an error rather than a no-op. Two spellings of the same request,
+#     one silent and one refused.
+#   * **`DEFERRABLE INITIALLY IMMEDIATE` is still deferrable at runtime.** `SET CONSTRAINTS … 
+#     DEFERRED` on it succeeds, and the violation then moves to the `SET CONSTRAINTS … IMMEDIATE`
+#     exactly as for the `INITIALLY DEFERRED` one. `INITIALLY` sets the starting mode, not the
+#     capability.
+#   * **`pg_get_constraintdef` drops `INITIALLY IMMEDIATE` and keeps `INITIALLY DEFERRED`.**
+#     `UNIQUE ("position_2") DEFERRABLE INITIALLY IMMEDIATE` comes back as
+#     `UNIQUE (position_2) DEFERRABLE`. This is the "keep only what differs from the default" rule
+#     the `DESC` index and `NULLS DISTINCT` both met — and it is what `ActiveRecord`'s schema
+#     dumper reads, so printing the input back verbatim is a divergence.
+#   * **`NULLS NOT DISTINCT` prints between `UNIQUE` and the column list**, and explicit
+#     `NULLS DISTINCT` prints as **nothing**: `UNIQUE NULLS NOT DISTINCT (position_4)` versus
+#     `UNIQUE (position_3)`. Combined with `DEFERRABLE` the order is
+#     `UNIQUE NULLS NOT DISTINCT (position_2) DEFERRABLE INITIALLY DEFERRED`.
+#   * **`bigserial primary key` catalogues THREE constraints, and one of them is not a key.**
+#     Beside the `p` and the `u` rows there is `test_unique_constraints_id_not_null` with
+#     `contype = 'n'` and `pg_get_constraintdef` = **`NOT NULL id`** — a `pg_constraint` row for a
+#     `NOT NULL`, which older PostgreSQL did not have. And `information_schema.table_constraints`
+#     reports that same row as **`CHECK`**, not `NOT NULL`: the two catalogs disagree by design, and
+#     an implementation that makes them agree breaks whichever one the client is reading.
+#   * **The two ways to violate `NULLS NOT DISTINCT` have different messages.** A second NULL
+#     inserted is `duplicate key value … DETAIL: Key (position_4)=(null) already exists.`; the same
+#     table with two NULLs already in it refuses the `ALTER TABLE … ADD CONSTRAINT` with
+#     `could not create unique index "u_nnd_deferred" DETAIL: Key (position_2)=(null) is
+#     duplicated.` — **"is duplicated", not "already exists"**, and a different message text before
+#     the DETAIL. Both are `23505`.
+#   * **The NULL prints as `null`** — lower case, unquoted, no `NULL` keyword — and **`UPDATE` into
+#     a NULL is checked too**, which is the half an implementation that only hooks `INSERT` misses.
+#   * **`indnullsnotdistinct` lives on the index and `condeferrable`/`condeferred` live on the
+#     constraint.** One feature, two catalogs, and `conindid` is the only thing joining them. The
+#     backing index takes the constraint's own name.
+#   * **A column named in a key that does not exist is `42703 column "nosuchcol" named in key does
+#     not exist`** — not `42P01`, and the message says "named in key" rather than the usual
+#     "does not exist" phrasing for a column reference.
+#   * **`is_deferrable` and `initially_deferred` are `YES`/`NO` strings of type
+#     `character varying(3)`**, not booleans.
+BEGIN		-
+CREATE TABLE "test_unique_constraints" ("id" bigserial primary key, "position_1" integer, "position_2" integer, "position_3" integer, "position_4" integer, CONSTRAINT "test_unique_constraints_position_deferrable_false" UNIQUE ("position_1"), CONSTRAINT "test_unique_constraints_position_deferrable_immediate" UNIQUE ("position_2") DEFERRABLE INITIALLY IMMEDIATE, CONSTRAINT "test_unique_constraints_position_deferrable_deferred" UNIQUE ("position_3") DEFERRABLE INITIALLY DEFERRED, CONSTRAINT "test_unique_constraints_position_nulls_not_distinct" UNIQUE NULLS NOT DISTINCT ("position_4"))		-
+SELECT 'r', conname, contype, condeferrable, condeferred, convalidated FROM pg_constraint WHERE conrelid = 'test_unique_constraints'::regclass ORDER BY conname		r|test_unique_constraints_id_not_null|n|f|f|t ; r|test_unique_constraints_pkey|p|f|f|t ; r|test_unique_constraints_position_deferrable_deferred|u|t|t|t ; r|test_unique_constraints_position_deferrable_false|u|f|f|t ; r|test_unique_constraints_position_deferrable_immediate|u|t|f|t ; r|test_unique_constraints_position_nulls_not_distinct|u|f|f|t
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'test_unique_constraints'::regclass ORDER BY conname		r|test_unique_constraints_id_not_null|NOT NULL id ; r|test_unique_constraints_pkey|PRIMARY KEY (id) ; r|test_unique_constraints_position_deferrable_deferred|UNIQUE (position_3) DEFERRABLE INITIALLY DEFERRED ; r|test_unique_constraints_position_deferrable_false|UNIQUE (position_1) ; r|test_unique_constraints_position_deferrable_immediate|UNIQUE (position_2) DEFERRABLE ; r|test_unique_constraints_position_nulls_not_distinct|UNIQUE NULLS NOT DISTINCT (position_4)
+SELECT 'r', conname, pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'test_unique_constraints'::regclass ORDER BY conname		r|test_unique_constraints_id_not_null|NOT NULL id ; r|test_unique_constraints_pkey|PRIMARY KEY (id) ; r|test_unique_constraints_position_deferrable_deferred|UNIQUE (position_3) DEFERRABLE INITIALLY DEFERRED ; r|test_unique_constraints_position_deferrable_false|UNIQUE (position_1) ; r|test_unique_constraints_position_deferrable_immediate|UNIQUE (position_2) DEFERRABLE ; r|test_unique_constraints_position_nulls_not_distinct|UNIQUE NULLS NOT DISTINCT (position_4)
+SELECT 'r', i.relname, x.indisunique, x.indnullsnotdistinct, x.indisprimary FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'test_unique_constraints'::regclass ORDER BY i.relname		r|test_unique_constraints_pkey|t|f|t ; r|test_unique_constraints_position_deferrable_deferred|t|f|f ; r|test_unique_constraints_position_deferrable_false|t|f|f ; r|test_unique_constraints_position_deferrable_immediate|t|f|f ; r|test_unique_constraints_position_nulls_not_distinct|t|t|f
+SELECT 'r', c.conname, i.relname, x.indnullsnotdistinct FROM pg_constraint c JOIN pg_class i ON i.oid = c.conindid JOIN pg_index x ON x.indexrelid = i.oid WHERE c.conrelid = 'test_unique_constraints'::regclass AND c.contype = 'u' ORDER BY c.conname		r|test_unique_constraints_position_deferrable_deferred|test_unique_constraints_position_deferrable_deferred|f ; r|test_unique_constraints_position_deferrable_false|test_unique_constraints_position_deferrable_false|f ; r|test_unique_constraints_position_deferrable_immediate|test_unique_constraints_position_deferrable_immediate|f ; r|test_unique_constraints_position_nulls_not_distinct|test_unique_constraints_position_nulls_not_distinct|t
+SELECT 'r', constraint_name, constraint_type, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name = 'test_unique_constraints' ORDER BY constraint_name	text,name,character varying,character varying(3),character varying(3)	r|test_unique_constraints_id_not_null|CHECK|NO|NO ; r|test_unique_constraints_pkey|PRIMARY KEY|NO|NO ; r|test_unique_constraints_position_deferrable_deferred|UNIQUE|YES|YES ; r|test_unique_constraints_position_deferrable_false|UNIQUE|NO|NO ; r|test_unique_constraints_position_deferrable_immediate|UNIQUE|YES|NO ; r|test_unique_constraints_position_nulls_not_distinct|UNIQUE|NO|NO
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (1,1,1,1)		-
+SAVEPOINT s1		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (1,20,20,20)	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_deferrable_false" DETAIL: Key (position_1)=(1) already exists.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (21,1,21,21)	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_deferrable_immediate" DETAIL: Key (position_2)=(1) already exists.
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (31,31,1,31)		-
+SELECT 'r', count(*) FROM "test_unique_constraints"		r|2
+SET CONSTRAINTS "test_unique_constraints_position_deferrable_deferred" IMMEDIATE	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_deferrable_deferred" DETAIL: Key (position_3)=(1) already exists.
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (41,41,41,1)	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_nulls_not_distinct" DETAIL: Key (position_4)=(1) already exists.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SET CONSTRAINTS "test_unique_constraints_position_deferrable_immediate" DEFERRED		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (51,1,51,51)		-
+SELECT 'r', count(*) FROM "test_unique_constraints"		r|2
+SET CONSTRAINTS "test_unique_constraints_position_deferrable_immediate" IMMEDIATE	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_deferrable_immediate" DETAIL: Key (position_2)=(1) already exists.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+SET CONSTRAINTS "test_unique_constraints_position_deferrable_false" DEFERRED	!42809 constraint "test_unique_constraints_position_deferrable_false" is not deferrable
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+SET CONSTRAINTS ALL DEFERRED		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (1,61,61,61)	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_deferrable_false" DETAIL: Key (position_1)=(1) already exists.
+ROLLBACK TO s7		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (NULL,NULL,NULL,70)		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (NULL,NULL,NULL,71)		-
+SELECT 'r', count(*) FROM "test_unique_constraints" WHERE "position_1" IS NULL		r|2
+SAVEPOINT s8		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (80,80,80,NULL)		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (81,81,81,NULL)	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_nulls_not_distinct" DETAIL: Key (position_4)=(null) already exists.
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+INSERT INTO "test_unique_constraints" ("position_1","position_2","position_3","position_4") VALUES (90,90,90,NULL)		-
+UPDATE "test_unique_constraints" SET "position_4" = NULL WHERE "position_1" = 1	!23505 duplicate key value violates unique constraint "test_unique_constraints_position_nulls_not_distinct" DETAIL: Key (position_4)=(null) already exists.
+ROLLBACK TO s9		-
+SELECT 'r', "position_1", "position_2", "position_3", "position_4" FROM "test_unique_constraints" ORDER BY "id"		r|1|1|1|1 ; r|\N|\N|\N|70 ; r|\N|\N|\N|71
+SAVEPOINT s10		-
+ALTER TABLE "test_unique_constraints" ADD CONSTRAINT "u_nnd_deferred" UNIQUE NULLS NOT DISTINCT ("position_2") DEFERRABLE INITIALLY DEFERRED	!23505 could not create unique index "u_nnd_deferred" DETAIL: Key (position_2)=(null) is duplicated.
+ROLLBACK TO s10		-
+DELETE FROM "test_unique_constraints" WHERE "position_2" IS NULL		-
+ALTER TABLE "test_unique_constraints" ADD CONSTRAINT "u_nnd_deferred" UNIQUE NULLS NOT DISTINCT ("position_2") DEFERRABLE INITIALLY DEFERRED		-
+SELECT 'r', conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'u_nnd_deferred'	text,name,boolean,boolean,text	r|u_nnd_deferred|t|t|UNIQUE NULLS NOT DISTINCT (position_2) DEFERRABLE INITIALLY DEFERRED
+ALTER TABLE "test_unique_constraints" ADD CONSTRAINT "u_nd_explicit" UNIQUE NULLS DISTINCT ("position_3")		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'u_nd_explicit'	text,name,text	r|u_nd_explicit|UNIQUE (position_3)
+SAVEPOINT s11		-
+CREATE TABLE tuc_bad (a int4, CONSTRAINT tuc_bad_u UNIQUE NULLS NOT DISTINCT (a) DEFERRABLE INITIALLY IMMEDIATE, CONSTRAINT tuc_bad_u2 UNIQUE (nosuchcol))	!42703 column "nosuchcol" named in key does not exist
+ROLLBACK TO s11		-
+SELECT 'r', pg_typeof(condeferrable), pg_typeof(condeferred), pg_typeof(pg_get_constraintdef(oid)) FROM pg_constraint WHERE conname = 'test_unique_constraints_position_deferrable_false'	text,regtype,regtype,regtype	r|boolean|boolean|text
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'test_unique_constraints%' OR relname LIKE 'tuc_bad%'	bigint	0
+SELECT count(*) FROM pg_constraint WHERE conname LIKE 'test_unique_constraints%' OR conname LIKE 'u_n%'	bigint	0

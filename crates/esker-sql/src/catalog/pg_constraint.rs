@@ -157,11 +157,12 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 Datum::Text(constraint.name),
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
                 Datum::Text(constraint.contype.to_owned()),
-                // `condeferrable` is what was written; `condeferred` is **always `f`**, because
-                // `INITIALLY DEFERRED` is refused by name and `DEFERRABLE INITIALLY IMMEDIATE` —
-                // the only deferrable form here — is `t`/`f` on a real server too. Measured.
+                // **Two flags, not one.** `condeferrable` is whether the constraint *may* be
+                // deferred and `condeferred` is whether it starts that way: `t`/`f` for
+                // `DEFERRABLE INITIALLY IMMEDIATE` and `t`/`t` for `INITIALLY DEFERRED`. A
+                // constraint that is not deferrable is `f`/`f` and cannot be either.
                 Datum::Bool(constraint.condeferrable),
-                Datum::Bool(false),
+                Datum::Bool(constraint.condeferred),
                 // Every constraint here is validated: there is no `NOT VALID` to leave one behind.
                 Datum::Bool(true),
                 Datum::Int8(relation.oid),
@@ -279,10 +280,15 @@ struct Constraint {
     conkey: Option<String>,
     /// A `FOREIGN KEY`'s columns, or `None` for every other kind.
     foreign: Option<ForeignColumns>,
-    /// `condeferrable`. A `UNIQUE` constraint carries it as well as a `FOREIGN KEY`, and it says
-    /// nothing about *when* the check runs here — `INITIALLY DEFERRED` is refused by name, so
-    /// every constraint this node holds is checked at the statement.
+    /// `condeferrable`: whether `DEFERRABLE` was written, in either initial mode. A `UNIQUE`
+    /// constraint carries it as well as a `FOREIGN KEY`.
     condeferrable: bool,
+    /// `condeferred`: whether it **starts** deferred, which is `INITIALLY DEFERRED`.
+    ///
+    /// Never true without `condeferrable`, and the pair is what says when the check runs: `f`/`f`
+    /// at the statement and never movable, `t`/`f` at the statement until `SET CONSTRAINTS` says
+    /// otherwise, `t`/`t` at `COMMIT` (`crate::exec::deferred`).
+    condeferred: bool,
 }
 
 /// What a `FOREIGN KEY` row carries that no other constraint does.
@@ -309,6 +315,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: Some(attnum_vector(table, &[at])),
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         })
         .collect();
     if !table.primary_key_name.is_empty() {
@@ -326,6 +333,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: Some(attnum_vector(table, &table.primary_key)),
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         });
     }
     // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
@@ -339,6 +347,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             conkey: None,
             foreign: None,
             condeferrable: false,
+            condeferred: false,
         });
     }
     // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint
@@ -366,6 +375,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
                 }),
             }),
             condeferrable: key.deferrable,
+            condeferred: false,
         });
     }
     // `UNIQUE`, contype `u`. **Only an index a constraint made**: `CREATE UNIQUE INDEX` builds an
@@ -389,7 +399,8 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             // a shape this node can build anyway; the `None` is what makes that visible.
             conkey: index.key_columns().map(|keys| attnum_vector(table, &keys)),
             foreign: None,
-            condeferrable: kind == UniqueKind::Deferrable,
+            condeferrable: matches!(kind, UniqueKind::Deferrable | UniqueKind::Deferred),
+            condeferred: kind == UniqueKind::Deferred,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -411,8 +422,13 @@ fn unique_definition(table: &TableDef, index: &IndexDef, kind: UniqueKind) -> St
     }
     let columns = index.key_columns().unwrap_or_default();
     let _ = write!(out, " ({})", column_list(table, &columns));
-    if kind == UniqueKind::Deferrable {
-        out.push_str(" DEFERRABLE");
+    // **The text out is not the text in.** `DEFERRABLE INITIALLY IMMEDIATE` prints as
+    // `DEFERRABLE` — the initial mode is the default and PostgreSQL drops it — while
+    // `INITIALLY DEFERRED` keeps both words. Measured, both.
+    match kind {
+        UniqueKind::Deferrable => out.push_str(" DEFERRABLE"),
+        UniqueKind::Deferred => out.push_str(" DEFERRABLE INITIALLY DEFERRED"),
+        UniqueKind::Immediate => {}
     }
     out
 }

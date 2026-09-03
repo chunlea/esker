@@ -556,6 +556,18 @@ pub enum SqlError {
         operand: &'static str,
     },
 
+    /// `SET CONSTRAINTS` naming a constraint that cannot be deferred: `42809`.
+    ///
+    /// **Raised for `IMMEDIATE` too**, which would change nothing — PostgreSQL refuses the
+    /// statement either way, and answering "done" for a constraint that can never be deferred
+    /// would tell a client its transaction is arranged differently than it is. Measured.
+    #[error("constraint \"{0}\" is not deferrable")]
+    ConstraintNotDeferrable(String),
+
+    /// `SET CONSTRAINTS` naming nothing: `42704`.
+    #[error("constraint \"{0}\" does not exist")]
+    ConstraintDoesNotExist(String),
+
     /// `generate_series(1, 3, 0)`: a step that never moves, which is `22023` and not an empty
     /// result.
     ///
@@ -1432,11 +1444,15 @@ impl SqlError {
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
             | SqlError::UndefinedLanguage(_)
-            | SqlError::UndefinedTrigger { .. } => sqlstate::UNDEFINED_OBJECT,
+            | SqlError::UndefinedTrigger { .. }
+            | SqlError::ConstraintDoesNotExist(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
-            SqlError::WrongObjectType { .. } | SqlError::AlterActionOnWrongObject { .. } => {
-                sqlstate::WRONG_OBJECT_TYPE
-            }
+            SqlError::WrongObjectType { .. }
+            | SqlError::AlterActionOnWrongObject { .. }
+            // A constraint that cannot be deferred is the wrong *kind* of object for the
+            // statement, which is the same `42809` an `ALTER` on the wrong kind gets.
+            | SqlError::ConstraintNotDeferrable(_)
+            | SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)
@@ -1510,7 +1526,6 @@ impl SqlError {
             | SqlError::UndefinedFunctionTypes(_)
             | SqlError::UndefinedFunctionName(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
-            SqlError::ParameterlessAggregate => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::GeneratedAlways { .. }
             | SqlError::GeneratedColumnInsert { .. }
             | SqlError::GeneratedColumnUpdate { .. } => sqlstate::GENERATED_ALWAYS,

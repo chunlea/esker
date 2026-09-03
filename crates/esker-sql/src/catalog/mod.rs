@@ -162,11 +162,20 @@ pub enum UniqueKind {
     Immediate,
     /// `UNIQUE (c) DEFERRABLE [INITIALLY IMMEDIATE]` — **also** checked at the statement.
     ///
-    /// `INITIALLY DEFERRED` is the form that really waits and it is refused where it is lowered,
-    /// so every constraint this node holds is checked immediately and the flag reaches exactly two
-    /// readers: `pg_constraint.condeferrable` and `pg_get_constraintdef`, which keeps the word
-    /// `DEFERRABLE` and drops the `INITIALLY IMMEDIATE` half.
+    /// It is checked at the statement, and the flag reaches two readers that a plain `UNIQUE`
+    /// does not give: `pg_constraint.condeferrable` and `pg_get_constraintdef`, which keeps the
+    /// word `DEFERRABLE` and drops the `INITIALLY IMMEDIATE` half.
+    ///
+    /// **Its index still stores suffixed entries**, as [`UniqueKind::Deferred`]'s does, because
+    /// `SET CONSTRAINTS <name> DEFERRED` may defer it for a transaction and the two colliding rows
+    /// then have to coexist. The shape follows *deferrability*, which is fixed at declaration; the
+    /// mode only decides when the scan runs (`crate::exec::deferred`).
     Deferrable,
+    /// `UNIQUE (c) DEFERRABLE INITIALLY DEFERRED` — checked at `COMMIT`, not at the statement.
+    ///
+    /// The form that really waits, and the reason the mechanism exists: a transaction may break
+    /// the constraint in the middle and repair it before the end, and a real server commits that.
+    Deferred,
 }
 
 /// Where an index or a column is in a staged schema change (ADR 0020).
@@ -559,6 +568,26 @@ pub struct IndexDef {
 }
 
 impl IndexDef {
+    /// Whether this index's constraint may be deferred — in either initial mode.
+    ///
+    /// The question the *writer* asks, because it decides the entry's shape
+    /// (`crate::exec::index`), and it is about the declaration rather than about the transaction:
+    /// a `DEFERRABLE INITIALLY IMMEDIATE` constraint can be deferred by `SET CONSTRAINTS` and so
+    /// needs the same room a deferred one does.
+    #[must_use]
+    pub fn deferrable(&self) -> bool {
+        matches!(
+            self.constraint,
+            Some(UniqueKind::Deferrable | UniqueKind::Deferred)
+        )
+    }
+
+    /// Whether it **starts** deferred, which is what a transaction that has said nothing gets.
+    #[must_use]
+    pub fn initially_deferred(&self) -> bool {
+        self.constraint == Some(UniqueKind::Deferred)
+    }
+
     /// The key's column positions, or `None` for an index with an expression in its key.
     ///
     /// `None` is what stops a read from choosing one. The planner narrows a scan by pinning every

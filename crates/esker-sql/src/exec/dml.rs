@@ -465,6 +465,41 @@ pub(super) fn write_row(
         let Some(entry) = super::index::entry(tenant, table, index, row, &primary_key)? else {
             continue;
         };
+        // **A deferrable constraint is checked by scanning, not by reading one key**, because
+        // its entries carry a suffix so that two colliding rows can coexist until the check runs.
+        // Which is *now* for an immediate one and at `COMMIT` for a deferred one; the transaction
+        // decides, and `SET CONSTRAINTS` is how it says (`crate::exec::deferred`).
+        eprintln!(
+            "PROBE index {} unique={} deferrable={:?}",
+            index.name, index.unique, index.constraint
+        );
+        // **A NULL is still not a duplicate.** `UNIQUE` admits any number of NULLs unless
+        // `NULLS NOT DISTINCT` says otherwise, and the by-value test below carried that rule for
+        // an immediate constraint. A deferrable one is scanned rather than read, and the scan
+        // counts entries that share a key — so two NULLs would collide unless the same rule is
+        // asked first. It is the same question, in the same words, one line earlier.
+        if index.unique
+            && index.deferrable()
+            && (index.nulls_not_distinct || row::unique_index_key_is_unique_by_value(&entry.values))
+        {
+            let check = super::deferred::Check::Unique {
+                table: Executor::table_arc(table),
+                index: index.id,
+                values: entry.values.clone(),
+            };
+            if executor.constraint_is_deferred(&index.name, index.initially_deferred()) {
+                executor.defer_check(check);
+            } else {
+                // Written first, then checked: the scan has to see this row, or the second of two
+                // colliding writes would find only the first and pass.
+                txn.put(
+                    &entry.key,
+                    &row::encode_row(&table.primary_key_types(), &primary_key)?,
+                );
+                check.verify(txn, tenant)?;
+                continue;
+            }
+        }
         // A unique index leaves the primary key off, which is what makes a duplicate a collision
         // on one key -- unless a column is NULL, because PostgreSQL admits any number of NULLs in
         // a `UNIQUE` column and those entries need the suffix to stay apart (`crate::row`).
