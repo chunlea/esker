@@ -22,6 +22,7 @@
 use crate::error::{Result, SqlError};
 use crate::plan::ArithOp;
 use crate::value::{ColumnType, PgDatum as _, PgType};
+use esker_keys::numeric::{Decimal, Numeric};
 use esker_keys::value::Datum;
 
 /// The type `left <op> right` has, or the `42883` PostgreSQL raises when no operator exists.
@@ -128,6 +129,7 @@ pub fn apply(op: ArithOp, ty: ColumnType, left: &Datum, right: &Datum) -> Result
         }
         ColumnType::Real => float4(op, as_f64(left)?, as_f64(right)?),
         ColumnType::Double => float8(op, as_f64(left)?, as_f64(right)?),
+        ColumnType::Numeric => numeric(op, &as_numeric(left)?, &as_numeric(right)?),
         other => Err(SqlError::unsupported(format!(
             "arithmetic over {}",
             other.name()
@@ -240,14 +242,138 @@ fn finite(value: f64, left: f64, right: f64) -> Result<()> {
     Ok(())
 }
 
+/// The exact forms. Scales are part of the answer here in a way they are not for a float:
+/// addition takes the **larger** scale, multiplication takes the **sum** of the two, and division
+/// aims at sixteen significant digits (`super::numeric::div_scale`, PostgreSQL's
+/// `select_div_scale`).
+///
+/// # `NaN` is checked before the divisor
+///
+/// `'NaN'::numeric / 0` is `NaN` and `'Infinity'::numeric / 0` is `22012`. The same shape as the
+/// NULL rule above and measured the same way: a value that absorbs everything absorbs the error
+/// too, and one that does not, does not.
+fn numeric(op: ArithOp, left: &Numeric, right: &Numeric) -> Result<Datum> {
+    use Numeric::{Finite, NaN};
+    // `^` over two exact values has a scale rule of its own — `2 ^ 3` is `8.0000000000000000` and
+    // `10 ^ 100` is an integer — which is `numeric_power`'s and not `select_div_scale`'s. Named
+    // rather than approximated with the float form, whose answer would differ in its last digits.
+    if op == ArithOp::Power {
+        return Err(SqlError::unsupported("the operator ^ over numeric"));
+    }
+    if matches!(left, NaN) || matches!(right, NaN) {
+        return Ok(Datum::Numeric(NaN));
+    }
+    let (left, right) = match (left, right) {
+        (Finite(left), Finite(right)) => (left, right),
+        // An infinity: the answer is decided by the signs and never by the digits, and the two
+        // that have no sign to decide by are `NaN`. Measured, each of them.
+        (left, right) => return Ok(Datum::Numeric(infinite(op, left, right)?)),
+    };
+    let value = match op {
+        ArithOp::Add => super::numeric::add(left, right),
+        ArithOp::Subtract => super::numeric::subtract(left, right),
+        ArithOp::Multiply => super::numeric::multiply(left, right),
+        ArithOp::Divide => {
+            let scale = super::numeric::div_scale(left, right);
+            super::numeric::divide(left, right, scale).ok_or(SqlError::DivisionByZero)?
+        }
+        ArithOp::Modulo => super::numeric::modulo(left, right).ok_or(SqlError::DivisionByZero)?,
+        ArithOp::Power => return Err(SqlError::unsupported("the operator ^ over numeric")),
+    };
+    Ok(Datum::Numeric(Finite(value)))
+}
+
+/// The arithmetic of the two infinities, where at least one operand is one.
+///
+/// Every answer here is measured: `Infinity - Infinity` and `Infinity * 0` and `Infinity / Infinity`
+/// and `Infinity % 3` are `NaN`; `3 % Infinity` is 3; `0 / Infinity` is 0; `Infinity / 0` is the
+/// division error, because a zero divisor is a zero divisor whatever the numerator.
+fn infinite(op: ArithOp, left: &Numeric, right: &Numeric) -> Result<Numeric> {
+    use Numeric::{Finite, NaN, NegInfinity, PosInfinity};
+    let sign = |value: &Numeric| match value {
+        PosInfinity => 1,
+        NegInfinity => -1,
+        Finite(value) if value.negative => -1,
+        _ => 0,
+    };
+    let infinity = |sign: i32| {
+        if sign < 0 { NegInfinity } else { PosInfinity }
+    };
+    let (left_infinite, right_infinite) = (
+        matches!(left, PosInfinity | NegInfinity),
+        matches!(right, PosInfinity | NegInfinity),
+    );
+    Ok(match op {
+        ArithOp::Add => match (left_infinite, right_infinite) {
+            // Two infinities of opposite sign have no sum, and of the same sign have theirs.
+            (true, true) if sign(left) != sign(right) => NaN,
+            (true, _) => infinity(sign(left)),
+            _ => infinity(sign(right)),
+        },
+        ArithOp::Subtract => match (left_infinite, right_infinite) {
+            (true, true) if sign(left) == sign(right) => NaN,
+            (true, _) => infinity(sign(left)),
+            _ => infinity(-sign(right)),
+        },
+        // **`Infinity * 0` is `NaN`**, which is why the finite side's sign is not enough: a zero
+        // has no sign to give the product.
+        ArithOp::Multiply => {
+            let (finite, infinite_side) = if left_infinite {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            if matches!(finite, Finite(value) if value.is_zero()) {
+                NaN
+            } else {
+                infinity(sign(infinite_side) * if sign(finite) < 0 { -1 } else { 1 })
+            }
+        }
+        ArithOp::Divide => {
+            if right_infinite && left_infinite {
+                NaN
+            } else if right_infinite {
+                // A finite over an infinity is zero, at scale zero.
+                Finite(super::numeric::of_i64_decimal(0))
+            } else if matches!(right, Finite(value) if value.is_zero()) {
+                return Err(SqlError::DivisionByZero);
+            } else {
+                infinity(sign(left) * if sign(right) < 0 { -1 } else { 1 })
+            }
+        }
+        // `Infinity % 3` is `NaN` and `3 % Infinity` is 3 — the dividend, unchanged.
+        ArithOp::Modulo => {
+            if left_infinite {
+                NaN
+            } else if matches!(right, Finite(value) if value.is_zero()) {
+                return Err(SqlError::DivisionByZero);
+            } else {
+                left.clone()
+            }
+        }
+        ArithOp::Power => return Err(SqlError::unsupported("the operator ^ over numeric")),
+    })
+}
+
+/// A datum that has already been converted to `numeric`.
+fn as_numeric(value: &Datum) -> Result<Numeric> {
+    Ok(match value {
+        Datum::Numeric(value) => value.clone(),
+        Datum::Int8(value) => super::numeric::of_i64(*value),
+        Datum::Int4(value) => super::numeric::of_i64(i64::from(*value)),
+        Datum::Int2(value) => super::numeric::of_i64(i64::from(*value)),
+        other => {
+            return Err(SqlError::Internal(format!(
+                "{other:?} reached numeric arithmetic"
+            )));
+        }
+    })
+}
+
 /// An `unknown` operand read as the type the operator resolved to.
 fn coerce(value: &Datum, ty: ColumnType) -> Result<Datum> {
     match value {
         Datum::Text(text) => Datum::from_text(ty, text),
-        // `numeric` has its own arithmetic — exact, and with scale rules the floats do not have —
-        // and until it is built a `numeric` operand is refused **by name** rather than rounded
-        // into a float, which would answer where the answer is not PostgreSQL's.
-        Datum::Numeric(_) => Err(SqlError::unsupported("arithmetic over numeric")),
         other => Ok(other.clone()),
     }
 }
@@ -278,6 +404,9 @@ fn as_f64(value: &Datum) -> Result<f64> {
         Datum::Int8(value) => Ok(*value as f64),
         Datum::Int4(value) => Ok(f64::from(*value)),
         Datum::Int2(value) => Ok(f64::from(*value)),
+        // `float8 * numeric` is a `double precision` on a real server: the exact side is cast to
+        // the inexact one, not the other way round.
+        Datum::Numeric(value) => Ok(super::numeric::as_f64(value)),
         other => Err(SqlError::Internal(format!(
             "{other:?} reached float arithmetic"
         ))),
@@ -308,6 +437,16 @@ pub fn abs(value: &Datum) -> Result<Datum> {
         ),
         Datum::Double(value) => Datum::Double(value.abs()),
         Datum::Real(value) => Datum::Real(value.abs()),
+        // A `numeric`'s absolute value keeps its scale: `abs(-3.75)` is `3.75` and not `3.8`.
+        Datum::Numeric(Numeric::Finite(value)) => Datum::Numeric(Numeric::Finite(Decimal {
+            negative: false,
+            digits: value.digits.clone(),
+            scale: value.scale,
+        })),
+        Datum::Numeric(Numeric::NegInfinity) => Datum::Numeric(Numeric::PosInfinity),
+        Datum::Numeric(value @ (Numeric::PosInfinity | Numeric::NaN)) => {
+            Datum::Numeric(value.clone())
+        }
         other => {
             return Err(SqlError::UndefinedFunctionTypes(format!(
                 "abs({})",

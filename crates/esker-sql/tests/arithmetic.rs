@@ -38,22 +38,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT true + 1",
             "**This node's integer constants are `int8` where a real server's are `int4`** — the divergence `tests/unknown_literal.rs` declares — and it is visible here in the type the message names: PostgreSQL resolves the `unknown` beside a constant to `integer` and this node to `bigint`. Same SQLSTATE, same failure, one word apart. The values agree everywhere; only a constant's *width* differs, and closing it means changing what a bare integer is everywhere rather than anything arithmetic does.",
         ),
-        (
-            "SELECT 2::int4 + 3::numeric",
-            "`numeric` arithmetic is the next commit of this unit: it is exact, its scales follow rules the floats have none of (`1.50 * 1.50` is `2.2500`, so multiplication **adds** the scales), and rounding it into a float here would answer where the answer is not PostgreSQL's. Refused by name and counted, per ADR 0031.",
-        ),
-        (
-            "SELECT 2::int8 + 3::numeric",
-            "`numeric` arithmetic is the next commit of this unit: it is exact, its scales follow rules the floats have none of (`1.50 * 1.50` is `2.2500`, so multiplication **adds** the scales), and rounding it into a float here would answer where the answer is not PostgreSQL's. Refused by name and counted, per ADR 0031.",
-        ),
-        (
-            "SELECT 2::float8 + 3::numeric",
-            "`numeric` arithmetic is the next commit of this unit: it is exact, its scales follow rules the floats have none of (`1.50 * 1.50` is `2.2500`, so multiplication **adds** the scales), and rounding it into a float here would answer where the answer is not PostgreSQL's. Refused by name and counted, per ADR 0031.",
-        ),
-        (
-            "SELECT 2::numeric + 3::numeric",
-            "`numeric` arithmetic is the next commit of this unit: it is exact, its scales follow rules the floats have none of (`1.50 * 1.50` is `2.2500`, so multiplication **adds** the scales), and rounding it into a float here would answer where the answer is not PostgreSQL's. Refused by name and counted, per ADR 0031.",
-        ),
     ],
 };
 

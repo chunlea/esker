@@ -61,47 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`pg_typeof` is `0A000` naming itself, for every type. The first of its four answers is also the declared bare-decimal divergence: `1.5` is a `numeric` on a real server and a `double precision` here, which is the next unit's to close now that the type exists.",
         ),
         (
-            "SELECT 0.1::numeric + 0.2::numeric = 0.3::numeric",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 1::numeric / 2",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 1::numeric / 3",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 1.5::numeric(10,2) + 1.5::numeric(10,2), 1.5::numeric(10,2) * 2",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 1.50::numeric * 1.50::numeric",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 6.0::numeric / 2.0::numeric",
-            "Arithmetic. This crate has no operators beyond comparison and the connectives, for any type; the value rules the line measures are proved by the storage half of this corpus.",
-        ),
-        (
-            "SELECT 'NaN'::numeric / 0",
-            "Arithmetic. The **value** it measures is right and is proved elsewhere in this file: `NaN` is a value that equals itself and absorbs. `'NaN' / 0` is `NaN` on a real server where `1 / 0` is `22012`, and neither operator exists here.",
-        ),
-        (
-            "SELECT 1::numeric / 0",
-            "Arithmetic. `22012 division by zero`, which this crate has no operator to reach.",
-        ),
-        ("SELECT 10::numeric % 3", "Arithmetic."),
-        (
-            "SELECT 2::numeric ^ 10, 2::numeric ^ 0.5",
-            "Arithmetic, and the line that shows exponentiation picks a scale of its own: `2 ^ 10` is `1024.0000000000000`, not `1024`.",
-        ),
-        (
-            "SELECT 9223372036854775807::numeric + 1",
-            "Arithmetic — and the point of the line is that a `numeric` **has no width to overflow**: the answer is `9223372036854775808`, which no integer type here can hold. The storage half of that is built and proved by the corpus.",
-        ),
-        (
             "SELECT round(1.245, 2), trunc(1.999, 2), ceil(1.1), floor(1.9)",
             "Four functions, each `0A000` naming itself. **The rounding rule they measure is implemented** — `round(1.245, 2)` is `1.25` and so is `1.245::numeric(10,2)`, which this corpus does prove: one rule for the cast, the assignment and the function.",
         ),
@@ -140,6 +99,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT greatest(1.5::numeric, 2.5::numeric), least(1.5::numeric, 2.5::numeric)",
             "`greatest`/`least` are `0A000` naming themselves, for every type.",
+        ),
+        (
+            "SELECT 2::numeric ^ 10, 2::numeric ^ 0.5",
+            "**`^` over two exact values has a scale rule of its own** — `2 ^ 10` is \
+             `1024.0000000000000` and `10 ^ 100` is a bare integer, so the rule is about the \
+             result's weight and not the operands'. That is `numeric_power` in `numeric.c`, a \
+             different function from the `select_div_scale` this node implements for division, \
+             and it needs a capture round of its own. Every other `numeric` operator answers now \
+             (`tests/numeric_arithmetic.rs`), and `^` over the floats does too.",
         ),
     ],
 };
