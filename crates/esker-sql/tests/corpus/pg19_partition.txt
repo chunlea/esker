@@ -1,0 +1,142 @@
+# Declarative partitioning — `PARTITION BY LIST`, `PARTITION OF`, and what `INSERT`/`SELECT` do
+# through them — as a real PostgreSQL 19beta1 answers it.
+#
+# **Statements 781-786 of `postgresql_specific_schema.rb`**, verbatim as `ActiveRecord` emits them,
+# interleaved with the `DROP TABLE IF EXISTS` lines it sends between them. Four of the nine refusals
+# left at `3f02889` are these, which makes this the largest single unit on the board:
+#
+#     781  CREATE TABLE "measurements" (…) PARTITION BY LIST (city_id)        0A000
+#     782  CREATE UNIQUE INDEX … ON "measurements" ("logdate", "city_id")     follow-on
+#     784  CREATE TABLE "measurements_toronto" PARTITION OF measurements …    0A000
+#     786  CREATE TABLE "measurements_concepcion" PARTITION OF measurements … 0A000
+#
+# `pg19_extension_inherits.txt` pins the *refusal* as a declared divergence; nothing pinned the
+# behaviour. This does.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The two `SELECT count(*)` lines at the end prove it left nothing behind — `0` relations and `0`
+# rows in `pg_partitioned_table`. As in `pg19_catalog_functions.txt`, the `\gdesc` pass runs after
+# the rollback, so statements naming these tables have an **empty** declared-types column;
+# catalog-only queries keep theirs, and the `pg_typeof` line pins `text` and `boolean`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The suite's bound is an integer and the column is `character varying`.**
+#     `FOR VALUES IN (1)` is accepted, coerced to the partition key's type, and printed back as
+#     **`FOR VALUES IN ('1')`** — quoted. An implementation that stored the literal as written
+#     diverges the moment `ActiveRecord` dumps the schema.
+#   * **Four `relkind`s in one feature, and one of them is a capital letter.** The partitioned
+#     table is `p`, each partition is an ordinary `r`, the partitioned index is **`I`**, and each
+#     partition's own index is `i`. A `relkind IN ('r','p')` filter that forgets `I` still passes
+#     every test that does not create a partitioned index.
+#   * **`pg_get_indexdef` on the partitioned index says `ON ONLY public.measurements`** — the word
+#     `ONLY` in the definition of the index that covers *every* partition — and it does **not**
+#     change when partitions are attached, detached, or re-attached.
+#   * **Statement 782 creates the index before a single partition exists, and every partition
+#     created afterwards silently gets its own child index**, named `<partition>_<cols>_idx`:
+#     `measurements_toronto_logdate_city_id_idx`. Two partitions produce two indexes the suite
+#     never named, and it is the **child** index that a duplicate-key error names, not the parent's.
+#   * **A unique index on a partitioned table must contain every partition column.** Dropping
+#     `city_id` from it is `0A000 UNIQUE constraint on partitioned table must include all
+#     partitioning columns`, `DETAIL: … lacks column "city_id" which is part of the partition key.`
+#     `PRIMARY KEY` gives the same sentence with `PRIMARY KEY` substituted. The suite's index passes
+#     only because `city_id` happens to be its second column.
+#   * **Two different `23514`s, with two different messages and two different DETAIL shapes.**
+#     Through the parent, a value with no partition is `no partition of relation "measurements"
+#     found for row` / `DETAIL: Partition key of the failing row contains (city_id) = (99).`
+#     Straight into the wrong partition it is `new row for relation "measurements_toronto" violates
+#     partition constraint` / `DETAIL: Failing row contains (2, 2026-09-04, 33, 13).` — **the whole
+#     row, not the key**.
+#   * **`SELECT count(*) FROM ONLY "measurements"` is `0` while `FROM "measurements"` is every
+#     row.** A partitioned table stores nothing itself; `ONLY` is the difference between the two,
+#     and both spellings have to work.
+#   * **An `UPDATE` that changes the partition key moves the row** instead of failing.
+#     `tableoid::regclass` goes from `measurements_toronto` to `measurements_concepcion` and no
+#     error is raised. Row movement is the default, not an opt-in.
+#   * **An overlapping partition is `42P17`**, and the message names the partition it would overlap
+#     — `partition "measurements_dup" would overlap partition "measurements_toronto"`.
+#   * **A `DEFAULT` partition prints its bound as the bare word `DEFAULT`**, and once it exists the
+#     `no partition found` error above stops being reachable.
+#   * **`DETACH PARTITION` keeps the table and its rows.** The parent's `count(*)` drops by exactly
+#     that partition's rows, `relispartition` becomes `f`, and `ATTACH PARTITION … FOR VALUES IN (2)`
+#     puts all of it back. `DROP TABLE <partition>` is also allowed outright — the parent does not
+#     protect it.
+#   * **`partstrat` is a one-letter code (`l` for LIST) and `partattrs` is an `int2vector`.**
+#     Neither is the word in the DDL.
+#   * **RANGE bounds print `MINVALUE`/`MAXVALUE` back verbatim and are half-open**:
+#     `FROM (MINVALUE) TO (10)` takes `9` and `FROM (10) TO (MAXVALUE)` takes `10`.
+BEGIN		-
+DROP TABLE IF EXISTS "measurements"		-
+CREATE TABLE "measurements" ("city_id" character varying NOT NULL, "logdate" date NOT NULL, "peaktemp" integer, "unitsales" integer) PARTITION BY LIST (city_id)		-
+SELECT 'r', relkind, relispartition, relhassubclass FROM pg_class WHERE relname = 'measurements'	text,"char",boolean,boolean	r|p|f|f
+SELECT 'r', pg_get_partkeydef('measurements'::regclass)		r|LIST (city_id)
+SELECT 'r', partstrat, partnatts, partattrs FROM pg_partitioned_table WHERE partrelid = 'measurements'::regclass		r|l|1|1
+CREATE UNIQUE INDEX "index_measurements_on_logdate_and_city_id" ON "measurements" ("logdate", "city_id")		-
+SELECT 'r', relkind, relispartition FROM pg_class WHERE relname = 'index_measurements_on_logdate_and_city_id'	text,"char",boolean	r|I|f
+SELECT 'r', pg_get_indexdef('index_measurements_on_logdate_and_city_id'::regclass)		r|CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON ONLY public.measurements USING btree (logdate, city_id)
+SAVEPOINT s1		-
+CREATE UNIQUE INDEX "m_bad_unique" ON "measurements" ("logdate")	!0A000 UNIQUE constraint on partitioned table must include all partitioning columns DETAIL: UNIQUE constraint on table "measurements" lacks column "city_id" which is part of the partition key.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+ALTER TABLE "measurements" ADD CONSTRAINT "m_bad_pk" PRIMARY KEY ("logdate")	!0A000 PRIMARY KEY constraint on partitioned table must include all partitioning columns DETAIL: PRIMARY KEY constraint on table "measurements" lacks column "city_id" which is part of the partition key.
+ROLLBACK TO s2		-
+DROP TABLE IF EXISTS "measurements_toronto"		-
+CREATE TABLE "measurements_toronto" PARTITION OF measurements FOR VALUES IN (1)		-
+DROP TABLE IF EXISTS "measurements_concepcion"		-
+CREATE TABLE "measurements_concepcion" PARTITION OF measurements FOR VALUES IN (2)		-
+SELECT 'r', c.relname, c.relkind, c.relispartition FROM pg_class c WHERE c.relname LIKE 'measurements%' ORDER BY c.relname	text,name,"char",boolean	r|measurements|p|f ; r|measurements_concepcion|r|t ; r|measurements_concepcion_logdate_city_id_idx|i|t ; r|measurements_toronto|r|t ; r|measurements_toronto_logdate_city_id_idx|i|t
+SELECT 'r', c.relname, pg_get_expr(c.relpartbound, c.oid) FROM pg_class c WHERE c.relispartition AND c.relname LIKE 'measurements%' ORDER BY c.relname	text,name,text	r|measurements_concepcion|FOR VALUES IN ('2') ; r|measurements_concepcion_logdate_city_id_idx|\N ; r|measurements_toronto|FOR VALUES IN ('1') ; r|measurements_toronto_logdate_city_id_idx|\N
+SELECT 'r', p.relname AS parent, ch.relname AS child, i.inhseqno FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent JOIN pg_class ch ON ch.oid = i.inhrelid WHERE p.relname = 'measurements' ORDER BY ch.relname	text,name,name,integer	r|measurements|measurements_concepcion|1 ; r|measurements|measurements_toronto|1
+SELECT 'r', c.relname FROM pg_class c WHERE c.relname LIKE 'index_measurements%' ORDER BY c.relname	text,name	r|index_measurements_on_logdate_and_city_id
+SELECT 'r', count(*) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid IN ('measurements_toronto'::regclass, 'measurements_concepcion'::regclass)		r|2
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-01',30,10)		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('2','2026-09-02',31,11)		-
+SELECT 'r', tableoid::regclass::text, city_id, logdate, peaktemp FROM "measurements" ORDER BY city_id		r|measurements_toronto|1|2026-09-01|30 ; r|measurements_concepcion|2|2026-09-02|31
+SELECT 'r', count(*) FROM "measurements"		r|2
+SELECT 'r', count(*) FROM "measurements_toronto"		r|1
+SELECT 'r', count(*) FROM ONLY "measurements"		r|0
+SAVEPOINT s3		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('99','2026-09-03',32,12)	!23514 no partition of relation "measurements" found for row DETAIL: Partition key of the failing row contains (city_id) = (99).
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+INSERT INTO "measurements_toronto" ("city_id","logdate","peaktemp","unitsales") VALUES ('2','2026-09-04',33,13)	!23514 new row for relation "measurements_toronto" violates partition constraint DETAIL: Failing row contains (2, 2026-09-04, 33, 13).
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-01',34,14)	!23505 duplicate key value violates unique constraint "measurements_toronto_logdate_city_id_idx" DETAIL: Key (logdate, city_id)=(2026-09-01, 1) already exists.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+CREATE TABLE "measurements_dup" PARTITION OF measurements FOR VALUES IN (1)	!42P17 partition "measurements_dup" would overlap partition "measurements_toronto"
+ROLLBACK TO s6		-
+CREATE TABLE "measurements_default" PARTITION OF measurements DEFAULT		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('99','2026-09-03',32,12)		-
+SELECT 'r', tableoid::regclass::text, city_id FROM "measurements" ORDER BY city_id		r|measurements_toronto|1 ; r|measurements_concepcion|2 ; r|measurements_default|99
+SELECT 'r', relname, pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname = 'measurements_default'	text,name,text	r|measurements_default|DEFAULT
+UPDATE "measurements" SET city_id = '2' WHERE city_id = '1'		-
+SELECT 'r', tableoid::regclass::text, city_id FROM "measurements" ORDER BY city_id, logdate		r|measurements_concepcion|2 ; r|measurements_concepcion|2 ; r|measurements_default|99
+ALTER TABLE "measurements" DETACH PARTITION "measurements_concepcion"		-
+SELECT 'r', count(*) FROM "measurements"		r|1
+SELECT 'r', relispartition FROM pg_class WHERE relname = 'measurements_concepcion'	text,boolean	r|f
+SELECT 'r', pg_get_indexdef('index_measurements_on_logdate_and_city_id'::regclass)		r|CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON ONLY public.measurements USING btree (logdate, city_id)
+ALTER TABLE "measurements" ATTACH PARTITION "measurements_concepcion" FOR VALUES IN (2)		-
+SELECT 'r', count(*) FROM "measurements"		r|3
+SAVEPOINT s7		-
+DROP TABLE "measurements_toronto"		-
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+CREATE TABLE mp_range (id int8, r int4) PARTITION BY RANGE (r)		-
+CREATE TABLE mp_range_lo PARTITION OF mp_range FOR VALUES FROM (MINVALUE) TO (10)		-
+CREATE TABLE mp_range_hi PARTITION OF mp_range FOR VALUES FROM (10) TO (MAXVALUE)		-
+SELECT 'r', relname, pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname LIKE 'mp_range_%' ORDER BY relname	text,name,text	r|mp_range_hi|FOR VALUES FROM (10) TO (MAXVALUE) ; r|mp_range_lo|FOR VALUES FROM (MINVALUE) TO (10)
+INSERT INTO mp_range VALUES (1, 9), (2, 10)		-
+SELECT 'r', tableoid::regclass::text, id, r FROM mp_range ORDER BY id		r|mp_range_lo|1|9 ; r|mp_range_hi|2|10
+ROLLBACK TO s8		-
+SELECT 'r', pg_typeof(pg_get_partkeydef('measurements'::regclass)), pg_typeof(relispartition) FROM pg_class WHERE relname = 'measurements'		r|text|boolean
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'measurements%' OR relname LIKE 'mp_range%' OR relname LIKE 'index_measurements%'	bigint	0
+SELECT count(*) FROM pg_partitioned_table	bigint	0

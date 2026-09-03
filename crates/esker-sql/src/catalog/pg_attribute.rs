@@ -164,6 +164,16 @@ fn columns_of<'a>(
                             None,
                         )),
                     })
+                    // **The included columns are attributes of the index too**, after the key's
+                    // and in the order written. A real server gives the suite's index four rows
+                    // and `a.attnum <= x.indnkeyatts` is what separates the two halves — an index
+                    // that described only its key would answer that query with two.
+                    .chain(index.include.iter().filter_map(|at| {
+                        table
+                            .columns
+                            .get(*at)
+                            .map(|column| (Cow::Borrowed(column), Some(*at)))
+                    }))
                     .collect()
             })
             .unwrap_or_default(),

@@ -60,6 +60,10 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         rows.push(vec![
             Datum::Int8(relation.oid),
             Datum::Int8(oid_of_table(&relations, relation.table_id)),
+            // **`indnatts` counts the payload too** — four for a two-column key with two
+            // included columns — and `indnkeyatts` is what tells the halves apart. Both are
+            // `smallint`, measured, not `integer`.
+            Datum::Int2(i16::try_from(key.keys.len() + key.include.len()).unwrap_or(i16::MAX)),
             Datum::Int2(i16::try_from(key.keys.len()).unwrap_or(i16::MAX)),
             Datum::Bool(key.unique),
             Datum::Bool(key.nulls_not_distinct),
@@ -164,14 +168,37 @@ fn definition(
     qualified: bool,
 ) -> String {
     let mut out = format!(
-        "CREATE {}INDEX {} ON {}{} USING {} ({})",
+        "CREATE {}INDEX {} ON {}{}{} USING {} ({})",
         if key.unique { "UNIQUE " } else { "" },
         quote_identifier(&relation.name),
+        // **`ON ONLY` for an index on a partitioned table** — the word `ONLY` in the definition of
+        // the index that covers *every* partition, which reads backwards and is what a real server
+        // prints. It says the index relation itself holds no entries: the partitions' own indexes
+        // do. Measured, and it does not change when partitions are attached or detached.
+        if table.partition_by.is_some() {
+            "ONLY "
+        } else {
+            ""
+        },
         if qualified { "public." } else { "" },
         quote_identifier(&table.name),
         key.method,
         parts.join(", ")
     );
+    // **`INCLUDE (…)` comes first of the three tails**: after the key list and before the
+    // predicate — `USING btree (firm_id) INCLUDE (name) WHERE (account_id IS NOT NULL)`, measured,
+    // and `pg_indexes.indexdef` carries the same string.
+    if !key.include.is_empty() {
+        let printed: Vec<String> = key
+            .include
+            .iter()
+            .filter_map(|&at| table.columns.get(at))
+            .map(|column| quote_identifier(&column.name))
+            .collect();
+        out.push_str(" INCLUDE (");
+        out.push_str(&printed.join(", "));
+        out.push(')');
+    }
     // **After the key list and before the `WHERE`**, which is the order a real server prints
     // them in: `USING btree (a, b) NULLS NOT DISTINCT WHERE (c IS NOT NULL)`. Measured, and it is
     // printed for a **non-unique** index too, where it can refuse nothing.
@@ -227,6 +254,9 @@ struct Key<'a> {
     /// A partial index's predicate as it is stored — one pair of parentheses short of how it
     /// prints ([`parenthesised`]).
     predicate: Option<&'a str>,
+    /// `INCLUDE (…)`: the non-key payload columns, by position. Empty for a primary key and for
+    /// every index that names none.
+    include: &'a [usize],
 }
 
 impl Key<'_> {
@@ -241,14 +271,24 @@ impl Key<'_> {
     /// numbers are one-based there, so zero is free, and `ActiveRecord` branches on exactly this
     /// (`indkey.include?(0)`) to decide whether to believe its column list or re-read the
     /// definition text. A two-part key over `a` and `lower(b)` is `2 0`, measured.
+    ///
+    /// **The included columns are in it**, after the key's, and only `indnkeyatts` separates the
+    /// two halves: the suite's index is `2 3 4 5` with `indnatts = 4` and `indnkeyatts = 2`. A
+    /// client that reads `indkey` alone reports a four-column index — and `ActiveRecord`'s schema
+    /// dumper is such a client.
     fn indkey(&self, table: &TableDef) -> String {
         self.keys
             .iter()
             .map(|key| {
                 key.position()
                     .map_or(0, |at| super::pg_relations::attnum_of(table, at))
-                    .to_string()
             })
+            .chain(
+                self.include
+                    .iter()
+                    .map(|&at| super::pg_relations::attnum_of(table, at)),
+            )
+            .map(|attnum| attnum.to_string())
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -347,6 +387,8 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
                 // exclusion constraint is a plain one, measured.
                 unique: false,
                 primary: false,
+                // Nothing: `INCLUDE` is a `CREATE INDEX` clause, and this index is a constraint's.
+                include: &[],
                 predicate: exclude.predicate.as_deref(),
                 valid: true,
                 exclusion: true,
@@ -369,6 +411,7 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
                 // selects it. Reporting `t` for a half-built index would be the wrong answer in
                 // the one place a client asked the right question.
                 valid: index.state == SchemaState::Public,
+                include: &index.include,
             })
         }
         RelKind::PrimaryKey => Some(Key {
@@ -386,6 +429,9 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             primary: true,
             valid: true,
             predicate: None,
+            // **A primary key never has one.** `ALTER TABLE … ADD PRIMARY KEY … INCLUDE` exists
+            // on a real server and does not reach this node: the action itself is `0A000`.
+            include: &[],
         }),
         RelKind::Table | RelKind::Sequence => None,
     }
@@ -404,6 +450,9 @@ pub const INDEX_COLUMNS: &[(&str, ColumnType)] = &[
     ("indexrelid", ColumnType::Int8),
     ("indrelid", ColumnType::Int8),
     ("indnatts", ColumnType::Int2),
+    // **The column that separates the key from the payload**, and PostgreSQL puts it right here,
+    // straight after the total. `smallint` like its neighbour.
+    ("indnkeyatts", ColumnType::Int2),
     ("indisunique", ColumnType::Bool),
     ("indnullsnotdistinct", ColumnType::Bool),
     ("indisprimary", ColumnType::Bool),

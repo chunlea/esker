@@ -88,7 +88,7 @@ fn foreign_key_of(oid: i64) -> Option<(u64, usize)> {
 }
 
 /// `{2}` / `{1,3}` — attribute numbers as an `int2vector` prints them.
-fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
+pub(super) fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
     let numbers: Vec<String> = ordinals
         .iter()
         .map(|at| pg_relations::attnum_of(table, *at).to_string())

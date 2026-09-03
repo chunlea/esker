@@ -71,9 +71,12 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "ALTER TABLE ... ADD COLUMN ... bigserial",
         ),
         ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
+        // **`PARTITION BY LIST` and `RANGE` left this list** with statements 781-786; `HASH` is
+        // what is still refused, because nothing captured how it routes and a strategy this node
+        // guessed at would put rows in the wrong partition.
         (
-            "CREATE TABLE t (a int8) PARTITION BY RANGE (a)",
-            "PARTITION BY",
+            "CREATE TABLE t (a int8) PARTITION BY HASH (a)",
+            "PARTITION BY HASH",
         ),
         // **`INHERITS` left this list** with statement 762: the child takes the parent's
         // columns, a scan of the parent returns the child's rows, and an `UPDATE` or `DELETE` on
@@ -98,10 +101,9 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CASE <expression> WHEN ..., the simple form",
         ),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
-        (
-            "CREATE INDEX i ON t (a) INCLUDE (b)",
-            "CREATE INDEX ... INCLUDE",
-        ),
+        // **`INCLUDE` left this list** with statement 787. What it still refuses is the payload
+        // on an access method that cannot carry one, and that message is PostgreSQL's own rather
+        // than a name of ours — it has its own test in `tests/include_index.rs`.
         // Refused by the parser's recognizer rather than the lowering: sqlparser 0.62.0 cannot
         // read this spelling, which is gap G31 in the plan's register. Either way the answer is
         // 0A000 naming it, which is all contract C2 asks.

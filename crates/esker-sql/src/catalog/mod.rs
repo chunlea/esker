@@ -520,6 +520,18 @@ pub struct IndexDef {
     /// is measured in. It is written on every transition and read by the job, never by a read or a
     /// write of a row.
     pub state_since: u64,
+    /// `INCLUDE (…)` — the **non-key payload** columns, by position, in the order written.
+    ///
+    /// **They are in `indkey` and only a count separates them from the key**: the suite's index
+    /// has `indnatts = 4`, `indnkeyatts = 2` and `indkey = "2 3 4 5"`, one vector holding both
+    /// halves. A client that reconstructs an index from `indkey` alone reports a four-column
+    /// index, and `ActiveRecord`'s schema dumper is such a client.
+    ///
+    /// **Uniqueness is over [`IndexDef::keys`] only.** The payload is recorded and never compared,
+    /// which is what makes `("firm_id") INCLUDE ("name")` refuse a second row with the same
+    /// `firm_id` and a different `name`. An included column may also **repeat** a key column —
+    /// `("firm_id") INCLUDE ("firm_id")` is accepted, `indkey = "2 2"`, not deduplicated.
+    pub include: Vec<usize>,
     /// `WHERE …` — a **partial** index, whose entries exist only for rows the predicate admits.
     ///
     /// Stored as text and lowered per row, the same trade [`CheckDef`] makes and for the same two
@@ -714,6 +726,19 @@ pub struct TableDef {
     /// ([`TableDef::triggers_disabled`]) that predates these and means something else: it turns
     /// off the *internal* triggers a foreign key is made of.
     pub triggers: Vec<TriggerDef>,
+    /// `PARTITION BY LIST (…)` — the key this table's rows are routed on, or `None` for a table
+    /// that is not partitioned.
+    ///
+    /// A partitioned table **stores no rows of its own**: `SELECT count(*) FROM ONLY m` is `0` on
+    /// a real server however many rows the partitions hold. Its own key range stays empty here for
+    /// the same reason, and the rows come from [`TableDef::children`] — the edge declarative
+    /// partitioning shares with `INHERITS`, which is why a partition appears in `pg_inherits` too.
+    pub partition_by: Option<PartitionKey>,
+    /// `FOR VALUES IN (…)` or `DEFAULT` — which rows this table takes, for a partition.
+    ///
+    /// `None` for everything that is not a partition, including a table that merely *inherits*:
+    /// the two share an edge and not this.
+    pub partition_bound: Option<PartitionBound>,
     /// How to read each child's rows **as this table's**, filled where the table is loaded.
     ///
     /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
@@ -776,6 +801,213 @@ impl TriggerDef {
     #[must_use]
     pub fn tgenabled(&self) -> &'static str {
         if self.enabled { "O" } else { "D" }
+    }
+}
+
+/// `PARTITION BY LIST (col, …)` — how a partitioned table routes a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionKey {
+    /// Which strategy. `LIST` is the one this node builds; the others are refused by name where
+    /// the statement is lowered, because a bound it cannot compare is a row it would misroute.
+    pub strategy: PartitionStrategy,
+    /// The key columns, by position, in the order written.
+    pub columns: Vec<usize>,
+}
+
+/// The strategy letter `pg_partitioned_table.partstrat` reports.
+///
+/// **A one-letter code, not the word in the DDL** — `l`, never `LIST`. Measured.
+///
+/// `HASH` is not here: nothing captured it, and a strategy whose routing nobody measured is a row
+/// this node would put in the wrong partition. It is refused by name where the statement is
+/// lowered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    /// `LIST`, reported as `l`.
+    List,
+    /// `RANGE`, reported as `r`.
+    Range,
+}
+
+impl PartitionStrategy {
+    /// `partstrat`.
+    ///
+    /// `l` is measured. `r` is PostgreSQL's own code for `RANGE` and this capture never asked for
+    /// it — `pg_partitioned_table` is probed only over the `LIST` table — so it is the one letter
+    /// here that is taken from PostgreSQL rather than from a row.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            PartitionStrategy::List => "l",
+            PartitionStrategy::Range => "r",
+        }
+    }
+
+    /// The word `pg_get_partkeydef` prints.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            PartitionStrategy::List => "LIST",
+            PartitionStrategy::Range => "RANGE",
+        }
+    }
+}
+
+/// Which rows a partition takes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionBound {
+    /// `FOR VALUES IN (…)`, **already coerced to the key columns' types**.
+    ///
+    /// That coercion is visible: the suite writes the integer `1` against a `character varying`
+    /// key and a real server prints the bound back as `FOR VALUES IN ('1')`, quoted. Storing the
+    /// literal as written would diverge the moment `ActiveRecord` dumps the schema.
+    Values(Vec<Datum>),
+    /// `FOR VALUES FROM (…) TO (…)` — **half-open**, `from` included and `to` excluded.
+    ///
+    /// Measured: `FROM (MINVALUE) TO (10)` takes `9` and `FROM (10) TO (MAXVALUE)` takes `10`. A
+    /// closed upper bound would put `10` in both partitions, which is why the two ranges in the
+    /// capture do not overlap despite sharing the number.
+    Range {
+        /// The lower bound, one entry per key column.
+        from: Vec<RangeBound>,
+        /// The upper bound, one entry per key column.
+        to: Vec<RangeBound>,
+    },
+    /// `DEFAULT` — everything no other partition takes, and its bound prints as the bare word.
+    Default,
+}
+
+/// One end of a `RANGE` bound: a value, or an infinity.
+///
+/// **`MINVALUE` and `MAXVALUE` print back verbatim** — they are not a very small and a very large
+/// number, and a node that stored them as `i64::MIN` and `i64::MAX` would print numbers where a
+/// real server prints the words.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeBound {
+    /// `MINVALUE`: below every value, NULL included.
+    MinValue,
+    /// A value, **already coerced to the key column's type**.
+    Value(Datum),
+    /// `MAXVALUE`: above every value.
+    MaxValue,
+}
+
+impl RangeBound {
+    /// Where a key value sits relative to this end.
+    ///
+    /// `MINVALUE` is below everything and `MAXVALUE` above it, which makes the half-open test one
+    /// comparison either side rather than four cases.
+    #[must_use]
+    pub fn cmp_value(&self, value: &Datum) -> core::cmp::Ordering {
+        match self {
+            RangeBound::MinValue => core::cmp::Ordering::Less,
+            RangeBound::MaxValue => core::cmp::Ordering::Greater,
+            RangeBound::Value(bound) => value::PgDatum::pg_cmp(bound, value),
+        }
+    }
+
+    /// How two ends of the same kind order against each other.
+    #[must_use]
+    pub fn cmp_bound(&self, other: &RangeBound) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        match (self, other) {
+            (RangeBound::MinValue, RangeBound::MinValue)
+            | (RangeBound::MaxValue, RangeBound::MaxValue) => Ordering::Equal,
+            (RangeBound::MinValue, _) | (_, RangeBound::MaxValue) => Ordering::Less,
+            (RangeBound::MaxValue, _) | (_, RangeBound::MinValue) => Ordering::Greater,
+            (RangeBound::Value(ours), RangeBound::Value(theirs)) => {
+                value::PgDatum::pg_cmp(ours, theirs)
+            }
+        }
+    }
+
+    /// The text `pg_get_expr(relpartbound, oid)` prints for this end.
+    #[must_use]
+    pub fn printed(&self) -> String {
+        match self {
+            RangeBound::MinValue => "MINVALUE".to_owned(),
+            RangeBound::MaxValue => "MAXVALUE".to_owned(),
+            RangeBound::Value(value) => partition_literal(value),
+        }
+    }
+}
+
+/// A bound value as PostgreSQL deparses it: **a number bare and a string quoted**.
+///
+/// Both spellings are in one capture. The `LIST` bound is on a `character varying` key and comes
+/// back `FOR VALUES IN ('1')`; the `RANGE` bound is on an `int4` key and comes back
+/// `FOR VALUES FROM (MINVALUE) TO (10)` — no quotes. The type decides, which is why the value is
+/// coerced before it is stored rather than printed as it was typed.
+fn partition_literal(value: &Datum) -> String {
+    let text = value::PgDatum::to_text(value).unwrap_or_else(|| "NULL".to_owned());
+    match value {
+        Datum::Int2(_)
+        | Datum::Int4(_)
+        | Datum::Int8(_)
+        | Datum::Numeric(_)
+        | Datum::Double(_)
+        | Datum::Real(_)
+        | Datum::Oid(_) => text,
+        Datum::Bool(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        _ => format!("'{}'", text.replace('\'', "''")),
+    }
+}
+
+/// `pg_get_partkeydef(oid)` — `LIST (city_id)`, or NULL for a relation that is not partitioned.
+///
+/// The **word**, not the code: `partstrat` is `l` and this is `LIST`, and the two are read from
+/// the same field. A client that guessed one from the other would be wrong in both directions.
+#[must_use]
+pub fn partition_key_definition(relations: &pg_relations::Relations, oid: Option<i64>) -> Datum {
+    let Some(oid) = oid else {
+        return Datum::Null;
+    };
+    let Some(relation) = relations.by_oid(oid) else {
+        return Datum::Null;
+    };
+    let Some(table) = relations.table(relation) else {
+        return Datum::Null;
+    };
+    let Some(key) = &table.partition_by else {
+        return Datum::Null;
+    };
+    let columns: Vec<&str> = key
+        .columns
+        .iter()
+        .filter_map(|&at| table.columns.get(at).map(|column| column.name.as_str()))
+        .collect();
+    Datum::Text(format!("{} ({})", key.strategy.word(), columns.join(", ")))
+}
+
+/// `FOR VALUES IN ('1')`, `FOR VALUES FROM (MINVALUE) TO (10)` or `DEFAULT` — the bound as
+/// `pg_get_expr(relpartbound, oid)` prints it.
+///
+/// The bound stored here has already been coerced to the key columns' types, so this prints what
+/// the column holds and not what was typed — which is the whole reason the suite's
+/// `FOR VALUES IN (1)` against a `character varying` key comes back quoted: a number prints bare
+/// and a string prints quoted, and the value knows which it is.
+#[must_use]
+pub fn partition_bound_definition(bound: &PartitionBound) -> String {
+    let listed = |values: &[Datum]| {
+        values
+            .iter()
+            .map(partition_literal)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ends = |bounds: &[RangeBound]| {
+        bounds
+            .iter()
+            .map(RangeBound::printed)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match bound {
+        PartitionBound::Default => "DEFAULT".to_owned(),
+        PartitionBound::Values(values) => format!("FOR VALUES IN ({})", listed(values)),
+        PartitionBound::Range { from, to } => {
+            format!("FOR VALUES FROM ({}) TO ({})", ends(from), ends(to))
+        }
     }
 }
 
@@ -2096,12 +2328,22 @@ pub(super) fn child_scans(txn: &dyn Txn, tenant: u64, table: &TableDef) -> Resul
         // lacks one is skipped rather than guessed at: a projection with a wrong position in it
         // would return another column's values under this one's name.
         let mut project = Vec::with_capacity(table.columns.len());
-        for column in &table.columns {
-            let Some(at) = child.column(&column.name) else {
+        for (at, column) in table.columns.iter().enumerate() {
+            // **The internal row id is not found by name**, and deliberately: its name is the
+            // empty string and `TableDef::column` refuses that, so a user's identifier can never
+            // reach it. Matching it positionally is the only way — and without this a parent
+            // with no primary key silently lost every child, because the *first* column it
+            // looked for was the one name that can never resolve.
+            let found = if Some(at) == table.row_id() {
+                child.row_id()
+            } else {
+                child.column(&column.name)
+            };
+            let Some(found) = found else {
                 project.clear();
                 break;
             };
-            project.push(at);
+            project.push(found);
         }
         if project.len() != table.columns.len() {
             continue;
@@ -2364,6 +2606,7 @@ mod tests {
                 keys: vec![IndexKey::column(1)],
                 state: SchemaState::Public,
                 state_since: 1,
+                include: Vec::new(),
                 predicate: None,
                 nulls_not_distinct: false,
                 constraint: None,
@@ -2379,6 +2622,8 @@ mod tests {
             triggers: Vec::new(),
             excludes: Vec::new(),
             child_scans: Vec::new(),
+            partition_by: None,
+            partition_bound: None,
         }
     }
 
@@ -2403,7 +2648,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2496,7 +2741,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",       // catalog format version
+                "14",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2529,7 +2774,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",                 // catalog format version
+                "14",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2586,7 +2831,15 @@ mod tests {
                 "00",
                 // Version 18. No triggers, which is every table until `CREATE TRIGGER` runs.
                 "00",
-                // Version 19. No `EXCLUDE` constraints, which is every table until one parses —
+                // Version 19. No partition key and no bound: this table neither partitions
+                // anything nor is a partition, which is every table until `PARTITION BY` runs.
+                "00",
+                "00",
+                // Version 19, still: one list per index, and the one index here includes
+                // nothing — which is every index until `CREATE INDEX ... INCLUDE` runs. Two
+                // sections under one number, because they arrived in one release.
+                "00",
+                // Version 20. No `EXCLUDE` constraints, which is every table until one parses —
                 // and until this version it could not, being a syntax error rather than a refusal.
                 "00",
             )
@@ -3296,6 +3549,7 @@ mod tests {
             keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
@@ -3355,6 +3609,7 @@ mod tests {
             keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
@@ -3547,7 +3802,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

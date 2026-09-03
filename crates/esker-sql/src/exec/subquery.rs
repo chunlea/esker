@@ -197,6 +197,8 @@ pub(super) fn table_function_def(
         triggers: Vec::new(),
         excludes: Vec::new(),
         child_scans: Vec::new(),
+        partition_by: None,
+        partition_bound: None,
     })
 }
 
@@ -288,6 +290,8 @@ fn plan_derived(
         triggers: Vec::new(),
         excludes: Vec::new(),
         child_scans: Vec::new(),
+        partition_by: None,
+        partition_bound: None,
     }));
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
     // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`

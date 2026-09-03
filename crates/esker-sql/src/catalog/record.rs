@@ -49,8 +49,8 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
-    IndexKey, KeyOrder, KeyPart, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
-    TriggerDef, UniqueKind,
+    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, RangeBound,
+    ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 19;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1117,10 +1117,79 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         varint::put_u64(trigger.events.unsigned_abs().into(), &mut out);
     }
 
-    // Version 19. The `EXCLUDE` constraints, after version 18's triggers — the seventh section on
-    // the end, and the rule has not changed: sections go on in version order and come off in that
-    // order. A table written before 19 has none, which is what every table had while an `EXCLUDE`
-    // constraint was a *syntax error* rather than a refusal.
+    // Version 19. The partition key and this table's own bound, in that order and after version
+    // 18's bytes — the seventh section on the end, and the rule has not changed: sections go on in
+    // version order and come off in that order.
+    //
+    // A table written before 19 has neither, which is what every table had while `PARTITION BY`
+    // was `0A000`.
+    match &table.partition_by {
+        None => out.push(0),
+        Some(key) => {
+            out.push(1);
+            out.push(match key.strategy {
+                PartitionStrategy::List => b'l',
+                PartitionStrategy::Range => b'r',
+            });
+            varint::put_u64(key.columns.len() as u64, &mut out);
+            for &column in &key.columns {
+                varint::put_u64(column as u64, &mut out);
+            }
+        }
+    }
+    match &table.partition_bound {
+        None => out.push(0),
+        Some(PartitionBound::Default) => out.push(1),
+        Some(PartitionBound::Values(values)) => {
+            out.push(2);
+            varint::put_u64(values.len() as u64, &mut out);
+            for value in values {
+                put_bound_value(value, &mut out);
+            }
+        }
+        Some(PartitionBound::Range { from, to }) => {
+            out.push(3);
+            for side in [from, to] {
+                varint::put_u64(side.len() as u64, &mut out);
+                for end in side {
+                    // One tag byte per end, because `MINVALUE` and `MAXVALUE` are not values: a
+                    // range that stored them as the extremes of the key's type would print
+                    // numbers where a real server prints the words.
+                    match end {
+                        RangeBound::MinValue => out.push(0),
+                        RangeBound::MaxValue => out.push(2),
+                        RangeBound::Value(value) => {
+                            out.push(1);
+                            put_bound_value(value, &mut out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Version 19, still: one list per index, the `INCLUDE (…)` columns by position in the order
+    // written — the eighth section on the end, after the partition key and bound.
+    //
+    // **Two sections under one version number, because they arrived in one release.** A version
+    // is what a *reader* branches on, and no reader can ever see a record with the partitioning
+    // section and not this one; giving them separate numbers would claim a state that has never
+    // existed on disk and would spend a number another lane needs. A table written before 19 has
+    // neither, which is what every table had while `PARTITION BY` and `INCLUDE` were both `0A000`.
+    for index in &table.indexes {
+        varint::put_u64(index.include.len() as u64, &mut out);
+        for &at in &index.include {
+            varint::put_u64(at as u64, &mut out);
+        }
+    }
+
+    // Version 20. The `EXCLUDE` constraints, after version 19's two sections — the ninth on the
+    // end, and the rule has not changed: sections go on in version order and come off in that
+    // order. This one was written as 19 while it was the only section claiming that number; the
+    // partition and `INCLUDE` sections landed on main first, so it moved to 20 and moved *after*
+    // them here. A table written before 20 — anything main-with-partitioning wrote — has none,
+    // which is what every table had while an `EXCLUDE` constraint was a *syntax error* rather
+    // than a refusal.
     varint::put_u64(table.excludes.len() as u64, &mut out);
     for exclude in &table.excludes {
         put_str(&exclude.name, &mut out);
@@ -1133,6 +1202,29 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+/// The second half of the version 19 section: each index's `INCLUDE (…)` columns.
+///
+/// Read into the indexes that have already been decoded, the way the version 17 byte is: one list
+/// per index, in the order the indexes were written. It shares 19 with the partitioning section
+/// above because the two arrived in one release and no record can carry one without the other.
+fn read_index_include(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result<()> {
+    if reader.version < 19 {
+        return Ok(());
+    }
+    for index in indexes {
+        let count = reader.count()?;
+        let mut include = Vec::with_capacity(count);
+        for _ in 0..count {
+            include.push(
+                usize::try_from(reader.varint()?)
+                    .map_err(|_| corrupt("an included column that is not a usize"))?,
+            );
+        }
+        index.include = include;
+    }
+    Ok(())
 }
 
 /// The version 17 byte: whether an index is a `UNIQUE` constraint's, and whether it is deferrable.
@@ -1350,9 +1442,97 @@ fn read_triggers(reader: &mut Reader<'_>) -> Result<Vec<TriggerDef>> {
     Ok(triggers)
 }
 
-/// The version 19 section: the `EXCLUDE` constraints on this table.
-fn read_excludes(reader: &mut Reader<'_>) -> Result<Vec<ExcludeDef>> {
+/// One bound value: its **type tag** and then its text.
+///
+/// The type is written because the bound is compared, not only printed. A value stored as text and
+/// read back as text compares equal to another text and to nothing else — so an `int4` range bound
+/// decoded without its type would say `10` and `10` are different values, and the second partition
+/// of a two-partition range would be refused as overlapping the first. A bound's type is the key
+/// column's, which belongs to the **parent**, and the parent is not loaded here: writing the tag is
+/// what makes the record self-describing rather than needing one.
+fn put_bound_value(value: &Datum, out: &mut Vec<u8>) {
+    // A NULL bound value cannot be written by any statement — `FOR VALUES IN (NULL)` is refused
+    // where it is lowered — so `text` is a tag that will never be read back, not a coercion.
+    out.push(tag_of(value.column_type().unwrap_or(ColumnType::Text)));
+    put_str(
+        &crate::value::PgDatum::to_text(value).unwrap_or_default(),
+        out,
+    );
+}
+
+/// One bound value, read back as the type it was written with.
+fn bound_value(reader: &mut Reader<'_>) -> Result<Datum> {
+    let ty = type_of(reader.byte()?)?;
+    let text = reader.string()?;
+    <Datum as crate::value::PgDatum>::from_text(ty, &text)
+        .map_err(|_| corrupt("a partition bound value of the wrong type"))
+}
+
+/// The version 19 section: the partition key, then this table's own bound.
+///
+/// A bound's values come back as **text**, to be read as the key columns' types where the parent
+/// is in hand — which is not here.
+fn read_partitioning(
+    reader: &mut Reader<'_>,
+) -> Result<(Option<PartitionKey>, Option<PartitionBound>)> {
     if reader.version < 19 {
+        return Ok((None, None));
+    }
+    let partition_by = match reader.byte()? {
+        0 => None,
+        1 => {
+            let strategy = match reader.byte()? {
+                b'l' => PartitionStrategy::List,
+                b'r' => PartitionStrategy::Range,
+                other => return Err(corrupt(format!("partition strategy byte {other}"))),
+            };
+            let count = reader.count()?;
+            let mut columns = Vec::with_capacity(count);
+            for _ in 0..count {
+                columns.push(
+                    usize::try_from(reader.varint()?)
+                        .map_err(|_| corrupt("a partition key column that is not a usize"))?,
+                );
+            }
+            Some(PartitionKey { strategy, columns })
+        }
+        other => return Err(corrupt(format!("partition key tag {other}"))),
+    };
+    let partition_bound = match reader.byte()? {
+        0 => None,
+        1 => Some(PartitionBound::Default),
+        2 => {
+            let count = reader.count()?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(bound_value(reader)?);
+            }
+            Some(PartitionBound::Values(values))
+        }
+        3 => {
+            let mut sides = [Vec::new(), Vec::new()];
+            for side in &mut sides {
+                let count = reader.count()?;
+                for _ in 0..count {
+                    side.push(match reader.byte()? {
+                        0 => RangeBound::MinValue,
+                        1 => RangeBound::Value(bound_value(reader)?),
+                        2 => RangeBound::MaxValue,
+                        other => return Err(corrupt(format!("range bound tag {other}"))),
+                    });
+                }
+            }
+            let [from, to] = sides;
+            Some(PartitionBound::Range { from, to })
+        }
+        other => return Err(corrupt(format!("partition bound tag {other}"))),
+    };
+    Ok((partition_by, partition_bound))
+}
+
+/// The version 20 section: the `EXCLUDE` constraints on this table.
+fn read_excludes(reader: &mut Reader<'_>) -> Result<Vec<ExcludeDef>> {
+    if reader.version < 20 {
         return Ok(Vec::new());
     }
     let count = reader.count()?;
@@ -1456,6 +1636,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             state,
             state_since,
             // All three filled after the loop, for versions 7, 8 and 11.
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             // Filled from the version 17 section below, after every index has been read.
@@ -1504,6 +1685,9 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         }
     }
     let triggers = read_triggers(&mut reader)?;
+    let (partition_by, partition_bound) = read_partitioning(&mut reader)?;
+    read_index_include(&mut reader, &mut indexes)?;
+    // Read **after** version 19's two sections, because it is written after them.
     let excludes = read_excludes(&mut reader)?;
     reader.finish()?;
 
@@ -1524,6 +1708,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         triggers,
         excludes,
         child_scans: Vec::new(),
+        partition_by,
+        partition_bound,
         checks,
         foreign_keys,
         triggers_disabled,

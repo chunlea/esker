@@ -137,6 +137,14 @@ pub enum CatalogView {
     /// never executed. Reporting the language is what makes that definition storable, and it is
     /// the first thing a client asks before writing one.
     PgLanguage,
+    /// One row per partitioned table: its strategy, its key's width, and the key columns.
+    PgPartitionedTable,
+    /// One row per index, **as a view over `pg_class` and `pg_index`** rather than a catalog
+    /// table: the table it is on and the `CREATE INDEX` that would rebuild it.
+    ///
+    /// A real server defines it in exactly those terms, and `indexdef` is `pg_get_indexdef` — the
+    /// same string, which is why the two agree about `INCLUDE (…)` without being written twice.
+    PgIndexes,
     /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
     /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
     PgEnum,
@@ -160,7 +168,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 22] = [
+    pub const ALL: [CatalogView; 24] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -176,6 +184,8 @@ impl CatalogView {
         CatalogView::PgProc,
         CatalogView::PgTrigger,
         CatalogView::PgLanguage,
+        CatalogView::PgPartitionedTable,
+        CatalogView::PgIndexes,
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
@@ -205,6 +215,8 @@ impl CatalogView {
             CatalogView::PgProc => "pg_proc",
             CatalogView::PgTrigger => "pg_trigger",
             CatalogView::PgLanguage => "pg_language",
+            CatalogView::PgPartitionedTable => "pg_partitioned_table",
+            CatalogView::PgIndexes => "pg_indexes",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
@@ -234,10 +246,12 @@ impl CatalogView {
                 CatalogView::PgCollation => 8,
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
-                CatalogView::PgAm => 21,
+                CatalogView::PgAm => 23,
                 CatalogView::PgProc => 18,
                 CatalogView::PgTrigger => 19,
                 CatalogView::PgLanguage => 20,
+                CatalogView::PgPartitionedTable => 21,
+                CatalogView::PgIndexes => 22,
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
@@ -260,6 +274,11 @@ impl CatalogView {
     /// those four, so an `oid` is a `bigint` and the other three are `text`. The *values* are
     /// identical and only `RowDescription`'s OID differs — declared in `tests/pg_catalog.rs`.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per view, each the column list a client reads; splitting it would put \
+                  half the catalog's vocabulary somewhere else"
+    )]
     pub fn columns(self) -> &'static [(&'static str, ColumnType)] {
         match self {
             CatalogView::PgType => &[
@@ -304,6 +323,12 @@ impl CatalogView {
                 ("relnamespace", ColumnType::Int8),
                 ("relkind", ColumnType::Text),
                 ("relhastriggers", ColumnType::Bool),
+                // Added for declarative partitioning. `relispartition` says the relation *is* a
+                // partition, `relhassubclass` that something inherits from or partitions it, and
+                // `relpartbound` holds the bound `pg_get_expr` prints.
+                ("relispartition", ColumnType::Bool),
+                ("relhassubclass", ColumnType::Bool),
+                ("relpartbound", ColumnType::Text),
                 // **Last**, because `SELECT *` expands in this order. The access method of an
                 // index and **zero** for everything else, which is what a real server reports for
                 // a table — the join `pg_am am ON am.oid = i.relam` then finds nothing for one,
@@ -377,6 +402,24 @@ impl CatalogView {
                 ("tgisinternal", ColumnType::Bool),
                 ("tgfoid", ColumnType::Int8),
             ],
+            // `schemaname` and `tablespace` are what a real server's view has and this node has
+            // neither concept: one schema, and no tablespaces — `public` and NULL, which is what
+            // a real server answers for an index in the default tablespace too.
+            CatalogView::PgIndexes => &[
+                ("schemaname", ColumnType::Text),
+                ("tablename", ColumnType::Text),
+                ("indexname", ColumnType::Text),
+                ("tablespace", ColumnType::Text),
+                ("indexdef", ColumnType::Text),
+            ],
+            // `partstrat` is a **one-letter code** and `partattrs` an `int2vector` — neither is
+            // the word the DDL used, which `pg_get_partkeydef` gives instead.
+            CatalogView::PgPartitionedTable => &[
+                ("partrelid", ColumnType::Int8),
+                ("partstrat", ColumnType::Text),
+                ("partnatts", ColumnType::Int2),
+                ("partattrs", ColumnType::Text),
+            ],
             // The five a real server has, in its order. `name` is of type `name` there and the
             // four others are `text`; this node has one string type and answers `text` for all
             // five, which is the same trade every `pg_catalog` column makes.
@@ -430,6 +473,8 @@ impl CatalogView {
             CatalogView::PgInherits => inherits_rows(txn, tenant),
             CatalogView::PgProc => proc_rows(txn, tenant),
             CatalogView::PgTrigger => trigger_rows(txn, tenant),
+            CatalogView::PgPartitionedTable => partitioned_table_rows(txn, tenant),
+            CatalogView::PgIndexes => indexes_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -571,6 +616,8 @@ impl CatalogView {
             | CatalogView::PgProc
             | CatalogView::PgTrigger
             | CatalogView::PgLanguage
+            | CatalogView::PgPartitionedTable
+            | CatalogView::PgIndexes
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -630,6 +677,8 @@ impl CatalogView {
                         triggers: Vec::new(),
                         excludes: Vec::new(),
                         child_scans: Vec::new(),
+                        partition_by: None,
+                        partition_bound: None,
                     })
                 })
                 .collect()
@@ -814,6 +863,70 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
         .wrapping_add(at.wrapping_add(1))
 }
 
+/// One row per index, the way `pg_indexes` presents them.
+///
+/// **A view, not a table**: a real server defines it over `pg_class` and `pg_index`, and its
+/// `indexdef` *is* `pg_get_indexdef(indexrelid)` — so the string here is the one that function
+/// builds rather than a second rendering that could drift from it. A primary key is in it, which
+/// is why `companies_pkey` is one of the capture's two rows.
+fn indexes_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for relation in relations.rows() {
+        if !matches!(
+            relation.kind,
+            super::pg_relations::RelKind::Index | super::pg_relations::RelKind::PrimaryKey
+        ) {
+            continue;
+        }
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        let Datum::Text(definition) =
+            super::pg_index::index_definition(&relations, Some(relation.oid), None)
+        else {
+            continue;
+        };
+        rows.push(vec![
+            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            Datum::Text(table.name.clone()),
+            Datum::Text(relation.name.clone()),
+            // No tablespaces here, and NULL is what a real server answers for an index in the
+            // default one — so the column is the same answer rather than a stub.
+            Datum::Null,
+            Datum::Text(definition),
+        ]);
+    }
+    Ok(rows)
+}
+
+/// One row per partitioned table, the way `pg_partitioned_table` holds them.
+fn partitioned_table_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for table in relations.tables() {
+        let Some(key) = &table.partition_by else {
+            continue;
+        };
+        let attnums: Vec<usize> = key.columns.clone();
+        rows.push(vec![
+            Datum::Int8(super::pg_relations::as_oid(table.id)),
+            Datum::Text(key.strategy.code().to_owned()),
+            Datum::Int2(i16::try_from(key.columns.len()).unwrap_or(i16::MAX)),
+            // **The bare `int2vector` form**, `1`, not the brace form `{1}` — the same rendering
+            // `pg_index.indkey` uses, and what a real server prints here. Measured.
+            Datum::Text(
+                attnums
+                    .iter()
+                    .map(|&at| super::pg_relations::attnum_of(table, at).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        ]);
+    }
+    Ok(rows)
+}
+
 /// One row per inheritance edge, the way `pg_inherits` holds them.
 ///
 /// Read from the **child** side, because that is where the order lives: `inhseqno` numbers a
@@ -868,6 +981,9 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Int8(PUBLIC_NAMESPACE_OID),
             Datum::Text("v".to_owned()),
             Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Null,
             Datum::Int8(0),
         ]
     });
@@ -878,7 +994,13 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                 Datum::Int8(relation.oid),
                 Datum::Text(relation.name.clone()),
                 Datum::Int8(PUBLIC_NAMESPACE_OID),
-                Datum::Text(relation.kind.relkind().to_owned()),
+                // **Four `relkind`s in one feature, and one is a capital letter.** A partitioned
+                // table is `p` where an ordinary one is `r`, and an index *on* a partitioned table
+                // is `I` where an ordinary one is `i` — so the letter is not a function of the
+                // relation's kind alone, which is why it is decided here with the table in hand.
+                // A `relkind IN ('r','p')` filter that forgets `I` still passes every test that
+                // never makes a partitioned index.
+                Datum::Text(partitioned_relkind(&relations, relation)),
                 // Only a **table** has them: an index over a table with a foreign key is `f` on a
                 // real server, and the index's row here names that table.
                 Datum::Bool(
@@ -888,6 +1010,31 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                                 .table(relation)
                                 .is_some_and(|table| !table.foreign_keys.is_empty())),
                 ),
+                // `relispartition`: the relation is a partition. An index on one is a partition
+                // too on a real server; here the flag follows the table it is on.
+                Datum::Bool(
+                    relations
+                        .table(relation)
+                        .is_some_and(|table| table.partition_bound.is_some()),
+                ),
+                // `relhassubclass`: something inherits from or partitions it. **`f` for a freshly
+                // created partitioned table with no partitions yet** — measured, the capture's
+                // first `pg_class` row has it false.
+                Datum::Bool(
+                    relation.kind == super::pg_relations::RelKind::Table
+                        && relations
+                            .table(relation)
+                            .is_some_and(|table| !table.children.is_empty()),
+                ),
+                // `relpartbound`. NULL for everything that is not a partition, which is what a
+                // real server holds there too.
+                relations
+                    .table(relation)
+                    .filter(|_| relation.kind == super::pg_relations::RelKind::Table)
+                    .and_then(|table| table.partition_bound.as_ref())
+                    .map_or(Datum::Null, |bound| {
+                        Datum::Text(super::partition_bound_definition(bound))
+                    }),
                 Datum::Int8(access_method_oid(relation.kind)),
             ]
         })
@@ -909,6 +1056,25 @@ fn access_method_oid(kind: super::pg_relations::RelKind) -> i64 {
         RelKind::Index | RelKind::PrimaryKey => BTREE_AM_OID,
         RelKind::Exclusion => GIST_AM_OID,
         RelKind::Table | RelKind::Sequence => 0,
+    }
+}
+
+/// The `relkind` letter, which needs the **table** and not only the relation's kind.
+///
+/// A partitioned table is `p`, an index on one is `I`, and everything else is what
+/// `RelKind::relkind` says.
+fn partitioned_relkind(
+    relations: &super::pg_relations::Relations,
+    relation: &super::pg_relations::RelationRow,
+) -> String {
+    use super::pg_relations::RelKind;
+    let partitioned = relations
+        .table(relation)
+        .is_some_and(|table| table.partition_by.is_some());
+    match relation.kind {
+        RelKind::Table if partitioned => "p".to_owned(),
+        RelKind::Index if partitioned => "I".to_owned(),
+        kind => kind.relkind().to_owned(),
     }
 }
 

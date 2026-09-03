@@ -62,6 +62,9 @@ pub(super) fn create_table(
     // **The parents' columns come first**, whatever order the child declared its own in, and a
     // child that redeclares an inherited name merges into it rather than adding a second column.
     let (parents, columns) = inherited_columns(executor, txn, create, declared)?;
+    // A partition takes the parent's columns and declares none of its own; see
+    // [`partition_of_columns`].
+    let (parents, columns) = partition_of_columns(executor, txn, create, parents, columns)?;
     refuse_unavailable_defaults(txn, executor, &columns)?;
 
     let key_position = |name: &String| {
@@ -104,6 +107,10 @@ pub(super) fn create_table(
     };
 
     let indexes = unique_indexes(executor, txn, create, &columns)?;
+    // Resolved before the table is written, so a key naming no column, an unsupported strategy or
+    // an overlapping bound leaves the catalog untouched.
+    let partition_by = partition_key(create, &columns)?;
+    let partition_bound = partition_bound(executor, txn, create, parents.first())?;
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
@@ -119,6 +126,8 @@ pub(super) fn create_table(
         foreign_keys: Vec::new(),
         triggers_disabled: false,
         parents: parents.iter().map(|parent| parent.id).collect(),
+        partition_by,
+        partition_bound,
         // Filled by the parents, not here: this table is nobody's parent yet.
         children: Vec::new(),
         triggers: Vec::new(),
@@ -140,6 +149,11 @@ pub(super) fn create_table(
         let resolved = resolve_foreign_key(txn, executor, &table, key)?;
         backrefs.push((resolved.parent, table.id));
         table.foreign_keys.push(resolved);
+    }
+    // Every partition silently gets its own copy of the parent's indexes; see
+    // [`copy_parent_indexes`].
+    if table.partition_bound.is_some() {
+        copy_parent_indexes(executor, txn, &mut table, &parents)?;
     }
     catalog::create_table(txn, executor.tenant, &table)?;
     // **The other half of the edge.** A parent's `children` is what a scan of it reads to reach
@@ -348,6 +362,7 @@ fn unique_indexes(
             }),
             state: catalog::SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
         });
     }
@@ -469,6 +484,280 @@ fn set_column_default(
         }
     }
     Ok(())
+}
+
+/// **A partition takes the parent's columns and declares none of its own.**
+///
+/// The suite writes `CREATE TABLE "measurements_toronto" PARTITION OF measurements FOR VALUES IN
+/// (1)` with no column list at all. It is the same borrowing an `INHERITS` child does, which is
+/// why the two share the edge and `pg_inherits` reports a partition too — and why a table that is
+/// not a partition passes straight through with what it already had.
+fn partition_of_columns(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &CreateTable,
+    parents: Vec<std::sync::Arc<TableDef>>,
+    columns: Vec<ColumnDef>,
+) -> Result<(Vec<std::sync::Arc<TableDef>>, Vec<ColumnDef>)> {
+    let Some((parent, _)) = &create.partition_of else {
+        return Ok((parents, columns));
+    };
+    let parent = executor.require_table(txn, parent)?;
+    let mut inherited: Vec<ColumnDef> = parent
+        .user_columns()
+        .map(|(_, column)| column.clone())
+        .collect();
+    for column in columns {
+        if !inherited.iter().any(|held| held.name == column.name) {
+            inherited.push(column);
+        }
+    }
+    Ok((vec![parent], inherited))
+}
+
+/// `INCLUDE (…)` resolved against the table's columns.
+///
+/// **The plain column-not-found wording**, not the `column "…" named in key does not exist`
+/// phrasing a key column gets: an included column is not in the key, and PostgreSQL says so by
+/// falling back to its ordinary message. Measured.
+///
+/// **Not deduplicated against the key**, either: `("firm_id") INCLUDE ("firm_id")` is accepted and
+/// reports the same attnum twice in `indkey`. Nothing here removes it.
+fn included_columns(table: &TableDef, names: &[String]) -> Result<Vec<usize>> {
+    names
+        .iter()
+        .map(|name| {
+            table
+                .column(name)
+                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
+        })
+        .collect()
+}
+
+/// **A unique index on a partitioned table must contain every partition column**, or `0A000`.
+///
+/// PostgreSQL's own words and its own reason: with the key columns in it, two rows that could
+/// collide must route to the *same* partition, so a per-partition index enforces the constraint
+/// exactly. Without one they could land in different partitions and neither index would see the
+/// pair. `kind` is the word the message and its `DETAIL` are built from — `UNIQUE` or
+/// `PRIMARY KEY`, which a real server substitutes into the same two sentences.
+fn refuse_uncovered_partition_key(
+    table: &TableDef,
+    keys: &[IndexKey],
+    kind: &'static str,
+) -> Result<()> {
+    let Some(key) = &table.partition_by else {
+        return Ok(());
+    };
+    // The **first** column it misses is the one PostgreSQL names in the `DETAIL`.
+    let missing = key
+        .columns
+        .iter()
+        .find(|&&at| !keys.iter().any(|part| part.position() == Some(at)));
+    if let Some(&at) = missing {
+        return Err(SqlError::PartitionKeyNotCovered {
+            kind,
+            relation: table.name.clone(),
+            missing: table.columns[at].name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// **Every partition silently gets its own copy of the parent's indexes.**
+///
+/// Statement 782 creates the index before a single partition exists, and each partition made
+/// afterwards acquires one named `<partition>_<cols>_idx` — two partitions produce two indexes the
+/// suite never named, and it is the *child* index a duplicate-key error names. Measured.
+///
+/// A per-partition index is not an approximation of a partitioned one: a unique index on a
+/// partitioned table must contain every partition column, so two rows that could collide route to
+/// the same partition and one index sees both.
+fn copy_parent_indexes(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &mut TableDef,
+    parents: &[std::sync::Arc<TableDef>],
+) -> Result<()> {
+    for parent in parents {
+        for index in &parent.indexes {
+            let Some(columns) = index.key_columns() else {
+                continue;
+            };
+            let keys: Vec<plan::IndexKeyPart> = columns
+                .iter()
+                .filter_map(|&at| parent.columns.get(at))
+                .map(|column| plan::IndexKeyPart::column(column.name.clone()))
+                .collect();
+            let mine = columns
+                .iter()
+                .filter_map(|&at| parent.columns.get(at))
+                .filter_map(|column| table.column(&column.name))
+                .map(IndexKey::column)
+                .collect::<Vec<_>>();
+            if mine.len() != columns.len() {
+                continue;
+            }
+            table.indexes.push(IndexDef {
+                id: catalog::allocate_id(txn, executor.tenant)?,
+                name: plan::index_name(&table.name, &keys),
+                unique: index.unique,
+                keys: mine,
+                include: Vec::new(),
+                predicate: index.predicate.clone(),
+                nulls_not_distinct: index.nulls_not_distinct,
+                // The child of a constraint's index is not itself a constraint: only the
+                // partitioned table's own row is in `pg_constraint`.
+                constraint: None,
+                state: catalog::SchemaState::Public,
+                state_since: 1,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `PARTITION BY LIST (col, …)` — the key columns resolved against the table's own.
+fn partition_key(
+    create: &CreateTable,
+    columns: &[ColumnDef],
+) -> Result<Option<catalog::PartitionKey>> {
+    let Some((strategy, names)) = &create.partition_by else {
+        return Ok(None);
+    };
+    let key = names
+        .iter()
+        .map(|name| {
+            columns
+                .iter()
+                .position(|column| &column.name == name)
+                .ok_or_else(|| SqlError::UndefinedColumnInKey(name.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(catalog::PartitionKey {
+        strategy: *strategy,
+        columns: key,
+    }))
+}
+
+/// `FOR VALUES IN (…)` or `DEFAULT` — coerced to the parent's key types, and checked for overlap.
+///
+/// **The coercion is observable.** The suite writes `FOR VALUES IN (1)` against a
+/// `character varying` key and a real server prints the bound back as `FOR VALUES IN ('1')`. A
+/// bound stored as the literal was written would diverge the moment `ActiveRecord` dumps the
+/// schema — and would compare wrongly against a routed row, which reaches the key as text.
+fn partition_bound(
+    executor: &Executor,
+    txn: &dyn Txn,
+    create: &CreateTable,
+    parent: Option<&std::sync::Arc<TableDef>>,
+) -> Result<Option<catalog::PartitionBound>> {
+    let Some((parent_name, spec)) = &create.partition_of else {
+        return Ok(None);
+    };
+    let Some(parent) = parent else {
+        return Err(SqlError::UndefinedTable(parent_name.clone()));
+    };
+    // A table that is not partitioned has no bounds to take: PostgreSQL's own message names the
+    // relation rather than the clause.
+    let Some(key) = &parent.partition_by else {
+        return Err(SqlError::NotPartitioned(parent.name.clone()));
+    };
+    let coerce = |value: &Datum, at: usize| -> Result<Datum> {
+        let ty = parent.columns[at].ty;
+        let text = crate::value::PgDatum::to_text(value).unwrap_or_default();
+        Datum::from_text(ty, &text)
+    };
+    let bound = match spec {
+        plan::PartitionSpec::Default => catalog::PartitionBound::Default,
+        plan::PartitionSpec::Values(values) => {
+            if values.len() != key.columns.len() {
+                return Err(SqlError::unsupported(
+                    "FOR VALUES IN over a different number of columns than the key",
+                ));
+            }
+            catalog::PartitionBound::Values(
+                values
+                    .iter()
+                    .zip(&key.columns)
+                    .map(|(value, &at)| coerce(value, at))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        plan::PartitionSpec::Range { from, to } => {
+            if from.len() != key.columns.len() || to.len() != key.columns.len() {
+                return Err(SqlError::unsupported(
+                    "FOR VALUES FROM ... TO ... over a different number of columns than the key",
+                ));
+            }
+            let ends = |side: &[plan::RangeEnd]| -> Result<Vec<catalog::RangeBound>> {
+                side.iter()
+                    .zip(&key.columns)
+                    .map(|(end, &at)| {
+                        Ok(match end {
+                            plan::RangeEnd::MinValue => catalog::RangeBound::MinValue,
+                            plan::RangeEnd::MaxValue => catalog::RangeBound::MaxValue,
+                            plan::RangeEnd::Value(value) => {
+                                catalog::RangeBound::Value(coerce(value, at)?)
+                            }
+                        })
+                    })
+                    .collect()
+            };
+            catalog::PartitionBound::Range {
+                from: ends(from)?,
+                to: ends(to)?,
+            }
+        }
+    };
+    // **An overlapping bound is `42P17`, and the message names the partition it would overlap.**
+    // Checked against the parent's existing partitions, which is where the answer is: two `DEFAULT`
+    // partitions overlap as surely as two identical value lists.
+    for &sibling_id in &parent.children {
+        let sibling = executor.table_by_id(txn, sibling_id)?;
+        let Some(theirs) = &sibling.partition_bound else {
+            continue;
+        };
+        if bounds_overlap(&bound, theirs) {
+            return Err(SqlError::PartitionOverlap {
+                partition: create.name.clone(),
+                existing: sibling.name.clone(),
+            });
+        }
+    }
+    Ok(Some(bound))
+}
+
+/// Whether two bounds admit any row in common.
+///
+/// Two `DEFAULT`s do — a table may have only one — and two value lists do when they share a value.
+/// A `DEFAULT` and anything else never do: `DEFAULT` takes what the others do not, by definition.
+///
+/// Two ranges overlap when each starts before the other ends, which is the **half-open** test:
+/// `FROM (MINVALUE) TO (10)` and `FROM (10) TO (MAXVALUE)` share the number `10` and do not
+/// overlap, because the first excludes its upper end. Measured — the capture creates both.
+///
+/// A list and a range cannot meet, because one strategy is a table's and a partition of it cannot
+/// be declared with the other's grammar.
+fn bounds_overlap(one: &catalog::PartitionBound, other: &catalog::PartitionBound) -> bool {
+    use catalog::PartitionBound::{Default, Range, Values};
+    match (one, other) {
+        (Default, Default) => true,
+        (Values(ours), Values(theirs)) => ours.iter().any(|value| theirs.contains(value)),
+        (
+            Range { from, to },
+            Range {
+                from: their_from,
+                to: their_to,
+            },
+        ) => {
+            catalog::RangeBound::cmp_bound(&from[0], &their_to[0]).is_lt()
+                && catalog::RangeBound::cmp_bound(&their_from[0], &to[0]).is_lt()
+        }
+        // A `DEFAULT` and anything else; and a list against a range, which cannot happen because
+        // the strategy is the parent's and both partitions are declared against the same one.
+        _ => false,
+    }
 }
 
 /// The columns a `CREATE TABLE … INHERITS (…)` ends up with, and the parents it resolved.
@@ -1332,11 +1621,16 @@ pub(super) fn create_index(
         let scope = crate::exec::query::Scope::single(&table);
         crate::exec::query::resolve(&parsed, &scope)?;
     }
+    if create.unique {
+        refuse_uncovered_partition_key(&table, &keys, "UNIQUE")?;
+    }
+    let include = included_columns(&table, &create.include)?;
     let index = IndexDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
         keys,
+        include,
         predicate: create.predicate.clone(),
         nulls_not_distinct: create.nulls_not_distinct,
         // **`CREATE UNIQUE INDEX` is not a constraint.** It builds the same index a `UNIQUE (c)`

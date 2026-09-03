@@ -1,0 +1,96 @@
+# `CREATE INDEX … INCLUDE` — non-key payload columns — as a real PostgreSQL 19beta1 answers it.
+#
+# **Statement 787 of `postgresql_specific_schema.rb`**, verbatim as `ActiveRecord` emits it:
+#
+#     CREATE INDEX "company_include_index" ON "companies" ("firm_id", "type")
+#       INCLUDE ("name", "account_id")
+#
+# Nothing in the corpus covered `INCLUDE`. `pg19_index_constraint.txt` covers `DESC`, partial and
+# expression indexes; this is the one index clause it does not have.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. The `\gdesc` pass
+# runs after the rollback, so statements naming `companies` have an **empty** declared-types column;
+# the `pg_typeof` line pins `smallint` for both attribute counts.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The included columns are IN `indkey`, and only a count separates them from the key.** The
+#     suite's index has `indnatts = 4`, `indnkeyatts = 2`, and `indkey = "2 3 4 5"` — all four
+#     attributes, in one vector. An implementation that reads `indkey` to reconstruct an index
+#     reports a four-column index unless it also reads `indnkeyatts`, and `ActiveRecord`'s schema
+#     dumper reads `indkey`.
+#   * **`indnkeyatts` and `indnatts` are `smallint`**, not `integer`.
+#   * **Uniqueness applies to the key columns only.** `CREATE UNIQUE INDEX … ("firm_id") INCLUDE
+#     ("name")` refuses a second row with the same `firm_id` and a *different* `name`, and the
+#     DETAIL names only `Key (firm_id)=(1)`. The payload is stored, never compared.
+#   * **An included column may repeat a key column.** `("firm_id") INCLUDE ("firm_id")` is
+#     **accepted** — `indnatts = 2`, `indnkeyatts = 1`, `indkey = "2 2"`, the same attnum twice, and
+#     `pg_get_indexdef` prints it back as written. Not an error, not deduplicated.
+#   * **Three different mistakes on an included column give three different SQLSTATEs**, and two of
+#     them are `42P17` rather than a syntax error:
+#       - `INCLUDE ("name" DESC)`               → `42P17 including column does not support ASC/DESC options`
+#       - `INCLUDE ("name" varchar_pattern_ops)` → `42P17 including column does not support an operator class`
+#       - `INCLUDE ("nosuchcol")`                → `42703 column "nosuchcol" does not exist`
+#     Note the last is the plain column-not-found wording — **not** the `column "…" named in key does
+#     not exist` phrasing `pg19_unique_constraint.txt` records for a key column.
+#   * **Most access methods refuse included columns, with `0A000` and the AM's name in the
+#     sentence.** `hash` is `access method "hash" does not support included columns`; `brin` gives
+#     the same sentence. btree accepts.
+#   * **`pg_get_indexdef` puts `INCLUDE (…)` after the key list and before the predicate**:
+#     `USING btree (firm_id) INCLUDE (name) WHERE (account_id IS NOT NULL)`. `pg_indexes.indexdef`
+#     carries the same string.
+#   * **A `UNIQUE` *constraint* takes `INCLUDE` too**, and `pg_get_constraintdef` prints it:
+#     `UNIQUE (account_id) INCLUDE (name)` — so the clause has to be understood in two grammars,
+#     not one.
+BEGIN		-
+CREATE TABLE "companies" ("id" bigserial primary key, "firm_id" integer, "type" character varying, "name" character varying, "account_id" integer)		-
+CREATE INDEX "company_include_index" ON "companies" ("firm_id", "type") INCLUDE ("name", "account_id")		-
+SELECT 'r', pg_get_indexdef('company_include_index'::regclass)		r|CREATE INDEX company_include_index ON public.companies USING btree (firm_id, type) INCLUDE (name, account_id)
+SELECT 'r', x.indnatts, x.indnkeyatts, x.indisunique, x.indkey FROM pg_index x WHERE x.indexrelid = 'company_include_index'::regclass		r|4|2|f|2 3 4 5
+SELECT 'r', a.attname, a.attnum, (a.attnum <= x.indnkeyatts) AS is_key FROM pg_index x JOIN pg_attribute a ON a.attrelid = x.indexrelid WHERE x.indexrelid = 'company_include_index'::regclass ORDER BY a.attnum		r|firm_id|1|t ; r|type|2|t ; r|name|3|f ; r|account_id|4|f
+SELECT 'r', i.relname, x.indnkeyatts, x.indnatts FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'companies'::regclass ORDER BY i.relname		r|companies_pkey|1|1 ; r|company_include_index|2|4
+SELECT 'r', indexname, indexdef FROM pg_indexes WHERE tablename = 'companies' ORDER BY indexname	text,name,text	r|companies_pkey|CREATE UNIQUE INDEX companies_pkey ON public.companies USING btree (id) ; r|company_include_index|CREATE INDEX company_include_index ON public.companies USING btree (firm_id, type) INCLUDE (name, account_id)
+CREATE UNIQUE INDEX "company_unique_include" ON "companies" ("firm_id") INCLUDE ("name")		-
+SELECT 'r', pg_get_indexdef('company_unique_include'::regclass)		r|CREATE UNIQUE INDEX company_unique_include ON public.companies USING btree (firm_id) INCLUDE (name)
+INSERT INTO "companies" ("firm_id","type","name","account_id") VALUES (1,'Firm','one',10)		-
+SAVEPOINT s1		-
+INSERT INTO "companies" ("firm_id","type","name","account_id") VALUES (1,'Client','two',20)	!23505 duplicate key value violates unique constraint "company_unique_include" DETAIL: Key (firm_id)=(1) already exists.
+ROLLBACK TO s1		-
+INSERT INTO "companies" ("firm_id","type","name","account_id") VALUES (2,'Client','one',20)		-
+SELECT 'r', firm_id, type, name, account_id FROM "companies" ORDER BY id		r|1|Firm|one|10 ; r|2|Client|one|20
+SAVEPOINT s2		-
+CREATE INDEX "ci_dup" ON "companies" ("firm_id") INCLUDE ("firm_id")		-
+SELECT 'r', pg_get_indexdef('ci_dup'::regclass)		r|CREATE INDEX ci_dup ON public.companies USING btree (firm_id) INCLUDE (firm_id)
+SELECT 'r', indnatts, indnkeyatts, indkey FROM pg_index WHERE indexrelid = 'ci_dup'::regclass		r|2|1|2 2
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE INDEX "ci_desc" ON "companies" ("firm_id") INCLUDE ("name" DESC)	!42P17 including column does not support ASC/DESC options
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+CREATE INDEX "ci_opclass" ON "companies" ("firm_id") INCLUDE ("name" varchar_pattern_ops)	!42P17 including column does not support an operator class
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+CREATE INDEX "ci_hash" ON "companies" USING hash ("firm_id") INCLUDE ("name")	!0A000 access method "hash" does not support included columns
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+CREATE INDEX "ci_nosuch" ON "companies" ("firm_id") INCLUDE ("nosuchcol")	!42703 column "nosuchcol" does not exist
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+CREATE INDEX "ci_brin" ON "companies" USING brin ("firm_id") INCLUDE ("name")	!0A000 access method "brin" does not support included columns
+ROLLBACK TO s7		-
+ALTER TABLE "companies" ADD CONSTRAINT "companies_u_include" UNIQUE ("account_id") INCLUDE ("name")		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'companies_u_include'	text,name,text	r|companies_u_include|UNIQUE (account_id) INCLUDE (name)
+SELECT 'r', pg_get_indexdef('companies_u_include'::regclass)		r|CREATE UNIQUE INDEX companies_u_include ON public.companies USING btree (account_id) INCLUDE (name)
+SELECT 'r', x.indnkeyatts, x.indnatts, x.indisunique FROM pg_index x WHERE x.indexrelid = 'companies_u_include'::regclass		r|1|2|t
+CREATE INDEX "ci_where" ON "companies" ("firm_id") INCLUDE ("name") WHERE "account_id" IS NOT NULL		-
+SELECT 'r', pg_get_indexdef('ci_where'::regclass)		r|CREATE INDEX ci_where ON public.companies USING btree (firm_id) INCLUDE (name) WHERE (account_id IS NOT NULL)
+SELECT 'r', pg_typeof(indnkeyatts), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'company_include_index'::regclass		r|smallint|smallint
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'compan%' OR relname LIKE 'ci_%'	bigint	0

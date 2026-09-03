@@ -1166,6 +1166,129 @@ pub(crate) fn parse_expr_text(text: &str) -> Result<plan::Expr> {
     crate::parse::parse_stored_expr(text)
 }
 
+/// `PARTITION BY LIST|RANGE (col, …)` — the strategy and the key columns.
+///
+/// **`HASH` is refused by name.** Nothing captured it — the capture pins `LIST` (the suite's, at
+/// `postgresql_specific_schema.rb` statement 781) and `RANGE` — and a strategy whose routing
+/// nobody measured is a row this node would put in the wrong partition, which is a wrong answer
+/// rather than a gap.
+///
+/// `sqlparser` gives the whole clause as one expression, so `LIST (city_id)` arrives looking like
+/// a function call — the strategy is the "function" and the key columns are its arguments.
+fn lower_partition_by(
+    partition_by: Option<&Expr>,
+) -> Result<Option<(catalog::PartitionStrategy, Vec<String>)>> {
+    let Some(expr) = partition_by else {
+        return Ok(None);
+    };
+    let Expr::Function(function) = unwrap_nested(expr) else {
+        return Err(SqlError::unsupported(format!(
+            "CREATE TABLE ... PARTITION BY {expr}"
+        )));
+    };
+    let name = unqualified_function_name(function)?;
+    let strategy = match name.to_ascii_uppercase().as_str() {
+        "LIST" => catalog::PartitionStrategy::List,
+        "RANGE" => catalog::PartitionStrategy::Range,
+        other => {
+            return Err(SqlError::unsupported(format!(
+                "CREATE TABLE ... PARTITION BY {other}"
+            )));
+        }
+    };
+    let columns = function_arguments(function, "PARTITION BY")?
+        .into_iter()
+        .map(|argument| match unwrap_nested(argument) {
+            Expr::Identifier(name) => {
+                Ok(fold_identifier(&name.value, name.quote_style.is_some()).0)
+            }
+            other => Err(SqlError::unsupported(format!(
+                "PARTITION BY over the expression {other}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((strategy, columns)))
+}
+
+/// `PARTITION OF parent FOR VALUES IN (…)`, `… FROM (…) TO (…)` and `… DEFAULT`.
+///
+/// The values stay literals here: coercing them to the key's types needs the parent, and a plan is
+/// lowered without the catalog. `FOR VALUES WITH (MODULUS …)` is `HASH`'s and is refused for the
+/// reason that strategy is.
+fn lower_partition_of(
+    partition_of: Option<&ObjectName>,
+    for_values: Option<&sqlparser::ast::ForValues>,
+) -> Result<Option<(String, plan::PartitionSpec)>> {
+    use sqlparser::ast::ForValues;
+    let Some(parent) = partition_of else {
+        return Ok(None);
+    };
+    let spec = match for_values {
+        Some(ForValues::Default) => plan::PartitionSpec::Default,
+        Some(ForValues::In(values)) => plan::PartitionSpec::Values(
+            values
+                .iter()
+                .map(|value| match unwrap_nested(value) {
+                    // Read as text and coerced to the key's type where the parent is in hand,
+                    // which is what makes `IN (1)` on a `character varying` key store `'1'`.
+                    Expr::Value(literal) => Ok(Datum::Text(literal_text(&literal.value))),
+                    other => Err(SqlError::unsupported(format!(
+                        "FOR VALUES IN ({other}), which is not a literal"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        // **Multi-column `RANGE` bounds are refused by name.** One column is what the capture
+        // shows, and PostgreSQL's rule past that is not the obvious one — `MINVALUE` in a position
+        // makes every column after it unbounded whatever was written there — so a lexicographic
+        // guess would route rows a real server routes elsewhere.
+        Some(ForValues::From { from, to }) => {
+            refuse_if(
+                from.len() != 1 || to.len() != 1,
+                "FOR VALUES FROM ... TO ... over more than one column",
+            )?;
+            plan::PartitionSpec::Range {
+                from: range_ends(from)?,
+                to: range_ends(to)?,
+            }
+        }
+        Some(ForValues::With { .. }) => {
+            return Err(SqlError::unsupported("PARTITION OF ... FOR VALUES WITH"));
+        }
+        None => return Err(SqlError::unsupported("PARTITION OF with no bound")),
+    };
+    Ok(Some((relation_name(parent)?, spec)))
+}
+
+/// `(MINVALUE)`, `(10)` — one end of a `FOR VALUES FROM … TO …`, still untyped.
+fn range_ends(ends: &[sqlparser::ast::PartitionBoundValue]) -> Result<Vec<plan::RangeEnd>> {
+    use sqlparser::ast::PartitionBoundValue;
+    ends.iter()
+        .map(|end| match end {
+            PartitionBoundValue::MinValue => Ok(plan::RangeEnd::MinValue),
+            PartitionBoundValue::MaxValue => Ok(plan::RangeEnd::MaxValue),
+            PartitionBoundValue::Expr(expr) => match unwrap_nested(expr) {
+                Expr::Value(literal) => Ok(plan::RangeEnd::Value(Datum::Text(literal_text(
+                    &literal.value,
+                )))),
+                other => Err(SqlError::unsupported(format!(
+                    "FOR VALUES FROM ... TO ... over {other}, which is not a literal"
+                ))),
+            },
+        })
+        .collect()
+}
+
+/// A literal's text, for a partition bound: what the value would be written as.
+fn literal_text(value: &Value) -> String {
+    match value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.clone(),
+        Value::Number(digits, _) => digits.clone(),
+        Value::Boolean(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        other => other.to_string(),
+    }
+}
+
 /// A columnar-replica count: a plain non-negative integer, and nothing else.
 ///
 /// No interval grammar, no `'forever'`, no `DEFAULT` — it is a replica count, so the only thing
@@ -1237,14 +1360,7 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.query.is_some(), "CREATE TABLE ... AS")?;
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
-    refuse_if(
-        create.partition_of.is_some(),
-        "CREATE TABLE ... PARTITION OF",
-    )?;
-    refuse_if(
-        create.partition_by.is_some(),
-        "CREATE TABLE ... PARTITION BY",
-    )?;
+
     refuse_if(create.on_commit.is_some(), "CREATE TABLE ... ON COMMIT")?;
     refuse_if(create.without_rowid, "CREATE TABLE ... WITHOUT ROWID")?;
     refuse_if(create.strict, "CREATE TABLE ... STRICT")?;
@@ -1389,6 +1505,8 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         primary_key_name,
         // Filled by `Parsed::lower`, from the clauses the parser was never given.
         excludes: Vec::new(),
+        partition_by: lower_partition_by(create.partition_by.as_deref())?,
+        partition_of: lower_partition_of(create.partition_of.as_ref(), create.for_values.as_ref())?,
         // Names only: a parent's columns come from the catalog and the catalog is the executor's.
         inherits: create
             .inherits
@@ -1813,8 +1931,6 @@ fn referential_action(
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
-    refuse_if(!create.include.is_empty(), "CREATE INDEX ... INCLUDE")?;
-
     refuse_if(!create.with.is_empty(), "CREATE INDEX ... WITH")?;
 
     refuse_if(
@@ -1825,13 +1941,23 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         !create.alter_options.is_empty(),
         "CREATE INDEX with table options",
     )?;
-    if let Some(using) = &create.using {
-        // Every index here is a range of the ordered key space, which is what a btree is. Saying
-        // `USING hash` and getting one would be a different index than the user asked for.
-        refuse_if(
-            !matches!(using, IndexType::BTree),
-            format!("an index USING {using}"),
-        )?;
+    if let Some(using) = &create.using
+        && !matches!(using, IndexType::BTree)
+    {
+        // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is a
+        // different complaint: `amcaninclude` is a property of the access method, checked before
+        // anything about the index is built, so `USING hash (…) INCLUDE (…)` is refused for the
+        // payload rather than for the method. Measured for `hash` and for `brin`, one sentence
+        // with the name substituted.
+        if create.include.is_empty() {
+            // Every index here is a range of the ordered key space, which is what a btree is.
+            // Saying `USING hash` and getting one would be a different index than the user asked
+            // for.
+            return Err(SqlError::unsupported(format!("an index USING {using}")));
+        }
+        return Err(SqlError::AccessMethodWithoutInclude(
+            using.to_string().to_ascii_lowercase(),
+        ));
     }
     Ok(plan::CreateIndex {
         // Kept as text and lowered per row, the same trade a `CHECK` makes — and normalised the
@@ -1847,6 +1973,15 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         // `sqlparser` spells this clause as `Option<bool>` on a `CREATE INDEX` and as a
         // three-valued enum on a table constraint — `Some(false)` here is `NULLS NOT DISTINCT`.
         nulls_not_distinct: create.nulls_distinct == Some(false),
+        // **Bare identifiers and nothing more.** `sqlparser` 0.62.0 types this clause as a list
+        // of them, so `INCLUDE (name DESC)` and `INCLUDE (name varchar_pattern_ops)` -- both of
+        // which a real server refuses with `42P17` and its own sentence -- are syntax errors
+        // before this is reached. A C1 gap, in the plan's register.
+        include: create
+            .include
+            .iter()
+            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .collect(),
         name: create.name.as_ref().map(object_name).transpose()?,
         table: relation_name(&create.table_name)?,
         keys: index_keys(&create.columns)?,

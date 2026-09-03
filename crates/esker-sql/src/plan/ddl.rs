@@ -14,7 +14,7 @@ use crate::catalog::{ExprShape, Identity, KeyOrder, ReferentialAction, fold_iden
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTable {
     /// The table's name, folded.
     pub name: String,
@@ -31,6 +31,16 @@ pub struct CreateTable {
     /// The `EXCLUDE` constraints, re-attached after the parser was handed a statement without
     /// them (`crate::parse::strip_exclude_constraints`).
     pub excludes: Vec<crate::catalog::ExcludeDef>,
+    /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
+    pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
+    /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as
+    /// written, both unresolved.
+    ///
+    /// The bound's values are **expressions here and values in the catalog**: coercing them needs
+    /// the parent's key columns, and a plan is lowered without the catalog. That coercion is
+    /// visible — the suite writes `IN (1)` against a `character varying` key and a real server
+    /// prints `FOR VALUES IN ('1')` back.
+    pub partition_of: Option<(String, PartitionSpec)>,
     /// `INHERITS (parent, …)` — the parents' names, in the order written, unresolved.
     ///
     /// Resolved by the executor, which is where the catalog is: a parent's columns are prepended
@@ -205,6 +215,37 @@ pub struct DropFunction {
     pub if_exists: bool,
 }
 
+/// A partition's bound as the statement wrote it, before the parent's types are in reach.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionSpec {
+    /// `FOR VALUES IN (…)`.
+    Values(Vec<Datum>),
+    /// `FOR VALUES FROM (…) TO (…)`.
+    Range {
+        /// The lower bound, one entry per key column.
+        from: Vec<RangeEnd>,
+        /// The upper bound, one entry per key column.
+        to: Vec<RangeEnd>,
+    },
+    /// `DEFAULT`.
+    Default,
+}
+
+/// One end of a `FOR VALUES FROM … TO …`, as written.
+///
+/// `MINVALUE` and `MAXVALUE` are **keywords and not values**, so they cannot be a `Datum` waiting
+/// for a type — which is the whole reason this enum exists beside [`PartitionSpec::Values`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeEnd {
+    /// `MINVALUE`.
+    MinValue,
+    /// A literal, still untyped: the key column's type is the parent's and the parent is the
+    /// executor's.
+    Value(Datum),
+    /// `MAXVALUE`.
+    MaxValue,
+}
+
 /// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {
@@ -328,6 +369,13 @@ pub struct CreateIndex {
     /// `NULLS NOT DISTINCT`. See `crate::catalog::IndexDef::nulls_not_distinct` — the one clause
     /// in an index definition that changes which rows are refused.
     pub nulls_not_distinct: bool,
+    /// `INCLUDE (…)` — the **non-key payload** columns, by name, unresolved.
+    ///
+    /// Plain column names and nothing else: an included column takes no `ASC`/`DESC` and no
+    /// operator class, both of which a real server refuses with `42P17` rather than a syntax
+    /// error. Neither reaches here — `sqlparser` 0.62.0 types this clause as a list of bare
+    /// identifiers — so both are a C1 parser gap and are declared as such.
+    pub include: Vec<String>,
 }
 
 /// A `FOREIGN KEY` as written, before the parent has been looked up.
