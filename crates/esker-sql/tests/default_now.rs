@@ -23,15 +23,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              is why this node keeps one flag and not two.",
         ),
         (
-            "SELECT CURRENT_TIMESTAMP = now()",
-            "Both are the transaction's timestamp here and both would answer `t`, but neither is \
-             a *scalar expression* yet: this unit records the default and does not add \
-             `CURRENT_TIMESTAMP` to the expression language. `0A000` naming it.",
-        ),
-        (
             "SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), \
              pg_typeof(CURRENT_DATE)",
-            "`pg_typeof` is not implemented, and neither are three of its four arguments.",
+            "`pg_typeof` is not implemented. Three of its four arguments now are \
+             (`tests/scalar_functions.rs`); `LOCALTIMESTAMP` is the one that is not.",
         ),
         (
             "SELECT CURRENT_TIMESTAMP IS NOT NULL, LOCALTIMESTAMP IS NOT NULL",

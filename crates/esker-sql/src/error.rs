@@ -479,6 +479,13 @@ pub enum SqlError {
     #[error("{0} must not be negative")]
     NegativeLimit(&'static str),
 
+    /// A `convert_to` to a name that is not one of PostgreSQL's encodings: `22023`.
+    ///
+    /// **Not a refusal.** A real server raises this for a name it does not know, so answering
+    /// `0A000` would be reporting a missing feature where there is a user error.
+    #[error("invalid destination encoding name \"{0}\"")]
+    InvalidDestinationEncoding(String),
+
     /// A division or a modulo by zero: `22012`, for the integers **and** the floats.
     ///
     /// A float divided by zero raises here as it does on a real server; it does not yield
@@ -1301,7 +1308,8 @@ impl SqlError {
             | SqlError::NonBooleanParameter(_)
             | SqlError::NumericPrecisionOutOfRange(_)
             | SqlError::NumericScaleOutOfRange(_)
-            | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::ParameterOutOfRange { .. }
+            | SqlError::InvalidDestinationEncoding(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT

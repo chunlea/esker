@@ -1194,6 +1194,39 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
 /// The arity was checked where the call was lowered, so an argument that is not there is a bug
 /// rather than a user's mistake — and it is answered as NULL rather than as a panic, because every
 /// one of these functions is NULL-propagating anyway ([`crate::catalog::def_functions`]).
+/// `convert_to(text, encoding)`: the bytes `text` has in `encoding`.
+///
+/// **Strict in both arguments**, the encoding name included — `convert_to('A', NULL)` is NULL,
+/// measured. A name that is not one of PostgreSQL's encodings is `22023` and not a refusal,
+/// because that is a real server's own answer; a name that *is* one but is not UTF-8 is `0A000`,
+/// because transcoding is a conversion table this node does not have and returning the UTF-8
+/// bytes under another encoding's name would be a wrong answer wearing a right one's label.
+fn convert_to(text: Option<&Datum>, encoding: Option<&Datum>) -> Result<Datum> {
+    let (Some(text), Some(encoding)) = (text, encoding) else {
+        return Ok(Datum::Null);
+    };
+    if matches!(text, Datum::Null) || matches!(encoding, Datum::Null) {
+        return Ok(Datum::Null);
+    }
+    let (Some(text), Some(encoding)) = (text.to_text(), encoding.to_text()) else {
+        return Ok(Datum::Null);
+    };
+    // `pg_char_to_encoding` matches case-insensitively and ignores `-` and `_`, so `UTF8`, `utf8`
+    // and `Utf-8` are one name. Measured, all three.
+    let folded: String = encoding
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if folded == "UTF8" || folded == "UNICODE" {
+        return Ok(Datum::Bytea(text.into_bytes()));
+    }
+    if crate::value::encoding::is_postgresql_encoding(&folded) {
+        return Err(SqlError::unsupported(format!("the encoding {encoding}")));
+    }
+    Err(SqlError::InvalidDestinationEncoding(encoding))
+}
+
 fn catalog_function(
     call: &crate::plan::CatalogFuncCall,
     row: &[Datum],
@@ -1206,6 +1239,32 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **The transaction's instant**, so two calls in one transaction are equal and their
+        // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
+        CatalogFunc::Now | CatalogFunc::CurrentDate => {
+            let Some(txn) = env.txn else {
+                return Err(SqlError::Internal(
+                    "now() reached an evaluator with no transaction".to_owned(),
+                ));
+            };
+            let micros = crate::time_machine::micros_of_ts(txn.start_ts());
+            if call.func == CatalogFunc::CurrentDate {
+                // Floor division, so an instant before the epoch lands on the day containing it.
+                let day = micros.div_euclid(86_400_000_000);
+                Datum::Date(i32::try_from(day).unwrap_or(i32::MAX))
+            } else {
+                Datum::TimestampTz(micros)
+            }
+        }
+        // **Not strict**: a NULL argument is skipped, not propagated, so `concat(NULL, NULL)` is
+        // the empty string. Each argument is rendered by its own output function.
+        CatalogFunc::Concat => Datum::Text(
+            args.iter()
+                .filter(|arg| !matches!(arg, Datum::Null))
+                .filter_map(PgDatum::to_text)
+                .collect::<String>(),
+        ),
+        CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
         CatalogFunc::FormatType => crate::catalog::def_functions::format_type(
             type_oid_argument(args.first())?,
             typmod_argument(args.get(1))?,

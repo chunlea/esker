@@ -2108,10 +2108,14 @@ fn lower_catalog_function(
     refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
 
     refuse_wrong_arities(function, func.name(), func.arities())?;
-    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
-        // No argument list at all, which `refuse_wrong_arity` has already answered for every
-        // function here — none of them takes zero arguments.
-        return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
+    let empty = Vec::new();
+    let args = match &function.args {
+        FunctionArguments::List(FunctionArgumentList { args, .. }) => args,
+        // **No argument list at all**, which is how `CURRENT_TIMESTAMP` and `CURRENT_DATE` are
+        // written: a keyword, no parentheses. For a function that takes none that is a call with
+        // zero arguments and not a missing one — `refuse_wrong_arities` above has already said so.
+        _ if func.arities().contains(&0) => &empty,
+        _ => return Err(SqlError::UndefinedFunction(format!("{}()", func.name()))),
     };
     let args = args
         .iter()

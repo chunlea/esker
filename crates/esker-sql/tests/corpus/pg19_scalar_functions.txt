@@ -1,0 +1,60 @@
+# The scalar functions `CREATE TABLE "defaults"` calls — statement 738 of the specific schema.
+#
+# They were "accepted" before only by the old `DEFAULT` whitelist, never as functions: `SELECT
+# now()` was `0A000`. Captured in one rolled-back session against PostgreSQL 19beta1.
+#
+# Nothing here prints a clock reading, because a corpus is replayed and an instant is not
+# reproducible. What is pinned instead is every property of these values that *is* stable:
+#
+#   * **`now()` and `CURRENT_TIMESTAMP` are the same instant** — the transaction's, not the
+#     statement's — so they compare equal and their difference is exactly `00:00:00`;
+#   * `CURRENT_DATE` is that instant's date;
+#   * neither is ever NULL.
+#
+# The rules that decide an implementation:
+#
+#   * **`concat` skips NULLs rather than propagating them.** `concat('a', NULL, 'b')` is `ab` and
+#     `concat(NULL, NULL)` is the **empty string**, not NULL — the opposite of `||`. It is also
+#     variadic and not strict, so `concat()` is a `42883` about the *number* of arguments;
+#   * a non-text argument is rendered by its own output function: `concat('n=', 42, ' t=', true)`
+#     is `n=42 t=t`, and a `numeric` keeps its scale (`2.50` stays `2.50`);
+#   * **`convert_to` is strict** — a NULL in either argument is NULL, encoding name included —
+#     and an encoding name that is not one is `22023`, not a refusal;
+#   * the encoding name is matched the way `pg_char_to_encoding` matches it: case-insensitively
+#     and ignoring `-` and `_`, so `UTF8`, `utf8` and `Utf-8` are one name. `UNICODE` is an alias
+#     for it.
+SELECT concat('Ruby ', 'on ', 'Rails')	text	Ruby on Rails
+SELECT concat('a', NULL, 'b')	text	ab
+SELECT concat(NULL, NULL)	text	
+SELECT concat('a')	text	a
+SELECT concat()	!42883 function concat() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT concat('n=', 42, ' t=', true)	text	n=42 t=t
+SELECT concat('x', 1.5, 2.50::numeric)	text	x1.52.50
+SELECT length(concat('a', NULL, 'b'))	integer	2
+SELECT concat('a', 'b') = 'ab'	boolean	t
+SELECT convert_to('A', 'UTF8')	bytea	\x41
+SELECT convert_to('Ruby on Rails', 'UTF8')	bytea	\x52756279206f6e205261696c73
+SELECT convert_to('', 'UTF8')	bytea	\x
+SELECT convert_to('é', 'UTF8')	bytea	\xc3a9
+SELECT convert_to(NULL, 'UTF8')	bytea	\N
+SELECT convert_to('A', 'LATIN1')	bytea	\x41
+SELECT convert_to('A', 'NOT_AN_ENCODING')	!22023 invalid destination encoding name "NOT_AN_ENCODING"
+SELECT convert_to('A', NULL)	bytea	\N
+SELECT length(convert_to('Ruby on Rails', 'UTF8'))	integer	13
+SELECT now() = CURRENT_TIMESTAMP	boolean	t
+SELECT CURRENT_DATE = now()::date	boolean	t
+SELECT now() - CURRENT_TIMESTAMP	interval	00:00:00
+SELECT CURRENT_TIMESTAMP - now()	interval	00:00:00
+SELECT now() IS NULL	boolean	f
+SELECT CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)	boolean	t
+SELECT CURRENT_TIME IS NULL	boolean	f
+SELECT LOCALTIMESTAMP IS NULL	boolean	f
+SELECT now()::text = CURRENT_TIMESTAMP::text	boolean	t
+SELECT convert_to('A', 'UNICODE')	bytea	\x41
+SELECT convert_to('A', 'utf8')	bytea	\x41
+SELECT convert_to('A', 'Utf-8')	bytea	\x41
+SELECT convert_to('é', 'LATIN1')	bytea	\xe9
+SELECT concat('a', 'b', 'c', 'd', 'e', 'f')	text	abcdef
+SELECT concat('', '')	text	
+SELECT concat(1, 2)	text	12
+SELECT now() AT TIME ZONE 'UTC' IS NULL	boolean	f

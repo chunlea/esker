@@ -393,6 +393,20 @@ impl ScalarFunc {
     }
 }
 
+/// Every arity `concat` accepts: one argument up to a limit no statement reaches.
+///
+/// A list rather than a range because [`CatalogFunc::arities`] answers a set, and a variadic
+/// function is the one member whose set is not two or three numbers long.
+const CONCAT_ARITIES: [usize; 100] = {
+    let mut arities = [0usize; 100];
+    let mut at = 0;
+    while at < 100 {
+        arities[at] = at + 1;
+        at += 1;
+    }
+    arities
+};
+
 /// One call to a `pg_catalog` function that prints a definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogFuncCall {
@@ -482,6 +496,30 @@ pub enum CatalogFunc {
     /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
     /// break a `LEFT JOIN` that legitimately has no match.
     RegClassName,
+    /// `now()`, and `CURRENT_TIMESTAMP` which is the same function under a keyword spelling.
+    ///
+    /// **The transaction's instant, not the statement's.** Two calls in one transaction are equal
+    /// and their difference is exactly `00:00:00` — measured, and PostgreSQL's own rule. It comes
+    /// from the TSO's physical half (`crate::time_machine::micros_of_ts`) rather than from a
+    /// clock this node reads, which is `docs/DESIGN.md` §6 and not an implementation detail: a
+    /// node here has no wall clock it is allowed to order by.
+    ///
+    /// It is the one member of this enum that is **not** a function of its arguments alone.
+    Now,
+    /// `CURRENT_DATE`: the date of [`CatalogFunc::Now`]'s instant.
+    CurrentDate,
+    /// `concat(...)`: variadic, and **not strict**.
+    ///
+    /// It *skips* NULLs where `||` propagates them — `concat('a', NULL, 'b')` is `ab` and
+    /// `concat(NULL, NULL)` is the empty string. Each argument is rendered by its own output
+    /// function, so `concat('n=', 42, ' t=', true)` is `n=42 t=t` and a `numeric` keeps its scale.
+    Concat,
+    /// `convert_to(text, encoding)`: the bytes `text` has in `encoding`.
+    ///
+    /// **Strict**, encoding name included: `convert_to('A', NULL)` is NULL. A name that is not an
+    /// encoding is `22023` and not a refusal, which is a real server's answer and not this node's
+    /// idea of one.
+    ConvertTo,
     /// `array_position(array, value)`: the subscript `value` sits at, or NULL.
     ///
     /// The five below are the array operators the catalog's own columns need, and they read the
@@ -513,6 +551,16 @@ impl CatalogFunc {
     #[must_use]
     pub fn from_name(name: &str) -> Option<CatalogFunc> {
         match () {
+            // `CURRENT_TIMESTAMP` reaches here as a function name, which is what it is: a keyword
+            // spelling of `now()`, recorded by PostgreSQL as the same thing.
+            () if name.eq_ignore_ascii_case("now")
+                || name.eq_ignore_ascii_case("current_timestamp") =>
+            {
+                Some(CatalogFunc::Now)
+            }
+            () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
+            () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
+            () if name.eq_ignore_ascii_case("convert_to") => Some(CatalogFunc::ConvertTo),
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
             () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
             () if name.eq_ignore_ascii_case("pg_get_indexdef") => Some(CatalogFunc::PgGetIndexdef),
@@ -551,6 +599,10 @@ impl CatalogFunc {
             CatalogFunc::ArrayUpper => "array_upper",
             CatalogFunc::ArrayLength => "array_length",
             CatalogFunc::Cardinality => "cardinality",
+            CatalogFunc::Now => "now",
+            CatalogFunc::CurrentDate => "current_date",
+            CatalogFunc::Concat => "concat",
+            CatalogFunc::ConvertTo => "convert_to",
         }
     }
 
@@ -568,7 +620,8 @@ impl CatalogFunc {
             | CatalogFunc::ArrayPosition
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
-            | CatalogFunc::ArrayLength => &[2],
+            | CatalogFunc::ArrayLength
+            | CatalogFunc::ConvertTo => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
@@ -576,6 +629,10 @@ impl CatalogFunc {
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
             | CatalogFunc::Cardinality => &[1],
+            CatalogFunc::Now | CatalogFunc::CurrentDate => &[0],
+            // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
+            // arguments that a real server raises, so zero is not in the set.
+            CatalogFunc::Concat => &CONCAT_ARITIES,
         }
     }
 
@@ -592,7 +649,9 @@ impl CatalogFunc {
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
             // is what it prints as. The one place the difference shows is the declared type.
             | CatalogFunc::PgGetPartkeydef
-            | CatalogFunc::RegClassName => ColumnType::Text,
+            | CatalogFunc::RegClassName
+            // `concat` answers `text` for the ordinary reason: it builds a string.
+            | CatalogFunc::Concat => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
 
@@ -603,6 +662,9 @@ impl CatalogFunc {
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
             | CatalogFunc::Cardinality => ColumnType::Int4,
+            CatalogFunc::Now => ColumnType::TimestampTz,
+            CatalogFunc::CurrentDate => ColumnType::Date,
+            CatalogFunc::ConvertTo => ColumnType::Bytea,
         }
     }
 }
