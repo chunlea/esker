@@ -1,0 +1,75 @@
+crates/esker-keys/src/row.rs
+  s_792befbffafc33::t_f64c78bc66d2e3 902-923
+crates/esker-sql/src/catalog/information_schema.rs
+  s_792befbffafc33::t_688ea221b89445 169-174,180-188
+crates/esker-sql/src/catalog/mod.rs
+  s_792befbffafc33::t_54c29e91ae127d 165-172,174-178,559-578,822,824-828
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_792befbffafc33::t_b4512946da878e 191-194,321-322,324-328,440-441,513-519
+crates/esker-sql/src/catalog/pg_index.rs
+  s_792befbffafc33::t_750594ef2d8194 133-158,169,171,287,308
+crates/esker-sql/src/catalog/record.rs
+  s_792befbffafc33::t_d86a3f76f79393 1144-1146,1155
+crates/esker-sql/src/error.rs
+  s_792befbffafc33::t_92ed8c29292546 559-579,1424-1425,1427-1433,1553-1554
+crates/esker-sql/src/exec/cursor.rs
+  s_792befbffafc33::t_86ae60b1ac850f 915-955,1218-1223,1470-1477,1541-1543
+crates/esker-sql/src/exec/ddl.rs
+  s_792befbffafc33::t_17ca3f5fb8c142 344-347
+crates/esker-sql/src/exec/deferred.rs
+  s_792befbffafc33::t_96900f76123fc3 1-212
+crates/esker-sql/src/exec/dml.rs
+  s_792befbffafc33::t_cacd6cfa2a639d 453-483,822-824,831-853,855-875,886-897,899,901-922,925-936,939
+crates/esker-sql/src/exec/index.rs
+  s_792befbffafc33::t_34a6874323b6f5 55-60,62
+crates/esker-sql/src/exec/mod.rs
+  s_792befbffafc33::t_0461d730fd3672 31,72,81-88,167-335,345,486-492,497,1587-1591,1709-1715,1738-1740
+crates/esker-sql/src/exec/subquery.rs
+  s_792befbffafc33::t_53ee15a4e0ac0a 30,166-173,179,424-427,684-689,697,700-714
+crates/esker-sql/src/exec/table_function.rs
+  s_792befbffafc33::t_76a21543f41c25 26-28,87-133,186-191,193,213-215,218
+crates/esker-sql/src/parse/lower.rs
+  s_792befbffafc33::t_c8be28bd3b66bf 1027-1034,1037,1039,1045-1049,1320-1321,1327-1328,1582,1587-1588,2203-2224,3934-3981,4237-4240,4244
+crates/esker-sql/src/parse/mod.rs
+  s_792befbffafc33::t_143bf9e0edad0d 129-142,263,272-273,1186-1261,1264-1269
+crates/esker-sql/src/plan/ddl.rs
+  s_792befbffafc33::t_575d6cc7cf9b87 101,103-105,107-112
+crates/esker-sql/src/plan/expr.rs
+  s_792befbffafc33::t_da62e8e8b7d630 600-607,682,729,764-765,790-793
+crates/esker-sql/src/plan/subquery.rs
+  s_792befbffafc33::t_dfce4df1bb0f90 56-66,97-98,109-111,123,224-231,248-249
+crates/esker-sql/src/row.rs
+  s_792befbffafc33::t_8749cc21110868 13
+crates/esker-sql/tests/activerecord_schema_dump.rs
+  s_792befbffafc33::t_a4aa4836500968 97-103,106-114,134-141
+crates/esker-sql/tests/activerecord_surface.rs
+  s_792befbffafc33::t_e62e75a6fe2037 145-153
+crates/esker-sql/tests/array_subquery.rs
+  s_792befbffafc33::t_752ede1c609fbd 1-143
+crates/esker-sql/tests/corpus/pg19_array_subquery.txt
+  s_792befbffafc33::t_ce11c2870cc3be 1-82
+crates/esker-sql/tests/corpus/pg19_unique_constraint.txt
+  s_792befbffafc33::t_8fabb1e235e8cb 1-137
+crates/esker-sql/tests/exclusion_constraint.rs
+  s_792befbffafc33::t_2eac1819565cd5 181-186,188-190,192,205-225,227-239,241-242
+crates/esker-sql/tests/inline_unique.rs
+  s_792befbffafc33::t_a5d27d1df087d8 120,122-127,129-144,147-160
+crates/esker-sql/tests/unique_constraint.rs
+  s_792befbffafc33::t_8f2deef4949d45 1-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "16643460837b2f9248a4cd34adcab84d61b50fc1",
+  "prompts": {},
+  "sessions": {
+    "s_792befbffafc33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a959529-913e-4560-a03d-9f3c43faa7c7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
