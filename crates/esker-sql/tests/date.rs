@@ -29,44 +29,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`format_type(1082, 3)` prints `date(3)` on a real server: it prints the typmod it is handed whether or not the type takes one. A `date` **has** no typmod — `CREATE TABLE t (d date(3))` is a syntax error there — so no column can reach this and only a hand-written oid can.",
         ),
         (
-            "SELECT 'tomorrow'::date - 'today'::date, 'today'::date - 'yesterday'::date",
-            "Arithmetic. This crate has **no arithmetic operators at all** — `a + 1` is `0A000` naming itself for every type — which is older than this unit and is the one thing `date` inherits rather than introduces. The nine lines below are the same gap.",
-        ),
-        (
             "SELECT '2020-01-02'::date::varchar, '2020-01-02'::date::char(4)",
             "`::char(n)` **truncates** on an explicit cast and raises `22001` only on an assignment; this node raises on both. Older than this unit — it is `value::fit_to_typmod`, and it does the same for a `text` source.",
-        ),
-        (
-            "SELECT '2020-01-31'::date - '2020-01-01'::date",
-            "Arithmetic; see above.",
-        ),
-        (
-            "SELECT '2020-01-01'::date + 30, '2020-01-01'::date - 30",
-            "Arithmetic; see above.",
-        ),
-        (
-            "SELECT '2020-01-01'::date + '1 day'::interval, '2020-01-01'::date - '1 day'::interval",
-            "Arithmetic, and `interval` is a type this node does not have — tier 2's own entry.",
-        ),
-        (
-            "SELECT '2020-06-15'::date - '2020-06-15'::timestamp",
-            "Arithmetic; see above.",
         ),
         (
             "SELECT age('2020-01-01'::date, '2019-01-01'::date)",
             "`age` answers an `interval`, which this node does not have.",
         ),
         (
-            "SELECT 'infinity'::date - 1",
-            "Arithmetic; see above. The **value** would be right — `infinity` absorbs it, and `date::as_micros` keeps the sentinel — there is simply no operator to apply.",
-        ),
-        (
             "SELECT '2020-01-01'::date + 1.5",
             "Arithmetic. PostgreSQL raises `42883` and this node `0A000`: both refuse, and the reason differs — there the operator is missing for that *pair*, here for every pair.",
-        ),
-        (
-            "SELECT '2020-01-01'::date + '2020-01-01'::date",
-            "Arithmetic; see above.",
         ),
         ("SELECT '2020-01-01'::date * 2", "Arithmetic; see above."),
         (

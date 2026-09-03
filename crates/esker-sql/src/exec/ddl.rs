@@ -1180,6 +1180,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Binary { op, left, right } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }
+        Expr::Negate(operand) => format!("(- {})", sub(operand)),
         Expr::Arithmetic {
             op, left, right, ..
         } => {

@@ -1613,6 +1613,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // that gives each column a type is in hand. Falling through to the clone below would leave
         // the operands as `Expr::Column` and the evaluator would report them as having reached it
         // unresolved — the same trap `Expr::CatalogFunc` documents below.
+        Expr::Negate(operand) => Expr::Negate(Box::new(resolve(operand, scope)?)),
         Expr::Arithmetic {
             op, left, right, ..
         } => resolve_arithmetic(*op, left, right, scope)?,
@@ -2447,6 +2448,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // Both operands, then the promotion table — the same table the evaluator uses, so the
         // type a client is told matches the values it is sent.
+        Expr::Negate(operand) => crate::value::arith::negate_type(expr_type(operand, scope)?)?,
         Expr::Arithmetic {
             op, left, right, ..
         } => arithmetic_type(*op, left, right, scope)?,

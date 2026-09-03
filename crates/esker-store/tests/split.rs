@@ -443,8 +443,16 @@ async fn a_restart_finds_both_halves_and_does_not_split_again() {
             harness.put(&key(n), &value).await;
         }
         harness.wait_for_regions(2).await;
-        let regions = harness.store.regions().regions();
+        // **Stopped before the regions are read**, and that ordering is the whole of this test's
+        // stability. `wait_for_regions(2)` returns at *at least* two, and sixteen kilobytes of
+        // values over an eight-kilobyte threshold does not stop at two: measured, this store is
+        // at four regions when the wait returns and at five two hundred milliseconds later. Read
+        // before the stop, `before` is a snapshot of a moving store and any split that lands
+        // between the read and the stop makes the comparison below fail — which is what it did,
+        // as a test that passed alone and failed under load. `stop` aborts the split checker and
+        // drains the drivers, so what is read after it is what is on disk.
         harness.store.stop();
+        let regions = harness.store.regions().regions();
         harness.store.flush().unwrap();
         regions
     };

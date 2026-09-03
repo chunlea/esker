@@ -65,10 +65,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT '1 day 02:00:00'::interval::time",
         "SELECT '12:34:56'::time::timetz",
         "SELECT '12:34:56'::timetz::time",
-        "SELECT '12:34:56'::time - '01:00:00'::time",
-        "SELECT '12:34:56'::time + '1 hour'::interval",
-        "SELECT '24:00:00'::time + '1 second'::interval",
-        "SELECT '12:34:56'::time * 2",
         "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
         "SELECT date_part('minute', '12:34:56'::time)",
         "SELECT '12:34:56'::time = '12:34:56'::timetz",
@@ -110,10 +106,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ("SELECT '1 day 02:00:00'::interval::time", INTERVAL),
         ("SELECT '12:34:56'::time::timetz", TIMETZ),
         ("SELECT '12:34:56'::timetz::time", TIMETZ),
-        ("SELECT '12:34:56'::time - '01:00:00'::time", INTERVAL),
-        ("SELECT '12:34:56'::time + '1 hour'::interval", INTERVAL),
-        ("SELECT '24:00:00'::time + '1 second'::interval", INTERVAL),
-        ("SELECT '12:34:56'::time * 2", INTERVAL),
         (
             "SELECT '12:34:56'::time + '12:34:56'::time",
             "Both refuse, with different codes and for different reasons. PostgreSQL has **too \
@@ -161,15 +153,16 @@ fn every_time_answer_is_postgresql_19_s() {
     );
 }
 
-/// `date + time` is folded over **constants**, and a column pair is still named.
+/// `date + time` answers the same timestamp over **columns** as over constants.
 ///
-/// The boundary is deliberate and is the same one `lower_cast` draws. A per-row `+` needs a
-/// `plan::BinaryOp::Plus` that produces a *value* where every one of that enum's seventy uses
-/// assumes a comparison producing a boolean — an arithmetic unit, not a `time` one, and
-/// `interval` (what every other `time` arithmetic answers) would have to land first for the
-/// family to make sense. This test exists so that the gap is pinned rather than discovered.
+/// It did not, and the gap this test was written to pin is closed. The constant form was a fold
+/// at lowering; the per-row form needed an operator that produces a *value*, which every use of
+/// `plan::BinaryOp` assumed was a boolean — so it waited for `plan::ArithOp` and the temporal
+/// table beside it (`crate::value::temporal`, ADR 0046). What it asserts now is the property that
+/// mattered either way: **the two forms agree**. A fold that answered something the evaluator
+/// would not is the failure it was guarding against, and it is still the failure.
 #[test]
-fn a_column_plus_a_column_is_still_named() {
+fn a_column_plus_a_column_answers_what_the_constants_do() {
     let mut node = parity::Node::new(&[]);
     for statement in [
         "CREATE TABLE tp (id int8 PRIMARY KEY, t time, d date)",
@@ -188,15 +181,14 @@ fn a_column_plus_a_column_is_still_named() {
         vec![vec!["2020-01-01 12:34:56"]]
     );
 
-    // The per-row form is still `0A000` naming the operator — a refusal, never a wrong value.
-    // Arithmetic over the numeric types answers now (`tests/arithmetic.rs`); the temporal
-    // operators are the commit after it, and until then the refusal says **which** operator over
-    // **which** types rather than claiming `+` does not exist. PostgreSQL has this one.
-    let error = node.run("SELECT d + t FROM tp").unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
+    // And the per-row form, which is the half that was refused.
     assert_eq!(
-        error.to_string(),
-        "the operator + over date and time without time zone is not supported"
+        node.rows("SELECT d + t FROM tp"),
+        vec![vec!["2020-01-01 12:34:56"]]
+    );
+    assert_eq!(
+        node.rows("SELECT t + d FROM tp"),
+        vec![vec!["2020-01-01 12:34:56"]]
     );
 }
 

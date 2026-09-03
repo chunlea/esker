@@ -895,6 +895,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // The type was settled when the expression was resolved. Where it was not — a `DEFAULT`
         // evaluated by the DDL path, which never resolves against a row — the operands' own types
         // answer the same question, and a NULL operand makes the question moot.
+        Expr::Negate(operand) => crate::value::arith::negate(&evaluate_in(operand, row, env)?)?,
         Expr::Arithmetic {
             op,
             left,

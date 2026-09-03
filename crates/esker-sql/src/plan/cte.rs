@@ -160,6 +160,7 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
             for_each_subquery_mut(left, visit);
             for_each_subquery_mut(right, visit);
         }
+        Expr::Negate(operand) => for_each_subquery_mut(operand, visit),
         Expr::Not(inner) => for_each_subquery_mut(inner, visit),
         Expr::IsNull { operand, .. }
         | Expr::ToText { operand, .. }
