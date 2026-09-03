@@ -242,6 +242,45 @@ fn initially_deferred_holds_the_check_to_commit() {
     assert_eq!(node.rows("SELECT count(*) FROM ex"), [["0"]]);
 }
 
+/// **`USING gist` is load-bearing, not decoration** — and the bare form is not a shortcut for it.
+///
+/// `EXCLUDE (… WITH &&)` with no `USING` defaults to **btree**, and `&&` is not in btree's
+/// `range_ops` family; spelling `USING btree` gives the identical error, which is how a reader can
+/// tell what the default was. The capture proves both against a `daterange` *column*, which this
+/// node does not have — so both are asserted here over the expression key the suite actually uses.
+///
+/// Getting this wrong in the accepting direction is the dangerous one: reading a bare `EXCLUDE` as
+/// `USING gist` would silently enforce a constraint a real server refused to create.
+#[test]
+fn an_exclude_without_using_gist_is_refused() {
+    for written in [
+        "CREATE TABLE tec (a date, b date, CONSTRAINT tec_x EXCLUDE (daterange(a, b) WITH &&))",
+        "CREATE TABLE tec (a date, b date, CONSTRAINT tec_x EXCLUDE USING btree (daterange(a, b) \
+         WITH &&))",
+    ] {
+        let mut node = parity::Node::new(&[]);
+        let error = node.run(written).unwrap_err();
+        assert_eq!(error.sqlstate(), "42809", "for {written}");
+        assert_eq!(
+            error.to_string(),
+            "operator &&(anyrange,anyrange) is not a member of operator family \"range_ops\"",
+            "for {written}"
+        );
+        assert_eq!(
+            error.detail().as_deref(),
+            Some(
+                "The exclusion operator must be related to the index operator class for the \
+                 constraint."
+            )
+        );
+        // And nothing was created: the refusal is raised where the constraint is read.
+        assert!(
+            node.rows("SELECT relname FROM pg_class WHERE relname = 'tec'")
+                .is_empty()
+        );
+    }
+}
+
 /// **Statement 777 itself**: all three constraints in one `CREATE TABLE`, as the suite writes it.
 #[test]
 fn statement_777_loads() {
