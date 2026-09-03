@@ -1,0 +1,60 @@
+# A **set-returning function in the target list** — as PostgreSQL 19beta1 answers it.
+#
+# `SELECT generate_series(1,3)` and `SELECT id, unnest(tags) FROM t` are the shapes; the same
+# functions in `FROM` already work here, and this is the other half. It was named as a gap by
+# `tests/catalog_vectors.rs`, whose `generate_subscripts(conkey, 1)` is in a target list.
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The target list becomes a generator, and everything beside it repeats.** `SELECT 'r',
+#     generate_series(1,3)` is three rows of `r`, and `SELECT id, generate_series(1,2) FROM t` is
+#     two rows per input row.
+#   * **Two of them run in lockstep and the shorter is padded with NULL** — not a cross join.
+#     `generate_series(1,3), generate_series(1,2)` is three rows ending `3|NULL`, where a Cartesian
+#     reading would give six. Two of equal length pair up one to one.
+#   * **An empty result contributes no rows at all.** `generate_series(1,0)` answers nothing, and
+#     `unnest('{}')` makes the row it came from disappear — measured, the `id = 3` row is gone.
+#   * **The call may be inside an expression.** `generate_series(1,2) + 10` is `11, 12` and
+#     `abs(generate_series(-1,1))` is `1, 0, 1`: the function expands and the expression is
+#     evaluated per generated value, not the other way round.
+#   * `ORDER BY` and `LIMIT` apply **after** the expansion, and `ORDER BY 2` names the expanded
+#     column.
+#   * **Two refusals, and they are different sentences.** In a `WHERE` it is
+#     `0A000 set-returning functions are not allowed in WHERE`; inside an aggregate it is
+#     `0A000 aggregate function calls cannot contain set-returning function calls` with a HINT
+#     about `LATERAL`.
+BEGIN		-
+CREATE TABLE sr (id bigint primary key, name text, tags text[])		-
+INSERT INTO sr VALUES (1, 'a', '{x,y}'), (2, 'b', '{z}'), (3, 'c', '{}')		-
+SELECT 'r', generate_series(1, 3)	text,integer	r|1 ; r|2 ; r|3
+SELECT 'r', generate_series(1, 0)	text,integer	-
+SELECT 'r', generate_series(3, 1, -1)	text,integer	r|3 ; r|2 ; r|1
+SELECT 'r', pg_typeof(generate_series(1, 3))	text,regtype	r|integer ; r|integer ; r|integer
+SELECT 'r', generate_series(1, 2), generate_series(1, 2)	text,integer,integer	r|1|1 ; r|2|2
+SELECT 'r', generate_series(1, 3), generate_series(1, 2)	text,integer,integer	r|1|1 ; r|2|2 ; r|3|\N
+SELECT 'r', generate_series(1, 2) + 10	text,integer	r|11 ; r|12
+SELECT 'r', abs(generate_series(-1, 1))	text,integer	r|1 ; r|0 ; r|1
+SELECT 'r', id, generate_series(1, 2) FROM sr WHERE id = 1	text,bigint,integer	r|1|1 ; r|1|2
+SELECT 'r', id, unnest(tags) FROM sr ORDER BY id	text,bigint,text	r|1|x ; r|1|y ; r|2|z
+SELECT 'r', unnest(ARRAY[1,2,3])	text,integer	r|1 ; r|2 ; r|3
+SELECT 'r', pg_typeof(unnest(ARRAY['a','b']::text[]))	text,regtype	r|text ; r|text
+SELECT 'r', count(*) FROM (SELECT generate_series(1, 3)) s	text,bigint	r|3
+SELECT 'r', g FROM (SELECT generate_series(1, 3) AS g) s WHERE g > 1 ORDER BY g DESC	text,integer	r|3 ; r|2
+SELECT 'r', generate_series(1, 3) ORDER BY 2 DESC	text,integer	r|3 ; r|2 ; r|1
+SELECT 'r', generate_series(1, 3) LIMIT 2	text,integer	r|1 ; r|2
+SAVEPOINT s1		-
+SELECT 'r', id FROM sr WHERE generate_series(1, 2) = 1	!0A000 set-returning functions are not allowed in WHERE
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', count(generate_series(1, 3))	!0A000 aggregate function calls cannot contain set-returning function calls HINT: You might be able to move the set-returning function into a LATERAL FROM item.
+ROLLBACK TO s2		-
+SELECT 'r', id, unnest(tags) FROM sr WHERE id = 3	text,bigint,text	-
+SELECT 'r', generate_subscripts(ARRAY[10,20], 1)	text,integer	r|1 ; r|2
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'sr'	bigint	0

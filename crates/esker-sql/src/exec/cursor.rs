@@ -80,6 +80,10 @@ enum Kind<'a> {
     Project {
         input: Box<Cursor<'a>>,
         exprs: Vec<Expr>,
+        /// Rows one input row expanded into, when the target list holds a **set-returning
+        /// function**. Empty for every other projection, which is all but one in a hundred: a
+        /// `Vec` that is never filled costs an allocation nobody makes.
+        pending: std::vec::IntoIter<Vec<Datum>>,
     },
     /// The one node that cannot stream: it drains its input on the first call.
     Sort {
@@ -271,6 +275,7 @@ impl<'a> Cursor<'a> {
             Node::Project { input, exprs } => Kind::Project {
                 input: Box::new(Cursor::open(txn, tenant, input)?),
                 exprs: exprs.clone(),
+                pending: Vec::new().into_iter(),
             },
             Node::Sort { input, keys } => Kind::Sort {
                 input: Some(Box::new(Cursor::open(txn, tenant, input)?)),
@@ -517,13 +522,30 @@ impl<'a> Cursor<'a> {
                 Ok(None)
             }
 
-            Kind::Project { input, exprs } => match input.next()? {
-                None => Ok(None),
-                Some(row) => exprs
-                    .iter()
-                    .map(|expr| evaluate_in(expr, &row, env))
-                    .collect::<Result<Vec<_>>>()
-                    .map(Some),
+            // **The projection is where a set-returning call becomes rows.** One input row makes
+            // as many output rows as the longest call in the list yields, every other expression
+            // repeating and every shorter call padded with NULL — measured, and not a cross join:
+            // `generate_series(1,3), generate_series(1,2)` is three rows, not six. A call that
+            // yields nothing takes its input row with it.
+            Kind::Project {
+                input,
+                exprs,
+                pending,
+            } => loop {
+                if let Some(row) = pending.next() {
+                    return Ok(Some(row));
+                }
+                let Some(row) = input.next()? else {
+                    return Ok(None);
+                };
+                if !exprs.iter().any(has_set_func) {
+                    return exprs
+                        .iter()
+                        .map(|expr| evaluate_in(expr, &row, env))
+                        .collect::<Result<Vec<_>>>()
+                        .map(Some);
+                }
+                *pending = expand(exprs, &row, env)?.into_iter();
             },
 
             Kind::Sort {
@@ -1017,6 +1039,71 @@ fn regex_text(value: &Datum, operator: &'static str) -> Result<Option<String>> {
     }
 }
 
+/// Whether an expression holds a set-returning call anywhere inside it.
+fn has_set_func(expr: &Expr) -> bool {
+    let mut found = false;
+    super::bind::descend(expr, &mut |expr| {
+        found |= matches!(expr, Expr::SetFunc(_));
+    });
+    found
+}
+
+/// One input row, expanded into the rows its set-returning calls make.
+///
+/// **Lockstep, not a cross join.** Every call in the target list is run once, the output has as
+/// many rows as the longest of them, and a call that ran out contributes NULL from there on —
+/// which is what a real server does since it moved set-returning functions out of the executor's
+/// projection loop, and is measured in `tests/corpus/pg19_srf_target_list.txt`. A call yielding
+/// nothing therefore makes **no** rows at all, taking its input row with it: `unnest('{}')` is why
+/// the `id = 3` row disappears there.
+///
+/// The calls are collected by a walk rather than by position, because one may sit **inside** an
+/// expression: `abs(generate_series(-1,1))` is `1, 0, 1`, the function expanding and the
+/// expression evaluated per generated value.
+fn expand(exprs: &[Expr], row: &[Datum], env: Env<'_>) -> Result<Vec<Vec<Datum>>> {
+    let mut calls: Vec<crate::plan::TableFunction> = Vec::new();
+    for expr in exprs {
+        super::bind::descend(expr, &mut |expr| {
+            if let Expr::SetFunc(call) = expr {
+                calls.push((**call).clone());
+            }
+        });
+    }
+    let mut values = Vec::with_capacity(calls.len());
+    for call in &calls {
+        values.push(super::table_function::rows(call, row)?);
+    }
+    let longest = values.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(longest);
+    for at in 0..longest {
+        let mut substituted = exprs.to_vec();
+        let mut next = 0;
+        for expr in &mut substituted {
+            super::bind::walk_expr_mut(expr, &mut |expr| {
+                if matches!(expr, Expr::SetFunc(_)) {
+                    // One column wide, which every set-returning function this node has is; a
+                    // record-returning one would expand to several and is not one of them.
+                    let value = values
+                        .get(next)
+                        .and_then(|rows| rows.get(at))
+                        .and_then(|row| row.first())
+                        .cloned()
+                        .unwrap_or(Datum::Null);
+                    *expr = Expr::Literal(crate::plan::Literal::Typed(Box::new(value)));
+                    next += 1;
+                }
+            });
+        }
+        out.push(
+            substituted
+                .iter()
+                .map(|expr| evaluate_in(expr, row, env))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok(out)
+}
+
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
     evaluate_in(expr, row, Env::none())
 }
@@ -1170,6 +1257,30 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         //
         // A condition is this branch only when it is **`true`**: NULL and false are both "not
         // this one", which is why `CASE WHEN NULL THEN 'a' ELSE 'b' END` is `b`.
+        // **The first argument that is not NULL**, and NULL when they all are. Every argument is
+        // evaluated in turn and none after the answer, which is what makes
+        // `COALESCE(a, 1/0)` safe when `a` is not NULL — the same short circuit a `CASE` has.
+        // **Unreachable through the projection**, which expands a set-returning call into rows
+        // before any expression is evaluated (`Kind::Project`). One here is a call somewhere the
+        // expansion does not reach, and PostgreSQL names those two places itself: a `WHERE` and
+        // the inside of an aggregate. Both are refused where they are resolved, so this is the
+        // internal error it looks like.
+        Expr::SetFunc(call) => {
+            return Err(SqlError::Internal(format!(
+                "the set-returning function {} reached the row evaluator",
+                call.name
+            )));
+        }
+        Expr::Coalesce(args) => {
+            let mut answer = Datum::Null;
+            for arg in args {
+                answer = evaluate_in(arg, row, env)?;
+                if !matches!(answer, Datum::Null) {
+                    break;
+                }
+            }
+            answer
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1584,6 +1695,13 @@ fn catalog_function(
                 None if oid == 0 => Datum::Text("-".to_owned()),
                 None => Datum::Text(oid.to_string()),
             },
+        },
+        // The one encoding this node speaks. Anything else is the empty string, which is what a
+        // real server answers for a number that names no encoding.
+        CatalogFunc::PgEncodingToChar => match oid_argument(args.first())? {
+            Some(6) => Datum::Text("UTF8".to_owned()),
+            Some(_) => Datum::Text(String::new()),
+            None => Datum::Null,
         },
         // **The sequence a column's default draws from, schema-qualified.** Its arguments are
         // names rather than oids, which is why it is the one catalog function here that looks a

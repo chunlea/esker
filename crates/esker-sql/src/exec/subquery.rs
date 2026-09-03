@@ -606,6 +606,16 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(operand, outer, depth);
             substitute_in_expr(index, outer, depth);
         }
+        Expr::SetFunc(call) => {
+            for arg in &mut call.args {
+                substitute_in_expr(arg, outer, depth);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                substitute_in_expr(arg, outer, depth);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1075,6 +1085,16 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             walk(operand, visit);
             walk(index, visit);
         }
+        Expr::SetFunc(call) => {
+            for arg in &call.args {
+                walk(arg, visit);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                walk(arg, visit);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1153,6 +1173,16 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         Expr::Subscript { operand, index, .. } => {
             walk_mut(operand, visit)?;
             walk_mut(index, visit)?;
+        }
+        Expr::SetFunc(call) => {
+            for arg in &mut call.args {
+                walk_mut(arg, visit)?;
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                walk_mut(arg, visit)?;
+            }
         }
         Expr::Case {
             branches,

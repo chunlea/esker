@@ -79,6 +79,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Numeric => 16,
         ColumnType::Int8Array => 21,
         ColumnType::Int4Array => 22,
+        ColumnType::Int2Array => 25,
         ColumnType::NumericArray => 23,
         ColumnType::TextArray => 24,
     }
@@ -108,6 +109,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         16 => ColumnType::Numeric,
         21 => ColumnType::Int8Array,
         22 => ColumnType::Int4Array,
+        25 => ColumnType::Int2Array,
         23 => ColumnType::NumericArray,
         24 => ColumnType::TextArray,
         other => {

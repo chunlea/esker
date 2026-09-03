@@ -145,6 +145,12 @@ pub enum CatalogView {
     /// A real server defines it in exactly those terms, and `indexdef` is `pg_get_indexdef` — the
     /// same string, which is why the two agree about `INCLUDE (…)` without being written twice.
     PgIndexes,
+    /// The databases this server has, which is **one**.
+    ///
+    /// `ActiveRecord`'s adapter reads it three times while connecting — the encoding, the collation
+    /// and the ctype — each joined to `current_database()`, which answers the same name this row
+    /// carries so the join matches by construction.
+    PgDatabase,
     /// **Which sequence belongs to which column**, and nothing else this node has a dependency
     /// for. `ActiveRecord`'s `pk_and_sequence_for` joins it to `pg_class`, `pg_attribute`,
     /// `pg_constraint` and `pg_namespace` to find the sequence behind a primary key, and
@@ -178,7 +184,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 26] = [
+    pub const ALL: [CatalogView; 27] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -196,6 +202,7 @@ impl CatalogView {
         CatalogView::PgLanguage,
         CatalogView::PgPartitionedTable,
         CatalogView::PgIndexes,
+        CatalogView::PgDatabase,
         CatalogView::PgDepend,
         CatalogView::PgSequence,
         CatalogView::PgEnum,
@@ -229,6 +236,7 @@ impl CatalogView {
             CatalogView::PgLanguage => "pg_language",
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
             CatalogView::PgIndexes => "pg_indexes",
+            CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
             CatalogView::PgSequence => "pg_sequence",
             CatalogView::PgEnum => "pg_enum",
@@ -266,6 +274,7 @@ impl CatalogView {
                 CatalogView::PgLanguage => 20,
                 CatalogView::PgPartitionedTable => 21,
                 CatalogView::PgIndexes => 22,
+                CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
                 CatalogView::PgEnum => 16,
@@ -460,6 +469,14 @@ impl CatalogView {
             // `enumsortorder` is a `real` on a real server, which is the one place this view's
             // types are worth reading: the order is a float so a value can be inserted *between*
             // two others without renumbering.
+            // The four the adapter reads, plus the `oid` every catalog relation carries.
+            CatalogView::PgDatabase => &[
+                ("oid", ColumnType::Int8),
+                ("datname", ColumnType::Text),
+                ("encoding", ColumnType::Int4),
+                ("datcollate", ColumnType::Text),
+                ("datctype", ColumnType::Text),
+            ],
             // PostgreSQL's own seven columns, in its own order. `classid`/`objid`/`objsubid`
             // name the **dependent** object and `refclassid`/`refobjid`/`refobjsubid` the one it
             // depends on — a sequence depending on the column it fills, which is the only
@@ -565,6 +582,21 @@ impl CatalogView {
             // **One row per schema**, `public` included — and `public` is not a record: it is a
             // property of the build, the way the available extensions are, so a tenant that has
             // created nothing still reports it.
+            // **One database, and its name is `current_database()`'s.** The two are one constant so
+            // that `WHERE datname = current_database()` matches without either half knowing about
+            // the other.
+            CatalogView::PgDatabase => Ok(vec![vec![
+                Datum::Int8(DATABASE_OID),
+                Datum::Text(crate::parse::DATABASE_NAME.to_owned()),
+                // 6 is `UTF8` in PostgreSQL's own encoding table, and it is the only encoding this
+                // node speaks — the startup packet says so too (`client_encoding`).
+                Datum::Int4(6),
+                // **`C`, not the oracle's `en_US.utf8`.** A collation is a feature this node does
+                // not have (`CatalogView::PgCollation` is empty for the same reason), so the honest
+                // locale is the one that sorts by byte value.
+                Datum::Text("C".to_owned()),
+                Datum::Text("C".to_owned()),
+            ]]),
             CatalogView::PgNamespace => Ok(super::schema_names(txn, tenant)?
                 .into_iter()
                 .map(|(name, id)| {
@@ -644,6 +676,7 @@ impl CatalogView {
             | CatalogView::PgNamespace
             | CatalogView::PgAttribute
             | CatalogView::PgType
+            | CatalogView::PgDatabase
             | CatalogView::PgDepend
             | CatalogView::PgSequence
             | CatalogView::PgAttrdef
@@ -758,6 +791,11 @@ pub fn refuse_write(name: &str) -> Result<()> {
 const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
+
+/// The one database's oid. PostgreSQL's `postgres` database is 5 on a fresh cluster; this is a
+/// number of ours, because the database here is not that one and pretending otherwise would be a
+/// value nobody measured.
+const DATABASE_OID: i64 = 16_384;
 
 /// The oid of a schema by name, for `relnamespace` and its kin.
 ///
@@ -1315,6 +1353,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         // client matching on it expects.
         ColumnType::Int8Array => "_int8",
         ColumnType::Int4Array => "_int4",
+        ColumnType::Int2Array => "_int2",
         ColumnType::NumericArray => "_numeric",
         ColumnType::TextArray => "_text",
         ColumnType::Int8 => "int8",
@@ -1368,6 +1407,7 @@ fn typcategory(ty: ColumnType) -> &'static str {
         // element type's.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => "A",
     }
@@ -1387,6 +1427,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         // `quote` and fail client-side with `can't quote Array`.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => "array_in",
         ColumnType::Int8 => "int8in",

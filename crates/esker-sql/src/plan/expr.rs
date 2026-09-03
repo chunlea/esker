@@ -348,6 +348,33 @@ pub enum Expr {
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
     },
+    /// A **set-returning function in the target list**: `SELECT generate_series(1,3)`.
+    ///
+    /// The same call that stands where a table does ([`crate::plan::TableFunction`]), in the one
+    /// other place PostgreSQL allows it — and there it does something no other expression does:
+    /// **it makes rows**. `SELECT 'r', generate_series(1,3)` is three rows of `r`, and
+    /// `SELECT id, unnest(tags) FROM t` is one row per element per input row. Everything beside it
+    /// repeats.
+    ///
+    /// Two of them run **in lockstep**, not as a cross join: `generate_series(1,3),
+    /// generate_series(1,2)` is three rows and the second column's third is NULL. Measured; a
+    /// Cartesian reading would give six.
+    ///
+    /// It may sit **inside** an expression — `abs(generate_series(-1,1))` is `1, 0, 1` — so the
+    /// expansion is over the whole target list and the expressions are evaluated per generated
+    /// value, which is why this is a variant of [`Expr`] and not a kind of projection.
+    SetFunc(Box<crate::plan::TableFunction>),
+    /// `COALESCE(a, b, …)`: the first argument that is not NULL.
+    ///
+    /// **Not a function**, which is the first thing an implementation gets wrong: PostgreSQL has it
+    /// in the grammar, so `COALESCE()` is `42601 syntax error at or near ")"` rather than the
+    /// `42883` a zero-argument function would give. It is a variant here for the same reason it is
+    /// a node there.
+    ///
+    /// Its arguments are typed exactly as a `CASE`'s results are — one common type, an `unknown`
+    /// coerced to it rather than compared against it — and the only difference is the word in the
+    /// message: `COALESCE types integer and text cannot be matched`.
+    Coalesce(Vec<Expr>),
     /// `CASE WHEN … THEN … [WHEN … THEN …] [ELSE …] END` — the **searched** form.
     ///
     /// The one expression in this crate whose operands are *not all evaluated*, and that is
@@ -592,6 +619,12 @@ pub enum CatalogFunc {
     /// Like `pg_get_indexdef` its argument is a column, and like it, an oid that names no
     /// constraint is NULL rather than an error.
     PgGetConstraintdef,
+    /// `pg_encoding_to_char(int)`: an encoding number's name.
+    ///
+    /// **6 is `UTF8`**, which is the only encoding this node speaks and the only number
+    /// `pg_database.encoding` ever carries here. Every other number is the empty string, which is
+    /// what a real server answers for one that names no encoding — not an error.
+    PgEncodingToChar,
     /// `pg_get_serial_sequence(table, column)`: the sequence a column's default draws from.
     ///
     /// **Schema-qualified `text`** — `public.posts_id_seq` — where the name `ActiveRecord` then
@@ -756,6 +789,9 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_get_constraintdef") => {
                 Some(CatalogFunc::PgGetConstraintdef)
             }
+            () if name.eq_ignore_ascii_case("pg_encoding_to_char") => {
+                Some(CatalogFunc::PgEncodingToChar)
+            }
             () if name.eq_ignore_ascii_case("pg_get_serial_sequence") => {
                 Some(CatalogFunc::PgGetSerialSequence)
             }
@@ -781,6 +817,7 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => "pg_get_expr",
             CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::PgGetConstraintdef => "pg_get_constraintdef",
+            CatalogFunc::PgEncodingToChar => "pg_encoding_to_char",
             CatalogFunc::PgGetSerialSequence => "pg_get_serial_sequence",
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::ObjDescription => "obj_description",
@@ -827,7 +864,8 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::PgGetPartkeydef
+            CatalogFunc::PgEncodingToChar
+            | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
@@ -853,6 +891,7 @@ impl CatalogFunc {
             | CatalogFunc::DateRange
             | CatalogFunc::ColDescription
             | CatalogFunc::PgGetSerialSequence
+            | CatalogFunc::PgEncodingToChar
             | CatalogFunc::ObjDescription
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
             // is what it prints as. The one place the difference shows is the declared type.
@@ -1284,6 +1323,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },
@@ -1348,6 +1388,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },
@@ -1386,6 +1427,7 @@ impl Literal {
                 // a cast; writing `{1}` for `1` here would be inventing the user's intent.
                 | ColumnType::Int8Array
                 | ColumnType::Int4Array
+        | ColumnType::Int2Array
                 | ColumnType::NumericArray
                 | ColumnType::TextArray => mismatch(),
             },
@@ -1474,6 +1516,8 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Default => "DEFAULT",
         Expr::Sequence(_) => "a sequence function",
         Expr::CatalogFunc(_) => "a catalog function",
+        Expr::SetFunc(_) => "a set-returning function",
+        Expr::Coalesce(_) => "COALESCE",
         Expr::Case { .. } => "CASE",
         Expr::Subquery(sub) => sub.kind.describe(),
     }

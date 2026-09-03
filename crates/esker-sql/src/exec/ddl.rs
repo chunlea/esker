@@ -1973,6 +1973,10 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
 /// Operator-shaped nodes carry their own parentheses, exactly as PostgreSQL's deparser adds them,
 /// so a `WHEN` writes its condition unadorned and gets `WHEN (rating > 0)` for a comparison and
 /// `WHEN flag` for a boolean column. Measured, both.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression shape, which is what a deparser is"
+)]
 fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
     use crate::plan::Expr;
     let sub = |expr: &Expr| deparse(expr, table, ty);
@@ -2039,6 +2043,22 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // why `ActiveRecord`'s schema dumper sees a multi-line definition for statement 198.
         // Captured with the newlines escaped, because a corpus line cannot hold one
         // (`tests/corpus/pg19_case_expression.txt`).
+        Expr::SetFunc(call) => format!(
+            "{}({})",
+            call.name,
+            call.args
+                .iter()
+                .map(|arg| deparse(arg, table, ty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Coalesce(args) => format!(
+            "COALESCE({})",
+            args.iter()
+                .map(|arg| deparse(arg, table, ty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Case {
             branches,
             otherwise,

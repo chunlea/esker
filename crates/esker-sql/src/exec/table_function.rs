@@ -18,13 +18,89 @@
 
 use crate::error::{Result, SqlError};
 use crate::plan::TableFunction;
+use crate::value::ColumnType;
 use crate::value::vector::Array;
+use crate::value::vector::Array as TextArray;
 use esker_keys::value::Datum;
+
+/// The type one generated **value** has: the column a client is described.
+///
+/// `generate_subscripts` is an `integer` whatever the array is — a subscript is an `int4` on a real
+/// server — and `generate_series` takes its arguments' type, which for this node's integer
+/// constants is `int8` where PostgreSQL's are `int4`: the standing constant-width divergence, one
+/// more surface. `unnest` answers its array's **element** type, which is the only one of the three
+/// that has to look at what it was given.
+pub(super) fn result_type(call: &TableFunction, scope: &super::query::Scope<'_>) -> ColumnType {
+    match call.name.as_str() {
+        "generate_series" => call
+            .args
+            .first()
+            .and_then(|arg| super::query::expr_type(arg, scope).ok())
+            .unwrap_or(ColumnType::Int8),
+        "unnest" => call
+            .args
+            .first()
+            .and_then(|arg| super::query::expr_type(arg, scope).ok())
+            .and_then(esker_keys::array::ArrayValue::element_of)
+            .unwrap_or(ColumnType::Text),
+        _ => ColumnType::Int4,
+    }
+}
+
+/// `unnest(anyarray)`: one row per element, **in the array's own order**.
+///
+/// **An empty array yields nothing, and so takes its input row with it** — measured: with
+/// `unnest(tags)` in the target list, a row whose array is `{}` does not appear in the result at
+/// all. A NULL array is the same nothing; a NULL *element* is a row, because an array of one NULL
+/// is not an empty array.
+///
+/// One argument only. PostgreSQL's `unnest` takes several and expands them in lockstep, which is
+/// the `ROWS FROM` behaviour under another name; this node has the lockstep and not the multi-
+/// argument spelling, so a second argument is `42883` naming the arity rather than a silent
+/// truncation.
+fn unnest(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>>> {
+    let [arg] = call.args.as_slice() else {
+        return Err(SqlError::UndefinedFunction(format!(
+            "unnest({})",
+            vec!["unknown"; call.args.len()].join(", ")
+        )));
+    };
+    Ok(match super::cursor::evaluate(arg, row)? {
+        Datum::Array(array) => array
+            .values
+            .into_iter()
+            .map(|value| vec![value.unwrap_or(Datum::Null)])
+            .collect(),
+        Datum::Null => Vec::new(),
+        // An array this node keeps as text — the catalog's `int2vector`s are the ones that reach
+        // here — read through the same parser a literal goes through.
+        Datum::Text(text) => TextArray::read(&text)
+            .map(|array| {
+                array
+                    .elements
+                    .into_iter()
+                    .map(|value| vec![value.map_or(Datum::Null, Datum::Text)])
+                    .collect()
+            })
+            .unwrap_or_default(),
+        other => {
+            return Err(SqlError::UndefinedFunctionTypes(format!(
+                "unnest({})",
+                other
+                    .column_type()
+                    .map_or("unknown", crate::value::PgType::name)
+            )));
+        }
+    })
+}
 
 /// The rows a call yields, one column wide.
 pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>>> {
     if call.name == "generate_series" {
         return series(call, row);
+    }
+    if call.name == "unnest" {
+        return unnest(call, row);
     }
     if call.name != "generate_subscripts" {
         return Err(SqlError::unsupported(format!(

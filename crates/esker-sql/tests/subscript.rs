@@ -18,7 +18,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT d.indkey[0], d.indkey[1], d.indkey[2] FROM pg_index d WHERE d.indexrelid = 'sb_ab'::regclass",
         "SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[0] WHERE d.indexrelid = 'sb_ab'::regclass",
         "SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[1] WHERE d.indexrelid = 'sb_ab'::regclass",
-        "SELECT c.conkey[1], c.confkey[1], c.conkey[2] FROM pg_constraint c WHERE c.conrelid = 'sbc'::regclass AND c.contype = 'f'",
         "SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] WHERE c.conrelid = 'sbc'::regclass AND c.contype = 'f'",
     ],
     // One, and it is **not the subscript**: `pg_constraint.conkey` is filled here only for a
@@ -26,12 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // key's is `{1}` there and NULL here. So the subscript is NULL for the right reason and the
     // wrong array. The foreign-key rows two lines below it in the corpus are exact, which is what
     // separates the two claims.
-    answers: &[(
-        "SELECT c.conkey[1], c.conkey[2] FROM pg_constraint c WHERE c.conrelid = 'sb'::regclass AND c.contype = 'p'",
-        "`conkey` is NULL for a constraint that is not a foreign key on this node — a \
-         `pg_constraint` gap that predates the subscript, and the one shape `ActiveRecord`'s \
-         `unique_constraints()` will want.",
-    )],
+    answers: &[],
 };
 
 #[test]

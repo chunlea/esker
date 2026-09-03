@@ -36,6 +36,7 @@
 //! ADR 0014 exists to prevent.
 
 mod lower;
+pub(crate) use lower::DATABASE_NAME;
 
 use sqlparser::ast::{ObjectType, Statement};
 use sqlparser::dialect::PostgreSqlDialect;

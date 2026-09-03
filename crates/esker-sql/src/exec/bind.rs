@@ -549,11 +549,6 @@ fn collect_table_names<'a>(select: &'a crate::plan::Select, into: &mut Vec<&'a s
 pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
     visit(expr);
     match expr {
-        Expr::Binary { left, right, .. } => {
-            walk_expr_mut(left, visit);
-            walk_expr_mut(right, visit);
-        }
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_expr_mut(operand, visit),
         Expr::InList { operand, list, .. } => {
             walk_expr_mut(operand, visit);
             for item in list {
@@ -572,9 +567,6 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         // complete: whatever is not here is never visited, so a `$1` inside it is never bound and
         // a `'x'::regclass` inside it is never resolved. Measured — `'rc'::regclass::text` reached
         // the row evaluator with the cast unresolved, because a cast to text was not on this list.
-        Expr::ToText { operand, .. } | Expr::Scalar { operand, .. } => {
-            walk_expr_mut(operand, visit);
-        }
         Expr::AnyArray { operand, array } => {
             walk_expr_mut(operand, visit);
             walk_expr_mut(array, visit);
@@ -582,6 +574,44 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         Expr::Subscript { operand, index, .. } => {
             walk_expr_mut(operand, visit);
             walk_expr_mut(index, visit);
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                walk_expr_mut(arg, visit);
+            }
+        }
+        // **The arms below were the blind spot.** `descend` and this walk are the crate's general
+        // ones — `has_sequence_call`, `has_set_func` and the parameter inference all go through
+        // them — and neither descended into arithmetic, a negation, a `LIKE` pattern or a
+        // set-returning call's arguments. `SELECT generate_series(1,2) + 10` found no call and
+        // reached the row evaluator as an internal error; `WHERE a = $1 + 1` would not have seen
+        // the parameter. A walker that is nearly total is worse than one that obviously is not.
+        Expr::Not(operand)
+        | Expr::IsNull { operand, .. }
+        | Expr::Negate(operand)
+        | Expr::ToText { operand, .. }
+        | Expr::Scalar { operand, .. } => {
+            walk_expr_mut(operand, visit);
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::Like {
+            operand: left,
+            pattern: right,
+            ..
+        }
+        | Expr::RegexMatch {
+            operand: left,
+            pattern: right,
+            ..
+        } => {
+            walk_expr_mut(left, visit);
+            walk_expr_mut(right, visit);
+        }
+        Expr::SetFunc(call) => {
+            for arg in &mut call.args {
+                walk_expr_mut(arg, visit);
+            }
         }
         Expr::Case {
             branches,
@@ -717,13 +747,10 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
 pub(super) fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
-        Expr::Binary { left, right, .. } => {
-            descend(left, visit);
-            descend(right, visit);
-        }
         Expr::Not(operand)
         | Expr::IsNull { operand, .. }
         | Expr::ToText { operand, .. }
+        | Expr::Negate(operand)
         | Expr::Scalar { operand, .. } => descend(operand, visit),
         Expr::InList { operand, list, .. } => {
             descend(operand, visit);
@@ -743,6 +770,33 @@ pub(super) fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Subscript { operand, index, .. } => {
             descend(operand, visit);
             descend(index, visit);
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                descend(arg, visit);
+            }
+        }
+        // The same arms as `walk_expr_mut`'s, and for the same reason: these two are the crate's
+        // general walks and a variant missing from one of them is a bug in whatever asks it.
+        Expr::Binary { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::Like {
+            operand: left,
+            pattern: right,
+            ..
+        }
+        | Expr::RegexMatch {
+            operand: left,
+            pattern: right,
+            ..
+        } => {
+            descend(left, visit);
+            descend(right, visit);
+        }
+        Expr::SetFunc(call) => {
+            for arg in &call.args {
+                descend(arg, visit);
+            }
         }
         Expr::Case {
             branches,
@@ -786,6 +840,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         // arrives, and one that answers `column_type` correctly while it stands in.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),

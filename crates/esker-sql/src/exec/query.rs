@@ -609,9 +609,22 @@ fn finish_plan(
     // rather than working around it: deduplication happens over the target list, so a sort key
     // the target list does not contain has no defined position to sort at. Its keys are resolved
     // against the *output* columns and a key that is not one of them is `42P10`.
-    let sort_keys = order_keys(select, scope, aggregation.as_ref(), &exprs, &columns)?;
+    // **A set-returning call in the target list moves the sort above the projection.** The rows
+    // do not exist until the projection has run — `SELECT generate_series(1,3) ORDER BY 2 DESC` is
+    // three rows to order and one row before it — so a sort underneath would order the input and
+    // leave the generated values in generation order, which is what it did. `DISTINCT` moves it
+    // for its own reason, and both then resolve their keys against the **output** columns.
+    let expands = exprs.iter().any(contains_set_func);
+    let sort_keys = order_keys(
+        select,
+        scope,
+        aggregation.as_ref(),
+        &exprs,
+        &columns,
+        select.distinct || expands,
+    )?;
     refuse_json_sort(&sort_keys)?;
-    if !select.distinct && !sort_keys.is_empty() {
+    if !select.distinct && !expands && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
             keys: sort_keys.clone(),
@@ -622,6 +635,13 @@ fn finish_plan(
         input: Box::new(node),
         exprs,
     };
+
+    if expands && !select.distinct && !sort_keys.is_empty() {
+        node = Node::Sort {
+            input: Box::new(node),
+            keys: sort_keys.clone(),
+        };
+    }
 
     if select.distinct {
         node = Node::Distinct {
@@ -702,6 +722,7 @@ fn order_keys(
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
     columns: &[(String, ColumnType, i32)],
+    over_output: bool,
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
     for item in &select.order_by {
@@ -739,7 +760,7 @@ fn order_keys(
                 Some(aggregation) => aggregation.rewrite(&resolved, scope)?,
             }
         };
-        let expr = if select.distinct {
+        let expr = if select.distinct || over_output {
             let at = outputs
                 .iter()
                 .position(|output| output == &resolved)
@@ -1688,6 +1709,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             branches,
             otherwise,
         } => resolve_case(branches, otherwise.as_deref(), scope)?,
+        Expr::Coalesce(args) => resolve_coalesce(args, scope)?,
+        // Its arguments are expressions of the row like a catalog function's — `unnest(tags)` is a
+        // column reference — so they resolve the same way. Falling through to the clone below left
+        // them as `Expr::Column` and the evaluator reported one as having reached it unresolved.
+        Expr::SetFunc(call) => {
+            let mut resolved = call.clone();
+            for arg in &mut resolved.args {
+                *arg = resolve(arg, scope)?;
+            }
+            Expr::SetFunc(resolved)
+        }
         // Its arguments are ordinary expressions of the row — `format_type(a.atttypid,
         // a.atttypmod)` is two column references — so they resolve like any others. Falling
         // through to the clone below would leave them as `Expr::Column` and the evaluator would
@@ -1845,6 +1877,63 @@ fn resolve_case(
     })
 }
 
+/// One `COALESCE`, resolved: its arguments given one type.
+///
+/// **The same rules a `CASE`'s results follow**, because they are the same rules on a real server —
+/// `select_common_type` over the argument list — and only two things differ. The list is walked
+/// **left to right**, where a `CASE`'s starts with its `ELSE`; and the message names `COALESCE`.
+/// Both measured: `COALESCE(1, 'x'::text)` is `42804 COALESCE types integer and text cannot be
+/// matched`, while `COALESCE(1, 'notanumber')` — an *unknown* rather than a typed argument — is
+/// `22P02 invalid input syntax for type integer`, because an unknown is **coerced** to the common
+/// type rather than compared with it. Same pair of arguments, two different failures.
+fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
+    let mut resolved = Vec::with_capacity(args.len());
+    for arg in args {
+        resolved.push(resolve(arg, scope)?);
+    }
+    let mut common = None;
+    for arg in &resolved {
+        let Some(ty) = branch_type(arg, scope) else {
+            continue;
+        };
+        match common {
+            None => common = Some(ty),
+            // **The wider of the two, not the first.** `COALESCE(1, 2.5)` is `numeric` on a real
+            // server — the integer is promoted — so the common type is taken from the same
+            // promotion table arithmetic uses (ADR 0046) rather than from whichever argument came
+            // first. A pair with no promotion between them keeps the family test's answer.
+            Some(chosen) if same_family(chosen, ty) => {
+                common = Some(
+                    crate::value::arith::result_type(crate::plan::ArithOp::Add, chosen, ty)
+                        .unwrap_or(chosen),
+                );
+            }
+            Some(chosen) => {
+                return Err(SqlError::DatatypeMismatch(format!(
+                    "COALESCE types {} and {} cannot be matched",
+                    chosen.name(),
+                    ty.name()
+                )));
+            }
+        }
+    }
+    if let Some(ty) = common {
+        for arg in &mut resolved {
+            give_branch_type(arg, ty)?;
+        }
+    }
+    Ok(Expr::Coalesce(resolved))
+}
+
+/// Whether an expression holds a set-returning call anywhere inside it.
+fn contains_set_func(expr: &Expr) -> bool {
+    let mut found = false;
+    super::bind::descend(expr, &mut |expr| {
+        found |= matches!(expr, Expr::SetFunc(_));
+    });
+    found
+}
+
 /// The left-hand side of an `IN`/`ANY`/`ALL`, typed against the subquery's column.
 ///
 /// The subquery's single column is what the operand is compared against, so it types the operand
@@ -1904,6 +1993,7 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // operators — so no two of these share a family and none shares one with a scalar.
             ColumnType::Int8Array => 20,
             ColumnType::Int4Array => 21,
+            ColumnType::Int2Array => 25,
             ColumnType::NumericArray => 22,
             ColumnType::TextArray => 23,
             ColumnType::Int8
@@ -2023,6 +2113,29 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
                 _ => (left, right),
             }
         }
+        // **Two columns whose types have no operator between them.** The same rule one line up,
+        // for the case where neither side is a literal: `WHERE id = title` over a `bigint` and a
+        // `text` is `42883 operator does not exist: bigint = text` on a real server, and this node
+        // compared two `Datum`s of different variants, found none equal and answered **no rows**.
+        // A query that silently finds nothing is what a suite reports as a wrong count rather than
+        // as an error, which is why it ranks worse than a refusal.
+        //
+        // The message names the two types **in the order they were written** — `s = id` is
+        // `text = bigint` — because they are two different operators that both do not exist.
+        _ if matches!(
+            (carried_type(&left), carried_type(&right)),
+            (Some(a), Some(b)) if !same_family(a, b)
+        ) =>
+        {
+            let (Some(a), Some(b)) = (carried_type(&left), carried_type(&right)) else {
+                unreachable!("both types are Some in the guard above")
+            };
+            return Err(SqlError::UndefinedOperator {
+                left: a.name(),
+                op: op.symbol(),
+                right: b.name(),
+            });
+        }
         _ => (left, right),
     })
 }
@@ -2053,6 +2166,23 @@ fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType
         _ => false,
     };
     vector.then_some(ColumnType::Int2)
+}
+
+/// The type an expression **carries in the node**, without a scope to resolve it against.
+///
+/// [`reconcile`] has no scope — it is given two already-resolved expressions — so it can only ask
+/// the ones that hold their own type. That is enough for the case it exists for: a column
+/// (`Ordinal`), a correlated reference (`Outer`), an arithmetic result and a per-row cast to
+/// `text`, which is every shape a cross-type comparison reached it as in the capture. Anything
+/// else answers `None` and falls through, because a rule that guessed here would refuse a
+/// statement a real server answers.
+fn carried_type(expr: &Expr) -> Option<ColumnType> {
+    match expr {
+        Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => Some(*ty),
+        Expr::Arithmetic { ty, .. } => *ty,
+        Expr::ToText { .. } => Some(ColumnType::Text),
+        _ => None,
+    }
 }
 
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
@@ -2249,6 +2379,14 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
     // An `UPDATE` or `DELETE` reaches here without going through `Aggregation::build`, and
     // `WHERE count(*) > 1` is `42803` on all three statements. One check rather than three.
     // A `HAVING` is the one clause where an aggregate belongs, so only `WHERE` refuses it.
+    // **A set-returning function is not allowed in a `WHERE`**, and PostgreSQL names the clause.
+    // The projection is the only place that expands one, so without this the call reaches the row
+    // evaluator and answers `XX000` — a bug report for a statement a real server declines politely.
+    if contains_set_func(expr) {
+        return Err(SqlError::SetFunctionNotAllowed(format!(
+            "set-returning functions are not allowed in {clause}"
+        )));
+    }
     if clause == "WHERE" && aggregate::contains_aggregate(expr) {
         return Err(SqlError::AggregateNotAllowed(
             "aggregate functions are not allowed in WHERE",
@@ -2587,6 +2725,18 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             .and_then(esker_keys::array::ArrayValue::element_of)
             .unwrap_or(*element),
         Expr::Uuid(_) => ColumnType::Uuid,
+        // Resolution has already given every argument the common type, so the first one that
+        // **carries** a type is the answer. `branch_type` rather than `expr_type` is the whole of
+        // it: a bare NULL answers `text` from the second and nothing from the first, and
+        // `COALESCE(NULL, 2)` typed as `text` made `COALESCE(1, NULL) + COALESCE(NULL, 2)` the
+        // `42883 operator does not exist: bigint + text` that a real server adds without blinking.
+        // One generated **value**, not the set: the column a client is described is the element
+        // type. `unnest` answers its array's element type and the two generators answer their own.
+        Expr::SetFunc(call) => super::table_function::result_type(call, scope),
+        Expr::Coalesce(args) => args
+            .iter()
+            .find_map(|arg| branch_type(arg, scope))
+            .unwrap_or(ColumnType::Text),
         Expr::Case {
             branches,
             otherwise,

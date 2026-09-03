@@ -842,6 +842,16 @@ pub enum SqlError {
     #[error("{0}")]
     AggregateNotAllowed(&'static str),
 
+    /// A set-returning function somewhere PostgreSQL does not allow one.
+    ///
+    /// **`0A000`, and the sentence is PostgreSQL's own** — not "… is not supported", which is what
+    /// this crate's generic refusal would have said. Two places, two sentences, both measured: in a
+    /// `WHERE` it is `set-returning functions are not allowed in WHERE`, and inside an aggregate it
+    /// is `aggregate function calls cannot contain set-returning function calls`, which carries a
+    /// HINT about `LATERAL`.
+    #[error("{0}")]
+    SetFunctionNotAllowed(String),
+
     /// `ORDER BY`, `GROUP BY` or `SELECT DISTINCT` naming something the target list does not have.
     #[error("{0}")]
     InvalidColumnReference(String),
@@ -1590,6 +1600,7 @@ impl SqlError {
             // server cannot enforce — which is what `0A000` says.
             | SqlError::PartitionKeyNotCovered { .. }
             | SqlError::AccessMethodWithoutInclude(_)
+            | SqlError::SetFunctionNotAllowed(_)
             | SqlError::OnConflictMovesPartition => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
@@ -1935,6 +1946,11 @@ impl SqlError {
     #[must_use]
     pub fn hint(&self) -> Option<String> {
         match self {
+            SqlError::SetFunctionNotAllowed(message)
+                if message.starts_with("aggregate function calls") =>
+            {
+                Some("You might be able to move the set-returning function into a LATERAL FROM item.".to_owned())
+            }
             SqlError::ForwardCteReference(_) => Some(
                 "Use WITH RECURSIVE, or re-order the WITH items to remove forward references."
                     .to_owned(),

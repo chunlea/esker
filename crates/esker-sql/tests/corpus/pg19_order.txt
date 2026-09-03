@@ -47,5 +47,6 @@ oid	0	1	26	1186	4294967295
 # are two values, ordered by where their subscripts start.
 int8[]	{}	[0:1]={1,2}	{1,2}	{1,2,3}	{1,NULL}	{2}	{NULL}
 int4[]	{}	{-1}	{0}	{1,2}	{1,2,3}	{{1,2},{3,4}}	{1,NULL,3}
+int2[]	{}	{-1}	{0}	{1,2}	{1,2,3}	{{1,2},{3,4}}	{1,NULL,3}
 numeric[]	{}	{0.0}	{1.00}	{1.0}	{1,2}	{1.5}	{NaN}
 text[]	{}	{""}	{a}	{a,b}	{"a b"}	{b}	{NULL}

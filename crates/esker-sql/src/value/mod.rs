@@ -399,6 +399,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // `typarray` holds for a type that has no array.
         ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => 0,
         ColumnType::Bool => 1000,
@@ -504,6 +505,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // refused where it is parsed rather than silently dropped.
         | ColumnType::Int8Array
         | ColumnType::Int4Array
+        | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray => false,
     }
@@ -619,6 +621,7 @@ impl PgType for ColumnType {
             // Unreachable: the four array types answered above, from their element's `typarray`.
             ColumnType::Int8Array
             | ColumnType::Int4Array
+            | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => 0,
         }
@@ -631,6 +634,7 @@ impl PgType for ColumnType {
             // that `pg_type.typname` holds.
             ColumnType::Int8Array => "bigint[]",
             ColumnType::Int4Array => "integer[]",
+            ColumnType::Int2Array => "smallint[]",
             ColumnType::NumericArray => "numeric[]",
             ColumnType::TextArray => "text[]",
             ColumnType::Int8 => "bigint",
@@ -680,6 +684,7 @@ impl PgType for ColumnType {
             // However many elements it has, which is the definition of a varlena.
             | ColumnType::Int8Array
             | ColumnType::Int4Array
+        | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => -1,
         }
@@ -792,6 +797,7 @@ impl PgDatum for Datum {
             // array's (`crate::value::array`).
             ColumnType::Int8Array
             | ColumnType::Int4Array
+            | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => {
                 let element =
@@ -897,6 +903,7 @@ impl PgDatum for Datum {
             // client that sends one is told so rather than given a value built from a guess.
             ColumnType::Int8Array
             | ColumnType::Int4Array
+            | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => {
                 return Err(SqlError::unsupported(format!(
@@ -1424,6 +1431,7 @@ mod tests {
                         // However many elements it has, which is the definition of a varlena.
                         | ColumnType::Int8Array
                         | ColumnType::Int4Array
+        | ColumnType::Int2Array
                         | ColumnType::NumericArray
                         | ColumnType::TextArray
                 ),

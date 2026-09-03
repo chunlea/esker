@@ -1,0 +1,48 @@
+# Comparing two columns of different types — as PostgreSQL 19beta1 answers it.
+#
+# Run 46's ranking rows `operator does not exist: bigint = text` (119 tests, 29 files) and
+# `integer = text` (50, 14) are **that message being right**: a comparison between an integer and a
+# text is `42883` on a real server too. The rows came through `PG::Connection#exec_params`, and a
+# bind gets its type from the context it sits in, which `0badfe7` fixed.
+#
+# What this file is for is the **other direction**, found while confirming that: this node answered
+# `WHERE id = title` with *no rows* where a real server refuses the statement. Answering where
+# PostgreSQL raises is ADR 0031's worst class — a query that silently finds nothing is a bug a
+# suite reports as a wrong count, not as an error.
+#
+# Captured in one session inside `BEGIN … ROLLBACK`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The message names the two types in the order they were written.** `id = s` is
+#     `bigint = text` and `s = id` is `text = bigint`; they are two different operators that both
+#     do not exist, and a node that normalised the pair would name one of them wrongly.
+#   * **`character varying` is spelled out**, not `varchar`: `id = v` is
+#     `bigint = character varying`.
+#   * **A cast on the *other* side is what makes it work**, and only one of the two: `id = s::text`
+#     is the same refusal, while `id::text = s` answers. The cast has to bring the operands
+#     together, not push them apart.
+#   * **`IN` carries it**: `id IN (s)` is `bigint = text`, the operator the list would have used.
+#   * `id = n` (bigint against integer) and `s = v` (text against character varying) both answer —
+#     those pairs are one family, and only a cross-family pair is `42883`.
+CREATE TABLE ot (id bigint primary key, n int4, s text, v character varying, b bool, d float8)		-
+INSERT INTO ot VALUES (1, 1, '1', '1', true, 1.0)		-
+SELECT 'r', id FROM ot WHERE id = s	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE s = id	!42883 operator does not exist: text = bigint DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = v	!42883 operator does not exist: bigint = character varying DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE n = s	!42883 operator does not exist: integer = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id > s	!42883 operator does not exist: bigint > text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id <> s	!42883 operator does not exist: bigint <> text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = s::text	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id::text = s	text,bigint	r|1
+SELECT 'r', id FROM ot WHERE id IN (s)	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE b = s	!42883 operator does not exist: boolean = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE d = s	!42883 operator does not exist: double precision = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = n	text,bigint	r|1
+SELECT 'r', id FROM ot WHERE s = v	text,bigint	r|1
+SELECT 'r', id FROM ot WHERE id = 'x'::text	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = b	!42883 operator does not exist: bigint = boolean DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.

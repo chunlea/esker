@@ -73,18 +73,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "A **slice** (`a[1:2]`) and a second subscript (`a[1][2]`). One subscript of a one-dimensional array answers now; a slice returns an array, which is the constructor's slice, and `a[1]` of a two-dimensional array is NULL rather than a row — measured, and the line is here so it stays measured.",
         ),
         (
-            "SELECT unnest('{1,2,3}'::int[])",
-            "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
-        ),
-        (
-            "SELECT unnest('{1,NULL}'::int[])",
-            "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
-        ),
-        (
-            "SELECT unnest('{}'::int[])",
-            "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
-        ),
-        (
             "SELECT 1 = ALL('{1,1}'::int[]), 1 = ALL('{1,2}'::int[])",
             "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
         ),

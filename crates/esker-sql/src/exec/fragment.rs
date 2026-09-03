@@ -424,6 +424,12 @@ fn push_filter(
         // The fragment language has no conditional, and a `CASE` is the one expression whose
         // branches must **not** all be evaluated — pushing it down as anything else would change
         // which of them raises. Rows, and the row evaluator answers it.
+        // A fragment is pushed down to a learner that has no expression evaluator of its own, so
+        // the two conditional constructs are refused there and computed here.
+        // A fragment is a projection a learner evaluates, and a set-returning call makes rows —
+        // which is a shape the fragment protocol has no room for.
+        Expr::SetFunc(_) => return Err(refused("a set-returning function")),
+        Expr::Coalesce(_) => return Err(refused("a COALESCE expression")),
         Expr::Case { .. } => return Err(refused("a CASE expression")),
         // The fragment language has no array. Rows, and the row evaluator answers it.
         Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
@@ -609,7 +615,9 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // by the row engine — which is the answer the caller's length check already produces,
         // and a `NotExpressible` rather than a wrong one. The alternative is an array run in
         // `esker-columnar`'s own vocabulary, which is a unit of its own.
-        Row::Int8Array | Row::Int4Array | Row::NumericArray | Row::TextArray => return None,
+        Row::Int8Array | Row::Int4Array | Row::Int2Array | Row::NumericArray | Row::TextArray => {
+            return None;
+        }
     })
 }
 
@@ -722,9 +730,16 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
                 collect_columns(item, into);
             }
         }
-        // Every branch's columns, condition and result alike: a projection that left out a column
-        // only one unreached branch names would still have to read it, because which branch is
-        // reached is a property of the row and not of the plan.
+        Expr::SetFunc(call) => {
+            for arg in &call.args {
+                collect_columns(arg, into);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_columns(arg, into);
+            }
+        }
         Expr::Case {
             branches,
             otherwise,

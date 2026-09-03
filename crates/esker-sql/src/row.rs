@@ -44,6 +44,7 @@ mod tests {
             // sometimes not one — the parts of the value an index key has to order by.
             ColumnType::Int8Array
             | ColumnType::Int4Array
+        | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)

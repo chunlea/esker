@@ -209,6 +209,9 @@ const TAG_OID: u8 = 20;
 /// written by an older build has no tag above 20 and reads unchanged.
 const TAG_INT8_ARRAY: u8 = 21;
 const TAG_INT4_ARRAY: u8 = 22;
+/// Appended with `smallint[]`, the catalog's own array type; a record written before it has no tag
+/// above 24.
+const TAG_INT2_ARRAY: u8 = 25;
 const TAG_NUMERIC_ARRAY: u8 = 23;
 const TAG_TEXT_ARRAY: u8 = 24;
 
@@ -268,6 +271,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Oid => TAG_OID,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
+        ColumnType::Int2Array => TAG_INT2_ARRAY,
         ColumnType::NumericArray => TAG_NUMERIC_ARRAY,
         ColumnType::TextArray => TAG_TEXT_ARRAY,
     }
@@ -340,6 +344,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_OID => ColumnType::Oid,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,
+        TAG_INT2_ARRAY => ColumnType::Int2Array,
         TAG_NUMERIC_ARRAY => ColumnType::NumericArray,
         TAG_TEXT_ARRAY => ColumnType::TextArray,
         other => return Err(corrupt(format!("column type tag {other}"))),
