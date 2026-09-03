@@ -4843,6 +4843,47 @@ fn join_constraint(constraint: &JoinConstraint) -> Result<(Option<plan::Expr>, V
 )]
 fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
     match factor {
+        // **`sqlparser` gives `UNNEST` a `TableFactor` of its own**, where every other table
+        // function is a `Table` with arguments — so the same call that lowers one way in the
+        // target list arrives here in another shape, and both have to end at the same
+        // `plan::TableFunction`. `WITH OFFSET` and `WITH ORDINALITY` add a second column, which is
+        // a different relation from the one this node builds.
+        TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_offset,
+            with_offset_alias,
+            with_ordinality,
+        } => {
+            refuse_if(
+                *with_offset || with_offset_alias.is_some(),
+                "UNNEST WITH OFFSET",
+            )?;
+            refuse_if(*with_ordinality, "UNNEST WITH ORDINALITY")?;
+            let alias = match alias {
+                None => None,
+                Some(alias) => {
+                    refuse_if(!alias.columns.is_empty(), "a column alias list")?;
+                    Some(ident(&alias.name))
+                }
+            };
+            let args = array_exprs
+                .iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(plan::TableRef {
+                values: None,
+                name: "unnest".to_owned(),
+                alias,
+                derived: None,
+                function: Some(Box::new(plan::TableFunction {
+                    name: "unnest".to_owned(),
+                    args,
+                    def: None,
+                })),
+                hidden_cte: false,
+            })
+        }
         TableFactor::Table {
             name,
             alias,
@@ -4859,7 +4900,10 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             if let Some(args) = args {
                 let folded = relation_name(name)?;
                 refuse_if(
-                    !matches!(folded.as_str(), "generate_subscripts" | "generate_series"),
+                    !matches!(
+                        folded.as_str(),
+                        "generate_subscripts" | "generate_series" | "unnest"
+                    ),
                     format!("the table function {folded}"),
                 )?;
                 let alias = match alias {

@@ -518,9 +518,11 @@ pub(super) fn plan_under(
         // A set-returning function is a third kind of source, beside a relation and a derived
         // table: no key range, no statistics, and rows that exist only once its arguments are
         // evaluated. It is checked before the derived plan because it has neither.
-        Some(table) if outer_entry.is_some_and(|entry| entry.function.is_some()) => {
-            function_node(outer_entry.unwrap_or_else(|| unreachable!()), table, outer)?
-        }
+        Some(table) if outer_entry.is_some_and(|entry| entry.function.is_some()) => function_node(
+            outer_entry.unwrap_or_else(|| unreachable!()),
+            table,
+            &Scope::empty().under(outer),
+        )?,
         // Rows written into the statement, which is a source with even less to it than a function:
         // no arguments, no key range, and the row count is the length of the list.
         Some(table) if outer_entry.is_some_and(|entry| entry.values.is_some()) => {
@@ -543,7 +545,20 @@ pub(super) fn plan_under(
         let inner = inner_table.ok_or_else(|| SqlError::UndefinedTable(join.table.name.clone()))?;
         // The inner side may be a function too — `FROM generate_subscripts(…) i, generate_subscripts(…) j` is a join of two of them — and it is read exactly as a derived side is,
         // because both are plans rather than key ranges.
-        let inner_function = source_function(inner_entry, inner, outer)?;
+        // **Implicitly `LATERAL`.** A set-returning function on the right of a comma or a `JOIN`
+        // may name the entries to its **left** — `FROM lt l, unnest(l.tags) u` is what
+        // `ActiveRecord`'s schema dump writes with `generate_subscripts` — so its arguments
+        // resolve in a scope of exactly those, and the rows are recomputed per outer row where the
+        // join is executed. Left, and not the whole `FROM`: the same function first is
+        // `42P01 missing FROM-clause entry`, measured.
+        // The outer side alone, which is everything to this entry's left in a two-entry `FROM`.
+        // **Under the name the `FROM` gave it**, not the table's own: `FROM lt l, unnest(l.tags)`
+        // names the alias, and a scope built from the relation would answer `42P01` for `l`.
+        let left = match named_table {
+            Some((table, name)) => Scope::single_as(table, name.to_owned()).under(outer),
+            None => Scope::empty().under(outer),
+        };
+        let inner_function = source_function(inner_entry, inner, &left)?;
         node = join_node(
             node,
             condition.as_ref(),
@@ -898,7 +913,9 @@ fn plan_chain(
         // A set-returning function is a third kind of source, beside a relation and a derived
         // table: no key range, no statistics, and rows that exist only once its arguments are
         // evaluated.
-        Some(entry) if entry.function.is_some() => function_node(entry, outer, enclosing)?,
+        Some(entry) if entry.function.is_some() => {
+            function_node(entry, outer, &Scope::empty().under(enclosing))?
+        }
         // Rows written into the statement, which is a source with even less to it than a function:
         // no arguments, no key range, and the row count is the length of the list.
         Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
@@ -914,7 +931,10 @@ fn plan_chain(
     for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
         let left_join = join.kind == crate::plan::JoinKind::Left;
-        let inner_function = source_function(Some(&join.table), inner, enclosing)?;
+        // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
+        // everything up to and including the outer side of this join.
+        let left = Scope::chain(&entries[..=at]).under(enclosing);
+        let inner_function = source_function(Some(&join.table), inner, &left)?;
         node = join_node(
             node,
             join.on.as_ref(),
@@ -1237,10 +1257,10 @@ fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::pl
 fn source_function(
     entry: Option<&crate::plan::TableRef>,
     def: &TableDef,
-    enclosing: Option<&Scope<'_>>,
+    left: &Scope<'_>,
 ) -> Result<Option<Node>> {
     match entry {
-        Some(entry) if entry.function.is_some() => function_node(entry, def, enclosing).map(Some),
+        Some(entry) if entry.function.is_some() => function_node(entry, def, left).map(Some),
         // A `VALUES` list is the fourth kind of source and the simplest: its rows are in the
         // statement, so there is nothing to resolve against the enclosing scope.
         Some(entry) if entry.values.is_some() => super::values::node(entry, def).map(Some),
@@ -1255,11 +1275,7 @@ fn source_function(
 /// local tables — which is what turns `generate_subscripts(c.conkey, 1)` inside a correlated
 /// subquery into an `Outer` reference that the row above supplies, and what makes a reference to
 /// a table of this same `FROM` an "undefined column" rather than a silent NULL.
-fn function_node(
-    entry: &crate::plan::TableRef,
-    def: &TableDef,
-    enclosing: Option<&Scope<'_>>,
-) -> Result<Node> {
+fn function_node(entry: &crate::plan::TableRef, def: &TableDef, scope: &Scope<'_>) -> Result<Node> {
     let mut call = entry.function.clone().unwrap_or_else(|| {
         Box::new(crate::plan::TableFunction {
             name: String::new(),
@@ -1267,9 +1283,13 @@ fn function_node(
             def: None,
         })
     });
-    let scope = Scope::empty().under(enclosing);
+    // **The entries to this one's left are the current scope, not an enclosing one.** A reference
+    // resolved through `under` becomes an `Expr::Outer` — a correlated reference the subquery
+    // machinery supplies — and there is no subquery here: the value comes from the outer row the
+    // nested loop is holding, which is an ordinary `Ordinal` into it. Resolving it the other way
+    // reached the row evaluator as "an outer reference … 1 scope out".
     for arg in &mut call.args {
-        *arg = resolve(arg, &scope)?;
+        *arg = resolve(arg, scope)?;
     }
     Ok(Node::TableFunction {
         call,
