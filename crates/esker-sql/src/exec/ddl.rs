@@ -1456,6 +1456,162 @@ fn references_a_key(parent: &TableDef, columns: &[usize]) -> bool {
     })
 }
 
+/// `ALTER TABLE ... DROP [COLUMN] [IF EXISTS] <name> [CASCADE]` — the tombstone and what goes with
+/// it (ADR 0051). Answers whether anything changed, which is `false` only for `IF EXISTS` on a
+/// column that is not there.
+///
+/// **The column's slot, type and missing value are left exactly as they are**, and that is the
+/// whole design: a row is decoded by position, so the type has to stay for the bytes of every row
+/// written before this statement to be read at the right offsets. What is cleared is only what a
+/// user could see — the flag is what hides it.
+///
+/// Everything that lives *on this table* goes silently and needs no `CASCADE`: an index over the
+/// column of any width, the column's `CHECK`, its `NOT NULL`, its default, its comment, a foreign
+/// key declared on it, and the sequence it owned. Only a dependent living on another object
+/// raises `2BP01`, and here that is another table's foreign key referencing the column. All
+/// measured against 19beta1.
+fn drop_column(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    updated: &mut TableDef,
+    relation: &str,
+    name: &str,
+    if_exists: bool,
+    cascade: bool,
+) -> Result<bool> {
+    let Some(at) = updated.column(name) else {
+        if if_exists {
+            executor.notice(SqlError::UndefinedColumnInRelation {
+                column: name.to_owned(),
+                relation: relation.to_owned(),
+            });
+            return Ok(false);
+        }
+        return Err(SqlError::UndefinedColumnInRelation {
+            column: name.to_owned(),
+            relation: relation.to_owned(),
+        });
+    };
+
+    // **Before anything is changed**, so a refusal leaves the definition as it was.
+    refuse_referencing_keys(txn, executor, updated, name, at, cascade)?;
+
+    // The tombstone. `ty`, `typmod` and `missing` survive because the row codec reads them;
+    // everything else was a promise to a user who can no longer see the column.
+    let column = &mut updated.columns[at];
+    column.dropped = true;
+    column.not_null = false;
+    column.default = None;
+    column.default_expr = None;
+    column.generated = None;
+    column.comment = None;
+
+    // An index over the column cannot be maintained once nothing writes the column again, and a
+    // real server drops it whether the column is one of its keys or all of them.
+    updated
+        .indexes
+        .retain(|index| !index.keys.iter().any(|key| key.position() == Some(at)));
+
+    // The primary key goes the same way, and the table stays — measured: after
+    // `ALTER TABLE dc DROP COLUMN id` the table has no `p` constraint and still answers
+    // `SELECT count(*)`.
+    if updated.primary_key.contains(&at) {
+        updated.primary_key.clear();
+        updated.primary_key_name.clear();
+        updated.primary_key_comment = None;
+    }
+
+    // A foreign key **declared on** the column: on this table, so it goes silently. This is the
+    // half that is not `refuse_referencing_keys`'s, and the two are easy to confuse.
+    updated
+        .foreign_keys
+        .retain(|key| !key.columns.contains(&at));
+
+    // The sequence the column owned. `serial` makes one and the column owns it, so
+    // `DROP COLUMN "id"` takes `dc_id_seq` with it — which does not follow from the statement's
+    // wording and is measured.
+    updated
+        .sequences
+        .retain(|sequence| sequence.column != Some(at));
+
+    // A `CHECK` or an `EXCLUDE` is stored as **text**, so what decides whether it depended on the
+    // column is whether it still resolves against the table now that the name is gone. That reuses
+    // `validate_checks`'s own machinery rather than adding a second walker over the same
+    // expressions, which is what would drift.
+    let scope_table = updated.clone();
+    updated
+        .checks
+        .retain(|check| resolves(&scope_table, &check.expr));
+    updated.excludes.retain(|exclude| {
+        resolves(&scope_table, &exclude.key)
+            && exclude
+                .predicate
+                .as_deref()
+                .is_none_or(|predicate| resolves(&scope_table, predicate))
+    });
+
+    Ok(true)
+}
+
+/// Whether a stored expression still names only columns this table has.
+///
+/// A parse failure counts as *not* resolving, which is the safe direction here: a constraint whose
+/// text cannot be read is one nothing can evaluate, and leaving it behind would fail the next
+/// `INSERT` rather than this `ALTER`.
+fn resolves(table: &TableDef, expr: &str) -> bool {
+    let Ok(parsed) = crate::parse::parse_stored_expr(expr) else {
+        return false;
+    };
+    let scope = crate::exec::query::Scope::single(table);
+    crate::exec::query::resolve(&parsed, &scope).is_ok()
+}
+
+/// `2BP01` when another table's foreign key references the column, unless `CASCADE`.
+///
+/// The backref index is the same one `DROP TABLE` walks, so this costs a range scan over the
+/// children that reference this table rather than a scan of every table.
+fn refuse_referencing_keys(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    table: &TableDef,
+    name: &str,
+    at: usize,
+    cascade: bool,
+) -> Result<()> {
+    let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
+    for (key, _) in txn.scan(&start, &end, 0)? {
+        let child_id = catalog::foreign_key_backref_child(executor.tenant, table.id, &key)?;
+        if child_id == table.id {
+            continue;
+        }
+        let child = executor.table_by_id(txn, child_id)?;
+        let depends: Vec<String> = child
+            .foreign_keys
+            .iter()
+            .filter(|constraint| {
+                constraint.parent == table.id && constraint.parent_columns.contains(&at)
+            })
+            .map(|constraint| constraint.name.clone())
+            .collect();
+        for constraint in depends {
+            if !cascade {
+                return Err(SqlError::DependentColumn {
+                    column: name.to_owned(),
+                    relation: table.name.clone(),
+                    detail: format!(
+                        "constraint {constraint} on table {} depends on column {name} of table {}",
+                        child.name, table.name
+                    ),
+                });
+            }
+            let mut without = (*child).clone();
+            without.foreign_keys.retain(|key| key.name != constraint);
+            catalog::replace_table(txn, executor.tenant, &child, &without)?;
+        }
+    }
+    Ok(())
+}
+
 /// Every `CHECK` on `table`, resolved against its own columns — **now**, not on the first row.
 ///
 /// A predicate is stored as text and lowered when a row is written, so nothing else would notice
@@ -2388,6 +2544,23 @@ pub(super) fn alter_table(
         if let AlterTableAction::SetDefault { column, default } = action {
             set_column_default(txn, executor, &mut updated, column, default.as_ref())?;
             changed = true;
+            continue;
+        }
+        if let AlterTableAction::DropColumn {
+            column,
+            if_exists,
+            cascade,
+        } = action
+        {
+            changed |= drop_column(
+                txn,
+                executor,
+                &mut updated,
+                &alter.name,
+                column,
+                *if_exists,
+                *cascade,
+            )?;
             continue;
         }
         let AlterTableAction::AddColumn {

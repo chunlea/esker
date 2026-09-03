@@ -1404,6 +1404,26 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A **column** something outside its own table still depends on: `2BP01`, and PostgreSQL's
+    /// third sentence in this class.
+    ///
+    /// The distinction that matters is not the kind of dependent, it is **where the dependent
+    /// lives**. Everything on the column's own table — an index over it, its `CHECK`, its
+    /// `NOT NULL`, its default, a foreign key declared on it — goes with the column silently and
+    /// needs no `CASCADE`. Only a dependent that lives on another object raises, and here that is
+    /// another table's foreign key referencing the column: `CREATE VIEW` is a named refusal in
+    /// this node, so the other half of PostgreSQL's answer has nothing that can produce it.
+    /// Measured (ADR 0051).
+    #[error("cannot drop column {column} of table {relation} because other objects depend on it")]
+    DependentColumn {
+        /// The column that cannot be dropped.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+        /// `constraint c_pu_fkey on table c depends on column u of table p`
+        detail: String,
+    },
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -1788,6 +1808,7 @@ impl SqlError {
             SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
+            | SqlError::DependentColumn { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
             | SqlError::DependentFunction { .. } => {
@@ -1897,6 +1918,7 @@ impl SqlError {
             | SqlError::ForeignKeyViolation { detail, .. }
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. }
+            | SqlError::DependentColumn { detail, .. }
             | SqlError::DependentFunction { detail, .. }
             | SqlError::DependentSchema { detail, .. }
             | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
@@ -2019,7 +2041,9 @@ impl SqlError {
             // and it is still the right sentence: it is what a real server says, and it is what
             // the user has to write once that unit lands. Saying something else would send them
             // looking for a different fix.
-            SqlError::DependentSchema { .. } | SqlError::DependentTable { .. }
+            SqlError::DependentSchema { .. }
+            | SqlError::DependentTable { .. }
+            | SqlError::DependentColumn { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentFunction { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())

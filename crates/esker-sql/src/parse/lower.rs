@@ -1705,6 +1705,31 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             });
             continue;
         }
+        // **One clause per column, however many the statement has.** `remove_columns` and
+        // `remove_timestamps` send `ALTER TABLE "x" DROP COLUMN "a", DROP COLUMN "b"` as one
+        // statement (`abstract/schema_statements.rb:700`), and `change_table` can put an
+        // `ADD COLUMN` in the same one — which the loop this sits in already allows. `sqlparser`
+        // additionally reads `DROP COLUMN a, b` as one action naming two columns, so the names
+        // are a list here and each becomes its own action.
+        if let AlterTableOperation::DropColumn {
+            has_column_keyword: _,
+            column_names,
+            if_exists,
+            drop_behavior,
+        } = operation
+        {
+            // `RESTRICT` is the default and is what happens with neither word, so it needs no
+            // flag; `CASCADE` is the one that changes an answer.
+            let cascade = matches!(drop_behavior, Some(sqlparser::ast::DropBehavior::Cascade));
+            for column_name in column_names {
+                actions.push(plan::AlterTableAction::DropColumn {
+                    column: ident(column_name),
+                    if_exists: *if_exists,
+                    cascade,
+                });
+            }
+            continue;
+        }
         let AlterTableOperation::AddColumn {
             column_keyword: _,
             if_not_exists,

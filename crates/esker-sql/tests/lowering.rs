@@ -176,7 +176,7 @@ fn refuses_by_name(cases: &[(&str, &str)]) {
 /// would need a row rewritten are the ones worth reading twice: each is refused because the
 /// `ALTER` is meant to touch no row at all.
 #[test]
-fn every_alter_table_action_but_add_column_is_refused_by_name() {
+fn every_unimplemented_alter_table_action_is_refused_by_name() {
     let cases = [
         (
             "ALTER TABLE t ADD COLUMN c int8 NOT NULL",
@@ -197,7 +197,6 @@ fn every_alter_table_action_but_add_column_is_refused_by_name() {
             "ADD COLUMN ... PRIMARY KEY",
         ),
         ("ALTER TABLE t ADD COLUMN c text COLLATE \"C\"", "COLLATE"),
-        ("ALTER TABLE t DROP COLUMN a", "ALTER TABLE ... DROP COLUMN"),
         (
             "ALTER TABLE t RENAME COLUMN a TO b",
             "ALTER TABLE ... RENAME COLUMN",

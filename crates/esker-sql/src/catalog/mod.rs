@@ -1403,6 +1403,18 @@ impl TableDef {
             .filter(|(_, column)| !column.dropped)
     }
 
+    /// Every column below the row id **including the ones `DROP COLUMN` tombstoned**, with their
+    /// ordinals.
+    ///
+    /// The one caller is `pg_attribute`, and it is the one view that must show a tombstone: a real
+    /// server keeps the row with `attisdropped` set, and `ActiveRecord`'s `column_definitions`
+    /// filters `AND NOT a.attisdropped` — so the row has to be there for that query to be the one
+    /// PostgreSQL answers. Everything else wants [`TableDef::user_columns`] (ADR 0051).
+    pub fn all_user_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
+        let skip = usize::from(self.row_id().is_some());
+        self.columns.iter().enumerate().skip(skip)
+    }
+
     /// How many columns a user can see. Not `columns.len()`, once anything has been dropped.
     #[must_use]
     pub fn live_column_count(&self) -> usize {
@@ -1427,13 +1439,19 @@ impl TableDef {
     /// The position of a column by name, or `None`.
     ///
     /// A user's name never finds the internal row id, because that column's name is one no
-    /// statement can contain ([`INTERNAL_ROW_ID_NAME`]).
+    /// statement can contain ([`INTERNAL_ROW_ID_NAME`]), and it never finds a column `DROP COLUMN`
+    /// tombstoned — which is the one edit that makes `SELECT gone` the `42703` PostgreSQL answers,
+    /// and makes it so for every clause at once rather than for the ones somebody remembered
+    /// (ADR 0051). A tombstone's *stored* name is unchanged here; the mangled
+    /// `........pg.dropped.N........` spelling is `pg_attribute`'s, and is rendered there.
     #[must_use]
     pub fn column(&self, name: &str) -> Option<usize> {
         if name.is_empty() {
             return None;
         }
-        self.columns.iter().position(|column| column.name == name)
+        self.columns
+            .iter()
+            .position(|column| column.name == name && !column.dropped)
     }
 
     /// The position of the internal row id, or `None` for a table whose user declared a primary
@@ -1468,7 +1486,14 @@ impl TableDef {
     /// the whole of what makes the row id *hidden* rather than merely unnamed.
     pub fn user_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
         let skip = usize::from(self.row_id().is_some());
-        self.columns.iter().enumerate().skip(skip)
+        // **And nothing `DROP COLUMN` tombstoned.** This is the `SELECT *` half of ADR 0051, and
+        // it is here rather than at each call site because "the columns a user can see" is what
+        // this method already meant — a dropped column simply stopped being one.
+        self.columns
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .filter(|(_, column)| !column.dropped)
     }
 
     /// Every column's type, in encoding order — what [`crate::row`] needs.

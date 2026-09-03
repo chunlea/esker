@@ -196,3 +196,66 @@ NULL
 NULL
 NULL
 NULL
+
+# --- DROP COLUMN: the slot stays, so rows from both sides of the drop read alike (ADR 0051) ---
+
+statement ok
+CREATE TABLE dc (id int8 PRIMARY KEY, keep text, gone int8, tail text)
+
+statement ok
+INSERT INTO dc VALUES (1, 'a', 10, 'x')
+
+statement ok
+INSERT INTO dc VALUES (2, 'b', 20, 'y')
+
+statement ok
+ALTER TABLE dc DROP COLUMN gone
+
+# A row written after the drop, beside two written before it. If the slot were removed rather than
+# tombstoned, the two old rows would carry a column the schema does not have — which decode_row
+# refuses — and if the slot shifted, `tail` would read the dropped column's value.
+statement ok
+INSERT INTO dc VALUES (3, 'c', 'z')
+
+query ITT rowsort
+SELECT * FROM dc
+----
+1	a	x
+2	b	y
+3	c	z
+
+# The name resolves nowhere a user can write it.
+statement error (42703)
+SELECT gone FROM dc
+
+statement error (42703)
+UPDATE dc SET gone = 1
+
+# The name is free again and the slot is not: a re-added `gone` is a new column that reads NULL,
+# not the int8 still sitting in the old rows' bytes.
+statement ok
+ALTER TABLE dc ADD COLUMN gone text
+
+query T rowsort
+SELECT gone FROM dc
+----
+NULL
+NULL
+NULL
+
+# Several clauses in one statement, which is what `remove_columns` sends.
+statement ok
+ALTER TABLE dc DROP COLUMN keep, DROP COLUMN gone
+
+query IT rowsort
+SELECT * FROM dc
+----
+1	x
+2	y
+3	z
+
+statement error (42703)
+ALTER TABLE dc DROP COLUMN nosuch
+
+statement ok
+ALTER TABLE dc DROP COLUMN IF EXISTS nosuch
