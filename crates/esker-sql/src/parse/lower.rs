@@ -106,8 +106,161 @@ impl Parsed {
                 )?);
             }
         }
+        if let plan::Statement::CreateDatabase(create) = &mut lowered {
+            apply_database_options(create, self.database_options())?;
+        }
         Ok(lowered)
     }
+}
+
+/// The one encoding this node speaks, which is what every database it has is in.
+pub(crate) const ENCODING: &str = "UTF8";
+
+/// The one collation, which sorts by byte value — a collation is a feature this node does not
+/// have, so `C` is the honest name for what it does.
+pub(crate) const COLLATION: &str = "C";
+
+/// PostgreSQL 19's server encodings, so that a name it has and a name nobody has get the two
+/// different errors PostgreSQL gives them: a name off this list is `42704 … is not a valid
+/// encoding name`, and one on it that is not [`ENCODING`] is a refusal by name.
+const ENCODING_NAMES: &[&str] = &[
+    "BIG5",
+    "EUC_CN",
+    "EUC_JP",
+    "EUC_JIS_2004",
+    "EUC_KR",
+    "EUC_TW",
+    "GB18030",
+    "GBK",
+    "ISO_8859_5",
+    "ISO_8859_6",
+    "ISO_8859_7",
+    "ISO_8859_8",
+    "JOHAB",
+    "KOI8R",
+    "KOI8U",
+    "LATIN1",
+    "LATIN2",
+    "LATIN3",
+    "LATIN4",
+    "LATIN5",
+    "LATIN6",
+    "LATIN7",
+    "LATIN8",
+    "LATIN9",
+    "LATIN10",
+    "MULE_INTERNAL",
+    "SJIS",
+    "SHIFT_JIS_2004",
+    "SQL_ASCII",
+    "UHC",
+    "UTF8",
+    "WIN866",
+    "WIN874",
+    "WIN1250",
+    "WIN1251",
+    "WIN1252",
+    "WIN1253",
+    "WIN1254",
+    "WIN1255",
+    "WIN1256",
+    "WIN1257",
+    "WIN1258",
+];
+
+/// The spellings PostgreSQL accepts for [`ENCODING`]. `UNICODE` is its documented alias and is
+/// what some clients send.
+const UTF8_SPELLINGS: &[&str] = &["UTF8", "UTF-8", "UNICODE"];
+
+/// `CREATE DATABASE`'s options, as PostgreSQL answers them on a cluster with one encoding and one
+/// collation.
+///
+/// **Every option PostgreSQL has is read here**, and what separates them is not whether this node
+/// implements the option but whether a client could *tell* that it had not:
+///
+///   * `ENCODING`, `LC_COLLATE`, `LC_CTYPE` and `LOCALE` are **honoured**, which on this cluster
+///     means checked against the one encoding and the one collation there are. They are not
+///     recorded, because every database here has the same two values and a record of a constant is
+///     a place for two answers to disagree.
+///   * `TEMPLATE` travels to the executor, which is where the directory is.
+///   * `OWNER` and `TABLESPACE` name facilities this node does not have, so every value gets
+///     PostgreSQL's own `42704` for a name that is not there — which is true here of every name
+///     but `pg_default`, the one that names the only storage there is.
+///   * `STRATEGY` names *how* PostgreSQL copies a template and there is nothing to copy, so its
+///     two valid values are accepted and have no effect, and a third is PostgreSQL's `22023`.
+///   * `CONNECTION LIMIT`, `ALLOW_CONNECTIONS` and `IS_TEMPLATE` are **refused by name** unless
+///     they ask for the default, because each of them is a promise a client can check: it would
+///     connect past the limit, connect to a database declared closed, or copy from something that
+///     is not a template. `CONNECTION LIMIT` in particular waits on the session registry that
+///     `DROP DATABASE` of another session's database waits on.
+///   * The ICU and locale-provider family is refused by name: this node has one provider and no
+///     ICU at all.
+///   * An option PostgreSQL does not have is its own `42601 option "x" not recognized`, which is a
+///     **syntax** error there and not a feature refusal — measured.
+fn apply_database_options(
+    create: &mut plan::CreateDatabase,
+    options: &[(String, String)],
+) -> Result<()> {
+    for (name, value) in options {
+        match name.as_str() {
+            "ENCODING" => {
+                let upper = value.to_ascii_uppercase();
+                if !UTF8_SPELLINGS.contains(&upper.as_str()) {
+                    if !ENCODING_NAMES.contains(&upper.as_str()) {
+                        return Err(SqlError::InvalidEncodingName(value.clone()));
+                    }
+                    return Err(SqlError::unsupported(format!(
+                        "the encoding {upper}, on a node whose only encoding is {ENCODING}"
+                    )));
+                }
+            }
+            "LC_COLLATE" | "LC_CTYPE" | "LOCALE" => {
+                if !value.eq_ignore_ascii_case(COLLATION) {
+                    return Err(SqlError::unsupported(format!(
+                        "the collation {value}, on a node whose only collation is {COLLATION}"
+                    )));
+                }
+            }
+            "TEMPLATE" => create.template = Some(fold_identifier(value, false).0),
+            "OWNER" => return Err(SqlError::UndefinedRole(value.clone())),
+            "TABLESPACE" => {
+                if !value.eq_ignore_ascii_case("pg_default") {
+                    return Err(SqlError::UndefinedTablespace(value.clone()));
+                }
+            }
+            "STRATEGY" => {
+                if !value.eq_ignore_ascii_case("wal_log")
+                    && !value.eq_ignore_ascii_case("file_copy")
+                {
+                    return Err(SqlError::InvalidCreateDatabaseStrategy(value.clone()));
+                }
+            }
+            // The default is `-1`, which is "no limit" and is the only answer this node can keep.
+            "CONNECTION LIMIT" if value == "-1" => {}
+            "ALLOW_CONNECTIONS" if is_true(value) => {}
+            "IS_TEMPLATE" if !is_true(value) => {}
+            "CONNECTION LIMIT" | "ALLOW_CONNECTIONS" | "IS_TEMPLATE" | "OID"
+            | "LOCALE_PROVIDER" | "ICU_LOCALE" | "ICU_RULES" | "COLLATION_VERSION"
+            | "BUILTIN_LOCALE" => {
+                return Err(SqlError::unsupported(format!(
+                    "CREATE DATABASE ... {name} = {value}"
+                )));
+            }
+            other => {
+                return Err(SqlError::UnrecognizedDatabaseOption(
+                    other.to_ascii_lowercase(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A boolean option's value, in the spellings PostgreSQL takes for one.
+fn is_true(value: &str) -> bool {
+    ["true", "on", "yes", "1", "t", "y"]
+        .iter()
+        .any(|spelling| value.eq_ignore_ascii_case(spelling))
 }
 
 #[allow(
@@ -223,12 +376,12 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: *if_not_exists,
             }))
         }
-        // `CREATE DATABASE [IF NOT EXISTS] name`. **PostgreSQL's option list is a `42601` before
-        // it can be a `0A000`**: `sqlparser` 0.62.0's `CREATE DATABASE` grammar has `LOCATION`,
-        // `MANAGEDLOCATION`, `CLONE` and MySQL's `CHARACTER SET`/`COLLATE` and nothing else, so
-        // `ENCODING = 'utf8'` — what `rake db:create` sends — never reaches this arm. The four it
-        // *can* read are refused by name here, so that a statement this node parses and cannot
-        // honour is never silently taken as the bare form.
+        // `CREATE DATABASE [IF NOT EXISTS] name`. **PostgreSQL's options never reach this arm**:
+        // `sqlparser` 0.62.0's grammar has `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
+        // `CHARACTER SET`/`COLLATE` and nothing PostgreSQL spells, so the list is cut out of the
+        // source before the parse and re-attached in `lower_inline`. The four this parser *can*
+        // read are refused by name here, so that a statement it takes and this node cannot honour
+        // is never silently read as the bare form.
         Statement::CreateDatabase {
             db_name,
             if_not_exists,
@@ -253,6 +406,8 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             Ok(plan::Statement::CreateDatabase(plan::CreateDatabase {
                 name: object_name(db_name)?,
                 if_not_exists: *if_not_exists,
+                // Filled from the text the parse could not read, in `lower_inline`.
+                template: None,
             }))
         }
         Statement::AlterSchema(alter) => {

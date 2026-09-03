@@ -2583,6 +2583,25 @@ pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
 /// ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)).
 pub const DEFAULT_DATABASE_ID: u64 = 1;
 
+/// The two databases PostgreSQL is born with, and this cluster is too.
+///
+/// **They are seeded rather than special-cased**, so `TEMPLATE = template0` — the spelling every
+/// writer of that clause uses, and the one PostgreSQL's own `HINT` points at — names a database
+/// that is there. Both are empty, which is what makes copying one exact on a node that cannot copy
+/// a database's contents: an empty copy of an empty database is the whole of it.
+///
+/// Their ids are ours. PostgreSQL's `template1` is oid 1 and this cluster's serving database
+/// already is, so these take the next two.
+pub const TEMPLATE_DATABASES: [(&str, u64); 2] = [("template1", 2), ("template0", 3)];
+
+/// Whether a name is one of [`TEMPLATE_DATABASES`], which is what `DROP DATABASE` refuses.
+#[must_use]
+pub fn is_template_database(name: &str) -> bool {
+    TEMPLATE_DATABASES
+        .iter()
+        .any(|(template, _)| *template == name)
+}
+
 /// Where ids for databases a user creates begin.
 ///
 /// PostgreSQL's own convention, and taken for the same reason: everything a user made is above
@@ -2605,10 +2624,12 @@ pub fn databases(txn: &dyn Txn) -> Result<Vec<(String, u64)>> {
         ));
     }
     if out.is_empty() {
-        return Ok(vec![(
-            crate::parse::DATABASE_NAME.to_owned(),
-            DEFAULT_DATABASE_ID,
-        )]);
+        out.push((crate::parse::DATABASE_NAME.to_owned(), DEFAULT_DATABASE_ID));
+        out.extend(
+            TEMPLATE_DATABASES
+                .iter()
+                .map(|(name, id)| ((*name).to_owned(), *id)),
+        );
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
@@ -2623,8 +2644,13 @@ pub fn database_id(txn: &dyn Txn, name: &str) -> Result<Option<u64>> {
     if let Some(bytes) = txn.get(&record::database_key(name))? {
         return Ok(Some(record::decode_database(&bytes)?));
     }
-    if name == crate::parse::DATABASE_NAME && seeded(txn)? {
-        return Ok(Some(DEFAULT_DATABASE_ID));
+    if seeded(txn)? {
+        if name == crate::parse::DATABASE_NAME {
+            return Ok(Some(DEFAULT_DATABASE_ID));
+        }
+        if let Some((_, id)) = TEMPLATE_DATABASES.iter().find(|(seed, _)| *seed == name) {
+            return Ok(Some(*id));
+        }
     }
     Ok(None)
 }
@@ -2647,6 +2673,12 @@ pub fn create_database(txn: &mut dyn Txn, name: &str, id: u64) -> Result<()> {
             &record::database_key(crate::parse::DATABASE_NAME),
             &record::encode_database(DEFAULT_DATABASE_ID),
         );
+        for (template, id) in TEMPLATE_DATABASES {
+            txn.put(
+                &record::database_key(template),
+                &record::encode_database(id),
+            );
+        }
     }
     txn.put(&record::database_key(name), &record::encode_database(id));
     bump_version(txn)
@@ -2687,6 +2719,13 @@ pub fn allocate_database_id(txn: &mut dyn Txn) -> Result<u64> {
         .ok_or_else(|| SqlError::Internal("the database id sequence is exhausted".into()))?;
     txn.put(&key, &record::encode_counter(after));
     Ok(next)
+}
+
+/// Whether a tenant holds any relation, which is what makes copying it something this node cannot
+/// do — an empty copy of an empty database is exact, and of a full one is a wrong answer.
+pub fn has_relations(txn: &dyn Txn, tenant: u64) -> Result<bool> {
+    let (start, end) = record::name_range(tenant);
+    Ok(!txn.scan(&start, &end, 1)?.is_empty())
 }
 
 /// The one schema every tenant has.
@@ -4032,7 +4071,12 @@ mod tests {
 
         assert_eq!(
             databases(&*txn).unwrap(),
-            vec![(crate::parse::DATABASE_NAME.to_owned(), 1)]
+            vec![
+                (crate::parse::DATABASE_NAME.to_owned(), 1),
+                ("template0".to_owned(), 3),
+                ("template1".to_owned(), 2),
+            ],
+            "the database being served, and the two every cluster is born with"
         );
         assert_eq!(
             database_id(&*txn, crate::parse::DATABASE_NAME).unwrap(),
@@ -4061,8 +4105,10 @@ mod tests {
             vec![
                 ("arunit2".to_owned(), 16_384),
                 (crate::parse::DATABASE_NAME.to_owned(), 1),
+                ("template0".to_owned(), 3),
+                ("template1".to_owned(), 2),
             ],
-            "sorted by name, and the seed is there beside the new one"
+            "sorted by name, and every seed is there beside the new one"
         );
         assert_eq!(database_id(&*txn, "arunit2").unwrap(), Some(16_384));
         assert_eq!(
@@ -4111,6 +4157,8 @@ mod tests {
             vec![
                 ("arunit3".to_owned(), 16_385),
                 (crate::parse::DATABASE_NAME.to_owned(), 1),
+                ("template0".to_owned(), 3),
+                ("template1".to_owned(), 2),
             ]
         );
         assert_eq!(database_id(&*txn, "arunit2").unwrap(), None);
@@ -4182,8 +4230,8 @@ mod tests {
         assert_eq!(database_id(&*txn, "arunit23").unwrap(), None);
         assert_eq!(
             databases(&*txn).unwrap().len(),
-            4,
-            "three written and the seed"
+            6,
+            "three written, the seed, and the two templates"
         );
     }
 

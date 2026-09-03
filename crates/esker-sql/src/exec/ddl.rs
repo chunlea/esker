@@ -1738,6 +1738,21 @@ pub(super) fn create_database(
         }
         return Err(SqlError::DuplicateDatabase(create.name.clone()));
     }
+    // **`TEMPLATE` is the one option whose value names something in the catalog**, so it is
+    // decided here and not where the rest of the list is read. A database this node creates is
+    // empty, and an empty copy of an empty template is exact — so what it cannot do is copy a
+    // template that holds anything, and that is refused by name rather than answered with an empty
+    // database somebody asked to be a copy.
+    if let Some(template) = &create.template {
+        let Some(id) = catalog::database_id(&*txn, template)? else {
+            return Err(SqlError::UndefinedTemplateDatabase(template.clone()));
+        };
+        if catalog::has_relations(&*txn, id)? {
+            return Err(SqlError::unsupported(format!(
+                "CREATE DATABASE ... TEMPLATE {template}, which is not empty"
+            )));
+        }
+    }
     let id = catalog::allocate_database_id(txn)?;
     catalog::create_database(txn, &create.name, id)?;
     Ok(Outcome::done("CREATE DATABASE"))
@@ -1768,6 +1783,12 @@ pub(super) fn drop_database(
         // comparing names would answer wrongly the moment two spellings reach one database.
         if id == executor.tenant {
             return Err(SqlError::DatabaseInUse(name.clone()));
+        }
+        // A template is there rather than missing and is not a dependency violation either, so it
+        // is its own class — `42809`, measured. `IF EXISTS` does not cover it, for the same reason
+        // it does not cover the open database.
+        if catalog::is_template_database(name) {
+            return Err(SqlError::CannotDropTemplateDatabase);
         }
         catalog::drop_database(txn, name, id)?;
     }

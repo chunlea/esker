@@ -240,6 +240,12 @@ pub struct Parsed {
     /// clause texts travel here — the same arrangement `concurrently` uses for a keyword the
     /// parser cannot carry ([`strip_exclude_constraints`]).
     exclude: Vec<String>,
+    /// The `CREATE DATABASE` options cut out of the source so the statement would parse.
+    ///
+    /// `sqlparser` 0.62.0 has no grammar for any of them, so they travel here — the same
+    /// arrangement `exclude` uses for a clause the parser cannot read
+    /// ([`strip_create_database_options`]).
+    database_options: Vec<Opt>,
     /// Whether `CREATE TABLE` was written `CREATE UNLOGGED TABLE`.
     ///
     /// `sqlparser` 0.62.0 reads `TEMP`/`TEMPORARY` before `TABLE` and not `UNLOGGED`, so the word
@@ -299,6 +305,12 @@ impl Parsed {
         &self.exclude
     }
 
+    /// The `CREATE DATABASE` options this statement was rewritten without, `(NAME, value)`.
+    #[must_use]
+    pub fn database_options(&self) -> &[(String, String)] {
+        &self.database_options
+    }
+
     /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
     #[must_use]
     pub fn rendered(&self) -> String {
@@ -322,6 +334,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         .map(|(_, clauses)| clauses)
         .unwrap_or_default();
     let unlogged = strip_unlogged(sql, &scanned).is_some();
+    let database_options = strip_create_database_options(sql, &scanned)
+        .map(|(_, options)| options)
+        .unwrap_or_default();
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
@@ -332,6 +347,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 class,
                 concurrently,
                 exclude: exclude.clone(),
+                database_options: database_options.clone(),
                 unlogged,
             }
         })
@@ -367,6 +383,160 @@ fn strip_unlogged(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let rest = sql.get(at + "UNLOGGED".len()..)?;
     kept.push_str(rest.strip_prefix(' ').unwrap_or(rest));
     Some(kept)
+}
+
+/// The option list cut out of a `CREATE DATABASE`, and the statement without it.
+///
+/// **`sqlparser` 0.62.0 has no grammar for PostgreSQL's options.** Its `parse_create_database`
+/// reads `LOCATION`, `MANAGEDLOCATION`, `CLONE` and `MySQL`'s `CHARACTER SET`/`COLLATE`, and none of
+/// what PostgreSQL spells — `ENCODING`, the one `rake db:create` always sends, exists in that
+/// crate only as a `COPY` option. So the statement is a *syntax error* rather than a clause the
+/// lowering declines, which is contract C1's shortfall and this module's standing fix: rewrite the
+/// source so it parses and carry what was taken out beside the tree
+/// ([`strip_exclude_constraints`] does the same for a clause the parser cannot read).
+///
+/// Everything after the database's name is the option list, so the cut is one offset rather than a
+/// search — and it is taken only when the whole list parses, because a list this cannot read is
+/// one `sqlparser` should be left to refuse as the syntax error it is.
+fn strip_create_database_options(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec<Opt>)> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("CREATE") || !second.eq_ignore_ascii_case("DATABASE") {
+        return None;
+    }
+    let at = after_database_name(sql.as_bytes())?;
+    let tail = sql.get(at..)?.trim_end();
+    let tail = tail.strip_suffix(';').unwrap_or(tail).trim();
+    if tail.is_empty() {
+        return None;
+    }
+    let options = create_database_options(tail)?;
+    Some((sql.get(..at)?.to_owned(), options))
+}
+
+/// One `CREATE DATABASE` option: its name upper-cased, and its value as written without quotes.
+pub(crate) type Opt = (String, String);
+
+/// The byte offset just past a `CREATE DATABASE`'s name, or `None` if this is not one.
+fn after_database_name(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    for keyword in ["CREATE", "DATABASE"] {
+        at = eat_word(bytes, skip_blank(bytes, at), keyword)?;
+    }
+    at = skip_blank(bytes, at);
+    // `IF NOT EXISTS` sits between the keyword and the name, and all three words or none.
+    if let Some(after_if) = eat_word(bytes, at, "IF")
+        && let Some(after_not) = eat_word(bytes, skip_blank(bytes, after_if), "NOT")
+        && let Some(after_exists) = eat_word(bytes, skip_blank(bytes, after_not), "EXISTS")
+    {
+        at = after_exists;
+    }
+    skip_name(bytes, skip_blank(bytes, at))
+}
+
+/// Whitespace and comments, which may sit anywhere a space may.
+fn skip_blank(bytes: &[u8], mut at: usize) -> usize {
+    loop {
+        match bytes.get(at) {
+            Some(byte) if byte.is_ascii_whitespace() => at += 1,
+            Some(b'-') if bytes.get(at + 1) == Some(&b'-') => at = line_comment_end(bytes, at),
+            Some(b'/') if bytes.get(at + 1) == Some(&b'*') => at = block_comment_end(bytes, at),
+            _ => return at,
+        }
+    }
+}
+
+/// `keyword` at `at`, case-insensitively and on a word boundary; the offset past it, or `None`.
+fn eat_word(bytes: &[u8], at: usize, keyword: &str) -> Option<usize> {
+    let end = at + keyword.len();
+    let found = bytes.get(at..end)?;
+    if !found.eq_ignore_ascii_case(keyword.as_bytes()) {
+        return None;
+    }
+    // A boundary, so `DATABASES` is not `DATABASE`.
+    match bytes.get(end) {
+        Some(byte) if byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$' => None,
+        _ => Some(end),
+    }
+}
+
+/// One identifier — quoted or bare — and the offset past it.
+fn skip_name(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) == Some(&b'"') {
+        let end = double_quote_end(bytes, at);
+        return (end > at).then_some(end);
+    }
+    let mut end = at;
+    while matches!(bytes.get(end), Some(byte) if byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$' || *byte >= 0x80)
+    {
+        end += 1;
+    }
+    (end > at).then_some(end)
+}
+
+/// A `CREATE DATABASE` option list as `(NAME, value)` pairs, or `None` when it is not one.
+///
+/// The grammar PostgreSQL documents: an optional `WITH`, then `name [=] value` repeated, where a
+/// value is a quoted string, an identifier or a number, and `CONNECTION LIMIT` is the one option
+/// whose name is two words. Nothing here interprets a value — that is
+/// `crate::parse::lower`'s, which is where a wrong one becomes the error PostgreSQL gives it.
+fn create_database_options(text: &str) -> Option<Vec<Opt>> {
+    let bytes = text.as_bytes();
+    let mut at = skip_blank(bytes, 0);
+    if let Some(after) = eat_word(bytes, at, "WITH") {
+        at = skip_blank(bytes, after);
+    }
+    let mut options = Vec::new();
+    while at < bytes.len() {
+        let end = skip_name(bytes, at)?;
+        let mut name = text.get(at..end)?.to_ascii_uppercase();
+        at = skip_blank(bytes, end);
+        // `CONNECTION LIMIT` is one option written as two words, and the only one that is.
+        if name == "CONNECTION"
+            && let Some(after) = eat_word(bytes, at, "LIMIT")
+        {
+            "CONNECTION LIMIT".clone_into(&mut name);
+            at = skip_blank(bytes, after);
+        }
+        if bytes.get(at) == Some(&b'=') {
+            at = skip_blank(bytes, at + 1);
+        }
+        let (value, after) = option_value(text, at)?;
+        options.push((name, value));
+        at = skip_blank(bytes, after);
+        // A comma is not PostgreSQL's separator here, but it costs nothing to allow one.
+        if bytes.get(at) == Some(&b',') {
+            at = skip_blank(bytes, at + 1);
+        }
+    }
+    (!options.is_empty()).then_some(options)
+}
+
+/// One option's value — a quoted string, a quoted identifier, or a bare word or number — unquoted,
+/// with the offset past it.
+fn option_value(text: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    match bytes.get(at) {
+        Some(b'\'') => {
+            let end = single_quote_end(bytes, at);
+            let inner = text.get(at + 1..end.checked_sub(1)?)?;
+            Some((inner.replace("''", "'"), end))
+        }
+        Some(b'"') => {
+            let end = double_quote_end(bytes, at);
+            let inner = text.get(at + 1..end.checked_sub(1)?)?;
+            Some((inner.replace("\"\"", "\""), end))
+        }
+        _ => {
+            let mut end = at;
+            while matches!(bytes.get(end), Some(byte) if byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-' || *byte == b'.' || *byte >= 0x80)
+            {
+                end += 1;
+            }
+            (end > at).then(|| (text.get(at..end).unwrap_or_default().to_owned(), end))
+        }
+    }
 }
 
 /// Every `EXCLUDE` table constraint cut out of a `CREATE TABLE`, and the statement without them.
@@ -807,7 +977,8 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_synonym(sql, &scanned)
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
         .or_else(|| strip_unlogged(sql, &scanned))
-        .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept));
+        .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept))
+        .or_else(|| strip_create_database_options(sql, &scanned).map(|(kept, _)| kept));
     let text = rewritten.as_deref().unwrap_or(sql);
 
     let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
@@ -1180,97 +1351,6 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("CLUSTER", &["CLUSTER"], &[]),
     u("CHECKPOINT", &["CHECKPOINT"], &[]),
     u("MOVE", &["MOVE"], &[]),
-    // **`CREATE DATABASE` itself is implemented; its option list is not.** `sqlparser` 0.62.0's
-    // grammar for the statement has `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
-    // `CHARACTER SET`/`COLLATE` and nothing else, so every PostgreSQL option is a `42601` before
-    // it can be a `0A000` — a C1 break, which is what these rows exist to prevent. One per option
-    // keyword, because the construct a refusal names should be the one the user wrote.
-    //
-    // The cost is a database *named* for one of these words: `CREATE DATABASE encoding` is
-    // refused where a real server takes it. That is a `0A000` about a legal statement rather than
-    // a syntax error about one, which is the better of the two failures and the only one available
-    // without a parser of our own for this statement.
-    u(
-        "CREATE DATABASE with options",
-        &["CREATE", "DATABASE"],
-        &["WITH"],
-    ),
-    u(
-        "CREATE DATABASE ... OWNER",
-        &["CREATE", "DATABASE"],
-        &["OWNER"],
-    ),
-    u(
-        "CREATE DATABASE ... TEMPLATE",
-        &["CREATE", "DATABASE"],
-        &["TEMPLATE"],
-    ),
-    u(
-        "CREATE DATABASE ... ENCODING",
-        &["CREATE", "DATABASE"],
-        &["ENCODING"],
-    ),
-    u(
-        "CREATE DATABASE ... STRATEGY",
-        &["CREATE", "DATABASE"],
-        &["STRATEGY"],
-    ),
-    u(
-        "CREATE DATABASE ... LOCALE",
-        &["CREATE", "DATABASE"],
-        &["LOCALE"],
-    ),
-    u(
-        "CREATE DATABASE ... LC_COLLATE",
-        &["CREATE", "DATABASE"],
-        &["LC_COLLATE"],
-    ),
-    u(
-        "CREATE DATABASE ... LC_CTYPE",
-        &["CREATE", "DATABASE"],
-        &["LC_CTYPE"],
-    ),
-    u(
-        "CREATE DATABASE ... LOCALE_PROVIDER",
-        &["CREATE", "DATABASE"],
-        &["LOCALE_PROVIDER"],
-    ),
-    u(
-        "CREATE DATABASE ... ICU_LOCALE",
-        &["CREATE", "DATABASE"],
-        &["ICU_LOCALE"],
-    ),
-    u(
-        "CREATE DATABASE ... ICU_RULES",
-        &["CREATE", "DATABASE"],
-        &["ICU_RULES"],
-    ),
-    u(
-        "CREATE DATABASE ... COLLATION_VERSION",
-        &["CREATE", "DATABASE"],
-        &["COLLATION_VERSION"],
-    ),
-    u(
-        "CREATE DATABASE ... TABLESPACE",
-        &["CREATE", "DATABASE"],
-        &["TABLESPACE"],
-    ),
-    u(
-        "CREATE DATABASE ... ALLOW_CONNECTIONS",
-        &["CREATE", "DATABASE"],
-        &["ALLOW_CONNECTIONS"],
-    ),
-    u(
-        "CREATE DATABASE ... CONNECTION LIMIT",
-        &["CREATE", "DATABASE"],
-        &["CONNECTION", "LIMIT"],
-    ),
-    u(
-        "CREATE DATABASE ... IS_TEMPLATE",
-        &["CREATE", "DATABASE"],
-        &["IS_TEMPLATE"],
-    ),
-    u("CREATE DATABASE ... OID", &["CREATE", "DATABASE"], &["OID"]),
     // `DROP DATABASE … WITH (FORCE)` disconnects the sessions on it, which needs a session
     // registry this node does not have — so it is refused rather than quietly dropped.
     u("DROP DATABASE ... FORCE", &["DROP", "DATABASE"], &["FORCE"]),

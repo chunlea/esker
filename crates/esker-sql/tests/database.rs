@@ -26,13 +26,23 @@ fn creating_a_database_leaves_the_one_the_session_is_using() {
 
     assert_eq!(
         node.rows("SELECT datname FROM pg_database ORDER BY datname"),
-        vec![vec![SERVING.to_owned()]]
+        vec![
+            vec![SERVING.to_owned()],
+            vec!["template0".to_owned()],
+            vec!["template1".to_owned()],
+        ],
+        "the database being served, and the two every cluster is born with"
     );
 
     node.run("CREATE DATABASE arunit2").unwrap();
     assert_eq!(
         node.rows("SELECT datname FROM pg_database ORDER BY datname"),
-        vec![vec!["arunit2".to_owned()], vec![SERVING.to_owned()]]
+        vec![
+            vec!["arunit2".to_owned()],
+            vec![SERVING.to_owned()],
+            vec!["template0".to_owned()],
+            vec!["template1".to_owned()],
+        ]
     );
 
     // **The oid is the tenant id**, so the two are one number and `datname = current_database()`
@@ -61,7 +71,7 @@ fn a_second_database_of_one_name_is_refused_unless_the_clause_says_otherwise() {
     node.run("CREATE DATABASE IF NOT EXISTS arunit2").unwrap();
     assert_eq!(
         node.rows("SELECT count(*) FROM pg_database"),
-        vec![vec!["2".to_owned()]],
+        vec![vec!["4".to_owned()]],
         "the clause is a success and not a second row"
     );
 
@@ -113,7 +123,12 @@ fn a_dropped_database_leaves_the_directory_it_was_in() {
 
     assert_eq!(
         node.rows("SELECT datname FROM pg_database ORDER BY datname"),
-        vec![vec!["arunit3".to_owned()], vec![SERVING.to_owned()]]
+        vec![
+            vec!["arunit3".to_owned()],
+            vec![SERVING.to_owned()],
+            vec!["template0".to_owned()],
+            vec!["template1".to_owned()],
+        ]
     );
 
     // **Ids are not reused**, so the name coming back does not bring the old tenant's rows with
@@ -156,23 +171,106 @@ fn neither_statement_may_be_part_of_a_transaction_block() {
     node.run("ROLLBACK").unwrap();
 }
 
-/// **The option list is refused by name**, which is contract C2 — and it is a refusal rather than
-/// a feature because `sqlparser` 0.62.0's `CREATE DATABASE` grammar has no room for one, so
-/// without these rows every option would be a `42601` about a statement a real server runs.
-///
-/// `rake db:create` sends `ENCODING`, which is why it is the row that matters most.
+/// **`rake db:create`'s statement**, which is the one this whole option list exists for:
+/// `CREATE DATABASE "x" ENCODING = 'utf8'`. It was a `42601` — a syntax error about a statement a
+/// real server runs — until the list was cut out of the source before the parse.
 #[test]
-fn every_option_postgresql_takes_is_refused_by_name_and_never_as_syntax() {
+fn the_statement_rake_db_create_sends_is_an_answer() {
     let mut node = parity::Node::new(&[]);
 
+    node.run("CREATE DATABASE \"arunit\" ENCODING = 'utf8'")
+        .unwrap();
+    // Every spelling PostgreSQL takes for the same encoding, and the `WITH` and no-`=` forms.
+    node.run("CREATE DATABASE a2 ENCODING 'UTF8'").unwrap();
+    node.run("CREATE DATABASE a3 WITH ENCODING = 'unicode'")
+        .unwrap();
+    node.run("CREATE DATABASE a4 ENCODING = 'UTF-8' LC_COLLATE = 'C' LC_CTYPE = 'C'")
+        .unwrap();
+    node.run("CREATE DATABASE a5 TEMPLATE = template0 LOCALE = 'C' TABLESPACE = pg_default STRATEGY = 'wal_log'")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_database"),
+        vec![vec!["8".to_owned()]],
+        "five created, the one being served, and the two templates"
+    );
+    // **The values are not recorded, because there is nothing to record**: this cluster has one
+    // encoding and one collation, so every database has the same three and `pg_database` says so.
+    assert_eq!(
+        node.rows(
+            "SELECT DISTINCT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database"
+        ),
+        vec![vec!["UTF8".to_owned(), "C".to_owned(), "C".to_owned()]]
+    );
+}
+
+/// **A value this cluster cannot provide is refused by the value, in PostgreSQL's own words where
+/// PostgreSQL has them.**
+///
+/// The line these draw is not "is the option implemented" but "could a client tell that it was
+/// not": an encoding or a collation this node does not have is a refusal, an option naming a
+/// facility it has none of gets PostgreSQL's `42704` for a name that is not there, and an option
+/// PostgreSQL itself does not have gets PostgreSQL's own `42601` — which is a **syntax** error
+/// there and not a feature refusal.
+#[test]
+fn a_value_this_cluster_cannot_provide_is_refused_the_way_postgresql_refuses_one() {
+    let mut node = parity::Node::new(&[]);
+
+    for (statement, state, message) in [
+        (
+            "CREATE DATABASE d ENCODING = 'nosuchencoding'",
+            sqlstate::UNDEFINED_OBJECT,
+            "nosuchencoding is not a valid encoding name",
+        ),
+        (
+            "CREATE DATABASE d OWNER = alice",
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"alice\" does not exist",
+        ),
+        (
+            "CREATE DATABASE d TABLESPACE = fast",
+            sqlstate::UNDEFINED_OBJECT,
+            "tablespace \"fast\" does not exist",
+        ),
+        (
+            "CREATE DATABASE d STRATEGY = 'nosuch'",
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid create database strategy \"nosuch\"",
+        ),
+        (
+            "CREATE DATABASE d TEMPLATE = nosuchdb",
+            sqlstate::INVALID_CATALOG_NAME,
+            "template database \"nosuchdb\" does not exist",
+        ),
+        (
+            "CREATE DATABASE d NOSUCHOPTION = 1",
+            sqlstate::SYNTAX_ERROR,
+            "option \"nosuchoption\" not recognized",
+        ),
+    ] {
+        let error = node.run(statement).unwrap_err();
+        assert_eq!(error.sqlstate(), state, "{statement}: {error}");
+        assert_eq!(error.to_string(), message, "{statement}");
+    }
+    assert_eq!(
+        node.run("CREATE DATABASE d STRATEGY = 'nosuch'")
+            .unwrap_err()
+            .hint()
+            .as_deref(),
+        Some("Valid strategies are \"wal_log\" and \"file_copy\".")
+    );
+
+    // **An encoding PostgreSQL has and this node does not is a different failure from one nobody
+    // has**, which is why the encoding names are a list here rather than a single comparison.
     for statement in [
-        "CREATE DATABASE d WITH OWNER alice ENCODING 'UTF8'",
-        "CREATE DATABASE d ENCODING = 'utf8'",
-        "CREATE DATABASE d TEMPLATE template0",
-        "CREATE DATABASE d LC_COLLATE 'C' LC_CTYPE 'C'",
+        "CREATE DATABASE d ENCODING = 'LATIN1'",
+        "CREATE DATABASE d LC_COLLATE = 'en_US.utf8'",
+        "CREATE DATABASE d LOCALE = 'en_US.utf8'",
+        // Each of these is a promise a client can check — it would connect past the limit,
+        // connect to a database declared closed, or copy from something that is not a template.
         "CREATE DATABASE d CONNECTION LIMIT 5",
-        "CREATE DATABASE d TABLESPACE fast",
-        "DROP DATABASE IF EXISTS d WITH (FORCE)",
+        "CREATE DATABASE d ALLOW_CONNECTIONS = false",
+        "CREATE DATABASE d IS_TEMPLATE = true",
+        "CREATE DATABASE d LOCALE_PROVIDER = 'icu'",
     ] {
         let error = node.run(statement).unwrap_err();
         assert_eq!(
@@ -186,11 +284,43 @@ fn every_option_postgresql_takes_is_refused_by_name_and_never_as_syntax() {
         );
     }
 
-    // And the bare form is not caught by any of them, which is the half a refusal table gets
-    // wrong by being too eager.
-    node.run("CREATE DATABASE d").unwrap();
-    node.run("CREATE DATABASE IF NOT EXISTS d").unwrap();
-    node.run("DROP DATABASE d").unwrap();
+    // The defaults of the three that are refused **are** answers: they promise nothing.
+    node.run("CREATE DATABASE d1 CONNECTION LIMIT -1").unwrap();
+    node.run("CREATE DATABASE d2 ALLOW_CONNECTIONS = true")
+        .unwrap();
+    node.run("CREATE DATABASE d3 IS_TEMPLATE = false").unwrap();
+}
+
+/// **A template must be empty, because this node creates an empty database.**
+///
+/// An empty copy of an empty template is exact; of a full one it is a wrong answer wearing a
+/// success, so it is refused by name. `template0` and `template1` are seeded precisely so that the
+/// spelling everybody writes — and the one PostgreSQL's own `HINT` points at — names something.
+#[test]
+fn a_template_is_copied_only_when_there_is_nothing_to_copy() {
+    let mut node = parity::Node::new(&[]);
+
+    node.run("CREATE DATABASE fromtpl TEMPLATE = template1")
+        .unwrap();
+    node.run("CREATE TABLE t (id bigserial primary key)")
+        .unwrap();
+
+    let error = node
+        .run(&format!("CREATE DATABASE copied TEMPLATE = {SERVING}"))
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert!(error.to_string().contains("which is not empty"), "{error}");
+
+    // **A template is there rather than missing**, so it is its own class and `IF EXISTS` does not
+    // cover it — the same distinction the open database draws.
+    for statement in [
+        "DROP DATABASE template0",
+        "DROP DATABASE IF EXISTS template1",
+    ] {
+        let error = node.run(statement).unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::WRONG_OBJECT_TYPE, "{statement}");
+        assert_eq!(error.to_string(), "cannot drop a template database");
+    }
 }
 
 /// **Two databases on one cluster are two tenants, and the isolation is the key encoding rather
@@ -268,7 +398,7 @@ fn two_databases_hold_two_tables_of_one_name() {
     for node in [&mut arunit, &mut arunit2] {
         assert_eq!(
             node.rows("SELECT count(*) FROM pg_database"),
-            vec![vec!["2".to_owned()]]
+            vec![vec!["4".to_owned()]]
         );
     }
     assert_eq!(

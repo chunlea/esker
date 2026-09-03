@@ -983,6 +983,39 @@ pub enum SqlError {
     #[error("database \"{0}\" does not exist")]
     UndefinedDatabase(String),
 
+    /// A `CREATE DATABASE` option PostgreSQL does not have. **`42601`, not `0A000`** — measured:
+    /// PostgreSQL treats it as a syntax error and lower-cases the name back at the user.
+    #[error("option \"{0}\" not recognized")]
+    UnrecognizedDatabaseOption(String),
+
+    /// `ENCODING = 'nosuch'`. **The value is not quoted** in PostgreSQL's sentence, unlike almost
+    /// every other name it quotes back — measured.
+    #[error("{0} is not a valid encoding name")]
+    InvalidEncodingName(String),
+
+    /// `OWNER = x`. This node has no roles at all, so every name is this.
+    #[error("role \"{0}\" does not exist")]
+    UndefinedRole(String),
+
+    /// `TABLESPACE = x`. This node has no tablespaces but `pg_default`, which names the only
+    /// storage there is.
+    #[error("tablespace \"{0}\" does not exist")]
+    UndefinedTablespace(String),
+
+    /// `STRATEGY = 'nosuch'`. PostgreSQL names the two it has in a `HINT`.
+    #[error("invalid create database strategy \"{0}\"")]
+    InvalidCreateDatabaseStrategy(String),
+
+    /// `TEMPLATE = x` naming a database the directory does not have. **`3D000` like any other
+    /// missing database**, with a sentence that says which role the name was playing.
+    #[error("template database \"{0}\" does not exist")]
+    UndefinedTemplateDatabase(String),
+
+    /// `DROP DATABASE template0`. **Its own class**: the database is there and is not missing, it
+    /// is a kind of database this statement cannot act on.
+    #[error("cannot drop a template database")]
+    CannotDropTemplateDatabase,
+
     /// `DROP DATABASE` naming the one the session is connected to.
     ///
     /// PostgreSQL's own sentence and its own class: a database in use is not a missing one and not
@@ -1703,7 +1736,10 @@ impl SqlError {
             // saying out loud: the rows have no common shape, so there is nothing to type.
             | SqlError::ValuesRowLength
             | SqlError::SyntaxAtOrNear(_)
-            | SqlError::UnloggedView => sqlstate::SYNTAX_ERROR,
+            | SqlError::UnloggedView
+            // **PostgreSQL's own class for this**: an option its `CREATE DATABASE` does not have
+            // is a syntax error there and not a feature refusal. Measured.
+            | SqlError::UnrecognizedDatabaseOption(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
@@ -1722,7 +1758,12 @@ impl SqlError {
             | SqlError::UndefinedType(_)
             | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. }
-            | SqlError::ConstraintDoesNotExist(_) => sqlstate::UNDEFINED_OBJECT,
+            | SqlError::ConstraintDoesNotExist(_)
+            // `CREATE DATABASE`'s three options that name an object: an encoding nobody has, and
+            // the role and the tablespace this node has none of.
+            | SqlError::InvalidEncodingName(_)
+            | SqlError::UndefinedRole(_)
+            | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
@@ -1730,7 +1771,10 @@ impl SqlError {
             // statement, which is the same `42809` an `ALTER` on the wrong kind gets.
             | SqlError::ConstraintNotDeferrable(_)
             | SqlError::ParameterlessAggregate
-            | SqlError::ExclusionOperatorNotInFamily { .. } => sqlstate::WRONG_OBJECT_TYPE,
+            | SqlError::ExclusionOperatorNotInFamily { .. }
+            // A template database is there rather than missing, and is not a dependency violation
+            // either: it is a kind of database `DROP DATABASE` cannot act on.
+            | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
             SqlError::PermanentReferencesUnlogged => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
@@ -1834,7 +1878,9 @@ impl SqlError {
             | SqlError::SnapshotAfterQuery
             | SqlError::NotInATransactionBlock(_) => sqlstate::ACTIVE_SQL_TRANSACTION,
             SqlError::DuplicateDatabase(_) => sqlstate::DUPLICATE_DATABASE,
-            SqlError::UndefinedDatabase(_) => sqlstate::INVALID_CATALOG_NAME,
+            SqlError::UndefinedDatabase(_) | SqlError::UndefinedTemplateDatabase(_) => {
+                sqlstate::INVALID_CATALOG_NAME
+            }
             SqlError::DatabaseInUse(_) => sqlstate::OBJECT_IN_USE,
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
@@ -1876,7 +1922,8 @@ impl SqlError {
             | SqlError::NumericScaleOutOfRange(_)
             | SqlError::ParameterOutOfRange { .. }
             | SqlError::InvalidDestinationEncoding(_)
-            | SqlError::ZeroStep => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::ZeroStep
+            | SqlError::InvalidCreateDatabaseStrategy(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
@@ -2147,6 +2194,11 @@ impl SqlError {
             )),
             // PostgreSQL's own sentence, and it is the one thing the message does not say: the
             // column it names as missing is the *qualifier* the user wrote.
+            // PostgreSQL names the two it has, and the message alone does not say what a valid
+            // strategy looks like.
+            SqlError::InvalidCreateDatabaseStrategy(_) => {
+                Some("Valid strategies are \"wal_log\" and \"file_copy\".".to_owned())
+            }
             SqlError::QualifiedSetTarget { .. } => {
                 Some("SET target columns cannot be qualified with the relation name.".to_owned())
             }

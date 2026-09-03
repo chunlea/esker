@@ -1,4 +1,4 @@
-# 0051 — A database is a tenant, and the directory that names them
+# 0052 — A database is a tenant, and the directory that names them
 
 ## Context
 
@@ -65,9 +65,11 @@ somebody has to remember to write. Three things follow from that and they are th
    rule is that a connection sees exactly one database and *cannot* query across, so the constraint
    the encoding imposes is the constraint the semantics want. A design where cross-database access
    were possible would have to add the refusal back.
-2. **`DROP DATABASE` is two range deletes** — the tenant's slice of `'t'` and its slice of each
-   `'m' ++ "sql"` kind — and there is no third place a row can hide. Anything else makes dropping a
-   database a walk that a future record kind can silently fall out of.
+2. **`DROP DATABASE` is a bounded sweep** — the tenant's slice of `'t'`, and its slice under every
+   `'m' ++ "sql"` kind byte — and there is no third place a row can hide. It is every byte rather
+   than a list of the kinds that take a tenant, because a list is a thing to forget: the next
+   record kind added to `catalog::record` would leak its tenant's rows on every drop and nothing
+   would say so.
 3. **The id sequence is already per tenant** (`'m' ++ "sql" ++ 's' ++ tenant`), so two databases
    cannot collide on a relation id, and each starts counting from its own beginning the way a real
    database does.
@@ -97,7 +99,7 @@ immediately runs `SELECT current_database()` and three joins against `pg_databas
 encoding, the collation and the ctype (`postgresql/schema_statements.rb:230-258`, measured in
 `tests/corpus/pg19_coalesce_current_database.txt`) — and `CREATE DATABASE` has to check a name that
 belongs to no database in particular. So the directory is the one piece of state that cannot be
-tenant-scoped, and it is a new record kind in **`esker-sql`'s own metadata space**, which
+tenant-scoped, and it is **two** new record kinds in `esker-sql`'s own metadata space, which
 `catalog::record` owns end to end:
 
 ```text
@@ -122,13 +124,23 @@ checkpoint keys already rely on, and what makes `ar`, `arunit` and `arunit2` thr
 **The database id is the tenant id is the `pg_database` oid.** One number, so there is no mapping
 to keep consistent and no way for two of them to disagree.
 
-### A cluster with no directory has one database, and it is the one that is there
+### A cluster with no directory has the databases it is already serving
 
 An existing cluster has a tenant `1` full of rows and no `'D'` record. The directory is therefore
-**seeded rather than migrated**: a read that finds no databases answers with one — id `1`, named
-`DATABASE_NAME` — which is exactly what this node reports today. So an upgrade needs no step, the
-first `CREATE DATABASE` writes the seed row alongside the new one, and the constant that has been
-standing in for the directory becomes its default rather than being deleted.
+**seeded rather than migrated**: a read that finds nothing answers with the database this node
+reported before it could name a second — id `1`, named `DATABASE_NAME` — so an upgrade needs no
+step, and the constant that had been standing in for the directory becomes its default rather than
+being deleted. `create_database` writes the seed beside the first row anybody types, because
+otherwise the directory would stop being empty and the database the cluster was already serving
+would vanish from `pg_database`: a row disappearing because a *different* row was added.
+
+**`template0` and `template1` are seeded with it**, at ids 2 and 3. They arrived with
+`CREATE DATABASE`'s option list rather than with this decision, and they belong here because they
+are part of what the directory answers: without them `TEMPLATE = template0` — the spelling every
+writer of that clause uses, and the one PostgreSQL's own `HINT` points at — would name nothing, and
+a node claiming PostgreSQL's shape would be missing the two rows every cluster has. Both are empty,
+which is what makes copying one exact on a node that cannot copy a database's contents. Dropping
+one is `42809 cannot drop a template database`.
 
 ### What the startup packet selects, and what a wrong name costs
 
@@ -158,17 +170,24 @@ is `3D000 database "x" does not exist`, at startup, which is what a real server 
 - **The refusal `DROP DATABASE` can make is only about *this* session.** PostgreSQL refuses to drop
   a database any session is connected to; that needs a registry this node does not have, so what is
   enforced is `55006` for the one the current session is serving and nothing for the rest.
-- **PostgreSQL's option list is a `42601` before it can be a `0A000`.** `sqlparser` 0.62.0's
-  `CREATE DATABASE` grammar carries `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
-  `CHARACTER SET`/`COLLATE`, and nothing PostgreSQL spells — `ENCODING`, which is what
-  `rake db:create` sends, exists in that crate only as a `COPY` option. Every option keyword is
-  therefore a row in `parse`'s refusal table, so the answer is `0A000` naming the option rather than
-  a syntax error about a statement a real server runs (contract C1). The cost is a database *named*
-  for one of those words.
+- **PostgreSQL's option list is a `42601` before it can be a `0A000`**, because `sqlparser`
+  0.62.0's `CREATE DATABASE` grammar carries `LOCATION`, `MANAGEDLOCATION`, `CLONE` and `MySQL`'s
+  `CHARACTER SET`/`COLLATE` and nothing PostgreSQL spells — `ENCODING`, which is what
+  `rake db:create` sends, exists in that crate only as a `COPY` option. That is contract C1's
+  shortfall and it is closed the way this module closes one: the list is cut out of the source
+  before the parse and carried beside the tree. What sorts the options once they are read is **not
+  whether this node implements one but whether a client could tell that it had not** —
+  `ENCODING`/`LC_COLLATE`/`LC_CTYPE`/`LOCALE` are checked against the one encoding and the one
+  collation there are and **not recorded**, since a record of a constant is a place for two answers
+  to disagree; `OWNER` and `TABLESPACE` get PostgreSQL's own `42704` for a name that is not there,
+  which here is true of every name; and `CONNECTION LIMIT`, `ALLOW_CONNECTIONS` and `IS_TEMPLATE`
+  are refused unless they ask for the default, because each is a promise a client can check.
 - Anything that reads the tenant from a constant becomes a session property: the re-driver and the
   columnar asserter in `bin/esker-sql.rs` each take `TENANT` today and each has to say *which*
   database it is working on, or work on all of them.
-- `template0` / `template1` are not implemented and `CREATE DATABASE … TEMPLATE x` is refused by
-  name (contract C2). `rake db:create` sends `CREATE DATABASE "x" ENCODING = 'utf8'`, which the
-  directory can answer; copying a database's contents is a second unit and this one does not
-  pretend to it.
+- **`TEMPLATE` is honoured only where there is nothing to copy.** `template0` and `template1` are
+  seeded, so the clause names something; a template holding any relation is `0A000`, because an
+  empty copy of a full database is a wrong answer wearing a success. Copying a database's contents
+  is a second unit and this one does not pretend to it.
+- **`CONNECTION LIMIT` and refusing to drop a database another session holds want the same thing**
+  — a registry of live sessions — which is why they are one debt rather than two.
