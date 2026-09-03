@@ -242,15 +242,25 @@ pub struct DropSchema {
 /// `CREATE DATABASE [IF NOT EXISTS] name`.
 ///
 /// **A database is a tenant** ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)),
-/// so this statement allocates one and writes the cluster's directory. It carries no options:
-/// PostgreSQL's `ENCODING`, `LC_COLLATE`, `TEMPLATE` and their kin are not in `sqlparser` 0.62.0's
-/// `CREATE DATABASE` grammar at all, so the option list is a `42601` before it can be a `0A000`.
+/// so this statement allocates one and writes the cluster's directory. PostgreSQL's option list is
+/// not in `sqlparser` 0.62.0's `CREATE DATABASE` grammar at all, so it is cut out of the source
+/// before the parse and re-attached in the lowering
+/// (`crate::parse::strip_create_database_options`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateDatabase {
     /// The database's name, folded.
     pub name: String,
     /// `IF NOT EXISTS`, which turns the `42P04` into a notice and a success.
     pub if_not_exists: bool,
+    /// `TEMPLATE = x` — the database whose contents the new one starts with, or `None` for the
+    /// default.
+    ///
+    /// **The only option that reaches the executor**, because it is the only one whose value names
+    /// something in the catalog. Every other option is decided where it is read: this node has one
+    /// encoding and one collation, so `ENCODING`/`LC_COLLATE`/`LC_CTYPE` are answered against
+    /// constants and never recorded — there is nothing to record that is not already true of every
+    /// database here.
+    pub template: Option<String>,
 }
 
 /// `DROP DATABASE [IF EXISTS] name`.
