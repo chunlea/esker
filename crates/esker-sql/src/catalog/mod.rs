@@ -1718,7 +1718,11 @@ pub fn create_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) -
             sequence_id: sequence.id,
         }),
     );
-    Ok(())
+    // **The catalog version, without which the name is invisible.** Every node caches what names
+    // resolve to and the cache is keyed by this counter; a `CREATE TABLE` bumped it on the way out
+    // through `write_table`, and a sequence no column owns writes no table record at all, so
+    // nothing bumped it and `nextval` on the sequence just created answered `42P01`.
+    bump_version(txn)
 }
 
 /// One sequence by the pair its name resolves to, read straight from its record.

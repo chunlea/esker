@@ -100,6 +100,25 @@ pub struct CreateExtension {
     pub if_not_exists: bool,
 }
 
+/// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSequence {
+    /// Its name, folded, in the same namespace as tables and indexes.
+    pub name: String,
+    /// `IF NOT EXISTS`: an existing name is a notice rather than a `42P07`.
+    pub if_not_exists: bool,
+    /// `START n`: the **first** value `nextval` answers.
+    pub start: i64,
+    /// `INCREMENT BY n`.
+    pub increment: i64,
+    /// `OWNED BY t.c` — the table and column, unresolved. `None` for `OWNED BY NONE` and for a
+    /// statement that said nothing, which PostgreSQL treats the same.
+    ///
+    /// **Ownership is not a default**: it says the sequence goes when the column does, and the
+    /// column keeps whatever default it had.
+    pub owned_by: Option<(String, String)>,
+}
+
 /// `DROP SEQUENCE [IF EXISTS] s [, …] [CASCADE | RESTRICT]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSequence {

@@ -361,6 +361,92 @@ pub(super) fn create_extension(
     done
 }
 
+/// A sequence's first value as the counter stores it.
+///
+/// The counter is a `u64` and `START` is signed, so a negative start is refused by name rather
+/// than wrapped into an enormous positive one — this node counts up from the value it is given and
+/// has nowhere to put a number below zero.
+fn sequence_start(start: i64) -> Result<u64> {
+    u64::try_from(start)
+        .map_err(|_| SqlError::unsupported(format!("CREATE SEQUENCE ... START {start}")))
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c]`.
+///
+/// **`OWNED BY` does not give the column a default.** It records that the sequence goes when the
+/// column does — the opposite direction from a default — and `pg_attrdef` shows it: creating one
+/// against a `bigserial`'s column leaves that column's own sequence as its default and the table
+/// with one default row, measured. Pointing the column at the new sequence takes an
+/// `ALTER COLUMN … SET DEFAULT`, which is the suite's next statement.
+///
+/// A column may own more than one, which is why the record is keyed by the sequence's id
+/// (`catalog::SequenceDef`).
+pub(super) fn create_sequence(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateSequence,
+) -> Result<Outcome> {
+    // The whole relation namespace, not just other sequences: `CREATE SEQUENCE` over a table's
+    // name is the same `42P07` a table over a table's is.
+    if existing_relation(executor, txn, &create.name)?.is_some() {
+        if create.if_not_exists {
+            executor.notice(SqlError::AlreadyExistsSkipping(create.name.clone()));
+            return Ok(Outcome::done("CREATE SEQUENCE"));
+        }
+        return Err(SqlError::DuplicateTable(create.name.clone()));
+    }
+
+    // `OWNED BY t.c` names a column, and **both halves can be wrong with different codes**: a
+    // missing table is `42P01` and a missing column is `42703`, which spells the relation it
+    // looked in.
+    let owner = match &create.owned_by {
+        Some((table, column)) => {
+            let table = executor.require_table(txn, table)?;
+            let at = table
+                .column(column)
+                .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                    column: column.clone(),
+                    relation: table.name.clone(),
+                })?;
+            Some((table, at))
+        }
+        None => None,
+    };
+    let sequence = catalog::SequenceDef {
+        id: catalog::allocate_id(txn, executor.tenant)?,
+        name: create.name.clone(),
+        table_id: owner
+            .as_ref()
+            .map_or(catalog::STANDALONE_SEQUENCE_OWNER, |(table, _)| table.id),
+        // **Nothing yet.** It fills no column until an `ALTER COLUMN … SET DEFAULT` says so.
+        column: None,
+        owner_column: owner.as_ref().map(|(_, at)| *at),
+        // A value written into a column this does not fill is nobody's business to refuse, and
+        // `Identity::Default` is the kind that refuses nothing.
+        identity: catalog::Identity::Default,
+        start: create.start,
+        increment: create.increment,
+    };
+    catalog::create_sequence(txn, executor.tenant, &sequence)?;
+    // The counter starts **at** the start value, because `START n` hands out `n` first — measured,
+    // `START 101` answers `101` and then `102`. Storing `n - 1` and stepping would be one short
+    // for every sequence anyone gave a `START`.
+    catalog::set_sequence_value(
+        txn,
+        executor.tenant,
+        sequence.id,
+        sequence_start(create.start)?,
+    );
+    if let Some((table, _)) = owner {
+        // The owning table's cached definition now has one more sequence in it.
+        let mut updated = (*table).clone();
+        updated.schema_version += 1;
+        updated.sequences.push(sequence);
+        catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    }
+    Ok(Outcome::done("CREATE SEQUENCE"))
+}
+
 /// `DROP SEQUENCE [IF EXISTS] s [, …] [CASCADE | RESTRICT]`.
 ///
 /// **`RESTRICT` and no clause at all are the same statement**, and both refuse: a sequence a

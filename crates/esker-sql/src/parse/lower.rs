@@ -65,6 +65,27 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             Ok(plan::Statement::CreateIndex(lower_create_index(create)?))
         }
         Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(alter)?)),
+        Statement::CreateSequence {
+            temporary,
+            if_not_exists,
+            name,
+            data_type,
+            sequence_options,
+            owned_by,
+        } => {
+            refuse_if(*temporary, "CREATE TEMPORARY SEQUENCE")?;
+            // `AS smallint` narrows the counter, which changes when a sequence runs out. This
+            // node counts in `i64` whatever it fills; taking the word and counting wider anyway
+            // would hand out a number the column cannot hold instead of the `22003` a real server
+            // gives at the same point.
+            refuse_if(data_type.is_some(), "CREATE SEQUENCE ... AS <type>")?;
+            Ok(plan::Statement::CreateSequence(lower_create_sequence(
+                name,
+                *if_not_exists,
+                sequence_options,
+                owned_by.as_ref(),
+            )?))
+        }
         // `CREATE EXTENSION [IF NOT EXISTS] "name"`. The name keeps its case and its hyphens —
         // `ActiveRecord` writes `"uuid-ossp"` — so it is **not** folded the way a relation name
         // is: an extension is looked up by the string a control file is named with, not by a
@@ -783,6 +804,95 @@ fn is_set_returning(function: &sqlparser::ast::Function) -> bool {
             | "json_each"
             | "jsonb_each"
     )
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] s [START n] [INCREMENT BY n] [OWNED BY t.c | NONE]`.
+///
+/// **`START n` is the first value handed out**, not the one before it — measured, `START 101`
+/// answers `101` and then `102`. The counter is stored as that first value, so the sequence needs
+/// no "has it started yet" flag beside it.
+///
+/// `MINVALUE`, `MAXVALUE`, `CYCLE` and `CACHE` are refused by name. Each one changes what happens
+/// at an end this node's counter does not have — a bound to stop at, or to wrap at — and a node
+/// that read the word and counted on regardless would answer past the limit the user asked for.
+fn lower_create_sequence(
+    name: &ObjectName,
+    if_not_exists: bool,
+    options: &[sqlparser::ast::SequenceOptions],
+    owned_by: Option<&ObjectName>,
+) -> Result<plan::CreateSequence> {
+    use sqlparser::ast::SequenceOptions;
+    let mut start = 1;
+    let mut increment = 1;
+    for option in options {
+        match option {
+            SequenceOptions::StartWith(expr, _) => start = sequence_number(expr, "START")?,
+            SequenceOptions::IncrementBy(expr, _) => {
+                increment = sequence_number(expr, "INCREMENT BY")?;
+                // A sequence that counts down, or does not count, is a different mechanism at
+                // every end: this one only goes up, and saying so beats handing out one value
+                // for ever.
+                refuse_if(
+                    increment <= 0,
+                    "CREATE SEQUENCE ... INCREMENT BY a non-positive",
+                )?;
+            }
+            SequenceOptions::MinValue(Some(_)) => {
+                return Err(SqlError::unsupported("CREATE SEQUENCE ... MINVALUE"));
+            }
+            SequenceOptions::MaxValue(Some(_)) => {
+                return Err(SqlError::unsupported("CREATE SEQUENCE ... MAXVALUE"));
+            }
+            SequenceOptions::Cycle(false) => {
+                return Err(SqlError::unsupported("CREATE SEQUENCE ... CYCLE"));
+            }
+            SequenceOptions::Cache(_) => {
+                return Err(SqlError::unsupported("CREATE SEQUENCE ... CACHE"));
+            }
+            // `NO MINVALUE`, `NO MAXVALUE` and `NO CYCLE` ask for the behaviour this node already
+            // has, so honouring them is honouring nothing.
+            SequenceOptions::MinValue(None) | SequenceOptions::MaxValue(None) => {}
+            SequenceOptions::Cycle(true) => {}
+        }
+    }
+    // `OWNED BY NONE` and no clause at all are the same statement — measured, both leave the
+    // sequence unowned — so the word `none` is read here rather than carried into the plan.
+    let owned_by = match owned_by.map(|owner| owner.to_string()) {
+        Some(owner) if owner.eq_ignore_ascii_case("none") => None,
+        Some(_) => {
+            let parts: Option<Vec<&str>> = owned_by
+                .map(|owner| {
+                    owner
+                        .0
+                        .iter()
+                        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match parts.as_deref() {
+                Some([table, column]) => Some((
+                    fold_identifier(table, false).0,
+                    fold_identifier(column, false).0,
+                )),
+                _ => return Err(SqlError::unsupported("CREATE SEQUENCE ... OWNED BY a path")),
+            }
+        }
+        None => None,
+    };
+    Ok(plan::CreateSequence {
+        name: relation_name(name)?,
+        if_not_exists,
+        start,
+        increment,
+        owned_by,
+    })
+}
+
+/// One of `CREATE SEQUENCE`'s numbers: an integer literal, with an optional sign.
+fn sequence_number(expr: &Expr, clause: &str) -> Result<i64> {
+    let text = unwrap_nested(expr).to_string();
+    text.parse::<i64>()
+        .map_err(|_| SqlError::unsupported(format!("CREATE SEQUENCE ... {clause} {text}")))
 }
 
 /// A columnar-replica count: a plain non-negative integer, and nothing else.

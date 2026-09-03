@@ -14,22 +14,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // identical characters. The standing trade every `pg_catalog` column makes.
     types: &["SELECT relname, relkind FROM pg_class WHERE relname = 'seqco_id_seq'"],
     answers: &[
-        (
-            "CREATE SEQUENCE seqfree",
-            "**A free-standing sequence cannot be created yet** — contract C2, and it is the next \
-             unit (statement 754, `CREATE SEQUENCE … START n OWNED BY t.c`). Every sequence this \
-             node has belongs to a `bigserial` column, which is why the dependency refusal above \
-             is the *only* shape `DROP SEQUENCE` meets here: there is no sequence without a \
-             dependent default to drop without `CASCADE`. The line is in the corpus because it is \
-             what proves that, and it will stop being a divergence one commit from now.",
-        ),
-        (
-            "DROP SEQUENCE seqfree",
-            "The consequence of the line above: the sequence was never created, so this is \
-             `42P01` rather than the success a real server gives. It is the *undependent* drop — \
-             the one case where `CASCADE` is not needed — and it stays declared until \
-             `CREATE SEQUENCE` can make one.",
-        ),
+        // **Both entries here are deleted** (ADR 0031, rule 2). They said a free-standing
+        // sequence could not be created, so `DROP SEQUENCE` never met the one shape that needs no
+        // `CASCADE`: a sequence with no dependent default. `CREATE SEQUENCE` landed in the next
+        // commit and both lines agree, which is what the entries predicted.
     ],
 };
 

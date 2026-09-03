@@ -1,0 +1,51 @@
+# `CREATE SEQUENCE`, against PostgreSQL 19beta1 — statement 754 of
+# `postgresql_specific_schema.rb`: `CREATE SEQUENCE companies_nonstd_seq START 101 OWNED BY
+# companies.id`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`OWNED BY` does not give the column a default.** `pg_attrdef` still shows one row for a
+#     `bigserial` table after a second sequence is created `OWNED BY` that same column — the
+#     original one. Ownership says the sequence *goes when the column does*, which points the
+#     opposite way from a default, and it takes an `ALTER COLUMN … SET DEFAULT nextval(…)` to make
+#     the column use it. A node that wired the default here would answer the suite's next
+#     statement before it was asked.
+#   * **A column can own more than one sequence.** The statement above is issued against a table
+#     whose `id` is already a `bigserial`, so `companies_id_seq` and `companies_nonstd_seq` both
+#     belong to `companies.id` and `pg_class` holds both.
+#   * **`START 101` is the first value, not the one before it** — `nextval` answers `101` and then
+#     `102`. A node that stored the start as "the last value handed out" would be one short for
+#     every sequence anyone gave a `START` to.
+#   * **A name collision is `42P07` against the whole relation namespace**, not just other
+#     sequences: `CREATE SEQUENCE` over a table's name is the same error a table over a table's is.
+#   * **`OWNED BY` names a column and both halves can be wrong**: a missing table is `42P01` and a
+#     missing column is `42703`, which spells the relation it looked in.
+CREATE TABLE cseq (id bigserial primary key, name text)		-
+CREATE SEQUENCE s1		-
+SELECT seqstart, seqincrement, seqmin, seqmax, seqcycle, seqcache FROM pg_sequence WHERE seqrelid = 's1'::regclass	bigint,bigint,bigint,bigint,boolean,bigint	1|1|1|9223372036854775807|f|1
+SELECT relkind, relname FROM pg_class WHERE relname = 's1'	"char",name	S|s1
+SELECT nextval('s1'), nextval('s1')	bigint,bigint	1|2
+CREATE SEQUENCE s1	!42P07 relation "s1" already exists
+CREATE SEQUENCE IF NOT EXISTS s1		-
+CREATE SEQUENCE s2 START 101 OWNED BY cseq.id		-
+SELECT nextval('s2'), nextval('s2')	bigint,bigint	101|102
+SELECT seqstart, seqincrement FROM pg_sequence WHERE seqrelid = 's2'::regclass	bigint,bigint	101|1
+SELECT 'g', count(*) FROM pg_attrdef WHERE adrelid = 'cseq'::regclass	text,bigint	g|1
+SELECT 'g', count(*) FROM pg_class WHERE relname IN ('cseq_id_seq','s2')	text,bigint	g|2
+DROP SEQUENCE s2		-
+CREATE SEQUENCE s2 START 101 OWNED BY cseq.id		-
+CREATE SEQUENCE s3 OWNED BY cseq.nosuchcol	!42703 column "nosuchcol" of relation "cseq" does not exist
+CREATE SEQUENCE s3 OWNED BY nosuchtable.id	!42P01 relation "nosuchtable" does not exist
+CREATE SEQUENCE s3 OWNED BY NONE		-
+CREATE SEQUENCE s3 INCREMENT BY 5 START 10	!42P07 relation "s3" already exists
+SELECT nextval('s3'), nextval('s3')	bigint,bigint	1|2
+CREATE SEQUENCE s4 AS smallint		-
+CREATE SEQUENCE s5 MINVALUE 5 MAXVALUE 7 CYCLE		-
+CREATE SEQUENCE cseq	!42P07 relation "cseq" already exists
+SELECT currval('s1')	!55000 currval of sequence "s1" is not yet defined in this session
+SELECT setval('s1', 50)	bigint	50
+SELECT nextval('s1')	bigint	51
