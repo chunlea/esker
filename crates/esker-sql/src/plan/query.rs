@@ -63,6 +63,13 @@ pub struct TableRef {
     pub alias: Option<String>,
     /// `FROM (SELECT …) AS t` — the sub-select this entry is, or `None` for a real relation.
     pub derived: Option<Box<crate::plan::Derived>>,
+    /// `FROM (VALUES (1),(2)) AS t(x)` — a relation made of **constant rows**, or `None` for
+    /// anything else.
+    ///
+    /// A fourth kind of `FROM` entry beside a relation, a derived table and a set-returning
+    /// function. It is not a derived table even though it is written like one: a derived table's
+    /// rows come from a sub-*select*, and no select with no `FROM` produces more than one row.
+    pub values: Option<Box<ValuesList>>,
     /// `FROM generate_subscripts(a, 1) AS i` — a **set-returning function** standing where a
     /// relation would, or `None` for anything else.
     ///
@@ -86,6 +93,7 @@ impl TableRef {
     #[must_use]
     pub fn bare(name: String) -> Self {
         TableRef {
+            values: None,
             name,
             alias: None,
             derived: None,
@@ -237,6 +245,26 @@ pub struct OrderItem {
     pub nulls_first: Option<bool>,
 }
 
+/// The constant rows of a `VALUES` list, and the names they are read under.
+///
+/// **Every row has the same number of expressions**, checked where this is built: PostgreSQL calls
+/// a ragged list `42601 VALUES lists must all be the same length`, which is a syntax error and not
+/// a type one, so it is raised at lowering rather than carried into a plan.
+///
+/// **The types are not here.** A column's type is its *first row's*, and reading an expression's
+/// type needs a scope — so it is decided in `crate::exec::values`, once, and the rows are read as
+/// it there too. Carrying a half-answer from lowering would mean two places deciding one thing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesList {
+    /// The rows, in the order written. `ORDER BY` may reorder them; nothing else does.
+    pub rows: Vec<Vec<Expr>>,
+    /// One name per column: `column1`, `column2`, … unless an alias list renames them.
+    ///
+    /// A name a statement can use — `VALUES (1),(2) ORDER BY column1 DESC` sorts by it — which is
+    /// why they are carried rather than generated when a row description is built.
+    pub columns: Vec<String>,
+}
+
 /// A set-returning function used as a `FROM` entry.
 ///
 /// Only `generate_subscripts`, which is what `ActiveRecord`'s schema dump reads every foreign key
@@ -269,6 +297,17 @@ pub enum Node {
         /// Which relation.
         view: CatalogView,
         /// How its rows are shaped, so everything above it reads a row like any other.
+        columns: RowSchema,
+    },
+    /// Rows written into the statement: `FROM (VALUES (1),(2))`, and `VALUES …` on its own.
+    ///
+    /// Its own node beside [`Node::OneRow`] for the reason that one exists: a source of rows the
+    /// planner can put anything above. Nothing is read to produce them, so there is no key range,
+    /// no statistics and no order but the one they were written in.
+    Values {
+        /// The rows and the names they are read under.
+        list: Box<ValuesList>,
+        /// How a row is shaped, so everything above it reads one like any other.
         columns: RowSchema,
     },
     /// The rows a set-returning function in `FROM` yields.
@@ -622,6 +661,9 @@ impl Node {
         let names = &self.input_names(columns)[..];
         match self {
             Node::OneRow => ("Result".to_owned(), None, None),
+            // PostgreSQL's own name for it, `*VALUES*` included: the rows are a relation with no
+            // relation behind them, and the quoted star is what it calls that relation.
+            Node::Values { .. } => ("Values Scan on \"*VALUES*\"".to_owned(), None, None),
             // Named for what it is: one access path, no costs, and a row count that is the length
             // of an array nobody has read yet.
             Node::TableFunction { call, .. } => {

@@ -1,0 +1,58 @@
+# `VALUES` as a **relation** — a table made of constant rows — as PostgreSQL 19beta1 answers it.
+#
+# Two spellings of one thing: `(VALUES …) AS t(a,b)` where a table goes, and `VALUES …` on its own
+# as a whole statement. The second is a query like any other, so `ORDER BY`, `LIMIT` and `OFFSET`
+# apply to it — and the columns it orders by are the ones it names itself.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The columns are called `column1`, `column2`, …** when nothing names them, and that is a
+#     name a statement can use: `VALUES (1),(2) ORDER BY column1 DESC` sorts by it.
+#   * **The column's type comes from the first row and the rest are read as that type.**
+#     `VALUES (1),('a')` is not a text column and not a union of two types — it is
+#     `22P02 invalid input syntax for type integer: "a"`, the element failing to parse. A column
+#     of nothing but NULL is `text`, which is what an untyped NULL is everywhere.
+#   * **Rows of different lengths are `42601 VALUES lists must all be the same length`**, which is
+#     a *syntax* error and not a type one.
+#   * An alias list may be **shorter** than the columns — `(VALUES (1,2)) AS t(a)` keeps `column2`
+#     for the second — and one that is longer is `42P10`, naming both counts.
+#   * **The rows keep the order they were written in** — `VALUES (3),(1),(2)` is `3, 1, 2` — and
+#     an `ORDER BY` over them may name the column by position as well as by name.
+#   * The alias itself is optional in both halves: `(VALUES (1))` with no `AS` at all is a legal
+#     `FROM` entry, and PostgreSQL 19 allows a derived table with no name.
+SELECT 'r', * FROM (VALUES (1),(2),(3)) AS t(x) ORDER BY x	text,integer	r|1 ; r|2 ; r|3
+SELECT 'r', a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b) ORDER BY a	text,integer,text	r|1|x ; r|2|y
+SELECT 'r', column1, column2 FROM (VALUES (1,'x'),(2,'y')) AS t ORDER BY column1	text,integer,text	r|1|x ; r|2|y
+SELECT 'r', * FROM (VALUES (1),(NULL),(3)) AS t(x) ORDER BY x	text,integer	r|1 ; r|3 ; r|\N
+SELECT 'r', count(*) FROM (VALUES (1),(2)) AS t(x)	text,bigint	r|2
+SELECT 'r', array_agg(x ORDER BY x) FROM (VALUES (1),(2)) AS t(x)	text,integer[]	r|{1,2}
+SELECT 'r', ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))	text,integer[]	r|{1,NULL,3}
+SELECT 'r', ARRAY(VALUES (1),(2))	text,integer[]	r|{1,2}
+SELECT 'r', x FROM (VALUES (1),(2)) AS t(x) WHERE x > 1	text,integer	r|2
+SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1	text,regtype,regtype	r|integer|text
+SELECT 'r', pg_typeof(column1) FROM (VALUES (1.5)) AS t LIMIT 1	text,regtype	r|numeric
+SELECT 'r', * FROM (VALUES (1,2),(3,4)) AS t(a,b) ORDER BY a DESC	text,integer,integer	r|3|4 ; r|1|2
+SELECT 'r', v.x FROM (VALUES (1)) AS v(x)	text,integer	r|1
+SELECT 'r', count(*) FROM (VALUES (1),(2),(3)) AS t(x) LIMIT 1	text,bigint	r|3
+VALUES (1),(2),(3)	integer	1 ; 2 ; 3
+VALUES (1,'a'),(2,'b')	integer,text	1|a ; 2|b
+VALUES (1)	integer	1
+VALUES (1),(2) ORDER BY column1 DESC	integer	2 ; 1
+VALUES (1),(2),(3) LIMIT 2	integer	1 ; 2
+VALUES (1),(2),(3) OFFSET 1	integer	2 ; 3
+VALUES (1),(2,3)	!42601 VALUES lists must all be the same length
+VALUES (1),('a')	!22P02 invalid input syntax for type integer: "a"
+VALUES (1),(NULL)	integer	1 ; \N
+VALUES (NULL)	text	\N
+SELECT 'r', * FROM (VALUES (1)) AS t(a,b)	!42P10 table "t" has 1 columns available but 2 columns specified
+SELECT 'r', * FROM (VALUES (1,2)) AS t(a)	text,integer,integer	r|1|2
+SELECT 'r', * FROM (VALUES (1)) t(x)	text,integer	r|1
+SELECT 'r', * FROM (VALUES (1))	text,integer	r|1
+SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)	text,integer	r|1 ; r|1
+SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x) CROSS JOIN (VALUES (3)) AS u(y)	text,integer	r|1 ; r|1
+SELECT 'r', t.x, u.y FROM (VALUES (1),(2)) AS t(x) JOIN (VALUES (2)) AS u(y) ON t.x = u.y	text,integer,integer	r|2|2
+SELECT 'r', x FROM (VALUES (3),(1),(2)) AS t(x)	text,integer	r|3 ; r|1 ; r|2
+SELECT 'r', * FROM (VALUES (1),(2)) AS t(x) WHERE x = 2	text,integer	r|2
+VALUES (1),(2) ORDER BY 1 DESC	integer	2 ; 1
+VALUES ('2020-01-01'::date)	date	2020-01-01
+VALUES (1::int8)	bigint	1

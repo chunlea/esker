@@ -89,14 +89,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`pg_typeof` is `0A000` naming itself, for every type, and the arithmetic under it is refused too. **The promotion rule it asks about is implemented**: `pg_cmp` compares a `numeric` with an integer exactly and with a float through `f64`, which is the same \"exact loses to inexact\" rule this line measures.",
         ),
         (
-            "SELECT sum(x) FROM (VALUES (1::int8), (2::int8)) v(x)",
-            "A bare `VALUES` list is `0A000` naming itself — the statement cannot run at all, so this measures nothing about `numeric`. **`sum(int8)` answering `numeric` is the next unit**: the type exists now, and re-typing that aggregate is what ADR 0031 has been waiting for.",
-        ),
-        (
-            "SELECT avg(x) FROM (VALUES (1::int8), (2::int8)) v(x)",
-            "The same `VALUES` refusal. `avg(int8)` is the aggregate ADR 0031 has refused **since unit 0** on the grounds that its answer is a `numeric` with sixteen fractional digits and this node had no such type. It has one now; the aggregate is the next unit, and it needs division, which is arithmetic.",
-        ),
-        (
             "SELECT greatest(1.5::numeric, 2.5::numeric), least(1.5::numeric, 2.5::numeric)",
             "`greatest`/`least` are `0A000` naming themselves, for every type.",
         ),

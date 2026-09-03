@@ -43,6 +43,7 @@ pub mod redrive;
 mod savepoint;
 mod subquery;
 mod table_function;
+mod values;
 mod verbs;
 
 use std::sync::Arc;
