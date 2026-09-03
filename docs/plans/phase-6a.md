@@ -478,7 +478,7 @@ rather than to add the lines a feature happens to need.
 | G24 | role grants and privileges | 5 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only |
 | G25 | VACUUM / CLUSTER / CHECKPOINT | 4 | `VACUUM (FULL, ANALYZE, VERBOSE) t;` | admin / DDL only |
 | G26 | cursor MOVE | 1 | `MOVE BACKWARD 1 IN c;` | admin / DDL only |
-| G27 | database and system admin | 8 | `CREATE DATABASE d WITH OWNER alice ENCODING 'UTF8';` | admin / DDL only |
+| G27 | database and system admin | 7 | `ALTER DATABASE d SET work_mem = '8MB';` | admin / DDL only — **`CREATE DATABASE` left this row**: its option list is read now (ADR 0052, `tests/create_database_options.rs`), so the example moved to one still in the group |
 | G28 | extended statistics | 2 | `CREATE STATISTICS st ON a, b FROM t;` | admin / DDL only |
 | G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |
 | G30 | foreign data wrappers | 2 | `CREATE FOREIGN TABLE ft (a int8) SERVER srv;` | admin / DDL only |

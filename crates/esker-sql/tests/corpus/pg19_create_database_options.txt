@@ -1,0 +1,96 @@
+# `CREATE DATABASE`'s option list — as a real PostgreSQL 19beta1 answers it.
+#
+# `rake db:create` sends `CREATE DATABASE "x" ENCODING = 'utf8'` and `ActiveRecord`'s
+# `create_database` will add `OWNER`, `TEMPLATE`, `LC_COLLATE`, `LC_CTYPE`, `TABLESPACE` and
+# `CONNECTION LIMIT` when `database.yml` names them. **`sqlparser` 0.62.0 has a grammar for none of
+# them** — its `CREATE DATABASE` reads `LOCATION`, `MANAGEDLOCATION`, `CLONE` and MySQL's
+# `CHARACTER SET`/`COLLATE`, and `ENCODING` exists in that crate only as a `COPY` option — so every
+# one of these was a `42601` about a statement a real server runs, which is contract C1's
+# shortfall. The list is cut out of the source before the parse and carried beside the tree, the
+# mechanism `EXCLUDE` and `DROP INDEX CONCURRENTLY` already use.
+#
+# **This capture is not inside a transaction, and cannot be.** `CREATE DATABASE` is
+# `25001 … cannot run inside a transaction block` (`pg19_two_database_dogs.txt` pins that), so
+# unlike every other corpus in this phase it creates and drops real databases and proves at the end
+# that it left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An unrecognised option is `42601`, not `0A000`** — PostgreSQL treats it as a *syntax* error
+#     and lower-cases the name back at the user: `option "nosuchoption" not recognized`.
+#   * **A bad encoding name and a good one the template does not use are different errors.**
+#     `ENCODING = 'nosuchencoding'` is `42704 nosuchencoding is not a valid encoding name` — and the
+#     value is **not quoted**, unlike almost every other name PostgreSQL quotes back. A real
+#     encoding that differs from the template's is `22023 new encoding (SQL_ASCII) is incompatible
+#     with the encoding of the template database (UTF8)`, with a HINT naming `template0`.
+#   * **`LC_COLLATE` alone fails against the default template**, because `template1` carries the
+#     cluster's locale: `LC_COLLATE = 'C'` is `22023` until `TEMPLATE = template0` is written too.
+#     The same clause with the template's own collation succeeds without it.
+#   * **A database inherits the template's locale, not the cluster's default.** `TEMPLATE =
+#     template0` alone gives `en_US.utf8` here; `TEMPLATE = template0 LOCALE = 'C'` gives `C`, and
+#     `LOCALE` sets **both** `datcollate` and `datctype`.
+#   * **`UNICODE` and `UTF-8` are spellings of `UTF8`**, normalised on the way in — `pg_database`
+#     reports `UTF8` for all three.
+#   * **`=` is optional** on every option: `ENCODING 'utf8'` and `CONNECTION LIMIT 3` are the same
+#     statements as their `=` forms, and a leading `WITH` is optional too.
+#   * **A template database cannot be dropped** — `42809`, its own class, because it is there
+#     rather than missing and is not a dependency violation either.
+#   * `OWNER`, `TABLESPACE` and `TEMPLATE` are validated against real objects, and each names a
+#     different class of missing: `42704` for a role, `42704` for a tablespace, and **`3D000`** for
+#     a template database.
+#
+# WHAT WAS MEASURED AND IS NOT REPLAYED HERE
+#
+# The oracle container's locale is `en_US.utf8` and this node has one collation, `C` — the standing
+# divergence `tests/coalesce.rs` already declares — so several answers measured in the same session
+# are about the *container* rather than about a rule, and replaying them would be a divergence list
+# longer than the agreements. They are recorded here instead, in full:
+#
+#     CREATE DATABASE d ENCODING = 'utf8'         -> datcollate/datctype en_US.utf8, inherited
+#     CREATE DATABASE d TEMPLATE = template0      -> en_US.utf8 too: the *template's*, not a default
+#     CREATE DATABASE d LC_COLLATE = 'en_US.utf8' -> accepted, because it matches the template
+#     CREATE DATABASE d WITH OWNER = esker …      -> accepted; the role exists on that container
+#     CREATE DATABASE d CONNECTION LIMIT = 5      -> datconnlimit 5
+#     CREATE DATABASE d ALLOW_CONNECTIONS = true IS_TEMPLATE = false  -> datallowconn t, datistemplate f
+#     CREATE DATABASE d ENCODING='LATIN1' TEMPLATE=template0 LC_COLLATE='C' LC_CTYPE='C' -> LATIN1
+#     SELECT datname, datistemplate, datallowconn FROM pg_database ORDER BY oid
+#       -> template1|t|t ; template0|t|f ; postgres|f|t ; esker|f|t
+#
+# `datconnlimit`, `datallowconn` and `datistemplate` are not columns this node's `pg_database` has,
+# which is why the last four cannot be asked here at all.
+
+CREATE DATABASE vlcap1 ENCODING = 'utf8'		-
+SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'vlcap1'		r|UTF8
+CREATE DATABASE vlq1 ENCODING 'utf8'		-
+CREATE DATABASE vlq2 WITH ENCODING = 'unicode'		-
+SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'vlq2'		r|UTF8
+CREATE DATABASE "vlq5" ENCODING = 'utf8'		-
+SELECT 'r', datname FROM pg_database WHERE datname = 'vlq5'		r|vlq5
+CREATE DATABASE vlq3 TEMPLATE = template0		-
+SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'vlq3'		r|UTF8
+CREATE DATABASE vlq4 TEMPLATE = template0 LOCALE = 'C'		-
+SELECT 'r', datcollate, datctype FROM pg_database WHERE datname = 'vlq4'		r|C|C
+CREATE DATABASE vlq9 STRATEGY = 'wal_log' TABLESPACE = pg_default		-
+SELECT 'r', count(*) FROM pg_database WHERE datname LIKE 'vlq%' OR datname LIKE 'vlcap%'		r|7
+CREATE DATABASE vlcapE1 ENCODING = 'nosuchencoding'	!42704 nosuchencoding is not a valid encoding name
+CREATE DATABASE vlcapE2 LC_COLLATE = 'C'	!22023 new collation (C) is incompatible with the collation of the template database (en_US.utf8) HINT: Use the same collation as in the template database, or use template0 as template.
+CREATE DATABASE vlcapE3 OWNER = nosuchrole	!42704 role "nosuchrole" does not exist
+CREATE DATABASE vlcapE4 TEMPLATE = nosuchdb	!3D000 template database "nosuchdb" does not exist
+CREATE DATABASE vlcapE5 STRATEGY = 'nosuch'	!22023 invalid create database strategy "nosuch" HINT: Valid strategies are "wal_log" and "file_copy".
+CREATE DATABASE vlcapE6 TABLESPACE = nosuchtablespace	!42704 tablespace "nosuchtablespace" does not exist
+CREATE DATABASE vlcapE7 ENCODING = 'SQL_ASCII'	!22023 new encoding (SQL_ASCII) is incompatible with the encoding of the template database (UTF8) HINT: Use the same encoding as in the template database, or use template0 as template.
+CREATE DATABASE vlcapE8 NOSUCHOPTION = 1	!42601 option "nosuchoption" not recognized
+DROP DATABASE template1	!42809 cannot drop a template database
+DROP DATABASE esker	!55006 cannot drop the currently open database
+DROP DATABASE vlcap1		-
+DROP DATABASE vlq1		-
+DROP DATABASE vlq2		-
+DROP DATABASE vlq3		-
+DROP DATABASE vlq4		-
+DROP DATABASE vlq5		-
+DROP DATABASE vlq9		-
+SELECT count(*) FROM pg_database WHERE datname LIKE 'vlca%' OR datname LIKE 'vlq%'	bigint	0
