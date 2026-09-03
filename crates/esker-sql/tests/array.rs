@@ -43,19 +43,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
-            "The `ARRAY[...]` **constructor**, which builds an array from expressions where a literal builds one from text. This slice is storage and text I/O: a column of an array type, its values in and out, and their order. The constructor is the next slice, and the empty one has a rule of its own — `SELECT ARRAY[]` is `42P18 cannot determine type of empty array`, which is measured here so it is built against that rather than against a guess.",
-        ),
-        (
-            "SELECT '{}'::int[], ARRAY[]::int[]",
-            "The `ARRAY[...]` **constructor**, which builds an array from expressions where a literal builds one from text. This slice is storage and text I/O: a column of an array type, its values in and out, and their order. The constructor is the next slice, and the empty one has a rule of its own — `SELECT ARRAY[]` is `42P18 cannot determine type of empty array`, which is measured here so it is built against that rather than against a guess.",
-        ),
-        (
-            "SELECT ARRAY[]",
-            "The `ARRAY[...]` **constructor**, which builds an array from expressions where a literal builds one from text. This slice is storage and text I/O: a column of an array type, its values in and out, and their order. The constructor is the next slice, and the empty one has a rule of its own — `SELECT ARRAY[]` is `42P18 cannot determine type of empty array`, which is measured here so it is built against that rather than against a guess.",
+            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
         ),
         (
             "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
-            "The `ARRAY[...]` **constructor**, which builds an array from expressions where a literal builds one from text. This slice is storage and text I/O: a column of an array type, its values in and out, and their order. The constructor is the next slice, and the empty one has a rule of its own — `SELECT ARRAY[]` is `42P18 cannot determine type of empty array`, which is measured here so it is built against that rather than against a guess.",
+            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
         ),
         (
             "SELECT array_length('{}'::int[], 1), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality('{}'::int[])",
@@ -108,10 +100,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 1 = ANY('{}'::int[]), 1 = ALL('{}'::int[])",
             "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
-        ),
-        (
-            "SELECT ARRAY['a','b'] = '{a,b}'::text[]",
-            "The `ARRAY[...]` **constructor**, which builds an array from expressions where a literal builds one from text. This slice is storage and text I/O: a column of an array type, its values in and out, and their order. The constructor is the next slice, and the empty one has a rule of its own — `SELECT ARRAY[]` is `42P18 cannot determine type of empty array`, which is measured here so it is built against that rather than against a guess.",
         ),
         (
             "SELECT '{1,2}'::int[] @> '{1}'::int[], '{1}'::int[] <@ '{1,2}'::int[], '{1,2}'::int[] && '{2,3}'::int[]",

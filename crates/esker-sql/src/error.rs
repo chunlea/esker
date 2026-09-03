@@ -555,6 +555,14 @@ pub enum SqlError {
         operand: &'static str,
     },
 
+    /// `ARRAY[]` with no cast: `42P18`, and PostgreSQL's own hint about how to fix it.
+    ///
+    /// An empty constructor has no elements to take a type from, and an array of nothing in
+    /// particular is not a value — so this is an error where `'{}'::int[]` is a perfectly good
+    /// empty array. Measured, hint included.
+    #[error("cannot determine type of empty array")]
+    EmptyArrayType,
+
     /// An array literal PostgreSQL's `array_in` will not read: `22P02`, with a `DETAIL` saying
     /// what is wrong with it.
     ///
@@ -1366,6 +1374,7 @@ impl SqlError {
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
             SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
+            SqlError::EmptyArrayType => sqlstate::INDETERMINATE_DATATYPE,
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
@@ -1642,6 +1651,10 @@ impl SqlError {
             SqlError::UndefinedUnaryOperator { .. } => {
                 Some("You might need to add an explicit type cast.".to_owned())
             }
+            // PostgreSQL's own sentence, example and all.
+            SqlError::EmptyArrayType => Some(
+                "Explicitly cast to the desired type, for example ARRAY[]::integer[].".to_owned(),
+            ),
             // PostgreSQL lists the values an enum parameter takes, and the list is the parameter's
             // rather than the error's — looked up so the two can never say different things.
             SqlError::InvalidParameterValue { name, .. } => match crate::parameter::lookup(name) {

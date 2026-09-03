@@ -1783,6 +1783,10 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => lower_expr(expr),
         Expr::Nested(inner) => lower_expr(inner),
+        // `ARRAY[…]` as a value. `= ANY(ARRAY[…])` never reaches here — that path reads the
+        // elements as a list before the expression is lowered (`lower_array`) — so this is the
+        // constructor standing on its own, in a projection or beside a comparison.
+        Expr::Array(array) => lower_array_constructor(&array.elem),
         // `a[i]`. Only a **single** subscript: a slice (`a[1:2]`) answers an array rather than an
         // element and a second dimension is a shape the catalog's arrays do not have, so both are
         // named rather than approximated by the one this node has.
@@ -2589,6 +2593,70 @@ fn sequence_reference(text: &str) -> String {
     }
 }
 
+/// `ARRAY[…]` as a **value**, folded where every element is a constant.
+///
+/// The constructor builds an array from expressions where a literal builds one from text, and the
+/// element type is the elements' — PostgreSQL's `select_common_type`, narrowed to the four array
+/// types this node has. A constructor over anything but constants is refused by name: building one
+/// per row is a node of its own, and none of the statements this node is measured against has one.
+///
+/// **`ARRAY[]` is an error and `'{}'::int[]` is not.** An empty constructor has no elements to take
+/// a type from, so PostgreSQL answers `42P18` with a hint; an empty *literal* has its type from the
+/// cast and is a perfectly good empty array. Measured, both.
+fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
+    let mut texts: Vec<Option<String>> = Vec::with_capacity(elements.len());
+    let mut element = None;
+    for expr in elements {
+        let Expr::Value(value) = strip_nesting(expr) else {
+            return Err(SqlError::unsupported(
+                "an ARRAY constructor over anything but constants",
+            ));
+        };
+        // The widest element type wins, in PostgreSQL's own order: a string makes the whole array
+        // `text`, a decimal makes it `numeric`, and integers alone leave it an integer array.
+        let (text, wanted) = match &value.value {
+            Value::Null => (None, None),
+            Value::Number(digits, _) if digits.contains('.') => {
+                (Some(digits.clone()), Some(ColumnType::Numeric))
+            }
+            Value::Number(digits, _) => (Some(digits.clone()), Some(ColumnType::Int8)),
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                (Some(text.clone()), Some(ColumnType::Text))
+            }
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "an ARRAY constructor holding {other}"
+                )));
+            }
+        };
+        element = match (element, wanted) {
+            (Some(ColumnType::Text), _) | (_, Some(ColumnType::Text)) => Some(ColumnType::Text),
+            (Some(ColumnType::Numeric), _) | (_, Some(ColumnType::Numeric)) => {
+                Some(ColumnType::Numeric)
+            }
+            (known, None) => known,
+            (None, wanted) => wanted,
+            (known, _) => known,
+        };
+        texts.push(text);
+    }
+    let Some(element) = element else {
+        return Err(SqlError::EmptyArrayType);
+    };
+    let mut values = Vec::with_capacity(texts.len());
+    for text in texts {
+        values.push(match text {
+            None => None,
+            Some(text) => Some(Datum::from_text(element, &text)?),
+        });
+    }
+    Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+        Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+            element, 1, values,
+        )),
+    ))))
+}
+
 /// The elements of an array expression, for the right-hand side of `= ANY(…)`.
 ///
 /// Three spellings, all of which `ActiveRecord` or its `pg` driver may send:
@@ -2864,6 +2932,53 @@ fn cast_type_name(data_type: &DataType) -> String {
 /// The one schema this node has. `public`, which is what `current_schema()` answers.
 const PUBLIC_SCHEMA: &str = "public";
 
+/// A cast to one of the four array types, or `None` when this is not one.
+///
+/// Split out of [`lower_cast`] because it is a whole rule rather than a case of one: what an
+/// array cast does is read its operand with `array_in` at the target's element type, and the
+/// two shapes it accepts — a literal's text and an already-built array's — are the same door.
+fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Expr>> {
+    // **A cast to an array type reads the literal**, and used to be the identity on its text.
+    // It was the identity because there was no array *column* type to cast to and the array
+    // operators read their arrays out of text anyway; the cost was that nothing ever checked the
+    // literal, so `'{a,,b}'::text[]` answered `{a,,b}` where a real server raises `22P02`, and
+    // `'{a,b}'::text[]` reported its type as `text`. Now that an array is a type, this is an
+    // ordinary cast to a stored type: `Datum::from_text` is `array_in`, and it is the element
+    // type that answers for a bad element.
+    if let DataType::Array(inner) = data_type
+        && let Some(element) = array_element(inner)
+        && let Ok((element, NO_TYPMOD)) = lower_type(element)
+        && let Some(array) = esker_keys::array::ArrayValue::array_of(element)
+    {
+        // **`ARRAY[]::int[]` is the empty array and `ARRAY[]` is an error**, and the difference
+        // is exactly this cast: the constructor has no element to take a type from, and the cast
+        // is what supplies one. So it is answered here rather than by lowering the constructor,
+        // which would raise `42P18` before the type arrived.
+        if matches!(strip_nesting(expr), Expr::Array(array) if array.elem.is_empty()) {
+            return Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Array(esker_keys::array::ArrayValue::empty(element)),
+            )))));
+        }
+        // A literal's text, or an already-built array's — `ARRAY[1,2,3]::int8[]` is the
+        // constructor folded and then read again at the target's element type. Going through the
+        // text is `array_in` doing the element conversion, so a value that does not fit the new
+        // element type fails with that type's own message.
+        let text = match cast_literal_text(expr)? {
+            Some(text) => Some(text),
+            None => match lower_expr(expr) {
+                Ok(plan::Expr::Literal(plan::Literal::Typed(value))) => value.to_text(),
+                _ => None,
+            },
+        };
+        if let Some(text) = text {
+            return Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::from_text(array, &text)?,
+            )))));
+        }
+    }
+    Ok(None)
+}
+
 /// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
 ///
 /// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
@@ -2888,22 +3003,8 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
         return Ok(plan::Expr::Literal(plan::Literal::Null));
     }
-    // **A cast to an array type reads the literal**, and used to be the identity on its text.
-    // It was the identity because there was no array *column* type to cast to and the array
-    // operators read their arrays out of text anyway; the cost was that nothing ever checked the
-    // literal, so `'{a,,b}'::text[]` answered `{a,,b}` where a real server raises `22P02`, and
-    // `'{a,b}'::text[]` reported its type as `text`. Now that an array is a type, this is an
-    // ordinary cast to a stored type: `Datum::from_text` is `array_in`, and it is the element
-    // type that answers for a bad element.
-    if let DataType::Array(inner) = data_type
-        && let Some(element) = array_element(inner)
-        && let Ok((element, NO_TYPMOD)) = lower_type(element)
-        && let Some(array) = esker_keys::array::ArrayValue::array_of(element)
-        && let Some(text) = cast_literal_text(expr)?
-    {
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            Datum::from_text(array, &text)?,
-        ))));
+    if let Some(array) = lower_array_cast(expr, data_type)? {
+        return Ok(array);
     }
     let Some(target) = cast_target(data_type) else {
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it

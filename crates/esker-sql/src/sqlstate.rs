@@ -82,6 +82,9 @@ pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 /// What `bytea`'s hexadecimal input reports a bad digit or an odd count with. Surprising — the
 /// neighbouring failures in the same input function are `22P02` — and captured, not assumed.
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
+
+/// `indeterminate_datatype` — `ARRAY[]` with nothing to say what it is an array of.
+pub const INDETERMINATE_DATATYPE: &str = "42P18";
 /// A `SET` of a parameter that exists and is fixed — a different answer from one that does not
 /// exist, which is [`UNDEFINED_OBJECT`].
 pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
