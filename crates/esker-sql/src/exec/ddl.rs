@@ -341,10 +341,10 @@ fn unique_indexes(
             nulls_not_distinct: constraint.nulls_not_distinct,
             // It **is** a constraint, which is what separates it from the identical index a
             // `CREATE UNIQUE INDEX` builds: only this one gets a `pg_constraint` row.
-            constraint: Some(if constraint.deferrable {
-                catalog::UniqueKind::Deferrable
-            } else {
-                catalog::UniqueKind::Immediate
+            constraint: Some(match (constraint.deferrable, constraint.deferred) {
+                (_, true) => catalog::UniqueKind::Deferred,
+                (true, false) => catalog::UniqueKind::Deferrable,
+                (false, false) => catalog::UniqueKind::Immediate,
             }),
             state: catalog::SchemaState::Public,
             state_since: 1,

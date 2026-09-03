@@ -149,7 +149,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
         "BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;",
         "G22",
     ),
-    ("SET CONSTRAINTS ALL DEFERRED;", "G22"),
     // G23 -- two-phase commit
     ("PREPARE TRANSACTION 'gid';", "G23"),
     ("COMMIT PREPARED 'gid';", "G23"),

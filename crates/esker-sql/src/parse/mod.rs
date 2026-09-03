@@ -126,6 +126,20 @@ pub enum StatementClass {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }`.
+    ///
+    /// **`sqlparser` 0.62.0 cannot read it** — it takes `SET` and then wants `=` or `TO` — which
+    /// makes this a contract C1 gap and not a syntax question, exactly as `DROP INDEX
+    /// CONCURRENTLY` is. So the source is rewritten to a statement the parser accepts and what it
+    /// said is carried here, which is the mechanism this module already has for that.
+    SetConstraints {
+        /// The constraints named, or **empty for `ALL`** — which is not "no constraints" but
+        /// "every deferrable one", and the two are told apart by the mode's own rules rather than
+        /// by a flag (`crate::exec::deferred`).
+        names: Vec<String>,
+        /// `DEFERRED`, as against `IMMEDIATE`.
+        deferred: bool,
+    },
     /// `SAVEPOINT <name>`, carrying the name.
     Savepoint(String),
     /// `ROLLBACK TO [SAVEPOINT] <name>`, carrying the name.
@@ -246,6 +260,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // fact about the statement that the parsed tree cannot carry.
     let scanned = scan(sql);
     let concurrently = strip_drop_index_concurrently(sql, &scanned).is_some();
+    let constraints = set_constraints(sql, &scanned);
     // The clause texts, taken the same way `parse` takes them — this only has to *notice*, because
     // what was removed is a fact about the statement that the parsed tree cannot carry.
     let exclude = strip_exclude_constraints(sql, &scanned)
@@ -254,7 +269,8 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
-            let class = classify(&statement);
+            // The rewritten source parses as something harmless; what the user wrote is this.
+            let class = constraints.clone().unwrap_or_else(|| classify(&statement));
             Parsed {
                 statement,
                 class,
@@ -928,7 +944,6 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("PREPARE TRANSACTION", &["PREPARE", "TRANSACTION"], &[]),
     u("COMMIT PREPARED", &["COMMIT", "PREPARED"], &[]),
     u("ROLLBACK PREPARED", &["ROLLBACK", "PREPARED"], &[]),
-    u("SET CONSTRAINTS", &["SET", "CONSTRAINTS"], &[]),
     u("a DEFERRABLE transaction", &["BEGIN"], &["DEFERRABLE"]),
     u("a DEFERRABLE transaction", &["START"], &["DEFERRABLE"]),
     // --- Schema objects ---
@@ -1168,8 +1183,90 @@ fn recognize_redirect(words: &[&str]) -> Option<&'static str> {
 /// as `SELECT * FROM name`, and `ABORT` is a deprecated synonym for `ROLLBACK` — so this is a
 /// rewrite PostgreSQL sanctions rather than an interpretation of ours. It buys two statements that
 /// are really written: `TABLE t` is a query, and `ABORT` ends a transaction.
+/// `SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }`, read off the words.
+///
+/// Read here rather than parsed, because `sqlparser` 0.62.0 stops at the `CONSTRAINTS`: it takes
+/// `SET` and then wants `=` or `TO`. The grammar is small enough to read exactly — two keywords, a
+/// comma-separated list or `ALL`, and one of two modes — and reading it here is what keeps a
+/// statement PostgreSQL accepts from reaching a user as a syntax error.
+fn set_constraints(sql: &str, scanned: &Scan<'_>) -> Option<StatementClass> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("SET") || !second.eq_ignore_ascii_case("CONSTRAINTS") {
+        return None;
+    }
+    let deferred = match scanned.words.last()? {
+        mode if mode.eq_ignore_ascii_case("DEFERRED") => true,
+        mode if mode.eq_ignore_ascii_case("IMMEDIATE") => false,
+        // Anything else is not this statement, and the parser's own error is the right answer.
+        _ => return None,
+    };
+    // **The names are read from the source, not from the words.** A `Scan`'s words are keywords —
+    // a quoted identifier is deliberately not one — and `ActiveRecord` quotes every constraint
+    // name it writes, so reading the words gave `SET CONSTRAINTS "x" DEFERRED` an *empty* list,
+    // which is `ALL`. That deferred every deferrable constraint where the user named one, and
+    // answered "done" where a non-deferrable name is `42809`.
+    let body = sql.get(sql.to_ascii_uppercase().find("CONSTRAINTS")? + "CONSTRAINTS".len()..)?;
+    let names = constraint_names(body);
+    // `ALL` is the empty list: every deferrable constraint, which is not the same question as a
+    // list of none.
+    if names.len() == 1 && names[0].eq_ignore_ascii_case("ALL") {
+        return Some(StatementClass::SetConstraints {
+            names: Vec::new(),
+            deferred,
+        });
+    }
+    Some(StatementClass::SetConstraints { names, deferred })
+}
+
+/// The comma-separated names between `CONSTRAINTS` and the mode, quoted or bare.
+///
+/// A quoted name keeps its case and its spaces and loses its quotes, which is what a quoted
+/// identifier means; a bare one is folded to lower case, which is what an unquoted one means.
+fn constraint_names(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut name = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    // `""` inside a quoted identifier is one quote.
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        name.push('"');
+                        continue;
+                    }
+                    break;
+                }
+                name.push(c);
+            }
+            names.push(name);
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut name = String::from(c);
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
+                name.push(chars.next().unwrap_or_default());
+            }
+            names.push(name.to_ascii_lowercase());
+        }
+    }
+    // The trailing `DEFERRED` or `IMMEDIATE` is a word like any other here, and is not a name.
+    names.pop();
+    names
+}
+
 fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let range = scanned.first_word.clone()?;
+    // A `SET CONSTRAINTS` is rewritten **whole**, because nothing of it survives: what it said is
+    // carried on the class instead ([`set_constraints`]), and the statement the parser gets is a
+    // placeholder that never runs — the executor dispatches on the class first.
+    if set_constraints(sql, scanned).is_some() {
+        return Some("SELECT 1".to_owned());
+    }
     let replacement = match scanned.words.first()? {
         first if first.eq_ignore_ascii_case("TABLE") => "SELECT * FROM",
         first if first.eq_ignore_ascii_case("ABORT") => "ROLLBACK",

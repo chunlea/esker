@@ -28,6 +28,7 @@ mod aggregate;
 mod bind;
 mod cursor;
 mod ddl;
+mod deferred;
 mod dml;
 pub(crate) mod explain;
 mod flashback;
@@ -68,6 +69,7 @@ use crate::value::{PgDatum, PgType};
 pub struct Executor {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
+
     pub(crate) tenant: u64,
     /// The transaction an explicit `BEGIN` opened. `None` means the next statement gets its own.
     open: Option<Box<dyn Txn>>,
@@ -76,6 +78,14 @@ pub struct Executor {
     /// any one statement's — the first version of this recorded per statement and lost the
     /// translation entirely for a client that used `BEGIN`.
     written: Written,
+    /// The constraint checks this transaction owes, and what it has been told about them
+    /// (`crate::exec::deferred`).
+    ///
+    /// **Behind a `RefCell`, deliberately.** A row is written through `&Executor` — the write path
+    /// borrows the catalog out of it while it works — and threading `&mut` down to the one line
+    /// that registers a check turned four unrelated signatures mutable and did not stop there.
+    /// One session is one thread, so the cell is a borrow discipline rather than a lock.
+    constraints: std::cell::RefCell<deferred::Constraints>,
     /// Notices produced by the statement that just ran, waiting for the session to send them.
     ///
     /// What actually leaves is filtered by `client_min_messages`
@@ -154,6 +164,175 @@ struct ReadAsOf {
 }
 
 impl Executor {
+    /// The table as an `Arc`, for a deferred check that outlives the statement.
+    ///
+    /// A check is verified after the statement that registered it has finished, so it cannot
+    /// borrow the definition it was written against — and it must not re-read it either, because
+    /// an `ALTER` later in the same transaction would move the constraint under it.
+    pub(crate) fn table_arc(table: &crate::catalog::TableDef) -> Arc<crate::catalog::TableDef> {
+        Arc::new(table.clone())
+    }
+
+    /// Whether `name` is deferred in this transaction, given how it was declared.
+    pub(crate) fn constraint_is_deferred(&self, name: &str, initially_deferred: bool) -> bool {
+        self.constraints.borrow().deferred(name, initially_deferred)
+    }
+
+    /// Registers a check to run at `COMMIT`, or at the next `SET CONSTRAINTS … IMMEDIATE`.
+    pub(crate) fn defer_check(&self, check: deferred::Check) {
+        self.constraints.borrow_mut().push(check);
+    }
+
+    /// `SET CONSTRAINTS`, run against a transaction of its own when there is no block.
+    ///
+    /// **It needs one even outside a block**: the names are checked against the catalog whether or
+    /// not there is anything to defer, so `SET CONSTRAINTS nosuch IMMEDIATE` is `42704` on its own
+    /// as it is inside a transaction. Measured.
+    fn set_constraints_statement(&mut self, names: &[String], deferred: bool) -> Result<Outcome> {
+        if let Some(txn) = self.open.take() {
+            let outcome = self.set_constraints(names, deferred, &*txn);
+            self.open = Some(txn);
+            outcome?;
+        } else {
+            let txn = self.open_txn()?;
+            let outcome = self.set_constraints(names, deferred, &*txn);
+            // **Outside a block the mode belongs to the implicit transaction**, which ends with
+            // this statement — so it is forgotten here. Keeping it made a later `BEGIN` inherit a
+            // `SET CONSTRAINTS ALL DEFERRED` from a statement that had already finished, and a
+            // constraint that was declared immediate stopped checking at the statement.
+            self.constraints.borrow_mut().clear();
+            let _ = txn.rollback();
+            outcome?;
+        }
+        Ok(Outcome::done("SET CONSTRAINTS"))
+    }
+
+    /// Whether a constraint of this name exists and may be deferred.
+    ///
+    /// `42704` when nothing has the name — a real server checks that a constraint exists before
+    /// it checks whether it is deferrable, and the two errors are different SQLSTATEs.
+    ///
+    /// `UNIQUE` and `EXCLUDE` answer, which are the two kinds this node can defer. A third
+    /// registers here as it registers in `crate::exec::deferred`: one more place to look, in the
+    /// same order.
+    fn constraint_deferrable(&self, txn: &dyn Txn, name: &str) -> Result<bool> {
+        let relations = crate::catalog::pg_relations::Relations::read(txn, self.tenant)?;
+        for table in relations.rows().filter_map(|row| relations.table(row)) {
+            for index in &table.indexes {
+                if index.name == name {
+                    return Ok(index.deferrable());
+                }
+            }
+            if table.primary_key_name == name {
+                // A primary key is never deferrable here; PostgreSQL's may be, and declaring one
+                // that way is refused where it is lowered.
+                return Ok(false);
+            }
+            for check in &table.checks {
+                if check.name == name {
+                    return Ok(false);
+                }
+            }
+            for exclude in &table.excludes {
+                if exclude.name == name {
+                    return Ok(exclude.deferrable);
+                }
+            }
+            for key in &table.foreign_keys {
+                if key.name == name {
+                    // `DEFERRABLE` on a foreign key is recorded and changes nothing yet, so it
+                    // cannot be deferred either — and saying so is better than accepting a
+                    // `SET CONSTRAINTS` that would not defer it.
+                    return Ok(false);
+                }
+            }
+        }
+        Err(SqlError::ConstraintDoesNotExist(name.to_owned()))
+    }
+
+    /// The deferred checks, then the commit — the pair every transaction ends with.
+    ///
+    /// A failed check leaves nothing committed: the transaction is rolled back, which is what a
+    /// real server does and is visible afterwards as the rows not being there.
+    fn checked_and_committed(&mut self, txn: Box<dyn Txn>, written: &Written) -> Result<()> {
+        let owed = self.constraints.borrow_mut().take();
+        for check in &owed {
+            if let Err(error) = check.verify(&*txn, self.tenant) {
+                let _ = txn.rollback();
+                return Err(error);
+            }
+        }
+        match txn.commit() {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.explain_conflict(error, written)),
+        }
+    }
+
+    /// Runs every check the transaction owes, and forgets them.
+    ///
+    /// The **first** failure is the answer, which is what a real server reports: one `23505`
+    /// naming one constraint, not a list.
+    fn run_deferred_checks(&mut self) -> Result<()> {
+        if self.constraints.borrow().is_empty() {
+            return Ok(());
+        }
+        let checks = self.constraints.borrow_mut().take();
+        let Some(txn) = self.open.as_deref() else {
+            return Ok(());
+        };
+        for check in &checks {
+            check.verify(txn, self.tenant)?;
+        }
+        Ok(())
+    }
+
+    /// `SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }`.
+    ///
+    /// **`IMMEDIATE` runs what is already owed**, at once — which is where the `23505` appears for
+    /// a transaction that deferred a violation and then asked for the answer. `ALL` reaches only
+    /// the constraints that are deferrable; a plain `UNIQUE` is unaffected by it and refuses a
+    /// statement that names it (`42809`). Measured, all three.
+    pub(crate) fn set_constraints(
+        &mut self,
+        names: &[String],
+        deferred: bool,
+        txn: &dyn Txn,
+    ) -> Result<()> {
+        if names.is_empty() {
+            self.constraints.borrow_mut().set_all(deferred);
+            if !deferred {
+                let owed = self.constraints.borrow_mut().take();
+                for check in &owed {
+                    check.verify(txn, self.tenant)?;
+                }
+            }
+            return Ok(());
+        }
+        for name in names {
+            // **Not deferrable is an error and not a no-op**, even for `IMMEDIATE`, which would
+            // change nothing: PostgreSQL refuses the statement either way. Measured.
+            if !self.constraint_deferrable(txn, name)? {
+                return Err(SqlError::ConstraintNotDeferrable(name.clone()));
+            }
+            self.constraints
+                .borrow_mut()
+                .set_one(name.clone(), deferred);
+        }
+        if deferred {
+            return Ok(());
+        }
+        // **The transaction handed in, not `self.open`** — which the caller took out before
+        // calling, so reading it here found `None` and skipped every check it was asked to run.
+        let owed: Vec<deferred::Check> = names
+            .iter()
+            .flat_map(|name| self.constraints.borrow_mut().take_named(name))
+            .collect();
+        for check in &owed {
+            check.verify(txn, self.tenant)?;
+        }
+        Ok(())
+    }
+
     /// An executor over a store and a shared catalog cache.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, catalog: Arc<Catalog>, tenant: u64) -> Self {
@@ -163,6 +342,7 @@ impl Executor {
             tenant,
             open: None,
             written: Written::default(),
+            constraints: std::cell::RefCell::default(),
             notices: Vec::new(),
             parameters: savepoint::Parameters::new(),
             block_parameters: None,
@@ -303,13 +483,18 @@ impl Executor {
             }
         };
         let outcome = match self.run_recording(&mut *txn, &bound, &mut written) {
-            Ok(outcome) => match txn.commit() {
-                Ok(_) => {
+            // **A statement outside a block is its own transaction, so its commit is here** — and
+            // a deferred check runs at every commit, this one included. Measured: the second of
+            // two colliding inserts fails on its own, with the row not written, exactly as an
+            // immediate constraint would refuse it; deferral is a property of the *transaction*,
+            // and an implicit transaction is one statement long.
+            Ok(outcome) => match self.checked_and_committed(txn, &written) {
+                Ok(()) => {
                     // After the commit, and only after it.
                     self.report_columnar();
                     Ok(outcome)
                 }
-                Err(error) => Err(self.explain_conflict(error, &written)),
+                Err(error) => Err(error),
             },
             Err(error) => {
                 // The rollback's own failure is not what the client asked about; the statement's
@@ -1399,6 +1584,11 @@ fn returning_fields(
 
 impl Execute for Executor {
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
+        // **Before lowering**, because the statement the parser was given is a placeholder: what
+        // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
+        if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {
+            return self.set_constraints_statement(names, *deferred);
+        }
         let statement = parsed.lower()?;
         if let Statement::Session(session) = &statement {
             return self.session_statement(session);
@@ -1516,6 +1706,13 @@ impl Execute for Executor {
     }
 
     fn commit(&mut self) -> Result<()> {
+        // **Before anything else the commit does**, because a check that fails means the
+        // transaction does not commit at all. A real server rolls it back and this does too: the
+        // rows the block wrote are not there afterwards, measured.
+        if let Err(error) = self.run_deferred_checks() {
+            let _ = self.rollback();
+            return Err(error);
+        }
         self.savepoints.clear();
         let written = std::mem::take(&mut self.written);
         self.catalog_written = false;
@@ -1538,6 +1735,9 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        // A check owed by a transaction that is not committing is a check nobody will ever run,
+        // and `SET CONSTRAINTS` is undone with everything else the block did.
+        self.constraints.borrow_mut().clear();
         // Before `end_of_block`, which drops the snapshot: a `SET` made inside the block goes back
         // with everything else the block did.
         if let Some(parameters) = self.block_parameters.take() {

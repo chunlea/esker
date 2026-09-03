@@ -10,7 +10,7 @@
 
 pub use esker_keys::row::{
     ROW_FORMAT_VERSION, RowError, RowSchema, decode_key_columns, decode_row, encode_row, index_key,
-    index_range, row_key, table_row_range, unique_index_key_is_unique_by_value,
+    index_range, index_value_range, row_key, table_row_range, unique_index_key_is_unique_by_value,
 };
 
 #[cfg(test)]

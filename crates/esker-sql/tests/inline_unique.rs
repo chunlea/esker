@@ -40,16 +40,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              same code.",
         ),
         (
-            "CREATE TABLE tucd (a integer, CONSTRAINT d UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)",
-            "**`INITIALLY DEFERRED` really defers, and this node cannot** — refused by name \
-             (contract C2). Measured on 19beta1: both colliding rows are accepted inside the \
-             transaction and the `23505` is raised by `COMMIT`, which rolls the whole transaction \
-             back. Every check in this crate is immediate, so taking the clause would refuse a \
-             transaction a real server commits — a wrong answer rather than a gap. It is the one \
-             of statement 779's four constraints that does not land; the other three do, \
-             `DEFERRABLE INITIALLY IMMEDIATE` included, because that one is not deferred at all.",
-        ),
-        (
             "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
              pg_constraint WHERE conrelid = 'tucd'::regclass AND contype = 'u'",
             "The consequence of the line above: the table was never created. It is in the corpus \
@@ -127,22 +117,47 @@ fn deferrable_initially_immediate_is_checked_at_the_statement() {
     );
 }
 
-/// **`INITIALLY DEFERRED` really waits**, and this node cannot — so it is refused by name.
+/// **`INITIALLY DEFERRED` really waits**, and now it does here too.
 ///
-/// Measured: both rows go in inside the transaction and the violation is raised by `COMMIT`, which
-/// rolls the whole transaction back. Checking it at the statement instead would refuse a
-/// transaction a real server commits — a wrong answer, not a gap — so the clause is named rather
-/// than approximated. It is the one of the four constraints in statement 779 that does not land.
+/// This test asserted the refusal until the transaction could owe a check. What it asserts now is
+/// the behaviour that refusal was standing in for, and the case that makes deferral worth having:
+/// a transaction breaks the constraint in the middle and **repairs it before the end**, which a
+/// real server commits. Checking at the statement would refuse it — a wrong answer, not a gap,
+/// which is why the clause was named rather than approximated until the mechanism existed
+/// (`crate::exec::deferred`).
 #[test]
-fn initially_deferred_is_refused_by_name() {
-    let mut node = parity::Node::new(&[]);
-    let error = node
-        .run("CREATE TABLE td (id integer, CONSTRAINT d UNIQUE (id) DEFERRABLE INITIALLY DEFERRED)")
-        .unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
+fn initially_deferred_waits_for_the_commit() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE td (id int8 PRIMARY KEY, a int4, CONSTRAINT td_a UNIQUE (a) DEFERRABLE \
+         INITIALLY DEFERRED)",
+        "INSERT INTO td VALUES (1, 1)",
+    ]);
+
+    // Broken in the middle: the second row goes in, and both are visible inside the block.
+    node.run("BEGIN").unwrap();
+    node.run("INSERT INTO td VALUES (2, 1)").unwrap();
+    assert_eq!(node.rows("SELECT count(*) FROM td"), vec![vec!["2"]]);
+
+    // And the `COMMIT` is what refuses it — rolling the whole transaction back, so the row that
+    // was visible a moment ago is not there.
+    let error = node.run("COMMIT").unwrap_err();
+    assert_eq!(error.sqlstate(), "23505");
     assert_eq!(
         error.to_string(),
-        "UNIQUE ... DEFERRABLE INITIALLY DEFERRED is not supported"
+        "duplicate key value violates unique constraint \"td_a\""
+    );
+    assert_eq!(node.rows("SELECT count(*) FROM td"), vec![vec!["1"]]);
+
+    // **Repaired before the end**: the same duplicate, with the original deleted, commits. This
+    // is the case the whole mechanism exists for and the one an immediate constraint cannot
+    // express — there is no order of these two statements that an immediate check admits.
+    node.run("BEGIN").unwrap();
+    node.run("INSERT INTO td VALUES (3, 1)").unwrap();
+    node.run("DELETE FROM td WHERE id = 1").unwrap();
+    node.run("COMMIT").unwrap();
+    assert_eq!(
+        node.rows("SELECT id, a FROM td ORDER BY id"),
+        vec![vec!["3", "1"]]
     );
 }
 

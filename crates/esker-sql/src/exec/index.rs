@@ -52,7 +52,14 @@ pub(super) fn entry(
     // because two unknowns are not known to be equal — so the entry carries the primary key as a
     // suffix and the NULLs stay apart. The clause says to treat them as one value instead, which
     // is exactly "drop the suffix": the second NULL then writes the key the first one holds.
+    // **A deferrable constraint's index is never by value.** Two colliding rows have to be able
+    // to coexist until the check runs — at `COMMIT`, or at a `SET CONSTRAINTS … IMMEDIATE` — and
+    // by-value keys give them one slot between them. So its entries carry the primary key as a
+    // suffix, as a non-unique index's do, and the constraint is enforced by scanning the value's
+    // range instead of by reading one key (`crate::exec::deferred`). The shape follows the
+    // *declaration*, which never changes; the mode only decides when the scan happens.
     let by_value = index.unique
+        && !index.deferrable()
         && (index.nulls_not_distinct || row::unique_index_key_is_unique_by_value(&values));
     let suffix = if by_value { None } else { Some(primary_key) };
     let key = row::index_key(tenant, table.id, index.id, &values, suffix)?;

@@ -23,6 +23,9 @@ use esker_keys::value::Datum;
 
 /// The rows a call yields, one column wide.
 pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>>> {
+    if call.name == "generate_series" {
+        return series(call, row);
+    }
     if call.name != "generate_subscripts" {
         return Err(SqlError::unsupported(format!(
             "the table function {}",
@@ -81,6 +84,53 @@ pub(super) fn rows(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>
         .collect())
 }
 
+/// `generate_series(start, stop [, step])`: the values from `start` to `stop` **inclusive**.
+///
+/// Three rules, measured: a step that walks away from `stop` yields **no rows** rather than
+/// looping — `generate_series(1, 3, -1)` is empty — a **zero** step is `22023 step size cannot
+/// equal zero`, and a NULL in any argument is no rows at all.
+fn series(call: &TableFunction, row: &[Datum]) -> Result<Vec<Vec<Datum>>> {
+    if !matches!(call.args.len(), 2 | 3) {
+        return Err(SqlError::UndefinedFunction(format!(
+            "generate_series({})",
+            vec!["unknown"; call.args.len()].join(", ")
+        )));
+    }
+    let mut bounds = [0i64; 3];
+    for (at, slot) in bounds.iter_mut().enumerate() {
+        // The step defaults to one, which is the two-argument form.
+        let Some(expr) = call.args.get(at) else {
+            *slot = 1;
+            continue;
+        };
+        *slot = match super::cursor::evaluate(expr, row)? {
+            Datum::Int8(value) => value,
+            Datum::Int4(value) => i64::from(value),
+            Datum::Int2(value) => i64::from(value),
+            Datum::Null => return Ok(Vec::new()),
+            _ => {
+                return Err(SqlError::UndefinedFunctionTypes(
+                    "generate_series".to_owned(),
+                ));
+            }
+        };
+    }
+    let [start, last, step] = bounds;
+    if step == 0 {
+        return Err(SqlError::ZeroStep);
+    }
+    let mut out = Vec::new();
+    let mut at = start;
+    while (step > 0 && at <= last) || (step < 0 && at >= last) {
+        out.push(vec![Datum::Int8(at)]);
+        let Some(next) = at.checked_add(step) else {
+            break;
+        };
+        at = next;
+    }
+    Ok(out)
+}
+
 /// The subscripts of a real array's `dimension`, or `None` when it has none.
 ///
 /// Every "nothing to do" case is here rather than at the caller: a dimension the array does not
@@ -133,8 +183,14 @@ fn subscripts(text: &str, dimension: i64) -> Option<std::ops::RangeInclusive<i32
         if dimension != 1 {
             return None;
         }
+        // **An `int2vector` is subscripted from zero**, which is why `ActiveRecord` writes
+        // `pg_get_indexdef(…, k + 1, true)` over `generate_subscripts(d.indkey, 1)`: measured on
+        // 19beta1, an index on two columns gives `k` of 0 and 1 and `array_lower(indkey, 1)` is 0.
+        // This branch returned `1..=count` when it was written — an assumption, and the unit test
+        // beside it asserted the same assumption, so nothing caught it until boot statement 32
+        // read the *second* column where PostgreSQL reads the first.
         let count = i32::try_from(body.split_whitespace().count()).ok()?;
-        (count > 0).then_some(1..=count)
+        (count > 0).then_some(0..=count - 1)
     }
 }
 
@@ -154,10 +210,12 @@ mod tests {
             subscripts("[0:2]={a,b,c}", 1).map(Iterator::collect),
             Some(vec![0, 1, 2])
         );
-        // An `int2vector`, which is how `pg_index.indkey` prints here.
+        // **An `int2vector` is 0-based**, which is `pg_index.indkey`'s whole difference from an
+        // array — measured, not assumed. This assertion said `[1, 2]` when it was written and
+        // agreed with an implementation that had made the same mistake.
         assert_eq!(
             subscripts("2 1", 1).map(Iterator::collect),
-            Some(vec![1, 2])
+            Some(vec![0, 1])
         );
         // Every "nothing to do" case is no rows.
         for (text, dimension) in [

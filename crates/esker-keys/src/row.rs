@@ -899,6 +899,28 @@ pub fn table_row_range(tenant: u64, table_id: u64) -> (Vec<u8>, Vec<u8>) {
     (start.clone(), successor(start))
 }
 
+/// Every entry of one index that holds **these key values**, whatever suffix it carries.
+///
+/// The range a uniqueness check scans when the entries are suffixed — which is what a deferrable
+/// constraint's are, so that two colliding rows can coexist until the check runs
+/// (`esker_sql::exec::deferred`). The end is the **prefix's** successor and not the key's: a
+/// suffixed entry sorts *after* the bare value key, so a range ending one byte past that key would
+/// contain none of them.
+///
+/// # Errors
+///
+/// When a value cannot be encoded as a key column.
+pub fn index_value_range(
+    tenant: u64,
+    table_id: u64,
+    index_id: u64,
+    columns: &[Datum],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let start = index_key(tenant, table_id, index_id, columns, None)?;
+    let end = successor(start.clone());
+    Ok((start, end))
+}
+
 /// The half-open key range holding every entry of one index.
 #[must_use]
 pub fn index_range(tenant: u64, table_id: u64, index_id: u64) -> (Vec<u8>, Vec<u8>) {

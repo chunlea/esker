@@ -1024,26 +1024,29 @@ fn lower_drop_function(drop: &sqlparser::ast::DropFunction) -> Result<plan::Drop
 /// all that differs is `pg_constraint.condeferrable` and what `pg_get_constraintdef` prints. So it
 /// is taken, and the flag is stored for those two readers alone.
 ///
-/// **`INITIALLY DEFERRED` really waits**, and is refused by name for the reason the foreign-key
-/// form is: a transaction that breaks the constraint in the middle and repairs it before `COMMIT`
-/// succeeds on a real server, and every check in this crate is immediate — so accepting the clause
-/// would refuse a transaction PostgreSQL commits, which is a wrong answer rather than a gap.
-/// Measured: both rows go in and `COMMIT` raises the `23505`, rolling the whole transaction back.
+/// **`INITIALLY DEFERRED` really waits**, and now it can: the check is registered against the
+/// transaction and run at `COMMIT` (`crate::exec::deferred`). It was refused by name until then,
+/// deliberately — accepting the clause while checking at the statement would refuse a transaction
+/// PostgreSQL commits, which is a wrong answer rather than a gap.
+///
+/// Returns `(deferrable, deferred)`. The second is never true without the first: `INITIALLY
+/// DEFERRED` implies `DEFERRABLE` in the grammar, and PostgreSQL rejects the pair written the
+/// other way round.
 fn unique_deferrable(
     characteristics: Option<&sqlparser::ast::ConstraintCharacteristics>,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let Some(characteristics) = characteristics else {
-        return Ok(false);
+        return Ok((false, false));
     };
-    refuse_if(
-        characteristics.initially == Some(DeferrableInitial::Deferred),
-        "UNIQUE ... DEFERRABLE INITIALLY DEFERRED",
-    )?;
     refuse_if(
         characteristics.enforced.is_some(),
         "UNIQUE ... ENFORCED, which is MySQL's",
     )?;
-    Ok(characteristics.deferrable.unwrap_or(false))
+    let deferred = characteristics.initially == Some(DeferrableInitial::Deferred);
+    Ok((
+        characteristics.deferrable.unwrap_or(false) || deferred,
+        deferred,
+    ))
 }
 
 /// `CREATE [OR REPLACE] FUNCTION f() RETURNS TRIGGER AS $$…$$ LANGUAGE plpgsql`.
@@ -1314,12 +1317,15 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 // primary key that refuses the second insert.
                 ColumnOption::Default(expr) => (default, default_expr) = column_default(expr, ty)?,
                 ColumnOption::Unique(constraint) => {
+                    let (deferrable, deferred) =
+                        unique_deferrable(constraint.characteristics.as_ref())?;
                     unique.push(plan::UniqueConstraint {
                         name: option.name.as_ref().map(ident),
                         columns: vec![column_name.clone()],
                         nulls_not_distinct: constraint.nulls_distinct
                             == NullsDistinctOption::NotDistinct,
-                        deferrable: unique_deferrable(constraint.characteristics.as_ref())?,
+                        deferrable,
+                        deferred,
                     });
                 }
                 ColumnOption::PrimaryKey(_) => {
@@ -1573,11 +1579,13 @@ fn lower_table_constraints(
                     .or_else(|| key.name.as_ref().map(ident));
             }
             TableConstraint::Unique(key) => {
+                let (deferrable, deferred) = unique_deferrable(key.characteristics.as_ref())?;
                 unique.push(plan::UniqueConstraint {
                     name: key.name.as_ref().map(ident),
                     columns: index_columns(&key.columns)?,
                     nulls_not_distinct: key.nulls_distinct == NullsDistinctOption::NotDistinct,
-                    deferrable: unique_deferrable(key.characteristics.as_ref())?,
+                    deferrable,
+                    deferred,
                 });
             }
             TableConstraint::ForeignKey(constraint) => {
@@ -2190,6 +2198,28 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     days: value.days,
                     micros: value.micros,
                 },
+            ))))
+        }
+        // **`ARRAY( SELECT … )` is a sixth spelling**, and `sqlparser` gives it as a *function*
+        // named `ARRAY` whose arguments are a subquery — which is why it refused as "the function
+        // ARRAY is not supported" while `ARRAY[…]`, a different production entirely, answered.
+        // Its argument is any query, so `ARRAY(VALUES (1),(2))` is one too.
+        Expr::Function(function)
+            // Written without `relation_name`, which *refuses* a qualified name: reading it here
+            // turned `public.obj_description(…)`'s `42883` into this arm's `0A000` — a guard has
+            // to be a question, not a decision.
+            if function.name.to_string().eq_ignore_ascii_case("array")
+                && matches!(
+                    function.args,
+                    sqlparser::ast::FunctionArguments::Subquery(_)
+                ) =>
+        {
+            let sqlparser::ast::FunctionArguments::Subquery(query) = &function.args else {
+                return Err(SqlError::unsupported("the function ARRAY"));
+            };
+            Ok(plan::Expr::Subquery(Box::new(plan::SubqueryExpr::bare(
+                plan::SubqueryKind::Array,
+                Box::new(lower_query(query)?),
             ))))
         }
         Expr::Function(function) => lower_function(function),
@@ -3901,6 +3931,54 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(select.exclude.is_some(), "EXCLUDE")?;
     refuse_if(!select.optimizer_hints.is_empty(), "an optimizer hint")?;
 
+    // **`SELECT srf(…)` with no `FROM` is `SELECT * FROM srf(…)`.** A set-returning function in
+    // the target list multiplies the rows of the query it is written in; where there is no `FROM`
+    // there is one input row, so the two spellings are the same query and this is the rewrite
+    // rather than an approximation of one. It is deliberately narrow — one item, that item the
+    // whole projection, no `FROM` — because a set-returning function *beside* other items is the
+    // mechanism this does not have: two of them run in lockstep and pad the shorter with NULL,
+    // which is measured in `tests/corpus/pg19_generate_subscripts.txt` and is not this.
+    if select.from.is_empty()
+        && select.selection.is_none()
+        && let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice()
+        && is_set_returning(function)
+        && let Ok(name) = unqualified_function_name(function)
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "generate_series" | "generate_subscripts"
+        )
+        && let sqlparser::ast::FunctionArguments::List(list) = &function.args
+    {
+        // The same query with the call moved into the `FROM` and the projection made a wildcard,
+        // lowered by the ordinary path — so its `ORDER BY`, `LIMIT` and `OFFSET` are handled once,
+        // here as everywhere.
+        let mut rewritten = select.clone();
+        rewritten.projection = vec![SelectItem::Wildcard(
+            sqlparser::ast::WildcardAdditionalOptions::default(),
+        )];
+        rewritten.from = vec![sqlparser::ast::TableWithJoins {
+            relation: TableFactor::Table {
+                name: function.name.clone(),
+                alias: None,
+                args: Some(sqlparser::ast::TableFunctionArgs {
+                    args: list.args.clone(),
+                    settings: None,
+                }),
+                with_hints: Vec::new(),
+                version: None,
+                with_ordinality: false,
+                partitions: Vec::new(),
+                json_path: None,
+                sample: None,
+                index_hints: Vec::new(),
+            },
+            joins: Vec::new(),
+        }];
+        let mut inner = query.clone();
+        *inner.body = SetExpr::Select(rewritten);
+        return lower_query(&inner);
+    }
+
     let (from, joins) = match select.from.as_slice() {
         [] => (None, Vec::new()),
         [table] => {
@@ -4156,13 +4234,14 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
             partitions,
             ..
         } => {
-            // **A set-returning function standing where a relation does.** Only
-            // `generate_subscripts`, which is what the schema dump reads every constraint's
-            // column list through; anything else is still named rather than approximated.
+            // **A set-returning function standing where a relation does.** Two of them:
+            // `generate_subscripts`, which is what the schema dump reads every constraint's and
+            // every index's column list through, and `generate_series`. Anything else is still
+            // named rather than approximated.
             if let Some(args) = args {
                 let folded = relation_name(name)?;
                 refuse_if(
-                    folded != "generate_subscripts",
+                    !matches!(folded.as_str(), "generate_subscripts" | "generate_series"),
                     format!("the table function {folded}"),
                 )?;
                 let alias = match alias {

@@ -25,39 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          daterange(NULL,NULL) && daterange('2026-01-01','2026-02-01')",
     ],
     answers: &[
-        // **The deferral, in five statements.** `INITIALLY DEFERRED` is recorded here and not yet
-        // honoured: the check runs at the statement where a real server holds it to `COMMIT`, so
-        // the two inserts a real server *accepts* are refused, and the `SET CONSTRAINTS … IMMEDIATE`
-        // that a real server refuses on is a `0A000` naming the command. Holding a check to the end
-        // of a transaction is the session layer's unit, not this one; the flag it will read is
-        // already in the catalog (`condeferred`, and `ExcludeDef::deferred`), and these five lines
-        // are what will turn green when it lands.
-        (
-            "SET CONSTRAINTS \"test_exclusion_constraints_valid_overlap\" DEFERRED",
-            "`SET CONSTRAINTS` is refused by name: there is no deferred checking to switch on yet.",
-        ),
-        (
-            "INSERT INTO \"test_exclusion_constraints\" (\"valid_from\",\"valid_to\") VALUES \
-             ('2026-01-15','2026-02-15')",
-            "Refused at the statement where a real server, with the constraint deferred, admits \
-             the row and reports at `COMMIT`.",
-        ),
-        (
-            "SET CONSTRAINTS \"test_exclusion_constraints_valid_overlap\" IMMEDIATE",
-            "The same: a real server raises the pending `23P01` here, and this node raised it at \
-             the insert.",
-        ),
-        (
-            "INSERT INTO \"test_exclusion_constraints\" (\"transaction_from\",\"transaction_to\") \
-             VALUES ('2026-01-15','2026-02-15')",
-            "`INITIALLY DEFERRED`, recorded and not honoured — the same divergence as the row \
-             above, through the constraint that declares it in the schema rather than through \
-             `SET CONSTRAINTS`.",
-        ),
-        (
-            "SET CONSTRAINTS \"test_exclusion_constraints_transaction_overlap\" IMMEDIATE",
-            "And the same.",
-        ),
         // **A scalar key**, which a real server refuses for a reason this node cannot reach.
         (
             "CREATE TABLE tec_scalar (id int8, CONSTRAINT tec_scalar_x EXCLUDE USING gist (id \
@@ -211,16 +178,18 @@ fn an_update_is_checked_against_the_new_range() {
     assert_eq!(error.sqlstate(), "23P01");
 }
 
-/// **`DEFERRABLE INITIALLY DEFERRED` is recorded rather than refused**, so statement 777 loads.
+/// **`INITIALLY DEFERRED` holds the check to `COMMIT`**, and that is what makes a repair possible.
 ///
-/// The clause is real and this node does not honour it yet: the check runs at the statement, where
-/// a real server holds it to `COMMIT`. The capture proves the difference is reachable — with the
-/// constraint deferred, the conflicting row inserts and the `23P01` arrives on
-/// `SET CONSTRAINTS … IMMEDIATE`. Recording it is the coordinator's ruling and the reason the
-/// schema this appears in can load at all; end-of-transaction checking is a transaction-layer unit
-/// that plugs in where the flag is read.
+/// The point of deferring is not the delay: it is that a transaction may break the constraint in
+/// the middle and put it right before the end. So the conflicting row inserts, `count(*)` sees it,
+/// and what happens next depends on what the transaction does — `DELETE` the row it collided with
+/// and the commit stands; leave it and the `23P01` arrives at `COMMIT`.
+///
+/// The **later** row is the one named `Key` and the earlier one is the existing key, because only
+/// the insert that conflicted queued a recheck — the first row's insert conflicted with nothing and
+/// left nothing to run.
 #[test]
-fn initially_deferred_is_recorded_and_not_yet_honoured() {
+fn initially_deferred_holds_the_check_to_commit() {
     let mut node = parity::Node::new(&[
         "CREATE TABLE ex (a date, b date, CONSTRAINT ex_3 EXCLUDE USING gist (daterange(a, b) \
          WITH &&) DEFERRABLE INITIALLY DEFERRED)",
@@ -233,15 +202,44 @@ fn initially_deferred_is_recorded_and_not_yet_honoured() {
         ),
         [["ex_3", "x", "t", "t"]]
     );
-    // And the check is immediate for now, which is the half that is not yet PostgreSQL's.
-    node.run("INSERT INTO ex (a, b) VALUES ('2026-01-01','2026-02-01')")
-        .unwrap();
+    // Broken in the middle and repaired before the end: this commits.
+    for statement in [
+        "BEGIN",
+        "INSERT INTO ex (a, b) VALUES ('2026-01-01','2026-02-01')",
+        "INSERT INTO ex (a, b) VALUES ('2026-01-15','2026-02-15')",
+        "DELETE FROM ex WHERE a = '2026-01-01'",
+        "COMMIT",
+    ] {
+        node.run(statement).unwrap();
+    }
+    assert_eq!(node.rows("SELECT count(*) FROM ex"), [["1"]]);
+
+    // Broken and left broken: the row inserts, and `COMMIT` is where it fails.
+    node.run("DELETE FROM ex").unwrap();
+    for statement in [
+        "BEGIN",
+        "INSERT INTO ex (a, b) VALUES ('2026-01-01','2026-02-01')",
+        "INSERT INTO ex (a, b) VALUES ('2026-01-15','2026-02-15')",
+    ] {
+        node.run(statement).unwrap();
+    }
     assert_eq!(
-        node.run("INSERT INTO ex (a, b) VALUES ('2026-01-15','2026-02-15')")
-            .unwrap_err()
-            .sqlstate(),
-        "23P01"
+        node.rows("SELECT count(*) FROM ex"),
+        [["2"]],
+        "both are there"
     );
+    let error = node.run("COMMIT").unwrap_err();
+    assert_eq!(error.sqlstate(), "23P01");
+    assert_eq!(
+        error.detail().as_deref(),
+        Some(
+            "Key (daterange(a, b))=([2026-01-15,2026-02-15)) conflicts with existing key \
+             (daterange(a, b))=([2026-01-01,2026-02-01))."
+        ),
+        "the later row is the Key; only its insert queued a recheck"
+    );
+    // The failed check rolled the transaction back, so neither row is there.
+    assert_eq!(node.rows("SELECT count(*) FROM ex"), [["0"]]);
 }
 
 /// **Statement 777 itself**: all three constraints in one `CREATE TABLE`, as the suite writes it.

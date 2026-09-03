@@ -912,6 +912,47 @@ impl Env<'_> {
 }
 
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
+/// The three functions `crate::value::range` answers: `daterange`, `isempty` and `&&`.
+///
+/// Split out of [`catalog_function`] because they are one family and it is long enough already.
+fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+    Ok(match func {
+        // **`daterange(low, high)`** — a NULL bound is *unbounded*, not NULL, so the call answers a
+        // range either way and is never NULL itself. That is the fact that makes
+        // `daterange(NULL, NULL)` overlap everything rather than nothing.
+        CatalogFunc::DateRange => {
+            // A bare `'2026-01-01'` reaches here as text, the way an unknown literal reaches a
+            // real server's `daterange(unknown, unknown)` — so it is coerced rather than refused.
+            let day = |value: Option<&Datum>| match value {
+                Some(Datum::Date(day)) => Ok(Some(*day)),
+                Some(Datum::Null) | None => Ok(None),
+                Some(Datum::Text(text)) => Ok(Some(crate::value::date::from_text(text, 0)?)),
+                Some(other) => Err(SqlError::UndefinedFunctionTypes(format!(
+                    "daterange({})",
+                    other
+                        .column_type()
+                        .map_or("unknown", crate::value::PgType::name)
+                ))),
+            };
+            Datum::Text(
+                crate::value::range::DateRange::new(day(args.first())?, day(args.get(1))?)
+                    .to_text(),
+            )
+        }
+        CatalogFunc::IsEmpty => match range_argument(args.first())? {
+            None => Datum::Null,
+            Some(range) => Datum::Bool(range.empty),
+        },
+        // Strict on both sides: a NULL range makes the answer unknown, the way every other
+        // operator over a NULL does.
+        _ => match (range_argument(args.first())?, range_argument(args.get(1))?) {
+            (Some(left), Some(right)) => Datum::Bool(left.overlaps(right)),
+            _ => Datum::Null,
+        },
+    })
+}
+
 /// A range argument, or `None` for NULL — and `42883` for a value that is not one.
 fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::DateRange>> {
     match value {
@@ -1174,7 +1215,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 // this makes is the shape, not an accident (`docs/plans/phase-12-subquery.md` §1).
                 (true, Some(txn)) => {
                     let values = crate::exec::subquery::run_correlated(sub, row, txn, env.tenant)?;
-                    crate::exec::subquery::value_of(sub.kind, operand, &values)?
+                    crate::exec::subquery::value_of(
+                        sub.kind,
+                        operand,
+                        &values,
+                        sub.column.as_ref().map(|(_, ty)| *ty),
+                    )?
                 }
                 (true, None) => {
                     return Err(SqlError::Internal(format!(
@@ -1421,6 +1467,14 @@ fn catalog_function(
                 .collect::<String>(),
         ),
         CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
+        // The value's own type. An untyped NULL has none and is `text`, which is what it is
+        // everywhere else in this crate.
+        CatalogFunc::PgTypeof => Datum::Text(
+            args.first()
+                .and_then(Datum::column_type)
+                .map_or("text", crate::value::PgType::name)
+                .to_owned(),
+        ),
         // **Per call, and the corpus pins the consequence rather than a value**: two calls in one
         // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool
         // through the same file `gen_random_uuid` reads (`crate::value::random`).
@@ -1484,42 +1538,11 @@ fn catalog_function(
         CatalogFunc::ColDescription
         | CatalogFunc::ObjDescription
         | CatalogFunc::PgGetPartkeydef => Datum::Null,
+        CatalogFunc::DateRange | CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => {
+            range_function(call.func, &args)?
+        }
         // **`EXECUTE PROCEDURE` prints back as `EXECUTE FUNCTION`**, so the text out is not the
         // text in — statement 762 writes the first spelling and statement 790 the second.
-        // **`daterange(low, high)`** — a NULL bound is *unbounded*, not NULL, so the call answers a
-        // range either way and is never NULL itself. That is the fact that makes
-        // `daterange(NULL, NULL)` overlap everything rather than nothing.
-        CatalogFunc::DateRange => {
-            // A bare `'2026-01-01'` reaches here as text, the way an unknown literal reaches a
-            // real server's `daterange(unknown, unknown)` — so it is coerced rather than refused.
-            let day = |value: Option<&Datum>| match value {
-                Some(Datum::Date(day)) => Ok(Some(*day)),
-                Some(Datum::Null) | None => Ok(None),
-                Some(Datum::Text(text)) => Ok(Some(crate::value::date::from_text(text, 0)?)),
-                Some(other) => Err(SqlError::UndefinedFunctionTypes(format!(
-                    "daterange({})",
-                    other
-                        .column_type()
-                        .map_or("unknown", crate::value::PgType::name)
-                ))),
-            };
-            Datum::Text(
-                crate::value::range::DateRange::new(day(args.first())?, day(args.get(1))?)
-                    .to_text(),
-            )
-        }
-        CatalogFunc::IsEmpty => match range_argument(args.first())? {
-            None => Datum::Null,
-            Some(range) => Datum::Bool(range.empty),
-        },
-        // Strict on both sides: a NULL range makes the answer unknown, the way every other
-        // operator over a NULL does.
-        CatalogFunc::RangeOverlaps => {
-            match (range_argument(args.first())?, range_argument(args.get(1))?) {
-                (Some(left), Some(right)) => Datum::Bool(left.overlaps(right)),
-                _ => Datum::Null,
-            }
-        }
         CatalogFunc::PgGetTriggerdef => {
             crate::catalog::trigger_definition(env.relations()?, oid_argument(args.first())?)
         }

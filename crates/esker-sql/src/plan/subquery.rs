@@ -53,6 +53,17 @@ pub enum SubqueryKind {
         /// `NOT IN`, which is `<> ALL` and **not** "none of them are equal" — see the module note.
         negated: bool,
     },
+    /// `ARRAY( SELECT … )`: the subquery's rows, in its own order, as one array.
+    ///
+    /// **Not `array_agg`, and the difference is visible.** Over zero rows this is `{}` and
+    /// `array_agg` is NULL — measured in one statement, `array_agg(x) IS NULL` is `t` and
+    /// `ARRAY(SELECT x …) IS NULL` is `f` over the same empty input. It is *why* `ActiveRecord`
+    /// writes boot statement 32 this way, and an implementation that rewrote one into the other
+    /// would return NULL where Rails expects an empty array.
+    ///
+    /// A NULL row is a NULL **element**, so `ARRAY(SELECT NULL::int4)` is `{NULL}` — a third
+    /// answer distinct from both `{}` and NULL.
+    Array,
     /// `x <op> ANY (SELECT …)`, `x <op> SOME (…)` and `x <op> ALL (…)`.
     Quantified {
         /// The comparison, which is any of the six.
@@ -83,7 +94,8 @@ impl SubqueryKind {
         match self {
             SubqueryKind::Exists { .. } => Some(1),
             SubqueryKind::Scalar => Some(2),
-            SubqueryKind::In { .. } | SubqueryKind::Quantified { .. } => None,
+            // Every row, because every row is an element.
+            SubqueryKind::In { .. } | SubqueryKind::Quantified { .. } | SubqueryKind::Array => None,
         }
     }
 
@@ -94,7 +106,9 @@ impl SubqueryKind {
     #[must_use]
     pub fn comparison(self) -> Option<BinaryOp> {
         match self {
-            SubqueryKind::Scalar | SubqueryKind::Exists { .. } => None,
+            // Neither compares its rows against anything: one *is* the value, the other counts
+            // them, and this one collects them.
+            SubqueryKind::Scalar | SubqueryKind::Exists { .. } | SubqueryKind::Array => None,
             SubqueryKind::In { negated: false } => Some(BinaryOp::Eq),
             SubqueryKind::In { negated: true } => Some(BinaryOp::NotEq),
             SubqueryKind::Quantified { op, .. } => Some(op),
@@ -106,6 +120,7 @@ impl SubqueryKind {
     pub fn describe(self) -> &'static str {
         match self {
             SubqueryKind::Scalar => "a scalar subquery",
+            SubqueryKind::Array => "ARRAY (subquery)",
             SubqueryKind::Exists { negated: false } => "EXISTS",
             SubqueryKind::Exists { negated: true } => "NOT EXISTS",
             SubqueryKind::In { negated: false } => "IN (subquery)",
@@ -206,6 +221,14 @@ impl SubqueryExpr {
     pub fn value_type(&self) -> ColumnType {
         match self.kind {
             SubqueryKind::Scalar => self.column.as_ref().map_or(ColumnType::Text, |(_, ty)| *ty),
+            // **The array of whatever the subquery's one column is.** PostgreSQL does not encode
+            // dimensionality in the name, so a nested one is still `integer[]` — measured,
+            // `ARRAY(SELECT ARRAY(SELECT 1))` is `{{1}}` of type `integer[]`.
+            SubqueryKind::Array => self
+                .column
+                .as_ref()
+                .and_then(|(_, ty)| esker_keys::array::ArrayValue::array_of(*ty))
+                .unwrap_or(ColumnType::TextArray),
             _ => ColumnType::Bool,
         }
     }
@@ -222,6 +245,8 @@ impl SubqueryExpr {
         match self.kind {
             SubqueryKind::Scalar => self.column.as_ref().map(|(name, _)| name.as_str()),
             SubqueryKind::Exists { negated: false } => Some("exists"),
+            // `array` on a real server, whatever the subquery's own column is called. Measured.
+            SubqueryKind::Array => Some("array"),
             _ => None,
         }
     }
