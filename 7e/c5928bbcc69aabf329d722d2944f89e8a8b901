@@ -1,0 +1,55 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_2ed9df2fd94fee::t_71aee86b2cfdbb 680-685,694-750,1866-1950,2266,2292,2385,2418,2473-2474,3433
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2ed9df2fd94fee::t_4e0d5c3953608d 122-132,156,168-170,196-198,228-230,328-357,409-410,422-429,533-535,592,640-642,714-777
+crates/esker-sql/src/catalog/record.rs
+  s_2ed9df2fd94fee::t_f27d8c3d9c512b 51-53,80,94-97,121-122,475-531,921-924,1105-1119,1307-1333,1461,1478
+crates/esker-sql/src/error.rs
+  s_2ed9df2fd94fee::t_62ee9e1bfbbff5 186-188,897-924,1371,1384-1386,1474-1475,1556-1557,1655-1657
+crates/esker-sql/src/exec/bind.rs
+  s_2ed9df2fd94fee::t_d4485e6e31b909 173-175,294-296,383-385,449-451
+crates/esker-sql/src/exec/cursor.rs
+  s_2ed9df2fd94fee::t_4bd04685d11d4f 1465-1469
+crates/esker-sql/src/exec/ddl.rs
+  s_2ed9df2fd94fee::t_5598a4f2a695a1 124,529-661,719-723,736-749
+crates/esker-sql/src/exec/mod.rs
+  s_2ed9df2fd94fee::t_b151bd455d604d 358-361,1341-1347
+crates/esker-sql/src/exec/subquery.rs
+  s_2ed9df2fd94fee::t_166d0eddff9eae 189,279
+crates/esker-sql/src/parse/lower.rs
+  s_2ed9df2fd94fee::t_9da3b4e6207029 71-91,1039-1146
+crates/esker-sql/src/plan/ddl.rs
+  s_2ed9df2fd94fee::t_8e8e3b37fd0250 135-183
+crates/esker-sql/src/plan/expr.rs
+  s_2ed9df2fd94fee::t_df1b39c059917f 560-565,656-658,694,730,749
+crates/esker-sql/src/plan/mod.rs
+  s_2ed9df2fd94fee::t_ceba192b18c050 34-37,75-80,173-175,213-215
+crates/esker-sql/tests/corpus/pg19_trigger_function.txt
+  s_2ed9df2fd94fee::t_23c6c07cad0be9 1-131
+crates/esker-sql/tests/drop_function.rs
+  s_2ed9df2fd94fee::t_0bb8c6928488d3 15-17
+crates/esker-sql/tests/lowering.rs
+  s_2ed9df2fd94fee::t_d967a4a89c5974 45-48
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_2ed9df2fd94fee::t_8b153ce5915086 271-272,289-297,317-330,340-341,391-407
+crates/esker-sql/tests/trigger_function.rs
+  s_2ed9df2fd94fee::t_0d01a48f687cb3 1-238
+docs/plans/phase-9-rails.md
+  s_2ed9df2fd94fee::t_ce04751f38ea26 1489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7ec5928bbcc69aabf329d722d2944f89e8a8b901",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
