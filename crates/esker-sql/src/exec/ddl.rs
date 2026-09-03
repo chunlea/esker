@@ -1717,6 +1717,63 @@ pub(super) fn create_schema(
     Ok(Outcome::done("CREATE SCHEMA"))
 }
 
+/// `CREATE DATABASE [IF NOT EXISTS] name` — a second tenant, and a row in the cluster's directory.
+///
+/// **Outside a transaction block**, which the executor checked before it got here: a database is
+/// state outside every transaction, so a block that could roll this back would be a block that
+/// could roll back half a schema change. PostgreSQL's `25001`, measured.
+pub(super) fn create_database(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateDatabase,
+) -> Result<Outcome> {
+    if catalog::database_id(&*txn, &create.name)?.is_some() {
+        // `IF NOT EXISTS` is a notice and a success, the way `CREATE SCHEMA`'s is.
+        if create.if_not_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "database",
+                name: create.name.clone(),
+            });
+            return Ok(Outcome::done("CREATE DATABASE"));
+        }
+        return Err(SqlError::DuplicateDatabase(create.name.clone()));
+    }
+    let id = catalog::allocate_database_id(txn)?;
+    catalog::create_database(txn, &create.name, id)?;
+    Ok(Outcome::done("CREATE DATABASE"))
+}
+
+/// `DROP DATABASE [IF EXISTS] name`, and everything the tenant behind it held.
+///
+/// **`IF EXISTS` covers absence and nothing else.** The database this session is connected to is
+/// still `55006` with the clause written, because it is there rather than missing — the same
+/// distinction `DROP SCHEMA` draws between a schema that is absent and one that is depended on.
+pub(super) fn drop_database(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropDatabase,
+) -> Result<Outcome> {
+    for name in &drop.names {
+        let Some(id) = catalog::database_id(&*txn, name)? else {
+            if drop.if_exists {
+                executor.notice(SqlError::DoesNotExistSkipping {
+                    kind: "database",
+                    name: name.clone(),
+                });
+                continue;
+            }
+            return Err(SqlError::UndefinedDatabase(name.clone()));
+        };
+        // **By id, not by name.** The session knows which tenant it is serving and nothing else;
+        // comparing names would answer wrongly the moment two spellings reach one database.
+        if id == executor.tenant {
+            return Err(SqlError::DatabaseInUse(name.clone()));
+        }
+        catalog::drop_database(txn, name, id)?;
+    }
+    Ok(Outcome::done("DROP DATABASE"))
+}
+
 /// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.
 ///
 /// **`IF EXISTS` covers absence and not dependence**: a schema with something in it is `2BP01`
@@ -2245,6 +2302,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Column { name, .. } => name.clone(),
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
+        Expr::CurrentDatabase => "current_database()".to_owned(),
         Expr::CurrentSchema {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),

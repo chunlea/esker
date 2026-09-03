@@ -91,11 +91,10 @@ pub(super) fn plan_in_write_filter(
     tenant: u64,
     txn: &dyn Txn,
     tables: &dyn Tables,
-    table: &crate::catalog::TableDef,
+    scope: &crate::exec::query::Scope<'_>,
 ) -> Result<()> {
-    let scope = crate::exec::query::Scope::single(table);
     walk_mut(filter, &mut |expr| match expr {
-        Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(&scope)),
+        Expr::Subquery(sub) => plan_one(sub, tenant, txn, tables, Some(scope)),
         _ => Ok(()),
     })
 }
@@ -722,6 +721,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::CurrentSchema { .. }
+        | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
@@ -1193,6 +1193,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::CurrentSchema { .. }
+        | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
@@ -1279,6 +1280,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::Uuid(_)
         | Expr::Parameter(_)
         | Expr::CurrentSchema { .. }
+        | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }

@@ -109,8 +109,24 @@ pub(crate) struct Node {
 impl Node {
     pub(crate) fn new(fixture: &[&str]) -> Self {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Node::on(backend, Arc::new(Catalog::new()), 1, "esker", fixture)
+    }
+
+    /// A session on a store something else already has — a **second database** on one cluster,
+    /// which is the only way to reach the isolation `esker-sql` gets from the tenant in its keys.
+    ///
+    /// `tenant` and `database` are the two halves the startup packet decides between them: the
+    /// directory answers which tenant a name is, and the executor carries the name so that
+    /// `current_database()` reports the one this session asked for.
+    pub(crate) fn on(
+        backend: Arc<dyn Backend>,
+        catalog: Arc<Catalog>,
+        tenant: u64,
+        database: &str,
+        fixture: &[&str],
+    ) -> Self {
         let mut node = Node {
-            executor: Executor::new(backend, Arc::new(Catalog::new()), 1),
+            executor: Executor::new(backend, catalog, tenant).serving_database(database),
             in_block: false,
             failed: false,
         };

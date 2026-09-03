@@ -75,6 +75,12 @@ pub struct Executor {
     catalog: Arc<Catalog>,
 
     pub(crate) tenant: u64,
+    /// The database this session is connected to, which is the tenant above under its name.
+    ///
+    /// **The name is carried rather than looked up.** `current_database()` runs four times while
+    /// `ActiveRecord` connects and the tenant is already decided by then — reading the directory
+    /// again per statement would answer the same thing and cost a catalog read to do it.
+    pub(crate) database: String,
     /// The transaction an explicit `BEGIN` opened. `None` means the next statement gets its own.
     open: Option<Box<dyn Txn>>,
     /// What the open transaction has written that changes how a failed commit reads. It
@@ -344,6 +350,7 @@ impl Executor {
             backend,
             catalog,
             tenant,
+            database: crate::parse::DATABASE_NAME.to_owned(),
             open: None,
             written: Written::default(),
             constraints: std::cell::RefCell::default(),
@@ -372,6 +379,17 @@ impl Executor {
     #[must_use]
     pub fn reporting_columnar_to(mut self, report: Arc<dyn crate::pd::ColumnarReport>) -> Self {
         self.columnar = Some(report);
+        self
+    }
+
+    /// The same executor, serving a named database.
+    ///
+    /// The tenant and the name are two halves of one fact and the caller has both — the startup
+    /// packet named the database and the directory answered which tenant it is
+    /// ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)).
+    #[must_use]
+    pub fn serving_database(mut self, name: impl Into<String>) -> Self {
+        self.database = name.into();
         self
     }
 
@@ -543,6 +561,8 @@ impl Executor {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
+            Statement::CreateDatabase(create) => ddl::create_database(self, txn, create),
+            Statement::DropDatabase(drop) => ddl::drop_database(self, txn, drop),
             Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
             Statement::AlterSchemaRename(rename) => ddl::alter_schema_rename(self, txn, rename),
             Statement::DropSequence(drop) => ddl::drop_sequence(self, txn, drop),
@@ -1325,10 +1345,32 @@ impl Executor {
             bind::substitute(&mut statement, params, &types)?;
         }
         self.resolve_current_schema(txn, &mut statement)?;
+        self.resolve_current_database(&mut statement);
         self.resolve_current_setting(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
+    }
+
+    /// Folds every `current_database()` to the database this session is connected to.
+    ///
+    /// **Not a constant of the server.** It was one while there was a single database to fold to,
+    /// and a constant would now report the default database's name to a client connected to
+    /// another — a wrong answer rather than a missing feature, which is the class ADR 0031 ranks
+    /// worst. `pg_database.datname` carries the same string, so `WHERE datname =
+    /// current_database()` still matches by construction.
+    fn resolve_current_database(&self, statement: &mut Statement) {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| matches!(expr, Expr::CurrentDatabase)) {
+            return;
+        }
+        let mut resolve = |expr: &mut Expr| {
+            if matches!(expr, Expr::CurrentDatabase) {
+                *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(self.database.clone()))));
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
     }
 
     /// Folds every `current_setting(…)` to the value this session reports.
@@ -1726,6 +1768,10 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
             vec![format!("Create Extension on {}", create.name)]
         }
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
+        Statement::CreateDatabase(create) => vec![format!("Create Database on {}", create.name)],
+        Statement::DropDatabase(drop) => {
+            vec![format!("Drop Database on {}", drop.names.join(", "))]
+        }
         Statement::DropSchema(drop) => vec![format!("Drop Schema on {}", drop.names.join(", "))],
         Statement::AlterSchemaRename(rename) => {
             vec![format!("Alter Schema on {}", rename.name)]
@@ -1791,12 +1837,46 @@ fn returning_fields(
         return Ok(None);
     };
     let (columns, _) = query::returning_columns(items, table)?;
-    Ok(Some(
-        columns
-            .into_iter()
-            .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
-            .collect(),
-    ))
+    Ok(Some(described(columns)))
+}
+
+/// The same for an `UPDATE`, whose `RETURNING` may name a `FROM` relation as readily as the row
+/// being written — `RETURNING a.id, a.body, p.title`, measured — and whose target may be under an
+/// alias that took its name away.
+///
+/// The `FROM` relations are resolved here rather than read out of `tables` positionally: a name
+/// the catalog does not have is dropped from that list, and a scope built by position off a list
+/// with a hole in it describes the wrong columns rather than failing.
+fn update_returning_fields(
+    update: &crate::plan::Update,
+    tables: &[Arc<crate::catalog::TableDef>],
+    catalogued: &Catalogued<'_>,
+) -> Result<Option<Vec<FieldDescription>>> {
+    let (Some(items), Some(target)) = (update.returning.as_ref(), tables.first()) else {
+        return Ok(None);
+    };
+    let chain = update.chain();
+    let sources = chain
+        .iter()
+        .map(|join| subquery::relation_of(&join.table, catalogued))
+        .collect::<Result<Vec<_>>>()?;
+    let name = dml::target_name(update, target);
+    let entries = dml::scope_entries(target, &name, &chain, &sources);
+    let from = crate::plan::TableRef {
+        alias: update.alias.clone(),
+        ..crate::plan::TableRef::bare(target.name.clone())
+    };
+    let (columns, _) =
+        query::returning_columns_over(items, Some(from), &chain, &query::Scope::chain(&entries))?;
+    Ok(Some(described(columns)))
+}
+
+/// A resolved target list as the wire describes it.
+fn described(columns: Vec<(String, ColumnType, i32)>) -> Vec<FieldDescription> {
+    columns
+        .into_iter()
+        .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+        .collect()
 }
 
 impl Execute for Executor {
@@ -1829,9 +1909,9 @@ impl Execute for Executor {
         // naming: `in_a_transaction` *takes* the open transaction out of `self` before it runs the
         // statement, so a check for "am I in a block" further down always reads `None`.
         if self.open.is_some()
-            && let Some(named) = statement.concurrently()
+            && let Some(named) = statement.refused_in_a_transaction_block()
         {
-            return Err(SqlError::ConcurrentlyInTransactionBlock(named));
+            return Err(SqlError::NotInATransactionBlock(named));
         }
         // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
         // block may run before it counts as having read anything.
@@ -1876,7 +1956,14 @@ impl Execute for Executor {
             // there are no columns and then send it some, which is the one thing a `Describe` is
             // for.
             Statement::Insert(insert) => returning_fields(insert.returning.as_ref(), &tables)?,
-            Statement::Update(update) => returning_fields(update.returning.as_ref(), &tables)?,
+            Statement::Update(update) => update_returning_fields(
+                update,
+                &tables,
+                &Catalogued {
+                    exec: self,
+                    txn: &*txn,
+                },
+            )?,
             Statement::Delete(delete) => returning_fields(delete.returning.as_ref(), &tables)?,
             _ => None,
         };

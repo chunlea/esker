@@ -66,6 +66,29 @@ impl Returned {
         }))
     }
 
+    /// The same over the relations an `UPDATE … FROM` has in scope.
+    ///
+    /// `RETURNING` there may name a column of a `FROM` relation as readily as one of the row
+    /// being written — `RETURNING a.id, a.body, p.title`, measured — because by the time it is
+    /// evaluated the two are one row. So the target list resolves against the whole chain, and
+    /// the rows [`Returned::push`] is handed are that concatenated shape.
+    fn open_over(
+        returning: Option<&Returning>,
+        from: crate::plan::TableRef,
+        joins: &[crate::plan::Join],
+        scope: &query::Scope<'_>,
+    ) -> Result<Option<Self>> {
+        let Some(items) = returning else {
+            return Ok(None);
+        };
+        let (columns, exprs) = query::returning_columns_over(items, Some(from), joins, scope)?;
+        Ok(Some(Returned {
+            columns,
+            exprs,
+            rows: Vec::new(),
+        }))
+    }
+
     /// One row, as the statement leaves it.
     fn push(&mut self, row: &[Datum]) -> Result<()> {
         let values = self
@@ -623,32 +646,57 @@ pub(super) fn update(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
     let named = executor.require_table(txn, &update.table)?;
-    let mut returned = Returned::open(update.returning.as_ref(), &named)?;
+    let chain = update.chain();
+    // Resolved once and **before the first row is read**, so a `FROM` naming nothing is `42P01`
+    // with nothing written. The same lookup a `SELECT`'s `FROM` entry gets, which is what makes a
+    // derived table, a `VALUES` list and a set-returning function relations here too.
+    let sources = {
+        let catalogued = super::Catalogued {
+            exec: executor,
+            txn: &*txn,
+        };
+        chain
+            .iter()
+            .map(|join| super::subquery::relation_of(&join.table, &catalogued))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let target_name = target_name(update, &named);
+    let target_ref = crate::plan::TableRef {
+        alias: update.alias.clone(),
+        ..crate::plan::TableRef::bare(named.name.clone())
+    };
+    let mut returned = {
+        let entries = scope_entries(&named, &target_name, &chain, &sources);
+        Returned::open_over(
+            update.returning.as_ref(),
+            target_ref,
+            &chain,
+            &query::Scope::chain(&entries),
+        )?
+    };
     let targets = inheritance_targets(executor, txn, &named)?;
     let mut count = 0;
 
     for (table, project) in targets {
-        // Resolve the target of every assignment first, so `SET nope = 1` fails before anything is
-        // read rather than after some rows have been rewritten. Per relation, because a child's
-        // ordinals are its own — the same name is a different position the moment it has a row id
-        // the parent has not.
-        let assignments = update
-            .assignments
-            .iter()
-            .map(|(name, value)| {
-                let ordinal =
-                    table
-                        .column(name)
-                        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
-                            column: name.clone(),
-                            relation: table.name.clone(),
-                        })?;
-                Ok((ordinal, value.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Per relation, because a child's ordinals are its own — but under the name the statement
+        // wrote, because that is what every qualifier in it was written against.
+        let entries = scope_entries(&table, &target_name, &chain, &sources);
+        let scope = query::Scope::chain(&entries);
+        let width = table.columns.len();
+        let assignments = assignment_ordinals(update, &table)?;
 
-        let rows = collect(executor, txn, update.filter.as_ref(), &table)?;
-        for old in rows {
+        let rows = target_rows(
+            executor,
+            txn,
+            update.filter.as_ref(),
+            &table,
+            &entries,
+            &chain,
+        )?;
+        for joined in rows {
+            // The row being written is the front of it; anything after is what the `FROM` chain
+            // put beside it, which the `SET` expressions and the `RETURNING` list may read.
+            let old = joined[..width].to_vec();
             let mut new = old.clone();
             for (ordinal, value) in &assignments {
                 let column = &table.columns[*ordinal];
@@ -677,10 +725,15 @@ pub(super) fn update(
                         literal.assign(column.ty, &column.name)?
                     }
                     other => {
-                        let resolved = query::resolve_against(other, &table)?;
+                        let resolved = query::resolve_against_scope(other, &scope)?;
+                        // Against the row as the statement found it, and **the whole joined row**:
+                        // `SET body = c.body || '!'` over `FROM vl_comments c` appends to the
+                        // pre-statement value of every row rather than letting one row's new value
+                        // leak into the next.
+                        //
                         // In the transaction, so `SET updated_at = CURRENT_TIMESTAMP` reads the
                         // instant rather than reporting a clock with nothing to read.
-                        cursor::evaluate_in_txn(&resolved, &old, &*txn)?
+                        cursor::evaluate_in_txn(&resolved, &joined, &*txn)?
                     }
                 };
                 new[*ordinal] = super::assign::into_column(evaluated, column)?;
@@ -714,7 +767,11 @@ pub(super) fn update(
             // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
             // the new value, which is the whole reason a client writes it.
             if let Some(returned) = &mut returned {
-                returned.push(&projected(&new, project.as_ref()))?;
+                // The written row in the shape the statement named it by, with its `FROM` row
+                // still behind it: the target list was resolved against that concatenation.
+                let mut row = projected(&new, project.as_ref());
+                row.extend_from_slice(&joined[width..]);
+                returned.push(&row)?;
             }
             count += 1;
         }
@@ -735,7 +792,7 @@ pub(super) fn delete(
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
     // measured, and each row has to go through its own table's keys and indexes.
     for (table, project) in inheritance_targets(executor, txn, &named)? {
-        let rows = collect(executor, txn, delete.filter.as_ref(), &table)?;
+        let rows = collect(executor, txn, delete.filter.as_ref(), &table, &table.name)?;
         count += rows.len();
         for row in rows {
             // The row as it was, gathered before it goes: after `remove_row` there is nothing to
@@ -1244,40 +1301,173 @@ pub(super) fn rewrite_row(
     write_row(executor, txn, table, new, written)
 }
 
+/// The relations a write statement has in scope: the row it writes under the name the statement
+/// wrote, then its `FROM` chain under theirs.
+///
+/// The same table may appear twice under two names — which is exactly what the `update_all` shape
+/// does — so it is the *names* that have to be distinct and not the tables, which is the rule a
+/// `SELECT`'s `FROM` follows and is enforced where the chain is planned.
+/// **The name the statement refers to the row it writes by.** An alias *replaces* the table's
+/// name — `UPDATE t AS a … WHERE t.id = 1` is `42P01` with a `HINT` naming the alias, measured —
+/// and that is what frees the name for a `FROM` entry sharing it. Without an alias it is the name
+/// the statement wrote, which for a child reached through inheritance is still the parent's: a
+/// qualifier is about the query's text, not about which relation the row came from.
+pub(super) fn target_name(update: &Update, table: &TableDef) -> String {
+    update.alias.clone().unwrap_or_else(|| table.name.clone())
+}
+
+pub(super) fn scope_entries<'a>(
+    table: &'a TableDef,
+    target_name: &str,
+    chain: &[crate::plan::Join],
+    sources: &'a [std::sync::Arc<TableDef>],
+) -> Vec<(&'a TableDef, String)> {
+    std::iter::once((table, target_name.to_owned()))
+        .chain(
+            chain
+                .iter()
+                .zip(sources)
+                .map(|(join, def)| (def.as_ref(), join.table.referred_as().to_owned())),
+        )
+        .collect()
+}
+
+/// The statement's `WHERE` with every subquery in it planned, or the caller's own when it holds
+/// none.
+///
+/// **The write path plans its own subqueries**, because nothing above it does: a statement that
+/// writes never reaches `plan_select`, which is why a subquery in an `UPDATE`'s or a `DELETE`'s
+/// `WHERE` used to be `0A000` by name. `delete_all` and `update_all` on a relation carrying a
+/// `LIMIT` or a `JOIN` send exactly that shape — `ActiveRecord` cannot express either on a
+/// `DELETE`, so it wraps the selection in a subquery.
+///
+/// `Cow` rather than an owned clone, the way `plan_select` is shaped by hand: a filter with no
+/// subquery in it is used as the caller's own and nothing is copied.
+fn planned_filter<'f>(
+    executor: &Executor,
+    txn: &dyn Txn,
+    filter: Option<&'f crate::plan::Expr>,
+    scope: &query::Scope<'_>,
+) -> Result<Option<std::borrow::Cow<'f, crate::plan::Expr>>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    if !super::subquery::contains_subquery(filter) {
+        return Ok(Some(std::borrow::Cow::Borrowed(filter)));
+    }
+    let mut owned = filter.clone();
+    super::subquery::plan_in_write_filter(
+        &mut owned,
+        executor.tenant,
+        txn,
+        &super::Catalogued {
+            exec: executor,
+            txn,
+        },
+        scope,
+    )?;
+    Ok(Some(std::borrow::Cow::Owned(owned)))
+}
+
 /// Every row a predicate matches, read before anything is written. See [`update`] for why.
+///
+/// `name` is what the statement refers to the table by, which is its alias where it has one: a
+/// scope built on the table's own name would *answer* `UPDATE t AS a … WHERE t.id = 1` where a
+/// real server refuses it.
 fn collect(
     executor: &Executor,
     txn: &dyn Txn,
     filter: Option<&crate::plan::Expr>,
     table: &TableDef,
+    name: &str,
 ) -> Result<Vec<Vec<Datum>>> {
-    // **The write path plans its own subqueries**, because nothing above it does: a statement that
-    // writes never reaches `plan_select`, which is why a subquery in an `UPDATE`'s or a `DELETE`'s
-    // `WHERE` used to be `0A000` by name. `delete_all` and `update_all` on a relation carrying a
-    // `LIMIT` or a `JOIN` send exactly that shape — ActiveRecord cannot express either on a
-    // `DELETE`, so it wraps the selection in a subquery.
-    //
-    // `Cow`-shaped by hand the way `plan_select` is: a filter with no subquery in it is used as
-    // the caller's own and nothing is cloned.
-    let mut owned;
-    let filter = match filter {
-        Some(filter) if super::subquery::contains_subquery(filter) => {
-            owned = filter.clone();
-            super::subquery::plan_in_write_filter(
-                &mut owned,
-                executor.tenant,
-                txn,
-                &super::Catalogued {
-                    exec: executor,
-                    txn,
-                },
-                table,
-            )?;
-            Some(&owned)
+    let scope = query::Scope::single_as(table, name.to_owned());
+    let filter = planned_filter(executor, txn, filter, &scope)?;
+    let node = query::matching_rows_as(filter.as_deref(), executor.tenant, table, name.to_owned())?;
+    drain(executor, txn, node)
+}
+
+/// The same for an `UPDATE … FROM`: the target's row with whatever its `FROM` chain put beside it,
+/// which is [`collect`]'s scan with more relations in scope and no access path to narrow it.
+fn collect_joined(
+    executor: &Executor,
+    txn: &dyn Txn,
+    filter: Option<&crate::plan::Expr>,
+    entries: &[(&TableDef, String)],
+    joins: &[crate::plan::Join],
+) -> Result<Vec<Vec<Datum>>> {
+    let scope = query::Scope::chain(entries);
+    let filter = planned_filter(executor, txn, filter, &scope)?;
+    let node = query::joined_target_rows(executor.tenant, entries, joins, filter.as_deref())?;
+    drain(executor, txn, node)
+}
+
+/// Every `SET` target as an ordinal into one relation.
+///
+/// Resolved before anything is read, so `SET nope = 1` fails with nothing written rather than
+/// after some rows have been rewritten. Per relation, because a child's ordinals are its own —
+/// the same name is a different position the moment it has a row id the parent has not.
+fn assignment_ordinals(
+    update: &Update,
+    table: &TableDef,
+) -> Result<Vec<(usize, crate::plan::Expr)>> {
+    update
+        .assignments
+        .iter()
+        .map(|(name, value)| {
+            let ordinal =
+                table
+                    .column(name)
+                    .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                        column: name.clone(),
+                        relation: table.name.clone(),
+                    })?;
+            Ok((ordinal, value.clone()))
+        })
+        .collect()
+}
+
+/// The rows an `UPDATE` will rewrite: one entry per row of the target, whatever its `FROM` chain
+/// matched appended to each.
+///
+/// **A target row the join matches many times is written once.** PostgreSQL documents *which* of
+/// the matching rows is used as not readily predictable; what it does not leave open is how many
+/// times the target is written, and a loop over the join output writes it once per match — three
+/// matching `FROM` rows and `SET hits = a.hits + 1` would answer 3 where a real server answers 1.
+/// Measured. So the join's output is reduced to its first row per target identity, which is the
+/// primary key the rest of this file compares rows by.
+fn target_rows(
+    executor: &Executor,
+    txn: &dyn Txn,
+    filter: Option<&crate::plan::Expr>,
+    table: &TableDef,
+    entries: &[(&TableDef, String)],
+    chain: &[crate::plan::Join],
+) -> Result<Vec<Vec<Datum>>> {
+    let (_, target_name) = entries
+        .first()
+        .ok_or_else(|| SqlError::Internal("an UPDATE with no table to write".to_owned()))?;
+    if chain.is_empty() {
+        return collect(executor, txn, filter, table, target_name);
+    }
+    let joined = collect_joined(executor, txn, filter, entries, chain)?;
+    let width = table.columns.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut first = Vec::with_capacity(joined.len());
+    for row in joined {
+        if seen.insert(row_key_of(executor, table, &row[..width])?) {
+            first.push(row);
         }
-        other => other,
-    };
-    let mut node = query::matching_rows(filter, executor.tenant, table)?;
+    }
+    Ok(first)
+}
+
+/// Every row of a planned node, materialised.
+fn drain(
+    executor: &Executor,
+    txn: &dyn Txn,
+    mut node: crate::plan::Node,
+) -> Result<Vec<Vec<Datum>>> {
     // **Before the cursor opens**, which is what makes the subquery read the pre-statement
     // snapshot: `DELETE FROM t WHERE id IN (SELECT id FROM t LIMIT 1)` is not circular and does
     // not loop, and its rows are the ones that were there when it started.

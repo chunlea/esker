@@ -231,6 +231,14 @@ pub enum Expr {
         /// `implicit` is its argument — `true` prepends `pg_catalog` and nothing else.
         all: Option<bool>,
     },
+    /// `current_database()` — the database **this session** is connected to.
+    ///
+    /// Folded in `crate::exec::Executor::bound`, the way [`Expr::CurrentSchema`] is and for the
+    /// same reason. It was a constant folded at lowering while the node had one database to fold
+    /// to; with a directory behind it (ADR 0052) the answer is a property of the session, and a
+    /// lowering has no session — so a constant here would report the *default* database's name to
+    /// a client connected to another one, which is a wrong answer rather than a missing feature.
+    CurrentDatabase,
     /// `current_setting(name)` and `current_setting(name, missing_ok)`.
     ///
     /// Folded to a literal in `crate::exec::Executor::bound`, the way [`Expr::CurrentSchema`] is
@@ -1579,6 +1587,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::CurrentSetting { .. } => "current_setting",
         Expr::CurrentSchema { all: None } => "current_schema",
         Expr::CurrentSchema { .. } => "current_schemas",
+        Expr::CurrentDatabase => "current_database",
         Expr::Like {
             case_insensitive: false,
             ..

@@ -66,8 +66,13 @@ impl Default for Config {
 /// A trait rather than a closure because it is shared across connections and each one needs its own
 /// executor: sessions do not share portals, prepared statements or transactions.
 pub trait Executors: Send + Sync + 'static {
-    /// Makes an executor for one new session.
-    fn for_session(&self) -> Box<dyn Execute + Send>;
+    /// Makes an executor for one new session, serving the database the startup packet named.
+    ///
+    /// # Errors
+    ///
+    /// `3D000` when the cluster has no such database, which is the answer a real server gives and
+    /// the one `rake db:create` reads to know it must create one.
+    fn for_session(&self, database: &str) -> Result<Box<dyn Execute + Send>>;
 }
 
 /// Accepts connections until the process ends.
@@ -89,7 +94,7 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
             // every reply in this protocol is small.
             let _ = stream.set_nodelay(true);
             let mut connection = Connection::new(stream, config);
-            if let Err(error) = connection.run(executors.for_session()).await {
+            if let Err(error) = connection.run(executors.as_ref()).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });
@@ -103,6 +108,12 @@ pub struct Connection<S> {
     config: Config,
     /// The role the client asked to connect as, for the authentication failure message.
     user: String,
+    /// The database the startup packet asked for, which selects the tenant the session runs as
+    /// ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)).
+    ///
+    /// **It defaults to the user's name**, which is PostgreSQL's rule and is what makes `psql`
+    /// with no `-d` connect to a database named for whoever is running it.
+    database: String,
     /// Reused between messages so a busy session is not allocating a buffer per reply.
     ///
     /// It travels to the blocking thread with the session and comes back, so "reused" survives
@@ -131,6 +142,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             config,
 
             user: String::new(),
+            database: String::new(),
             out: Vec::with_capacity(8 * 1024),
         }
     }
@@ -141,10 +153,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// Any I/O failure. A *protocol* failure is reported to the client and ends the connection
     /// cleanly rather than surfacing here.
-    pub async fn run(&mut self, executor: Box<dyn Execute + Send>) -> std::io::Result<()> {
+    pub async fn run(&mut self, executors: &dyn Executors) -> std::io::Result<()> {
         if !self.startup().await? {
             return Ok(());
         }
+        // **After the startup packet, because the database it names is what decides the tenant.**
+        // A name the directory does not have is `3D000` here and the connection ends, which is
+        // what tells `rake db:create` it has work to do.
+        let executor = match executors.for_session(&self.database) {
+            Ok(executor) => executor,
+            Err(error) => {
+                self.send_error(&error).await?;
+                return Ok(());
+            }
+        };
         let mut work = Work {
             session: Session::new(),
             executor,
@@ -254,6 +276,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             if let Some((_, user)) = parameters.iter().find(|(name, _)| name == "user") {
                 self.user.clone_from(user);
             }
+            // **`database` defaults to `user`**, which is PostgreSQL's own rule: `psql` with no
+            // `-d` sends no `database` parameter at all and lands in the database named for the
+            // role. An empty user leaves it empty, and the directory answers `3D000` for that.
+            self.database = parameters
+                .iter()
+                .find(|(name, _)| name == "database")
+                .map_or_else(|| self.user.clone(), |(_, value)| value.clone());
         }
         self.out.clear();
         match negotiation(startup) {
@@ -433,8 +462,8 @@ impl<F> Executors for SharedBackend<F>
 where
     F: Fn() -> Box<dyn Execute + Send> + Send + Sync + 'static,
 {
-    fn for_session(&self) -> Box<dyn Execute + Send> {
-        (self.make)()
+    fn for_session(&self, _database: &str) -> Result<Box<dyn Execute + Send>> {
+        Ok((self.make)())
     }
 }
 
@@ -465,7 +494,7 @@ pub async fn serve_on(
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             let mut connection = Connection::<TcpStream>::new(stream, config);
-            if let Err(error) = connection.run(executors.for_session()).await {
+            if let Err(error) = connection.run(executors.as_ref()).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });

@@ -160,6 +160,12 @@ pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 /// `42P06 duplicate_schema` — `CREATE SCHEMA` over one that is there.
 pub const DUPLICATE_SCHEMA: &str = "42P06";
 
+/// `42P04 duplicate_database` — `CREATE DATABASE` over one that is there.
+pub const DUPLICATE_DATABASE: &str = "42P04";
+
+/// `55006 object_in_use` — `DROP DATABASE` naming the one the session is connected to.
+pub const OBJECT_IN_USE: &str = "55006";
+
 /// `3F000 invalid_schema_name` — a schema that is not there.
 ///
 /// **Its own class**, not `42P01`: `CREATE TABLE nosuchschema.t` fails on the *schema* and gives
@@ -356,6 +362,8 @@ mod tests {
             super::DEPENDENT_OBJECTS_STILL_EXIST,
         ),
         ("DUPLICATE_SCHEMA", super::DUPLICATE_SCHEMA),
+        ("DUPLICATE_DATABASE", super::DUPLICATE_DATABASE),
+        ("OBJECT_IN_USE", super::OBJECT_IN_USE),
         ("INVALID_SCHEMA_NAME", super::INVALID_SCHEMA_NAME),
         ("INVALID_CATALOG_NAME", super::INVALID_CATALOG_NAME),
         ("CARDINALITY_VIOLATION", super::CARDINALITY_VIOLATION),
