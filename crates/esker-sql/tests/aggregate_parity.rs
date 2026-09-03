@@ -72,10 +72,6 @@ const DIVERGENCES: &[(&str, &str)] = &[
     // Contract C2: parsed, named, not executed. Each is a unit of its own or explicitly out of
     // scope in `docs/plans/phase-9-rails.md` §5.
     (
-        "SELECT count(*) FROM agg, wide",
-        "a comma-separated FROM list",
-    ),
-    (
         "SELECT g, count(*) FROM agg GROUP BY GROUPING SETS ((g), ())",
         "GROUP BY GROUPING SETS",
     ),

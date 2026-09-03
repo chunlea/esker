@@ -315,7 +315,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
     }
 }
 
-fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
+pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) {
     visit(expr);
     match expr {
         Expr::Binary { left, right, .. } => {
@@ -490,7 +490,7 @@ pub(super) fn for_each_expr(statement: &Statement, visit: &mut impl FnMut(&Expr)
     }
 }
 
-fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+pub(super) fn descend(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
         Expr::Binary { left, right, .. } => {

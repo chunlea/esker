@@ -70,11 +70,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "WITH t AS (UPDATE ct_b SET v = 1 WHERE id = 10 RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item, as above.",
         ),
-        (
-            "WITH t AS (SELECT id FROM ct_a) SELECT * FROM t, t",
-            "a comma-separated `FROM` list is `0A000` naming itself and was before this unit. \
-             PostgreSQL gets one step further and answers `42712`; both refuse the statement.",
-        ),
     ],
 };
 

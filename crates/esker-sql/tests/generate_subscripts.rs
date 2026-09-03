@@ -75,10 +75,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`pg_typeof` is not built. It would answer `integer` here — the function's rows are `int4`, which the `FROM` form already reports — but the function itself is a separate unit and is refused by name rather than special-cased for one argument.",
         ),
         (
-            "SELECT 'g', count(*) FROM generate_subscripts('{a,b,c}'::text[], 1) AS i, generate_subscripts('{x,y}'::text[], 1) AS j",
-            "**A comma-separated `FROM` list**, which is a cross join and is refused for every relation, not just for a function — `FROM a, b` is `0A000` here whatever `a` and `b` are. Two functions joined with `CROSS JOIN` do work, and the six rows this asks for are that join's.",
-        ),
-        (
             "SELECT 'g', generate_subscripts('{a,b}'::text[], 1) AS i, generate_subscripts('{x,y,z}'::text[], 1) AS j",
             "The **two-function lockstep** itself: two set-returning functions in one SELECT list yield `max(len)` rows, not `len * len`, with the shorter padded to NULL — `(1,1) (2,2) (NULL,3)`. It is the rule an implementation gets wrong by treating the target list as a cross product, and it is measured here so that the day the target-list form is built it is built against this answer. Refused by name today.",
         ),
