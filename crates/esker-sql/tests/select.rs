@@ -396,14 +396,16 @@ fn narrowing_a_range_never_loses_a_row() {
     }
 }
 
-/// An expression the executor does not evaluate is named, not guessed at. Arithmetic is the one a
-/// user is most likely to reach for, and returning a wrong number would be worse than saying so.
+/// An expression the executor does not evaluate is named, not guessed at.
+///
+/// **Arithmetic used to head this list and no longer does** — `+ - * / % ^` and `abs` answer now
+/// (`tests/arithmetic.rs`), which is what statement 741 of the specific schema needed. What is
+/// left here is the same contract for everything else: a construct this node does not run says so
+/// by name, because a wrong number is worse than a refusal.
 #[test]
 fn an_expression_we_do_not_evaluate_is_refused_by_name() {
     let mut node = Node::loaded();
     for (sql, expected) in [
-        ("SELECT id + 1 FROM s1", "+"),
-        ("SELECT * FROM s1 WHERE id * 2 = 4", "*"),
         // The five aggregates, `GROUP BY`, `HAVING` and `DISTINCT` run now (phase 9 unit 1);
         // what is next to them still does not, and each still names itself.
         ("SELECT count(*) OVER () FROM s1", "a window function"),

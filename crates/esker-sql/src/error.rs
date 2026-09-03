@@ -522,6 +522,35 @@ pub enum SqlError {
     #[error("{0} must not be negative")]
     NegativeLimit(&'static str),
 
+    /// A `convert_to` to a name that is not one of PostgreSQL's encodings: `22023`.
+    ///
+    /// **Not a refusal.** A real server raises this for a name it does not know, so answering
+    /// `0A000` would be reporting a missing feature where there is a user error.
+    #[error("invalid destination encoding name \"{0}\"")]
+    InvalidDestinationEncoding(String),
+
+    /// A division or a modulo by zero: `22012`, for the integers **and** the floats.
+    ///
+    /// A float divided by zero raises here as it does on a real server; it does not yield
+    /// `Infinity`. What it does not do is come first: `NULL::int4 / 0` is NULL, because an
+    /// operator with a NULL operand is never evaluated (`crate::value::arith`).
+    #[error("division by zero")]
+    DivisionByZero,
+
+    /// A float arithmetic result past the type's range: `22003`.
+    ///
+    /// Only when **both operands were finite** — `'Infinity'::float8 + 1` is `Infinity` and
+    /// `1e308 * 10` is this. Measured, both.
+    #[error("value out of range: overflow")]
+    FloatOverflow,
+
+    /// `(-2) ^ 0.5`: `2201F`, a code of its own.
+    ///
+    /// PostgreSQL says what is wrong rather than returning NaN, because the answer exists and is
+    /// not a real number.
+    #[error("a negative number raised to a non-integer power yields a complex result")]
+    ComplexResult,
+
     /// An operator applied to types it is not defined for, named the way PostgreSQL names it.
     #[error("operator does not exist: {left} {op} {right}")]
     UndefinedOperator {
@@ -1275,7 +1304,10 @@ impl SqlError {
             | SqlError::BigintOutOfRange
             | SqlError::NumericFieldOverflow { .. }
             | SqlError::OidOutOfRange(_)
-            | SqlError::SetvalOutOfBounds { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            | SqlError::SetvalOutOfBounds { .. }
+            | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
+            SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
             SqlError::DatetimeFieldOutOfRange { .. }
@@ -1355,7 +1387,8 @@ impl SqlError {
             | SqlError::NonBooleanParameter(_)
             | SqlError::NumericPrecisionOutOfRange(_)
             | SqlError::NumericScaleOutOfRange(_)
-            | SqlError::ParameterOutOfRange { .. } => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::ParameterOutOfRange { .. }
+            | SqlError::InvalidDestinationEncoding(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT

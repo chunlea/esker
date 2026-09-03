@@ -327,10 +327,6 @@ impl<'a> Cursor<'a> {
             txn: Some(self.txn),
             tenant: self.tenant,
             catalog: Some(&self.catalog),
-            // The **transaction's** instant, which is what `CURRENT_TIMESTAMP` and `CURRENT_DATE`
-            // mean: every row this cursor answers reads the same clock, and so does every other
-            // cursor in the transaction.
-            now: crate::time_machine::micros_of_ts(self.txn.start_ts()),
         };
         match &mut self.kind {
             Kind::One(used) => Ok(if std::mem::replace(used, true) {
@@ -833,13 +829,6 @@ pub(super) struct Env<'a> {
     /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
     /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
     catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
-    /// The **transaction's** instant, in microseconds from 2000-01-01.
-    ///
-    /// Not the statement's and not a wall-clock reading: it is what `CURRENT_TIMESTAMP` means on a
-    /// real server — constant within a transaction, equal to `now()` — and it is the only clock
-    /// this node is allowed (`CLAUDE.md` invariant 6). Two columns defaulting to it in one
-    /// `INSERT` therefore hold the same instant, which the capture checks.
-    now: i64,
 }
 
 impl Env<'_> {
@@ -849,13 +838,19 @@ impl Env<'_> {
             txn: None,
             tenant: 0,
             catalog: None,
-            now: 0,
         }
     }
 
-    /// No transaction, but a clock: what a column `DEFAULT` is evaluated in.
-    pub(super) fn at(now: i64) -> Self {
-        Env { now, ..Env::none() }
+    /// A transaction and nothing else: what a column `DEFAULT` is evaluated in.
+    ///
+    /// It has no catalog snapshot, which is right for the job — a default is one value out of no
+    /// row, and the clock is the only thing outside itself it can reach.
+    pub(super) fn in_txn(txn: &dyn Txn) -> Env<'_> {
+        Env {
+            txn: Some(txn),
+            tenant: 0,
+            catalog: None,
+        }
     }
 
     /// The tenant's relations, read the first time one is asked for and shared after that.
@@ -878,68 +873,15 @@ impl Env<'_> {
     }
 }
 
-/// The plain functions, evaluated over arguments that are already values.
-///
-/// `now` is the transaction's instant; the two clock functions read it and the other three ignore
-/// it (`Env::now`).
-fn evaluate_call(func: crate::plan::PlainFunc, args: &[Datum], now: i64) -> Result<Datum> {
-    use crate::plan::PlainFunc;
-    Ok(match func {
-        PlainFunc::Random => Datum::Double(crate::value::random::random_f64()?),
-        // **NULL arguments are skipped, not propagated.** That is what separates `concat` from the
-        // `||` operator, which answers NULL if either side is NULL — measured, and the reason a
-        // schema reaches for `concat` when it wants a default that is never NULL.
-        PlainFunc::Concat => Datum::Text(
-            args.iter()
-                .filter(|arg| !matches!(arg, Datum::Null))
-                .filter_map(|arg| match arg {
-                    // A boolean concatenates as `true`, the way its `::text` cast prints it and
-                    // not the way a row of it does.
-                    Datum::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_owned()),
-                    other => other.to_text(),
-                })
-                .collect::<Vec<_>>()
-                .concat(),
-        ),
-        PlainFunc::ConvertTo => {
-            let [text, encoding] = args else {
-                return Err(SqlError::Internal(
-                    "convert_to reached the evaluator with the wrong arity".to_owned(),
-                ));
-            };
-            let (Some(text), Some(encoding)) = (text.to_text(), encoding.to_text()) else {
-                // NULL in either argument is NULL out, which is what a `STRICT` function does.
-                return Ok(Datum::Null);
-            };
-            // **Only UTF-8**, and named rather than approximated. This node stores text as Rust
-            // `String`s, which are UTF-8 by construction, so every other encoding would need a
-            // conversion table — and answering the UTF-8 bytes under another encoding's name would
-            // be a wrong answer rather than a gap. PostgreSQL spells the name without a hyphen.
-            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
-                return Err(SqlError::unsupported(format!(
-                    "convert_to(..., '{encoding}'), an encoding other than UTF8"
-                )));
-            }
-            Datum::Bytea(text.into_bytes())
-        }
-        PlainFunc::Now => Datum::TimestampTz(now),
-        // **Truncated toward the past, not toward zero.** The two agree after 2000-01-01 and
-        // disagree before it, where a `-1` microsecond is the last day of 1999 and integer
-        // division would call it the first day of 2000.
-        PlainFunc::CurrentDate => {
-            Datum::Date(i32::try_from(now.div_euclid(86_400_000_000)).unwrap_or(i32::MAX))
-        }
-    })
-}
-
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
 pub(super) fn evaluate(expr: &Expr, row: &[Datum]) -> Result<Datum> {
     evaluate_in(expr, row, Env::none())
 }
 
-/// The same, with the transaction's instant — what a column `DEFAULT` is evaluated with.
-pub(super) fn evaluate_at(expr: &Expr, row: &[Datum], now: i64) -> Result<Datum> {
-    evaluate_in(expr, row, Env::at(now))
+/// The same, in a transaction — what a column `DEFAULT` needs, because its clock is the
+/// transaction's instant and `now()` reads it from there.
+pub(super) fn evaluate_in_txn(expr: &Expr, row: &[Datum], txn: &dyn Txn) -> Result<Datum> {
+    evaluate_in(expr, row, Env::in_txn(txn))
 }
 
 #[allow(
@@ -950,24 +892,46 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
+        // The type was settled when the expression was resolved. Where it was not — a `DEFAULT`
+        // evaluated by the DDL path, which never resolves against a row — the operands' own types
+        // answer the same question, and a NULL operand makes the question moot.
+        Expr::Arithmetic {
+            op,
+            left,
+            right,
+            ty,
+        } => {
+            let left = evaluate_in(left, row, env)?;
+            let right = evaluate_in(right, row, env)?;
+            let ty = match ty {
+                Some(ty) => *ty,
+                None => match (left.column_type(), right.column_type()) {
+                    (Some(left), Some(right)) => {
+                        crate::value::arith::result_type(*op, left, right)?
+                    }
+                    _ => return Ok(Datum::Null),
+                },
+            };
+            crate::value::arith::apply(*op, ty, &left, &right)?
+        }
         // A cast to `text` is the operand's own output function, and NULL stays NULL: a cast
         // changes a value's type and never invents one.
         // Rust's own case conversion, which is full Unicode and agrees with PostgreSQL's
         // under a UTF-8 locale — measured on an accented pair, since that is where a byte-wise
         // implementation would differ. NULL in, NULL out.
-        // `random()`, `concat(...)`, `convert_to(...)` and the two clock functions.
-        Expr::Call { func, args } => {
-            let args = args
-                .iter()
-                .map(|arg| evaluate_in(arg, row, env))
-                .collect::<Result<Vec<_>>>()?;
-            evaluate_call(*func, &args, env.now)?
-        }
+        // `abs` is not a text function and does not reach the arm below: its argument is a
+        // number and its answer is one of the same type, overflow included.
+        Expr::Scalar {
+            func: crate::plan::ScalarFunc::Abs,
+            operand,
+        } => crate::value::arith::abs(&evaluate_in(operand, row, env)?)?,
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
             Datum::Text(text) => Datum::Text(match func {
                 crate::plan::ScalarFunc::Lower => text.to_lowercase(),
                 crate::plan::ScalarFunc::Upper => text.to_uppercase(),
+                // Unreachable: the arm above catches `abs` before this one is tried.
+                crate::plan::ScalarFunc::Abs => text,
             }),
             other => {
                 // A non-text argument: `lower(1)` is `42883 function lower(integer) does not
@@ -1248,6 +1212,39 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
 /// The arity was checked where the call was lowered, so an argument that is not there is a bug
 /// rather than a user's mistake — and it is answered as NULL rather than as a panic, because every
 /// one of these functions is NULL-propagating anyway ([`crate::catalog::def_functions`]).
+/// `convert_to(text, encoding)`: the bytes `text` has in `encoding`.
+///
+/// **Strict in both arguments**, the encoding name included — `convert_to('A', NULL)` is NULL,
+/// measured. A name that is not one of PostgreSQL's encodings is `22023` and not a refusal,
+/// because that is a real server's own answer; a name that *is* one but is not UTF-8 is `0A000`,
+/// because transcoding is a conversion table this node does not have and returning the UTF-8
+/// bytes under another encoding's name would be a wrong answer wearing a right one's label.
+fn convert_to(text: Option<&Datum>, encoding: Option<&Datum>) -> Result<Datum> {
+    let (Some(text), Some(encoding)) = (text, encoding) else {
+        return Ok(Datum::Null);
+    };
+    if matches!(text, Datum::Null) || matches!(encoding, Datum::Null) {
+        return Ok(Datum::Null);
+    }
+    let (Some(text), Some(encoding)) = (text.to_text(), encoding.to_text()) else {
+        return Ok(Datum::Null);
+    };
+    // `pg_char_to_encoding` matches case-insensitively and ignores `-` and `_`, so `UTF8`, `utf8`
+    // and `Utf-8` are one name. Measured, all three.
+    let folded: String = encoding
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if folded == "UTF8" || folded == "UNICODE" {
+        return Ok(Datum::Bytea(text.into_bytes()));
+    }
+    if crate::value::encoding::is_postgresql_encoding(&folded) {
+        return Err(SqlError::unsupported(format!("the encoding {encoding}")));
+    }
+    Err(SqlError::InvalidDestinationEncoding(encoding))
+}
+
 fn catalog_function(
     call: &crate::plan::CatalogFuncCall,
     row: &[Datum],
@@ -1260,6 +1257,36 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **The transaction's instant**, so two calls in one transaction are equal and their
+        // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
+        CatalogFunc::Now | CatalogFunc::CurrentDate => {
+            let Some(txn) = env.txn else {
+                return Err(SqlError::Internal(
+                    "now() reached an evaluator with no transaction".to_owned(),
+                ));
+            };
+            let micros = crate::time_machine::micros_of_ts(txn.start_ts());
+            if call.func == CatalogFunc::CurrentDate {
+                // Floor division, so an instant before the epoch lands on the day containing it.
+                let day = micros.div_euclid(86_400_000_000);
+                Datum::Date(i32::try_from(day).unwrap_or(i32::MAX))
+            } else {
+                Datum::TimestampTz(micros)
+            }
+        }
+        // **Not strict**: a NULL argument is skipped, not propagated, so `concat(NULL, NULL)` is
+        // the empty string. Each argument is rendered by its own output function.
+        CatalogFunc::Concat => Datum::Text(
+            args.iter()
+                .filter(|arg| !matches!(arg, Datum::Null))
+                .filter_map(PgDatum::to_text)
+                .collect::<String>(),
+        ),
+        CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
+        // **Per call, and the corpus pins the consequence rather than a value**: two calls in one
+        // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool
+        // through the same file `gen_random_uuid` reads (`crate::value::random`).
+        CatalogFunc::Random => Datum::Double(crate::value::random::random_f64()?),
         CatalogFunc::FormatType => crate::catalog::def_functions::format_type(
             type_oid_argument(args.first())?,
             typmod_argument(args.get(1))?,

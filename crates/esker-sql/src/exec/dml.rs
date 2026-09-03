@@ -140,7 +140,7 @@ fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
 fn column_default_value(
     table: &TableDef,
     column: &crate::catalog::ColumnDef,
-    now: i64,
+    txn: &dyn Txn,
 ) -> Result<Datum> {
     let Some(expr) = &column.default_expr else {
         return Ok(column.default.clone().unwrap_or(Datum::Null));
@@ -166,7 +166,7 @@ fn column_default_value(
     })?;
     // No row: a default cannot read one, which is the first of the three things PostgreSQL forbids
     // in one and is refused where the column is lowered.
-    let value = cursor::evaluate_at(&resolved, &[], now)?;
+    let value = cursor::evaluate_in_txn(&resolved, &[], txn)?;
     // The expression's type is not the column's — `now()` is a `timestamptz` filling a `date`, and
     // `concat` a `text` filling a `varchar` — so the assignment cast every other path through an
     // `INSERT` makes is made here too.
@@ -182,6 +182,10 @@ fn column_default_value(
 /// **A timestamp to a date is not a text round trip.** Both are counts from 2000-01-01, so the
 /// conversion is a division; going through text would print a zone offset that `date`'s input
 /// function then has to re-parse, and would answer the wrong day for the last hours of one.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`in_range` checks the bound first, which is what makes each cast exact"
+)]
 fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
     if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
         return Ok(value);
@@ -192,10 +196,52 @@ fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
             i32::try_from(micros.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
         ));
     }
+    // **A float into an integer rounds, and it rounds half to *even*.** Measured on 19beta1:
+    // `0.5` is `0`, `1.5` is `2`, `2.5` is `2`, `3.5` is `4`, and the negatives mirror it. That is
+    // `rint`, which is what PostgreSQL's `dtoi4` calls — **not** the away-from-zero rounding a
+    // `numeric` gets, where `0.5` is `1` and `2.5` is `3`. The two casts differ and the difference
+    // is measurable in one statement, so they are written as two rules rather than one.
+    //
+    // Going through text instead was a wrong answer rather than a rounding difference: it refused
+    // the row outright, which is how `random() * 100` into an `integer` column — statement 738's
+    // own default — reported `22P02` where a real server stores a number.
+    if let Datum::Double(_) | Datum::Real(_) = value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        let raw = match value {
+            Datum::Double(raw) => raw,
+            Datum::Real(raw) => f64::from(raw),
+            _ => unreachable!("the pattern above admits only the two floats"),
+        };
+        let rounded = raw.round_ties_even();
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        // The bound is checked before the conversion, because casting an out-of-range `f64` to an
+        // integer saturates in Rust and would store the limit where a real server raises `22003`.
+        return match ty {
+            ColumnType::Int2 => in_range(rounded, f64::from(i16::MIN), f64::from(i16::MAX))
+                .map(|value| Datum::Int2(value as i16))
+                .ok_or_else(out_of_range),
+            ColumnType::Int4 => in_range(rounded, f64::from(i32::MIN), f64::from(i32::MAX))
+                .map(|value| Datum::Int4(value as i32))
+                .ok_or_else(out_of_range),
+            _ => in_range(
+                rounded,
+                -9_223_372_036_854_775_808.0,
+                9_223_372_036_854_775_807.0,
+            )
+            .map(|value| Datum::Int8(value as i64))
+            .ok_or_else(out_of_range),
+        };
+    }
     match value.to_text() {
         Some(text) => Datum::from_text(ty, &text),
         None => Ok(Datum::Null),
     }
+}
+
+/// A rounded float, if it is inside an integer type's range — NaN and the infinities are not.
+fn in_range(value: f64, low: f64, high: f64) -> Option<f64> {
+    (value >= low && value <= high).then_some(value)
 }
 
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
@@ -235,11 +281,10 @@ pub(super) fn insert(
         // The default and the *missing* value are different fields and this is the one that reads
         // the default (`crate::catalog::ColumnDef`). A row written now is written at full width,
         // so nothing about it is missing; the other field answers for rows that predate the column.
-        let now = crate::time_machine::micros_of_ts(txn.start_ts());
         let mut row: Vec<Datum> = table
             .columns
             .iter()
-            .map(|column| column_default_value(&table, column, now))
+            .map(|column| column_default_value(&table, column, &*txn))
             .collect::<Result<_>>()?;
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
@@ -504,11 +549,7 @@ pub(super) fn update(
                         table.columns[*ordinal].ty,
                         executor.next_sequence_value(sequence.id)?,
                     )?,
-                    None => column_default_value(
-                        &table,
-                        column,
-                        crate::time_machine::micros_of_ts(txn.start_ts()),
-                    )?,
+                    None => column_default_value(&table, column, &*txn)?,
                 },
                 crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
                 other => {

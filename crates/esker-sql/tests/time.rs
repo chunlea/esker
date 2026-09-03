@@ -188,10 +188,16 @@ fn a_column_plus_a_column_is_still_named() {
         vec![vec!["2020-01-01 12:34:56"]]
     );
 
-    // The per-row form is `0A000` naming the operator — a refusal, never a wrong value.
+    // The per-row form is still `0A000` naming the operator — a refusal, never a wrong value.
+    // Arithmetic over the numeric types answers now (`tests/arithmetic.rs`); the temporal
+    // operators are the commit after it, and until then the refusal says **which** operator over
+    // **which** types rather than claiming `+` does not exist. PostgreSQL has this one.
     let error = node.run("SELECT d + t FROM tp").unwrap_err();
     assert_eq!(error.sqlstate(), "0A000");
-    assert_eq!(error.to_string(), "the operator + is not supported");
+    assert_eq!(
+        error.to_string(),
+        "the operator + over date and time without time zone is not supported"
+    );
 }
 
 /// A `time` casts to a string and to nothing else, and the refusal is `42846` before any value.

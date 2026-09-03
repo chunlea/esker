@@ -276,19 +276,27 @@ fn an_expression_default_on_add_column_is_refused_by_name() {
         .unwrap();
 }
 
-/// **PostgreSQL does not fold `(1+1)` either** — it prints the default back as `(1 + 1)`,
-/// unevaluated — so the refusal here names the missing operator rather than a missing folder.
+/// **PostgreSQL does not fold `(1+1)`** — it prints the default back as `(1 + 1)`, unevaluated —
+/// so this node does not either, and what stops it on `ADD COLUMN` is the rewrite.
 ///
-/// This test asserted "is not a constant" until the `DEFAULT` expression unit, under a rule this
-/// node had invented: a default had to fold to a value. It does not, on any server. What stops
-/// this line now is that there is no `+` operator at any width.
+/// This test has named three reasons across three units and only the last is a real server's:
+/// "is not a constant" (a rule this node invented), then "the operator +" (true until arithmetic
+/// landed), and now the table rewrite — the one thing about `ADD COLUMN` that is genuinely this
+/// node's limit rather than a gap in the expression language.
 #[test]
-fn an_arithmetic_default_is_refused_by_its_operator() {
+fn an_arithmetic_default_on_add_column_is_refused_for_the_rewrite() {
     let mut node = Node::new();
     a_populated_table(&mut node);
     let error = node.fails("ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)");
     assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(error.to_string(), "the operator + is not supported");
+    assert_eq!(
+        error.to_string(),
+        "ALTER TABLE ... ADD COLUMN ... DEFAULT 1 + 1, which would rewrite every row is not \
+         supported"
+    );
+    // And `CREATE TABLE`, which has no rows to rewrite, takes the same expression.
+    node.run("CREATE TABLE plus (a int8 DEFAULT (1+1))")
+        .unwrap();
 }
 
 /// A default is read as the column's own type, by the same conversion an `INSERT` does — so a bad

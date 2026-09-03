@@ -49,6 +49,9 @@ pub const CARDINALITY_VIOLATION: &str = "21000";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 /// A value is outside its type's range.
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+
+/// `invalid_argument_for_power_function` — `(-2) ^ 0.5`, whose answer is not a real number.
+pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
 /// Division by zero, including modulo.
 pub const DIVISION_BY_ZERO: &str = "22012";
 /// A datetime literal PostgreSQL's own parser would also refuse — `'abc'::timestamptz`. Note that

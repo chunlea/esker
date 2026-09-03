@@ -38,8 +38,8 @@ pub use ddl::{
 };
 pub use dml::{Delete, Insert, Returning, Update};
 pub use expr::{
-    AggregateCall, AggregateFunc, BinaryOp, CaseBranch, CatalogFunc, CatalogFuncCall, Expr,
-    Literal, PlainFunc, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc,
+    AggregateCall, AggregateFunc, ArithOp, BinaryOp, CaseBranch, CatalogFunc, CatalogFuncCall,
+    Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc,
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, Node, OrderItem, Probe, Select, SelectItem, SortKey,
@@ -68,10 +68,10 @@ pub enum Statement {
     /// `DROP SEQUENCE [IF EXISTS] s [CASCADE]` — the sequence, its name, its counter, and the
     /// column default that *is* it.
     DropSequence(DropSequence),
-    /// `DROP FUNCTION`.
-    DropFunction(DropFunction),
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequence),
+    /// `DROP FUNCTION`.
+    DropFunction(DropFunction),
     /// `CREATE EXTENSION [IF NOT EXISTS] name` — a catalog write and nothing else here: it records
     /// that the extension is installed, and what an extension *carries* is either already in this
     /// build or is why the name is not available.
@@ -160,10 +160,10 @@ impl Statement {
             Statement::CreateTable(_) => Some("CREATE TABLE"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
-            Statement::DropSequence(_) => Some("DROP SEQUENCE"),
-            Statement::DropFunction(_) => Some("DROP FUNCTION"),
-            Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
             Statement::DropTable(_) => Some("DROP TABLE"),
+            Statement::DropSequence(_) => Some("DROP SEQUENCE"),
+            Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
+            Statement::DropFunction(_) => Some("DROP FUNCTION"),
             Statement::CreateIndex(_) => Some("CREATE INDEX"),
             Statement::DropIndex(_) => Some("DROP INDEX"),
             Statement::AlterTable(_) => Some("ALTER TABLE"),
@@ -199,8 +199,8 @@ impl Statement {
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropTable(_) => "DROP TABLE",
             Statement::DropSequence(_) => "DROP SEQUENCE",
-            Statement::DropFunction(_) => "DROP FUNCTION",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",
+            Statement::DropFunction(_) => "DROP FUNCTION",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
             Statement::AlterTable(_) => "ALTER TABLE",

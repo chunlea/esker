@@ -46,6 +46,10 @@ impl Parsed {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per statement kind; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
     match statement {
         Statement::CreateTable(create) => {
@@ -760,10 +764,12 @@ fn cast_default_text(text: &str, literal: &Value, to: &DataType) -> String {
 fn refuse_default_shapes(expr: &Expr) -> Result<()> {
     match expr {
         // **A bare keyword that is a function is not a column.** `CURRENT_DATE` and
-        // `CURRENT_TIMESTAMP` reach the parser as identifiers, and refusing them here as column
-        // references is exactly the mistake this function exists to stop making.
+        // `CURRENT_TIMESTAMP` reach the parser without parentheses, and refusing them here as
+        // column references is exactly the mistake this function exists to stop making. Quoted,
+        // the name is a column again — that is what the quotes mean.
         Expr::Identifier(name)
-            if name.quote_style.is_some() || keyword_func_from_name(&name.value).is_none() =>
+            if name.quote_style.is_some()
+                || plan::CatalogFunc::from_name(&name.value).is_none() =>
         {
             Err(SqlError::DefaultColumnReference)
         }
@@ -856,14 +862,16 @@ fn lower_create_sequence(
                 return Err(SqlError::unsupported("CREATE SEQUENCE ... CACHE"));
             }
             // `NO MINVALUE`, `NO MAXVALUE` and `NO CYCLE` ask for the behaviour this node already
-            // has, so honouring them is honouring nothing.
-            SequenceOptions::MinValue(None) | SequenceOptions::MaxValue(None) => {}
-            SequenceOptions::Cycle(true) => {}
+            // has, so honouring them is honouring nothing. (`Cycle(true)` is the *`NO CYCLE`*
+            // spelling in `sqlparser` 0.62.0 — the flag says "no", not "yes".)
+            SequenceOptions::MinValue(None)
+            | SequenceOptions::MaxValue(None)
+            | SequenceOptions::Cycle(true) => {}
         }
     }
     // `OWNED BY NONE` and no clause at all are the same statement — measured, both leave the
     // sequence unowned — so the word `none` is read here rather than carried into the plan.
-    let owned_by = match owned_by.map(|owner| owner.to_string()) {
+    let owned_by = match owned_by.map(ObjectName::to_string) {
         Some(owner) if owner.eq_ignore_ascii_case("none") => None,
         Some(_) => {
             let parts: Option<Vec<&str>> = owned_by
@@ -1208,6 +1216,10 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
 /// than from the AST's `Display`, because the name is what the user is told to change and
 /// `sqlparser` renders an action with the identifiers the user wrote in it — a message that
 /// echoes a column name back is a message that cannot be searched for.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per ALTER action; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTable> {
     // `ONLY` is about inheritance, which there is none of here; honouring it silently would be
     // honouring a word we do not implement.
@@ -1741,7 +1753,33 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
         } => match expr.as_ref() {
             Expr::Value(value) => lower_value(&value.value, true),
-            other => Err(SqlError::unsupported(format!("the expression -{other}"))),
+            // **`-2 ^ 2` is 4, not -4.** Unary minus binds *tighter* than `^` on a real server and
+            // looser in this parser, so the minus is pushed into the base here. Measured, and the
+            // opposite of the mathematical convention — which is why it is worth a line rather
+            // than an assumption.
+            Expr::BinaryOp { op, left, right }
+                if arithmetic_op(op) == Some(plan::ArithOp::Power) =>
+            {
+                Ok(plan::Expr::Arithmetic {
+                    op: plan::ArithOp::Power,
+                    left: Box::new(lower_expr(&Expr::UnaryOp {
+                        op: UnaryOperator::Minus,
+                        expr: left.clone(),
+                    })?),
+                    right: Box::new(lower_expr(right)?),
+                    ty: None,
+                })
+            }
+            // **`0 - x`, not a negated value.** It is the same answer for every input and it is
+            // the same *error* too: `-((-2147483648)::int4)` is `22003 integer out of range`,
+            // which a negation written as its own operation has to remember to raise and a
+            // subtraction gets from the width it is done at. Measured.
+            other => Ok(plan::Expr::Arithmetic {
+                op: plan::ArithOp::Subtract,
+                left: Box::new(plan::Expr::Literal(plan::Literal::Integer(0))),
+                right: Box::new(lower_expr(other)?),
+                ty: None,
+            }),
         },
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
@@ -1805,19 +1843,6 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 Datum::Text(PUBLIC_SCHEMA.to_owned()),
             ))))
         }
-        // **A keyword that is a function, written without parentheses.** `CURRENT_DATE` and
-        // `CURRENT_TIMESTAMP` reach the parser as bare identifiers, and reading one as a column
-        // would make `SELECT CURRENT_DATE` a `42703` naming a column nobody wrote. Quoted, it is
-        // a column again — `"current_date"` is an ordinary name, which is what the quotes mean.
-        Expr::Identifier(name) if name.quote_style.is_none() => {
-            match keyword_func_from_name(&name.value) {
-                Some(func) => Ok(plan::Expr::Call { func, args: vec![] }),
-                None => Ok(plan::Expr::Column {
-                    table: None,
-                    name: ident(name),
-                }),
-            }
-        }
         Expr::Identifier(name) => Ok(plan::Expr::Column {
             table: None,
             name: ident(name),
@@ -1871,6 +1896,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Timestamp(micros),
             ))))
+        }
+        // The six that yield a **value**. They are lowered before the comparisons because they are
+        // a different node: `crate::plan::ArithOp` says why the two are not one enum.
+        Expr::BinaryOp { op, left, right } if arithmetic_op(op).is_some() => {
+            Ok(plan::Expr::Arithmetic {
+                op: arithmetic_op(op).unwrap_or(plan::ArithOp::Add),
+                left: Box::new(lower_expr(left)?),
+                right: Box::new(lower_expr(right)?),
+                ty: None,
+            })
         }
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
@@ -2133,30 +2168,6 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
             Datum::Text(value::vector::Array::write(&elements)),
         ))));
-    }
-    // `random`, `concat`, `convert_to` and the two clock keywords in their function spellings.
-    //
-    // **`concat` is variadic and takes one argument at least**: `concat()` is
-    // `42883 function concat() does not exist`, measured, because the variadic signature has a
-    // parameter. Every other one here is niladic or fixed, and a wrong count is the same `42883`
-    // naming the signature that every function on this node gives.
-    if let Some(func) = plain_func_from_name(&name) {
-        let args = function_arguments(function, func.name())?;
-        match func {
-            plan::PlainFunc::Concat if args.is_empty() => {
-                return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
-            }
-            plan::PlainFunc::Concat => {}
-            plan::PlainFunc::ConvertTo => refuse_wrong_arity(function, func.name(), 2)?,
-            _ => refuse_wrong_arity(function, func.name(), 0)?,
-        }
-        return Ok(plan::Expr::Call {
-            func,
-            args: args
-                .iter()
-                .map(|arg| lower_expr(arg))
-                .collect::<Result<Vec<_>>>()?,
-        });
     }
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
@@ -2423,10 +2434,14 @@ fn lower_catalog_function(
     refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
 
     refuse_wrong_arities(function, func.name(), func.arities())?;
-    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
-        // No argument list at all, which `refuse_wrong_arity` has already answered for every
-        // function here — none of them takes zero arguments.
-        return Err(SqlError::UndefinedFunction(format!("{}()", func.name())));
+    let empty = Vec::new();
+    let args = match &function.args {
+        FunctionArguments::List(FunctionArgumentList { args, .. }) => args,
+        // **No argument list at all**, which is how `CURRENT_TIMESTAMP` and `CURRENT_DATE` are
+        // written: a keyword, no parentheses. For a function that takes none that is a call with
+        // zero arguments and not a missing one — `refuse_wrong_arities` above has already said so.
+        _ if func.arities().contains(&0) => &empty,
+        _ => return Err(SqlError::UndefinedFunction(format!("{}()", func.name()))),
     };
     let args = args
         .iter()
@@ -2778,34 +2793,6 @@ fn refuse_wrong_arities(
     )))
 }
 
-/// The plain functions, by the name a call spells them.
-///
-/// `now()` and `transaction_timestamp()` are one entry: PostgreSQL defines the second as an alias
-/// of the first and both answer the transaction's instant. Which spelling was written survives in
-/// the **text** a default stores, not here, because the value does not depend on it.
-fn plain_func_from_name(name: &str) -> Option<plan::PlainFunc> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "random" => plan::PlainFunc::Random,
-        "concat" => plan::PlainFunc::Concat,
-        "convert_to" => plan::PlainFunc::ConvertTo,
-        "now" | "transaction_timestamp" | "current_timestamp" => plan::PlainFunc::Now,
-        "current_date" => plan::PlainFunc::CurrentDate,
-        _ => return None,
-    })
-}
-
-/// The subset of those that SQL also spells **without parentheses**, as a bare keyword.
-///
-/// `random` is not one of them: `SELECT random` is a column reference on a real server, and
-/// answering a number there would be a wrong answer rather than a gap.
-fn keyword_func_from_name(name: &str) -> Option<plan::PlainFunc> {
-    match name.to_ascii_lowercase().as_str() {
-        "current_timestamp" | "localtimestamp" => Some(plan::PlainFunc::Now),
-        "current_date" => Some(plan::PlainFunc::CurrentDate),
-        _ => None,
-    }
-}
-
 /// A call's positional arguments, or `42883` for a call written in a shape that has none.
 fn function_arguments<'a>(
     function: &'a sqlparser::ast::Function,
@@ -3076,6 +3063,24 @@ fn is_json_expr(expr: &Expr) -> bool {
         } => matches!(data_type, DataType::JSON | DataType::JSONB) || is_json_expr(expr),
         _ => false,
     }
+}
+
+/// The arithmetic operator a token is, or `None` for one that compares or combines.
+///
+/// `^` is here and `#`, `&`, `|`, `<<` and `>>` are not: PostgreSQL's bit operators are a separate
+/// surface with their own types, and naming them is better than approximating them.
+fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
+    Some(match op {
+        BinaryOperator::Plus => plan::ArithOp::Add,
+        BinaryOperator::Minus => plan::ArithOp::Subtract,
+        BinaryOperator::Multiply => plan::ArithOp::Multiply,
+        BinaryOperator::Divide => plan::ArithOp::Divide,
+        BinaryOperator::Modulo => plan::ArithOp::Modulo,
+        // `^` under the PostgreSQL dialect is exponentiation, not a bitwise XOR — that is `#`
+        // there — so both spellings the parser can produce for the token mean the same operator.
+        BinaryOperator::PGExp | BinaryOperator::BitwiseXor => plan::ArithOp::Power,
+        _ => return None,
+    })
 }
 
 /// Whether an operator compares, as against combines.

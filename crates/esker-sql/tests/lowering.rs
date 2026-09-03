@@ -36,11 +36,12 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         ),
         ("CREATE TABLE t AS SELECT 1", "CREATE TABLE ... AS"),
         ("CREATE UNLOGGED TABLE t (a int8)", "UNLOGGED"),
-        // `DEFAULT <expression>` is honoured now, at `CREATE TABLE`, for any expression this
-        // node can evaluate — `random()` included. What stays refused is an expression this node
-        // has no operator for, named for the operator rather than for the clause.
-        ("CREATE TABLE t (a int8 DEFAULT 1 + 1)", "the operator +"),
-        ("CREATE TABLE t (a int8 DEFAULT (1+1))", "the operator +"),
+        // **Nothing about a column `DEFAULT` is on this list any more.** It took an arbitrary
+        // expression from the `DEFAULT`-is-an-expression unit, and the last thing it could not
+        // evaluate — arithmetic — arrived on `main` in the same round. What a default still
+        // refuses is PostgreSQL's own three shapes, and those have their own test rather than a
+        // line here: they are not clauses this node declines to honour, they are clauses a real
+        // server declines too.
         // The identity forms run, and so does the computed column that shares their grammar:
         // `GENERATED ALWAYS AS (expr) STORED` landed with statement 738. **`VIRTUAL` is not on
         // this list and is not implemented either** — `sqlparser` 0.62.0 cannot parse the word, so

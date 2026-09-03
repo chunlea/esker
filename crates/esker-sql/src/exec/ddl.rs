@@ -411,8 +411,14 @@ fn set_column_default(
 
     match default {
         None => {}
+        // The `Some` was resolved above for exactly this arm; a `let else` says so without a
+        // panic that would be unreachable and unprovable at the same time.
         Some(plan::ColumnDefault::Sequence(_)) => {
-            let mut sequence = sequence.expect("resolved above for this arm");
+            let Some(mut sequence) = sequence else {
+                return Err(SqlError::Internal(
+                    "a sequence default reached the writer unresolved".to_owned(),
+                ));
+            };
             sequence.column = Some(at);
             catalog::replace_sequence(txn, executor.tenant, &sequence);
             // The table's own copy, so the cached definition agrees with the records.
@@ -1171,14 +1177,12 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             .get(*at)
             .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
         Expr::Literal(literal) => deparse_literal(literal, ty),
-        // A call prints as a call: `concat('a', 'b')`, `random()`. The arguments are deparsed the
-        // same way, so a nested one comes back too.
-        Expr::Call { func, args } => format!(
-            "{}({})",
-            func.name(),
-            args.iter().map(sub).collect::<Vec<_>>().join(", ")
-        ),
         Expr::Binary { op, left, right } => {
+            format!("({} {} {})", sub(left), op.symbol(), sub(right))
+        }
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => {
             format!("({} {} {})", sub(left), op.symbol(), sub(right))
         }
         Expr::Not(operand) => format!("(NOT {})", sub(operand)),
@@ -1400,6 +1404,10 @@ pub(super) fn drop_index(
 /// is. A statement whose actions all skip writes nothing at all: it has changed no shape, and
 /// bumping the catalog version for it would make every node discard its cache and every concurrent
 /// DDL conflict, for nothing.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per ALTER action; splitting it would hide the vocabulary rather than clarify it"
+)]
 pub(super) fn alter_table(
     executor: &mut Executor,
     txn: &mut dyn Txn,

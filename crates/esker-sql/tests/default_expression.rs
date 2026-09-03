@@ -40,23 +40,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              are what `PlainFunc::result_type` returns, and the `\\gdesc` column of every other \
              line here checks them the long way.",
         ),
-        (
-            "CREATE TABLE ar1 (a integer DEFAULT random() * 100)",
-            "**This node has no arithmetic operator of any kind** — not `*`, not `+`, at no \
-             width — so the refusal names the operator (contract C2). It is not a rule about \
-             defaults: the same `random() * 100` is refused in a `SELECT`, and the default \
-             machinery around it works, which is what the eleven other defaults in this corpus \
-             show. Statement 738 of `postgresql_specific_schema.rb` needs this one and needs \
-             `random_number * 10` in its `GENERATED` column, so the table still does not load — \
-             the remaining blocker, and one no lane currently owns.",
-        ),
-        (
-            "CREATE TABLE ar2 (a int4 DEFAULT 1 + 1)",
-            "The same missing operator, in its `+` spelling. **PostgreSQL does not fold this \
-             one** — it prints the default back as `(1 + 1)`, unevaluated — so a node that folded \
-             it to `2` would agree on the value and disagree on the text, which is why the fold \
-             here stops exactly where a real server's does.",
-        ),
+        // **Both arithmetic entries are deleted** (ADR 0031, rule 2). They recorded that this
+        // node had no arithmetic operator of any kind, so `random() * 100` and `1 + 1` — two of
+        // statement 738's ten defaults — were refused by the operator's name. The arithmetic
+        // landed on `main` in the same round as this branch's `random()`, and between them the
+        // two lines now answer what a real server answers. Nothing in the default machinery
+        // changed to make that true; the operators simply arrived under it.
         (
             "CREATE TABLE bad4 (a int8 DEFAULT nosuchfunc())",
             "`0A000` here against `42883` there, and the difference is contract C2 rather than a \

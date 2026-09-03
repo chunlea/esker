@@ -365,6 +365,16 @@ pub fn of_i64(value: i64) -> Numeric {
     })
 }
 
+/// Zero, or any small integer, as a `Decimal` at scale zero.
+#[must_use]
+pub fn of_i64_decimal(value: i64) -> Decimal {
+    match of_i64(value) {
+        Numeric::Finite(value) => value,
+        // Unreachable: an `i64` is always finite.
+        _ => Decimal::zero(),
+    }
+}
+
 /// A `numeric` as the `f64` PostgreSQL promotes it to when it meets a float.
 ///
 /// **The exact type loses to the inexact one**, which is PostgreSQL's own rule: `numeric + float8`
@@ -480,6 +490,104 @@ pub fn add(left: &Decimal, right: &Decimal) -> Decimal {
     }
 }
 
+/// `left - right`, which is `left + (-right)` and needs no arithmetic of its own.
+#[must_use]
+pub fn subtract(left: &Decimal, right: &Decimal) -> Decimal {
+    let negated = Decimal {
+        // Zero is never negative, which is `Decimal`'s invariant and the reason this is not a
+        // plain `!right.negative`.
+        negative: !right.negative && !right.is_zero(),
+        digits: right.digits.clone(),
+        scale: right.scale,
+    };
+    add(left, &negated)
+}
+
+/// `left * right`, whose scale is the **sum** of the two.
+///
+/// `1.50 * 1.50` is `2.2500` and not `2.25`: the scales add, so the trailing zeros are part of
+/// the answer. `0 * 3.14` is `0.00` for the same reason — nothing is stripped, because the scale
+/// says how many places the value is known to and multiplying two known values knows more places,
+/// not fewer. Measured, all three.
+#[must_use]
+pub fn multiply(left: &Decimal, right: &Decimal) -> Decimal {
+    let digits = trim_leading(mul_digits(&left.digits, &right.digits));
+    let negative = (left.negative != right.negative) && digits.iter().any(|digit| *digit != 0);
+    Decimal {
+        negative,
+        digits,
+        scale: left.scale + right.scale,
+    }
+}
+
+/// Schoolbook multiplication over base-10 digits, most significant first.
+fn mul_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut product = vec![0u32; a.len() + b.len()];
+    for (i, left) in a.iter().rev().enumerate() {
+        for (j, right) in b.iter().rev().enumerate() {
+            product[i + j] += u32::from(*left) * u32::from(*right);
+        }
+    }
+    let mut carry = 0u32;
+    for slot in &mut product {
+        let total = *slot + carry;
+        *slot = total % 10;
+        carry = total / 10;
+    }
+    let mut digits: Vec<u8> = product
+        .iter()
+        .rev()
+        .map(|digit| u8::try_from(*digit).unwrap_or(0))
+        .collect();
+    if digits.is_empty() {
+        digits.push(0);
+    }
+    digits
+}
+
+/// `left % right`: the remainder, at the **larger** of the two scales and with the **dividend's**
+/// sign.
+///
+/// `10.5 % 3` is `1.5`, `(-10) % 3` is `-1` and `10 % (-3)` is `1` — measured, all three, because
+/// the two signs are where a remainder and a modulus part company. `None` for a zero divisor,
+/// which the caller turns into `22012`.
+#[must_use]
+pub fn modulo(left: &Decimal, right: &Decimal) -> Option<Decimal> {
+    if right.is_zero() {
+        return None;
+    }
+    // Both brought to one scale, which makes them two integers and the remainder an integer
+    // division — no rounding anywhere, which is what a remainder must not have.
+    let scale = left.scale.max(right.scale);
+    let numerator = shift_left(
+        &left.digits,
+        usize::try_from(scale - left.scale).unwrap_or(0),
+    );
+    let divisor = shift_left(
+        &right.digits,
+        usize::try_from(scale - right.scale).unwrap_or(0),
+    );
+    let mut remainder: Vec<u8> = vec![0];
+    for digit in &numerator {
+        if remainder == [0] {
+            remainder = vec![*digit];
+        } else {
+            remainder.push(*digit);
+        }
+        remainder = trim_leading(remainder);
+        while cmp_digits(&remainder, &divisor).is_ge() {
+            remainder = sub_digits(&remainder, &divisor);
+        }
+    }
+    let digits = trim_leading(remainder);
+    let negative = left.negative && digits.iter().any(|digit| *digit != 0);
+    Some(Decimal {
+        negative,
+        digits,
+        scale,
+    })
+}
+
 /// The fractional digits PostgreSQL's division produces for these two operands.
 ///
 /// This is `select_div_scale` from `numeric.c`, and it is **not** a fixed number of places: it
@@ -499,14 +607,22 @@ pub fn div_scale(numerator: &Decimal, denominator: &Decimal) -> i32 {
         }
         let integer_digits =
             i32::try_from(normalised.digits.len()).unwrap_or(i32::MAX) - normalised.scale;
-        // The leading base-10000 group is the first `integer_digits mod 4` digits (or four).
+        // The leading base-10000 group is the first `integer_digits mod 4` digits (or four) —
+        // **padded with zeros when the value has fewer**, which is not a detail. `normalised()`
+        // strips trailing zeros, so `10` is stored as the digit `1` at scale -1; reading only the
+        // digits that are there makes its leading group `1` instead of `10`, and `10 / 3` then
+        // takes the `first digit <=` branch and comes out at twenty places where PostgreSQL gives
+        // sixteen. The group is a fixed-width number, so it is built to that width.
         let lead_len = integer_digits.rem_euclid(4);
         let lead_len = if lead_len == 0 { 4 } else { lead_len };
-        let lead: i32 = normalised
-            .digits
-            .iter()
-            .take(usize::try_from(lead_len).unwrap_or(1))
-            .fold(0, |acc, digit| acc * 10 + i32::from(*digit));
+        let lead: i32 = (0..lead_len).fold(0, |acc, at| {
+            let digit = usize::try_from(at)
+                .ok()
+                .and_then(|at| normalised.digits.get(at))
+                .copied()
+                .unwrap_or(0);
+            acc * 10 + i32::from(digit)
+        });
         // `weight` counts whole base-10000 groups above the point, less one.
         ((integer_digits - 1).div_euclid(4), lead)
     }

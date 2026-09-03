@@ -36,9 +36,6 @@ SELECT count(*) OVER () FROM t
 statement error (0A000)
 SELECT count(*) FILTER (WHERE a > 0) FROM t
 
-statement error (0A000)
-SELECT a + 1 FROM t
-
 
 statement error (0A000)
 INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT DO NOTHING
@@ -52,11 +49,10 @@ CREATE TEMPORARY TABLE tmp (id int8 PRIMARY KEY)
 statement error (0A000)
 CREATE TABLE copy AS SELECT * FROM t
 
-# `DEFAULT <expression>` runs now, for any expression this node can evaluate — the line that stood
-# here refused `DEFAULT random()` at CREATE TABLE and no longer does. What is left is an expression
-# with no operator behind it, refused by the operator's name.
-statement error (0A000)
-CREATE TABLE d (id int8 PRIMARY KEY, a int8 DEFAULT 1 + 1)
+# **Nothing about a column `DEFAULT` is refused here any more.** Two lines stood in this place: one
+# refused `DEFAULT random()` at CREATE TABLE, which the DEFAULT-is-an-expression unit took, and one
+# refused `DEFAULT 1 + 1`, which arithmetic on `main` took. What a default still refuses is
+# PostgreSQL's own three shapes, and those are not "unsupported" — a real server refuses them too.
 
 # Tier 1 is complete since the typmod unit and `numeric` since the numeric one, so the three
 # lines that stood here are gone. No column type in ADR 0033's first two tiers is refused now.

@@ -72,20 +72,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // because the *text* is the same characters for every input that does not overflow.
         "SELECT (SELECT sum(v) FROM sq_b)",
     ],
-    answers: &[
-        (
-            "SELECT (SELECT max(id) FROM sq_a) + 0",
-            "the operator `+` is `0A000` naming itself and was before this unit. The subquery in \
+    answers: &[(
+        "SELECT (SELECT max(id) FROM sq_a) + 0",
+        "the operator `+` is `0A000` naming itself and was before this unit. The subquery in \
              it runs the moment arithmetic does.",
-        ),
-        (
-            "SELECT EXISTS (SELECT 1/0 FROM sq_e)",
-            "the operator `/`, as above — and the interesting half of this line is what a real \
-             server does with it, which is **not** `22012`: a subquery over no rows evaluates no \
-             expression, so the division never happens. When arithmetic lands, this line is the \
-             one that says the evaluation is lazy rather than eager.",
-        ),
-    ],
+    )],
 };
 
 #[test]

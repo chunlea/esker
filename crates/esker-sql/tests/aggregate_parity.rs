@@ -59,10 +59,6 @@ const DIVERGENCES: &[(&str, &str)] = &[
     // ADR 0031, and the whole of what an int8 sum costs.
     // avg over an integer column: numeric with sixteen fractional digits, which no float8 renders.
     (
-        "SELECT avg(n) FROM agg WHERE id = 1",
-        "avg(bigint) is numeric there and 0A000 here",
-    ),
-    (
         "SELECT avg(n)::text FROM agg",
         "a cast, and avg(bigint) under it",
     ),

@@ -29,7 +29,11 @@
 //! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
 //! single `match` be exhaustive over what a column can hold.
 
+/// Binary arithmetic: the promotion table and the six operators.
+pub mod arith;
 pub mod date;
+/// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
+pub mod encoding;
 pub(crate) mod float;
 pub mod interval;
 pub(crate) mod json;

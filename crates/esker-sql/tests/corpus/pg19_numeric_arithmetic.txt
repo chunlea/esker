@@ -1,0 +1,78 @@
+# `numeric` arithmetic, as a real PostgreSQL 19beta1 answers — the exact half of the operators.
+#
+# The scale is part of the answer here in a way it is not for a float, and each rule is its own
+# rule rather than one rounding policy:
+#
+#   * **addition and subtraction take the larger scale**: `1.5 + 1.25` is `2.75`;
+#   * **multiplication takes the sum of the scales**: `1.50 * 1.50` is `2.2500`, not `2.25`, and
+#     `0 * 3.14` is `0.00`. Nothing is stripped — the scale says how many places the value is
+#     known to, and multiplying two known values knows more places rather than fewer;
+#   * **division aims at sixteen significant digits**, which is `select_div_scale` in `numeric.c`
+#     and not a fixed number of places: `10 / 3` gets sixteen fractional digits and `1 / 3` gets
+#     twenty, because the first has a digit before the point;
+#   * `%` takes the **larger** scale and the **dividend's** sign: `10.5 % 3` is `1.5`,
+#     `(-10) % 3` is `-1` and `10 % (-3)` is `1`.
+#
+# And the non-finite rules, which are not the float ones by assumption but by measurement:
+#
+#   * **`'NaN' / 0` is `NaN` and `'Infinity' / 0` is `22012`.** A value that absorbs everything
+#     absorbs the error too, and one that does not, does not — the same shape as the NULL rule;
+#   * `Infinity * 0`, `Infinity - Infinity`, `Infinity / Infinity` and `Infinity % 3` are `NaN`;
+#   * `3 % Infinity` is 3 and `0 / Infinity` is 0.
+SELECT 1.50::numeric * 1.50::numeric	numeric	2.2500
+SELECT 1.5::numeric + 1.25::numeric	numeric	2.75
+SELECT 1.5::numeric - 1.25::numeric	numeric	0.25
+SELECT 6.0::numeric / 2.0::numeric	numeric	3.0000000000000000
+SELECT 1::numeric / 3::numeric	numeric	0.33333333333333333333
+SELECT 10::numeric / 3::numeric	numeric	3.3333333333333333
+SELECT 1.0::numeric / 3.0::numeric	numeric	0.33333333333333333333
+SELECT 100::numeric / 7::numeric	numeric	14.2857142857142857
+SELECT 2::numeric + 3::numeric	numeric	5
+SELECT 10::numeric % 3::numeric	numeric	1
+SELECT (-10)::numeric % 3::numeric	numeric	-1
+SELECT 10::numeric % (-3)::numeric	numeric	1
+SELECT 10.5::numeric % 3::numeric	numeric	1.5
+SELECT 1::numeric / 0::numeric	!22012 division by zero
+SELECT 1::numeric % 0::numeric	!22012 division by zero
+SELECT 2::numeric ^ 3::numeric	numeric	8.0000000000000000
+SELECT 2::numeric ^ 0.5::numeric	numeric	1.4142135623730950
+SELECT (10::numeric ^ 100)::text	text	10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+SELECT (-2)::numeric ^ 0.5::numeric	!2201F a negative number raised to a non-integer power yields a complex result
+SELECT 0::numeric ^ 0::numeric	numeric	1.0000000000000000
+SELECT abs((-3.75)::numeric)	numeric	3.75
+SELECT -((-3.75)::numeric)	numeric	3.75
+SELECT 1.5::numeric(10,2) + 1.5::numeric(10,2)	numeric	3.00
+SELECT 1.5::numeric(10,2) * 2::numeric	numeric	3.00
+SELECT 'NaN'::numeric + 1::numeric	numeric	NaN
+SELECT 'NaN'::numeric * 0::numeric	numeric	NaN
+SELECT 'Infinity'::numeric + 1::numeric	numeric	Infinity
+SELECT 'Infinity'::numeric - 'Infinity'::numeric	numeric	NaN
+SELECT 1::numeric / 'Infinity'::numeric	numeric	0
+SELECT NULL::numeric + 1::numeric	numeric	\N
+SELECT 2::int2 + 3::numeric	numeric	5
+SELECT 2::int4 * 3::numeric	numeric	6
+SELECT 7::int8 / 2::numeric	numeric	3.5000000000000000
+SELECT 2::float4 + 3::numeric	double precision	5
+SELECT 2::float8 * 3::numeric	double precision	6
+SELECT 1.5 + 1.5	numeric	3.0
+SELECT 1.5 * 2	numeric	3.0
+SELECT 0.1 + 0.2	numeric	0.3
+SELECT 1.5::numeric + 1	numeric	2.5
+SELECT 123456789012345678901234567890::numeric * 2::numeric	numeric	246913578024691357802469135780
+SELECT 1.23::numeric(5,2) / 3::numeric	numeric	0.41000000000000000000
+SELECT 0.000001::numeric * 0.000001::numeric	numeric	0.000000000001
+SELECT 1e-20::numeric + 1e20::numeric	numeric	100000000000000000000.00000000000000000001
+SELECT 'Infinity'::numeric * 0::numeric	numeric	NaN
+SELECT 'Infinity'::numeric / 'Infinity'::numeric	numeric	NaN
+SELECT 0::numeric / 'Infinity'::numeric	numeric	0
+SELECT '-Infinity'::numeric + 1::numeric	numeric	-Infinity
+SELECT 'Infinity'::numeric % 3::numeric	numeric	NaN
+SELECT 3::numeric % 'Infinity'::numeric	numeric	3
+SELECT 'NaN'::numeric / 0::numeric	numeric	NaN
+SELECT 'Infinity'::numeric / 0::numeric	!22012 division by zero
+SELECT (-1.5)::numeric - 1.25::numeric	numeric	-2.75
+SELECT 1.25::numeric - 1.5::numeric	numeric	-0.25
+SELECT 1.5::numeric * (-2)::numeric	numeric	-3.0
+SELECT (-7)::numeric / 2::numeric	numeric	-3.5000000000000000
+SELECT 0::numeric * 3.14::numeric	numeric	0.00
+SELECT 12.0::numeric * 1.000::numeric	numeric	12.0000

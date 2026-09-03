@@ -18,13 +18,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // this corpus asks the same question about `float`'s three spellings.
         "SELECT 'float'::regtype::oid, 'float4'::regtype::oid, 'float8'::regtype::oid",
     ],
-    answers: &[(
-        "SELECT 1.0/3.0::FLOAT, 1.0/3.0::FLOAT(24)",
-        "Arithmetic — `/` — is not implemented, and a cast of a *numeric* literal is `0A000` \
-         besides. Both are already declared elsewhere and neither is about the spelling. The line \
-         is in the corpus because it is the one that would show `float(24)` rounding like a \
-         `real` once either lands.",
-    )],
+    answers: &[],
 };
 
 #[test]

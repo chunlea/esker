@@ -32,16 +32,37 @@ use crate::value::{PgDatum, PgType};
 
 /// An expression, as far as phase 6a needs one.
 ///
-/// Arithmetic is deliberately absent. `a + 1` is refused by name rather than implemented, because
-/// every operator brings its own overflow, division and type-resolution rules and each of them is
-/// a way to return a confidently wrong number. §3's scope is projection, `WHERE`, `ORDER BY`,
-/// `LIMIT` and `OFFSET`, and this is exactly what those need.
+/// **Arithmetic was deliberately absent and is here now** ([ADR
+/// 0046](../../docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md)).
+/// The reason it was left out still holds — every operator brings its own overflow, division and
+/// type-resolution rules, and each of them is a way to return a confidently wrong number — so it
+/// arrived the way the rest of this crate does: a capture of what a real server answers first,
+/// and one table (`crate::value::arith`) that the planner and the evaluator both read, so the
+/// type a client is told cannot drift from the values it is sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A constant as written.
     Literal(Literal),
     /// `$1`, one-based as PostgreSQL writes it.
     Parameter(u32),
+    /// `left <op> right` where the operator yields a **value**, not a boolean.
+    ///
+    /// The type it yields is `crate::value::arith::result_type`'s answer and is computed once, at
+    /// plan time, because a client is told the column's OID before any row is read.
+    Arithmetic {
+        /// Which operator.
+        op: ArithOp,
+        /// The left operand.
+        left: Box<Expr>,
+        /// The right operand.
+        right: Box<Expr>,
+        /// The type the operator yields, once a scope has been available to work it out — and
+        /// `None` until then, which is a **state and not a default**. A `DEFAULT` expression is
+        /// evaluated by the DDL path without ever being resolved against a row, so the evaluator
+        /// falls back to the operands' own types there; putting a guess here instead would make
+        /// that path silently disagree with the one a `SELECT` takes.
+        ty: Option<ColumnType>,
+    },
     /// A column of the row being evaluated, by name. The planner resolves it to a position.
     Column {
         /// The table it was qualified with — `a` in `a.id` — or `None` for a bare name.
@@ -150,15 +171,6 @@ pub enum Expr {
     /// than a [`CatalogFunc`] for exactly that reason: that family is documented as a function of
     /// its arguments alone, and this is the opposite.
     Uuid(UuidFunc),
-    /// A [`PlainFunc`] and its arguments, in the order written.
-    ///
-    /// The arity is checked where the call is lowered, so the evaluator reads by position.
-    Call {
-        /// Which function.
-        func: PlainFunc,
-        /// Its arguments.
-        args: Vec<Expr>,
-    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -352,6 +364,10 @@ pub enum ScalarFunc {
     Lower,
     /// `upper(text)`.
     Upper,
+    /// `abs(numeric type)` — the one scalar function whose result type is its **argument's**,
+    /// and whose failure is an overflow: `abs((-32768)::int2)` is `22003`, because the positive
+    /// of the smallest `int2` is not one.
+    Abs,
 }
 
 impl ScalarFunc {
@@ -361,6 +377,7 @@ impl ScalarFunc {
         match self {
             ScalarFunc::Lower => "lower",
             ScalarFunc::Upper => "upper",
+            ScalarFunc::Abs => "abs",
         }
     }
 
@@ -370,68 +387,25 @@ impl ScalarFunc {
         match name.to_ascii_lowercase().as_str() {
             "lower" => Some(ScalarFunc::Lower),
             "upper" => Some(ScalarFunc::Upper),
+            "abs" => Some(ScalarFunc::Abs),
             _ => None,
         }
     }
 }
 
-/// The plain SQL functions this node evaluates: a name, and arguments read by position.
+/// Every arity `concat` accepts: one argument up to a limit no statement reaches.
 ///
-/// Separate from [`ScalarFunc`], which is one argument over a string and predates any need for a
-/// second. These arrived together with the generalised column `DEFAULT`, where PostgreSQL allows
-/// **any** expression: a default of `concat('Ruby ', 'on ', 'Rails')` or `random() * 100` is not a
-/// special DDL form, it is an ordinary expression that happens to sit in a `DEFAULT` clause, so
-/// the way to accept one is to be able to evaluate it anywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlainFunc {
-    /// `random()`: a `double precision` in `[0, 1)`, drawn per call.
-    Random,
-    /// `concat(v, ...)`: the arguments as text, run together, **skipping NULLs**.
-    ///
-    /// Not the `||` operator, which answers NULL if either side is NULL. One argument at least —
-    /// `concat()` is `42883` on a real server, measured, because the variadic signature needs one.
-    Concat,
-    /// `convert_to(text, encoding)`: the bytes of a string in a named encoding.
-    ConvertTo,
-    /// `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`: the transaction's instant.
-    ///
-    /// **The spelling is not recorded here**, because the value does not depend on it; the text a
-    /// stored default prints back is the text the catalog holds (`catalog::ColumnDef`).
-    Now,
-    /// `CURRENT_DATE`: the transaction's instant, truncated to a day.
-    CurrentDate,
-}
-
-impl PlainFunc {
-    /// The name a `42883` spells it, and the name a default prints.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            PlainFunc::Random => "random",
-            PlainFunc::Concat => "concat",
-            PlainFunc::ConvertTo => "convert_to",
-            PlainFunc::Now => "now",
-            PlainFunc::CurrentDate => "current_date",
-        }
+/// A list rather than a range because [`CatalogFunc::arities`] answers a set, and a variadic
+/// function is the one member whose set is not two or three numbers long.
+const CONCAT_ARITIES: [usize; 100] = {
+    let mut arities = [0usize; 100];
+    let mut at = 0;
+    while at < 100 {
+        arities[at] = at + 1;
+        at += 1;
     }
-
-    /// What it answers, which is what a `RowDescription` has to declare before any row exists.
-    ///
-    /// Measured against `pg_typeof` on 19beta1: `random()` is `double precision`, `concat` is
-    /// `text`, `convert_to` is `bytea` and `CURRENT_DATE` is `date` — and `now()` is
-    /// `timestamp with time zone`, which is the one a reader would guess wrong from the column
-    /// types it usually fills.
-    #[must_use]
-    pub fn result_type(self) -> ColumnType {
-        match self {
-            PlainFunc::Random => ColumnType::Double,
-            PlainFunc::Concat => ColumnType::Text,
-            PlainFunc::ConvertTo => ColumnType::Bytea,
-            PlainFunc::Now => ColumnType::TimestampTz,
-            PlainFunc::CurrentDate => ColumnType::Date,
-        }
-    }
-}
+    arities
+};
 
 /// One call to a `pg_catalog` function that prints a definition.
 #[derive(Debug, Clone, PartialEq)]
@@ -522,6 +496,37 @@ pub enum CatalogFunc {
     /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
     /// break a `LEFT JOIN` that legitimately has no match.
     RegClassName,
+    /// `now()`, and `CURRENT_TIMESTAMP` which is the same function under a keyword spelling.
+    ///
+    /// **The transaction's instant, not the statement's.** Two calls in one transaction are equal
+    /// and their difference is exactly `00:00:00` — measured, and PostgreSQL's own rule. It comes
+    /// from the TSO's physical half (`crate::time_machine::micros_of_ts`) rather than from a
+    /// clock this node reads, which is `docs/DESIGN.md` §6 and not an implementation detail: a
+    /// node here has no wall clock it is allowed to order by.
+    ///
+    /// It is the one member of this enum that is **not** a function of its arguments alone.
+    Now,
+    /// `CURRENT_DATE`: the date of [`CatalogFunc::Now`]'s instant.
+    CurrentDate,
+    /// `random()`: a `double precision` in `[0, 1)`, drawn **per call**.
+    ///
+    /// The one function here that is not a pure function of its arguments, and the corpus pins the
+    /// consequence rather than a value: two calls in one statement differ, and every draw is
+    /// inside the half-open range. It arrived with the generalised column `DEFAULT`, where
+    /// `random() * 100` is an ordinary expression that happens to sit in a `DEFAULT` clause.
+    Random,
+    /// `concat(...)`: variadic, and **not strict**.
+    ///
+    /// It *skips* NULLs where `||` propagates them — `concat('a', NULL, 'b')` is `ab` and
+    /// `concat(NULL, NULL)` is the empty string. Each argument is rendered by its own output
+    /// function, so `concat('n=', 42, ' t=', true)` is `n=42 t=t` and a `numeric` keeps its scale.
+    Concat,
+    /// `convert_to(text, encoding)`: the bytes `text` has in `encoding`.
+    ///
+    /// **Strict**, encoding name included: `convert_to('A', NULL)` is NULL. A name that is not an
+    /// encoding is `22023` and not a refusal, which is a real server's answer and not this node's
+    /// idea of one.
+    ConvertTo,
     /// `array_position(array, value)`: the subscript `value` sits at, or NULL.
     ///
     /// The five below are the array operators the catalog's own columns need, and they read the
@@ -553,6 +558,17 @@ impl CatalogFunc {
     #[must_use]
     pub fn from_name(name: &str) -> Option<CatalogFunc> {
         match () {
+            // `CURRENT_TIMESTAMP` reaches here as a function name, which is what it is: a keyword
+            // spelling of `now()`, recorded by PostgreSQL as the same thing.
+            () if name.eq_ignore_ascii_case("now")
+                || name.eq_ignore_ascii_case("current_timestamp") =>
+            {
+                Some(CatalogFunc::Now)
+            }
+            () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
+            () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
+            () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
+            () if name.eq_ignore_ascii_case("convert_to") => Some(CatalogFunc::ConvertTo),
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
             () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
             () if name.eq_ignore_ascii_case("pg_get_indexdef") => Some(CatalogFunc::PgGetIndexdef),
@@ -591,6 +607,11 @@ impl CatalogFunc {
             CatalogFunc::ArrayUpper => "array_upper",
             CatalogFunc::ArrayLength => "array_length",
             CatalogFunc::Cardinality => "cardinality",
+            CatalogFunc::Now => "now",
+            CatalogFunc::CurrentDate => "current_date",
+            CatalogFunc::Random => "random",
+            CatalogFunc::Concat => "concat",
+            CatalogFunc::ConvertTo => "convert_to",
         }
     }
 
@@ -608,7 +629,8 @@ impl CatalogFunc {
             | CatalogFunc::ArrayPosition
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
-            | CatalogFunc::ArrayLength => &[2],
+            | CatalogFunc::ArrayLength
+            | CatalogFunc::ConvertTo => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
@@ -616,6 +638,10 @@ impl CatalogFunc {
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
             | CatalogFunc::Cardinality => &[1],
+            CatalogFunc::Now | CatalogFunc::CurrentDate | CatalogFunc::Random => &[0],
+            // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
+            // arguments that a real server raises, so zero is not in the set.
+            CatalogFunc::Concat => &CONCAT_ARITIES,
         }
     }
 
@@ -632,7 +658,9 @@ impl CatalogFunc {
             // A `regclass` on a real server is an oid that *prints* as a name; `text` here, which
             // is what it prints as. The one place the difference shows is the declared type.
             | CatalogFunc::PgGetPartkeydef
-            | CatalogFunc::RegClassName => ColumnType::Text,
+            | CatalogFunc::RegClassName
+            // `concat` answers `text` for the ordinary reason: it builds a string.
+            | CatalogFunc::Concat => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
 
@@ -643,6 +671,10 @@ impl CatalogFunc {
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
             | CatalogFunc::Cardinality => ColumnType::Int4,
+            CatalogFunc::Now => ColumnType::TimestampTz,
+            CatalogFunc::CurrentDate => ColumnType::Date,
+            CatalogFunc::ConvertTo => ColumnType::Bytea,
+            CatalogFunc::Random => ColumnType::Double,
         }
     }
 }
@@ -804,6 +836,45 @@ impl AggregateCall {
     #[must_use]
     pub fn arg(&self) -> Option<&Expr> {
         if self.star { None } else { self.args.first() }
+    }
+}
+
+/// A binary arithmetic operator.
+///
+/// **A separate enum from [`BinaryOp`], deliberately.** Every match on `BinaryOp` in this crate
+/// assumes the expression yields a boolean — a comparison or a connective — and there are enough
+/// of them that adding `+` there would mean auditing each one for a case it was never written to
+/// have. Arithmetic yields a *value* whose type depends on both operands, which is a different
+/// shape of question, so it gets a different node (`crate::value::arith`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// `+`.
+    Add,
+    /// `-`.
+    Subtract,
+    /// `*`.
+    Multiply,
+    /// `/` — integer division truncates **toward zero**.
+    Divide,
+    /// `%` — the sign of the **dividend**, and undefined for the floats.
+    Modulo,
+    /// `^` — **left-associative** (`2 ^ 3 ^ 2` is 64) and looser than unary minus
+    /// (`-2 ^ 2` is 4). Both measured, both the opposite of the mathematical convention.
+    Power,
+}
+
+impl ArithOp {
+    /// The symbol, for the `operator does not exist: boolean + integer` message.
+    #[must_use]
+    pub fn symbol(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Subtract => "-",
+            ArithOp::Multiply => "*",
+            ArithOp::Divide => "/",
+            ArithOp::Modulo => "%",
+            ArithOp::Power => "^",
+        }
     }
 }
 
@@ -1138,13 +1209,13 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Column { .. } | Expr::Ordinal { .. } => "a column reference",
         Expr::Outer { .. } => "a correlated column reference",
         Expr::Binary { .. } => "an operator",
+        Expr::Arithmetic { .. } => "an arithmetic operator",
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",
         Expr::AnyArray { .. } => "= ANY",
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
-        Expr::Call { func, .. } => func.name(),
         Expr::InList { negated: true, .. } => "NOT IN",
         Expr::Aggregate(_) => "an aggregate function",
         Expr::Default => "DEFAULT",

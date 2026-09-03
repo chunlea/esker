@@ -109,7 +109,7 @@ pub enum ColumnDefault {
     /// expression text (`crate::parse::lower`'s `column_default`).
     Value {
         /// The folded constant, when it folds.
-        folded: Option<crate::value::Datum>,
+        folded: Option<Datum>,
         /// The expression text, when it stays one.
         expr: Option<String>,
     },
