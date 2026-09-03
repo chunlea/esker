@@ -109,7 +109,17 @@ const KIND_RETENTION: u8 = b'r';
 const KIND_ROW_ID: u8 = b'a';
 const KIND_CHECKPOINT: u8 = b'c';
 const KIND_JOB: u8 = b'j';
-const KIND_FLASHBACK: u8 = b'f';
+/// A flashback in progress: the instant a table is being put back to, and how far it has got.
+///
+/// **`b`, not `f`.** It shared `f` with [`KIND_FUNCTION`] until 2026-09-03, which put every
+/// flashback record of a tenant inside the range `catalog::functions` scans — so `pg_proc` read
+/// during a flashback tried to decode one as a function. Two record kinds may never share a byte:
+/// a kind's key range is what tells its records apart from everything else, and `function_range`
+/// is a prefix scan with nothing else to filter on.
+///
+/// Moving *this* one rather than the function's is deliberate: a flashback record lives only while
+/// a flashback runs, and a stored function is a durable catalog object whose key must not move.
+const KIND_FLASHBACK: u8 = b'b';
 const KIND_SEQUENCE: u8 = b'q';
 const KIND_SEQUENCE_VALUE: u8 = b'e';
 /// A `FOREIGN KEY`'s **back**-reference: parent id first, so "who references me" is a prefix scan.

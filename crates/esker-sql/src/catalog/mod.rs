@@ -2768,6 +2768,31 @@ mod tests {
         assert_eq!(record::decode_extension(&written_at_12).unwrap(), "1.1");
     }
 
+    /// **Every record kind owns its own key byte**, and two that share one are two records in one
+    /// key range.
+    ///
+    /// `KIND_FUNCTION` and `KIND_FLASHBACK` were both `b'f'`, so `catalog::functions` — which is a
+    /// prefix scan over `'f' ++ tenant` — swept up every flashback record the tenant had and tried
+    /// to decode it as a function. `SELECT * FROM pg_proc` during a flashback is the reachable
+    /// shape. The assertion is over the *keys* rather than over the behaviour, because a key range
+    /// that overlaps is the bug whatever is stored in it.
+    #[test]
+    fn no_two_record_kinds_share_a_key_range() {
+        let (start, end) = record::function_range(7);
+        let flashback = record::flashback_key(7, 1);
+        assert!(
+            flashback < start || flashback >= end,
+            "a flashback record sits inside the function range: functions() would decode it"
+        );
+        // And the other way round, for the range a flashback scan would use if one is added.
+        let function = record::function_key(7, "f");
+        let (extension_start, extension_end) = record::extension_range(7);
+        assert!(
+            function < extension_start || function >= extension_end,
+            "a function record sits inside the extension range"
+        );
+    }
+
     #[test]
     fn a_table_record_is_a_version_and_then_the_definition() {
         let encoded = record::encode_table(&accounts(7)).unwrap();
