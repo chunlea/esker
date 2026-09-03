@@ -1902,8 +1902,6 @@ fn referential_action(
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
-    refuse_if(!create.include.is_empty(), "CREATE INDEX ... INCLUDE")?;
-
     refuse_if(!create.with.is_empty(), "CREATE INDEX ... WITH")?;
 
     refuse_if(
@@ -1914,13 +1912,23 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         !create.alter_options.is_empty(),
         "CREATE INDEX with table options",
     )?;
-    if let Some(using) = &create.using {
-        // Every index here is a range of the ordered key space, which is what a btree is. Saying
-        // `USING hash` and getting one would be a different index than the user asked for.
-        refuse_if(
-            !matches!(using, IndexType::BTree),
-            format!("an index USING {using}"),
-        )?;
+    if let Some(using) = &create.using
+        && !matches!(using, IndexType::BTree)
+    {
+        // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is a
+        // different complaint: `amcaninclude` is a property of the access method, checked before
+        // anything about the index is built, so `USING hash (…) INCLUDE (…)` is refused for the
+        // payload rather than for the method. Measured for `hash` and for `brin`, one sentence
+        // with the name substituted.
+        if create.include.is_empty() {
+            // Every index here is a range of the ordered key space, which is what a btree is.
+            // Saying `USING hash` and getting one would be a different index than the user asked
+            // for.
+            return Err(SqlError::unsupported(format!("an index USING {using}")));
+        }
+        return Err(SqlError::AccessMethodWithoutInclude(
+            using.to_string().to_ascii_lowercase(),
+        ));
     }
     Ok(plan::CreateIndex {
         // Kept as text and lowered per row, the same trade a `CHECK` makes — and normalised the
@@ -1936,6 +1944,15 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         // `sqlparser` spells this clause as `Option<bool>` on a `CREATE INDEX` and as a
         // three-valued enum on a table constraint — `Some(false)` here is `NULLS NOT DISTINCT`.
         nulls_not_distinct: create.nulls_distinct == Some(false),
+        // **Bare identifiers and nothing more.** `sqlparser` 0.62.0 types this clause as a list
+        // of them, so `INCLUDE (name DESC)` and `INCLUDE (name varchar_pattern_ops)` -- both of
+        // which a real server refuses with `42P17` and its own sentence -- are syntax errors
+        // before this is reached. A C1 gap, in the plan's register.
+        include: create
+            .include
+            .iter()
+            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .collect(),
         name: create.name.as_ref().map(object_name).transpose()?,
         table: relation_name(&create.table_name)?,
         keys: index_keys(&create.columns)?,

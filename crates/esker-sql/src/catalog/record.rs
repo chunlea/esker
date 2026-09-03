@@ -77,7 +77,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 19;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 20;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1168,7 +1168,39 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         }
     }
 
+    // Version 20. One list per index: the `INCLUDE (…)` columns, by position, in the order
+    // written — the eighth section on the end, in version order like every one before it. An
+    // index written before 20 has none, which is what every index had while `INCLUDE` was `0A000`.
+    for index in &table.indexes {
+        varint::put_u64(index.include.len() as u64, &mut out);
+        for &at in &index.include {
+            varint::put_u64(at as u64, &mut out);
+        }
+    }
+
     Ok(out)
+}
+
+/// The version 20 section: each index's `INCLUDE (…)` columns.
+///
+/// Read into the indexes that have already been decoded, the way the version 17 byte is: one list
+/// per index, in the order the indexes were written.
+fn read_index_include(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result<()> {
+    if reader.version < 20 {
+        return Ok(());
+    }
+    for index in indexes {
+        let count = reader.count()?;
+        let mut include = Vec::with_capacity(count);
+        for _ in 0..count {
+            include.push(
+                usize::try_from(reader.varint()?)
+                    .map_err(|_| corrupt("an included column that is not a usize"))?,
+            );
+        }
+        index.include = include;
+    }
+    Ok(())
 }
 
 /// The version 17 byte: whether an index is a `UNIQUE` constraint's, and whether it is deferrable.
@@ -1550,6 +1582,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             state,
             state_since,
             // All three filled after the loop, for versions 7, 8 and 11.
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             // Filled from the version 17 section below, after every index has been read.
@@ -1599,6 +1632,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     }
     let triggers = read_triggers(&mut reader)?;
     let (partition_by, partition_bound) = read_partitioning(&mut reader)?;
+    read_index_include(&mut reader, &mut indexes)?;
     reader.finish()?;
 
     Ok(TableDef {

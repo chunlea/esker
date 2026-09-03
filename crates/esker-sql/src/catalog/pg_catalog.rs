@@ -132,6 +132,12 @@ pub enum CatalogView {
     PgLanguage,
     /// One row per partitioned table: its strategy, its key's width, and the key columns.
     PgPartitionedTable,
+    /// One row per index, **as a view over `pg_class` and `pg_index`** rather than a catalog
+    /// table: the table it is on and the `CREATE INDEX` that would rebuild it.
+    ///
+    /// A real server defines it in exactly those terms, and `indexdef` is `pg_get_indexdef` — the
+    /// same string, which is why the two agree about `INCLUDE (…)` without being written twice.
+    PgIndexes,
     /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
     /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
     PgEnum,
@@ -155,7 +161,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 22] = [
+    pub const ALL: [CatalogView; 23] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -171,6 +177,7 @@ impl CatalogView {
         CatalogView::PgTrigger,
         CatalogView::PgLanguage,
         CatalogView::PgPartitionedTable,
+        CatalogView::PgIndexes,
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
@@ -200,6 +207,7 @@ impl CatalogView {
             CatalogView::PgTrigger => "pg_trigger",
             CatalogView::PgLanguage => "pg_language",
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
+            CatalogView::PgIndexes => "pg_indexes",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
@@ -233,6 +241,7 @@ impl CatalogView {
                 CatalogView::PgTrigger => 19,
                 CatalogView::PgLanguage => 20,
                 CatalogView::PgPartitionedTable => 21,
+                CatalogView::PgIndexes => 22,
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
@@ -371,6 +380,16 @@ impl CatalogView {
                 ("tgisinternal", ColumnType::Bool),
                 ("tgfoid", ColumnType::Int8),
             ],
+            // `schemaname` and `tablespace` are what a real server's view has and this node has
+            // neither concept: one schema, and no tablespaces — `public` and NULL, which is what
+            // a real server answers for an index in the default tablespace too.
+            CatalogView::PgIndexes => &[
+                ("schemaname", ColumnType::Text),
+                ("tablename", ColumnType::Text),
+                ("indexname", ColumnType::Text),
+                ("tablespace", ColumnType::Text),
+                ("indexdef", ColumnType::Text),
+            ],
             // `partstrat` is a **one-letter code** and `partattrs` an `int2vector` — neither is
             // the word the DDL used, which `pg_get_partkeydef` gives instead.
             CatalogView::PgPartitionedTable => &[
@@ -433,6 +452,7 @@ impl CatalogView {
             CatalogView::PgProc => proc_rows(txn, tenant),
             CatalogView::PgTrigger => trigger_rows(txn, tenant),
             CatalogView::PgPartitionedTable => partitioned_table_rows(txn, tenant),
+            CatalogView::PgIndexes => indexes_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -559,6 +579,7 @@ impl CatalogView {
             | CatalogView::PgTrigger
             | CatalogView::PgLanguage
             | CatalogView::PgPartitionedTable
+            | CatalogView::PgIndexes
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -801,6 +822,43 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
     super::pg_relations::as_oid(table_id)
         .wrapping_mul(1_000)
         .wrapping_add(at.wrapping_add(1))
+}
+
+/// One row per index, the way `pg_indexes` presents them.
+///
+/// **A view, not a table**: a real server defines it over `pg_class` and `pg_index`, and its
+/// `indexdef` *is* `pg_get_indexdef(indexrelid)` — so the string here is the one that function
+/// builds rather than a second rendering that could drift from it. A primary key is in it, which
+/// is why `companies_pkey` is one of the capture's two rows.
+fn indexes_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for relation in relations.rows() {
+        if !matches!(
+            relation.kind,
+            super::pg_relations::RelKind::Index | super::pg_relations::RelKind::PrimaryKey
+        ) {
+            continue;
+        }
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        let Datum::Text(definition) =
+            super::pg_index::index_definition(&relations, Some(relation.oid), None)
+        else {
+            continue;
+        };
+        rows.push(vec![
+            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            Datum::Text(table.name.clone()),
+            Datum::Text(relation.name.clone()),
+            // No tablespaces here, and NULL is what a real server answers for an index in the
+            // default one — so the column is the same answer rather than a stub.
+            Datum::Null,
+            Datum::Text(definition),
+        ]);
+    }
+    Ok(rows)
 }
 
 /// One row per partitioned table, the way `pg_partitioned_table` holds them.

@@ -511,6 +511,18 @@ pub struct IndexDef {
     /// is measured in. It is written on every transition and read by the job, never by a read or a
     /// write of a row.
     pub state_since: u64,
+    /// `INCLUDE (…)` — the **non-key payload** columns, by position, in the order written.
+    ///
+    /// **They are in `indkey` and only a count separates them from the key**: the suite's index
+    /// has `indnatts = 4`, `indnkeyatts = 2` and `indkey = "2 3 4 5"`, one vector holding both
+    /// halves. A client that reconstructs an index from `indkey` alone reports a four-column
+    /// index, and `ActiveRecord`'s schema dumper is such a client.
+    ///
+    /// **Uniqueness is over [`IndexDef::keys`] only.** The payload is recorded and never compared,
+    /// which is what makes `("firm_id") INCLUDE ("name")` refuse a second row with the same
+    /// `firm_id` and a different `name`. An included column may also **repeat** a key column —
+    /// `("firm_id") INCLUDE ("firm_id")` is accepted, `indkey = "2 2"`, not deduplicated.
+    pub include: Vec<usize>,
     /// `WHERE …` — a **partial** index, whose entries exist only for rows the predicate admits.
     ///
     /// Stored as text and lowered per row, the same trade [`CheckDef`] makes and for the same two
@@ -941,8 +953,8 @@ pub fn partition_key_definition(relations: &pg_relations::Relations, oid: Option
 ///
 /// The bound stored here has already been coerced to the key columns' types, so this prints what
 /// the column holds and not what was typed — which is the whole reason the suite's
-/// `FOR VALUES IN (1)` against a `character varying` key comes back quoted
-/// ([`partition_literal`]).
+/// `FOR VALUES IN (1)` against a `character varying` key comes back quoted: a number prints bare
+/// and a string prints quoted, and the value knows which it is.
 #[must_use]
 pub fn partition_bound_definition(bound: &PartitionBound) -> String {
     let listed = |values: &[Datum]| {
@@ -2481,6 +2493,7 @@ mod tests {
                 keys: vec![IndexKey::column(1)],
                 state: SchemaState::Public,
                 state_since: 1,
+                include: Vec::new(),
                 predicate: None,
                 nulls_not_distinct: false,
                 constraint: None,
@@ -2521,7 +2534,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -2614,7 +2627,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",       // catalog format version
+                "14",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -2647,7 +2660,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",                 // catalog format version
+                "14",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -2707,6 +2720,9 @@ mod tests {
                 // Version 19. No partition key and no bound: this table neither partitions
                 // anything nor is a partition, which is every table until `PARTITION BY` runs.
                 "00",
+                "00",
+                // Version 20. One list per index, and the one index here includes nothing —
+                // which is every index until `CREATE INDEX ... INCLUDE` runs.
                 "00",
             )
         );
@@ -3415,6 +3431,7 @@ mod tests {
             keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
@@ -3474,6 +3491,7 @@ mod tests {
             keys: vec![IndexKey::column(0)],
             state: SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
             nulls_not_distinct: false,
             constraint: None,
@@ -3666,7 +3684,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "13",               // catalog format version
+                "14",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

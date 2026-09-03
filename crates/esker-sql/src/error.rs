@@ -931,6 +931,15 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `CREATE INDEX … USING hash (…) INCLUDE (…)`: `0A000`, naming the access method.
+    ///
+    /// **`amcaninclude` is a property of the method, checked before anything is built** — so the
+    /// complaint is about the payload rather than about the method itself, which this node refuses
+    /// separately and for its own reason. Measured for `hash` and for `brin`, one sentence with
+    /// the name substituted; btree accepts.
+    #[error("access method \"{0}\" does not support included columns")]
+    AccessMethodWithoutInclude(String),
+
     /// `CREATE TABLE … PARTITION OF t` where `t` is not partitioned: `42P17`.
     #[error("\"{0}\" is not partitioned")]
     NotPartitioned(String),
@@ -1395,7 +1404,8 @@ impl SqlError {
             // PostgreSQL's own class for it, and it reads oddly on purpose: a unique key that
             // misses a partition column is not a *syntax* problem, it is a constraint this
             // server cannot enforce — which is what `0A000` says.
-            | SqlError::PartitionKeyNotCovered { .. } => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::PartitionKeyNotCovered { .. }
+            | SqlError::AccessMethodWithoutInclude(_) => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::CardinalityViolation => sqlstate::CARDINALITY_VIOLATION,
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }

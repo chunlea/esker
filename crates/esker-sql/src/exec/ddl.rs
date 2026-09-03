@@ -361,6 +361,7 @@ fn unique_indexes(
             }),
             state: catalog::SchemaState::Public,
             state_since: 1,
+            include: Vec::new(),
             predicate: None,
         });
     }
@@ -513,6 +514,25 @@ fn partition_of_columns(
     Ok((vec![parent], inherited))
 }
 
+/// `INCLUDE (…)` resolved against the table's columns.
+///
+/// **The plain column-not-found wording**, not the `column "…" named in key does not exist`
+/// phrasing a key column gets: an included column is not in the key, and PostgreSQL says so by
+/// falling back to its ordinary message. Measured.
+///
+/// **Not deduplicated against the key**, either: `("firm_id") INCLUDE ("firm_id")` is accepted and
+/// reports the same attnum twice in `indkey`. Nothing here removes it.
+fn included_columns(table: &TableDef, names: &[String]) -> Result<Vec<usize>> {
+    names
+        .iter()
+        .map(|name| {
+            table
+                .column(name)
+                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
+        })
+        .collect()
+}
+
 /// **A unique index on a partitioned table must contain every partition column**, or `0A000`.
 ///
 /// PostgreSQL's own words and its own reason: with the key columns in it, two rows that could
@@ -582,6 +602,7 @@ fn copy_parent_indexes(
                 name: plan::index_name(&table.name, &keys),
                 unique: index.unique,
                 keys: mine,
+                include: Vec::new(),
                 predicate: index.predicate.clone(),
                 nulls_not_distinct: index.nulls_not_distinct,
                 // The child of a constraint's index is not itself a constraint: only the
@@ -1602,11 +1623,13 @@ pub(super) fn create_index(
     if create.unique {
         refuse_uncovered_partition_key(&table, &keys, "UNIQUE")?;
     }
+    let include = included_columns(&table, &create.include)?;
     let index = IndexDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
         keys,
+        include,
         predicate: create.predicate.clone(),
         nulls_not_distinct: create.nulls_not_distinct,
         // **`CREATE UNIQUE INDEX` is not a constraint.** It builds the same index a `UNIQUE (c)`

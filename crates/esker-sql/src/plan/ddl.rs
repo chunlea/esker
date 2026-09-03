@@ -361,6 +361,13 @@ pub struct CreateIndex {
     /// `NULLS NOT DISTINCT`. See `crate::catalog::IndexDef::nulls_not_distinct` — the one clause
     /// in an index definition that changes which rows are refused.
     pub nulls_not_distinct: bool,
+    /// `INCLUDE (…)` — the **non-key payload** columns, by name, unresolved.
+    ///
+    /// Plain column names and nothing else: an included column takes no `ASC`/`DESC` and no
+    /// operator class, both of which a real server refuses with `42P17` rather than a syntax
+    /// error. Neither reaches here — `sqlparser` 0.62.0 types this clause as a list of bare
+    /// identifiers — so both are a C1 parser gap and are declared as such.
+    pub include: Vec<String>,
 }
 
 /// A `FOREIGN KEY` as written, before the parent has been looked up.

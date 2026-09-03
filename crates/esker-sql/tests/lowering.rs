@@ -101,10 +101,9 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CASE <expression> WHEN ..., the simple form",
         ),
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
-        (
-            "CREATE INDEX i ON t (a) INCLUDE (b)",
-            "CREATE INDEX ... INCLUDE",
-        ),
+        // **`INCLUDE` left this list** with statement 787. What it still refuses is the payload
+        // on an access method that cannot carry one, and that message is PostgreSQL's own rather
+        // than a name of ours — it has its own test in `tests/include_index.rs`.
         // Refused by the parser's recognizer rather than the lowering: sqlparser 0.62.0 cannot
         // read this spelling, which is gap G31 in the plan's register. Either way the answer is
         // 0A000 naming it, which is all contract C2 asks.
