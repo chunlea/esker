@@ -1,0 +1,49 @@
+crates/esker-sql/src/error.rs
+  s_dc640bf0df4adb::t_f20818a441abc8 489-514,1267-1269,1283-1284,1404-1407,1506-1509
+crates/esker-sql/src/exec/cursor.rs
+  s_dc640bf0df4adb::t_f8516868afc8c7 880
+crates/esker-sql/src/exec/ddl.rs
+  s_dc640bf0df4adb::t_0ba6ef1bc19eb2 818
+crates/esker-sql/src/exec/fragment.rs
+  s_dc640bf0df4adb::t_4b83cb1aef8fe2 413,687
+crates/esker-sql/src/exec/query.rs
+  s_dc640bf0df4adb::t_2d3d2304fc8419 1616,2451
+crates/esker-sql/src/exec/subquery.rs
+  s_dc640bf0df4adb::t_45e649ec324982 549-551,970,1038
+crates/esker-sql/src/parse/lower.rs
+  s_dc640bf0df4adb::t_597303f484dcda 1432
+crates/esker-sql/src/plan/cte.rs
+  s_dc640bf0df4adb::t_180165418f712c 163
+crates/esker-sql/src/plan/expr.rs
+  s_dc640bf0df4adb::t_3407033934738b 48-57,1212
+crates/esker-sql/src/plan/query.rs
+  s_dc640bf0df4adb::t_9f5f8a42c7b6c1 813
+crates/esker-sql/src/value/arith.rs
+  s_dc640bf0df4adb::t_cf1f8ea984e9cd 40-47,122-133,424-472
+crates/esker-sql/src/value/mod.rs
+  s_dc640bf0df4adb::t_c98e997a2c3305 44-45
+crates/esker-sql/src/value/temporal.rs
+  s_dc640bf0df4adb::t_86466679f54466 1-423
+crates/esker-sql/tests/corpus/pg19_temporal_arithmetic.txt
+  s_dc640bf0df4adb::t_41fc338f0aa777 1-87
+crates/esker-sql/tests/temporal_arithmetic.rs
+  s_dc640bf0df4adb::t_a549f1a7092dee 1-49
+crates/esker-sql/tests/time.rs
+  s_dc640bf0df4adb::t_b831ca10a38dc6 156,158-163,165,184,186-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c7242c7e71bb651e911ec73c8798bb9803f6e079",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
