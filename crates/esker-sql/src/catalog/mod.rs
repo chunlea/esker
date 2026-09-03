@@ -1905,17 +1905,10 @@ impl View<'_> {
             return Ok(None);
         };
         let mut table = record::decode_table(&bytes)?;
-        // The sequences are a second read, and this is the one place it happens: a `TableDef` in
-        // anybody's hands has them, so nothing above the catalog has to remember to ask.
-        table.sequences = table_sequences(self.txn, self.tenant, table_id)?;
-        // And the parents' — see `inherited_sequences` for why the record stays theirs.
-        let inherited = inherited_sequences(self.txn, self.tenant, &table, &table.parents.clone())?;
-        table.sequences.extend(inherited);
-        table.child_scans = child_scans(self.txn, self.tenant, &table)?;
-        // And the user-defined types its columns were declared as, for the same reason and in the
-        // same place: a `TableDef` in anybody's hands can name them. **Only when a column has
-        // one** — the common table pays nothing, which is what keeps this off the hot path.
-        table.enums = column_user_types(self.txn, self.tenant, &table)?;
+        // What the record does not hold is a second read, and [`hydrate`] is where all of it
+        // happens: a `TableDef` in anybody's hands has it, so nothing above the catalog has to
+        // remember to ask.
+        hydrate(self.txn, self.tenant, &mut table)?;
         let table = Arc::new(table);
         if let Some(cache) = cache {
             cache.lock().tables.insert(key, Arc::clone(&table));
@@ -1981,6 +1974,25 @@ pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Typ
         Some(bytes) => record::decode_type(name, &bytes).map(Some),
         None => Ok(None),
     }
+}
+
+/// Everything a `TableDef` carries that is **not** in its own record, read and attached here.
+///
+/// The sequences, the inherited sequences, the child scans and the user-defined types: four
+/// second reads, and the point of one function is that there are two places a table record is
+/// decoded — [`View::table_by_id`], which every statement goes through, and
+/// `pg_relations::table_of`, which the catalog views go through. They had drifted apart once
+/// already by the time this was written: `enums` was attached in the first and not the second, so
+/// `information_schema.columns` reported a column's storage where every other reader reported its
+/// type. **A field added to a `TableDef` outside its record belongs here and nowhere else.**
+pub(crate) fn hydrate(txn: &dyn Txn, tenant: u64, table: &mut TableDef) -> Result<()> {
+    table.sequences = table_sequences(txn, tenant, table.id)?;
+    // And the parents' — see `inherited_sequences` for why the record stays theirs.
+    let inherited = inherited_sequences(txn, tenant, table, &table.parents.clone())?;
+    table.sequences.extend(inherited);
+    table.child_scans = child_scans(txn, tenant, table)?;
+    table.enums = column_user_types(txn, tenant, table)?;
+    Ok(())
 }
 
 /// The user-defined types a table's columns were declared as, by oid.

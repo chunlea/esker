@@ -90,14 +90,30 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 },
                 Datum::Text(if column.not_null { NO } else { YES }.to_owned()),
                 // The **spelling**, which is `format_type` with no modifier — `character` and not
-                // `bpchar`, and `timestamp without time zone` in full.
-                Datum::Text(data_type(column.ty)),
+                // `bpchar`, and `timestamp without time zone` in full. A column declared as a
+                // user-defined type is the literal string `USER-DEFINED`, whatever the type is and
+                // whatever it is stored as: measured, and it is what `timestamp_test.rb:202`
+                // asserts by name, beside a `udt_name` of the type itself.
+                Datum::Text(match column.user_type {
+                    Some(_) => USER_DEFINED.to_owned(),
+                    None => data_type(column.ty),
+                }),
                 length_of(column),
                 numeric_precision(column.ty),
                 numeric_scale(column.ty),
                 datetime_precision(column),
-                // The type's internal name, which is `pg_type.typname`.
-                Datum::Text(super::pg_catalog::typname(column.ty).to_owned()),
+                // The type's internal name, which is `pg_type.typname` — and for a user-defined
+                // type that is the name it was declared with, not the name of what it is stored
+                // as. `ActiveRecord` reads this column to decide a column is an enum.
+                Datum::Text(
+                    column
+                        .user_type
+                        .and_then(|oid| table.enums.get(&oid))
+                        .map_or_else(
+                            || super::pg_catalog::typname(column.ty).to_owned(),
+                            |def| def.name.clone(),
+                        ),
+                ),
                 Datum::Text(
                     match identity {
                         // `bigserial` is a default, not an identity — measured, `is_identity` is
@@ -233,6 +249,9 @@ fn constraint_type(contype: &str) -> &'static str {
         _ => "CHECK",
     }
 }
+
+/// What `data_type` says for a column of a user-defined type — the name is in `udt_name`.
+const USER_DEFINED: &str = "USER-DEFINED";
 
 /// `data_type`: the type's name with no modifier on it.
 ///

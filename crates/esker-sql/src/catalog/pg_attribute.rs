@@ -247,7 +247,16 @@ fn attribute(
     vec![
         Datum::Int8(relation.oid),
         Datum::Text(column.name.clone()),
-        Datum::Int8(i64::from(column.ty.oid())),
+        // **A user-defined type's own oid**, not the oid of what the value physically is. This is
+        // the column every client reads a type through: `format_type(a.atttypid, …)` prints `mood`
+        // rather than `smallint`, the `JOIN pg_type t ON a.atttypid = t.oid` in the statement above
+        // finds `typtype = 'e'`, and `information_schema.columns` reports `USER-DEFINED` with
+        // `udt_name` `mood`. Answering `int2` here would tell a client the storage, which is the
+        // one thing about an enum it must not be told (ADR 0050).
+        Datum::Int8(column.user_type.map_or_else(
+            || i64::from(column.ty.oid()),
+            |oid| i64::try_from(oid).unwrap_or(i64::MAX),
+        )),
         Datum::Int2(i16::try_from(attnum).unwrap_or(i16::MAX)),
         Datum::Int4(column.typmod),
         Datum::Bool(own && column.not_null),

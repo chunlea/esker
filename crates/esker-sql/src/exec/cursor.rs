@@ -1727,10 +1727,27 @@ fn catalog_function(
         // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool
         // through the same file `gen_random_uuid` reads (`crate::value::random`).
         CatalogFunc::Random => Datum::Double(crate::value::random::random_f64()?),
-        CatalogFunc::FormatType => crate::catalog::def_functions::format_type(
-            type_oid_argument(args.first())?,
-            typmod_argument(args.get(1))?,
-        ),
+        // **A user-defined type is asked about only after the built-in ones**, so a tenant's id
+        // sequence can never shadow one of PostgreSQL's fixed oids: everything that already had a
+        // name keeps it, and this can only turn a `???` into an answer. `pg_attribute.atttypid`
+        // reports a column's user type rather than its storage, so this is the call that prints
+        // `mood` where the row holds an `int2` (ADR 0050).
+        CatalogFunc::FormatType => {
+            let oid = type_oid_argument(args.first())?;
+            let built_in =
+                crate::catalog::def_functions::format_type(oid, typmod_argument(args.get(1))?);
+            match (&built_in, oid.and_then(|oid| u64::try_from(oid).ok())) {
+                (Datum::Text(printed), Some(oid))
+                    if printed == crate::catalog::def_functions::UNKNOWN_TYPE =>
+                {
+                    match env.relations()?.user_type_name(oid) {
+                        Some(name) => Datum::Text(name.to_owned()),
+                        None => built_in,
+                    }
+                }
+                _ => built_in,
+            }
+        }
         // **The five array operators, over the text the catalog holds** — see
         // `crate::value::vector` for why an array is text here and not a `Datum`. Every one is
         // strict: a NULL array or a NULL argument is NULL, never an error and never 0.
