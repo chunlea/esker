@@ -1,0 +1,27 @@
+crates/esker-sql/src/value/arith.rs
+  s_a0868d54f0983f::t_f9ef222ba5a602 25,132,245-372,407-409,440-449
+crates/esker-sql/src/value/numeric.rs
+  s_a0868d54f0983f::t_05f4b7a3622650 368-377,493-590,610-615,618-625
+crates/esker-sql/tests/corpus/pg19_numeric_arithmetic.txt
+  s_a0868d54f0983f::t_34f71f25bb03ff 1-78
+crates/esker-sql/tests/numeric.rs
+  s_a0868d54f0983f::t_0b4b2eb2b38203 103-111
+crates/esker-sql/tests/numeric_arithmetic.rs
+  s_a0868d54f0983f::t_99eb8efed09917 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b30374e2cb6de0a1e75794f6a5ba1d6b13587f95",
+  "prompts": {},
+  "sessions": {
+    "s_a0868d54f0983f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001c95bd-db24-4085-b657-66d3a8400c25",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
