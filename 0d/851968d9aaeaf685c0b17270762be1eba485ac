@@ -1,0 +1,21 @@
+crates/esker-sql/tests/array_column.rs
+  s_2ed9df2fd94fee::t_27e997706e37d1 1-39
+crates/esker-sql/tests/corpus/pg19_array_column.txt
+  s_2ed9df2fd94fee::t_f319f429a6f962 1-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0d851968d9aaeaf685c0b17270762be1eba485ac",
+  "prompts": {},
+  "sessions": {
+    "s_2ed9df2fd94fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec622e3b-48a0-4735-8805-fe22838e8b26",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
