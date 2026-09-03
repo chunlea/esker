@@ -29,7 +29,9 @@
 //! index key's leading byte, in a `DataRow`'s -1 length. Keeping them in one type is what lets a
 //! single `match` be exhaustive over what a column can hold.
 
-/// Binary arithmetic: the promotion table and the six operators.
+// `arith` documents itself with `//!`. An outer `///` here as well would be **concatenated** with
+// that block and resolve its links in *this* module's scope, where `result_type` and `apply` are
+// not — which is what broke `cargo doc -D warnings` the moment the two met.
 pub mod arith;
 pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
