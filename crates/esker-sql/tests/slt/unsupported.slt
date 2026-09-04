@@ -108,8 +108,10 @@ ALTER TABLE t ALTER COLUMN a TYPE text
 statement error (0A000)
 ALTER TABLE ONLY t ADD COLUMN c int8
 
+# `CREATE VIEW` left this file with `tests/view.rs`. What is still refused is the materialized
+# form, which holds its own rows rather than expanding where it is read.
 statement error (0A000)
-CREATE VIEW v AS SELECT * FROM t
+CREATE MATERIALIZED VIEW v AS SELECT * FROM t
 
 statement error (0A000)
 PREPARE p AS SELECT 1

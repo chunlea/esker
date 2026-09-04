@@ -26,30 +26,36 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // the statement, because the entry is per statement text and the capture asks it twice.
     types: &["SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dc' ORDER BY indexname"],
     answers: &[
-        // **The view half of the dependency rule cannot be measured here, because there are no
-        // views.** `CREATE VIEW` is a named refusal in this node and predates this unit, so the
-        // three lines the capture uses to pin `2BP01` have nothing to depend on the column. The
-        // rule itself is implemented and tested — over the *other* dependent that lives outside
-        // the table, another table's foreign key referencing the column, which is
-        // `the_drop_takes_its_dependents_and_refuses_the_others`. When `CREATE VIEW` lands these
-        // three entries are deleted rather than edited, and the capture is already here to say
-        // what the answers must become.
-        (
-            "CREATE VIEW dc_view AS SELECT id, shown FROM dc",
-            "`0A000 CREATE VIEW is not supported`, older than this unit. The two entries below \
-             are its consequences and not separate gaps.",
-        ),
+        // **`CREATE VIEW` landed (`tests/view.rs`) and deleted the three entries that used to be
+        // here** — the view is created, and `pg_class` reports it. What replaces them is the gap
+        // that was hiding behind the refusal, and one bug that was hiding behind the *abort*.
         (
             "ALTER TABLE \"dc\" DROP COLUMN \"shown\"",
-            "PostgreSQL refuses with `2BP01` because `dc_view` reads the column. Here the view \
-             was never created, so nothing depends on it and the drop succeeds — and the \
-             `ROLLBACK TO d3` on the next line puts the column back on both servers, so the \
-             capture converges again immediately.",
+            "**Nothing tracks that a view reads a column.** PostgreSQL refuses with `2BP01` naming \
+             `dc_view`; this node drops the column and leaves the view reading one that is gone. \
+             The rule itself is implemented for the *other* dependent that lives outside the \
+             table — another table's foreign key, in \
+             `the_drop_takes_its_dependents_and_refuses_the_others` — so what is missing is the \
+             dependency edge from a view to the columns its definition names, not the refusal. \
+             That edge is the follow-on unit, and this capture already says what both answers must \
+             become.",
         ),
         (
             "SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_view'",
-            "One view there, none here — the same `CREATE VIEW` refusal. The *second* occurrence \
-             of this statement, after the `CASCADE`, agrees at zero on both.",
+            "The other half of the same missing edge: `DROP COLUMN … CASCADE` takes the dependent \
+             view with it there and leaves it here. The **first** occurrence of this statement, \
+             before the `CASCADE`, agrees at one on both — which is what says the view itself is \
+             right and only the dependency is missing.",
+        ),
+        (
+            "SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_id_seq'",
+            "**Not a view divergence at all, and it was never being compared.** `DROP COLUMN` does \
+             not drop the sequence the column owned — reproduced on its own, with no view in the \
+             statement — and PostgreSQL does. It is visible now only because `CREATE VIEW` used to \
+             fail twelve lines above it: the transaction aborted there and every line after was \
+             swallowed by the harness rather than checked. A gap in one feature was hiding a bug \
+             in a different one, which is the argument for the harness counting swallowed lines \
+             out loud.",
         ),
     ],
 };

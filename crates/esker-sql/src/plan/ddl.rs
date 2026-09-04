@@ -266,6 +266,40 @@ pub struct DropSchema {
     pub cascade: bool,
 }
 
+/// `CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT …`.
+///
+/// **A view is a stored derived table.** The `SELECT` is kept as text and re-lowered wherever the
+/// view is read, so `FROM v` becomes `FROM (<definition>) AS v` before anything plans it — the
+/// rewrite `crate::plan::cte` already performs for a `WITH` item, with the text coming from the
+/// catalog instead of the statement. That is why a view needs no plan node, no access path and no
+/// read of its own.
+///
+/// Text and not a lowered plan, for the reason `CHECK` constraints and generated columns are also
+/// stored as text: a lowered plan would have to be invalidated with the catalog entry that caches
+/// it, and re-lowering a short `SELECT` per statement is the cheaper mistake to make. It is also
+/// what `pg_get_viewdef` has to print back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateView {
+    /// The view's name, folded.
+    pub name: String,
+    /// `CREATE VIEW v (a, b) AS …` — the names the view gives its columns, or empty when it takes
+    /// them from the query.
+    pub columns: Vec<String>,
+    /// The `SELECT`, as text.
+    pub definition: String,
+    /// `OR REPLACE`.
+    pub or_replace: bool,
+}
+
+/// `DROP VIEW [IF EXISTS] name [, …]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropView {
+    /// The views named, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`.
+    pub if_exists: bool,
+}
+
 /// `CREATE DATABASE [IF NOT EXISTS] name`.
 ///
 /// **A database is a tenant** ([ADR 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)),

@@ -589,6 +589,8 @@ impl Executor {
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
+            Statement::CreateView(create) => ddl::create_view(self, txn, create),
+            Statement::DropView(drop) => ddl::drop_view(self, txn, drop),
             Statement::CreateDatabase(create) => ddl::create_database(self, txn, create),
             Statement::DropDatabase(drop) => ddl::drop_database(self, txn, drop),
             Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
@@ -1225,6 +1227,22 @@ impl Executor {
 
     /// Resolves the tables a `SELECT` names and plans against them.
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
+        // **A view becomes the derived table it stands for, before anything else looks at the
+        // statement.** `FROM v` is `FROM (<definition>) AS v`, which is the rewrite
+        // `crate::plan::cte` performs for a `WITH` item — the text comes from the catalog instead.
+        // Doing it here rather than in `relation_of` is what makes it one rewrite rather than a
+        // second kind of relation for every pass below to know about: after this, nothing in the
+        // planner can tell a view from a sub-select somebody typed.
+        //
+        // Before the subqueries are planned, because a view may be named inside one.
+        let mut expanded;
+        let select = if self.names_a_view(txn, select)? {
+            expanded = select.clone();
+            self.expand_views(txn, &mut expanded)?;
+            &expanded
+        } else {
+            select
+        };
         // Every subquery is planned **before** the statement holding it, because the statement
         // cannot be typed until they are: `WHERE n IN (SELECT a_id FROM b)` is `42883 operator
         // does not exist: text = bigint`, and nothing can say so without knowing the subquery's
@@ -2066,6 +2084,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
             vec![format!("Drop Extension on {}", drop.name)]
         }
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
+        Statement::CreateView(create) => vec![format!("Create View on {}", create.name)],
+        Statement::DropView(drop) => vec![format!("Drop View on {}", drop.names.join(", "))],
         Statement::CreateDatabase(create) => vec![format!("Create Database on {}", create.name)],
         Statement::DropDatabase(drop) => {
             vec![format!("Drop Database on {}", drop.names.join(", "))]
@@ -2364,6 +2384,115 @@ impl subquery::Tables for Catalogued<'_> {
 }
 
 impl Executor {
+    /// Whether any `FROM` entry of this statement — or of a subquery in it — names a view.
+    ///
+    /// Asked first so that the overwhelming majority of statements, which name none, are planned
+    /// from the caller's own `Select` with nothing cloned.
+    fn names_a_view(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<bool> {
+        let mut found = false;
+        Self::each_relation_name(select, &mut |name| {
+            if found {
+                return Ok(());
+            }
+            found = self.view_named(txn, name)?.is_some();
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// The view a name resolves to, or `None` — along the `search_path`, like every other name.
+    ///
+    /// **The path is walked here rather than through `resolve_unqualified`**, and the difference is
+    /// the catalog *cache*: this runs for every relation name of every `SELECT`, and going through
+    /// the cached view populated it earlier in a statement's life than anything had before. A
+    /// `DROP COLUMN` that dropped a sequence then found its `pg_class` row still there, and eight
+    /// tests with no view in them went red on it. `crate::catalog::view` is a plain read of this
+    /// transaction and cannot do that.
+    fn view_named(&self, txn: &dyn Txn, name: &str) -> Result<Option<crate::catalog::ViewDef>> {
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if name.contains(crate::catalog::SCHEMA_SEPARATOR) {
+            return crate::catalog::view(txn, self.tenant, name);
+        }
+        for schema in self.resolved_search_path(txn)? {
+            let candidate = crate::catalog::qualify(&schema, name);
+            if let Some(view) = crate::catalog::view(txn, self.tenant, &candidate)? {
+                return Ok(Some(view));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Replaces every `FROM` entry naming a view with the derived table it stands for.
+    fn expand_views(&self, txn: &dyn Txn, select: &mut crate::plan::Select) -> Result<()> {
+        for entry in select
+            .from
+            .iter_mut()
+            .chain(select.joins.iter_mut().map(|join| &mut join.table))
+        {
+            if entry.derived.is_some() || entry.values.is_some() || entry.function.is_some() {
+                continue;
+            }
+            let Some(view) = self.view_named(txn, &entry.name)? else {
+                continue;
+            };
+            let mut body = Self::view_body(&view)?;
+            // Nested first, so a view over a view expands all the way down.
+            self.expand_views(txn, &mut body)?;
+            // **The alias is the view's own name unless the query gave one**, which is what makes
+            // `SELECT v.id FROM v` resolve: a derived table with no name is one nothing can
+            // qualify.
+            if entry.alias.is_none() {
+                entry.alias = Some(entry.name.clone());
+            }
+            // `Derived::new` and not a literal, so a view lands in exactly the state the parser
+            // leaves a `FROM (SELECT …)` in and `plan_subqueries` fills the rest.
+            entry.derived = Some(Box::new(crate::plan::Derived::new(
+                Box::new(body),
+                view.columns.clone(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// A view's stored `SELECT`, parsed and lowered.
+    fn view_body(view: &crate::catalog::ViewDef) -> Result<crate::plan::Select> {
+        let parsed = crate::parse::parse_statements(&view.definition)?;
+        let [statement] = parsed.as_slice() else {
+            return Err(SqlError::Internal(format!(
+                "the stored definition of view {} is not one statement",
+                view.name
+            )));
+        };
+        match statement.lower()? {
+            Statement::Select(select) => Ok(*select),
+            _ => Err(SqlError::Internal(format!(
+                "the stored definition of view {} is not a SELECT",
+                view.name
+            ))),
+        }
+    }
+
+    /// Every relation name a statement reads, including inside its subqueries and derived tables.
+    fn each_relation_name(
+        select: &crate::plan::Select,
+        each: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        for entry in select
+            .from
+            .iter()
+            .chain(select.joins.iter().map(|join| &join.table))
+        {
+            if let Some(derived) = &entry.derived {
+                Self::each_relation_name(&derived.select, each)?;
+            } else if entry.values.is_none() && entry.function.is_none() {
+                each(&entry.name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// What a `Describe` answers, read through one transaction.
     fn described_in(&self, txn: &dyn Txn, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
         let statement = parsed.lower()?;

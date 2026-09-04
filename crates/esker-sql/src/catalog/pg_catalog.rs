@@ -145,6 +145,8 @@ pub enum CatalogView {
     /// A real server defines it in exactly those terms, and `indexdef` is `pg_get_indexdef` — the
     /// same string, which is why the two agree about `INCLUDE (…)` without being written twice.
     PgIndexes,
+    /// `pg_views`: one row per view, with the `SELECT` it stands for.
+    PgViews,
     /// The databases this server has, which is **one**.
     ///
     /// `ActiveRecord`'s adapter reads it three times while connecting — the encoding, the collation
@@ -184,7 +186,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 27] = [
+    pub const ALL: [CatalogView; 28] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -202,6 +204,7 @@ impl CatalogView {
         CatalogView::PgLanguage,
         CatalogView::PgPartitionedTable,
         CatalogView::PgIndexes,
+        CatalogView::PgViews,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
         CatalogView::PgSequence,
@@ -236,6 +239,7 @@ impl CatalogView {
             CatalogView::PgLanguage => "pg_language",
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
             CatalogView::PgIndexes => "pg_indexes",
+            CatalogView::PgViews => "pg_views",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
             CatalogView::PgSequence => "pg_sequence",
@@ -274,6 +278,11 @@ impl CatalogView {
                 CatalogView::PgLanguage => 20,
                 CatalogView::PgPartitionedTable => 21,
                 CatalogView::PgIndexes => 22,
+                // **27, because 25 is `PgSequence`'s.** These are reserved *relation ids* and two
+                // views sharing one resolve to each other: giving `pg_views` 25 made
+                // `'…'::regclass` over a sequence find this view instead, and eight tests that had
+                // nothing to do with views went red at once.
+                CatalogView::PgViews => 27,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
@@ -448,6 +457,15 @@ impl CatalogView {
                 ("tablespace", ColumnType::Text),
                 ("indexdef", ColumnType::Text),
             ],
+            // **`viewowner` is here and is empty**, because this node has no roles: the column has
+            // to exist for `SELECT * FROM pg_views` to have PostgreSQL's shape, and a name
+            // invented for it would be a user nobody created.
+            CatalogView::PgViews => &[
+                ("schemaname", ColumnType::Text),
+                ("viewname", ColumnType::Text),
+                ("viewowner", ColumnType::Text),
+                ("definition", ColumnType::Text),
+            ],
             // `partstrat` is a **one-letter code** and `partattrs` an `int2vector` — neither is
             // the word the DDL used, which `pg_get_partkeydef` gives instead.
             CatalogView::PgPartitionedTable => &[
@@ -545,6 +563,7 @@ impl CatalogView {
             CatalogView::PgTrigger => trigger_rows(txn, tenant),
             CatalogView::PgPartitionedTable => partitioned_table_rows(txn, tenant),
             CatalogView::PgIndexes => indexes_rows(txn, tenant),
+            CatalogView::PgViews => views_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -683,6 +702,8 @@ impl CatalogView {
             | CatalogView::PgLanguage
             | CatalogView::PgPartitionedTable
             | CatalogView::PgIndexes
+            // Catalog-backed like `pg_indexes`: `rows_of` answers for it before it delegates here.
+            | CatalogView::PgViews
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -986,6 +1007,26 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
 /// `indexdef` *is* `pg_get_indexdef(indexrelid)` — so the string here is the one that function
 /// builds rather than a second rendering that could drift from it. A primary key is in it, which
 /// is why `companies_pkey` is one of the capture's two rows.
+/// `pg_views`: one row per view, with the `SELECT` it stands for.
+///
+/// **Not materialized views** — those are `pg_matviews` on a real server, and `pg_views` answers
+/// nothing for one (measured). This node has neither, so the distinction costs nothing to keep and
+/// would cost a wrong row to drop.
+fn views_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    Ok(super::views(txn, tenant)?
+        .into_iter()
+        .map(|view| {
+            let (schema, name) = super::split_qualified(&view.name);
+            vec![
+                Datum::Text(schema.to_owned()),
+                Datum::Text(name.to_owned()),
+                Datum::Text(String::new()),
+                Datum::Text(view.definition),
+            ]
+        })
+        .collect())
+}
+
 fn indexes_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = super::pg_relations::Relations::read(txn, tenant)?;
     let mut rows = Vec::new();
@@ -1357,7 +1398,8 @@ fn access_method_oid(kind: super::pg_relations::RelKind) -> i64 {
     match kind {
         RelKind::Index | RelKind::PrimaryKey => BTREE_AM_OID,
         RelKind::Exclusion => GIST_AM_OID,
-        RelKind::Table | RelKind::Sequence => 0,
+        // A view is not built with an access method either, so a join to `pg_am` drops it.
+        RelKind::Table | RelKind::Sequence | RelKind::View => 0,
     }
 }
 

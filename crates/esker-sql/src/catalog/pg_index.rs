@@ -440,7 +440,10 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
             // on a real server and does not reach this node: the action itself is `0A000`.
             include: &[],
         }),
-        RelKind::Table | RelKind::Sequence => None,
+        // **A view has no index and no primary key**, which `view_test.rb` asserts directly:
+        // `test_does_not_assume_id_column_as_primary_key` finds none even though the view selects
+        // `id`. Measured — `pg_index` and `pg_constraint` are both empty for one.
+        RelKind::Table | RelKind::Sequence | RelKind::View => None,
     }
 }
 

@@ -33,10 +33,10 @@ pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
     CreateDatabase, CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence,
-    CreateTable, CreateTrigger, CreateType, DropDatabase, DropExtension, DropFunction, DropIndex,
-    DropSchema, DropSequence, DropTable, DropTrigger, DropType, ForeignKey, IndexKeyPart,
-    KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name, index_name,
-    primary_key_name, sequence_name, unique_constraint_name,
+    CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase, DropExtension, DropFunction,
+    DropIndex, DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey,
+    IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name,
+    index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -89,6 +89,10 @@ pub enum Statement {
     DropExtension(DropExtension),
     /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
     CreateSchema(CreateSchema),
+    /// `CREATE VIEW` — a stored `SELECT`, expanded where it is read.
+    CreateView(CreateView),
+    /// `DROP VIEW`.
+    DropView(DropView),
     /// `CREATE DATABASE` — a second **tenant**, which is what a database is (ADR 0052).
     CreateDatabase(CreateDatabase),
     /// `DROP DATABASE`, which takes everything that tenant held with it.
@@ -194,6 +198,8 @@ impl Statement {
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
             Statement::DropExtension(_) => Some("DROP EXTENSION"),
             Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
+            Statement::CreateView(_) => Some("CREATE VIEW"),
+            Statement::DropView(_) => Some("DROP VIEW"),
             Statement::CreateDatabase(_) => Some("CREATE DATABASE"),
             Statement::DropDatabase(_) => Some("DROP DATABASE"),
             Statement::DropSchema(_) => Some("DROP SCHEMA"),
@@ -245,6 +251,8 @@ impl Statement {
             Statement::DropExtension(_) => "DROP EXTENSION",
             Statement::CreateSchema(_) => "CREATE SCHEMA",
             Statement::DropSchema(_) => "DROP SCHEMA",
+            Statement::CreateView(_) => "CREATE VIEW",
+            Statement::DropView(_) => "DROP VIEW",
             Statement::CreateDatabase(_) => "CREATE DATABASE",
             Statement::DropDatabase(_) => "DROP DATABASE",
             Statement::AlterSchemaRename(_) => "ALTER SCHEMA",

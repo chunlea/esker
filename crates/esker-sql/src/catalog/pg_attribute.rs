@@ -224,7 +224,10 @@ fn columns_of<'a>(
         // `SELECT` from. Reading a sequence as a relation is `0A000` on this node
         // (`View::require_table`), so describing three columns nothing can read would be claiming
         // a shape rather than reporting one. Declared.
-        RelKind::Sequence => Vec::new(),
+        // **A view's columns are its definition's, and nothing here has them**: `columns_of` is
+        // handed a `TableDef` and a view has none, so its shape is what the expansion works out
+        // where the view is read rather than something borrowed from a table here.
+        RelKind::Sequence | RelKind::View => Vec::new(),
     }
 }
 
