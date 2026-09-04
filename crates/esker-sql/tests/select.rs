@@ -410,7 +410,9 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         // what is next to them still does not, and each still names itself.
         ("SELECT count(*) OVER () FROM s1", "a window function"),
         ("SELECT count(*) FILTER (WHERE n > 0) FROM s1", "FILTER"),
-        ("SELECT length(t) FROM s1", "length"),
+        // `length` was the example here and is implemented now (the generated columns the suite
+        // declares use it); the property under test is that an absent function names itself.
+        ("SELECT soundex(t) FROM s1", "soundex"),
         ("SELECT DISTINCT ON (n) n FROM s1", "SELECT DISTINCT ON"),
         ("SELECT id FROM s1 GROUP BY ROLLUP (id)", "GROUP BY"),
         // A table alias runs now (phase 9 unit 5, `tests/alias.rs`). What it does not carry is the

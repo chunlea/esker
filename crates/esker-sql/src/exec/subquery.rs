@@ -215,6 +215,7 @@ pub(super) fn table_function_def(
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -331,6 +332,7 @@ fn plan_derived(
             // nothing to pad with.
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -400,6 +402,22 @@ fn plan_select_of(
         .map(|join| relation_of(&join.table, tables))
         .collect::<Result<Vec<_>>>()?;
     let inner_refs: Vec<&crate::catalog::TableDef> = inners.iter().map(AsRef::as_ref).collect();
+    // **And never locked.** A sub-`SELECT`'s plan is used for its `node` alone, so everything else
+    // the planner computes for it is dropped here — which for a locking clause means the junk key
+    // columns would widen its rows and the withheld `LIMIT` would be given to nobody. Measured as
+    // three rows where one was asked for. PostgreSQL pushes the lock down to the base table; this
+    // node accepts the clause and locks nothing, which is the divergence ADR 0057 §5 declares for
+    // a view and for the same reason.
+    let unlocked;
+    let select = if select.locking.is_empty() {
+        select
+    } else {
+        unlocked = Select {
+            locking: Vec::new(),
+            ..select.clone()
+        };
+        &unlocked
+    };
     // **Never routed.** `crate::exec::query::plan` leaves `Planned::engine` at `None` and only
     // `crate::exec::fragment::route` fills it in; this is the call that does not make it, which is
     // what ADR 0040 asks a plan carrying a subquery to be able to say

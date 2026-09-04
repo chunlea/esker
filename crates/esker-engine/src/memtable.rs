@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use store::Store;
 
+use crate::error::{Error, Result};
 use crate::range_del::{RangeTombstone, RangeTombstones};
 
 use crate::dbformat::{
@@ -128,6 +129,17 @@ impl MemTable {
         }
     }
 
+    /// A memtable whose arena gives up after a few dozen bytes, so a test can reach the
+    /// exhaustion path without allocating four gigabytes to get there.
+    #[cfg(test)]
+    pub(crate) fn cramped(comparator: Arc<InternalKeyComparator>, seed: u64) -> Self {
+        Self {
+            store: skiplist::SkipList::cramped(comparator, seed),
+            range_tombstones: Mutex::new(RangeTombstones::new()),
+            approximate_size: AtomicUsize::new(0),
+        }
+    }
+
     /// The store, seen only as a [`Store`].
     ///
     /// Opaque on purpose. Reaching `self.store` directly would resolve to whichever inherent
@@ -153,19 +165,27 @@ impl MemTable {
     /// default `write_buffer_size`, and past the point where the batch that carried it would
     /// have exhausted memory first. It is reported rather than swallowed, and the size is still
     /// charged so the flush that would relieve it still fires.
-    pub fn add(&self, seqno: SeqNo, kind: EntryKind, key: &[u8], value: &[u8]) {
+    pub fn add(&self, seqno: SeqNo, kind: EntryKind, key: &[u8], value: &[u8]) -> Result<()> {
         let tag = pack_tag(seqno, kind).to_le_bytes();
         let charge = key.len() + tag.len() + value.len() + ENTRY_OVERHEAD;
         if !self.store().insert(key, &tag, value) {
-            tracing::error!(
-                seqno,
-                key_len = key.len(),
-                value_len = value.len(),
-                "the memtable arena is full and the entry was not stored"
-            );
+            // **A refusal is an error value, not a log line.** The arena is full, the entry is
+            // not stored, and the caller is part-way through a write group whose bytes are
+            // already in the log — so a caller that carried on would acknowledge a write this
+            // table does not hold, which is `CLAUDE.md` invariant 1 broken silently. It used to
+            // log at `error!` and return, and it also charged `approximate_size` for the entry
+            // it had just failed to store, so the table over-reported its size on the way to
+            // losing data.
+            return Err(Error::Unsupported(format!(
+                "the memtable arena is full: seqno {seqno}, a {}-byte key and a {}-byte value \
+                 were not stored",
+                key.len(),
+                value.len()
+            )));
         }
         self.approximate_size
             .fetch_add(charge, AtomicOrdering::Relaxed);
+        Ok(())
     }
 
     /// Records that `[begin, end)` was deleted at `seqno`.
@@ -392,13 +412,68 @@ impl crate::iterator::Cursor for MemTableIter {
     }
 
     /// A memtable lives in memory: there is nothing that can fail to be read.
-    fn status(&self) -> crate::error::Result<()> {
+    fn status(&self) -> Result<()> {
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// **An arena that refuses is an error the caller must see, not a log line.**
+    ///
+    /// `add` used to answer `()`. When the arena was full it logged at `error!`, charged
+    /// `approximate_size` for the entry it had just failed to store, and returned — so the write
+    /// group carried on and the write was acknowledged while the table did not hold it. The bytes
+    /// were already in the log by then, which is what makes it silent rather than merely wrong:
+    /// nothing on the read path could tell the entry from one that was never written.
+    ///
+    /// Unreachable in practice at four gigabytes in one memtable, and `Chunks::cramped` is how a
+    /// test reaches it without allocating them (`docs/plans/debt-c6.md` §15).
+    #[test]
+    fn a_full_arena_is_an_error_and_not_a_lost_entry() {
+        let table = Arc::new(MemTable::cramped(
+            Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator))),
+            7,
+        ));
+        let mut stored = 0u32;
+        let refusal = loop {
+            let key = format!("k{stored:04}");
+            match table.add(
+                u64::from(stored) + 1,
+                EntryKind::Put,
+                key.as_bytes(),
+                b"value",
+            ) {
+                Ok(()) => stored += 1,
+                Err(error) => break error,
+            }
+            assert!(
+                stored < 10_000,
+                "a cramped arena accepted {stored} entries without refusing"
+            );
+        };
+        assert!(
+            matches!(refusal, crate::error::Error::Unsupported(ref detail) if detail.contains("arena is full")),
+            "a refusal must say what happened: {refusal:?}"
+        );
+        assert!(stored > 0, "the arena refused before it stored anything");
+
+        // And the size it reports is what it actually holds: the refused entry is not charged.
+        // The old code added the charge and then dropped the entry, so a table that was losing
+        // data also over-reported how much of it there was.
+        let mut counted = 0usize;
+        let mut cursor = table.iter();
+        cursor.seek_to_first();
+        while cursor.valid() {
+            counted += 1;
+            cursor.next();
+        }
+        assert_eq!(
+            counted, stored as usize,
+            "the table holds every entry `add` accepted and no more"
+        );
+    }
     use super::{Lookup, MemTable};
     use crate::dbformat::{
         BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, internal_key,
@@ -437,7 +512,9 @@ mod tests {
     #[test]
     fn a_put_is_visible_at_and_above_its_sequence_number() {
         let table = table();
-        table.add(5, EntryKind::Put, b"key", b"value");
+        table
+            .add(5, EntryKind::Put, b"key", b"value")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"key", 5), Some(found(b"value", 5)));
         assert_eq!(table.get(b"key", 100), Some(found(b"value", 5)));
         assert_eq!(
@@ -452,9 +529,15 @@ mod tests {
     #[test]
     fn snapshots_see_the_version_that_was_current() {
         let table = table();
-        table.add(1, EntryKind::Put, b"k", b"one");
-        table.add(2, EntryKind::Put, b"k", b"two");
-        table.add(3, EntryKind::Put, b"k", b"three");
+        table
+            .add(1, EntryKind::Put, b"k", b"one")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Put, b"k", b"two")
+            .expect("a real arena does not refuse this");
+        table
+            .add(3, EntryKind::Put, b"k", b"three")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"k", 3), Some(found(b"three", 3)));
         assert_eq!(table.get(b"k", 2), Some(found(b"two", 2)));
         assert_eq!(table.get(b"k", 1), Some(found(b"one", 1)));
@@ -466,8 +549,12 @@ mod tests {
     #[test]
     fn a_tombstone_is_not_the_same_as_an_absence() {
         let table = table();
-        table.add(1, EntryKind::Put, b"k", b"value");
-        table.add(2, EntryKind::Delete, b"k", b"");
+        table
+            .add(1, EntryKind::Put, b"k", b"value")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Delete, b"k", b"")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"k", 2), Some(Lookup::Deleted));
         assert_eq!(table.get(b"k", 1), Some(found(b"value", 1)));
         assert_eq!(table.get(b"gone", 2), None, "never written is not deleted");
@@ -477,10 +564,18 @@ mod tests {
     #[test]
     fn iteration_is_user_key_ascending_then_newest_first() {
         let table = table();
-        table.add(1, EntryKind::Put, b"b", b"");
-        table.add(2, EntryKind::Put, b"a", b"");
-        table.add(3, EntryKind::Put, b"a", b"");
-        table.add(4, EntryKind::Delete, b"c", b"");
+        table
+            .add(1, EntryKind::Put, b"b", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Put, b"a", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(3, EntryKind::Put, b"a", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(4, EntryKind::Delete, b"c", b"")
+            .expect("a real arena does not refuse this");
         assert_eq!(
             walk(&table),
             vec![
@@ -496,7 +591,9 @@ mod tests {
     fn seek_and_seek_for_prev_land_on_the_right_side() {
         let table = table();
         for (seqno, key) in [(1u64, "a"), (2, "c"), (3, "e")] {
-            table.add(seqno, EntryKind::Put, key.as_bytes(), b"");
+            table
+                .add(seqno, EntryKind::Put, key.as_bytes(), b"")
+                .expect("a real arena does not refuse this");
         }
         let mut iter = table.iter();
 
@@ -519,7 +616,9 @@ mod tests {
     fn the_cursor_walks_both_ways() {
         let table = table();
         for key in ["a", "b", "c"] {
-            table.add(1, EntryKind::Put, key.as_bytes(), key.as_bytes());
+            table
+                .add(1, EntryKind::Put, key.as_bytes(), key.as_bytes())
+                .expect("a real arena does not refuse this");
         }
         let mut iter = table.iter();
         iter.seek_to_last();
@@ -554,10 +653,14 @@ mod tests {
     fn approximate_size_grows_with_every_entry() {
         let table = table();
         assert_eq!(table.approximate_size(), 0);
-        table.add(1, EntryKind::Put, b"key", b"value");
+        table
+            .add(1, EntryKind::Put, b"key", b"value")
+            .expect("a real arena does not refuse this");
         let after_one = table.approximate_size();
         assert!(after_one >= 3 + 8 + 5, "key, tag and value are all charged");
-        table.add(2, EntryKind::Delete, b"key", b"");
+        table
+            .add(2, EntryKind::Delete, b"key", b"")
+            .expect("a real arena does not refuse this");
         assert!(
             table.approximate_size() > after_one,
             "a tombstone occupies memory too"
@@ -574,11 +677,15 @@ mod tests {
         for seqno in 1u64..40 {
             let key = keys[(seqno % 3) as usize];
             if seqno % 5 == 0 {
-                table.add(seqno, EntryKind::Delete, key, b"");
+                table
+                    .add(seqno, EntryKind::Delete, key, b"")
+                    .expect("a real arena does not refuse this");
                 model.insert((key.to_vec(), seqno), None);
             } else {
                 let value = format!("v{seqno}").into_bytes();
-                table.add(seqno, EntryKind::Put, key, &value);
+                table
+                    .add(seqno, EntryKind::Put, key, &value)
+                    .expect("a real arena does not refuse this");
                 model.insert((key.to_vec(), seqno), Some(value));
             }
         }
@@ -624,7 +731,9 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..ROUNDS {
                         let key = format!("key-{:04}", i % 100);
-                        table.add(worker * 1000 + i + 1, EntryKind::Put, key.as_bytes(), b"v");
+                        table
+                            .add(worker * 1000 + i + 1, EntryKind::Put, key.as_bytes(), b"v")
+                            .expect("a real arena does not refuse this");
                     }
                 })
             })

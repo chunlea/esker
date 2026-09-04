@@ -154,6 +154,14 @@ pub struct Leadership {
     pub office_term: Term,
     /// The clock stamp the term's `TakeOffice` carried; what the oracle resumes against.
     pub office_now_ms: u64,
+    /// The membership in force — the latest in the log, committed or not.
+    ///
+    /// Published here rather than asked for, because the one caller that wants it —
+    /// [`crate::pd::Pd::membership`] — is answered **on the reactor**, and a question that had to
+    /// cross to the driver thread and back would be a blocking round trip there. The driver
+    /// already has it at the end of every drive; this is one clone per drive against a channel
+    /// round trip per request.
+    pub conf: esker_raft::ConfState,
 }
 
 impl Leadership {
@@ -166,6 +174,7 @@ impl Leadership {
             serving: false,
             office_term: 0,
             office_now_ms: 0,
+            conf: esker_raft::ConfState::default(),
         }
     }
 }
@@ -585,6 +594,7 @@ impl PdCore {
         leadership.role = status.role;
         leadership.term = status.term;
         leadership.leader = status.leader;
+        leadership.conf = status.conf;
         // Serving requires *both*: leading now, and having applied this term's barrier.
         leadership.serving = leading && leadership.office_term == status.term;
     }

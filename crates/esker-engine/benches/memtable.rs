@@ -9,6 +9,11 @@
 //! a run of the other measures the machine as much as the code (`docs/plans/phase-11-engine.md`
 //! §10). `docs/bench/skiplist.md` records how, and what came out.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a bench builds a real arena, which refuses only at four gigabytes; an entry it               declined would make the measurement meaningless, so saying so loudly is right"
+)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +44,9 @@ fn filled() -> Arc<MemTable> {
     let table = table();
     for i in 0..ENTRIES {
         let key = format!("key-{:012}", scattered(i));
-        table.add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64]);
+        table
+            .add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64])
+            .expect("the bench's arena is a real one and does not refuse");
     }
     table
 }
@@ -55,7 +62,9 @@ fn fill(c: &mut Criterion) {
             |table| {
                 for i in 0..ENTRIES {
                     let key = format!("key-{i:012}");
-                    table.add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64]);
+                    table
+                        .add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64])
+                        .expect("the bench's arena is a real one and does not refuse");
                 }
                 table
             },
@@ -69,7 +78,9 @@ fn fill(c: &mut Criterion) {
             |table| {
                 for i in 0..ENTRIES {
                     let key = format!("key-{:012}", scattered(i));
-                    table.add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64]);
+                    table
+                        .add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64])
+                        .expect("the bench's arena is a real one and does not refuse");
                 }
                 table
             },
@@ -85,7 +96,9 @@ fn fill(c: &mut Criterion) {
             |table| {
                 for i in 0..ENTRIES {
                     let key = format!("key-{:04}", i % 1000);
-                    table.add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64]);
+                    table
+                        .add(i + 1, EntryKind::Put, key.as_bytes(), &[b'v'; 64])
+                        .expect("the bench's arena is a real one and does not refuse");
                 }
                 table
             },

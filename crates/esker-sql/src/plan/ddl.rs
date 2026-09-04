@@ -74,6 +74,8 @@ pub struct Column {
     /// A generated column is **not** a defaulted one: a writer may not supply a value for it at
     /// all, and the catalog reports it in a different place (`catalog::ColumnDef::generated`).
     pub generated: Option<String>,
+    /// Whether it was declared `VIRTUAL` rather than `STORED` — storage, not answers.
+    pub generated_virtual: bool,
     /// The type it was declared as.
     ///
     /// For a column declared as a **user-defined type** this is what the value physically is —
