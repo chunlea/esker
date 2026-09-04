@@ -1,0 +1,22 @@
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 627-645,2004-2006,2034-2036
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 611-656,3363-3365,3470-3474
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 1979-1990
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 837-850
+crates/esker-sql/tests/drop_constraint.rs
+  h_44076b318daf9c 28-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9e16dc386f1668fa7403061645cb8d589ca80a12",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
