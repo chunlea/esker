@@ -220,6 +220,38 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `SET SESSION AUTHORIZATION <name>` on a node that has no roles.
+    ///
+    /// **`22023`, not `42704`** — measured, and it is not the class the same condition takes
+    /// elsewhere: `CREATE DATABASE … OWNER x` is `42704 role "x" does not exist` and this is
+    /// `22023` with the identical sentence. PostgreSQL treats the authorization name as a
+    /// *parameter value* and the owner as an object reference, so a rule copied from one to the
+    /// other would give the right words under the wrong code.
+    ///
+    /// Every name reaches this, because this node has no roles at all — the sentence is true of
+    /// all of them rather than of the ones somebody mistyped. `DEFAULT` is accepted: it asks for
+    /// what is already the case.
+    #[error("role \"{0}\" does not exist")]
+    UndefinedRoleForAuthorization(String),
+
+    /// A condition that is not a boolean: `WHERE name AND true`, `CASE WHEN name THEN …`.
+    ///
+    /// **The type, never the value.** PostgreSQL says `argument of AND must be type boolean, not
+    /// type character varying` — the word `type` twice — and names the one construct rather than
+    /// the pair, `CASE/WHEN` included. A message built from the datum a row happened to hold leaks
+    /// that row into an error and differs per row of one query.
+    ///
+    /// A *literal* is not this: an untyped `'true'` takes the type its context wants, so
+    /// `WHERE 'true' AND true` runs and `WHERE 'text' AND true` is `22P02` — a value error, not a
+    /// type one. Only something that already has a type reaches here. Measured, all four.
+    #[error("argument of {construct} must be type boolean, not type {found}")]
+    NonBooleanArgument {
+        /// `AND`, `OR` or `CASE/WHEN`.
+        construct: &'static str,
+        /// The type the operand actually has, as `format_type` prints it.
+        found: String,
+    },
+
     /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
     /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
     /// relation that outlives the transaction. Measured.
@@ -687,6 +719,46 @@ pub enum SqlError {
     /// dropping it would leave a key that could hold a NULL.
     #[error("column \"{0}\" is in a primary key")]
     ColumnIsInPrimaryKey(String),
+
+    /// `RAISE NOTICE | WARNING | INFO '<text>'` inside a `DO` block: the raised text, verbatim.
+    ///
+    /// Its severity is the level that was written, which is the whole of what a client sees —
+    /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
+    /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
+    #[error("{message}")]
+    Raised {
+        /// The text between the quotes.
+        message: String,
+        /// `NOTICE`, `WARNING` or `INFO`, already read into a severity.
+        severity: Severity,
+    },
+
+    /// `ALTER COLUMN … TYPE` for a pair PostgreSQL will not convert on its own: `42804`.
+    ///
+    /// The HINT is the whole value of this message — it tells the caller the `USING` to write, and
+    /// `change_column` is built to read exactly that.
+    #[error("column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastColumnAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type, spelled the way `format_type` spells it.
+        target: String,
+        /// The `USING` the caller should have written, for the HINT.
+        using: String,
+    },
+
+    /// The same statement, failing on the **default** rather than on the rows: `42804`.
+    ///
+    /// `USING` governs the rows and says nothing about the default, so a column whose default will
+    /// not convert stops the statement even when every row would — and a `SET DEFAULT` later in
+    /// the same statement does not rescue it. Measured on two independent pairs.
+    #[error("default for column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastDefaultAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type.
+        target: String,
+    },
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
@@ -2049,6 +2121,11 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
+            // Measured: `RAISE NOTICE` carries `00000` and `RAISE WARNING` carries `01000`.
+            SqlError::Raised { severity, .. } => match severity {
+                Severity::Warning => sqlstate::WARNING,
+                _ => sqlstate::SUCCESSFUL_COMPLETION,
+            },
             SqlError::PermanentReferencesUnlogged
             | SqlError::OnCommitNotTemporary
             | SqlError::ColumnIsInPrimaryKey(_) => {
@@ -2062,7 +2139,9 @@ impl SqlError {
             | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. }
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
-            SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
+            SqlError::ColumnTypeConflict { .. }
+            | SqlError::CannotCastColumnAutomatically { .. }
+            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
 
@@ -2122,7 +2201,9 @@ impl SqlError {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            SqlError::DatatypeMismatch(_) | SqlError::DatatypeMismatchInColumn { .. } => {
+            SqlError::DatatypeMismatch(_)
+            | SqlError::NonBooleanArgument { .. }
+            | SqlError::DatatypeMismatchInColumn { .. } => {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
@@ -2211,7 +2292,11 @@ impl SqlError {
             | SqlError::ParameterOutOfRange { .. }
             | SqlError::InvalidDestinationEncoding(_)
             | SqlError::ZeroStep
-            | SqlError::InvalidCreateDatabaseStrategy(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::InvalidCreateDatabaseStrategy(_)
+            // **`22023`, not the `42704` the identical sentence takes for `CREATE DATABASE … OWNER`.**
+            // PostgreSQL reads an authorization name as a *parameter value* and an owner as an
+            // object reference. Measured, both.
+            | SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
@@ -2247,6 +2332,7 @@ impl SqlError {
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
+            SqlError::Raised { severity, .. } => *severity,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
@@ -2401,6 +2487,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, and the reason this error is worth more than a refusal:
+            // `change_column` reads the sentence and re-sends the statement with that `USING`.
+            SqlError::CannotCastColumnAutomatically { using, .. } => {
+                Some(format!("You might need to specify \"USING {using}\"."))
+            }
             // PostgreSQL's own, verbatim: the extension is missing from the *system*, not from the
             // statement, so the fix is outside SQL.
             SqlError::ExtensionNotAvailable(_) => Some(

@@ -262,6 +262,18 @@ impl Aggregation {
             keys.push(resolved);
         }
 
+        // **PostgreSQL's functional dependency**, applied by widening the grouping rather than by
+        // relaxing the check. A `GROUP BY` that contains a table's primary key leaves one row per
+        // group *of that table*, so every other column of it has exactly one value and needs no
+        // aggregate — and grouping by `(f.id, f.name)` is the same grouping as `(f.id)` when
+        // `f.id` is a key: same groups, same rows, same counts. So the dependent columns simply
+        // join the keys, and every check below sees a query that groups by them.
+        //
+        // It is **per table**: `GROUP BY f.id` frees `f`'s columns and none of `a`'s, which is
+        // what [`crate::exec::query::Scope::key_of`] answers. `ActiveRecord` writes this shape
+        // constantly — `group(:id)` on a relation selecting `*`.
+        widen_for_dependencies(&mut keys, &mut key_types, select, scope)?;
+
         // Every aggregate call the statement makes, once each: two `count(*)`s in one target list
         // are one accumulator and one output position.
         let ungrouped = keys.is_empty();
@@ -431,6 +443,10 @@ impl Aggregation {
             }
             // The one failure this function exists for. Resolution has already turned the name
             // into a position, so the qualified name is put back for the message.
+            //
+            // A column **functionally determined** by a grouping key never reaches here: it was
+            // added to the keys before any rewriting ran (`widen_for_dependencies`), so the
+            // is-it-a-key arm at the top of this function answers first.
             Expr::Ordinal { at, .. } => {
                 return Err(SqlError::GroupingError(scope.qualified_name(*at)));
             }
@@ -579,6 +595,85 @@ pub(super) fn ordinal(position: i64, select: &Select, clause: &str) -> Result<Ex
         ))),
     }
 }
+/// Adds every column a grouping key **functionally determines** to the keys.
+///
+/// PostgreSQL accepts a bare column when the `GROUP BY` contains its table's primary key, because
+/// grouping by a key leaves one row per group of that table. Honouring it by widening the grouping
+/// rather than by relaxing the check is what makes it obviously correct: grouping by `(f.id,
+/// f.name)` is the same grouping as `(f.id)` when `f.id` is a key — the same groups, the same
+/// rows, and the same `count(*)` in each.
+///
+/// **Per table.** A column is added only when *every* primary-key column of **its own** table is
+/// already a key, so `GROUP BY f.id` frees `f`'s columns and leaves `a`'s as the `42803` they are.
+/// A table with no declared primary key determines nothing.
+///
+/// The select list and the `HAVING` are both walked, because a real server allows the dependency
+/// in both — measured, `GROUP BY f.id HAVING f.name = 'one'` runs.
+fn widen_for_dependencies(
+    keys: &mut Vec<Expr>,
+    key_types: &mut Vec<ColumnType>,
+    select: &Select,
+    scope: &Scope<'_>,
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let grouped: Vec<usize> = keys
+        .iter()
+        .filter_map(|key| match key {
+            Expr::Ordinal { at, .. } => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let mut determined: Vec<Expr> = Vec::new();
+    let mut consider = |expr: &Expr| -> Result<()> {
+        let resolved = super::query::resolve(&super::query::dealias(expr, select), scope)?;
+        let mut bare = Vec::new();
+        bare_ordinals(&resolved, &mut bare);
+        for column in bare {
+            let Expr::Ordinal { at, .. } = &column else {
+                continue;
+            };
+            let Some(key) = scope.key_of(*at) else {
+                continue;
+            };
+            if key.iter().all(|column| grouped.contains(column))
+                && !grouped.contains(at)
+                && !determined.contains(&column)
+            {
+                determined.push(column);
+            }
+        }
+        Ok(())
+    };
+    for item in &select.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            consider(expr)?;
+        }
+    }
+    if let Some(having) = &select.having {
+        consider(having)?;
+    }
+    for key in determined {
+        key_types.push(super::query::expr_type(&key, scope)?);
+        keys.push(key);
+    }
+    Ok(())
+}
+
+/// Every column reference in a **resolved** expression that is not inside an aggregate.
+///
+/// A column inside `count(…)` is answered by the aggregate and needs no grouping; one outside is
+/// what the `42803` is about, and therefore what a functional dependency has to cover. Written
+/// here rather than reusing a general walker because that distinction — descend into everything
+/// *except* an aggregate's arguments — is the whole of what it is for.
+fn bare_ordinals(expr: &Expr, found: &mut Vec<Expr>) {
+    walk(expr, &mut |node| {
+        if matches!(node, Expr::Ordinal { .. }) {
+            found.push(node.clone());
+        }
+    });
+}
 
 /// Whether an expression contains an aggregate call anywhere inside it.
 ///
@@ -596,13 +691,25 @@ pub(crate) fn contains_aggregate(expr: &Expr) -> bool {
 /// something would be worse than a refusal.
 fn aggregate_calls(expr: &Expr) -> Vec<&AggregateCall> {
     let mut found = Vec::new();
-    walk(expr, &mut found);
+    walk(expr, &mut |expr| {
+        if let Expr::Aggregate(call) = expr {
+            found.push(&**call);
+        }
+    });
     found
 }
 
-fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
+/// Every node of an expression, **stopping at an aggregate**: the call is visited and its
+/// arguments are not.
+///
+/// One traversal with two callers, because they want the same shape for opposite reasons.
+/// [`aggregate_calls`] wants the calls; [`bare_ordinals`] wants the columns that are *not* under
+/// one, since a column inside `count(…)` is answered by the aggregate and needs no grouping. Two
+/// copies of this list would be two opinions about which expressions hold another, and that list
+/// having a blind spot is what made `pg_typeof(array_agg(i))` an internal error once.
+fn walk<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     match expr {
-        Expr::Aggregate(call) => found.push(call),
+        Expr::Aggregate(_) => visit(expr),
         // **Every expression that holds another**, and this list is the reason
         // `pg_typeof(array_agg(i))` used to be an internal error: an aggregate the collector does
         // not see is an aggregate the statement is not planned around, so it survives into the row
@@ -612,7 +719,7 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
         | Expr::IsNull { operand, .. }
         | Expr::Negate(operand)
         | Expr::Scalar { operand, .. }
-        | Expr::ToText { operand, .. } => walk(operand, found),
+        | Expr::ToText { operand, .. } => walk(operand, visit),
         Expr::Binary { left, right, .. }
         | Expr::Arithmetic { left, right, .. }
         | Expr::AnyArray {
@@ -629,17 +736,17 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
             pattern: right,
             ..
         } => {
-            walk(left, found);
-            walk(right, found);
+            walk(left, visit);
+            walk(right, visit);
         }
         Expr::CatalogFunc(call) => {
             for arg in &call.args {
-                walk(arg, found);
+                walk(arg, visit);
             }
         }
         Expr::Coalesce(args) => {
             for arg in args {
-                walk(arg, found);
+                walk(arg, visit);
             }
         }
         Expr::Case {
@@ -647,17 +754,17 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
             otherwise,
         } => {
             for branch in branches {
-                walk(&branch.when, found);
-                walk(&branch.then, found);
+                walk(&branch.when, visit);
+                walk(&branch.then, visit);
             }
             if let Some(otherwise) = otherwise {
-                walk(otherwise, found);
+                walk(otherwise, visit);
             }
         }
         Expr::InList { operand, list, .. } => {
-            walk(operand, found);
+            walk(operand, visit);
             for item in list {
-                walk(item, found);
+                walk(item, visit);
             }
         }
         // The operand only, and **not** into the sub-select: `WHERE count(*) IN (SELECT …)` is
@@ -665,10 +772,10 @@ fn walk<'a>(expr: &'a Expr, found: &mut Vec<&'a AggregateCall>) {
         // is an ordinary statement whose aggregate belongs to a different query.
         Expr::Subquery(sub) => {
             if let Some(operand) = &sub.operand {
-                walk(operand, found);
+                walk(operand, visit);
             }
         }
-        _ => {}
+        other => visit(other),
     }
 }
 

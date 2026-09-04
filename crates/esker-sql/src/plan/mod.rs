@@ -65,6 +65,19 @@ pub use time_machine::TimeMachineVerb;
 /// equals itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's *other* `DO` body.
+    ///
+    /// `postgresql_adapter_test.rb` raises one to exercise `db_warnings_action`, so what the test
+    /// needs is the message reaching the client at the severity that was written. There is no
+    /// PL/pgSQL here: one `RAISE` of a literal is a statement, and every other body is refused by
+    /// name (`crate::parse::strip_do_raise`).
+    Raise {
+        /// The text between the quotes, with `''` already unescaped.
+        message: String,
+        /// `NOTICE` or `WARNING`. `INFO`, `LOG` and `DEBUG` have no severity on this wire and are
+        /// refused by name rather than downgraded into one that would print the wrong word.
+        severity: crate::error::Severity,
+    },
     /// `CREATE TABLE`.
     CreateTable(CreateTable),
     /// `DROP TABLE`.
@@ -235,7 +248,10 @@ impl Statement {
             // snapshot it is refused like any other. Flashing back while reading the past would be
             // writing the present from a transaction that may not write.
             Statement::TimeMachine(TimeMachineVerb::Flashback { .. }) => Some("esker_flashback"),
-            Statement::TimeMachine(_)
+            // A `RAISE` writes nothing: it is allowed in a read-only transaction and against the
+            // past, exactly as `SELECT` is.
+            Statement::Raise { .. }
+            | Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(..)
             | Statement::Session(_) => None,
@@ -250,6 +266,8 @@ impl Statement {
     #[must_use]
     pub fn tag(&self) -> &'static str {
         match self {
+            // The tag is the outer statement's, not the body's: a real server answers `DO`.
+            Statement::Raise { .. } => "DO",
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropExtension(_) => "DROP EXTENSION",

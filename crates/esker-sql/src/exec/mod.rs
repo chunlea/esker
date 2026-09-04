@@ -631,6 +631,15 @@ impl Executor {
         // still written, and the reads it makes on the way are its own uncommitted catalog.
         self.catalog_written |= statement.writes_catalog();
         match statement {
+            // The `DO` block's whole effect: the message reaches the client at the severity that
+            // was written, and the statement's tag is `DO`.
+            Statement::Raise { message, severity } => {
+                self.notice(SqlError::Raised {
+                    message: message.clone(),
+                    severity: *severity,
+                });
+                Ok(Outcome::done("DO"))
+            }
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
@@ -677,6 +686,9 @@ impl Executor {
         use crate::plan::SessionStatement;
 
         match statement {
+            // Nothing to switch away from: this node has no roles, so `DEFAULT` is what the
+            // session already is. A named role never reaches here — it is `22023` in the lowering.
+            SessionStatement::SetSessionAuthorization => Ok(Outcome::done("SET")),
             SessionStatement::SetReadAsOf { value, local } => {
                 self.set_read_as_of(value.as_deref(), *local)?;
                 Ok(Outcome::done("SET"))
@@ -2433,6 +2445,7 @@ fn fill_sequence_reads_in(
 /// shape `psql` renders and users read.
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
+        Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
         Statement::CreateExtension(create) => {
             vec![format!("Create Extension on {}", create.name)]

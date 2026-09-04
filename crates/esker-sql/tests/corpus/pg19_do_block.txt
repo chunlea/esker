@@ -1,0 +1,77 @@
+# `DO $$ … $$` — an anonymous plpgsql block — as a real PostgreSQL 19beta1 answers it.
+#
+# **Run 45 ranking: 28 tests across 3 files** — `enum_test.rb` (19), `postgresql_adapter_test.rb`
+# (7), `invertible_migration_test.rb` (2). **None of those files contains the word `DO`.** It comes
+# from the adapter: `create_enum` in
+# `activerecord-8.1.3.1/lib/active_record/connection_adapters/postgresql_adapter.rb:556` builds an
+# anonymous block to make enum creation idempotent, and the first statement below is that block with
+# realistic arguments substituted.
+#
+# A note on where the library under test lives: the suite's *tests* come from the `rails/` checkout
+# via `-Itest`, but the *library* is the **gem** in `vendor/bundle`, selected by `BUNDLE_GEMFILE`.
+# Grepping the checkout's `lib/` for this block finds nothing; the gem is the thing that runs.
+#
+# This row and the `CREATE TYPE` row are related but not the same: `create_enum` reaches `CREATE
+# TYPE … AS ENUM` **through** a `DO` block, while `range_test.rb` and `composite_test.rb` send bare
+# `CREATE TYPE`. Supporting one does not give the other.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The two `SELECT count(*)` lines at the end prove it left nothing behind, and both answer `0`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A `DO` block returns no result set at all** — not an empty one, not a count. It is a
+#     command tag, and `create_enum` runs it through `internal_exec_query`, which must tolerate that.
+#   * **It is a statement, not an expression.** `SELECT DO $$ … $$` is `42601 syntax error at or
+#     near "DO"`. There is no value to select.
+#   * **The body really executes and its effects persist.** `DO $$ BEGIN CREATE TABLE do_made_this
+#     (a int); END $$` leaves the table behind — so a `DO` block is not a no-op that can be skipped,
+#     and the idempotent-enum block genuinely creates the type on the first run and genuinely does
+#     nothing on the second (`count(*)` stays `1`).
+#   * **`RAISE EXCEPTION` inside it surfaces as `P0001` with the raised text as the whole message** —
+#     `!P0001 boom`, no DETAIL, no function name.
+#   * **A syntax error in the body is reported at `CREATE`/execute time, not at parse time of the
+#     outer statement**: `DO $$ BEGIN SELECT 1 END $$` is
+#     `42601 unexpected end of function definition at end of input` — a plpgsql message, not a
+#     SQL-parser one, so the body has to be parsed by something that understands plpgsql.
+#   * **`LANGUAGE` is optional and defaults to plpgsql**, may be written *before* the body
+#     (`DO LANGUAGE plpgsql $$ … $$`) or after it, and an unknown one is `42704 language
+#     "nosuchlang" does not exist`.
+#   * **The dollar-quote tag is arbitrary**: `$do$ … $do$` works identically to `$$ … $$`, and the
+#     body may contain `;` freely — which is why this statement cannot be split on semicolons.
+BEGIN		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = 'public' ) THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT 'r', typname, typtype FROM pg_type WHERE typname = 'mood'	text,name,"char"	r|mood|e
+SELECT 'r', enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder		r|sad ; r|ok ; r|happy
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = 'public' ) THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT 'r', count(*) FROM pg_type WHERE typname = 'mood'	text,bigint	r|1
+DO $$ BEGIN RAISE NOTICE 'hello'; END $$;		-
+DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM pg_class; IF n > 0 THEN NULL; END IF; END $$;		-
+DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;		-
+DO $do$ BEGIN NULL; END $do$;		-
+SAVEPOINT s1		-
+DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$;	!P0001 boom
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+DO $$ BEGIN SELECT 1 END $$;	!42601 unexpected end of function definition at end of input
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+DO $$ BEGIN NULL; END $$ LANGUAGE nosuchlang;	!42704 language "nosuchlang" does not exist
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT DO $$ BEGIN NULL; END $$;	!42601 syntax error at or near "DO"
+ROLLBACK TO s4		-
+DO $$ BEGIN CREATE TABLE do_made_this (a int); END $$;		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'do_made_this'	text,bigint	r|1
+DROP TYPE "mood"		-
+SELECT 'r', count(*) FROM pg_type WHERE typname = 'mood'	text,bigint	r|0
+DROP TYPE IF EXISTS "mood"		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname = 'mood'	bigint	0
+SELECT count(*) FROM pg_class WHERE relname = 'do_made_this'	bigint	0

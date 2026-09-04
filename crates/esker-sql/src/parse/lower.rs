@@ -88,6 +88,14 @@ impl Parsed {
                 actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
             }));
         }
+        // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
+        // statement it is a disguised form of, so the whole lowering is this.
+        if let Some((message, severity)) = self.raised() {
+            return Ok(plan::Statement::Raise {
+                message: message.clone(),
+                severity: *severity,
+            });
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -105,6 +113,11 @@ impl Parsed {
                     &create.name,
                 )?);
             }
+        }
+        // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
+        // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
+        if let plan::Statement::CreateType(create) = &mut lowered {
+            create.if_not_exists = self.is_do_guarded();
         }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
@@ -819,7 +832,7 @@ fn verb_arguments(function: &sqlparser::ast::Function) -> Option<Vec<String>> {
 /// real server accepts and stores, and `SET TRANSACTION SNAPSHOT`, which a real server *acts* on
 /// and whose every precondition is one this feature wants anyway.
 fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
-    use sqlparser::ast::{ContextModifier, Set};
+    use sqlparser::ast::{ContextModifier, Set, SetSessionAuthorizationParamKind};
 
     match set {
         Set::SingleAssignment {
@@ -910,6 +923,24 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 plan::SessionStatement::SetSnapshot(id.clone()),
             ))
         }
+        // **`SET SESSION AUTHORIZATION` on a node with no roles**, which is the 12 refusals behind
+        // run 57's aborted-transaction row — every one of them in `schema_authorization_test.rb`,
+        // whose `set_session_auth` sends `DEFAULT` between each named user.
+        //
+        // `DEFAULT` asks for what is already the case and succeeds. Any *name* is
+        // `22023 role "x" does not exist`, which is true of every name here — and `22023` rather
+        // than the `42704` the same sentence takes for `CREATE DATABASE … OWNER`, because
+        // PostgreSQL reads an authorization name as a parameter value and an owner as an object.
+        // Measured, both. The file still needs `CREATE USER` to pass; what changes is that it now
+        // fails on the feature that is missing instead of aborting the transaction on this.
+        Set::SetSessionAuthorization(param) => match &param.kind {
+            SetSessionAuthorizationParamKind::Default => Ok(plan::Statement::Session(
+                plan::SessionStatement::SetSessionAuthorization,
+            )),
+            SetSessionAuthorizationParamKind::User(name) => {
+                Err(SqlError::UndefinedRoleForAuthorization(ident(name)))
+            }
+        },
         other => Err(SqlError::unsupported(set_feature_name(other))),
     }
 }
@@ -2029,6 +2060,38 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 });
                 continue;
             }
+            // `ALTER COLUMN c TYPE t [USING e]`. The `USING` is read only far enough to tell
+            // "cast this column to this type" — which is all `change_column` ever writes — from
+            // anything else, which is refused by name because there is no per-row evaluator.
+            if let AlterColumnOperation::SetDataType {
+                data_type, using, ..
+            } = op
+            {
+                let (ty, typmod, user_type) = lower_column_type(data_type)?;
+                if let Some(name) = user_type {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER TABLE ... ALTER COLUMN ... TYPE {name}"
+                    )));
+                }
+                let using = match using {
+                    None => None,
+                    Some(expr) => match using_cast_target(expr, &ident(column_name)) {
+                        Some(cast_to) => Some(lower_column_type(cast_to)?.0),
+                        None => {
+                            return Err(SqlError::unsupported(format!(
+                                "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING {expr}"
+                            )));
+                        }
+                    },
+                };
+                actions.push(plan::AlterTableAction::SetColumnType {
+                    column: ident(column_name),
+                    ty,
+                    typmod,
+                    using,
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
@@ -2979,16 +3042,53 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
         // unknown is unknown and `NOT (NULL = NULL)` is therefore NULL where
         // `NULL IS DISTINCT FROM NULL` is `false`.
-        Expr::IsDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::Distinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
-        Expr::IsNotDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::NotDistinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
+        Expr::IsDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::Distinct)
+        }
+        Expr::IsNotDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::NotDistinct)
+        }
+        // **`a BETWEEN x AND y` is `a >= x AND a <= y`**, and the rewrite is the whole feature:
+        // every rule a corpus can ask about falls out of it rather than needing one of its own.
+        // The ends are inclusive because `>=` and `<=` are; reversed bounds match nothing because
+        // nothing is both above 3 and below 2; a NULL bound is **three-valued AND** rather than
+        // "NULL anywhere means NULL", so `3 BETWEEN NULL AND 2` is `false` and `1 BETWEEN NULL AND
+        // 2` is NULL; and a type mismatch is `42883 operator does not exist: character varying >=
+        // integer` — a real server's own message, naming `>=` rather than `BETWEEN`, which is what
+        // says PostgreSQL rewrites it too.
+        //
+        // `NOT BETWEEN` is `NOT (…)` around the pair, which inherits the NULL: `1 NOT BETWEEN NULL
+        // AND 2` is NULL and not true. Measured, all of it.
+        //
+        // `BETWEEN SYMMETRIC` is refused by name before the parser sees it
+        // (`crate::parse`'s unsupported list) and stays that way: `sqlparser` 0.62.0's `Between`
+        // has no flag for it, so there is nothing to lower even if the keyword got through.
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let value = lower_expr(expr)?;
+            let pair = plan::Expr::Binary {
+                op: plan::BinaryOp::And,
+                left: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::GtEq,
+                    left: Box::new(value.clone()),
+                    right: Box::new(lower_expr(low)?),
+                }),
+                right: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::LtEq,
+                    left: Box::new(value),
+                    right: Box::new(lower_expr(high)?),
+                }),
+            };
+            Ok(if *negated {
+                plan::Expr::Not(Box::new(pair))
+            } else {
+                pair
+            })
+        }
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
@@ -3110,10 +3210,18 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     return Err(SqlError::unsupported(format!("the operator {other}")));
                 }
             };
+            // **An untyped string literal in a boolean context is *read* as a boolean**, not
+            // refused: `WHERE 'true' AND true` runs on a real server and `WHERE 'text' AND
+            // true` is `22P02 invalid input syntax for type boolean: "text"` — a *value* error
+            // rather than a type one, because an unadorned literal takes the type its context
+            // wants and only then fails to be read as one. A `character varying` **column**
+            // cannot: it already has a type, and that is the `42804` next door. Measured, all
+            // three.
+            let boolean = matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or);
             Ok(plan::Expr::Binary {
                 op,
-                left: Box::new(lower_expr(left)?),
-                right: Box::new(lower_expr(right)?),
+                left: Box::new(lower_condition(left, boolean)?),
+                right: Box::new(lower_condition(right, boolean)?),
             })
         }
         Expr::InList {
@@ -4397,6 +4505,67 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
             args: vec![lower_cast(inner, inner_type)?],
         },
     ))))
+}
+
+/// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.
+///
+/// PostgreSQL types a bare literal from its context, so `'true'` in a boolean position *is* a
+/// boolean and `'text'` is `22P02` — the value could not be read as one, which is a different
+/// answer from a column whose declared type is wrong (`42804`). `boolean` is false everywhere
+/// else, and then this is [`lower_expr`].
+fn lower_condition(expr: &Expr, boolean: bool) -> Result<plan::Expr> {
+    if boolean
+        && let Expr::Value(value) = expr
+        && let Value::SingleQuotedString(text) = &value.value
+    {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            <Datum as PgDatum>::from_text(ColumnType::Bool, text)?,
+        ))));
+    }
+    lower_expr(expr)
+}
+
+/// `IS [NOT] DISTINCT FROM`, **re-associated around an `AND` or `OR` the parser swallowed**.
+///
+/// `sqlparser` 0.62.0 reads the right operand of these two with a precedence *below* `AND` and
+/// `OR`, so `a IS NOT DISTINCT FROM b AND c IS NOT DISTINCT FROM d` arrives as
+/// `a IS NOT DISTINCT FROM (b AND c IS NOT DISTINCT FROM d)` — one comparison swallowing a whole
+/// conjunction. PostgreSQL's grammar puts `IS` above `NOT`, `AND` and `OR` and below everything
+/// else, so the fix is a rotation and not a guess: the swallowed operator moves out and the
+/// comparison closes over the operand it should have had.
+///
+/// **Only `AND` and `OR` move.** Every other binary operator — `=`, `<`, `+`, `||` — binds
+/// *tighter* than `IS` on a real server, so a right operand that is one of those was parsed
+/// correctly and must stay where it is.
+///
+/// The shape is what `ActiveRecord`'s `upsert_all` writes (`postgresql_adapter.rb:675`), which is
+/// how it was found: seven tests answering `42804 argument of AND/OR must be type boolean` because
+/// the `AND`'s left operand was a *column's value* rather than a comparison.
+fn lower_distinct(left: &Expr, right: &Expr, op: plan::BinaryOp) -> Result<plan::Expr> {
+    if let Expr::BinaryOp {
+        left: inner_left,
+        op: inner_op,
+        right: inner_right,
+    } = right
+    {
+        let boolean = match inner_op {
+            BinaryOperator::And => Some(plan::BinaryOp::And),
+            BinaryOperator::Or => Some(plan::BinaryOp::Or),
+            _ => None,
+        };
+        if let Some(boolean) = boolean {
+            return Ok(plan::Expr::Binary {
+                op: boolean,
+                left: Box::new(lower_distinct(left, inner_left, op)?),
+                right: Box::new(lower_expr(inner_right)?),
+            });
+        }
+    }
+    Ok(plan::Expr::Binary {
+        op,
+        left: Box::new(lower_expr(left)?),
+        right: Box::new(lower_expr(right)?),
+    })
 }
 
 /// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
@@ -6020,6 +6189,28 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// takes a typmod here — and `test_schema.mood` is a type in a schema, which is
 /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
 /// the namespace lane's. Both keep the refusal `lower_type` gives them.
+/// The type a `USING` casts this column to, or `None` if it is anything but such a cast.
+///
+/// `change_column` writes `USING CAST("c" AS timestamp)` and `USING c::integer`; both spell the
+/// conversion the statement already names, so they license it without asking for any computation
+/// this node cannot do. **Anything else is refused by name** — `USING string_to_array(c, ',')`
+/// included — because evaluating it would need a per-row expression evaluator that does not exist,
+/// and ignoring it would silently answer a different question than the one asked.
+fn using_cast_target<'a>(expr: &'a Expr, column: &str) -> Option<&'a DataType> {
+    let Expr::Cast {
+        expr: inner,
+        data_type,
+        ..
+    } = unwrap_nested(expr)
+    else {
+        return None;
+    };
+    let names_the_column = matches!(unwrap_nested(inner), Expr::Identifier(name) if ident(name) == column)
+        || matches!(unwrap_nested(inner), Expr::CompoundIdentifier(parts)
+            if parts.last().is_some_and(|part| ident(part) == column));
+    names_the_column.then_some(data_type)
+}
+
 fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<String>)> {
     match lower_type(data_type) {
         Ok((ty, typmod)) => Ok((ty, typmod, None)),
@@ -6119,6 +6310,17 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
             ColumnType::Timestamp,
             value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
         )),
+        // The same for the zoned spelling, which `change_column` sends as `timestamptz(6)`. The
+        // bound and the fall-through are the arm above's, because the difference between the two
+        // types is the label and not the precision.
+        DataType::Timestamp(Some(precision), TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
+            if *precision <= 6 =>
+        {
+            Ok((
+                ColumnType::TimestampTz,
+                value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
+            ))
+        }
         // **`time(7)` is `time(6)`, not an error.** A precision past the maximum is reduced to it
         // — a `WARNING` on a real server and no complaint at all in the answer — where a
         // `varchar` length past *its* bound is `22023`. The asymmetry is PostgreSQL's, measured:
@@ -6691,7 +6893,12 @@ fn lower_create_type(
         // C function. There is nothing this node could put in one.
         None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
     };
-    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
+    Ok(plan::Statement::CreateType(plan::CreateType {
+        name,
+        kind,
+        // Set by the caller that can see the `DO` block this came out of, if it came out of one.
+        if_not_exists: false,
+    }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

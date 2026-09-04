@@ -134,6 +134,13 @@ pub trait Txn: fmt::Debug + Send {
 
     /// Reads `[start, end)` at this transaction's snapshot, in key order, buffered writes merged
     /// in. `limit` is applied after the merge; 0 means no limit.
+    ///
+    /// **An empty range is no rows, not a panic.** `start >= end` names a range that cannot
+    /// contain anything, and it is a range a *query* can ask for: `WHERE id BETWEEN 3 AND 2`
+    /// bounds a primary-key scan below by 3 and above by 2, which is exactly this. Every
+    /// implementation must answer with no rows — `BTreeMap::range` panics on such a pair, so the
+    /// check is the implementation's and cannot be left to the caller (invariant 9: never panic on
+    /// user input).
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>>;
 
     /// Buffers a write. Nothing can fail here — the conflict, if there is one, comes from
@@ -409,6 +416,11 @@ impl Txn for MemoryTxn {
     }
 
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
+        // A range that cannot contain anything, which `BTreeMap::range` panics on rather than
+        // answering empty. See [`Txn::scan`] for why a query can ask for one.
+        if start >= end {
+            return Ok(Vec::new());
+        }
         let versions = self.lock();
         let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
         // **`range`, not a walk with a comparison inside it.** Both maps are ordered by key, so

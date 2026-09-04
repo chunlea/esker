@@ -1297,10 +1297,11 @@ fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
             // **A `Datum::Range` now that `daterange` is a type**, where it used to be text.
             // `pg_typeof(daterange(a, b))` is `daterange` on a real server, and a value that
             // carries its subtype is what makes it one here; the text is the same either way,
-            // because `DateRange::to_text` is what writes it.
+            // because `DateRange::to_text` is what writes it — and `new` is fallible now,
+            // because bounds the wrong way round are `22000` rather than an empty range.
             Datum::Range {
                 subtype: Box::new(ColumnType::Date),
-                text: range::DateRange::new(day(args.first())?, day(args.get(1))?).to_text(),
+                text: range::DateRange::new(day(args.first())?, day(args.get(1))?)?.to_text(),
             }
         }
         CatalogFunc::IsEmpty => match range_argument(args.first())? {
@@ -1383,19 +1384,41 @@ fn range_value_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
                 _ => "[)".to_owned(),
             };
             let mut chars = bounds.chars();
-            let range = range::Range {
+            // **A bare `'2026-01-01'` is an *unknown* literal**, which a real server reads at the
+            // subtype rather than keeping as text — so the range prints
+            // `["2026-01-01 00:00:00",…)` and not `[2026-01-01,…)`. Reading it here is what makes
+            // the bound a value that can be compared, rather than characters that sort like one.
+            let subtype = args
+                .iter()
+                .find_map(|arg| match arg {
+                    Datum::Text(_) | Datum::Null => None,
+                    other => other.column_type(),
+                })
+                .unwrap_or(ColumnType::Timestamp);
+            let bound = |value: Option<&Datum>| -> Result<Option<Datum>> {
+                match value {
+                    None | Some(Datum::Null) => Ok(None),
+                    Some(Datum::Text(text)) => {
+                        Ok(Some(<Datum as PgDatum>::from_text(subtype, text)?))
+                    }
+                    Some(other) => Ok(Some(other.clone())),
+                }
+            };
+            let mut range = range::Range {
                 empty: false,
-                lower: args.first().filter(|v| **v != Datum::Null).cloned(),
-                upper: args.get(1).filter(|v| **v != Datum::Null).cloned(),
+                lower: bound(args.first())?,
+                upper: bound(args.get(1))?,
                 lower_inc: chars.next() == Some('['),
                 upper_inc: chars.next() == Some(']'),
             };
+            // **The same normalisation the literal takes**, which is what makes the two spellings
+            // one value: `tsrange(hi, lo)` is `22000 range lower bound must be less than or equal
+            // to range upper bound` exactly as `'[hi,lo)'::tsrange` is, and a zero-width range
+            // collapses to `empty` on both roads. Building the value without it answered an
+            // impossible range object for one spelling and `22000` for the other.
+            range::canonicalise(subtype, &mut range)?;
             Datum::Range {
-                subtype: Box::new(
-                    args.first()
-                        .and_then(Datum::column_type)
-                        .unwrap_or(ColumnType::Timestamp),
-                ),
+                subtype: Box::new(subtype),
                 text: range.to_text(),
             }
         }
@@ -2084,12 +2107,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             match op {
                 // Three-valued AND and OR, and they are not symmetric: a definite `false` makes an
                 // AND false whatever the other side is, and a definite `true` makes an OR true.
-                BinaryOp::And => match (truth(&left)?, truth(&right)?) {
+                BinaryOp::And => match (truth_of(&left, "AND")?, truth_of(&right, "AND")?) {
                     (Some(false), _) | (_, Some(false)) => Datum::Bool(false),
                     (Some(true), Some(true)) => Datum::Bool(true),
                     _ => Datum::Null,
                 },
-                BinaryOp::Or => match (truth(&left)?, truth(&right)?) {
+                BinaryOp::Or => match (truth_of(&left, "OR")?, truth_of(&right, "OR")?) {
                     (Some(true), _) | (_, Some(true)) => Datum::Bool(true),
                     (Some(false), Some(false)) => Datum::Bool(false),
                     _ => Datum::Null,
@@ -2698,12 +2721,22 @@ fn array_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
     })
 }
 
-fn truth(value: &Datum) -> Result<Option<bool>> {
+/// One operand of `AND`/`OR` as a three-valued boolean, or PostgreSQL's `42804`, naming the
+/// construct the condition belongs to.
+///
+/// **The message names the type and never the value.** It was built from the datum a row happened
+/// to hold — `not Text("one")` — which leaks a user's row into an error and gives one query a
+/// different message per row. A real server says `argument of AND must be type boolean, not type
+/// character varying`, with the word `type` twice, and names the one construct rather than the
+/// pair `AND/OR`: measured, along with `argument of CASE/WHEN` for the other place a condition is
+/// read.
+fn truth_of(value: &Datum, construct: &'static str) -> Result<Option<bool>> {
     match value {
         Datum::Bool(value) => Ok(Some(*value)),
         Datum::Null => Ok(None),
-        other => Err(SqlError::DatatypeMismatch(format!(
-            "argument of AND/OR must be type boolean, not {other:?}"
-        ))),
+        other => Err(SqlError::NonBooleanArgument {
+            construct,
+            found: other.column_type().map_or("text", PgType::name).to_owned(),
+        }),
     }
 }

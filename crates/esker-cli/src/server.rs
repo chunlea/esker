@@ -147,10 +147,19 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     let pd = match &options.pd {
         None => None,
         Some(listed) => {
-            let addr: SocketAddr = listed
-                .parse()
-                .map_err(|error| format!("`--pd {listed}` is not an address: {error}"))?;
-            let client = RemotePd::connect(addr)
+            // A **list**, because a placement driver is a Raft group of up to three and only its
+            // leader answers ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). One
+            // address is still one address, so every existing invocation means what it did.
+            let mut endpoints = Vec::new();
+            for part in listed.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                endpoints.push(part.parse::<SocketAddr>().map_err(|error| {
+                    format!("`--pd {listed}`: `{part}` is not an address: {error}")
+                })?);
+            }
+            if endpoints.is_empty() {
+                return Err(format!("`--pd {listed}` names no placement driver"));
+            }
+            let client = RemotePd::connect_to(&endpoints, TransportConfig::new())
                 .map_err(|error| format!("starting the placement-driver client: {error}"))?;
             Some(Arc::new(client) as Arc<dyn PdClient>)
         }
@@ -261,9 +270,8 @@ async fn serve(
     if let Some(pd) = &options.pd {
         println!("esker server: registered with the placement driver at {pd}");
     }
-    // Every region this store hosts, in key order. In phase 4a that is one, bootstrapped to
-    // cover everything; `TODO(phase-4b)` a split makes the list grow while the server runs, and
-    // this line only says what it found at open.
+    // Every region this store hosts, in key order — what it found **at open**, and no more than
+    // that: a split makes the list grow while the server runs, and nothing reprints it.
     for region in store.regions().regions() {
         println!(
             "esker server: region {} covers [{}, {})",

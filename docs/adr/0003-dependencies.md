@@ -29,6 +29,55 @@ independent mechanisms enforce that.
 | `lz4_flex` | Pure-Rust LZ4 for SST block compression — the **only** compression codec. `zstd` and `snap` are banned because both are C. | An in-house LZ4 decoder (the format is simple) plus an encoder (harder to make fast). Or no compression, which costs disk. |
 | `crossbeam-skiplist` | The memtable: a concurrent lock-free skiplist. **This is the one piece of concurrent unsafe code we buy rather than write**, and it is deliberate — a subtly wrong lock-free skiplist would corrupt data in ways the test suite would find slowly and painfully. | An in-house arena skiplist behind the same `MemTable` trait. Planned as a post-v1 exercise, when there is a test suite good enough to trust the swap. |
 
+### The TLS exception, behind a default-off feature
+
+Added 2026-09-04 by the maintainer's ruling on
+[ADR 0055](0055-the-tls-options-across-three-surfaces-measured.md), which measured the options
+rather than arguing them. Both crates are **optional dependencies of `esker-sql` behind its `tls`
+feature, which is off by default** — the default build links neither, and the graph the budget
+measures does not move by one crate.
+
+| Crate | Why it is here | What replacing it would take |
+|---|---|---|
+| `rustls` | TLS itself, `default-features = false, features = ["std"]`. The defaults are the whole problem and are switched off: `aws_lc_rs` pulls `aws-lc-sys` (C), and the `ring` feature is banned for the same reason. With neither, rustls has no crypto of its own and takes a `CryptoProvider` at runtime — which is the seam that makes a pure-Rust provider possible at all. | Writing TLS 1.3. ADR 0055 estimates 4,000-8,000 lines plus a review this project is not equipped to give itself: a bug in constant-time crypto keeps the tests green and leaks the key. |
+| `rustls-graviola` | The `CryptoProvider`: pure Rust, no build script, no `links` key, `x86_64` and `aarch64` only — which is exactly `deny.toml`'s two targets. Chosen over `rustls-rustcrypto` **on measurement**: that crate fails this repo's own `cargo deny check` today on a banned `rand`, a stale duplicate `rustls-webpki` carrying four live RUSTSEC advisories, an unmaintained `paste`, and an unpatched RSA timing side-channel (RUSTSEC-2023-0071). graviola passes it clean. | The other pure-Rust provider, once one is fit to use; the swap is one `default_provider()` call in `pgwire::tls`. |
+
+Its real cost, measured in this workspace rather than in isolation: **nine** crates, not the twelve
+ADR 0055 measured standalone, because `once_cell`, `cfg-if` and `libc` are already here. With the
+feature on the compiled graph goes 34 → 43 (`cargo tree -e normal`); with it off, 34, unchanged.
+
+The nine: `rustls`, `rustls-graviola`, `graviola`, `rustls-pki-types`, `rustls-webpki`,
+`getrandom`, `subtle`, `untrusted`, `zeroize`.
+
+**The build-script audit `deny.toml` asks for, done.** That file says a build script "has to be
+looked at by a human rather than discovered in a profile six months later", so: of the nine, two
+have one and neither compiles anything. `rustls`'s is thirteen lines and sets one `cfg` for the
+nightly-only `read_buf` feature, which is not enabled here. `getrandom`'s runs `rustc -vV` to read
+the compiler's minor version and emits `cfg`s from it. **No `links` key on any of the nine**, and no
+`cc` anywhere in the graph. Graviola, the one that actually contains assembly, has **no build script
+at all**: its `Cargo.toml` says `build = false` and its x86-64 and aarch64 routines are `.rs` files
+that rustc assembles inline — the same shape `CLAUDE.md` already blesses for `crc32c`'s
+`std::arch` paths, and the reason a crate full of hand-written assembly is still pure Rust by this
+project's definition.
+
+**`Cargo.lock` now names `ring` and `cc`, and nothing builds them.** This is worth knowing before
+someone greps for it and concludes the rule was broken. Cargo locks a version for every optional
+dependency edge that could ever be selected, so `rustls-webpki`'s unused optional `ring` — and
+`ring`'s own `cc` and `windows-*` — land in the lock the moment rustls is in a manifest. They are
+not in the graph: `cargo tree --features esker-sql/tls --target all -e normal,build,dev -i ring`
+prints nothing, `rustls-webpki` resolves with features `["alloc", "std"]`, and `cargo deny check`
+— which builds its graph independently, through `krates` — says `bans ok`. The lock file is a
+record of what was *resolved*, not of what is *compiled*, and the pure-Rust rule is about the
+second.
+
+**No root store is part of this exception.** `webpki-roots` verifies *someone else's* certificate,
+which a server terminating TLS never does; it is owed by the S3 and RPC surfaces when they arrive,
+and it costs a `CDLA-Permissive-2.0` line in `[licenses] allow` that this exception does not.
+
+**If the feature is ever made default-on, the budget must be raised by ADR first** — and the two
+defects in the budget test that `deny.toml`'s comment names have to be fixed before the number it
+reports in that state means anything.
+
 ### Development dependencies
 
 Not shipped, so the pure-Rust rule does not bind them; `proptest` depends on `rand`, which is
@@ -60,10 +109,10 @@ anything matching `*-sys` — C.
 
 * **`sqlparser`** (phase 6a). Writing a full PostgreSQL parser is out of scope; this is the one
   large exception we expect to accept.
-* **An S3 client and TLS** (phase 6b). The S3 calls are small enough to write. TLS is the hard
-  case for the pure-Rust rule; the options — plain HTTP to a local MinIO or a terminating
-  sidecar, `rustls` with a pure-Rust provider, or one vetted exception — are recorded in
-  `docs/DESIGN.md` §13.
+* **An S3 client and TLS** (phase 6b). The S3 client was written in-house and costs nothing
+  (ADR 0025). TLS is **settled**: measured in ADR 0055 and accepted by the maintainer on
+  2026-09-04 as the default-off exception above, PostgreSQL port first. The S3 and RPC surfaces
+  still terminate outside the process until their own units land.
 
 ## Enforcement
 

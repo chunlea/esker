@@ -559,6 +559,12 @@ pub struct CreateType {
     pub name: String,
     /// Which shape, already read into the catalog's own form.
     pub kind: crate::catalog::TypeKind,
+    /// Do nothing if a type of this name is already there, instead of `42710`.
+    ///
+    /// **There is no `CREATE TYPE IF NOT EXISTS` in PostgreSQL**, and this is not one: it is what
+    /// `ActiveRecord`'s `create_enum` gets by wrapping the statement in a `DO` block that tests
+    /// `pg_type` first (`crate::parse::strip_do_create_enum`). Nothing a user can write sets it.
+    pub if_not_exists: bool,
 }
 
 /// `DROP TYPE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`.
@@ -840,6 +846,28 @@ pub enum AlterTableAction {
         /// measured. What `CASCADE` buys is a view over the column, or another table's foreign key
         /// referencing it; without it those are `2BP01`.
         cascade: bool,
+    },
+    /// `ALTER COLUMN <name> TYPE <type> [USING <expr>]`, which is what `change_column` sends.
+    ///
+    /// **`USING` is carried as a fact, not as an expression.** This node has no per-row cast to
+    /// evaluate one with, and the only `USING` the suite writes is `CAST(<the same column> AS <the
+    /// same target>)` — which asks for exactly the conversion the statement already names. So what
+    /// travels is whether the statement licensed a conversion PostgreSQL would not do implicitly;
+    /// any *other* `USING` expression is refused by name, because running it would need the
+    /// evaluator that does not exist and ignoring it would be a wrong answer.
+    SetColumnType {
+        /// The column, folded.
+        column: String,
+        /// The target type.
+        ty: ColumnType,
+        /// Its `atttypmod`, or `-1`.
+        typmod: i32,
+        /// The type a `USING` casts this column to, when the statement wrote one.
+        ///
+        /// **Not necessarily the target type.** `ALTER COLUMN s TYPE character varying USING
+        /// s::text` casts to `text` and lands in `varchar`, which PostgreSQL takes because the
+        /// second hop is an assignment cast — so both hops are checked rather than one.
+        using: Option<ColumnType>,
     },
     /// `VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
     ///

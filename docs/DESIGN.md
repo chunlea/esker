@@ -75,22 +75,28 @@ pub trait Iterator { seek, seek_for_prev, next, prev, key, value, valid }
 
 impl Db {
   fn open(path, Options) -> Result<Db>;
-  fn write(&self, batch: WriteBatch, WriteOptions { sync: bool }) -> Result<SeqNo>;
+  fn write(&self, batch: WriteBatch, WriteOptions { durability: Durability }) -> Result<SeqNo>;
   fn get(&self, cf, key, ReadOptions { snapshot, fill_cache }) -> Result<Option<Bytes>>;
   fn iter(&self, cf, ReadOptions) -> Result<impl Iterator>;   // prefix_same_as_start option
   fn snapshot(&self) -> Snapshot;
   fn create_cf(&self, name, CfOptions) -> Result<u32> / drop_cf(&self, name) -> Result<()>;
   fn checkpoint(&self, dir, Option<(cf, range)>) -> Result<()>;   // hard-links SSTs, writes a manifest
-  fn ingest(&self, cf, sst_paths) -> Result<()>;                   // phase 4 snapshots, phase 6 bulk load
+  fn ingest(&self, cf, sst_paths) -> Result<()>;                   // phase 6 bulk load; refuses a shared key
   fn flush(&self, cf) / compact_range(&self, cf, range) / property(&self, name)
 }
 ```
 
-**`WriteOptions::sync` defaults to `true`**, which is the deliberate inverse of LevelDB's and
-RocksDB's default. Invariant 1 says a write is acknowledged only once its bytes are durable
-"unless the caller explicitly passed `sync = false`", so the un-durable acknowledgement is the
-thing a caller opts into rather than the thing they have to know to opt out of. A `Db` used
-without reading its documentation is therefore slow and correct rather than fast and lossy.
+**A write says what it wants of the log with a `Durability`, which has three states and not two**
+([ADR 0036](adr/0036-a-write-may-have-no-opinion-about-durability.md)). `Durable` and `Buffered` are
+invariant 1's demand and its one sanctioned opt-out, and they outrank the database's policy in both
+directions. The third, `Policy`, is the default and is the one a `bool` could not express: **no
+opinion**, which leaves the decision to whoever opened the database. Without it a caller taking the
+default was indistinguishable from one demanding durability, `WalSyncMode` had nothing left to
+decide, and `Never` disabled nothing.
+
+The default remains slow and correct rather than fast and lossy, because the default `WalSyncMode`
+is `PerWrite`: a write that expressed no preference is still synced. What moved is that a database
+opened `Never` or `Interval` can now actually be opened that way.
 
 A `Snapshot` belongs to the `Db` instance that issued it and is refused by any other: sequence
 numbers survive a reopen, so a stale handle names a plausible number, but the reopened
@@ -101,7 +107,10 @@ database's snapshot list has never heard of it and the compaction floor can pass
 `write()` → assign seqno → group commit → WAL append (+ fsync if `sync`) → insert into the active
 memtable of each touched CF → return. Group commit: the first writer to take the write lock becomes
 leader, drains the queue (bounded by 1 MiB or 128 batches, *default*), writes one WAL record group,
-syncs once, then wakes everyone. Sync mode per write; `Options::wal_sync_mode = {PerWrite, Interval(ms), Never}`.
+syncs once, then wakes everyone. Each write states a `Durability`; the database's policy decides for
+those that state `Policy`, and `Options::wal_sync_mode = {PerWrite, Interval(d), Never}` is that
+policy — `Interval` by a real background thread, and `Never` syncing only for a `Durable` write and
+at a clean close.
 
 Two rules the implementation is not free to relax. The queue lock is **never held across the
 `fsync`**, or every arriving writer serialises behind a disk flush and group commit becomes a
@@ -111,8 +120,8 @@ published**, so no batch is observable at a sequence number before it is readabl
 The leader does the log write for everyone, so **its failure is everyone's**: each batch in the
 group is refused with `Error::GroupCommit` carrying the leader's message, because reporting
 success to a writer whose bytes never reached the log would break invariant 1 for a write that
-looked fine. A `sync = false` batch that rides a synced group gets durability for free, which
-is correct — `sync = false` is permission to acknowledge early, never a requirement to.
+looked fine. A `Buffered` batch that rides a synced group gets durability for free, which is
+correct — `Buffered` is permission to acknowledge early, never a requirement to.
 
 A failed *append* ends the log segment for good. A partial write and a full disk are
 indistinguishable from inside `write(2)`, so after one the segment's length is unknown: writing
@@ -401,17 +410,23 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     region held, which is [ADR 0032](adr/0032-a-snapshot-carries-every-column-family.md).
   - **Key-value pairs, not SST files, in v1.** §6 originally described `engine.checkpoint(range)` →
     `ingest()`, and two things stop it: a checkpoint links *whole files* and a file straddles a
-    region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses any
-    overlap including tombstones (§4.1), so a receive retried after a partial one could never
-    ingest again. The bytes cross a network either way, so what is given up is one write on the
+    region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses a file
+    holding a key the column family already has an entry for (§4.1), so a receive retried after a
+    partial one could never ingest again — the partial receive's own keys are what it would
+    collide with. The bytes cross a network either way, so what is given up is one write on the
     receiver. `TODO(post-v1)`: sequence-number rewriting plus a range-clipped checkpoint makes the
     link-only transfer possible, and only `esker-store/src/snapshot.rs` changes.
   - **A snapshot is never half-visible**, which is the property everything else is arranged around.
     The receive is four durable steps — announce, stage, ingest, adopt — and nothing serves the
     region until the last. A crash leaves an announcement record naming the region, and the next
     open clears the keys that record's *range* names, so the retry finds the empty range it needs.
-  - **Only into a range this store holds nothing in**, which is the case a new replica is. A peer
-    that already has data is refused and stays behind; PD sees it in the heartbeats.
+  - **A region this store already holds is replaced, not refused.** Refusing it was 4c's
+    limitation and phase-4 acceptance showed it is not an edge case: a peer that falls behind its
+    leader's compaction boundary can be repaired no other way, and until `snapshot::clear_range`
+    it could not be repaired at all (`docs/plans/phase-4.md` §18). The old peer is retired first,
+    so nothing is driving the region while its range is emptied and refilled, and the clear
+    **verifies** the range is empty rather than assuming it — a refill over survivors would serve
+    a mix of two states that looks exactly like correct data.
 - **Membership:** `AddPeer` and `RemovePeer` ride on the answer to a region heartbeat (§7) and the
   leader proposes the matching conf-change entry. The **store id of a new replica travels in the
   change's context**, which `esker-raft` never interprets — so the core moves the membership and
@@ -475,14 +490,54 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 
 ## 7. Placement driver (`esker-pd`)
 
-Single binary, state kept in its own `esker-engine` instance (default column family only); made highly
-available by running three PDs replicated with `esker-raft` — **deferred past v1 as a recorded
-milestone** (`docs/plans/phase-4.md` §15): phase 4 ships the single durable PD, which is a single
-point of failure by decision rather than by oversight, and which satisfies the one rule
-`prompts/04-multiraft-pd.md` refuses to bend — *never ship TSO without the persisted high-water
-mark*, which §7's oracle has had since 4a. What HA would add is replication of the state below,
-not a change to it: the routing table, the allocator and the mark move from one engine into a Raft
-log, PD elects a leader, and clients discover it.
+One binary; **a Raft group of up to three of them**, each with its own `esker-engine` instance
+([ADR 0059](adr/0059-pd-is-a-raft-group.md), `docs/plans/phase-15-pd-ha.md`). A group of one is
+what phase 4 shipped and is still the default: it wins with a quorum of itself, needs no ticks and
+no transport, and behaves exactly as the single durable PD did.
+
+Every rule below is unchanged by replication. **Only the meaning of "persisted" moved**, from one
+`fsync` to a Raft entry this member has applied:
+
+- **What goes in the log.** The four records that nothing can re-derive — the cluster's identity,
+  the routing table, the allocator's reserved end and the oracle's mark — become commands applied
+  by a deterministic state machine into the same key space, byte for byte. The log lives in the
+  `raft` column family of the same database, so an apply writes the record and the apply index in
+  **one atomic batch**.
+- **What stays out of it.** The in-flight operator set, the balance cooldowns and the settling load
+  deltas are memory, leader-only, re-derived from the next round of heartbeats
+  ([ADR 0013](adr/0013-repair-operators-are-requests-not-commands.md)). A PD that loses leadership
+  is, to the scheduler, a PD that restarted.
+- **The leader samples the clock; the state machine never does.** `apply` is a pure function of
+  `(applied state, command)`, so every `now_ms` travels *inside* the command. A member that read a
+  clock inside `apply` would diverge from its neighbours, and would be a second place in Esker that
+  orders on a wall clock (invariant 6).
+- **A new leader answers nothing until it has applied a `TakeOffice` entry of its own term.** Raft
+  promises a new leader's *log* holds every committed entry and says nothing about `applied`, and
+  the oracle is rebuilt out of applied state. Then, and only then, it reloads
+  `Allocator::load(allocated_end)` and `Oracle::load(high_water, now_ms)` — the same two
+  constructors a restart uses, because a failover is a restart that kept its socket.
+- **The mark is the lease, and the reservation is the same lease for ids.** A leader that has lost
+  its quorum and not noticed is confined *below* the mark: crossing it needs a commit its proposals
+  no longer earn, so the call fails rather than answering. A new leader begins at
+  `max(clock, mark)`, which is at or above it. Nothing in that argument needs either clock to be
+  right, or the two to agree — which is why PD needs no lease of its own.
+- **Only the leader serves; a follower answers `PdNotLeader` with an address.** A separate wire code
+  from the region-scoped `NotLeader`, because a client answers that one by repairing its region
+  cache and a PD redirect would poison an entry for a region that does not exist. Reads are
+  leader-only too — a follower would otherwise answer a routing question out of whatever it had
+  applied — with two exceptions that are questions about *this process* rather than about the
+  cluster: `Status` and `Members`.
+- **Reads do not take a `ReadIndex`.** A deposed leader can answer a routing question one entry
+  behind, which is exactly the staleness this section already designs for: a client's cache is a
+  hint the store checks against its epoch, so a stale route costs a redirect and never a wrong
+  answer (invariant 5). The two answers that *cannot* be stale — an id and a timestamp — are the
+  two that go through the log.
+- **Membership is configuration, not state.** The same `--peers` list on every member, and the
+  group's identity is `mix64` over it: a member refuses a Raft batch that does not carry its own
+  group id, so two clusters' placement drivers pointed at each other by a stale flag cannot form
+  one group and replicate one cluster's routing table over the other's. Dynamic membership is a
+  phase of its own and would have to mint that id into the log, as `Bootstrap` mints the cluster
+  id.
 
 - **State (*fixed*, version 1).** PD's own key space, under the `'m'` metadata prefix of §3, with ids
   big-endian so a scan runs in id order:
@@ -608,8 +663,13 @@ log, PD elects a leader, and clients discover it.
   one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation
   rather than a repair.
-- **Tools:** `esker pd serve --data-dir --listen` runs it; `esker pd inspect --data-dir` prints the whole
-  state above, including the range index beside the records it points at.
+- **Tools:** `esker pd serve --data-dir --listen` runs one; `--id` and `--peers` make it a member
+  of a group. `esker pd inspect --data-dir` prints the whole state above — including the range
+  index beside the records it points at, and the durable half of consensus — and it **creates
+  nothing**: opening a placement driver campaigns, and a campaign is a write, so the inspector is a
+  read-only view that names no column family and starts no driver. `esker pd members --pd` asks a
+  **running** member who is in its group and which one leads, and is answered by a follower too,
+  which is the point: it is what an operator reaches for when the leader is what is missing.
 
 ## 8. Transactions (`esker-txn`)
 
@@ -674,6 +734,17 @@ that goes silent is pinged, and one that stays silent is dropped with every wait
 | `request_timeout` | 30 s | How long a call waits for its answer before `Timeout`. |
 | `shutdown_grace` | 10 s | How long a graceful shutdown waits for in-flight requests before closing anyway. Graceful cannot mean "for ever": a handler wedged on a stuck disk must not hold the process open. |
 
+**Nothing on this wire is encrypted or authenticated**, and both halves of that are deliberate for
+now. A request carries a region epoch and a cluster id, neither of which is a credential: a store's
+`StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the socket,
+so the network boundary is the trust boundary. TLS here is one implementor away — the decision, the
+provider and the shape are settled by
+[ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md) and built once already on the
+SQL port — but this surface wants **mutual** authentication rather than server TLS, and a verified
+peer certificate is still not an authorization decision: mapping an identity to "may register as
+store 7" or "may vote in region 4" is application logic `esker-pd` does not have yet. That, not the
+encryption, is the bulk of the work here, and it is why this surface is not first.
+
 `HelloAck` reports the server's `max_frame_size` so a client can refuse an oversized request without
 spending a round trip on it. **A client is not obliged to adopt it**, and `esker-client` does not:
 `Transport::max_frame_size` returns the client's own limit, so a client configured more generously
@@ -729,7 +800,12 @@ that jumps rather than waits.
   not create one — and `Err` when it could not say, which is usually retryable; collapsing the two
   would turn a momentary PD outage into a terminal error on every call in the process.
 - **Retries** are bounded by both a budget (8 retries *default*) and a per-call deadline (10 s
-  *default*), whichever ends first. Which errors are retryable is `ProtoError::is_retryable()` —
+  *default*), whichever ends first. The budget counts **failures, not attempts**: a refusal that
+  moved the region's epoch taught the client something and resets it, because a request that keeps
+  being redirected to fresher routing is making progress, and spending a budget on progress is how
+  a client gives up on a region that is merely splitting. Only an epoch change resets it — a
+  `NotLeader` hint moves no epoch, and chasing leadership around an unchanging region is the loop
+  the budget exists to stop. Which errors are retryable is `ProtoError::is_retryable()` —
   asked, not duplicated, so the client and the store cannot drift: `NotLeader` (follow the peer-id
   hint), `EpochNotMatch` (take the replacement regions), `RegionNotFound` (drop the entry, ask the
   resolver), `ServerIsBusy` (wait). Backoff is exponential to a 2 s ceiling with **equal jitter**
@@ -789,17 +865,33 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   in the database's own directory rather than `(cluster_id, store_id)`, which two benchmarks do not have
   and two misconfigured stores share (ADR 0029). A prefix holding objects and no marker — every pre-6c
   prefix — is refused until `--adopt-sst-store` says otherwise; nothing is ever adopted silently.
-- **TLS — settled for S3 by ADR 0025, and measured for all three surfaces by
-  [ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md).** S3: plain HTTP to `MinIO`
-  or to a TLS-terminating sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at
-  ADR 0025, rather than accepting it and speaking plaintext — a configuration that looks encrypted and
-  is not is the worst of the three outcomes. The PostgreSQL port answers the same way: `SSLRequest`
-  gets a plain `N` (`pgwire::server`), and the RPC layer (§9) carries no TLS at all today. All
-  three are one dependency decision, not three: ADR 0055 measured the pure-Rust `rustls`
-  `CryptoProvider` options against `deny.toml` and found the crate cost is paid once, for whichever
-  surface adopts it first. `esker_s3::Transport` is a trait with a blocking `std::net` implementation
-  and `pgwire::server::Connection<S>` is already generic over its stream — both are a second
-  implementor away from TLS, not a refactor, once a provider is chosen.
+- **TLS — built on the PostgreSQL port, deferred on the other two
+  ([ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md), accepted 2026-09-04).**
+  All three surfaces are **one dependency decision, not three**, and it has been taken: `rustls` with
+  `rustls-graviola` as the `CryptoProvider`, behind `esker-sql`'s **`tls` feature, off by default**.
+  graviola was chosen on measurement — `rustls-rustcrypto`, the better-known pure-Rust provider,
+  fails this repo's own `cargo deny check` today. With the feature off the runtime graph does not
+  move by a crate; with it on it grows by nine.
+  **The PG port**: `SSLRequest` is answered `S` when the node holds a `--tls-cert`/`--tls-key` pair,
+  and the whole session including the client's real startup packet runs inside TLS records; a node
+  with no certificate answers `N` and carries on in the clear, and a node given a certificate it
+  cannot serve — the flags without the feature — **refuses to start** rather than serving plaintext
+  on a port an operator believes is encrypted. `pgwire::tls` is the only module that knows what TLS
+  is; the session is driven by a task over a duplex pipe rather than a hand-written poll adapter,
+  because the adapter is a third crate or a class of hang.
+  **S3 — built, and it cost no further crates.** `esker_s3::tls` is the second implementor the
+  transport trait was designed for (ADR 0025 decision 1, which needed no change), and
+  `Endpoint::parse` now accepts `https://` under the feature and refuses it without, naming the
+  feature. The root store is **not** `webpki-roots`: the host's CA bundle is a file, `SSL_CERT_FILE`
+  overrides it and `ESKER_S3_CA_CERT` names one for a self-signed `MinIO`, so the vendored-roots
+  crate and its `CDLA-Permissive-2.0` licence line are both avoided and the exception stays at nine
+  crates for both surfaces. Its connection pool absorbs post-handshake messages rather than peeking
+  at the socket, because a TLS 1.3 server sends tickets and key updates whenever it likes and the
+  plain transport's check would throw away a good connection for them — silently, since every
+  response stays correct. `esker-s3` costs nothing with the feature off, as it always has.
+  **The RPC layer (§9) is what is left.** It carries no TLS and no peer authentication, and ADR 0055
+  says why the second is the larger half of that work: mTLS makes a peer identity available, and
+  nothing in `esker-pd` yet decides what a given identity is *allowed* to be.
 - **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
   extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
@@ -876,8 +968,13 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 ## 15. Open questions (turn into ADRs as they are decided)
 
 Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
-leader leases vs ReadIndex only · PD HA timing · secondary-index encoding for
-composite keys · how much Postgres surface for the first SQL milestone.
+leader leases vs ReadIndex only · **dynamic PD membership** (adding or removing a placement driver
+at run time, which needs the group id minted into the log — [ADR 0059](adr/0059-pd-is-a-raft-group.md))
+· secondary-index encoding for composite keys · how much Postgres surface for the first SQL
+milestone.
+
+*Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
+`esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above).
 
 ## 16. Columnar (`esker-columnar`)
 

@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
-use crate::pd::{InspectOptions, PdCommand, ServeOptions, StatusOptions};
+use crate::pd::{InspectOptions, MembersOptions, PdCommand, ServeOptions, StatusOptions};
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::region::{RegionCommand, RegionOptions};
 use crate::server::ServerOptions;
@@ -132,7 +132,7 @@ impl fmt::Display for ParseError {
             ),
             ParseError::UnknownPdCommand(verb) => write!(
                 formatter,
-                "unknown pd command `{verb}`; expected serve or inspect"
+                "unknown pd command `{verb}`; expected serve, inspect, status or members"
             ),
             ParseError::UnknownRegionCommand(verb) => write!(
                 formatter,
@@ -270,7 +270,11 @@ Server options:
       --adopt-sst-store Claim an --sst-store prefix that already holds objects but
                         no claim marker, instead of refusing. Only do this when you
                         know no other database is using those objects
-      --pd HOST:PORT    The placement driver to register with and report to. With
+      --pd LIST         The placement driver to register with and report to, as one
+                        HOST:PORT or several separated by commas — a placement
+                        driver is a Raft group of up to three and only its leader
+                        answers, so a store given all three follows the redirect
+                        when one takes over (ADR 0059). With
                         one, PD decides which store creates region 1 and this store
                         reports its regions on the schedule of DESIGN.md §14.
                         Without one, the store bootstraps a region of its own and
@@ -280,7 +284,12 @@ Ctrl-C stops the listener, lets in-flight requests finish and closes the
 database. A second one does not wait.
 
 Pd options:
-  pd serve                  Run the placement driver
+  pd serve                  Run the placement driver. --id and --peers make it one
+                            member of a group of three; without them it is the single
+                            durable placement driver, which is a single point of failure
+  pd members                Ask any member who is in its group and which one leads.
+                            Answered by a follower too, which is the point: it is what
+                            you reach for when the leader is what is missing
   pd inspect                Print what a **stopped** PD has stored: the cluster, the
                             allocator, the oracle's mark, every store and region, and
                             the operator history
@@ -288,8 +297,13 @@ Pd options:
                             set is memory and dies with the process, so `inspect`
                             cannot show it and this is the only thing that can
       --data-dir PATH       PD's database, for serve and inspect (default ./esker-pd)
+      --id N                This member's id in its group, for serve (default 1)
+      --peers LIST          The whole group as id@host:port, comma-separated, this
+                            member included. Every member is given the SAME list: the
+                            group's identity is derived from it, so two members given
+                            different lists are two groups and will not talk
       --listen HOST:PORT    Address to serve on, for serve (default 127.0.0.1:2379)
-      --pd HOST:PORT        The placement driver to ask, for status
+      --pd HOST:PORT        The placement driver to ask, for status and members
                             (default 127.0.0.1:2379)
 
 Sst-store options:
@@ -833,6 +847,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     let mut serve = ServeOptions::default();
     let mut inspect = InspectOptions::default();
     let mut status = StatusOptions::default();
+    let mut members = MembersOptions::default();
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -855,8 +870,26 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             "--listen" => {
                 serve.listen = take_value(arguments, &mut index, inline, "--listen")?;
             }
+            "--id" => {
+                let raw = take_value(arguments, &mut index, inline, "--id")?;
+                serve.id = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--id",
+                    value: raw.clone(),
+                })?;
+                if serve.id == 0 {
+                    return Err(ParseError::InvalidValue {
+                        flag: "--id",
+                        value: raw,
+                    });
+                }
+            }
+            "--peers" => {
+                serve.peers = take_value(arguments, &mut index, inline, "--peers")?;
+            }
             "--pd" => {
-                status.pd = take_value(arguments, &mut index, inline, "--pd")?;
+                let value = take_value(arguments, &mut index, inline, "--pd")?;
+                status.pd.clone_from(&value);
+                members.pd = value;
             }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
@@ -869,6 +902,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
         "serve" => Ok(Command::Pd(PdCommand::Serve(serve))),
         "inspect" => Ok(Command::Pd(PdCommand::Inspect(inspect))),
         "status" => Ok(Command::Pd(PdCommand::Status(status))),
+        "members" => Ok(Command::Pd(PdCommand::Members(members))),
         other => Err(ParseError::UnknownPdCommand(other.to_owned())),
     }
 }
@@ -1304,6 +1338,89 @@ mod tests {
 
     fn parse_ok(arguments: &[&str]) -> Command {
         parse(arguments.iter().copied()).expect("expected the arguments to parse")
+    }
+
+    /// The 4a shape has to keep meaning what it meant: no `--id`, no `--peers`, one member.
+    #[test]
+    fn pd_serve_without_a_group_is_still_the_single_placement_driver() {
+        let Command::Pd(PdCommand::Serve(serve)) = parse_ok(&["pd", "serve"]) else {
+            panic!("pd serve did not parse");
+        };
+        assert_eq!(serve.id, 1);
+        assert!(serve.peers.is_empty());
+        assert_eq!(serve.listen, crate::pd::DEFAULT_LISTEN);
+    }
+
+    #[test]
+    fn pd_serve_takes_a_member_id_and_the_whole_group() {
+        let Command::Pd(PdCommand::Serve(serve)) = parse_ok(&[
+            "pd",
+            "serve",
+            "--id",
+            "2",
+            "--peers",
+            "1@127.0.0.1:2379,2@127.0.0.1:2380,3@127.0.0.1:2381",
+            "--listen",
+            "127.0.0.1:2380",
+        ]) else {
+            panic!("pd serve did not parse");
+        };
+        assert_eq!(serve.id, 2);
+        assert_eq!(serve.listen, "127.0.0.1:2380");
+        let members = crate::pd::parse_peers(&serve.peers).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[1].id, 2);
+        assert_eq!(members[1].address, "127.0.0.1:2380");
+    }
+
+    /// Member id zero is `esker-raft`'s "no node", so a typo must be refused rather than
+    /// producing a member nothing can address.
+    #[test]
+    fn a_member_id_of_zero_is_refused() {
+        assert!(parse(["pd", "serve", "--id", "0"].into_iter()).is_err());
+        assert!(parse(["pd", "serve", "--id", "two"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn pd_members_asks_a_running_placement_driver() {
+        let Command::Pd(PdCommand::Members(members)) =
+            parse_ok(&["pd", "members", "--pd", "10.0.0.1:2379"])
+        else {
+            panic!("pd members did not parse");
+        };
+        assert_eq!(members.pd, "10.0.0.1:2379");
+        assert!(parse(["pd", "wat"].into_iter()).is_err());
+    }
+
+    /// A `--peers` entry says which member it is; a list whose meaning came from its order would
+    /// be two different groups the moment two operators wrote it differently.
+    #[test]
+    fn a_peers_entry_without_a_member_id_is_refused() {
+        assert!(crate::pd::parse_peers("127.0.0.1:2379").is_err());
+        assert!(crate::pd::parse_peers("x@127.0.0.1:2379").is_err());
+        assert!(crate::pd::parse_peers("").unwrap().is_empty());
+    }
+
+    /// `--pd` takes the whole group, and one address still means one address — every existing
+    /// invocation has to keep working.
+    #[test]
+    fn a_server_takes_one_placement_driver_or_several() {
+        let Command::Server(one) = parse_ok(&["server", "--pd", "127.0.0.1:2379"]) else {
+            panic!("server did not parse");
+        };
+        assert_eq!(one.pd.as_deref(), Some("127.0.0.1:2379"));
+
+        let Command::Server(three) = parse_ok(&[
+            "server",
+            "--pd",
+            "127.0.0.1:2379,127.0.0.1:2380,127.0.0.1:2381",
+        ]) else {
+            panic!("server did not parse");
+        };
+        assert_eq!(
+            three.pd.as_deref(),
+            Some("127.0.0.1:2379,127.0.0.1:2380,127.0.0.1:2381")
+        );
     }
 
     #[test]

@@ -20,6 +20,10 @@ esker-engine.workspace = true
 # The wire: the Region/Peer/Epoch types the routing table stores, the encoder the
 # records are written with, and the typed error every method answers with.
 esker-proto.workspace = true
+# PD replicates itself: the same pure `RawNode` a region's peer is driven by
+# (docs/adr/0055-pd-is-a-raft-group.md). Read-only to this crate — PD drives it and
+# adds nothing to it.
+esker-raft.workspace = true
 # `mix64`, for minting a cluster id out of the one-time facts of a bootstrap.
 esker-base.workspace = true
 bytes.workspace = true
@@ -38,6 +42,9 @@ esker-pd = { path = ".", features = ["testing"] }
 # checker; this crate supplies the decision. Dev-only, so it is outside the runtime crate budget,
 # and `esker-sim` depends on nothing above `esker-raft`, so there is no cycle.
 esker-sim = { path = "../esker-sim" }
+# `tests/tso_window.rs`: the window's rule under a generator rather than under a script. Dev-only
+# and already on the allowlist (docs/adr/0003-dependencies.md).
+proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "time", "rt-multi-thread", "macros"] }
 

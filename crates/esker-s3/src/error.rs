@@ -57,6 +57,15 @@ pub enum Error {
     /// The configuration cannot be used as given.
     #[error("{0}")]
     Config(String),
+
+    /// A TLS session could not be established, or the server could not be trusted.
+    ///
+    /// Separate from [`Error::Io`] because it is separate to the *uploader*: a socket that broke
+    /// is worth waiting on, and a certificate that does not verify is a standing
+    /// misconfiguration that no amount of waiting fixes. `crate::tls` decides which of the two a
+    /// handshake failure was, and only the second lands here.
+    #[error("{0}")]
+    Tls(String),
 }
 
 impl Error {
@@ -73,7 +82,9 @@ impl Error {
             // *is* transient — but retrying it forever hides a wrong secret key, and the log
             // line is how an operator finds out.
             Self::Status { status, .. } => !matches!(status, 400 | 403 | 404 | 405),
-            Self::Config(_) => false,
+            // A wrong CA, a name the certificate does not cover, an expired chain: all of them
+            // are a wrong secret key's cousin, and retrying forever is how they stay unnoticed.
+            Self::Config(_) | Self::Tls(_) => false,
         }
     }
 
