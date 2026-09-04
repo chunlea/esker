@@ -1928,15 +1928,33 @@ impl Executor {
             let Expr::CatalogFunc(call) = expr else {
                 return;
             };
-            if call.func != CatalogFunc::RegClass {
-                return;
-            }
+            let asking = match call.func {
+                CatalogFunc::RegClass | CatalogFunc::ToRegClass => call.func,
+                _ => return,
+            };
             let Some(Expr::Literal(Literal::String(name))) = call.args.first() else {
-                failure.get_or_insert(SqlError::Internal(
-                    "a ::regclass whose argument is not a name".to_owned(),
-                ));
+                failure.get_or_insert(SqlError::Internal(format!(
+                    "{}() whose argument is not a name",
+                    asking.name()
+                )));
                 return;
             };
+            // **The same lookup, and the only difference is what a miss is.** `::regclass`
+            // raises `42P01`; `to_regclass` answers NULL, which is what it exists for — asking
+            // whether a relation is there without ending the transaction if it is not.
+            if asking == CatalogFunc::ToRegClass {
+                match self.relation_named(&mut relations, txn, name) {
+                    Ok(found) => {
+                        *expr = Expr::Literal(Literal::Typed(Box::new(
+                            found.map_or(Datum::Null, Datum::Text),
+                        )));
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+                return;
+            }
             match self.relation_oid(&mut relations, txn, name) {
                 Ok(oid) => *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(oid)))),
                 Err(error) => {
@@ -1949,6 +1967,38 @@ impl Executor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// The name a relation is known by, or `None` when nothing answers to that name.
+    ///
+    /// [`Self::relation_oid`]'s sibling, and deliberately the same lookup: `to_regclass` has to
+    /// find exactly what a bare reference would find, or it answers about a different relation
+    /// than the query it is guarding. What it does *not* share is the miss — absence is the
+    /// answer here, not an error.
+    ///
+    /// The name comes back in its **printed** form, which is the stored one with a schema
+    /// rendered as a dot: a `regclass` prints as a name on a real server, and this node's is that
+    /// name.
+    fn relation_named(
+        &self,
+        relations: &mut Option<crate::catalog::pg_relations::Relations>,
+        txn: &dyn Txn,
+        name: &str,
+    ) -> Result<Option<String>> {
+        if let Some(view) = crate::catalog::pg_catalog::view(name) {
+            return Ok(Some(view.name().to_owned()));
+        }
+        let stored = crate::catalog::parse_qualified(name);
+        let relations = match relations {
+            Some(relations) => relations,
+            slot => slot.insert(crate::catalog::pg_relations::Relations::read(
+                txn,
+                self.tenant,
+            )?),
+        };
+        Ok(relations
+            .by_name(&stored)
+            .map(|relation| crate::catalog::display_name(&relation.name)))
     }
 
     /// The oid of a relation by name, or `42P01`.

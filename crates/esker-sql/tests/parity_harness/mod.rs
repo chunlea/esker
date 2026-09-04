@@ -278,9 +278,32 @@ impl Node {
     }
 }
 
+/// What a replay saw: the statements it compared, and the statements it could not.
+pub(crate) struct Replay {
+    /// Statements compared against the oracle.
+    pub checked: usize,
+    /// Statements the aborted transaction swallowed, and therefore **nobody compared**.
+    ///
+    /// Reported so a corpus can say the number out loud. A refusal this node makes and PostgreSQL
+    /// does not aborts the transaction, and every line after it comes back `25P02` until the
+    /// `ROLLBACK` — so a gap in one feature hides whatever the rest of the file would have said
+    /// about the others. That is not hypothetical: `CREATE VIEW`'s arrival un-hid two bugs in
+    /// `drop_column` and `rename_column` that had been swallowed exactly this way for weeks.
+    pub swallowed: usize,
+}
+
 /// Replays a corpus over a fixture and asserts every line, holding the divergences from both
 /// sides. Answers how many statements ran, so a caller can assert the file loaded at all.
 pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) -> usize {
+    replay_reporting(corpus, fixture, divergences).checked
+}
+
+/// [`replay`], answering the swallowed count as well — for a corpus that has one and says so.
+pub(crate) fn replay_reporting(
+    corpus: &str,
+    fixture: &[&str],
+    divergences: &Divergences,
+) -> Replay {
     let mut node = Node::new(fixture);
     let mut checked = 0;
     let mut mismatched = Vec::new();
@@ -398,7 +421,10 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
         agreed_after_all.len(),
         agreed_after_all.join("\n")
     );
-    checked
+    Replay {
+        checked,
+        swallowed: cascaded,
+    }
 }
 
 /// The name `\gdesc` prints for an OID, which is the name [`PgType`] already knows.

@@ -147,6 +147,17 @@ pub enum CatalogView {
     PgIndexes,
     /// `pg_views`: one row per view, with the `SELECT` it stands for.
     PgViews,
+    /// The sessions this server is running, which is **the asking one and no other**.
+    ///
+    /// `migration_test.rb:1108` reads it to ask whether the connection that held an advisory lock
+    /// has gone away, and the whole view was `42P01` here until now. A real server's is
+    /// cluster-wide — one row per backend, in every database — and this node has no registry of
+    /// live sessions to build that from (the debt [ADR
+    /// 0052](../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)
+    /// names for `DROP DATABASE` is the same missing thing), so it reports the backend that is
+    /// asking. That row is **true**: it is `active`, because it is running the query that reads
+    /// the view, and its `datname` is the database it is serving.
+    PgStatActivity,
     /// The databases this server has, which is **one**.
     ///
     /// `ActiveRecord`'s adapter reads it three times while connecting — the encoding, the collation
@@ -191,7 +202,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 28] = [
+    pub const ALL: [CatalogView; 29] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -210,6 +221,7 @@ impl CatalogView {
         CatalogView::PgPartitionedTable,
         CatalogView::PgIndexes,
         CatalogView::PgViews,
+        CatalogView::PgStatActivity,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
         CatalogView::PgSequence,
@@ -245,6 +257,7 @@ impl CatalogView {
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
             CatalogView::PgIndexes => "pg_indexes",
             CatalogView::PgViews => "pg_views",
+            CatalogView::PgStatActivity => "pg_stat_activity",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
             CatalogView::PgSequence => "pg_sequence",
@@ -288,6 +301,7 @@ impl CatalogView {
                 // `'…'::regclass` over a sequence find this view instead, and eight tests that had
                 // nothing to do with views went red at once.
                 CatalogView::PgViews => 27,
+                CatalogView::PgStatActivity => 28,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
@@ -471,6 +485,36 @@ impl CatalogView {
                 ("viewowner", ColumnType::Text),
                 ("definition", ColumnType::Text),
             ],
+            // **All twenty-two, in a real server's order**, because `SELECT *` on this view is
+            // what a client writes and the column *after* the one it wanted has to be where it
+            // expects. Three of the types are ones this node does not have — `inet` for
+            // `client_addr`, `xid` for the two transaction columns, `name` for the two identifier
+            // ones — and each answers as the nearest thing it does have, the standing trade every
+            // `pg_catalog` column makes.
+            CatalogView::PgStatActivity => &[
+                ("datid", ColumnType::Oid),
+                ("datname", ColumnType::Text),
+                ("pid", ColumnType::Int4),
+                ("leader_pid", ColumnType::Int4),
+                ("usesysid", ColumnType::Oid),
+                ("usename", ColumnType::Text),
+                ("application_name", ColumnType::Text),
+                ("client_addr", ColumnType::Text),
+                ("client_hostname", ColumnType::Text),
+                ("client_port", ColumnType::Int4),
+                ("backend_start", ColumnType::TimestampTz),
+                ("xact_start", ColumnType::TimestampTz),
+                ("query_start", ColumnType::TimestampTz),
+                ("state_change", ColumnType::TimestampTz),
+                ("wait_event_type", ColumnType::Text),
+                ("wait_event", ColumnType::Text),
+                ("state", ColumnType::Text),
+                ("backend_xid", ColumnType::Int8),
+                ("backend_xmin", ColumnType::Int8),
+                ("query_id", ColumnType::Int8),
+                ("query", ColumnType::Text),
+                ("backend_type", ColumnType::Text),
+            ],
             // `partstrat` is a **one-letter code** and `partattrs` an `int2vector` — neither is
             // the word the DDL used, which `pg_get_partkeydef` gives instead.
             CatalogView::PgPartitionedTable => &[
@@ -570,6 +614,7 @@ impl CatalogView {
             CatalogView::PgPartitionedTable => partitioned_table_rows(txn, tenant),
             CatalogView::PgIndexes => indexes_rows(txn, tenant),
             CatalogView::PgViews => views_rows(txn, tenant),
+            CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
             CatalogView::InformationSchemaColumns => {
@@ -710,6 +755,7 @@ impl CatalogView {
             | CatalogView::PgIndexes
             // Catalog-backed like `pg_indexes`: `rows_of` answers for it before it delegates here.
             | CatalogView::PgViews
+            | CatalogView::PgStatActivity
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -1018,6 +1064,62 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
 /// **Not materialized views** — those are `pg_matviews` on a real server, and `pg_views` answers
 /// nothing for one (measured). This node has neither, so the distinction costs nothing to keep and
 /// would cost a wrong row to drop.
+/// One row: the session doing the asking.
+///
+/// **`datname` is the tenant's own name**, read from the directory rather than kept beside it —
+/// the oid *is* the id *is* the tenant (ADR 0052), so `WHERE datname = current_database()`
+/// matches this row by construction and cannot drift out of step with what `pg_database` says.
+///
+/// **`state` is `active` and not `idle`**, and that is the answer `migration_test.rb:1108` turns
+/// on: a backend that is running the query which reads the view is by definition not idle, so a
+/// view built out of the asking session alone reports no idle sessions, which is what a real
+/// server reports for a cluster where nobody else is connected. The test asks whether the
+/// connection that held an advisory lock has *gone*; both sides answer that it has.
+///
+/// The columns this node cannot know are NULL rather than invented. A NULL there is what a real
+/// server sends for a backend whose detail it will not show, so a client that reads one is on a
+/// path it already has; a `client_addr` of `127.0.0.1` or a `backend_start` of "now" would be a
+/// fact nobody measured.
+fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let datname = super::databases(txn)?
+        .into_iter()
+        .find(|(_, id)| *id == tenant)
+        .map(|(name, _)| name);
+    Ok(vec![vec![
+        Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX)),
+        datname.map_or(Datum::Null, Datum::Text),
+        // **A pid, because the column is an `integer` and a client filters on it.** This node has
+        // no backend processes to number, so the number is the one thing about the session that is
+        // already true and already unique: nothing else in `pg_stat_activity` is derived from a
+        // fact this node invented.
+        Datum::Int4(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
+        // Not a parallel worker: there are none, so no backend here has a leader.
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        Datum::Text(String::new()),
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        // Not waiting: a snapshot-isolated transaction does not block on another one, which is
+        // ADR 0031's permanent caveat and is why both wait columns are NULL rather than empty.
+        Datum::Null,
+        Datum::Null,
+        Datum::Text("active".to_owned()),
+        Datum::Null,
+        Datum::Null,
+        Datum::Null,
+        // The statement text is session state and `rows_of` is given a transaction and a tenant,
+        // not a session. NULL is what a real server sends when it will not show the query.
+        Datum::Null,
+        Datum::Text("client backend".to_owned()),
+    ]])
+}
+
 fn views_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     Ok(super::views(txn, tenant)?
         .into_iter()

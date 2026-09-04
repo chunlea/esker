@@ -786,6 +786,20 @@ pub enum CatalogFunc {
     /// `SELECT 'happy'::mood` prints `happy`; **the ordinal** everywhere else, so
     /// `'sad'::mood < 'happy'::mood` is `1 < 3` and is `t`.
     UserCast,
+    /// `to_regclass('name')`: the relation of that name, or **NULL** where a bare reference would
+    /// raise `42P01`.
+    ///
+    /// The supported way to ask whether a relation is there without an error, and not the same
+    /// question as `EXISTS (SELECT … FROM pg_class …)`: it walks the `search_path` exactly as a
+    /// reference does, so it answers about the relation the query would actually have found.
+    ///
+    /// **It answers the name, as [`CatalogFunc::RegClassName`] does**, and for the reason given
+    /// there: a `regclass` on a real server is an oid that *prints* as a name, this node has no
+    /// such type, and the name is what every text context sees. So `to_regclass(x) IS NULL` and
+    /// `to_regclass(x)::text` are both what a real server answers, and the declared type is where
+    /// the difference shows. Resolved once per statement like [`CatalogFunc::RegClass`], since its
+    /// argument is a literal.
+    ToRegClass,
     /// `pg_typeof(x)`: the name of the type `x` has.
     ///
     /// **Read from the value, not from the plan.** A real server answers the *static* type, and
@@ -922,6 +936,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
+            () if name.eq_ignore_ascii_case("to_regclass") => Some(CatalogFunc::ToRegClass),
             () if name.eq_ignore_ascii_case("pg_typeof") => Some(CatalogFunc::PgTypeof),
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
@@ -994,6 +1009,7 @@ impl CatalogFunc {
             CatalogFunc::ArrayUpper => "array_upper",
             CatalogFunc::ArrayLength => "array_length",
             CatalogFunc::Cardinality => "cardinality",
+            CatalogFunc::ToRegClass => "to_regclass",
             CatalogFunc::PgTypeof => "pg_typeof",
             CatalogFunc::Now => "now",
             CatalogFunc::CurrentDate => "current_date",
@@ -1051,6 +1067,7 @@ impl CatalogFunc {
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
+            | CatalogFunc::ToRegClass
             | CatalogFunc::IsEmpty
             | CatalogFunc::Cardinality
             | CatalogFunc::PgTypeof => &[1],
@@ -1086,6 +1103,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
+            | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
