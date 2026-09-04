@@ -688,6 +688,19 @@ pub enum SqlError {
     #[error("column \"{0}\" is in a primary key")]
     ColumnIsInPrimaryKey(String),
 
+    /// `RAISE NOTICE | WARNING | INFO '<text>'` inside a `DO` block: the raised text, verbatim.
+    ///
+    /// Its severity is the level that was written, which is the whole of what a client sees —
+    /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
+    /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
+    #[error("{message}")]
+    Raised {
+        /// The text between the quotes.
+        message: String,
+        /// `NOTICE`, `WARNING` or `INFO`, already read into a severity.
+        severity: Severity,
+    },
+
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
     #[error("{0} must not be negative")]
@@ -2049,6 +2062,11 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
+            // Measured: `RAISE NOTICE` carries `00000` and `RAISE WARNING` carries `01000`.
+            SqlError::Raised { severity, .. } => match severity {
+                Severity::Warning => sqlstate::WARNING,
+                _ => sqlstate::SUCCESSFUL_COMPLETION,
+            },
             SqlError::PermanentReferencesUnlogged
             | SqlError::OnCommitNotTemporary
             | SqlError::ColumnIsInPrimaryKey(_) => {
@@ -2247,6 +2265,7 @@ impl SqlError {
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
+            SqlError::Raised { severity, .. } => *severity,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock

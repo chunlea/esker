@@ -30,6 +30,13 @@ pub(super) fn create(
     // **One namespace for types and relations**, which is what makes the shared oid space honest:
     // a name that is already a table is `42710` here exactly as a duplicate type is.
     if catalog::type_by_name(txn, executor.tenant, &create.name)?.is_some() {
+        // **The `DO` block's guard, and the whole of what it does.** `create_enum` asks `pg_type`
+        // first and skips the `CREATE` when the type is there, so the second run is a success that
+        // changes nothing — the labels of the *first* run survive even when the second names
+        // different ones, which is measured (`pg19_do_create_enum.txt`).
+        if create.if_not_exists {
+            return Ok(Outcome::done("DO"));
+        }
         return Err(SqlError::DuplicateType(create.name.clone()));
     }
     let oid = catalog::allocate_id(txn, executor.tenant)?;
