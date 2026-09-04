@@ -1,0 +1,261 @@
+Cargo.lock
+  s_555c5659f0909b::t_575f482ea622cd 63,74,136-145,313,413,415,452-453,483-484,535-540,677-686,822,837,1052-1065,1076-1119,1180-1185,1221,1294-1299,1332,1389,1474-1479,1513-1521,1531-1594,1621-1626
+Cargo.toml
+  s_555c5659f0909b::t_e9c34d171914f5 25-37
+crates/esker-cli/src/args.rs
+  s_555c5659f0909b::t_37f0710ea1d65e 34,135,273-277,287-292,300-304,306,850,873-888,890-892,905,1343-1425
+crates/esker-cli/src/pd.rs
+  s_555c5659f0909b::t_92e510c00cc39c 16,37-54,79-90,98-99,104-128,156-159,163-227,303-315,322-340,342-343,355-363,395-433,439,468-473,491-497
+crates/esker-cli/src/server.rs
+  s_555c5659f0909b::t_359f5212cb3205 150-162,273-274
+crates/esker-cli/src/sst_store.rs
+  s_555c5659f0909b::t_5b4f420f9704ef 14-21,67-73,100,102,104-105,137,139,141-143,199-203
+crates/esker-cli/tests/tier_acceptance.rs
+  s_555c5659f0909b::t_6923ca90f081ec 780-833,842,853-859
+crates/esker-client/src/region_cache.rs
+  s_555c5659f0909b::t_7f444736303c7a 58-60
+crates/esker-client/src/tcp.rs
+  s_555c5659f0909b::t_6a6e29437bd980 50-52
+crates/esker-client/src/transport.rs
+  s_555c5659f0909b::t_53f2a439baaf91 19-22
+crates/esker-client/src/wire.rs
+  s_555c5659f0909b::t_b22dcc94e48cd7 147-150
+crates/esker-engine/src/db/ingest.rs
+  s_555c5659f0909b::t_faba976d9c76b8 8,10-11,13-20,22,24-60,66,69-71,74-116,121-126,128-129,143,146-154,191,215,217-227,230-242,244,248-311,313-357,369
+crates/esker-engine/src/db/iter.rs
+  s_555c5659f0909b::t_a017d39e241c26 38,374-387,389-415,419,437-438,444,458,460,463-481,484,489,496
+crates/esker-engine/tests/checkpoint.rs
+  s_555c5659f0909b::t_f1b7f8b454432b 310-311
+crates/esker-engine/tests/ingest_overlap.proptest-regressions
+  s_555c5659f0909b::t_a588e6a842c757 1-9
+crates/esker-engine/tests/ingest_overlap.rs
+  s_555c5659f0909b::t_a90e008f8682c4 1-210
+crates/esker-pd/Cargo.toml
+  s_555c5659f0909b::t_264d8452313a77 23-26,45-47
+crates/esker-pd/src/command.rs
+  s_555c5659f0909b::t_ed64c82b5f2afa 1-418
+crates/esker-pd/src/driver.rs
+  s_555c5659f0909b::t_72b5e5acb9383e 1-966
+crates/esker-pd/src/error.rs
+  s_555c5659f0909b::t_27f67161560f59 44-57,111-117,133-134,151-157,178-181
+crates/esker-pd/src/inspect.rs
+  s_555c5659f0909b::t_10d47e6e481b6d 1-268
+crates/esker-pd/src/lib.rs
+  s_555c5659f0909b::t_af9012f8eab7f1 24-28,33,35-36,38-42,49-50,52,54-55,58,63,68-69,71-73,80
+crates/esker-pd/src/machine.rs
+  s_555c5659f0909b::t_3679602676d12d 1-692
+crates/esker-pd/src/member.rs
+  s_555c5659f0909b::t_a1b6fcc09c4cc2 1-285
+crates/esker-pd/src/pd/mod.rs
+  s_555c5659f0909b::t_3827e2d24d6208 38-39,41,45-46,48-49,51-52,186-198,235-238,243-256,322-333,347-354,357-362,409-414,419-428,434-472,474-478,483-487,497-501,524,529,535-630,659,661-663,665-666,668-672,674,676-683,691-693,703-704,707,712,722-734,740-741,840-844,849-851,853-855,874-888,890-904,911-927,935,971-975,977-981,1006-1099,1116-1127,1130-1135,1138-1149
+crates/esker-pd/src/pd/repair.rs
+  s_555c5659f0909b::t_93841f89dd8f52 16,179,223,361,403-404,406-407,418-419
+crates/esker-pd/src/raft_log.rs
+  s_555c5659f0909b::t_f83e6a9dfe5c9c 1-865
+crates/esker-pd/src/record.rs
+  s_555c5659f0909b::t_86217ca944253d 522-557,582,594
+crates/esker-pd/src/service.rs
+  s_555c5659f0909b::t_da8af7438f83e5 8-10,13,40-72,75-81,109-125,142-154,156-164,167-198,281-285
+crates/esker-pd/src/transport.rs
+  s_555c5659f0909b::t_12de668229b816 1-284
+crates/esker-pd/tests/failover.rs
+  s_555c5659f0909b::t_2881aebf1c11e2 1-901
+crates/esker-pd/tests/tso_window.proptest-regressions
+  s_555c5659f0909b::t_ef71991d8c95d4 1-7
+crates/esker-pd/tests/tso_window.rs
+  s_555c5659f0909b::t_e50409dc81b2b4 1-213
+crates/esker-proto/src/error.rs
+  s_555c5659f0909b::t_6f896a14b0500a 66-67,70,89,126-146,325,357,397-403,457-463,521-524,711-714,825-846
+crates/esker-proto/src/lib.rs
+  s_555c5659f0909b::t_67e804817e598a 60-61
+crates/esker-proto/src/messages.rs
+  s_555c5659f0909b::t_b5c55fb5a729c5 88-104,186,206-207,254-255,313-314,1562-1564
+crates/esker-proto/src/pd.rs
+  s_555c5659f0909b::t_394b224fe259aa 34-35,429-533,576-584,684-685,724-725,772-773,803-814,936-937,947,991-1001,1051-1072
+crates/esker-proto/src/raft.rs
+  s_555c5659f0909b::t_16a462d0aefb88 154-159,264-265
+crates/esker-proto/tests/golden/messages.hex
+  s_555c5659f0909b::t_0549dc34715822 39-41,60-62,97-98
+crates/esker-proto/tests/messages.rs
+  s_555c5659f0909b::t_c05bdd45a9501e 16-18,85-91,111-117,120,123-131,134-135,137,139-140,143-152,180-213,261-262,729-769,978-980,1111-1127
+crates/esker-s3/Cargo.toml
+  s_555c5659f0909b::t_d6a7a67c115531 17-32
+crates/esker-s3/src/client.rs
+  s_555c5659f0909b::t_57d64e519ec1cd 20,36-40,44,46-49,51-66,68,86,94,98-102,105,137-142,195,216-224,227-231,235-253,639-641,646,653-683,690-691
+crates/esker-s3/src/error.rs
+  s_555c5659f0909b::t_9e10f4fe2646c9 60-68,85-87
+crates/esker-s3/src/lib.rs
+  s_555c5659f0909b::t_54af4c26717cf9 35,43
+crates/esker-s3/src/tls.rs
+  s_555c5659f0909b::t_271f006799f64a 1-597
+crates/esker-s3/src/transport.rs
+  s_555c5659f0909b::t_dd1a89569ac4a8 181-194,212,228-229
+crates/esker-s3/tests/fixtures/README.md
+  s_555c5659f0909b::t_97bad6f28d1050 1-55
+crates/esker-s3/tests/fixtures/ca-cert.pem
+  s_555c5659f0909b::t_f4569817524e90 1-11
+crates/esker-s3/tests/fixtures/localhost-cert.pem
+  s_555c5659f0909b::t_7b437ad563330d 1-12
+crates/esker-s3/tests/fixtures/localhost-key.pem
+  s_555c5659f0909b::t_344fd35e0a20d7 1-5
+crates/esker-s3/tests/fixtures/other-ca-cert.pem
+  s_555c5659f0909b::t_41381ad3499f58 1-11
+crates/esker-s3/tests/fixtures/wrong-name-cert.pem
+  s_555c5659f0909b::t_b3138840bbd655 1-12
+crates/esker-s3/tests/fixtures/wrong-name-key.pem
+  s_555c5659f0909b::t_5f153051c93223 1-5
+crates/esker-s3/tests/https.rs
+  s_555c5659f0909b::t_3e007542202fde 1-607
+crates/esker-sim/tests/raft_snapshot.rs
+  s_555c5659f0909b::t_b0f7efda9db0d7 163-166
+crates/esker-sql/Cargo.toml
+  s_555c5659f0909b::t_b7de2accf44ca6 33-37,45-54
+crates/esker-sql/src/backend/mod.rs
+  s_555c5659f0909b::t_8a3fa9d1338c2f 137-143,419-423
+crates/esker-sql/src/bin/esker-sql.rs
+  s_555c5659f0909b::t_8813c66a1782ee 25,88-89,91,95,202-237,254-257,266-267,269-270,272-300,309-310
+crates/esker-sql/src/error.rs
+  s_555c5659f0909b::t_74d3db672eeb98 223-254,723-762,2124-2128,2142-2144,2204-2206,2295-2299,2335,2490-2494
+crates/esker-sql/src/exec/aggregate.rs
+  s_555c5659f0909b::t_1dab24e22994a5 265-276,446-449,598-676,694-698,702-710,712,722,739-740,744,749,757-758,761,765,767,775,778
+crates/esker-sql/src/exec/bind.rs
+  s_555c5659f0909b::t_b7585d5dbd363c 234,768,982,1068
+crates/esker-sql/src/exec/cursor.rs
+  s_555c5659f0909b::t_7670c41de4ffc7 1300-1301,1304,1387-1407,1409-1410,1414-1419,1421,2110,2115,2724-2733,2737-2740
+crates/esker-sql/src/exec/ddl.rs
+  s_555c5659f0909b::t_1f0d5fe0ed6bba 646-842,3720-3724,3830-3840
+crates/esker-sql/src/exec/mod.rs
+  s_555c5659f0909b::t_3982dd6da938c2 634-642,689-691,2448
+crates/esker-sql/src/exec/query.rs
+  s_555c5659f0909b::t_5a97c4255dafd5 176-200
+crates/esker-sql/src/exec/typedef.rs
+  s_555c5659f0909b::t_68a058aa0fb927 33-39
+crates/esker-sql/src/parse/lower.rs
+  s_555c5659f0909b::t_b92c15b352bf6a 91-98,117-121,835,926-943,2063-2094,3045-3091,3213-3220,3223-3224,4510-4570,6192-6213,6313-6323,6896-6901
+crates/esker-sql/src/parse/mod.rs
+  s_555c5659f0909b::t_6fcc7656b3e4d7 260-270,290-306,374-384,397-398,404-782,1740-1755,1898-1921
+crates/esker-sql/src/pgwire/mod.rs
+  s_555c5659f0909b::t_5d195bb5fd1b09 26
+crates/esker-sql/src/pgwire/server.rs
+  s_555c5659f0909b::t_e1e01032d75627 15,24,53-58,67,104,129-132,151-158,166,282-291,293,402-407,409-410,412,440,481-608,635
+crates/esker-sql/src/pgwire/tls.rs
+  s_555c5659f0909b::t_0d71a19288c668 1-681
+crates/esker-sql/src/plan/ddl.rs
+  s_555c5659f0909b::t_f67a1f453c3805 562-567,850-871
+crates/esker-sql/src/plan/mod.rs
+  s_555c5659f0909b::t_ce1dfff58aae65 68-80,251-254,269-270
+crates/esker-sql/src/plan/session.rs
+  s_555c5659f0909b::t_fc08adfd17eee0 21-27,83
+crates/esker-sql/src/value/range.rs
+  s_555c5659f0909b::t_3129445bfe20fb 37-48,50,115-118,129-130,133,139,142,149-153,166-169,174,299-303,307
+crates/esker-sql/tests/alter_column_type.rs
+  s_555c5659f0909b::t_9f03a266bb4929 1-105
+crates/esker-sql/tests/between.rs
+  s_555c5659f0909b::t_0dbc3c41c7d64b 1-57
+crates/esker-sql/tests/boolean_argument.rs
+  s_555c5659f0909b::t_c1c9d196d70fcf 1-44
+crates/esker-sql/tests/corpus/pg19_alter_column_type.txt
+  s_555c5659f0909b::t_38e54b64d1da30 1-132
+crates/esker-sql/tests/corpus/pg19_between.txt
+  s_555c5659f0909b::t_8f6582f37b866e 1-56
+crates/esker-sql/tests/corpus/pg19_boolean_argument.txt
+  s_555c5659f0909b::t_a65aaf92ffb398 1-65
+crates/esker-sql/tests/corpus/pg19_crossed_bounds.txt
+  s_555c5659f0909b::t_c8a3930ff00a4f 1-42
+crates/esker-sql/tests/corpus/pg19_do_block.txt
+  s_555c5659f0909b::t_540fb2d71754f3 1-77
+crates/esker-sql/tests/corpus/pg19_do_create_enum.txt
+  s_555c5659f0909b::t_9afb3c2f3fa9a1 1-86
+crates/esker-sql/tests/corpus/pg19_group_by_key.txt
+  s_555c5659f0909b::t_95edc30a06fe0e 1-62
+crates/esker-sql/tests/corpus/pg19_set_session.txt
+  s_555c5659f0909b::t_38d3c1e3f159f0 1-70
+crates/esker-sql/tests/crossed_bounds.rs
+  s_555c5659f0909b::t_4cd33449e6fba1 1-70
+crates/esker-sql/tests/do_block.rs
+  s_555c5659f0909b::t_182e3d6a915f65 1-200
+crates/esker-sql/tests/enum_value.rs
+  s_555c5659f0909b::t_017c2583d2e762 140-145
+crates/esker-sql/tests/fixtures/README.md
+  s_555c5659f0909b::t_e8a8e7bd1dea9a 1-29
+crates/esker-sql/tests/fixtures/ca-cert.pem
+  s_555c5659f0909b::t_0639ffa27b58a7 1-11
+crates/esker-sql/tests/fixtures/localhost-test-cert.pem
+  s_555c5659f0909b::t_8d6525c2ef9ee6 1-12
+crates/esker-sql/tests/fixtures/localhost-test-key.pem
+  s_555c5659f0909b::t_90005e728b75ec 1-5
+crates/esker-sql/tests/group_by_key.rs
+  s_555c5659f0909b::t_77d8ab2d601e36 1-34
+crates/esker-sql/tests/lowering.rs
+  s_555c5659f0909b::t_a94f0302014e4c 196-198,200-201
+crates/esker-sql/tests/pgwire_tls.rs
+  s_555c5659f0909b::t_51a99bd6ac507d 1-545
+crates/esker-sql/tests/set_session.rs
+  s_555c5659f0909b::t_421f6dd06ea631 1-76
+crates/esker-sql/tests/slt/unsupported.slt
+  s_555c5659f0909b::t_e9459e2e50bae9 106-108,110
+crates/esker-store/src/lib.rs
+  s_555c5659f0909b::t_430e21ae3d4c05 107-123,125
+crates/esker-store/src/meta.rs
+  s_555c5659f0909b::t_73d6b4537ccbf0 43,160-162,240-317,320-325
+crates/esker-store/src/pd_remote.rs
+  s_555c5659f0909b::t_9cd2f664c38a0d 33-51,55,57,76-93,97-101,117,120,122-139,141-152,154-155,161,164-192,195-209,211-248,273,294-302,313-316,348-360,370-375,395,398-403,408,412,414-416,422,425
+crates/esker-store/src/peer.rs
+  s_555c5659f0909b::t_efc98977154106 351-353,2602-2641,2643-2645,2663,2667-2670,2672-2677,2681-2686
+crates/esker-store/src/raft_log.rs
+  s_555c5659f0909b::t_fce24722a22880 38,96-104,178-191,217-223,289-292
+crates/esker-store/src/regions.rs
+  s_555c5659f0909b::t_03ec7885dc1874 42-45,279-284
+crates/esker-store/src/server.rs
+  s_555c5659f0909b::t_b93a092b7aa8ff 266,268,317-475,642-646,944-969,971-975,994-997,1004-1007,1009-1012,1018,1020,1022-1032,1034-1036
+crates/esker-store/src/snapshot.rs
+  s_555c5659f0909b::t_a623050bade492 25-28
+crates/esker-store/tests/pd_client.rs
+  s_555c5659f0909b::t_eb085170d72739 114-127
+crates/esker-store/tests/retire.rs
+  s_555c5659f0909b::t_5c29d1abe0d77b 18-27,58-68,493-819
+crates/esker-store/tests/retire_crash_kill.rs
+  s_555c5659f0909b::t_4ccf67263971d2 1-266
+deny.toml
+  s_555c5659f0909b::t_0751594c923408 12-37
+docs/DESIGN.md
+  s_555c5659f0909b::t_0ec8cfedf1bb60 78,84,89-99,110-113,123-124,413-416,423-429,493-540,666-672,737-747,803-808,868-894,971-977
+docs/adr/0003-dependencies.md
+  s_555c5659f0909b::t_eb0906e3b7e1be 32-80,112-115
+docs/adr/0025-s3-transport-and-tls.md
+  s_555c5659f0909b::t_aa99bb701ba0c4 122-153
+docs/adr/0055-the-tls-options-across-three-surfaces-measured.md
+  s_555c5659f0909b::t_3f8fad579c44a2 3-10,296-377
+docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md
+  s_555c5659f0909b::t_da1f6d1451f2d6 1-126
+docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md
+  s_555c5659f0909b::t_1193824dc6afb2 1-294
+docs/adr/0058-a-do-block-is-two-templates-not-a-language.md
+  s_555c5659f0909b::t_141a4d168f51a2 1-93
+docs/adr/0059-pd-is-a-raft-group.md
+  s_555c5659f0909b::t_ecb6d7e38f4e04 1-191
+docs/adr/0060-a-using-clause-is-a-licence-not-an-expression.md
+  s_555c5659f0909b::t_39cfb37c8fdd08 1-74
+docs/plans/debt-c6.md
+  s_555c5659f0909b::t_8096dca1a845b3 1-511
+docs/plans/phase-15-pd-ha.md
+  s_555c5659f0909b::t_71c15694c251ef 1-445
+docs/plans/phase-9-rails.md
+  s_555c5659f0909b::t_cea389bac8d65b 1323-1326,1590-1593
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2ea9499ce8551d253858e13eed2003ceb787489b",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
