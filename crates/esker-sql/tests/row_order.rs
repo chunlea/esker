@@ -86,6 +86,7 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
 fn column_type(name: &str) -> ColumnType {
     match name {
         "int8" => ColumnType::Int8,
+        "citext" => ColumnType::Citext,
         "int4" => ColumnType::Int4,
         "int2" => ColumnType::Int2,
         "text" => ColumnType::Text,

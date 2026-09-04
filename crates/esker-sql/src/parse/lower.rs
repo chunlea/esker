@@ -2833,6 +2833,27 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 // arguments. Which type they are *for* is decided when they are evaluated, so
                 // `||` over anything but two hstores still gets the refusal it has today rather
                 // than a wrong answer.
+                // **`~~` and friends are `LIKE` spelled as operators**, which is what
+                // `ActiveRecord` writes for a citext match and what `citext_test.rb` reads. One
+                // lowering for both spellings, so the folding rule has one home.
+                op @ (BinaryOperator::PGLikeMatch
+                | BinaryOperator::PGILikeMatch
+                | BinaryOperator::PGNotLikeMatch
+                | BinaryOperator::PGNotILikeMatch) => {
+                    return Ok(plan::Expr::Like {
+                        operand: Box::new(lower_expr(left)?),
+                        pattern: Box::new(lower_expr(right)?),
+                        negated: matches!(
+                            op,
+                            BinaryOperator::PGNotLikeMatch | BinaryOperator::PGNotILikeMatch
+                        ),
+                        case_insensitive: matches!(
+                            op,
+                            BinaryOperator::PGILikeMatch | BinaryOperator::PGNotILikeMatch
+                        ),
+                        escape: None,
+                    });
+                }
                 BinaryOperator::Arrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreFetch,
@@ -5707,6 +5728,12 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("hstore") =>
         {
             ColumnType::Hstore
+        }
+        // `citext`, the other extension type, by the same road and for the same reason.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("citext") =>
+        {
+            ColumnType::Citext
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

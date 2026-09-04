@@ -245,6 +245,8 @@ const TAG_TEXT_ARRAY: u8 = 24;
 /// one type as another — read the constants, do not count the lines.
 const TAG_HSTORE: u8 = 26;
 const TAG_HSTORE_ARRAY: u8 = 27;
+/// The `citext` extension's type. 28, checked against the constants above rather than counted.
+const TAG_CITEXT: u8 = 28;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -296,6 +298,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Jsonb => TAG_JSONB,
         ColumnType::Hstore => TAG_HSTORE,
         ColumnType::HstoreArray => TAG_HSTORE_ARRAY,
+        ColumnType::Citext => TAG_CITEXT,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -371,6 +374,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_JSONB => ColumnType::Jsonb,
         TAG_HSTORE => ColumnType::Hstore,
         TAG_HSTORE_ARRAY => ColumnType::HstoreArray,
+        TAG_CITEXT => ColumnType::Citext,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,

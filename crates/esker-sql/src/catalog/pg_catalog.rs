@@ -845,7 +845,8 @@ fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
 /// lowering, which has no catalog to ask (`crate::parse::lower`), and every statement the suite
 /// sends installs the extension first — so it is a gap nothing measured reaches, recorded here
 /// rather than in a divergence nothing would exercise.
-const AVAILABLE_EXTENSIONS: [(&str, &str); 4] = [
+const AVAILABLE_EXTENSIONS: [(&str, &str); 5] = [
+    ("citext", "1.8"),
     ("hstore", "1.8"),
     ("pgcrypto", "1.4"),
     ("plpgsql", "1.0"),
@@ -1385,6 +1386,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Hstore => "hstore",
+        ColumnType::Citext => "citext",
         ColumnType::HstoreArray => "_hstore",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
@@ -1417,7 +1419,9 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Numeric
         // A number, and PostgreSQL groups it with them despite being an identifier.
         | ColumnType::Oid => "N",
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => "S",
+        // **`S` for citext too**, measured: it is a string type to the adapter, which is how it
+        // is told apart from hstore's `U` in the boot type-map query.
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => "S",
         ColumnType::Bool => "B",
         ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
             "D"
@@ -1470,6 +1474,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
+        ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
         ColumnType::TimestampTz => "timestamptz_in",

@@ -9,6 +9,12 @@
 # that tied values encode to identical bytes, which is the stronger property anyway: a unique
 # index would admit both copies otherwise.
 #
+# `citext` is here for the same reason and captured the same way, with one extra step: its key is
+# the **folded** value, so the fixture is `ORDER BY lower(v::text) COLLATE "C"` — which is what this
+# node's key encoding is, written as SQL. Under the container's own `en_US.utf8` a citext sorts `~`
+# second, and byte order does not; that is the *same* recorded divergence `text` has below and not
+# a second one.
+#
 # `text` was sorted with `COLLATE "C"`, deliberately. The container's database collation is
 # `en_US.utf8`, under which `a` sorts before `B`; ours is byte order, under which it does not.
 # That is a recorded divergence, not an oversight -- see `crate::row` for why a pure-Rust project
@@ -50,3 +56,4 @@ int4[]	{}	{-1}	{0}	{1,2}	{1,2,3}	{{1,2},{3,4}}	{1,NULL,3}
 int2[]	{}	{-1}	{0}	{1,2}	{1,2,3}	{{1,2},{3,4}}	{1,NULL,3}
 numeric[]	{}	{0.0}	{1.00}	{1.0}	{1,2}	{1.5}	{NaN}
 text[]	{}	{""}	{a}	{a,b}	{"a b"}	{b}	{NULL}
+citext		_a	A	a	a b	AB	ab	B	b	~	É	é
