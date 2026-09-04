@@ -259,8 +259,10 @@ fn not_null_without_a_default_depends_on_whether_there_are_rows() {
     // **Empty: the column is added.** There is no row to hold a NULL, so there is nothing to
     // refuse — and every test in the suite that sends this adds to an empty table.
     let mut empty = Node::new();
-    empty.run("CREATE TABLE e (id int8 PRIMARY KEY)");
-    empty.run("ALTER TABLE e ADD COLUMN n int8 NOT NULL");
+    empty.run("CREATE TABLE e (id int8 PRIMARY KEY)").unwrap();
+    empty
+        .run("ALTER TABLE e ADD COLUMN n int8 NOT NULL")
+        .unwrap();
     // And the column really is `NOT NULL` afterwards, which is what makes the next insert fail.
     let error = empty.fails("INSERT INTO e (id) VALUES (1)");
     assert_eq!(error.sqlstate(), "23502");

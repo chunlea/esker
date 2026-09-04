@@ -656,7 +656,7 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         // name: each narrows *what* is emptied, and emptying more than was asked is the wrong
         // answer in the one direction that cannot be undone.
         Statement::Truncate(truncate) => {
-            refuse_if(!truncate.partitions.is_none(), "TRUNCATE ... PARTITION")?;
+            refuse_if(truncate.partitions.is_some(), "TRUNCATE ... PARTITION")?;
             refuse_if(truncate.on_cluster.is_some(), "TRUNCATE ... ON CLUSTER")?;
             refuse_if(truncate.if_exists, "TRUNCATE ... IF EXISTS")?;
             for target in &truncate.table_names {
