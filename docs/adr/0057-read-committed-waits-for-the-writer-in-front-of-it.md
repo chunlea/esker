@@ -4,11 +4,18 @@ Status: accepted (the wire change alone is held for the human) · Date: 2026-09-
 
 ## Context
 
-Run 54 measured **74 of 120 tests** in the transaction and locking family stopping on
-`40001 could not serialize access due to concurrent update` where PostgreSQL simply waits and
-proceeds: `locking_test.rb`, `transactions_test.rb`, `transaction_isolation_test.rb`, pessimistic
-locking, counter caches, optimistic locking. It is the largest Rails-facing item left, and it is
-not a missing feature — it is the wrong *isolation level*.
+Run 54's concurrency probe — three writers contending for one row — measured **74 of 120 attempts**
+raising `40001 could not serialize access due to concurrent update` where PostgreSQL simply waits
+and proceeds. That is the shape of the problem; it is **not** a test count, and the difference
+matters to anyone reading this to decide whether the unit is worth its cost. The suite-visible
+number is smaller: run 59's locking family is **261 runs, 5 failures, 4 errors**, and about nine of
+those are this — `test_transaction_per_thread`, `test_transaction_isolation__read_committed`, the
+deadlock and serialization cases in `transaction_nested_test`, and `FOR SHARE NOWAIT` in
+`locking_test.rb`.
+
+So the honest framing is two numbers, not one. The suite moves by ~9 tests; the *probe* moves from
+74/120 to 0/120, and it is the probe that says whether an application under real contention can use
+this node at all. It is not a missing feature — it is the wrong *isolation level*.
 
 This node is Percolator: optimistic, snapshot-isolated, first-committer-wins. A writer that meets
 another writer's lock backs off while the lock is alive, and when its budget runs out it answers
@@ -288,7 +295,22 @@ Docs: this ADR, `docs/DESIGN.md` §8, `docs/plans/phase-9-rails.md`.
 
 ## The measure
 
-Run 54: **74 of 120** tests in the locking family stopped on `40001`. r1 re-runs the family after
-unit 4 and the number goes in `docs/plans/phase-9-rails.md` beside the before. A unit that moves it
-by less than it costs in blocked threads is a unit to reconsider, and the plan row will say which
-it was.
+**Two numbers, and both go in `docs/plans/phase-9-rails.md` beside their before.**
+
+* **The suite**: run 59's locking family is 261 runs / 5 failures / 4 errors. About nine tests are
+  this unit's — `test_transaction_per_thread`, `test_transaction_isolation__read_committed`, the
+  deadlock and serialization cases in `transaction_nested_test`, `FOR SHARE NOWAIT` in
+  `locking_test.rb`. **Two of them will stay red on purpose**: the `test_*Serialization*` cases in
+  `transaction_nested_test` need real serializability, and SERIALIZABLE is served as snapshot
+  isolation here (declared above). A measure that counted them as failures of this unit would be
+  measuring the wrong thing.
+* **The probe**: run 54's three-writers-one-row contention, 74 of 120 attempts raising `40001`,
+  should be 0 of 120. This is the number that says whether an application under real contention can
+  use this node, and it is the one worth the unit.
+
+r1 runs both after unit 5. The probe needs a **two-session instrument** — `two-server-replay.rb` is
+single-session — so that is a request to make of r1 through the coordinator when unit 6 is reached,
+not something to discover then.
+
+A unit that moves neither by more than it costs in blocked threads is a unit to reconsider, and the
+plan row will say which it was.
