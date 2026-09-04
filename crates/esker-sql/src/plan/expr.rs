@@ -1521,7 +1521,9 @@ impl Literal {
                 // A number or a boolean is not an hstore literal, and a real server says so with the
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
-                | ColumnType::HstoreArray => mismatch(),
+                | ColumnType::HstoreArray
+                // A number or a boolean is not a citext literal either.
+                | ColumnType::Citext => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1590,7 +1592,9 @@ impl Literal {
                 // A number or a boolean is not an hstore literal, and a real server says so with the
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
-                | ColumnType::HstoreArray => mismatch(),
+                | ColumnType::HstoreArray
+                // A number or a boolean is not a citext literal either.
+                | ColumnType::Citext => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1633,7 +1637,9 @@ impl Literal {
                 // A number or a boolean is not an hstore literal, and a real server says so with the
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
-                | ColumnType::HstoreArray => mismatch(),
+                | ColumnType::HstoreArray
+                // A number or a boolean is not a citext literal either.
+                | ColumnType::Citext => mismatch(),
             },
         }
     }

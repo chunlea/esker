@@ -636,7 +636,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::NumericArray
         | Row::TextArray
         | Row::Hstore
-        | Row::HstoreArray => {
+        | Row::HstoreArray
+        | Row::Citext => {
             return None;
         }
     })
@@ -649,7 +650,9 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // An array never reaches this: `column_type` refuses the column, so no fragment is built
         // over one. `Null` rather than a panic — a total function over a value vocabulary, where
         // a wrong *answer* would be a filter that silently matched.
-        Datum::Null | Datum::Array(_) => Value::Null,
+        // A citext never reaches this either — the column is refused above, for the same reason
+        // an array is: this vocabulary has no way to carry a comparison that folds.
+        Datum::Null | Datum::Array(_) | Datum::Citext(_) | Datum::Hstore(_) => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),

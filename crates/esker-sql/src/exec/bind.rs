@@ -1011,6 +1011,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Hstore => {
             Datum::Text(String::new())
         }
+        ColumnType::Citext => Datum::Citext(String::new()),
         // The empty string is not a document, so a `json` placeholder is the smallest one that
         // is. It only ever stands in for a type while a `Describe` is answered.
         ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),

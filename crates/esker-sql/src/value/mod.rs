@@ -74,6 +74,21 @@ const VARHDRSZ: i32 = 4;
 /// No typmod: the number a column declared without one carries.
 pub const NO_TYPMOD: i32 = -1;
 
+/// The text-shaped types' binary wire form, which is the text itself.
+///
+/// A citext keeps its spelling and answers a [`Datum::Citext`], because the folding is the
+/// comparison's and a comparison sees only values.
+fn binary_text(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
+    let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
+        let at = error.utf8_error().valid_up_to();
+        SqlError::InvalidByteSequence(error.as_bytes().get(at).copied().unwrap_or(0))
+    })?;
+    Ok(match ty {
+        ColumnType::Citext => Datum::Citext(text),
+        _ => Datum::Text(text),
+    })
+}
+
 /// `hstore`'s oid, and its array's.
 ///
 /// **Chosen in the user-oid range** (PostgreSQL's own fixed types stop below 16384), because that
@@ -84,6 +99,10 @@ pub const NO_TYPMOD: i32 = -1;
 pub const HSTORE_OID: u32 = 16400;
 /// See [`HSTORE_OID`].
 pub const HSTORE_ARRAY_OID: u32 = 16401;
+/// `citext`'s oid, and the array type this node does not build. See [`HSTORE_OID`].
+pub const CITEXT_OID: u32 = 16402;
+/// See [`CITEXT_OID`].
+pub const CITEXT_ARRAY_OID: u32 = 16403;
 
 /// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
 ///
@@ -438,6 +457,11 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // it installs them, so their oids are above 16384 and differ per database; fixed ones here
         // are invisible to a client that reads them the way `ActiveRecord` does — by `typname`.
         ColumnType::Hstore => HSTORE_ARRAY_OID,
+        // **No `citext[]` here.** `citext_test.rb` never declares one and a real server's
+        // `typarray` is non-zero, which the corpus reads as a boolean rather than a number — so
+        // `0` would be a wrong answer there. `CITEXT_ARRAY_OID` is reserved and reported, and the
+        // array type itself is not built.
+        ColumnType::Citext => CITEXT_ARRAY_OID,
         ColumnType::Jsonb => 3807,
     }
 }
@@ -527,7 +551,8 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::TextArray
         // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
         | ColumnType::Hstore
-        | ColumnType::HstoreArray => false,
+        | ColumnType::HstoreArray
+        | ColumnType::Citext => false,
     }
 }
 
@@ -629,6 +654,7 @@ impl PgType for ColumnType {
             ColumnType::Json => 114,
             ColumnType::Jsonb => 3802,
             ColumnType::Hstore => HSTORE_OID,
+            ColumnType::Citext => CITEXT_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
@@ -660,6 +686,7 @@ impl PgType for ColumnType {
             ColumnType::NumericArray => "numeric[]",
             ColumnType::TextArray => "text[]",
             ColumnType::Hstore => "hstore",
+            ColumnType::Citext => "citext",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
@@ -702,6 +729,7 @@ impl PgType for ColumnType {
             // adapter's own boot query.
             ColumnType::Hstore
             | ColumnType::HstoreArray
+            | ColumnType::Citext
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -783,7 +811,9 @@ impl PgDatum for Datum {
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
-            Datum::Text(v) => v.clone(),
+            // **As written**: what a client is sent is the spelling that was stored, never the
+            // folded form the key holds.
+            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => v.clone(),
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
             Datum::Bool(v) => (if *v { "t" } else { "f" }).to_string(),
@@ -849,7 +879,9 @@ impl PgDatum for Datum {
             ColumnType::Jsonb => Datum::Text(json::canonicalise(text)?),
             // Read and written back **canonical**, the same road `jsonb` takes: the stored form is
             // what the type prints, so equality and ordering are the text's (`crate::value::hstore`).
-            ColumnType::Hstore => Datum::Text(hstore::to_text(&hstore::from_text(text)?)),
+            ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
+            // **As written.** The folding is the comparison's, so nothing here touches the case.
+            ColumnType::Citext => Datum::Citext(text.to_owned()),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
@@ -915,7 +947,7 @@ impl PgDatum for Datum {
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
             Datum::Real(v) => v.to_be_bytes().to_vec(),
-            Datum::Text(v) => v.as_bytes().to_vec(),
+            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => v.as_bytes().to_vec(),
             Datum::Bytea(v) => v.clone(),
         })
     }
@@ -1022,11 +1054,10 @@ impl PgDatum for Datum {
                     "a json or jsonb parameter in the binary format",
                 ));
             }
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
-                Datum::Text(String::from_utf8(bytes.to_vec()).map_err(|error| {
-                    let at = error.utf8_error().valid_up_to();
-                    SqlError::InvalidByteSequence(error.as_bytes().get(at).copied().unwrap_or(0))
-                })?)
+            // A citext arrives as its own text and keeps its spelling, the same as from the text
+            // format; only the comparison folds.
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
+                binary_text(ty, bytes)?
             }
             ColumnType::Bytea => Datum::Bytea(bytes.to_vec()),
         })
@@ -1166,7 +1197,26 @@ impl PgDatum for Datum {
             (Datum::Int8(a), Datum::Int4(b)) => a.cmp(&i64::from(*b)),
             // Byte order, not the database's collation: see `crate::row` for why that is a
             // decision and not an oversight.
-            (Datum::Text(a), Datum::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
+            // An hstore's comparison **is** text's — the canonical form is a function of the
+            // content — which is the half citext does not share.
+            (Datum::Text(a), Datum::Text(b)) | (Datum::Hstore(a), Datum::Hstore(b)) => {
+                a.as_bytes().cmp(b.as_bytes())
+            }
+            // **A citext compares folded**, which is the whole type: `'ABC' = 'abc'` is true, two
+            // rows differing only in case are one group and one `DISTINCT`, and a unique index
+            // over the column refuses the second. It is the *comparison* that folds and never the
+            // value — `to_text` above returns the spelling that was stored.
+            //
+            // Folded with `to_lowercase`, which is Unicode's own mapping and not an ASCII one:
+            // measured, `'Ä'::citext = 'ä'::citext` is `t` on a real server, and an ASCII-only
+            // fold answers `f` there and is wrong for every non-English application.
+            (Datum::Citext(a), Datum::Citext(b)) => a.to_lowercase().cmp(&b.to_lowercase()),
+            // An `unknown` literal on one side, which is what `cival = 'cased text'` is after
+            // lowering: it takes the citext's comparison rather than text's, exactly as a real
+            // server resolves the operator to `citext = citext`.
+            (Datum::Citext(a), Datum::Text(b)) | (Datum::Text(b), Datum::Citext(a)) => {
+                a.to_lowercase().cmp(&b.to_lowercase())
+            }
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
             (Datum::Double(a), Datum::Double(b)) => float::pg_cmp(*a, *b),
@@ -1230,7 +1280,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // nothing else, so this rank exists to give the cross-type order a total answer rather
         // than to describe an operator a real server has.
         Datum::Time(_) => 8,
-        Datum::Text(_) => 4,
+        Datum::Text(_) | Datum::Citext(_) | Datum::Hstore(_) => 4,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,
     }
@@ -1469,6 +1519,7 @@ mod tests {
         // so that the exception is on the record rather than looking like an oversight.
         assert_eq!(ColumnType::Hstore.oid(), 16400);
         assert_eq!(ColumnType::HstoreArray.oid(), 16401);
+        assert_eq!(ColumnType::Citext.oid(), 16402);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
@@ -1481,6 +1532,7 @@ mod tests {
                         | ColumnType::Jsonb
                         | ColumnType::Hstore
                         | ColumnType::HstoreArray
+                        | ColumnType::Citext
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

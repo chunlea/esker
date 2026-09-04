@@ -1008,7 +1008,8 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
         ))
     };
     let map = |value: Option<&Datum>| match value {
-        Some(Datum::Text(text)) => hstore::from_text(text).map(Some),
+        // A `Text` is an `unknown` literal on its way to being one; a `Hstore` is one already.
+        Some(Datum::Text(text) | Datum::Hstore(text)) => hstore::from_text(text).map(Some),
         Some(Datum::Null) | None => Ok(None),
         other => Err(wrong_type(other)),
     };
@@ -1050,7 +1051,7 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
         CatalogFunc::HstoreConcat => match (map(args.first())?, map(args.get(1))?) {
             (Some(mut left), Some(right)) => {
                 left.extend(right);
-                Datum::Text(hstore::to_text(&left))
+                Datum::Hstore(hstore::to_text(&left))
             }
             _ => Datum::Null,
         },
@@ -1122,7 +1123,7 @@ fn build_hstore(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
         }
         _ => return Datum::Null,
     }
-    Datum::Text(hstore::to_text(&out))
+    Datum::Hstore(hstore::to_text(&out))
 }
 
 /// The three functions `crate::value::range` answers: `daterange`, `isempty` and `&&`.
@@ -1197,7 +1198,7 @@ fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::D
 fn like_text(value: &Datum) -> Result<Option<String>> {
     match value {
         Datum::Null => Ok(None),
-        Datum::Text(text) => Ok(Some(text.clone())),
+        Datum::Text(text) | Datum::Citext(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: "~~",
             left: other.column_type().map_or_else(
@@ -1358,6 +1359,11 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         } => {
             let subject = evaluate_in(operand, row, env)?;
             let pattern_value = evaluate_in(pattern, row, env)?;
+            // **A citext folds `LIKE` too**, which is the type's own rule rather than the
+            // statement's: `'ABC'::citext LIKE 'abc'` is `t` where the same `LIKE` over `text` is
+            // `f`, and `citext_test.rb` reads it. So `ILIKE` and a citext operand are two roads to
+            // the same fold.
+            let case_insensitive = &(*case_insensitive || matches!(subject, Datum::Citext(_)));
             match (like_text(&subject)?, like_text(&pattern_value)?) {
                 (Some(subject), Some(pattern)) => {
                     let fold = |text: String| {
@@ -1403,7 +1409,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         }
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
-            Datum::Text(text) => Datum::Text(match func {
+            // **A citext is binary-coercible to `text`**, so every text function takes one — and
+            // the *result* is a `text`, not a citext: measured, `pg_typeof(lower('X'::citext))` is
+            // `text`. The type survives a column, a cast and a comparison, and nothing else.
+            Datum::Text(text) | Datum::Citext(text) => Datum::Text(match func {
                 crate::plan::ScalarFunc::Lower => text.to_lowercase(),
                 crate::plan::ScalarFunc::Upper => text.to_uppercase(),
                 // Unreachable: the arm above catches `abs` before this one is tried.

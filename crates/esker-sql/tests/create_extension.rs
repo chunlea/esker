@@ -95,9 +95,10 @@ fn the_two_extension_views_agree() {
              BY name"
         ),
         vec![
-            // `hstore` joined the available list when its type was built — an entry here tells a
-            // client this server has something, so a type-bearing extension goes on with the type
-            // and not before.
+            // `citext` and `hstore` joined the available list when their types were built — an
+            // entry here tells a client this server has something, so a type-bearing extension
+            // goes on with the type and not before.
+            vec!["citext", "1.8", "\\N"],
             vec!["hstore", "1.8", "\\N"],
             vec!["pgcrypto", "1.4", "\\N"],
             vec!["plpgsql", "1.0", "1.0"],

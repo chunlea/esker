@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd8a65b47075cd78fa19d624c9b3d09f01ace4f0ed422f68fadc88bd8d0da206 # shrinks to (types, rows) = ([Citext, Int8, Interval], [[Citext(""), Int8(51423), Interval { months: 4907, days: 25523, micros: 1158447805 }]]), added = [Double, Text, Int8, Text, Double]
+cc f302a2919ac909e17a2420fdf07699f2bdf6f304591e867bc82f438e95d6742f # shrinks to (types, rows) = ([HstoreArray, Bytea, Timestamp, Int2Array, Uuid], [[Array(ArrayValue { element: Hstore, lower: 0, dims: [1], values: [Some(Text(""))] }), Bytea([]), Timestamp(1090866720477551), Array(ArrayValue { element: Int2, lower: -1, dims: [1], values: [Some(Int2(20262))] }), Uuid([76, 6, 154, 136, 204, 173, 150, 52, 184, 76, 199, 161, 46, 197, 203, 188])]]), added = [Bool, TimestampTz]
+cc eff54e186a6763aade4f78e4f2a1212e81bb716cb9907df5727ec2c49d901d97 # shrinks to (types, rows) = ([Hstore], [[Text("")]])

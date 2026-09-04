@@ -128,7 +128,12 @@ mod tests {
             // handed a value the SQL layer has already validated or canonicalised.
             // An hstore is a `Datum::Text` holding the canonical form; the ordering property
             // these tests state is the text's, which is exactly the claim.
-            ColumnType::Hstore => ".*".prop_map(Datum::Text).boxed(),
+            ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            // Folded, because a citext's *key* is its folded value: the ordering property these
+            // tests state is the folded text's, which is exactly the claim.
+            ColumnType::Citext => ".*"
+                .prop_map(|text: String| Datum::Citext(text.to_lowercase()))
+                .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",
