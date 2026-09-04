@@ -21,6 +21,14 @@
 //! handle to the comparator and delegates to it. That is one `Arc` clone per
 //! insert, which the in-house skiplist will remove by holding the comparator once per table.
 
+// Unit 1 of [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md). The skiplist that
+// allocates out of it is unit 2; until then nothing outside the arena's own tests calls it.
+#[allow(
+    dead_code,
+    reason = "the skiplist that uses the arena lands in the next commit"
+)]
+mod arena;
+
 use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
