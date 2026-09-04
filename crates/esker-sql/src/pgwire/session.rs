@@ -306,6 +306,19 @@ impl Session {
             StatementClass::Savepoint(name) => self.savepoint(name, executor),
             StatementClass::RollbackTo(name) => self.rollback_to(name, executor),
             StatementClass::Release(name) => self.release(name, executor),
+            // **`DISCARD ALL` clears what the session owns before the executor clears its own.**
+            // Prepared statements and portals live here and nowhere else, so an executor arm alone
+            // would reset the parameters and the locks and leave a pooled connection holding the
+            // statements of whoever had it last. The `25001` for running it inside a block is the
+            // executor's, beside `CREATE DATABASE`'s.
+            StatementClass::DiscardAll => {
+                let outcome = executor.execute(parsed, &Params::NONE);
+                if outcome.is_ok() {
+                    self.statements.clear();
+                    self.portals.clear();
+                }
+                outcome
+            }
             // A simple query carries no parameters: the protocol has no way to send one, which
             // is why `$1` in a `Query` is `42P02`.
             _ => executor.execute(parsed, &Params::NONE),

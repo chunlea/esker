@@ -130,6 +130,15 @@ pub struct Executor {
     /// One session's reserved block per sequence: the next value it will hand out and the first
     /// value past its block. See [`Executor::next_sequence_value`].
     sequences: std::collections::BTreeMap<u64, (i64, i64)>,
+    /// The sequences this session has a `currval` for, which is **not** the same set as the ones
+    /// it holds a block of.
+    ///
+    /// They were one map until `DISCARD SEQUENCES` needed to tell them apart: it makes `currval`
+    /// *undefined* again — `55000`, the answer a fresh connection gives — while `nextval` carries
+    /// on where it was. Clearing the block instead would answer the `currval` line correctly and
+    /// then skip a whole batch on the next `nextval`, which is what the capture caught: `2` on a
+    /// real server, `33` here.
+    currval_defined: std::collections::BTreeSet<u64>,
     /// The sequence this session last took a value from, which is the whole of what `lastval()`
     /// is. `None` until there has been one, and `55000` is what that answers with.
     last_sequence: Option<u64>,
@@ -376,6 +385,7 @@ impl Executor {
             block_parameters: None,
             row_ids: std::collections::BTreeMap::new(),
             sequences: std::collections::BTreeMap::new(),
+            currval_defined: std::collections::BTreeSet::new(),
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
@@ -649,6 +659,39 @@ impl Executor {
             SessionStatement::ResetAll => {
                 self.parameters.clear();
                 Ok(Outcome::done("RESET"))
+            }
+            // **Each target resets what it names and nothing else**, which the capture measured
+            // one at a time: `DISCARD PLANS` leaves the advisory lock and the temp table, and only
+            // `ALL` releases a lock. The prepared statements are the session's, not the
+            // executor's, and are cleared where they live (`crate::pgwire::session`).
+            SessionStatement::Discard(target) => {
+                // **The `25001` is raised here** and not with `CREATE DATABASE`'s, because a
+                // session statement returns from `execute` before that check is reached — so a
+                // rule written beside the others would never fire. Measured: only `ALL` is
+                // refused; `PLANS`, `SEQUENCES` and `TEMP` all run inside a block.
+                if matches!(target, crate::plan::DiscardTarget::All) && self.open.is_some() {
+                    return Err(SqlError::NotInATransactionBlock("DISCARD ALL"));
+                }
+                if matches!(target, crate::plan::DiscardTarget::All) {
+                    self.parameters.clear();
+                    self.locks.unlock_all(self.session);
+                }
+                if matches!(
+                    target,
+                    crate::plan::DiscardTarget::All | crate::plan::DiscardTarget::Sequences
+                ) {
+                    // `currval` becomes **undefined** again rather than stale — the next call is
+                    // `55000`, the answer a fresh connection gives. **The reserved block stays**:
+                    // throwing it away would answer that line correctly and then skip a batch on
+                    // the next `nextval`, which is `2` on a real server and was `33` here.
+                    self.currval_defined.clear();
+                    self.last_sequence = None;
+                }
+                // `PLANS` caches nothing here and `TEMP` has nothing to drop
+                // (`CREATE TEMPORARY TABLE` is a named refusal), so both are honest no-ops for as
+                // long as those two facts hold. Each is declared in the corpus rather than left to
+                // be assumed.
+                Ok(Outcome::done(statement.tag()))
             }
             SessionStatement::SetParameter { name, value } => {
                 self.set_parameter(name, value.as_deref())?;
@@ -1054,9 +1097,10 @@ impl Executor {
             return match call.func {
                 SequenceFunc::NextVal => self.next_sequence_value(sequence.id),
                 SequenceFunc::CurrVal => self
-                    .sequences
-                    .get(&sequence.id)
-                    .map(|(next, _)| next - 1)
+                    .currval_defined
+                    .contains(&sequence.id)
+                    .then(|| self.sequences.get(&sequence.id).map(|(next, _)| next - 1))
+                    .flatten()
                     // **The sequence's own name, not the spelling that reached it**: by here the
                     // name has resolved, and `currval('"public"."s"')` is about the sequence `s`.
                     .ok_or_else(|| {
@@ -1071,9 +1115,10 @@ impl Executor {
         let id = self
             .last_sequence
             .ok_or(SqlError::SequenceNotYetDefined(None))?;
-        self.sequences
-            .get(&id)
-            .map(|(next, _)| next - 1)
+        self.currval_defined
+            .contains(&id)
+            .then(|| self.sequences.get(&id).map(|(next, _)| next - 1))
+            .flatten()
             .ok_or(SqlError::SequenceNotYetDefined(None))
     }
 
@@ -1152,6 +1197,7 @@ impl Executor {
         // `currval` answers the value that was set, whether or not it was called -- measured.
         self.sequences.insert(sequence_id, (value + 1, value + 1));
         self.last_sequence = Some(sequence_id);
+        self.currval_defined.insert(sequence_id);
         Ok(value)
     }
 
@@ -1384,6 +1430,7 @@ impl Executor {
             let value = *next;
             *next += 1;
             self.last_sequence = Some(sequence_id);
+            self.currval_defined.insert(sequence_id);
             return Ok(value);
         }
 
@@ -1405,6 +1452,7 @@ impl Executor {
         self.sequences
             .insert(sequence_id, (first + 1, first.saturating_add(batch)));
         self.last_sequence = Some(sequence_id);
+        self.currval_defined.insert(sequence_id);
         Ok(first)
     }
 

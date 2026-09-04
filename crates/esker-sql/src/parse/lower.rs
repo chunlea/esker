@@ -525,6 +525,22 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             if_exists,
         } => lower_comment(*object_type, object_name, comment.as_deref(), *if_exists),
         Statement::Set(set) => lower_set(set),
+        // `DISCARD ALL` and its three narrower spellings. **Not refused inside a transaction
+        // here** — the session is what knows whether one is open, and it raises `25001` there,
+        // beside the same check `CREATE DATABASE` gets.
+        Statement::Discard { object_type } => {
+            use sqlparser::ast::DiscardObject;
+
+            let target = match object_type {
+                DiscardObject::ALL => plan::DiscardTarget::All,
+                DiscardObject::PLANS => plan::DiscardTarget::Plans,
+                DiscardObject::SEQUENCES => plan::DiscardTarget::Sequences,
+                DiscardObject::TEMP => plan::DiscardTarget::Temp,
+            };
+            Ok(plan::Statement::Session(plan::SessionStatement::Discard(
+                target,
+            )))
+        }
         Statement::ShowVariable { variable } => lower_show(variable),
         Statement::Reset(reset) => lower_reset(reset),
         other => Err(SqlError::unsupported(feature_name(other))),

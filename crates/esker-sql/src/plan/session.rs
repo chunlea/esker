@@ -37,6 +37,14 @@ pub enum SessionStatement {
     /// resets is *what the session has set* and only the executor knows that — and because a real
     /// server's `RESET ALL` leaves the ones it cannot change alone rather than failing on them.
     ResetAll,
+    /// `DISCARD ALL` and its three narrower spellings.
+    ///
+    /// **What a pooled connection is reset with**, and not a statement any test writes:
+    /// `postgresql_adapter.rb:392` sends it when the adapter returns a connection to the pool, so
+    /// it lands on every file that does. It cannot run inside a transaction block (`25001`), which
+    /// is checked where `BEGIN` is rather than here — the session knows whether one is open and a
+    /// plan does not.
+    Discard(DiscardTarget),
     /// `SET TRANSACTION SNAPSHOT '<id>'`.
     SetSnapshot(String),
     /// `SET <parameter> = <value>`, for one of the parameters in [`crate::parameter`].
@@ -70,7 +78,51 @@ impl SessionStatement {
             // reading the command tag expects; `RESET <name>` is a `SetParameter` with no value
             // and reports `SET`, exactly as a real server does. Measured, both.
             SessionStatement::ResetAll => "RESET",
+            // **The tag names the target**, and `TEMPORARY` reports as `TEMP` — measured, all
+            // four. A tag of a bare `DISCARD` or a constant `DISCARD ALL` would be a client told
+            // it reset more than it asked for.
+            SessionStatement::Discard(target) => match target {
+                DiscardTarget::All => "DISCARD ALL",
+                DiscardTarget::Plans => "DISCARD PLANS",
+                DiscardTarget::Sequences => "DISCARD SEQUENCES",
+                DiscardTarget::Temp => "DISCARD TEMP",
+            },
             SessionStatement::ShowReadAsOf | SessionStatement::ShowParameter(_) => "SHOW",
+        }
+    }
+}
+
+/// Which session state a `DISCARD` throws away.
+///
+/// Four targets, and the capture measured each one against what it must *not* touch —
+/// `DISCARD PLANS` leaves the advisory locks and the temp table, `DISCARD SEQUENCES` leaves
+/// everything but `currval`, and only `ALL` releases a lock. An implementation that treated them
+/// as one word would pass the `ALL` lines and quietly break a pooled connection's other resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardTarget {
+    /// `DISCARD ALL`: every other target at once, plus prepared statements and every `SET`.
+    All,
+    /// `DISCARD PLANS`: cached plans. This node caches none, so it is a no-op — and the capture
+    /// says a real server's is nearly one too, since it touches nothing else.
+    Plans,
+    /// `DISCARD SEQUENCES`: this session's `currval` values, which become *undefined* again rather
+    /// than stale — `55000` on the next `currval`, the same answer as a fresh connection.
+    Sequences,
+    /// `DISCARD TEMP` / `DISCARD TEMPORARY`: this session's temporary tables. There are none here
+    /// (`CREATE TEMPORARY TABLE` is a named refusal), so it is a no-op that stays honest as long
+    /// as that is true.
+    Temp,
+}
+
+impl DiscardTarget {
+    /// The word, for the command tag and for a message.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            DiscardTarget::All => "ALL",
+            DiscardTarget::Plans => "PLANS",
+            DiscardTarget::Sequences => "SEQUENCES",
+            DiscardTarget::Temp => "TEMP",
         }
     }
 }

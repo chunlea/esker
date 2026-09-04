@@ -1,0 +1,231 @@
+//! `DISCARD ALL` — **what a pooled connection is reset with**, 26 tests over 8 files.
+//!
+//! Not a statement any test writes: `postgresql_adapter.rb:392` sends it when the adapter returns
+//! a connection to the pool, so it lands on every file that does. The four targets are captured
+//! one at a time against what each must *not* touch, which is the half an implementation that
+//! treats `DISCARD` as one word gets wrong.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[path = "parity_harness/mod.rs"]
+mod parity;
+
+/// Nothing: the corpus builds its own state.
+const CORPUS_FIXTURE: &[&str] = &[];
+
+/// What this node answers differently, and why.
+const DIVERGENCES: parity::Divergences = parity::Divergences {
+    // An integer literal is `int4` there and `int8` here — the standing width trade every
+    // untyped number makes (ADR 0030's six stored types), and nothing to do with `DISCARD`.
+    types: &["SELECT 'r', 1 AS in_a_transaction"],
+    answers: &[
+        // **Every `DISCARD` in this file agrees.** What is listed below is the state a real server
+        // has and this node does not, so there is nothing for the statement to reset — the
+        // refusals are all older than this unit and each names its own missing feature.
+        //
+        // `CREATE TEMPORARY TABLE` is a named refusal, so `DISCARD TEMP` has nothing to drop. That
+        // is an honest no-op exactly as long as that stays true, which is why it is written down
+        // here rather than assumed in the code.
+        (
+            "CREATE TEMP TABLE dsc_tmp (id int)",
+            "`0A000 CREATE TEMPORARY TABLE is not supported`, older than this unit. Every line \
+             that reads `dsc_tmp` follows from it.",
+        ),
+        ("CREATE TEMP TABLE dsc_tmp2 (id int)", "The same."),
+        (
+            "INSERT INTO dsc_tmp VALUES (1)",
+            "The temp table was never created.",
+        ),
+        (
+            "SELECT 'r', count(*) FROM dsc_tmp",
+            "The same. A real server answers `1` before `DISCARD TEMP` and `42P01` after, and \
+             this node answers `42P01` throughout — so the *end* state agrees and the start does \
+             not. `dsc_tmp2` is only ever read *after* its `DISCARD ALL`, so that line agrees \
+             outright and is listed nowhere.",
+        ),
+        // SQL-level `PREPARE` is a named refusal — the extended protocol's named statements are a
+        // different thing and *are* cleared by `DISCARD ALL`, which `discarding_all_clears_the_\
+        // session` asserts directly because no corpus statement can reach them.
+        (
+            "PREPARE dsc_plan AS SELECT $1::int + 1",
+            "`0A000 PREPARE is not supported`: this node's prepared statements are the wire \
+             protocol's, not SQL's. `DISCARD ALL` does clear those — see the test below.",
+        ),
+        ("PREPARE dsc_plan2 AS SELECT 1", "The same."),
+        ("PREPARE dsc_plan3 AS SELECT 1", "The same."),
+        (
+            "DEALLOCATE ALL",
+            "The same: nothing SQL-level to deallocate.",
+        ),
+        (
+            "SELECT 'r', name FROM pg_prepared_statements WHERE name = 'dsc_plan'",
+            "`42P01`: no `pg_prepared_statements`, for the same reason as `pg_locks` — its rows \
+             are session state and this node's catalog views read the store.",
+        ),
+        (
+            "SELECT 'r', count(*) FROM pg_prepared_statements WHERE name = 'dsc_plan'",
+            "The same.",
+        ),
+        (
+            "SELECT 'r', count(*) FROM pg_prepared_statements",
+            "The same.",
+        ),
+        ("SELECT count(*) FROM pg_prepared_statements", "The same."),
+        // `pg_locks`, already declared by the advisory-lock unit and repeated here because this
+        // corpus reads it to prove which targets release a lock. The releases themselves are
+        // asserted in `discarding_all_clears_the_session`.
+        (
+            "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001",
+            "`42P01`: no `pg_locks` (see `tests/advisory_lock.rs`). The lock is taken and \
+             released correctly; there is nothing here that reports it.",
+        ),
+        (
+            "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'",
+            "The same.",
+        ),
+        (
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
+            "The same.",
+        ),
+        (
+            "SELECT 'r', current_setting('statement_timeout'), count(*) FROM pg_locks WHERE \
+             locktype = 'advisory' AND objid = 7001",
+            "The same — and the `statement_timeout` half agrees: `DEALLOCATE ALL` leaves it at \
+             `31s`, which is the point of the line.",
+        ),
+        // **The reset itself is right and one boot value is spelled differently.** `DISCARD ALL`
+        // put `statement_timeout` back to `0`; the container boots `TimeZone` at `Etc/UTC` and
+        // this node at `UTC`, which is the same instant and an older difference.
+        (
+            "SELECT 'r', current_setting('statement_timeout'), current_setting('timezone')",
+            "The timeout reset agrees at `0`. The zone is `UTC` here and `Etc/UTC` on the \
+             oracle's container — the same offset under another name, and a boot value rather \
+             than anything `DISCARD` did.",
+        ),
+        // **Two `SET`s this node refuses, both older than this unit and both declared in
+        // `tests/set_parameters.rs`.** They matter here only as the state `DISCARD ALL` is
+        // supposed to reset: what the corpus proves either way is that `statement_timeout` reads
+        // its boot value afterwards, and it does — from `0` to `0` rather than from `31s` to `0`.
+        (
+            "SET statement_timeout = '31s'",
+            "`0A000 a non-zero statement_timeout … is not supported`: nothing here cancels a \
+             running statement, so a non-zero value would be a setting honoured by `SHOW` and \
+             ignored by every statement (`crate::parameter::Parameter::honour`).",
+        ),
+        (
+            "SET timezone = 'Europe/Paris'",
+            "`0A000` naming the zone: `timestamptz` is printed in UTC and nowhere else, so a zone \
+             this node will not use is refused rather than reported.",
+        ),
+        (
+            "SELECT 'r', current_setting('statement_timeout')",
+            "`31s` there and `0` here, because the `SET` above never took. The line's purpose is \
+             that `DISCARD TEMP` leaves the parameter alone, and it does — this reads the same \
+             value before and after.",
+        ),
+        // A syntax error's *message* has never been claimed to be PostgreSQL's (`phase-6a.md` §1);
+        // what C1 promises is that a statement a real server accepts is never `42601`. Both refuse
+        // this one and both say `42601`.
+        (
+            "DISCARD EVERYTHING",
+            "`42601` on both, with `sqlparser`'s sentence rather than PostgreSQL's — the standing \
+             trade for syntax errors, and this one even lists the four targets.",
+        ),
+    ],
+};
+
+#[test]
+fn every_discard_answer_is_postgresql_19_s() {
+    let checked = parity::replay(
+        include_str!("corpus/pg19_discard_all.txt"),
+        CORPUS_FIXTURE,
+        &DIVERGENCES,
+    );
+    assert!(
+        checked > 40,
+        "only {checked} statements ran; the corpus did not load"
+    );
+}
+
+/// **What the corpus cannot reach: the state that lives on the *session* rather than the
+/// executor.**
+///
+/// A prepared statement here is the wire protocol's, not SQL's — `PREPARE` is a named refusal, so
+/// no statement in the corpus can make one, and `pg_prepared_statements` does not exist to read it
+/// back. `DISCARD ALL` still has to clear them, because that is the whole point of the statement:
+/// `postgresql_adapter.rb:392` sends it when a connection goes back to the pool, and a pooled
+/// connection that kept the last borrower's named statements would answer the next one's `Bind`
+/// with the wrong SQL.
+///
+/// The advisory lock is asserted here for the same reason — `pg_locks` is a declared divergence,
+/// so the release is invisible to the corpus and provable only by taking the lock again.
+#[test]
+fn discarding_all_clears_the_session() {
+    use std::sync::Arc;
+
+    use esker_sql::backend::{Backend, MemoryBackend};
+    use esker_sql::catalog::Catalog;
+    use esker_sql::exec::Executor;
+    use esker_sql::pgwire::message::Frontend;
+    use esker_sql::pgwire::session::Session;
+
+    let backend = Arc::new(MemoryBackend::new()) as Arc<dyn Backend>;
+    let mut executor = Executor::new(backend, Arc::new(Catalog::new()), 1);
+    let mut session = Session::new();
+    let mut out = Vec::new();
+
+    // A named statement, the way the extended protocol makes one.
+    session.handle(
+        &Frontend::Parse {
+            statement: "s1".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            param_types: Vec::new(),
+        },
+        &mut executor,
+        &mut out,
+    );
+    out.clear();
+    session.simple_query("SELECT pg_try_advisory_lock(4242)", &mut executor, &mut out);
+    assert!(
+        String::from_utf8_lossy(&out).contains('t'),
+        "the lock was taken"
+    );
+    out.clear();
+
+    session.simple_query("DISCARD ALL", &mut executor, &mut out);
+    assert!(
+        String::from_utf8_lossy(&out).contains("DISCARD ALL"),
+        "the tag names the target: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    out.clear();
+
+    // **The named statement is gone**, so binding it is the protocol's "does not exist" rather
+    // than a stale plan quietly answering.
+    session.handle(
+        &Frontend::Bind {
+            portal: String::new(),
+            statement: "s1".to_owned(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        },
+        &mut executor,
+        &mut out,
+    );
+    let answer = String::from_utf8_lossy(&out);
+    assert!(
+        answer.contains("26000") || answer.to_lowercase().contains("does not exist"),
+        "binding a discarded statement must fail: {answer}"
+    );
+    out.clear();
+
+    // And the lock went with it: taking it again succeeds, which it could not if the session still
+    // held it — the one observation left once `pg_locks` is a divergence.
+    session.simple_query("SELECT pg_advisory_unlock(4242)", &mut executor, &mut out);
+    assert!(
+        String::from_utf8_lossy(&out).contains('f'),
+        "DISCARD ALL released it, so there is nothing left to unlock: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}

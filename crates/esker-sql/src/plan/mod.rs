@@ -49,7 +49,7 @@ pub use query::{
     TableFunction, TableRef, ValuesList,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
-pub use session::SessionStatement;
+pub use session::{DiscardTarget, SessionStatement};
 pub use subquery::{Derived, SubqueryExpr, SubqueryKind};
 pub use time_machine::TimeMachineVerb;
 

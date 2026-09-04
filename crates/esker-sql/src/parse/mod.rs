@@ -191,6 +191,12 @@ pub enum StatementClass {
     RollbackTo(String),
     /// `RELEASE [SAVEPOINT] <name>`, carrying the name.
     Release(String),
+    /// `DISCARD ALL`, which the session has to see because half of what it resets — the prepared
+    /// statements and portals — lives on the session and not in the executor.
+    ///
+    /// Only `ALL`: the three narrower targets reset nothing the session owns, so they take the
+    /// ordinary path to the executor like any other statement.
+    DiscardAll,
     /// `EXPLAIN`.
     Explain,
     /// Parsed, not executed. The string is the feature name for the `0A000` message, phrased the
@@ -1078,6 +1084,9 @@ pub fn classify(statement: &Statement) -> StatementClass {
         Statement::Savepoint { name } => StatementClass::Savepoint(
             crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
         ),
+        Statement::Discard {
+            object_type: sqlparser::ast::DiscardObject::ALL,
+        } => StatementClass::DiscardAll,
         Statement::ReleaseSavepoint { name } => StatementClass::Release(
             crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
         ),
