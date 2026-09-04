@@ -5104,6 +5104,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
                     derived: None,
                     function: None,
                     hidden_cte: false,
+                    written: None,
                 }),
                 joins: Vec::new(),
                 filter: None,
@@ -5388,6 +5389,7 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
             ))),
             function: None,
             hidden_cte: false,
+            written: None,
         });
     }
     Ok(())
@@ -5507,6 +5509,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     def: None,
                 })),
                 hidden_cte: false,
+                written: None,
             })
         }
         TableFactor::Table {
@@ -5562,6 +5565,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                         def: None,
                     })),
                     hidden_cte: false,
+                    written: None,
                 });
             }
             refuse_if(args.is_some(), "a table function")?;
@@ -5582,6 +5586,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 derived: None,
                 function: None,
                 hidden_cte: false,
+                written: dropped_qualifier(name),
             })
         }
         // `FROM (SELECT …) AS t` — a **derived table**. The alias is optional on PostgreSQL 19
@@ -5620,6 +5625,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     derived: None,
                     function: None,
                     hidden_cte: false,
+                    written: None,
                 });
             }
             Ok(plan::TableRef {
@@ -5632,6 +5638,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 ))),
                 function: None,
                 hidden_cte: false,
+                written: None,
             })
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),
@@ -6309,6 +6316,30 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
 /// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
 /// (`catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
 /// is `42P07` there for the same reason.
+/// The name as written, when [`relation_name`] threw a qualifier away.
+///
+/// **Only `public.`**, because it is the only schema this node spells *out* of a stored name: a
+/// relation there is stored bare (`catalog::SCHEMA_SEPARATOR`), so the qualifier is gone by the
+/// time anything can fail to find it. Every other schema is part of the stored name and quotes
+/// itself back for free — `relation "nosuchschema.sometable" does not exist` was already right.
+///
+/// `pg_catalog.` is left alone deliberately: nothing measured says what a `42P01` naming it looks
+/// like, and a rule invented for it would be a message nobody captured
+/// ([ADR 0031](../../docs/adr/0031-rails-compatibility-is-measured.md)).
+fn dropped_qualifier(name: &ObjectName) -> Option<String> {
+    let parts: Option<Vec<&str>> = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect();
+    let [schema, relation] = parts.as_deref()? else {
+        return None;
+    };
+    schema
+        .eq_ignore_ascii_case(PUBLIC_SCHEMA)
+        .then(|| format!("{PUBLIC_SCHEMA}.{}", fold_identifier(relation, false).0))
+}
+
 fn relation_name(name: &ObjectName) -> Result<String> {
     let parts: Option<Vec<&str>> = name
         .0
