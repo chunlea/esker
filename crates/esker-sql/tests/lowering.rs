@@ -140,8 +140,10 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "an aggregate FILTER clause",
         ),
         ("SELECT sum(*) FROM t", "sum(*)"),
-        // `lower` and `upper` run since the scalar-function unit; `length` does not.
-        ("SELECT length(b) FROM t", "the function length"),
+        // `lower`, `upper`, `length`, `octet_length`, `reverse` and `ascii` all run now — the
+        // generated columns the suite declares use four of them. `soundex` is the example that is
+        // still absent, and the property under test is the *naming*, not which one it is.
+        ("SELECT soundex(b) FROM t", "the function soundex"),
     ];
 
     refuses_by_name(&cases);

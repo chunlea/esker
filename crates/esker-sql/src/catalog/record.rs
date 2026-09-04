@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 28;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 29;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1588,6 +1588,10 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // `0A000` until now.
     for column in &table.columns {
         put_str(column.generated.as_deref().unwrap_or(""), &mut out);
+        // Version 29: which kind of generated column it is. A record older than 29 can only hold
+        // a stored one — `VIRTUAL` was `0A000` until then — so reading `false` for one is not a
+        // default, it is the only value that was ever possible.
+        out.push(u8::from(column.generated_virtual));
     }
 
     // Version 14. One string per column, **after** version 13's, for the same reason version 13's
@@ -2084,6 +2088,10 @@ fn read_generation_expressions(reader: &mut Reader<'_>, columns: &mut [ColumnDef
     for column in columns {
         let expr = reader.string()?;
         column.generated = (!expr.is_empty()).then_some(expr);
+        // **Version 29 added the kind**, beside the expression rather than in a section of its
+        // own: the reader already walks this list once, and a record older than 29 can only hold
+        // a stored column because `VIRTUAL` was `0A000` until then.
+        column.generated_virtual = reader.version >= 29 && reader.flag()?;
     }
     Ok(())
 }
@@ -2311,6 +2319,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             missing,
             // Filled from the version 13 section below, after every column has been read.
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,

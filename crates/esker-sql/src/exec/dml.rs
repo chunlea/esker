@@ -1554,7 +1554,7 @@ fn drain(
 ///
 /// The expression is re-lowered from its stored text per row, the trade
 /// [`check_constraints`] already makes and for the same reason.
-fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
+pub(super) fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
     for (at, column) in table.columns.iter().enumerate() {
         let Some(expr) = &column.generated else {
             continue;
@@ -1572,7 +1572,11 @@ fn fill_generated(table: &TableDef, row: &mut [Datum]) -> Result<()> {
                 table.name, column.name
             ))
         })?;
-        row[at] = cursor::evaluate(&resolved, row)?;
+        // **Coerced to the column's type, like any assigned value.** `ASCII(name)` is an `int4`
+        // and the suite declares the column it fills as `character varying`; PostgreSQL applies
+        // the assignment cast and so does this — without it the row was refused as
+        // `column N is Varchar and was given Int4`.
+        row[at] = assign_default(cursor::evaluate(&resolved, row)?, column.ty)?;
     }
     Ok(())
 }

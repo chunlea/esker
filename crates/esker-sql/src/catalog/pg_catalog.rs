@@ -871,6 +871,7 @@ impl CatalogView {
                                 default: None,
                                 missing: None,
                                 generated: None,
+                                generated_virtual: false,
                                 comment: None,
                                 dropped: false,
                                 user_type: None,

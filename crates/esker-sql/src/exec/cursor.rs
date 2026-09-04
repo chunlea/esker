@@ -1759,12 +1759,27 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // **A citext is binary-coercible to `text`**, so every text function takes one — and
             // the *result* is a `text`, not a citext: measured, `pg_typeof(lower('X'::citext))` is
             // `text`. The type survives a column, a cast and a comparison, and nothing else.
-            Datum::Text(text) | Datum::Citext(text) => Datum::Text(match func {
-                crate::plan::ScalarFunc::Lower => text.to_lowercase(),
-                crate::plan::ScalarFunc::Upper => text.to_uppercase(),
+            Datum::Text(text) | Datum::Citext(text) => match func {
+                crate::plan::ScalarFunc::Lower => Datum::Text(text.to_lowercase()),
+                crate::plan::ScalarFunc::Upper => Datum::Text(text.to_uppercase()),
+                // **By character, not by byte** — `reverse` on a multi-byte string has to keep
+                // each code point whole, and reversing the bytes would not.
+                crate::plan::ScalarFunc::Reverse => Datum::Text(text.chars().rev().collect()),
+                // The one scalar function whose result is not its argument's type: the **first**
+                // character's code point, and `0` for the empty string. Measured.
+                crate::plan::ScalarFunc::Ascii => {
+                    Datum::Int4(text.chars().next().map_or(0, |first| first as i32))
+                }
+                // Characters against bytes, and the two differ for anything non-ASCII.
+                crate::plan::ScalarFunc::Length => {
+                    Datum::Int4(i32::try_from(text.chars().count()).unwrap_or(i32::MAX))
+                }
+                crate::plan::ScalarFunc::OctetLength => {
+                    Datum::Int4(i32::try_from(text.len()).unwrap_or(i32::MAX))
+                }
                 // Unreachable: the arm above catches `abs` before this one is tried.
-                crate::plan::ScalarFunc::Abs => text,
-            }),
+                crate::plan::ScalarFunc::Abs => Datum::Text(text),
+            },
             other => {
                 // A non-text argument: `lower(1)` is `42883 function lower(integer) does not
                 // exist` on a real server, not a cast. Measured.

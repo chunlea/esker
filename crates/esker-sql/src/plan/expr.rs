@@ -551,6 +551,17 @@ pub enum ScalarFunc {
     /// and whose failure is an overflow: `abs((-32768)::int2)` is `22003`, because the positive
     /// of the smallest `int2` is not one.
     Abs,
+    /// `reverse(text)`: the characters back to front. Text in, text out.
+    Reverse,
+    /// `ascii(text)`: the code point of the **first** character, as an `int4`. An empty string
+    /// is `0`.
+    Ascii,
+    /// `length(text)`, and its two aliases `char_length` and `character_length`: **characters**,
+    /// not bytes.
+    Length,
+    /// `octet_length(text)`: **bytes**, which is a different number for anything non-ASCII — the
+    /// pair is only interesting because the suite's generated columns use both.
+    OctetLength,
 }
 
 impl ScalarFunc {
@@ -561,6 +572,10 @@ impl ScalarFunc {
             ScalarFunc::Lower => "lower",
             ScalarFunc::Upper => "upper",
             ScalarFunc::Abs => "abs",
+            ScalarFunc::Reverse => "reverse",
+            ScalarFunc::Ascii => "ascii",
+            ScalarFunc::Length => "length",
+            ScalarFunc::OctetLength => "octet_length",
         }
     }
 
@@ -571,6 +586,10 @@ impl ScalarFunc {
             "lower" => Some(ScalarFunc::Lower),
             "upper" => Some(ScalarFunc::Upper),
             "abs" => Some(ScalarFunc::Abs),
+            "reverse" => Some(ScalarFunc::Reverse),
+            "ascii" => Some(ScalarFunc::Ascii),
+            "length" | "char_length" | "character_length" => Some(ScalarFunc::Length),
+            "octet_length" => Some(ScalarFunc::OctetLength),
             _ => None,
         }
     }

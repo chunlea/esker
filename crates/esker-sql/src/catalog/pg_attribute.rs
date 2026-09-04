@@ -57,9 +57,15 @@ use crate::value::{ColumnType, Datum, PgType};
 /// and what `ActiveRecord` would then treat as a missing column rather than an ordinary one.
 const NOT_IDENTITY: &str = "";
 
-/// `attgenerated` for a `GENERATED ALWAYS AS (…) STORED` column. A real server's other value is
-/// `v`, for a *virtual* one — computed on read, which this node refuses by name.
+/// `attgenerated` for a `GENERATED ALWAYS AS (…) STORED` column.
 const STORED_GENERATED: &str = "s";
+
+/// `attgenerated` for a **virtual** one — computed on read there, computed and stored here.
+///
+/// **The only column in which the two kinds differ.** Same values, same recompute on `UPDATE`,
+/// same `is_generated = ALWAYS`, same refusal of a non-DEFAULT write; where the bytes live is not
+/// visible to SQL, and this letter is.
+const VIRTUAL_GENERATED: &str = "v";
 
 /// `attcollation`: none, for every column of every type.
 ///
@@ -199,6 +205,7 @@ fn columns_of<'a>(
                                 default: None,
                                 missing: None,
                                 generated: None,
+                                generated_virtual: false,
                                 comment: None,
                                 dropped: false,
                                 user_type: None,
@@ -238,6 +245,7 @@ fn columns_of<'a>(
                         default: None,
                         missing: None,
                         generated: None,
+                        generated_virtual: false,
                         comment: None,
                         dropped: false,
                         user_type: None,
@@ -324,14 +332,14 @@ fn attribute(
         Datum::Bool(own && column.not_null && !column.dropped),
         Datum::Bool(has_default),
         Datum::Text(identity.to_owned()),
-        // **`s` for a stored generated column**, one character, and the empty string for every
-        // other — the same shape `attidentity` has. A real server's other value is `v`, for the
-        // virtual generated columns this node refuses by name.
+        // **One character, and the empty string for a column that is neither** — the same shape
+        // `attidentity` has. `s` and `v` are the two kinds of generated column, and this is the
+        // only place they differ: everything else about them agrees, including the values.
         Datum::Text(
-            if column.generated.is_some() && own {
-                STORED_GENERATED
-            } else {
-                NOT_IDENTITY
+            match (column.generated.is_some() && own, column.generated_virtual) {
+                (true, false) => STORED_GENERATED,
+                (true, true) => VIRTUAL_GENERATED,
+                (false, _) => NOT_IDENTITY,
             }
             .to_owned(),
         ),

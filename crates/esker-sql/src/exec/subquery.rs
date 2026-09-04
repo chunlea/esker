@@ -215,6 +215,7 @@ pub(super) fn table_function_def(
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -331,6 +332,7 @@ fn plan_derived(
             // nothing to pad with.
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
