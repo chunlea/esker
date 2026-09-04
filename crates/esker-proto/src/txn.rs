@@ -283,25 +283,42 @@ impl TxnMutation {
 
     /// The tag on the wire. Zero is not a tag, as everywhere else
     /// (`docs/DESIGN.md` §4.3, §9).
+    /// **Four tags, and the first two are unchanged.** A mutation whose value came from the
+    /// transaction's own snapshot — every mutation this node made before ADR 0057, and every one a
+    /// statement that never waited makes now — is tag 1 or 2 and encodes exactly the bytes it
+    /// always did, so every golden stays byte-identical and a peer that has never heard of this
+    /// reads them. A mutation that says which snapshot it read at takes a tag of its own, which an
+    /// older peer refuses as unknown rather than misreading as a shorter message: the one thing a
+    /// framing change must never do is decode wrongly.
     fn tag(&self) -> u8 {
         match self {
-            Self::Put { .. } => 1,
-            Self::Delete { .. } => 2,
+            Self::Put { read_ts: None, .. } => 1,
+            Self::Delete { read_ts: None, .. } => 2,
+            Self::Put { .. } => 3,
+            Self::Delete { .. } => 4,
         }
     }
 
-    /// **The encoding is unchanged**, and deliberately: `read_ts` is carried in memory and not on
-    /// the wire until the human has ruled on the framing change (ADR 0057 §4). Every golden this
-    /// crate has stays byte-identical, and a node that sends one of these to an older peer sends
-    /// exactly what it sent before.
     fn encode(&self, out: &mut Encoder) {
         out.put_u8(self.tag());
         match self {
-            Self::Put { key, value, .. } => {
+            Self::Put {
+                key,
+                value,
+                read_ts,
+            } => {
                 out.put_bytes(key);
                 out.put_bytes(value);
+                if let Some(read_ts) = read_ts {
+                    out.put_varint(*read_ts);
+                }
             }
-            Self::Delete { key, .. } => out.put_bytes(key),
+            Self::Delete { key, read_ts } => {
+                out.put_bytes(key);
+                if let Some(read_ts) = read_ts {
+                    out.put_varint(*read_ts);
+                }
+            }
         }
     }
 
@@ -315,6 +332,15 @@ impl TxnMutation {
             2 => Ok(Self::Delete {
                 key: take(input, "mutation.key")?,
                 read_ts: None,
+            }),
+            3 => Ok(Self::Put {
+                key: take(input, "mutation.key")?,
+                value: take(input, "mutation.value")?,
+                read_ts: Some(input.get_varint("mutation.read_ts")?),
+            }),
+            4 => Ok(Self::Delete {
+                key: take(input, "mutation.key")?,
+                read_ts: Some(input.get_varint("mutation.read_ts")?),
             }),
             tag => Err(DecodeError::invalid(
                 "mutation.tag",

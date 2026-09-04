@@ -259,17 +259,42 @@ impl TxnCommand {
                 out.put_varint(writes.len() as u64);
                 for write in writes {
                     match write {
-                        // **The log encoding is unchanged**, and `read_ts` is deliberately not in
-                        // it: this is a replicated command, so carrying it is a log format change
-                        // as well as a wire one and both wait for the human's ruling (ADR 0057).
-                        TxnWrite::Put { key, value, .. } => {
+                        // **Four kinds, and the first two are unchanged.** A write whose value
+                        // came from the transaction's own snapshot encodes exactly the bytes it
+                        // always did, so every log entry ever written still decodes and every
+                        // golden is byte-identical. A write that says which snapshot it read at
+                        // takes a kind of its own, which an older node refuses as unknown rather
+                        // than misreading as a shorter entry (ADR 0057 §4).
+                        TxnWrite::Put {
+                            key,
+                            value,
+                            read_ts: None,
+                        } => {
                             out.put_u8(1);
                             out.put_bytes(key);
                             out.put_bytes(value);
                         }
-                        TxnWrite::Delete { key, .. } => {
+                        TxnWrite::Delete { key, read_ts: None } => {
                             out.put_u8(2);
                             out.put_bytes(key);
+                        }
+                        TxnWrite::Put {
+                            key,
+                            value,
+                            read_ts: Some(read_ts),
+                        } => {
+                            out.put_u8(3);
+                            out.put_bytes(key);
+                            out.put_bytes(value);
+                            out.put_varint(*read_ts);
+                        }
+                        TxnWrite::Delete {
+                            key,
+                            read_ts: Some(read_ts),
+                        } => {
+                            out.put_u8(4);
+                            out.put_bytes(key);
+                            out.put_varint(*read_ts);
                         }
                     }
                 }
@@ -335,6 +360,15 @@ impl TxnCommand {
                             key: bytes(input, "txn.write.key")?,
                             value: bytes(input, "txn.write.value")?,
                             read_ts: None,
+                        },
+                        3 => TxnWrite::Put {
+                            key: bytes(input, "txn.write.key")?,
+                            value: bytes(input, "txn.write.value")?,
+                            read_ts: Some(varint(input, "txn.write.read_ts")?),
+                        },
+                        4 => TxnWrite::Delete {
+                            key: bytes(input, "txn.write.key")?,
+                            read_ts: Some(varint(input, "txn.write.read_ts")?),
                         },
                         2 => TxnWrite::Delete {
                             key: bytes(input, "txn.write.key")?,
