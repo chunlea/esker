@@ -314,6 +314,165 @@ fn discard_interrupted_snapshots(db: &Arc<Db>) -> Result<()> {
     Ok(())
 }
 
+/// Finishes one region's retirement: the range, the columnar tree, and the announcement.
+///
+/// The whole of what a retirement does to **data**, in one blocking function, because it has two
+/// callers that could not otherwise share it: the live path, where a conf change has just removed
+/// this store from the region, and [`reclaim_interrupted_retirements`] at open, where a crash
+/// interrupted the live path. A second implementation of a delete is a second chance to get a
+/// delete wrong.
+///
+/// # Gate 2: no region this store still hosts may overlap the range
+///
+/// `overlaps` is the ids of the hosted regions that cover it, and a non-empty one is the case
+/// that catches a *stale* record: a parent whose split narrowed it, retired against the range it
+/// had before, would delete the child's keys. The announcement is then **forgotten**, because the
+/// range is not orphaned — it belongs to a region that is being served — and an announcement kept
+/// for it would ask the same refused question at every open for the life of the store.
+///
+/// # What is idempotent, and why every step has to be
+///
+/// A crash may land anywhere in here and the next open runs the whole thing again.
+/// `snapshot::clear_range` returns early on an empty range and `FileSystem::remove_dir_all` treats
+/// an absent directory as done, so a second pass over a finished retirement is a pair of cheap
+/// reads and one delete of the announcement.
+///
+/// # The announcement outlives a failure, deliberately
+///
+/// It is removed only when `clear_range` reports the range **provably empty**. A clear that failed
+/// — a tombstone still above the compaction floor because something holds an engine snapshot open
+/// — leaves the keys and leaves the announcement, and the next open tries again. Removing it on
+/// the strength of having tried is how a reclamation that failed becomes the leak this record
+/// exists to end.
+fn finish_retirement(
+    db: &Db,
+    fs: &Arc<dyn FileSystem>,
+    data_dir: &Path,
+    region: &Region,
+    overlaps: &[u64],
+) {
+    let region_id = region.id;
+    if !overlaps.is_empty() {
+        tracing::warn!(
+            region_id,
+            ?overlaps,
+            "a retired region's range is still covered by a region this store hosts, so it is \
+             left alone rather than emptied under its owner"
+        );
+        forget_retirement(db, region_id);
+        return;
+    }
+
+    let cleared = match snapshot::clear_range(db, region) {
+        Ok(()) => {
+            tracing::info!(
+                region_id,
+                "a retired region's range was reclaimed in every column family"
+            );
+            true
+        }
+        // Loud and harmless: the range keeps its keys, which is where it was before, and it keeps
+        // its announcement, so the next open comes back for them.
+        Err(error) => {
+            tracing::warn!(region_id, %error, "a retired region's range was not reclaimed");
+            false
+        }
+    };
+
+    // **Unconditionally, and not chained onto the clear's success.** The columnar copy is derived
+    // from the range and belongs to a region that is gone either way; a range clear that failed is
+    // a reason to keep the *keys*, never a reason to keep a copy of them.
+    reclaim_columnar_tree(fs, data_dir, region_id);
+
+    if cleared {
+        forget_retirement(db, region_id);
+    }
+}
+
+/// Removes a retired region's columnar tree: a directory of immutable run files and a manifest of
+/// its own (`crate::columnar::runs`), one per region id, written **beside** the engine rather than
+/// inside it — so nothing the engine reclaims touches it and it has to be reclaimed by name. Left
+/// behind, it is the same unbounded growth as the range, on every store that ever held a columnar
+/// learner.
+///
+/// Per region id, which is what makes it safe without a second look at the region map: PD never
+/// reuses an id, and a split child gets its own directory. Sweeping `<data_dir>/columnar` would be
+/// a different and much worse operation.
+fn reclaim_columnar_tree(fs: &Arc<dyn FileSystem>, data_dir: &Path, region_id: u64) {
+    let root = data_dir.join("columnar");
+    let dir = root.join(region_id.to_string());
+    let removed = fs.remove_dir_all(&dir).and_then(|()| {
+        // The removal is not durable until the directory that held the entry is synced. A parent
+        // that has never existed is not an error: this store has never written a columnar run.
+        match fs.fsync_dir(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    });
+    match removed {
+        Ok(()) => tracing::debug!(region_id, "a retired region's columnar copy was removed"),
+        Err(error) => {
+            tracing::warn!(region_id, %error, "a retired region's columnar copy was not removed");
+        }
+    }
+}
+
+/// Drops the announcement that a region's range was being reclaimed.
+///
+/// Synced, on the same terms as the batch that wrote it: an announcement that survived its own
+/// completion costs one wasted sweep at the next open, which is cheap and correct, and losing one
+/// that had *not* completed costs the range for ever.
+fn forget_retirement(db: &Db, region_id: u64) {
+    let Some(cf_id) = db.cf_id(cf::RAFT) else {
+        tracing::warn!(region_id, "the `raft` column family is missing");
+        return;
+    };
+    let mut batch = WriteBatch::new();
+    meta::stage_retired(&mut batch, cf_id, region_id);
+    if let Err(error) = db.write(batch, &WriteOptions::synced()) {
+        // The announcement stays, so the next open sweeps a range that is already empty: two
+        // reads and a second attempt at this write.
+        tracing::warn!(region_id, %error, "a finished retirement was not marked finished");
+    }
+}
+
+/// Finishes every retirement a crash interrupted, before this store serves anything.
+///
+/// # The window this closes
+///
+/// Retiring a region is two durable steps: the batch that destroys its Raft state and its `'m'`
+/// record, and the clear of its range. Between them the range's keys belong to nothing — and
+/// until the announcement existed, *nothing on disk said which keys they were*, because the `'m'`
+/// record that named the range was the first casualty. A crash there orphaned a whole region's
+/// data permanently on every one of the three column families, on a path every rebalance takes.
+/// The old code read as though this were benign — the state is "recoverable, and never served" —
+/// which is true of reads and false of disk.
+///
+/// # Where it runs, and why after the peers are started
+///
+/// After [`Store::host_region`], not before, because gate 2 asks the **region map** whether
+/// anything this store serves covers the range, and the map is empty until the regions are
+/// hosted. Running it first would answer "nothing overlaps" for every retirement and clear a
+/// range under its owner, which is the one outcome the gate exists to prevent. Nothing can be
+/// written into the range in the meantime: a peer only writes inside its own region, so a peer
+/// that could reach these keys is one that makes the gate refuse.
+fn reclaim_interrupted_retirements(store: &Arc<Store>) -> Result<()> {
+    for region in meta::load_retiring(&store.db)? {
+        let overlaps: Vec<u64> = store
+            .regions
+            .overlapping(&region.start_key, &region.end_key)
+            .iter()
+            .map(|other| other.id)
+            .collect();
+        tracing::warn!(
+            region_id = region.id,
+            "a retirement was interrupted; finishing it before serving"
+        );
+        finish_retirement(&store.db, &store.fs, &store.data_dir, &region, &overlaps);
+    }
+    Ok(())
+}
+
 /// Reads the retention policy out of the catalog and hands it to the collector.
 ///
 /// A failure leaves the policy that was working rather than falling back to the default,
@@ -479,6 +638,11 @@ impl Store {
         for region in hosted {
             store.host_region(region)?;
         }
+
+        // After the peers, because gate 2 asks the region map what this store serves and the map
+        // is only now populated; before the heartbeats, because a store that has not finished
+        // reclaiming is not yet telling the placement driver how much disk it has.
+        reclaim_interrupted_retirements(&store)?;
 
         if let Some(pd) = pd {
             store.spawn_heartbeats(
@@ -777,9 +941,38 @@ impl Store {
                 let peer = Arc::clone(peer);
                 let _ = tokio::task::spawn_blocking(move || peer.stop()).await;
             }
+            // **Gate 1, and it runs here rather than after the destroy because the destroy is
+            // what takes its input away.** The batch below deletes the `'m'` record; the answer
+            // to "does the membership still name a peer on this store" is computed from a region
+            // record, and after that batch there is none.
+            let membership = membership.as_ref().unwrap_or(state.region());
+            let announce = match membership
+                .peers
+                .iter()
+                .find(|peer| peer.store_id == store.store_id)
+            {
+                Some(mine) => {
+                    tracing::warn!(
+                        region_id,
+                        peer_id = mine.peer_id,
+                        "a region was retired while its record still names a peer on this store; \
+                         its range is left alone"
+                    );
+                    None
+                }
+                // The **range** is always this store's own record: it is what this store actually
+                // wrote keys into, and a newer record from elsewhere may describe a narrower one.
+                // Gate 2, inside the reclamation, is what keeps the pair honest when the two
+                // records disagree about the range as well.
+                None => Some(state.region().clone()),
+            };
+
             let db = Arc::clone(&store.db);
-            let removed =
-                tokio::task::spawn_blocking(move || crate::raft_log::destroy(&db, region_id)).await;
+            let announced = announce.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                crate::raft_log::destroy(&db, region_id, announced.as_ref())
+            })
+            .await;
             match removed {
                 Ok(Ok(entries)) => tracing::info!(
                     region_id,
@@ -798,122 +991,49 @@ impl Store {
                     return;
                 }
             }
-            // The **range** is always this store's own record: it is what this store actually
-            // wrote keys into, and a newer record from elsewhere may describe a narrower one.
-            // The **membership** is the newest available. Gate 2 below is what keeps the pair
-            // honest when the two records disagree about the range as well.
-            store
-                .reclaim_retired_range(
-                    state.region(),
-                    membership.as_ref().unwrap_or(state.region()),
-                )
-                .await;
+            let Some(region) = announce else {
+                return;
+            };
+            store.reclaim_retired_range(&region).await;
         });
     }
 
     /// Empties a retired region's range, once it is provably nobody's here.
     ///
     /// Split out of [`retire_region`](Self::retire_region) because it is the part that deletes
-    /// data, and the two gates in front of it are the whole reason it is safe to. See that
-    /// method's documentation for what they are and what happens when one does not hold.
-    async fn reclaim_retired_range(self: &Arc<Self>, region: &Region, membership: &Region) {
-        if let Some(mine) = membership
-            .peers
-            .iter()
-            .find(|peer| peer.store_id == self.store_id)
-        {
-            tracing::warn!(
-                region_id = region.id,
-                peer_id = mine.peer_id,
-                "a region was retired while its record still names a peer on this store; its \
-                 range is left alone"
-            );
-            return;
-        }
-        let overlapping = self.regions.overlapping(&region.start_key, &region.end_key);
-        if !overlapping.is_empty() {
-            tracing::warn!(
-                region_id = region.id,
-                overlaps = ?overlapping.iter().map(|other| other.id).collect::<Vec<_>>(),
-                "a retired region's range is still covered by a region this store hosts, so it \
-                 is left alone rather than emptied under its owner"
-            );
-            return;
-        }
-
-        let db = Arc::clone(&self.db);
-        let cleared = region.clone();
-        let region_id = region.id;
-        // On a blocking thread: `clear_range` is a delete, a flush and a compaction of the range.
-        match tokio::task::spawn_blocking(move || snapshot::clear_range(&db, &cleared)).await {
-            Ok(Ok(())) => tracing::info!(
-                region_id,
-                "a retired region's range was reclaimed in every column family"
-            ),
-            // Loud and harmless: the range keeps its keys, which is where it was before. The one
-            // way this fails is a tombstone that could not be discharged because something is
-            // holding an engine snapshot open, and the next retirement of this range will clear
-            // it (`crate::snapshot::clear_range`).
-            Ok(Err(error)) => {
-                tracing::warn!(region_id, %error, "a retired region's range was not reclaimed");
-            }
-            Err(error) => {
-                tracing::warn!(region_id, %error, "the reclamation task failed");
-            }
-        }
-        // **Unconditionally after it**, and not chained onto its success. The columnar copy is
-        // derived from the range and belongs to a region that is gone either way; a range clear
-        // that failed is a reason to keep the *keys*, never a reason to keep a copy of them.
-        self.reclaim_columnar_copy(region_id).await;
-    }
-
-    /// Removes a retired region's columnar copy: the in-memory slot, then the tree of runs.
+    /// data, and the gates in front of it are the whole reason it is safe to. Gate 1 is that
+    /// method's; gate 2 is [`finish_retirement`]'s, and it is here rather than there because the
+    /// region map is the authority on what this store serves and it is consulted *after* the
+    /// removal, so its answer cannot include the region going away.
     ///
-    /// The copy is a directory of immutable run files and a manifest of its own
-    /// (`crate::columnar::runs`), one per region id, written **beside** the engine rather than
-    /// inside it — so nothing the engine reclaims touches it and it has to be reclaimed here. Left
-    /// behind, it is the same unbounded growth as the range, on every store that ever held a
-    /// columnar learner.
-    ///
-    /// Per region id, which is what makes it safe without a second look at the region map: PD
-    /// never reuses an id, and a split child gets its own directory. Sweeping
-    /// `<data_dir>/columnar` would be a different and much worse operation.
-    ///
-    /// The slot goes first. It holds the `RunSet` that owns the manifest, and a fragment arriving
-    /// mid-removal would otherwise reopen the table and write a manifest back into a directory
-    /// being deleted.
-    async fn reclaim_columnar_copy(self: &Arc<Self>, region_id: u64) {
+    /// The in-memory columnar slot is dropped first and on this thread, because it owns the
+    /// `RunSet` that owns the manifest: a fragment arriving mid-removal would otherwise reopen
+    /// the table and write a manifest back into a directory being deleted.
+    async fn reclaim_retired_range(self: &Arc<Self>, region: &Region) {
         {
             let mut slots = self
                 .columnar
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            slots.remove(&region_id);
+            slots.remove(&region.id);
         }
+        let db = Arc::clone(&self.db);
         let fs = Arc::clone(&self.fs);
-        let root = self.data_dir.join("columnar");
-        let dir = root.join(region_id.to_string());
-        let removed = tokio::task::spawn_blocking(move || {
-            fs.remove_dir_all(&dir)?;
-            // The removal is not durable until the directory that held the entry is synced. A
-            // parent that has never existed is not an error: this store has never written a
-            // columnar run at all.
-            match fs.fsync_dir(&root) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                other => other,
-            }
+        let data_dir = self.data_dir.clone();
+        let region = region.clone();
+        let overlaps: Vec<u64> = self
+            .regions
+            .overlapping(&region.start_key, &region.end_key)
+            .iter()
+            .map(|other| other.id)
+            .collect();
+        // On a blocking thread: `clear_range` is a delete, a flush and a compaction of the range.
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            finish_retirement(&db, &fs, &data_dir, &region, &overlaps);
         })
-        .await;
-        match removed {
-            Ok(Ok(())) => {
-                tracing::debug!(region_id, "a retired region's columnar copy was removed");
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(region_id, %error, "a retired region's columnar copy was not removed");
-            }
-            Err(error) => {
-                tracing::warn!(region_id, %error, "the columnar reclamation task failed");
-            }
+        .await
+        {
+            tracing::warn!(%error, "the reclamation task failed");
         }
     }
 

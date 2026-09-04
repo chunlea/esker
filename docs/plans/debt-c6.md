@@ -103,3 +103,89 @@ inventory is a snapshot, and a brief cut from a snapshot ages at the rate the ot
 The cheapest check is not "does the site still exist" but "does the *symptom* still exist" — for
 five of these seven the site had moved, and for all seven the recorded sentence was still findable
 in the source, in a doc comment explaining why it used to be true.
+
+## 2. The retirement that a crash left half-done — the residual under #2
+
+### What was there
+
+Retiring a region is two durable steps, and the first one destroys the input to the second.
+`raft_log::destroy` deletes the region's `'l'`, `'s'`, `'m'` and `'p'` records in one synced batch;
+`reclaim_retired_range` clears the range afterwards. The `'m'` record is the only thing on this
+store that says which **keys** the region was — its start and end live nowhere else — so a crash
+between the steps leaves them in `default`, `lock` and `write` under no region, with nothing that
+can name them again. Not the store, which hosts nothing covering them; not PD, which knows the
+cluster's regions and not what any disk still holds; not a later retirement, which needs the record
+that is gone.
+
+The old comment called that state "recoverable, and never served". The second half is true and is
+the safety property. The first half was not true of anything: no code path came back for those
+bytes. So the window is not a delay, it is the leak ADR 0034 was written to end, surviving inside
+the fix for it — one whole region's data, permanently, on a path **every rebalance takes**.
+
+### The fix
+
+[ADR 0055](../adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md). A fifth
+prefix in the `raft` column family, `'R' ++ region_id` → the region being reclaimed, whole, written
+**in the same synced batch that deletes the record it describes**. It is the mirror of `'p'`, the
+pending-snapshot record, whose own documentation had already made the argument: data arriving into
+an unowned range was given a durable name in phase 4, and data leaving one was not.
+
+Two consequences of "the batch destroys the input" shaped the rest:
+
+* **gate 1 moves in front of the destroy.** Whether the membership still names a peer on this store
+  is computed from a region record, and after the batch there is none. Its answer *is* the
+  argument: `Some(region)` announces, `None` keeps the keys and announces nothing;
+* **the open-time sweep runs *after* the peers are hosted**, because gate 2 asks the region map
+  whether anything this store serves covers the range, and the map is empty until they are. Run
+  first it would answer "nothing overlaps" for every announcement and empty a range under its
+  owner — which is what the second red below actually did.
+
+`finish_retirement` is the whole of what a retirement does to data — gate 2, the range, the
+columnar tree, the announcement — as one blocking function with two callers, the live path and the
+sweep. A second implementation of a delete is a second chance to get a delete wrong.
+
+The announcement is dropped only when `clear_range` reports the range **provably empty**. That
+turns the pre-existing "loud and harmless" failure into a retry: before this, a clear that failed
+left the keys with nothing to come back for them, which is the same permanent leak by a different
+route.
+
+### The tests, and the two reds
+
+`crates/esker-store/tests/retire.rs`, three new tests beside the wave-c3 one, 1.2 s for the file.
+
+**Red 1 — the sweep does not run at open.** All three fail, and the one that matters says the debt
+in its own words:
+
+```
+assertion `left == right` failed: a retirement interrupted by a crash left its range on disk for ever
+  left: [("default", 1), ("lock", 1), ("write", 4)]
+ right: [("default", 0), ("lock", 0), ("write", 0)]
+```
+
+**Red 2 — gate 2 does not run at open**, the announcement swept with an empty overlap list. One
+test fails, and it is the data-loss direction:
+
+```
+assertion `left == right` failed: a stale retirement announcement emptied a range this store still serves
+  left: [("default", 0), ("lock", 0), ("write", 0)]
+ right: [("default", 1), ("lock", 1), ("write", 4)]
+```
+
+Six keys gone from a range the store was serving. That is what makes gate 2 load-bearing rather
+than a comment, and it is why `a_stale_announcement_never_empties_a_range_this_store_still_serves`
+announces a region whose range is one a live region covers — a split parent's stale record has
+exactly that shape.
+
+The third test, `an_announcement_whose_range_is_already_empty_is_simply_dropped`, is the crash that
+lands *after* the clear and before the announcement goes, which is the ordinary case at open. It
+runs on a store that hosts **nothing**, and that is the setup rather than a detail: on a store that
+hosts a region every range is inside one, so gate 2 would refuse and the test would pass without
+reaching the code it is about.
+
+### One thing the first version of the test got wrong, and what it found
+
+Driving the first step by hand left the region's peer running, and the restarted store came back
+**hosting the region it had just been removed from**: a live driver writes its state record back
+underneath the batch that deleted it. `retire_region` stops the peer before it destroys anything,
+so the test now does too. The failure was the test's, and the reason it is written down is that it
+is also a statement about the production order — the stop is not tidiness, it is a precondition.

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use esker_engine::{Db, ReadOptions, WriteBatch, WriteOptions, cf};
-use esker_proto::{Decoder, Encoder};
+use esker_proto::{Decoder, Encoder, Region};
 use esker_raft::{
     ConfState, Entry, EntryKind, HardState, Index, InitialState, LogStorage, NodeId, RaftError,
     Snapshot, Term,
@@ -89,6 +89,15 @@ pub fn metadata_key(region_id: u64) -> [u8; REGION_KEY_LEN] {
 pub fn pending_snapshot_key(region_id: u64) -> [u8; REGION_KEY_LEN] {
     let mut key = [0_u8; REGION_KEY_LEN];
     key[0] = raft_cf::PENDING_SNAPSHOT;
+    key[1..].copy_from_slice(&region_id.to_be_bytes());
+    key
+}
+
+/// `'R' ++ region_id`.
+#[must_use]
+pub fn retiring_key(region_id: u64) -> [u8; REGION_KEY_LEN] {
+    let mut key = [0_u8; REGION_KEY_LEN];
+    key[0] = raft_cf::RETIRING;
     key[1..].copy_from_slice(&region_id.to_be_bytes());
     key
 }
@@ -166,9 +175,20 @@ pub fn decode_entry(index: Index, bytes: &[u8]) -> Result<Entry> {
 /// Removes every trace of a region from the `raft` column family: its entries, its state record
 /// and its metadata record. Returns how many log entries were dropped.
 ///
-/// Used when this store is removed from a region. The region's **data** is not touched — see
-/// [`crate::server::Store`]'s retirement path for why.
-pub fn destroy(db: &Db, region_id: u64) -> Result<u64> {
+/// Used when this store is removed from a region. The region's **data** is not touched here — see
+/// [`crate::server::Store`]'s retirement path for why, and for what does touch it.
+///
+/// # `retiring`, and why it is not optional in the sense it looks
+///
+/// `Some(region)` announces, in this same batch, that the region's range is to be reclaimed and
+/// has not been: [`crate::meta::stage_retiring`]. It is the caller's answer to *may this store
+/// delete these keys*, and it has to be answered **before** the batch rather than after, because
+/// the batch destroys the record the answer is computed from.
+///
+/// `None` means the keys stay — the caller found the region's membership still names a peer on
+/// this store, and a store that may still be serving a range must not schedule it for deletion.
+/// That is the pre-existing behaviour and it costs disk rather than data.
+pub fn destroy(db: &Db, region_id: u64, retiring: Option<&Region>) -> Result<u64> {
     let cf_id = db
         .cf_id(cf::RAFT)
         .ok_or_else(|| StoreError::Bootstrap("the `raft` column family is missing".into()))?;
@@ -194,6 +214,13 @@ pub fn destroy(db: &Db, region_id: u64) -> Result<u64> {
     batch.delete(cf_id, &state_key(region_id));
     batch.delete(cf_id, &metadata_key(region_id));
     batch.delete(cf_id, &pending_snapshot_key(region_id));
+    // **In the same batch, or not at all.** The `'m'` record being deleted is the only thing on
+    // disk that says which range this region was; the announcement is what a restart reclaims
+    // from. Two batches with a crash between them is the state this replaces
+    // ([ADR 0055](../../../docs/adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md)).
+    if let Some(region) = retiring {
+        crate::meta::stage_retiring(&mut batch, cf_id, region);
+    }
     // Synced: a region this store has been removed from must not come back after a crash and
     // rejoin a group that has already replaced it (`docs/plans/phase-4.md` §6, race 3).
     db.write(batch, &WriteOptions::synced())?;

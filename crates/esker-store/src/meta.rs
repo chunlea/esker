@@ -40,7 +40,7 @@ use esker_proto::{Decoder, Encoder, Epoch, Peer, PeerRole, Region};
 
 use crate::error::{Result, StoreError};
 use crate::raft_cf;
-use crate::raft_log::{REGION_KEY_LEN, metadata_key, pending_snapshot_key};
+use crate::raft_log::{REGION_KEY_LEN, metadata_key, pending_snapshot_key, retiring_key};
 
 /// Version byte on a region metadata record. A change to any field's meaning bumps it.
 const METADATA_FORMAT_VERSION: u8 = 1;
@@ -235,6 +235,84 @@ pub fn load_pending_snapshots(db: &Db) -> Result<Vec<(Region, u64)>> {
     }
     iter.status()?;
     Ok(pending)
+}
+
+/// Announces that a region's range is being reclaimed and has not finished.
+///
+/// The mirror of [`stage_pending_snapshot`], and it carries the whole region for the same reason:
+/// **the range is the recoverable part**. The `'m'` record is the only thing on disk that says
+/// which keys this region was, and reclaiming it means deleting that record — so an announcement
+/// that held only an id would name a range nobody can reconstruct, and the keys under it would be
+/// orphaned exactly as they were before any of this existed.
+///
+/// Staged rather than written, because it is only worth anything in **the same batch** as the
+/// deletion it announces: written before, a crash in the gap leaves a retirement for a region
+/// still on disk and still served; written after, the gap is the one it exists to close.
+///
+/// It is not written for every retirement. A region retired while its own membership still names
+/// a peer on this store keeps its keys — that is `Store::retire_region`'s first gate, and an
+/// announcement is what would make a later open delete them anyway.
+pub fn stage_retiring(batch: &mut WriteBatch, cf: u32, region: &Region) {
+    let mut out = Encoder::new();
+    out.put_u8(METADATA_FORMAT_VERSION);
+    encode_region_into(&mut out, region);
+    batch.put(cf, &retiring_key(region.id), &out.finish());
+}
+
+/// Removes the announcement, which is what makes the reclamation finished.
+///
+/// Only once the range is **provably empty**. Removing it on the strength of having tried is how
+/// a reclamation that failed becomes a leak that nothing ever comes back for, which is the state
+/// this record exists to end.
+pub fn stage_retired(batch: &mut WriteBatch, cf: u32, region_id: u64) {
+    batch.delete(cf, &retiring_key(region_id));
+}
+
+/// Every region whose reclamation had not finished when this store last stopped.
+///
+/// In id order, like [`load_regions`], and for the same reason: the key is a big-endian id.
+pub fn load_retiring(db: &Db) -> Result<Vec<Region>> {
+    let mut iter = db.iter(cf::RAFT, &ReadOptions::default())?;
+    let mut retiring = Vec::new();
+    iter.seek(&[raft_cf::RETIRING]);
+    while iter.valid() {
+        let key = iter.key();
+        if key.first() != Some(&raft_cf::RETIRING) {
+            break;
+        }
+        if key.len() != REGION_KEY_LEN {
+            return Err(StoreError::Bootstrap(format!(
+                "a retiring key is {} bytes, expected {REGION_KEY_LEN}",
+                key.len()
+            )));
+        }
+        let mut id = [0_u8; 8];
+        id.copy_from_slice(&key[1..]);
+        let region_id = u64::from_be_bytes(id);
+
+        let mut input = Decoder::new(iter.value());
+        let version = input
+            .get_u8("retiring.version")
+            .map_err(|error| corrupt(&error))?;
+        if version != METADATA_FORMAT_VERSION {
+            return Err(StoreError::Bootstrap(format!(
+                "a retiring record has format version {version}, expected \
+                 {METADATA_FORMAT_VERSION}"
+            )));
+        }
+        let region = decode_region_from(&mut input)?;
+        input.finish().map_err(|error| corrupt(&error))?;
+        if region.id != region_id {
+            return Err(StoreError::Bootstrap(format!(
+                "the retiring record under key {region_id} says it is region {}",
+                region.id
+            )));
+        }
+        retiring.push(region);
+        iter.next();
+    }
+    iter.status()?;
+    Ok(retiring)
 }
 
 /// Adds the removal of a region's record to `batch`.
