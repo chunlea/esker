@@ -32,6 +32,8 @@
 mod locks;
 mod store;
 
+pub use locks::LockView;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
@@ -184,6 +186,16 @@ pub trait Txn: fmt::Debug + Send {
     fn lock(&mut self, key: &[u8]) -> Result<Lock> {
         let _ = key;
         Ok(Lock::Taken)
+    }
+
+    /// Every row lock **this node** holds, and every session waiting for one, for `pg_locks`.
+    ///
+    /// On the trait rather than on the backend because a catalog view is handed a transaction and
+    /// nothing else. The default is empty, which is the truthful answer for a backend that takes no
+    /// locks — and an empty `pg_locks` on such a node says "nothing is held here", not "this node
+    /// cannot tell you".
+    fn locks(&self) -> LockView {
+        LockView::default()
     }
 
     /// Records what this transaction reads, so that its commit can be validated
@@ -773,6 +785,10 @@ impl Txn for MemoryTxn {
 
     fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
         Ok(self.versions().written_since(key, self.statement_ts))
+    }
+
+    fn locks(&self) -> LockView {
+        self.versions().row_locks.view()
     }
 
     fn validate_reads(&mut self, on: bool) {
