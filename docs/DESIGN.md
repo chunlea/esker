@@ -711,12 +711,14 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
 
 Percolator, optimistic, snapshot isolation (the TiKV model). Three CFs:
 
-**Two isolation levels, not one** ([ADR 0057](adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)):
+**Three isolation levels, not one** ([ADR 0057](adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md), [ADR 0062](adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)):
 `REPEATABLE READ` is the snapshot this section describes, and `READ COMMITTED` — PostgreSQL's
 default, and so the one `ActiveRecord` runs in — takes a **new** snapshot per statement and *waits*
 for the writer in front of it rather than answering `40001`. The three CFs and the protocol below
 are the same either way; what the level changes is which snapshot a statement reads at and what a
-conflict does.
+conflict does. `SERIALIZABLE` is the third: snapshot isolation **plus a validated read set**, so a
+transaction that read a row another transaction then wrote is refused at `COMMIT` rather than
+committing on a snapshot that never existed as a serial order.
 
 
 | CF | key | value |
