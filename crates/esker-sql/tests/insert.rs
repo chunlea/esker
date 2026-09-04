@@ -346,10 +346,21 @@ fn a_concurrent_duplicate_primary_key_is_also_a_duplicate() {
     left.begin(false).unwrap();
     right.begin(false).unwrap();
     run(&mut left, "INSERT INTO t VALUES (1)").unwrap();
-    run(&mut right, "INSERT INTO t VALUES (1)").unwrap();
+
+    // **The second insert waits now** (ADR 0057), and one thread cannot hold a row and wait for
+    // it — so the wait is bounded and the answer is a real server's for a waiter that runs out of
+    // `lock_timeout`. The *lesson* of this test is the one below it: a concurrent duplicate is a
+    // `23505` naming the key, not the `40001` of an ordinary race, and it is asserted where the
+    // race still happens — after the winner has committed.
+    run(&mut right, "SET lock_timeout = '100ms'").unwrap();
+    let waited = run(&mut right, "INSERT INTO t VALUES (1)").unwrap_err();
+    assert_eq!(waited.sqlstate(), "55P03", "{waited}");
+    right.rollback().unwrap();
 
     left.commit().unwrap();
-    let loser = right.commit().unwrap_err();
+
+    let mut after = node.session();
+    let loser = run(&mut after, "INSERT INTO t VALUES (1)").unwrap_err();
     assert_eq!(loser.sqlstate(), sqlstate::UNIQUE_VIOLATION);
     assert!(loser.to_string().contains("t_pkey"), "{loser}");
 }

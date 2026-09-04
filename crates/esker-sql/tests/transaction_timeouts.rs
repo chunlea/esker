@@ -214,6 +214,17 @@ impl Session {
 /// nothing here waits for a row lock**, from which the deadlock, the `NOWAIT` and the two
 /// blocked-`UPDATE` lines all follow.
 const DIVERGENCES: &[(char, &str, &str)] = &[
+    (
+        'B',
+        "UPDATE tt_rows SET n = n + 1 WHERE id = 1  (concurrent)",
+        "**The deadlock is detected and the victim's transaction is not ended**, which is what \
+         makes the *second* session deadlock too. PostgreSQL ends the loser's transaction with the \
+         `40P01`, so its locks go at once and the survivor proceeds — measured, the survivor's \
+         both updates landed. Here the `40P01` is the statement's error and the block stays open \
+         until its `ROLLBACK`, so the survivor asks for a row the victim still holds and is told \
+         the same thing. The detection is right and the *lifetime* is not; ending a transaction on \
+         a deadlock belongs with the isolation levels in unit 3 (ADR 0057).",
+    ),
     // --- (1) the timeouts, refused by name rather than accepted -------------------------------
     (
         'A',
@@ -430,20 +441,32 @@ fn corpus() -> Vec<(usize, char, String, String)> {
 
 /// **`0` is the truth and it is accepted; anything else is refused by name.**
 ///
-/// The whole of what this unit adds, asserted on both new parameters. `0` is PostgreSQL's own
-/// spelling of "no timeout", which is this node's permanent condition, so `SHOW` answering `0` is
-/// exact rather than a placeholder.
+/// `statement_timeout` boots at `0` as a real server does. **`lock_timeout` does not**, and that
+/// is a declared divergence in a parameter's *value* rather than a lie about a condition: a wait
+/// with no ceiling on a node whose deadlock detection is node-local is a wait that can hang a
+/// client with nothing to tell it, so the default is a real ceiling that `SHOW` reports honestly
+/// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+/// `SET lock_timeout = 0` gives a caller PostgreSQL's behaviour and its risk.
 #[test]
 fn a_timeout_of_zero_is_accepted_and_a_real_one_is_refused_by_name() {
     let mut cluster = Cluster::new(&['A']);
     let session = cluster.session('A');
 
-    for name in ["statement_timeout", "lock_timeout"] {
-        assert_eq!(
-            session.rows(&format!("SHOW {name}")),
-            [["0"]],
-            "boot: {name}"
-        );
+    assert_eq!(
+        session.rows("SHOW lock_timeout"),
+        [[esker_sql::parameter::DEFAULT_LOCK_TIMEOUT]],
+        "lock_timeout boots at a real ceiling here, declared"
+    );
+    // **`lock_timeout` is honoured for a real value now**, which is the first timeout this node
+    // can keep: a waiter is a loop the SQL layer drives, so it is cancellable in a way a statement
+    // that is *working* is not.
+    session.run("SET lock_timeout = '150ms'").unwrap();
+    assert_eq!(session.rows("SHOW lock_timeout"), [["150ms"]]);
+    session.run("SET lock_timeout = 0").unwrap();
+    assert_eq!(session.rows("SHOW lock_timeout"), [["0"]]);
+
+    {
+        let name = "statement_timeout";
         session.run(&format!("SET {name} = 0")).unwrap();
         session.run(&format!("SET {name} = '0ms'")).unwrap();
         assert_eq!(
@@ -508,14 +531,44 @@ fn two_writers_to_one_row_both_proceed_and_the_loser_fails_at_commit() {
         .unwrap();
 
     cluster.session('A').run("BEGIN").unwrap();
-    // **This is where PostgreSQL blocks.** It returns immediately here.
+    // **This is where PostgreSQL blocks, and now so does this** (ADR 0057). One thread cannot hold
+    // a row and wait for it, so the wait is bounded here and the answer is the one a real server
+    // gives a waiter that runs out of `lock_timeout`.
     cluster
         .session('A')
-        .run("UPDATE tt_rows SET n = 12 WHERE id = 1")
+        // `SET LOCAL` is refused by name here (`tests/set_session.rs`), so the session's own.
+        .run("SET lock_timeout = '150ms'")
         .unwrap();
+    let waited = cluster
+        .session('A')
+        .run("UPDATE tt_rows SET n = 12 WHERE id = 1")
+        .unwrap_err();
+    assert_eq!(
+        waited.sqlstate(),
+        "55P03",
+        "a writer that cannot have the row waits and then says so: {waited}"
+    );
+    cluster.session('A').run("ROLLBACK").unwrap();
 
     cluster.session('B').run("COMMIT").unwrap();
-    let error = cluster.session('A').run("COMMIT").unwrap_err();
+    // **The `23505` lesson, kept.** What this test found was a rewritten row's own index entries
+    // being recorded as newly-added ones, so the loser of a race was told its primary key was a
+    // duplicate for a column it never touched. The race is gone — the second writer waits now —
+    // so the lesson is asserted where a conflict still happens: a transaction whose snapshot
+    // predates a committed write it did not wait for.
+    cluster.session('A').run("BEGIN").unwrap();
+    cluster
+        .session('A')
+        .rows("SELECT n FROM tt_rows WHERE id = 2");
+    cluster
+        .session('B')
+        .run("UPDATE tt_rows SET n = 21 WHERE id = 2")
+        .unwrap();
+    let error = cluster
+        .session('A')
+        .run("UPDATE tt_rows SET n = 22 WHERE id = 2")
+        .and_then(|_| cluster.session('A').run("COMMIT"))
+        .unwrap_err();
     // **`23505` was the answer here and it was wrong.** The `UPDATE` never touched `id`, and the
     // loser was told its primary key was a duplicate — because a rewritten row's own index
     // entries were recorded as newly-added ones (`exec::Written::rewritten`).
@@ -528,7 +581,8 @@ fn two_writers_to_one_row_both_proceed_and_the_loser_fails_at_commit() {
         !error.to_string().contains("duplicate key"),
         "a row neither session re-keyed is not a duplicate: {error}"
     );
-    // B's value is the one that stands.
+    // B's value is the one that stands on the row they raced for.
+    let _ = cluster.session('A').run("ROLLBACK");
     assert_eq!(
         cluster
             .session('A')

@@ -258,6 +258,18 @@ pub const NO_SUCH_SAVEPOINT: &str = "3B001";
 /// `currval` before this session has called `nextval`. PostgreSQL's class 55, and a statement
 /// about the *session* rather than about the sequence — which does have a value.
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+
+/// `55P03` — a lock this statement needed and did not get. **Two conditions and two sentences**
+/// under one code: `FOR UPDATE NOWAIT` says `could not obtain lock on row in relation "x"`, and a
+/// `lock_timeout` says `canceling statement due to lock timeout`. Measured, both
+/// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+pub const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// `40P01` — two transactions waiting for each other. In class 40 with `40001`, which is what says
+/// a client should retry it, and a **different** condition: a serialization failure is one
+/// transaction losing a race, a deadlock is two that cannot both proceed
+/// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+pub const DEADLOCK_DETECTED: &str = "40P01";
 /// A value written into a `GENERATED ALWAYS AS IDENTITY` column. PostgreSQL's own class 428,
 /// which has exactly this one condition in it.
 pub const GENERATED_ALWAYS: &str = "428C9";

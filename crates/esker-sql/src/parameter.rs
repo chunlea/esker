@@ -171,10 +171,17 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Duration,
         read_only: false,
     },
+    // **A non-zero default, where a real server's is `0`.** PostgreSQL waits for a row lock
+    // forever unless told otherwise, and relies on its deadlock detector to end the waits that
+    // will never end. This node detects a cycle between two sessions of one process (ADR 0057)
+    // and cannot see one that runs across nodes, so a wait with no ceiling is a wait that can
+    // hang a client with nothing to tell it. A default ceiling is a **declared divergence in a
+    // parameter's value**, which `SHOW lock_timeout` reports honestly, rather than a lie about a
+    // condition — and `SET lock_timeout = 0` gives a caller PostgreSQL's behaviour and its risk.
     Parameter {
         name: "lock_timeout",
         reported: "lock_timeout",
-        boot: "0",
+        boot: DEFAULT_LOCK_TIMEOUT,
         values: Values::Duration,
         read_only: false,
     },
@@ -446,9 +453,14 @@ impl Parameter {
             // than as a wrong answer: a client told it holds a 150 ms cancellation waits for one,
             // and `adapters/postgresql/transaction_test.rb` waited twenty minutes. `0` is
             // accepted because it asks for what is already the case.
-            ("statement_timeout" | "lock_timeout", value) if !is_no_timeout(value) => Err(
-                SqlError::unsupported(format!("a non-zero {} ({value})", self.reported)),
-            ),
+            // **`lock_timeout` is honoured now** — it is the first timeout this node can keep,
+            // because a waiter is a loop the SQL layer drives and is cancellable in a way a
+            // statement that is *working* is not (ADR 0057). It therefore falls through to the
+            // catch-all below rather than having an arm of its own. `statement_timeout` stays
+            // refused, and the refusal is narrower rather than gone.
+            ("statement_timeout", value) if !is_no_timeout(value) => Err(SqlError::unsupported(
+                format!("a non-zero {} ({value})", self.reported),
+            )),
             // **A `search_path` is not validated**, on a real server or here: an entry naming no
             // schema is *skipped* rather than refused, which is what makes the default
             // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
@@ -501,6 +513,45 @@ fn is_utc(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "utc" | "etc/utc" | "universal" | "zulu" | "z" | "+00:00" | "utc+0" | "utc-0"
     )
+}
+
+/// How long a writer waits for a row before giving up, when nobody has said.
+///
+/// PostgreSQL's default is `0` — wait forever — because its deadlock detector ends the waits that
+/// would not end. See the parameter's own note for why this node's is not zero.
+pub const DEFAULT_LOCK_TIMEOUT: &str = "5s";
+
+/// `lock_timeout`, which bounds how long a writer waits for the row in front of it (ADR 0057).
+#[must_use]
+pub fn lock_timeout() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "lock_timeout")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// `statement_timeout`, which bounds the same wait when `lock_timeout` does not.
+#[must_use]
+pub fn statement_timeout() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "statement_timeout")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// A timeout parameter's value in milliseconds, or `None` for one that is not a duration.
+///
+/// PostgreSQL reports these as a bare number of milliseconds or with a unit — `0`, `31s`, `300ms`
+/// — and both spellings reach here, because both are spellings a client `SET`.
+#[must_use]
+pub fn timeout_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    for (suffix, scale) in [("ms", 1_u64), ("s", 1_000), ("min", 60_000)] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number.trim().parse::<u64>().ok().map(|n| n * scale);
+        }
+    }
+    value.parse::<u64>().ok()
 }
 
 /// The `search_path` parameter, for the executor that resolves it.

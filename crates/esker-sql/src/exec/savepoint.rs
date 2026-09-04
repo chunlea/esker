@@ -214,6 +214,19 @@ impl Txn for Recording<'_> {
         self.inner.scan(start, end, limit)
     }
 
+    // **Forwarded, and the default would have been silent.** A `Txn` method this wrapper does not
+    // pass through is a method the statement inside a savepoint does not really call: with the
+    // default `lock` the recording took every lock without telling the store, so the transaction
+    // *holding* a row never held it and the one waiting never waited. Found by the red test in
+    // `tests/read_committed.rs`, which then failed on the wrong side (ADR 0057).
+    fn lock(&mut self, key: &[u8]) -> Result<crate::backend::Lock> {
+        self.inner.lock(key)
+    }
+
+    fn restart_statement(&mut self) -> Result<()> {
+        self.inner.restart_statement()
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) {
         if self.failed.is_none() {
             let before = self.before(key);
