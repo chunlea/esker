@@ -2132,6 +2132,23 @@ fn lower_trigger_state(
     })
 }
 
+/// The advisory-lock function of that name, or `None`.
+///
+/// Matched on the whole name rather than a prefix so that `pg_advisory_lock` — the **blocking**
+/// form — falls through to the refusal table instead of being read as a `try`. Answering a wait
+/// with an immediate failure would be the worse kind of wrong: a migrator told it holds the lock
+/// when it does not.
+fn advisory_call(name: &str) -> Option<plan::AdvisoryCall> {
+    let folded = name.to_ascii_lowercase();
+    match folded.as_str() {
+        "pg_try_advisory_lock" => Some(plan::AdvisoryCall::TryLock),
+        "pg_try_advisory_lock_shared" => Some(plan::AdvisoryCall::TryLockShared),
+        "pg_advisory_unlock" => Some(plan::AdvisoryCall::Unlock),
+        "pg_advisory_unlock_shared" => Some(plan::AdvisoryCall::UnlockShared),
+        _ => None,
+    }
+}
+
 /// Which kind of constraint an `ADD CONSTRAINT` names, for the refusal that follows.
 fn constraint_kind(constraint: &TableConstraint) -> &'static str {
     match constraint {
@@ -3154,6 +3171,35 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if name.eq_ignore_ascii_case("current_database") {
         refuse_wrong_arity(function, "current_database", 0)?;
         return Ok(plan::Expr::CurrentDatabase);
+    }
+    // The advisory-lock functions this node answers. The **blocking** forms are not here and are
+    // refused by name: they wait, and nothing here has anything to wait on. `ActiveRecord` sends
+    // only these (`postgresql_adapter.rb:474`), so the refusal costs the suite nothing.
+    if let Some(call) = advisory_call(&name) {
+        let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+            return Err(SqlError::UndefinedFunction(format!("{}()", call.name())));
+        };
+        if args.len() != 1 && args.len() != 2 {
+            return Err(SqlError::UndefinedFunction(format!(
+                "{}() with {} arguments",
+                call.name(),
+                args.len()
+            )));
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for arg in args {
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                return Err(SqlError::unsupported(format!(
+                    "{}() with that argument",
+                    call.name()
+                )));
+            };
+            lowered.push(lower_expr(expr)?);
+        }
+        return Ok(plan::Expr::Advisory {
+            call,
+            args: lowered,
+        });
     }
     // **The array, unresolved.** It was folded here into a literal `{public}` while `public` was
     // the only schema; now the value is the session's `search_path` and a lowering has no session,

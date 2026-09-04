@@ -195,6 +195,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         // The block is abandoned before the socket goes, so nothing it wrote is
                         // left half-open behind a connection nobody can reach any more.
                         let _ = work.executor.rollback();
+                        work.executor.release_advisory_locks();
                         self.send_error(&SqlError::IdleInTransactionTimeout).await?;
                         return Ok(());
                     }
@@ -202,6 +203,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 None => self.read_message().await?,
             };
             let Some((tag, body)) = next else {
+                // The client left. Its advisory locks go with it — they survive `ROLLBACK` and are
+                // released by an explicit unlock or by the session ending, and this is the ending
+                // (`crate::advisory`).
+                work.executor.release_advisory_locks();
                 return Ok(());
             };
             let message = match decode(tag, &body) {
@@ -215,6 +220,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             };
             if matches!(message, crate::pgwire::message::Frontend::Terminate) {
+                work.executor.release_advisory_locks();
                 return Ok(());
             }
             // Onto a blocking thread and back. `spawn_blocking` rather than `block_in_place`

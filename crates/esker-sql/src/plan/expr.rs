@@ -253,6 +253,20 @@ pub enum Expr {
         /// difference, and the one shape here that must not error.
         missing_ok: bool,
     },
+    /// `pg_try_advisory_lock` and the three siblings this node answers.
+    ///
+    /// Folded in `crate::exec::Executor::bound` the way [`Expr::CurrentSetting`] is, and for a
+    /// reason those two share and this one sharpens: the answer is a property of the **session**,
+    /// which the row evaluator has no handle on. Here that also fixes *how many times* it happens
+    /// — once per statement — which is why a non-constant argument is refused by name rather than
+    /// evaluated per row (`crate::exec::Executor::resolve_advisory`).
+    Advisory {
+        /// Which of the four.
+        call: AdvisoryCall,
+        /// The key, as one `bigint` or as two `int4`s. Whatever the arity, it is folded after
+        /// parameter binding, so `pg_try_advisory_lock($1)` is a constant by the time it is read.
+        args: Vec<Expr>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never NULL itself — that is the whole point of
     /// the operator, and the reason `x = NULL` is not a way to write it.
     IsNull {
@@ -1697,6 +1711,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::CurrentSetting { .. } => "current_setting",
         Expr::CurrentSchema { all: None } => "current_schema",
         Expr::CurrentSchema { .. } => "current_schemas",
+        Expr::Advisory { call, .. } => call.name(),
         Expr::CurrentDatabase => "current_database",
         Expr::Like {
             case_insensitive: false,
@@ -1717,5 +1732,54 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Coalesce(_) => "COALESCE",
         Expr::Case { .. } => "CASE",
         Expr::Subquery(sub) => sub.kind.describe(),
+    }
+}
+
+/// Which advisory-lock function was written.
+///
+/// The **blocking** forms (`pg_advisory_lock`, `pg_advisory_lock_shared` and the `xact` family)
+/// are deliberately not here: they wait, and nothing in this node has anything to wait on — a
+/// `pg_try_advisory_lock` that cannot take the lock answers `false` instead. `ActiveRecord` sends
+/// only the two `try`/`unlock` shapes (`postgresql_adapter.rb:474`), so the blocking ones are
+/// refused by name in `crate::parse` rather than approximated by a spin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryCall {
+    /// `pg_try_advisory_lock(bigint)` / `(int4, int4)`.
+    TryLock,
+    /// `pg_try_advisory_lock_shared(bigint)` / `(int4, int4)`.
+    TryLockShared,
+    /// `pg_advisory_unlock(bigint)` / `(int4, int4)`.
+    Unlock,
+    /// `pg_advisory_unlock_shared(bigint)` / `(int4, int4)`.
+    UnlockShared,
+}
+
+impl AdvisoryCall {
+    /// The name as written, for a message and for `EXPLAIN`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            AdvisoryCall::TryLock => "pg_try_advisory_lock",
+            AdvisoryCall::TryLockShared => "pg_try_advisory_lock_shared",
+            AdvisoryCall::Unlock => "pg_advisory_unlock",
+            AdvisoryCall::UnlockShared => "pg_advisory_unlock_shared",
+        }
+    }
+
+    /// Whether this one takes a lock (rather than releasing one).
+    #[must_use]
+    pub fn takes(self) -> bool {
+        matches!(self, AdvisoryCall::TryLock | AdvisoryCall::TryLockShared)
+    }
+
+    /// The mode it works in.
+    #[must_use]
+    pub fn mode(self) -> crate::advisory::Mode {
+        match self {
+            AdvisoryCall::TryLock | AdvisoryCall::Unlock => crate::advisory::Mode::Exclusive,
+            AdvisoryCall::TryLockShared | AdvisoryCall::UnlockShared => {
+                crate::advisory::Mode::Shared
+            }
+        }
     }
 }

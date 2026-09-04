@@ -22,6 +22,14 @@ pub const LEN: usize = 5;
 /// asymmetry is not something a reading would have produced.
 pub const SUCCESSFUL_COMPLETION: &str = "00000";
 
+// --- Class 01 — Warning ---
+
+/// The generic warning, which is what PostgreSQL raises for `pg_advisory_unlock` on a lock the
+/// session does not hold. A `WARNING` and not an `ERROR`: the statement answers `false` and the
+/// transaction is untouched, which is what lets `ActiveRecord` read the answer rather than be
+/// aborted by it.
+pub const WARNING: &str = "01000";
+
 // --- Class 08 — Connection Exception ---
 
 /// The frontend sent something the protocol does not allow.
@@ -287,6 +295,7 @@ pub const DATA_CORRUPTED: &str = "XX001";
 mod tests {
     /// Every constant in this module, so the shape tests below cannot silently miss one.
     const ALL: &[(&str, &str)] = &[
+        ("WARNING", super::WARNING),
         ("PROTOCOL_VIOLATION", super::PROTOCOL_VIOLATION),
         ("FEATURE_NOT_SUPPORTED", super::FEATURE_NOT_SUPPORTED),
         (

@@ -185,6 +185,17 @@ pub trait Execute {
         Ok(())
     }
 
+    /// Releases every advisory lock this session holds, because it is ending.
+    ///
+    /// **Not tidying: the other half of the lifetime.** An advisory lock survives `ROLLBACK` and
+    /// survives the statement that took it, so the only two things that release one are an
+    /// explicit unlock and the session going away — and the connection is the only thing that
+    /// knows about the second (`crate::advisory`). Every path out of
+    /// [`crate::pgwire::server::Connection::run`] calls it.
+    ///
+    /// Does nothing by default, which is right for an executor that has no locks.
+    fn release_advisory_locks(&self) {}
+
     /// How long this session may sit **idle inside a transaction block** before the server ends
     /// the connection, or `None` for no limit.
     ///
