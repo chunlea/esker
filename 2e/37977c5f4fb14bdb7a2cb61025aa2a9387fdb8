@@ -1,0 +1,39 @@
+crates/esker-cli/src/args.rs
+  s_b20cd111ee22fe::t_81c71ecef6ad3c 34-36,295-299,309-316,863,902-904,913-917,921-926,936-979,1462,1466-1525
+crates/esker-cli/src/pd.rs
+  s_b20cd111ee22fe::t_a24da8081ef3e3 25-35,52,55-59,61-71,78,112-120,122-126,136,195-198,227-315,432-446,448,521-580
+crates/esker-cli/src/server.rs
+  s_b20cd111ee22fe::t_f4b67856ccd6a3 117-139,173
+crates/esker-pd/src/service.rs
+  s_b20cd111ee22fe::t_42a349dcc190de 286-303
+crates/esker-proto/src/lib.rs
+  s_b20cd111ee22fe::t_88e318f6a3bc58 60-61
+crates/esker-proto/src/messages.rs
+  s_b20cd111ee22fe::t_969daafbf029dd 105-113,195,217,266,326,1576-1577
+crates/esker-proto/src/pd.rs
+  s_b20cd111ee22fe::t_a230f1705fa663 438-474,497-533,653-662,770,810-818,868-877,910-917,1050,1104-1106,1108,1159-1163
+crates/esker-proto/tests/golden/messages.hex
+  s_b20cd111ee22fe::t_e6914ddd0e4996 42-43,65-66
+crates/esker-proto/tests/messages.rs
+  s_b20cd111ee22fe::t_dadd38c75849bc 17-18,93-112,224-247,800-816
+crates/esker-store/tests/pd_client.rs
+  s_b20cd111ee22fe::t_2085dbff3d697b 47-59,130-135,137
+docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md
+  s_b20cd111ee22fe::t_78e26d9a4d179d 134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2e37977c5f4fb14bdb7a2cb61025aa2a9387fdb8",
+  "prompts": {},
+  "sessions": {
+    "s_b20cd111ee22fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d47fb1f-9385-4f6f-88a7-2a1d2aaf1b64",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
