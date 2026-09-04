@@ -18,13 +18,12 @@
 //! worst outcome available — the same argument `esker_s3::Endpoint::parse` makes when it refuses
 //! `https://` instead of downgrading it (ADR 0025).
 //!
-//! # Why the PEM reader is in here
+//! # Where the PEM reading happens
 //!
-//! `rustls-pemfile` is a crate, and the exception the maintainer granted names two: rustls and its
-//! provider. PEM is a base64 payload between two labelled lines; that is a hundred lines with tests
-//! and it is the kind of thing `CLAUDE.md` says to write. It never panics on input — every length
-//! and every byte is checked, because a certificate file is bytes this process did not write
-//! (invariant 9).
+//! `esker_base::pem`, which is neither TLS nor a dependency's job: base64 between two labelled
+//! lines, naming no cryptographic type. `rustls-pemfile` would have been a third crate against an
+//! exception that names two, and the reader had grown three copies before it was moved down.
+//! What stays here is the part that *is* TLS: which label maps to which `PrivateKeyDer` shape.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -146,7 +145,7 @@ impl TlsConfig {
                 PrivateSec1KeyDer,
             };
 
-            let chain: Vec<CertificateDer<'static>> = pem_blocks(certificate, "CERTIFICATE")?
+            let chain: Vec<CertificateDer<'static>> = read_pem(certificate, "CERTIFICATE")?
                 .into_iter()
                 .map(CertificateDer::from)
                 .collect();
@@ -163,11 +162,11 @@ impl TlsConfig {
             // The three labels a PEM private key comes under, in the order a generated key is most
             // likely to carry. Each maps to the DER shape rustls names for it; guessing wrong here
             // is an error, never an attempt to parse it as something else.
-            let key_der = if let Some(der) = first_pem_block(key, "PRIVATE KEY")? {
+            let key_der = if let Some(der) = read_first(key, "PRIVATE KEY")? {
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))
-            } else if let Some(der) = first_pem_block(key, "EC PRIVATE KEY")? {
+            } else if let Some(der) = read_first(key, "EC PRIVATE KEY")? {
                 PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der))
-            } else if let Some(der) = first_pem_block(key, "RSA PRIVATE KEY")? {
+            } else if let Some(der) = read_first(key, "RSA PRIVATE KEY")? {
                 PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der))
             } else {
                 return Err(TlsError::NoPemBlock {
@@ -466,197 +465,27 @@ where
 }
 
 #[cfg(feature = "tls")]
-/// Every PEM block in `path` carrying `label`, base64-decoded.
-fn pem_blocks(path: &Path, label: &'static str) -> Result<Vec<Vec<u8>>, TlsError> {
+/// Every PEM block of `label` in `path`, read and decoded.
+fn read_pem(path: &Path, label: &'static str) -> Result<Vec<Vec<u8>>, TlsError> {
     let text = std::fs::read_to_string(path).map_err(|source| TlsError::Unreadable {
         path: path.to_path_buf(),
         source,
     })?;
-    decode_pem(&text, label).map_err(|reason| TlsError::Malformed {
+    esker_base::pem::blocks(&text, label).map_err(|reason| TlsError::Malformed {
         path: path.to_path_buf(),
-        reason,
+        reason: reason.to_string(),
     })
 }
 
 #[cfg(feature = "tls")]
-/// The first PEM block carrying `label`, or `None` if the file has none.
-fn first_pem_block(path: &Path, label: &'static str) -> Result<Option<Vec<u8>>, TlsError> {
-    Ok(pem_blocks(path, label)?.into_iter().next())
-}
-
-#[cfg(any(feature = "tls", test))]
-/// Pulls every `-----BEGIN <label>-----` … `-----END <label>-----` block out of `text`.
-///
-/// Anything outside a block is ignored, which is what lets a certificate file carry the human
-/// -readable summary `openssl` writes above the block. A block that opens and never closes, or
-/// whose payload is not base64, is an error rather than a shorter certificate.
-fn decode_pem(text: &str, label: &str) -> Result<Vec<Vec<u8>>, String> {
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
-    let mut blocks = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(&begin) {
-        let after = &rest[start + begin.len()..];
-        let Some(stop) = after.find(&end) else {
-            return Err(format!("a {label} block is never closed"));
-        };
-        blocks.push(base64_decode(&after[..stop])?);
-        rest = &after[stop + end.len()..];
-    }
-    Ok(blocks)
-}
-
-#[cfg(any(feature = "tls", test))]
-/// Decodes standard base64, ignoring ASCII whitespace, which is how PEM wraps its payload.
-///
-/// Written here rather than taken from a crate, for the reason the module doc gives. It never
-/// panics: every index is checked and every byte outside the alphabet is an error.
-fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
-    /// Position in the base64 alphabet, or `None` for a byte that is not in it.
-    fn value(byte: u8) -> Option<u32> {
-        match byte {
-            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
-            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    // A quantum is four encoded characters; `pad` counts the `=` seen, which may only appear at
-    // the very end and only one or two of them.
-    let mut quantum = 0u32;
-    let mut filled = 0;
-    let mut pad = 0;
-    for byte in text.bytes() {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        if byte == b'=' {
-            pad += 1;
-            if pad > 2 {
-                return Err("base64 padding runs past two characters".to_owned());
-            }
-            continue;
-        }
-        if pad > 0 {
-            return Err("base64 data after the padding".to_owned());
-        }
-        let Some(value) = value(byte) else {
-            return Err(format!("{:?} is not a base64 character", byte as char));
-        };
-        quantum = (quantum << 6) | value;
-        filled += 1;
-        if filled == 4 {
-            // The quantum holds exactly 24 bits, so the low three bytes of its big-endian form
-            // *are* the output: no cast, no mask, nothing to get wrong.
-            let [_, first, second, third] = quantum.to_be_bytes();
-            out.extend_from_slice(&[first, second, third]);
-            quantum = 0;
-            filled = 0;
-        }
-    }
-    // What is left over has to agree with the padding, **exactly**: three characters are two bytes
-    // and need one `=`, two are one byte and need two, and one on its own cannot have come from
-    // any input. Unpadded base64 is a real encoding elsewhere and is refused here, because PEM
-    // always pads and a key file that does not is malformed — the same "reject rather than guess"
-    // the HTTP response parser follows (ADR 0025) and for the same reason: the alternative is
-    // deciding on a user's behalf what their key file probably meant.
-    match (filled, pad) {
-        (0, 0) => Ok(out),
-        (3, 1) => {
-            let [_, first, second, _] = (quantum << 6).to_be_bytes();
-            out.extend_from_slice(&[first, second]);
-            Ok(out)
-        }
-        (2, 2) => {
-            let [_, only, _, _] = (quantum << 12).to_be_bytes();
-            out.push(only);
-            Ok(out)
-        }
-        (1, _) => Err("a base64 quantum has one character left over, which encodes nothing".into()),
-        _ => Err("base64 input ends mid-quantum, or its padding is missing".to_owned()),
-    }
+/// The first PEM block of `label` in `path`, or `None`.
+fn read_first(path: &Path, label: &'static str) -> Result<Option<Vec<u8>>, TlsError> {
+    Ok(read_pem(path, label)?.into_iter().next())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The vectors from RFC 4648 §10, which is where this alphabet is specified.
-    #[test]
-    fn decodes_the_rfc_4648_vectors() {
-        for (encoded, plain) in [
-            ("", ""),
-            ("Zg==", "f"),
-            ("Zm8=", "fo"),
-            ("Zm9v", "foo"),
-            ("Zm9vYg==", "foob"),
-            ("Zm9vYmE=", "fooba"),
-            ("Zm9vYmFy", "foobar"),
-        ] {
-            assert_eq!(
-                base64_decode(encoded).as_deref(),
-                Ok(plain.as_bytes()),
-                "decoding {encoded:?}"
-            );
-        }
-    }
-
-    /// PEM wraps at 64 columns, so the decoder has to ignore newlines wherever they fall.
-    #[test]
-    fn ignores_the_whitespace_pem_wraps_with() {
-        assert_eq!(
-            base64_decode("Zm9v\nYmFy\r\n").as_deref(),
-            Ok(&b"foobar"[..])
-        );
-        assert_eq!(base64_decode(" Z m 9 v ").as_deref(), Ok(&b"foo"[..]));
-    }
-
-    /// Invariant 9: a certificate file is bytes this process did not write.
-    #[test]
-    fn malformed_base64_is_an_error_not_a_panic() {
-        for bad in [
-            "Zm9vYmFy!",   // not in the alphabet
-            "Z",           // one character left over
-            "Zg===",       // three pad characters
-            "Zg==Zg==",    // data after the padding
-            "Zm9vYmF",     // ends mid-quantum with no padding
-            "\u{feff}Zm8", // a BOM is not whitespace
-        ] {
-            assert!(base64_decode(bad).is_err(), "{bad:?} decoded successfully");
-        }
-    }
-
-    #[test]
-    fn reads_the_blocks_it_is_asked_for_and_ignores_the_rest() {
-        let text = "\
-subject=CN = localhost
------BEGIN CERTIFICATE-----
-Zm9vYmFy
------END CERTIFICATE-----
------BEGIN PRIVATE KEY-----
-Zm9v
------END PRIVATE KEY-----
------BEGIN CERTIFICATE-----
-Zm8=
------END CERTIFICATE-----
-";
-        assert_eq!(
-            decode_pem(text, "CERTIFICATE"),
-            Ok(vec![b"foobar".to_vec(), b"fo".to_vec()])
-        );
-        assert_eq!(decode_pem(text, "PRIVATE KEY"), Ok(vec![b"foo".to_vec()]));
-        assert_eq!(decode_pem(text, "EC PRIVATE KEY"), Ok(Vec::new()));
-    }
-
-    #[test]
-    fn an_unclosed_block_is_an_error() {
-        let text = "-----BEGIN CERTIFICATE-----\nZm9v\n";
-        assert!(decode_pem(text, "CERTIFICATE").is_err());
-    }
 
     /// The refusal that is the whole point of unit 2, in the build that has no TLS.
     #[cfg(not(feature = "tls"))]
