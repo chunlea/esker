@@ -569,7 +569,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{RpcTls, TlsError};
+    use super::RpcTls;
+    #[cfg(not(feature = "tls"))]
+    use super::TlsError;
+    #[cfg(not(feature = "tls"))]
     use std::path::Path;
 
     #[test]
