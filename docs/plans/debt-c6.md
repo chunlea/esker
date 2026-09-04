@@ -509,3 +509,63 @@ the hazard needs a caller that ticks in a tight loop, which is a test. The fix i
 code, and the honest limit of it is that the failure stays load-dependent: with the barrier gone it
 is green 10 of 10 on a quiet box. What is deterministic is the *success* path — 20 ticks, 2 grants,
 invariant under load — and that is what the new assertion pins.
+## 7. Two harness findings from gating this wave, and the one that is a real debt
+
+Not planned work. The wave's own gate failed four tests twice and passed them on a third run, and
+running that down produced two things worth keeping.
+
+### The gate's failures were the shared network namespace, except one
+
+`~/workspace/lab/esker-docker/run.sh` starts every container with
+`--network container:esker-minio`, so **two lanes gating at once share one port space**. Three
+runs of the same tree:
+
+| run | foreign `esker-test` containers | result |
+|---|---|---|
+| first | one observed during the test phase | 3065/3066 |
+| second | one observed during the test phase | 3066/3070 |
+| third | **0 of 49 samples** | **3070/3070** |
+
+The counter that separates them had to be the number of *test* containers, not of containers:
+an `esker-in` compile job overlapped 48 of 49 samples of the passing run and binds no test port.
+Counting any container made the passing run look as contended as the failing one, which nearly
+threw the explanation away.
+
+`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster` passed in
+the exclusive run after failing on a 60 s timeout in both contended ones. It is carried as a
+standing flake with an owner; this is evidence it is the same contention rather than a defect of
+its own.
+
+### The one that is not the namespace: a wall-clock kill racing CPU-bound progress
+
+`esker-client::crash_through_the_client every_acknowledged_write_survives_a_kill_of_the_server`
+fails **6 runs in 10** under twenty-four spinning threads **in a single container**, where no port
+collision is possible. So it is not the namespace, and the harness fix would have buried it.
+
+It is also **not a durability failure**, and the panic's line says so before any reasoning does.
+The failure is at `crash_through_the_client.rs:305`:
+
+```rust
+assert!(acked > 0, "round {round} acknowledged nothing, so it proved nothing");
+```
+
+— the round's own guard that it did any work. The durability assertion, *"acknowledged write
+{index} did not survive the kill"*, is at `:287` and fired in none of the six. No acknowledged
+write was lost. The child is killed at a random moment measured on the **wall clock** while the
+writes it is meant to interrupt are **CPU-bound**, so on a loaded box the kill can land before the
+first acknowledgement and the round has nothing to verify.
+
+The guard is right to fail rather than pass vacuously — a round that verified nothing must not
+count. The defect is that the round cannot say "I was starved, give me more time". A fix belongs
+on the test side: measure the kill point in *acknowledged writes* rather than in milliseconds, or
+retry a round that acked none before declaring it a failure.
+
+- **Site:** `crates/esker-client/tests/crash_through_the_client.rs:305`, and the kill timing that
+  feeds it. **Size:** small. **Reproduction:** 10 runs under 24 busy threads, one container.
+
+### And the wait rule needs its settle to re-arm
+
+The lane rule is one container at a time. Implemented as *empty → sleep 30 → check again*, a
+container that arrives inside the window and exits before the second check slips through. Looping
+back to the wait instead fired twice on one gate ("a container appeared during the settle; waiting
+again") before a slot was genuinely clear at 110 s. The check has to re-arm, not re-check.
