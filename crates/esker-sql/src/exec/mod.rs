@@ -263,9 +263,18 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     let mut waited = 0_u64;
     loop {
         match txn.lock(key)? {
-            // **Only a wait costs a restart.** A lock taken at once means nothing changed under
-            // this statement, so what it read is still what is there.
-            crate::backend::Lock::Taken if waited == 0 => return Ok(()),
+            // **A lock taken at once is not proof that nothing moved.** The writer in front may
+            // have committed and released between this statement's read and this lock, in which
+            // case there was nothing to wait for and the value in hand is stale anyway. Asking is
+            // PostgreSQL's `EvalPlanQual`, and without it a single `UPDATE … SET n = n + 1` under
+            // three writers raised `40001` a hundred times in twelve hundred transactions.
+            crate::backend::Lock::Taken if waited == 0 => {
+                if waits && txn.changed_since_statement(key)? {
+                    txn.restart_statement()?;
+                    return Err(SqlError::StatementMustRestart);
+                }
+                return Ok(());
+            }
             crate::backend::Lock::Taken => {
                 txn.restart_statement()?;
                 return Err(SqlError::StatementMustRestart);

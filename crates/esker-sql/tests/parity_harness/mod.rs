@@ -65,7 +65,33 @@ impl Pair {
         Pair { store, catalog }
     }
 
+    /// A handle that can open more sessions, from another thread.
+    pub(crate) fn sessions(&self) -> Sessions {
+        Sessions {
+            store: Arc::clone(&self.store),
+            catalog: Arc::clone(&self.catalog),
+        }
+    }
+
     /// Another session against the same store and catalog.
+    pub(crate) fn session(&self) -> Node {
+        Node::on(
+            Arc::clone(&self.store),
+            Arc::clone(&self.catalog),
+            1,
+            "esker",
+            &[],
+        )
+    }
+}
+
+/// A [`Pair`]'s store and catalog, sendable to another thread so it can open sessions of its own.
+pub(crate) struct Sessions {
+    store: Arc<dyn Backend>,
+    catalog: Arc<Catalog>,
+}
+
+impl Sessions {
     pub(crate) fn session(&self) -> Node {
         Node::on(
             Arc::clone(&self.store),
