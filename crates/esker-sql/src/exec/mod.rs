@@ -734,6 +734,15 @@ impl Executor {
         // still written, and the reads it makes on the way are its own uncommitted catalog.
         self.catalog_written |= statement.writes_catalog();
         match statement {
+            // The `DO` block's whole effect: the message reaches the client at the severity that
+            // was written, and the statement's tag is `DO`.
+            Statement::Raise { message, severity } => {
+                self.notice(SqlError::Raised {
+                    message: message.clone(),
+                    severity: *severity,
+                });
+                Ok(Outcome::done("DO"))
+            }
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
@@ -2576,6 +2585,7 @@ fn fill_sequence_reads_in(
 /// shape `psql` renders and users read.
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
+        Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
         Statement::CreateExtension(create) => {
             vec![format!("Create Extension on {}", create.name)]
