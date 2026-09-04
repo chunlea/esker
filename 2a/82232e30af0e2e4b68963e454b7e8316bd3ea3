@@ -1,0 +1,16 @@
+crates/esker-cli/src/cluster.rs
+  h_44076b318daf9c 318-324,395,398-400,403-410,467,479,492-570,703,837-913,918-923
+crates/esker-cli/tests/cluster_start.rs
+  h_44076b318daf9c 189-254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2a82232e30af0e2e4b68963e454b7e8316bd3ea3",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
