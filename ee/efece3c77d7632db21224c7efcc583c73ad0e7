@@ -1,0 +1,22 @@
+crates/esker-engine/benches/memtable.rs
+  h_44076b318daf9c 12-16,47-49,65-67,81-83,99-101
+crates/esker-engine/src/db/open.rs
+  h_44076b318daf9c 406-410,412
+crates/esker-engine/src/db/write.rs
+  h_44076b318daf9c 257-262,264
+crates/esker-engine/src/memtable.rs
+  h_44076b318daf9c 37,132-142,168,172-184,188,415,422-476,515-517,532-540,552-557,567-578,594-596,619-621,656-658,661-663,680-682,686-688,734-736
+docs/plans/debt-c6.md
+  h_44076b318daf9c 1026-1083
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "eeefece3c77d7632db21224c7efcc583c73ad0e7",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
