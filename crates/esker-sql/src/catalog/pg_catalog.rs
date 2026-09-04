@@ -1659,9 +1659,13 @@ fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Ve
 ///
 /// **`enumsortorder` is a `real` and it is not the label's index** — it is what PostgreSQL wrote
 /// when the label was declared, and `ALTER TYPE … ADD VALUE … BEFORE` puts a new one *between* two
-/// existing numbers, which is why the column is a float and not an integer. This node appends only,
-/// so the numbers are 1, 2, 3 …, and the rule that matters is the one they encode: the order is the
-/// declaration order, never the alphabet, and a label's number is never reused (ADR 0050).
+/// existing numbers, which is why the column is a float and not an integer.
+///
+/// **This node's numbers are always 1, 2, 3 … even after an insert in the middle**, because the
+/// value a row stores *is* the label's position: `ALTER TYPE … ADD VALUE … BEFORE` rewrites the
+/// rows and renumbers, where a real server writes 1.5 and moves nothing. So the sequence differs
+/// and the **order** does not, which is the only thing these numbers encode — the order is the
+/// declaration order, never the alphabet (ADR 0050).
 ///
 /// Rows are ordered by type oid and then by that number, which is the order a client reading them
 /// without an `ORDER BY` would find least surprising — and `ActiveRecord`'s own `enum_types` query

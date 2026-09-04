@@ -910,6 +910,15 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `ALTER TYPE … RENAME VALUE` or `… BEFORE/AFTER` naming a label the enum does not have.
+    ///
+    /// **`22023`, not `42704`** — measured: PostgreSQL calls it an invalid *parameter*, because the
+    /// label is an argument to the statement rather than an object being looked up.
+    #[error("\"{0}\" is not an existing enum label")]
+    NotAnEnumLabel(String),
+    /// A label a `CREATE`/`ALTER TYPE` would add twice: `42710`.
+    #[error("enum label \"{0}\" already exists")]
+    DuplicateEnumLabel(String),
     /// A `CHECK` added over rows that already violate it: `23514`.
     ///
     /// **A different sentence from the one an `INSERT` gets**, which prints the failing row —
@@ -2383,7 +2392,9 @@ impl SqlError {
             | SqlError::CannotCastColumnAutomatically { .. }
             | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
 
-            SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
+            SqlError::DuplicateTrigger { .. }
+            // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
+            | SqlError::DuplicateEnumLabel(_) => sqlstate::DUPLICATE_OBJECT,
 
             // `42P17 invalid_object_definition`, not `42P16` — measured, and the two are one
             // digit apart.
@@ -2545,7 +2556,10 @@ impl SqlError {
             // A declared length is `22023` too, which is not a family resemblance with the
             // parameter errors beside it — it is `anychar_typmodin` reaching for the same code.
             // Captured, both ends: `varchar(0)` and `varchar(10485761)`.
-            SqlError::TypeLengthTooSmall(_)
+            // **A label is a parameter, not an object**: PostgreSQL answers `22023` for a name
+            // that is not one, where a missing *type* is `42704`.
+            SqlError::NotAnEnumLabel(_)
+            | SqlError::TypeLengthTooSmall(_)
             | SqlError::TypeLengthTooLarge(..)
             | SqlError::FloatPrecisionTooSmall
             | SqlError::FloatPrecisionTooLarge

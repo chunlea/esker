@@ -1,0 +1,40 @@
+BEGIN		-
+CREATE TYPE at_mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TABLE at_t (id serial primary key, m at_mood)		-
+INSERT INTO at_t (m) VALUES ('sad'), ('ok'), ('happy')		-
+SELECT 'r', m::text AS as_text, m::text = 'ok' AS is_ok FROM at_t ORDER BY m		r|sad|f ; r|ok|t ; r|happy|f
+SELECT 'r', enumlabel, enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder	text,name,real	r|sad|1 ; r|ok|2 ; r|happy|3
+ALTER TYPE at_mood ADD VALUE 'angry' BEFORE 'ok'		-
+SELECT 'r', enumlabel, enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder	text,name,real	r|sad|1 ; r|angry|1.5 ; r|ok|2 ; r|happy|3
+SELECT 'r', m::text AS as_text FROM at_t ORDER BY m		r|sad ; r|ok ; r|happy
+INSERT INTO at_t (m) VALUES ('angry')		-
+SELECT 'r', m::text AS as_text FROM at_t ORDER BY m		r|sad ; r|angry ; r|ok ; r|happy
+ALTER TYPE at_mood ADD VALUE 'nervous' AFTER 'ok'		-
+ALTER TYPE at_mood ADD VALUE 'glad'		-
+SELECT 'r', enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder	text,name	r|sad ; r|angry ; r|ok ; r|nervous ; r|happy ; r|glad
+SAVEPOINT a1		-
+ALTER TYPE at_mood ADD VALUE 'glad'	!42710 enum label "glad" already exists
+ROLLBACK TO a1		-
+ALTER TYPE at_mood ADD VALUE IF NOT EXISTS 'glad'		-
+ALTER TYPE at_mood ADD VALUE IF NOT EXISTS 'curious'		-
+SELECT 'r', count(*) AS labels FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood'	text,bigint	r|7
+ALTER TYPE at_mood RENAME VALUE 'ok' TO 'okay'		-
+SELECT 'r', enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder	text,name	r|sad ; r|angry ; r|okay ; r|nervous ; r|happy ; r|glad ; r|curious
+SELECT 'r', m::text AS as_text FROM at_t ORDER BY id		r|sad ; r|okay ; r|happy ; r|angry
+SAVEPOINT a2		-
+ALTER TYPE at_mood RENAME VALUE 'nosuch' TO 'other'	!22023 "nosuch" is not an existing enum label
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+ALTER TYPE at_mood RENAME VALUE 'sad' TO 'happy'	!42710 enum label "happy" already exists
+ROLLBACK TO a3		-
+ALTER TYPE at_mood RENAME TO at_feeling		-
+SELECT 'r', typname FROM pg_type WHERE typname IN ('at_mood','at_feeling')	text,name	r|at_feeling
+SELECT 'r', format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'at_t'::regclass AND a.attname = 'm'		r|at_feeling
+SELECT 'r', m::text AS as_text FROM at_t ORDER BY id		r|sad ; r|okay ; r|happy ; r|angry
+SAVEPOINT a4		-
+ALTER TYPE at_nosuch RENAME TO other	!42704 type "at_nosuch" does not exist
+ROLLBACK TO a4		-
+DROP TABLE at_t		-
+DROP TYPE at_feeling		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('at_mood','at_feeling')	bigint	0
