@@ -399,14 +399,45 @@ async fn observe(case: &Case) -> Observed {
 
     // Long enough for the throttle (50 leaderless rounds at a 5 ms tick) several times over, so a
     // "nothing happened" answer is a decision and not a race.
+    let beats_before = pd.store_beats().len();
     let watch_until = Instant::now() + Duration::from_secs(3);
+    let mut reclaimed_inside_the_window = false;
     while Instant::now() < watch_until {
         if second.store.regions().get(1).is_none() && keys_held(&second.store) == 0 {
             // The reclamation has finished. Every other case runs the full window, because
             // "nothing happened" is only a decision once the throttle has had time to fire.
+            reclaimed_inside_the_window = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // **The window's own precondition, asserted rather than asserted in prose.**
+    //
+    // Every "nothing happened" answer below rests on the throttle having had room to fire, and
+    // the comment above says so — but the budget is spent in *wall clock* while the throttle
+    // counts *rounds*, and the heartbeat interval is `MissedTickBehavior::Skip`, so a skipped
+    // tick is a round that never happens rather than one that happens late. Nothing connected
+    // the two, so a tighter tick, a larger `ORPHAN_PROBE_ROUNDS` or a slow enough box would
+    // shorten the window in rounds while it still looked like three seconds — and the failure
+    // would arrive as `still_hosted: true`, which this test reads as a *decision*.
+    //
+    // A store beat is emitted every `store_heartbeat / tick` rounds (20 ms / 5 ms = 4), so the
+    // beats PD received are a count of the rounds that really ran. Measured at 520-600 rounds
+    // against the 50 the throttle needs — quiet and under forty-eight spinning threads alike, so
+    // the margin is real and this assertion is not a flake waiting to happen. It exists to make
+    // the erosion loud if it ever starts.
+    const PROBE_ROUNDS: usize = 50; // `esker_store::server::ORPHAN_PROBE_ROUNDS`, which is private.
+    const ROUNDS_PER_BEAT: usize = 4; // store_heartbeat 20 ms / tick 5 ms.
+    if !reclaimed_inside_the_window {
+        let rounds = (pd.store_beats().len() - beats_before) * ROUNDS_PER_BEAT;
+        assert!(
+            rounds >= PROBE_ROUNDS * 2,
+            "case {:?}: the window ran {rounds} heartbeat rounds, and the orphan probe needs \
+             {PROBE_ROUNDS} before it asks PD anything — so \"nothing happened\" is this test \
+             running out of clock, not the store deciding",
+            case.name
+        );
     }
     let observed = Observed {
         still_hosted: second.store.regions().get(1).is_some(),

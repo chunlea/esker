@@ -639,3 +639,68 @@ looks at a leader hint at all — `balance.rs`, `retire.rs`, `server.rs`, `sim_s
 shape is one bug per file rather than one bug, and it is the "count the parsers before fixing the
 caller" lesson in test code. Not swept here: each needs its own judgement about whether a second
 voter can exist at the moment it writes.
+
+## 9. `sim_sweep the_sweep_reclaims_on_evidence_and_never_otherwise`: a hypothesis that did not survive its own measurement
+
+The third assigned sighting, recorded as time-based.
+
+### The hypothesis, which was wrong
+
+The test judges every case inside a three-second wall-clock window, justified in the code as
+*"long enough for the throttle (50 leaderless rounds at a 5 ms tick) several times over"*. That
+arithmetic converts a **count** into **milliseconds**, and the interval it counts is
+`MissedTickBehavior::Skip` — a tick lost to a busy process is a round that never happens rather
+than one that happens late. So on a loaded box the window should shrink in rounds while still
+looking like three seconds, and a case that should reclaim should report `still_hosted: true`,
+which this test reads as the store's *decision*.
+
+It is a tidy story, it fits the recorded sighting, and it is false.
+
+### The measurement that refuted it
+
+| | quiet | 48 spinning threads | needed |
+|---|---|---|---|
+| reclamation, the one case that reclaims | 254 ms | 433 ms | window is 3000 ms |
+| rounds inside the window | ~590 | ~520–600 | throttle needs 50 |
+
+Beats held at 130–150 per three seconds under forty-eight spinners against ~150 quiet. The round
+rate does not collapse; the margin is about sevenfold in time and tenfold in rounds. Nor did the
+test reproduce: 5 runs quiet and 8 under load, all green.
+
+**So the window was not changed.** Widening it, or replacing it with a wait on beats, would have
+been repairing something that is not broken on the strength of a mechanism that measurement had
+already ruled out.
+
+### What did change, and why it is worth a commit
+
+The prose claim — *several times over* — was the only thing connecting a budget spent in wall
+clock to a throttle counted in rounds, and nothing checked it. A store beat is emitted every
+`store_heartbeat / tick` rounds (20 ms / 5 ms = 4), so the beats PD received **are** a count of the
+rounds that really ran, and the test now asserts that the full-window cases got at least twice the
+throttle's fifty. Erosion — a tighter tick, a larger `ORPHAN_PROBE_ROUNDS`, a slower box — now
+fails loudly saying the window ran out of clock, instead of arriving as `still_hosted: true` and
+being read as a decision.
+
+No bug was found. A stated precondition became a checked one.
+
+### The sighting, left as a sighting
+
+Unreproduced across two load models and thirteen runs. Recorded rather than explained, with what
+was eliminated: it is not the window's length, and it is not the round rate under CPU load.
+
+### The wider family, and the one that fails the other way
+
+Three instances of one mistake live in these crates, each converting a count into milliseconds
+once, on a quiet machine:
+
+| site | counted in | judged by | under load |
+|---|---|---|---|
+| `peer.rs`'s election pump (§6) | drives | tick iterations | flaky — **fixed** |
+| `sim_sweep.rs`'s watch window | leaderless rounds | 3 s | sound, margin now asserted |
+| `snapshot.rs:548` | heartbeat rounds | a 200 ms sleep | **silently vacuous** |
+
+The third is the one worth chasing next. `sleep(200ms)` then *"an operator from a stale epoch was
+applied"* is a **negative** assertion behind a wall clock: under load it does not go red, it goes
+green without the store having considered the operator at all. It fails only on the day the
+rejection breaks — and it will still pass. Not fixed here; it wants a wait on evidence that the
+operator was seen and refused, and that is its own unit.
