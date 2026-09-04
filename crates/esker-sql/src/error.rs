@@ -316,6 +316,21 @@ pub enum SqlError {
         table: String,
     },
 
+    /// `DROP TABLE`/`DROP VIEW` of something a view is built on: `2BP01`, unless `CASCADE`.
+    ///
+    /// **A view is a dependency of its base relation, not a copy of it.** Without this edge the
+    /// base could be dropped and the view left naming a relation that is gone — the same shape as
+    /// a name record outliving its object, reached from an ordinary `DROP TABLE`.
+    #[error("cannot drop {kind} {name} because other objects depend on it")]
+    ViewDependsOnRelation {
+        /// `table` or `view` — what is being dropped.
+        kind: &'static str,
+        /// Its name, unquoted the way PostgreSQL writes it in this sentence.
+        name: String,
+        /// `view v_plain depends on table vb` — the `DETAIL`, naming the first dependent found.
+        detail: String,
+    },
+
     /// No such column.
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
@@ -1832,6 +1847,10 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// What a `CASCADE` took: a **notice**, one per view, in PostgreSQL's own wording.
+    #[error("drop cascades to view {0}")]
+    CascadeDropsView(String),
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -2120,6 +2139,7 @@ impl SqlError {
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
@@ -2271,7 +2291,8 @@ impl SqlError {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
-            SqlError::DependentObjectsStillExist { .. }
+            SqlError::ViewDependsOnRelation { .. }
+            | SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
@@ -2346,6 +2367,7 @@ impl SqlError {
             | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::Raised { severity, .. } => *severity,
             SqlError::ActiveTransaction
@@ -2376,6 +2398,7 @@ impl SqlError {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
             }
             SqlError::CouldNotCreateUniqueIndex { detail, .. } => Some(detail.clone()),
+            SqlError::ViewDependsOnRelation { detail, .. } => Some(detail.clone()),
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
@@ -2546,7 +2569,8 @@ impl SqlError {
             | SqlError::DependentConstraint { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentType { .. }
-            | SqlError::DependentFunction { .. } => {
+            | SqlError::DependentFunction { .. }
+            | SqlError::ViewDependsOnRelation { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),

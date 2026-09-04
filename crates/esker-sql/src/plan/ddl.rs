@@ -316,6 +316,8 @@ pub struct DropView {
     pub names: Vec<String>,
     /// `IF EXISTS`.
     pub if_exists: bool,
+    /// `CASCADE`: also drop the views built on this one. Without it a dependent is `2BP01`.
+    pub cascade: bool,
 }
 
 /// `CREATE DATABASE [IF NOT EXISTS] name`.
