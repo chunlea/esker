@@ -348,6 +348,19 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: create.if_not_exists,
             }))
         }
+        // `ALTER INDEX <name> RENAME TO <name>`, the one form `ActiveRecord` sends. `sqlparser`
+        // reads no other `ALTER INDEX` operation, so the rest reach `parse`'s refusal table.
+        Statement::AlterIndex { name, operation } => {
+            let sqlparser::ast::AlterIndexOperation::RenameIndex { index_name } = operation;
+            Ok(plan::Statement::AlterIndexRename(plan::AlterIndexRename {
+                name: relation_name(name)?,
+                to: relation_name(index_name)?,
+                // `sqlparser` 0.62.0 has nowhere to put `IF EXISTS` on this statement, so a client
+                // that writes it gets a syntax error before this — a C1 gap recorded in the
+                // corpus rather than a flag that is always false.
+                if_exists: false,
+            }))
+        }
         // `DROP EXTENSION [IF EXISTS] name [CASCADE|RESTRICT]` — the suite's teardown, always in
         // the `IF EXISTS` form (`postgresql_adapter.rb:503`).
         //

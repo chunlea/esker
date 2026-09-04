@@ -588,6 +588,7 @@ impl Executor {
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
+            Statement::AlterIndexRename(rename) => ddl::alter_index_rename(self, txn, rename),
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
             Statement::CreateView(create) => ddl::create_view(self, txn, create),
             Statement::DropView(drop) => ddl::drop_view(self, txn, drop),
@@ -2082,6 +2083,9 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         }
         Statement::DropExtension(drop) => {
             vec![format!("Drop Extension on {}", drop.name)]
+        }
+        Statement::AlterIndexRename(rename) => {
+            vec![format!("Alter Index on {}", rename.name)]
         }
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
         Statement::CreateView(create) => vec![format!("Create View on {}", create.name)],
