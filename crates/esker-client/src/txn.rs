@@ -688,7 +688,7 @@ impl Transaction {
     }
 
     /// The snapshot this transaction's reads are served at — the running statement's where there is
-    /// one, and the transaction's own otherwise. See [`Transaction::read_ts`]'s private twin.
+    /// one, and the transaction's own otherwise. The public face of the private `read_ts`.
     #[must_use]
     pub fn reading_ts(&self) -> u64 {
         self.read_ts()
