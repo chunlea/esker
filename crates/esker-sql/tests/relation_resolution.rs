@@ -96,7 +96,7 @@ fn every_relation_resolution_answer_is_postgresql_19_s() {
     // it aborted the transaction and the capture's last third — the temp table shadowing a
     // permanent one, `DROP TABLE pg_temp.rr` uncovering it, and the two savepoint-visibility
     // probes after it — came back `25P02` and was compared by nobody. This assertion is what the
-    // temp-table unit ([ADR 0053]) was measured by, and it stays as the thing that catches the
+    // temp-table unit ([ADR 0054]) was measured by, and it stays as the thing that catches the
     // next refusal to open a hole in the middle of this file.
     assert_eq!(
         replayed.swallowed, 0,

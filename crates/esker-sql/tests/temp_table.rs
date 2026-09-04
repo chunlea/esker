@@ -1,5 +1,5 @@
 //! `CREATE TEMPORARY TABLE` — a relation in a schema that belongs to one session
-//! ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+//! ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 //!
 //! The whole of it is the search path. A temp table is an ordinary relation in a schema named
 //! `pg_temp_<n>`, and pushing that schema to the front of the session's resolved path is what makes

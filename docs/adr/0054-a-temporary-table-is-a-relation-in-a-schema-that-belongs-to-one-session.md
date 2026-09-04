@@ -1,4 +1,4 @@
-# ADR 0053 — A temporary table is a relation in a schema that belongs to one session
+# ADR 0054 — A temporary table is a relation in a schema that belongs to one session
 
 Status: accepted · Date: 2026-09-03 · Phase 9 (Rails compatibility), the temp-table unit
 

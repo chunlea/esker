@@ -59,7 +59,7 @@ pub(super) fn create_table(
     // relation where it actually is.
     //
     // **A temporary table goes in the session's own schema**, whatever the `search_path` says, and
-    // the schema is written on demand — a session that makes none writes no record (ADR 0053).
+    // the schema is written on demand — a session that makes none writes no record (ADR 0054).
     // This happens **before** the duplicate check, and that order is the whole of why a permanent
     // `things` does not stop a temporary one: they are in different schemas, so the name is only
     // taken when the *temp* schema already has it. Measured — a `CREATE TABLE` of a name a temp
@@ -2759,7 +2759,7 @@ pub(super) fn drop_table(
 /// exactly the same removal the named table gets, and doing it by hand at the second call site is
 /// how one of the three steps gets forgotten.
 /// Every relation in one session's temporary schema, and then the schema
-/// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// The same path `DROP SCHEMA … CASCADE` walks, so each table takes its own indexes, sequences and
 /// primary key with it and nothing is left half-dropped.
@@ -2776,7 +2776,7 @@ pub(super) fn drop_temp_schema(executor: &Executor, txn: &mut dyn Txn, schema: &
 }
 
 /// `ON COMMIT` for every temporary table this session has, run at the end of **every** transaction
-/// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// **"Every transaction" includes the implicit one**, which is the fact this exists to get right:
 /// a plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero

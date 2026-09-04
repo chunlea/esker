@@ -1,4 +1,4 @@
-# `ON COMMIT` — the half of a temporary table that needs a commit to be seen (ADR 0053).
+# `ON COMMIT` — the half of a temporary table that needs a commit to be seen (ADR 0054).
 #
 # **This capture is deliberately NOT wrapped in `BEGIN … ROLLBACK`**, which every other capture is,
 # because what it measures *is* the commit: `ON COMMIT DELETE ROWS` empties the table at the end of

@@ -54,7 +54,7 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         .map(|relation| {
             // **The schema the relation is actually in**, not a constant. It was `public` while
             // that was the only schema a relation could be in; a temporary table is in
-            // `pg_temp_<n>` and a real server lists it there (ADR 0053), and a table in a user
+            // `pg_temp_<n>` and a real server lists it there (ADR 0054), and a table in a user
             // schema was being reported in `public` — a *wrong* row rather than a missing one.
             vec![
                 Datum::Text(relation.schema.clone()),

@@ -1,4 +1,4 @@
-# `CREATE TEMPORARY TABLE` — a relation in a schema that belongs to one session (ADR 0053).
+# `CREATE TEMPORARY TABLE` — a relation in a schema that belongs to one session (ADR 0054).
 #
 # **Run 56 stops exactly one test on it**, `UnloggedTablesTest#test_gracefully_handles_temporary_tables`,
 # which asserts `pg_class.relpersistence` is `t`. The reason to build it is the other measure:

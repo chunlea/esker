@@ -1801,7 +1801,7 @@ fn read_persistence(reader: &mut Reader<'_>) -> Result<Persistence> {
     match reader.byte()? {
         0 => Ok(Persistence::Permanent),
         1 => Ok(Persistence::Unlogged),
-        // Added by ADR 0053 to a byte version 23 already writes, which is why it needs no section
+        // Added by ADR 0054 to a byte version 23 already writes, which is why it needs no section
         // of its own: an older reader never sees it, because a table written before 0053 cannot be
         // temporary and one written after it lives in a schema an older node would not resolve.
         2 => Ok(Persistence::Temporary),

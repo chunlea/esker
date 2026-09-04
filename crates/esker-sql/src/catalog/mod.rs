@@ -868,7 +868,7 @@ pub struct TableDef {
     pub persistence: Persistence,
     /// What a **temporary** table does with its rows at every commit, and `PreserveRows` for
     /// every other table — which is what a table with no clause is, so nothing written before
-    /// [ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)
+    /// [ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)
     /// changes meaning.
     pub on_commit: OnCommit,
     /// Unique across the tenant.
@@ -1024,7 +1024,7 @@ pub enum Persistence {
     Unlogged,
     /// `t`. **A table in a schema that belongs to one session** — the whole of what makes it
     /// temporary is where it lives, not how it is stored
-    /// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    /// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
     ///
     /// Like [`Persistence::Unlogged`] it is recorded and not acted on by the engine: a temp
     /// table's rows go through the WAL and Raft like anything else, so this node pays full write
@@ -1034,7 +1034,7 @@ pub enum Persistence {
 }
 
 /// What a temporary table does with its rows at the end of every transaction
-/// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// **"Every transaction" includes the implicit one**, which is the fact easiest to get wrong: a
 /// plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero
@@ -3334,7 +3334,7 @@ pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 /// Not a schema and never a record — it is the word a client writes, resolved to `pg_temp_<n>`
 /// where the session is in reach. A relation stored under this qualifier cannot exist, which is
 /// what makes it safe to use as the marker
-/// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 pub const PG_TEMP_ALIAS: &str = "pg_temp";
 
 /// The prefix every session-scoped temporary schema's name begins with.

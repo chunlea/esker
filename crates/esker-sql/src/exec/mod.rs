@@ -165,7 +165,7 @@ pub struct Executor {
     block_read_only: bool,
     /// Where columnar placement is reported, on a node that has a placement driver.
     /// The schema this session's **temporary** relations live in, once it has made one
-    /// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    /// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
     ///
     /// `None` until the first `CREATE TEMP TABLE`, which is what keeps a session that makes none
     /// from writing a schema record — and what keeps `pg_namespace` from growing a row per
@@ -205,7 +205,7 @@ struct ReadAsOf {
 }
 
 /// **A session takes its temporary relations with it**, which is the third of the four rules a
-/// temporary table is ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// temporary table is ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// Best effort, deliberately: this runs where a failure cannot be reported to anybody, so a
 /// backend that will not answer leaves the schema behind rather than panicking in a destructor.
