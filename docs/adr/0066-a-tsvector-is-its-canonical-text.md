@@ -1,0 +1,90 @@
+# 0066 — A tsvector is its canonical text
+
+- Status: **proposed** — the decision below is what `docs/plans/tsvector.md` will implement, and
+  the capture (`captures/pg19_tsvector.txt`, owned by the harness lane) settles the two questions
+  §"Open until the capture lands" names. This ADR is written first because a stored type is an
+  on-disk format and the format is what has to be decided before code.
+- Date: 2026-09-04
+- Follows [ADR 0030](0030-the-row-codec-moves-down.md) on stored representations,
+  [ADR 0042](0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md) on when two
+  types may share one, and [ADR 0031](0031-rails-compatibility-is-measured.md)'s rule that the
+  capture decides.
+
+## Context
+
+`the type TSVECTOR is not supported` is the largest row on the compatibility board: 51 tests over
+two files. Measured, the two files want very different things.
+
+`full_text_test.rb` — the feature's own file, and **three** tests — writes a tsvector *literal* and
+reads the same characters back:
+
+```ruby
+Tsvector.create text_vector: "'text' 'vector'"
+assert_equal "'text' 'vector'", Tsvector.first.text_vector
+```
+
+It never calls `to_tsvector`, never uses `@@`, and never concatenates.
+
+`schema_test.rb` — **48 of its raises** — needs one column and one index, both in the `setup` that
+all 78 of its tests run:
+
+```sql
+CREATE TABLE test_schema.things (…, name_vector tsvector, …);
+CREATE INDEX … USING gin ((to_tsvector('english', coalesce(things.name, ''))));
+```
+
+Exactly one test in either file reads that index back, by name. **Neither file searches.**
+
+## Decision
+
+**A `tsvector` value is its canonical text, and a `tsquery` value is its canonical text.**
+
+The stored bytes are the printed form — the same string `pg_catalog`'s output function would
+produce — canonicalised on the way in: lexemes sorted, deduplicated, position lists merged and
+printed in PostgreSQL's order. A column of either type is a string column with a different
+`typname`, and nothing below `esker-sql` can tell it from one.
+
+Three things follow, and they are the reason:
+
+1. **The comparison is the text's**, which is what [ADR 0042](0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)
+   requires of two types sharing a representation. A `tsvector`'s ordering on a real server is over
+   its canonical form; two values that print the same are the same value.
+2. **The round-trip is the feature** for the file that owns it. A parsed structure would have to
+   reproduce the printed form exactly anyway, so the printed form is the shorter path to the same
+   answer — and the only one whose correctness the suite can currently check.
+3. **A format this node cannot exercise is a format it cannot get right.** Nothing in either file
+   compares two tsvectors, indexes one for search, or reads a position list back. A structural
+   codec would be a new on-disk format, a record version and a golden test, decided against
+   requirements nobody has measured.
+
+**The canonicalisation is not free and is the whole of the risk.** Storing the user's characters
+unchanged would round-trip `full_text_test.rb` and disagree with the oracle the first time a value
+arrives unsorted or repeated. So the input function is where the work is, and it is what the
+capture pins.
+
+## Consequences
+
+- No record-format change and no new codec: a `tsvector` column stores a string, and
+  `ColumnType::TsVector` exists to give it its own `typname`, `format_type` and dumper spelling.
+- `@@` and `||` parse and evaluate over the canonical text. `||` is a merge of two sorted lexeme
+  sets, which is the same operation the input function already performs.
+- **A GIN index is recorded and not built.** This node has one index shape; `USING gin` means an
+  index the catalog *reports* as GIN over that shape. `index_name_exists?` and the schema dumper
+  are right, and the difference a client can see is `pg_am` rather than an answer. Declared in the
+  corpus, never implicit.
+- Ranking, `ts_headline`, `setweight`, `websearch_to_tsquery` and text-search configurations are
+  out of v1 and refused by name.
+
+## Open until the capture lands
+
+Both are wrong-answer risks rather than gaps, which is why neither is decided here:
+
+1. **Stemming.** `to_tsvector('english', 'running')` is `'run':1` on a real server — a Snowball
+   stemmer per language. v1 will not stem. If the capture shows the suite reading a stemmed value
+   back, **`to_tsvector` is refused by name** instead of answering an unstemmed vector: the index
+   expression only needs to parse and be stored, and neither file reads that function's result.
+   A refusal is available, so a wrong answer is not.
+2. **The `config` argument.** `'english'` and the default are what the suite writes. Whether
+   another configuration name is refused or accepted-and-ignored is the capture's to say; the
+   default position is refused by name, because a configuration silently ignored changes which
+   lexemes come out.
