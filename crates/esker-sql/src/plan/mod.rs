@@ -31,12 +31,12 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault, Comment, CommentObject,
-    CreateDatabase, CreateExtension, CreateFunction, CreateIndex, CreateSchema, CreateSequence,
-    CreateTable, CreateTrigger, CreateType, DropDatabase, DropExtension, DropFunction, DropIndex,
-    DropSchema, DropSequence, DropTable, DropTrigger, DropType, ForeignKey, IndexKeyPart,
-    KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint, foreign_key_name, index_name,
-    primary_key_name, sequence_name, unique_constraint_name,
+    AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault,
+    Comment, CommentObject, CreateDatabase, CreateExtension, CreateFunction, CreateIndex,
+    CreateSchema, CreateSequence, CreateTable, CreateTrigger, CreateType, DropDatabase,
+    DropExtension, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
+    DropType, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -87,6 +87,8 @@ pub enum Statement {
     CreateExtension(CreateExtension),
     /// `DROP EXTENSION [IF EXISTS] <name> [CASCADE]`, which is what the suite's teardown sends.
     DropExtension(DropExtension),
+    /// `ALTER INDEX [IF EXISTS] <name> RENAME TO <name>`.
+    AlterIndexRename(AlterIndexRename),
     /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
     CreateSchema(CreateSchema),
     /// `CREATE DATABASE` — a second **tenant**, which is what a database is (ADR 0052).
@@ -193,6 +195,7 @@ impl Statement {
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
             Statement::DropExtension(_) => Some("DROP EXTENSION"),
+            Statement::AlterIndexRename(_) => Some("ALTER INDEX"),
             Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
             Statement::CreateDatabase(_) => Some("CREATE DATABASE"),
             Statement::DropDatabase(_) => Some("DROP DATABASE"),
@@ -243,6 +246,7 @@ impl Statement {
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropExtension(_) => "DROP EXTENSION",
+            Statement::AlterIndexRename(_) => "ALTER INDEX",
             Statement::CreateSchema(_) => "CREATE SCHEMA",
             Statement::DropSchema(_) => "DROP SCHEMA",
             Statement::CreateDatabase(_) => "CREATE DATABASE",

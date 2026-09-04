@@ -1805,6 +1805,72 @@ fn free_derived_name(txn: &dyn Txn, executor: &Executor, derived: &str) -> Resul
     Err(SqlError::DuplicateTable(derived.to_owned()))
 }
 
+/// `ALTER INDEX <name> RENAME TO <name>`.
+///
+/// **Renaming an index renames its constraint**, and here that is not two writes but one: a
+/// `UNIQUE` constraint and the index it owns are one `IndexDef::name`, and a primary key's index is
+/// `TableDef::primary_key_name`. A real server keeps two catalog rows that share a name and moves
+/// both; this node keeps one field, so the `pg_constraint` row follows by construction.
+///
+/// A name already taken is **`42P07`** — `relation "…" already exists`, because an index shares a
+/// namespace with tables and sequences — and a name nothing answers to is `42P01`, the *relation*
+/// message rather than an index-specific one. Both measured.
+pub(super) fn alter_index_rename(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    rename: &plan::AlterIndexRename,
+) -> Result<Outcome> {
+    let done = Ok(Outcome::done("ALTER INDEX"));
+    if catalog::name_exists(&*txn, executor.tenant, &rename.to)? {
+        return Err(SqlError::DuplicateTable(rename.to.clone()));
+    }
+    let Some(relation) = existing_relation(executor, txn, &rename.name)? else {
+        if rename.if_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "relation",
+                name: rename.name.clone(),
+            });
+            return done;
+        }
+        return Err(SqlError::UndefinedTable(rename.name.clone()));
+    };
+    let table_id = match relation {
+        catalog::Relation::Index { table_id, .. } | catalog::Relation::PrimaryKey { table_id } => {
+            table_id
+        }
+        // **A real server renames a *table* through this statement** — `ALTER INDEX` is the
+        // generic rename wearing another keyword, measured. Nothing the suite sends does it, and
+        // accepting it here would mean this arm quietly doing `ALTER TABLE`'s job; it is named
+        // instead, and the corpus records the divergence.
+        _ => {
+            return Err(SqlError::unsupported(format!(
+                "ALTER INDEX naming {}, which is not an index",
+                rename.name
+            )));
+        }
+    };
+    let table = executor.table_by_id(txn, table_id)?;
+    let mut updated = (*table).clone();
+    if updated.primary_key_name == rename.name {
+        updated.primary_key_name.clear();
+        updated.primary_key_name.push_str(&rename.to);
+    } else if let Some(index) = updated
+        .indexes
+        .iter_mut()
+        .find(|index| index.name == rename.name)
+    {
+        index.name.clear();
+        index.name.push_str(&rename.to);
+    } else {
+        return Err(SqlError::UndefinedTable(rename.name.clone()));
+    }
+    updated.schema_version += 1;
+    // The old name record goes and the new one is written here, because `replace_table` reconciles
+    // an index's name and the primary key's — the rule three separate leaks taught it.
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    done
+}
+
 /// `ALTER TABLE … RENAME COLUMN <from> TO <to>`.
 ///
 /// **Only `attname` changes.** The column keeps its ordinal, so every index, constraint, default
