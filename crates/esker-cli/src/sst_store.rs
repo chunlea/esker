@@ -196,10 +196,11 @@ mod tests {
 
     /// A bad URL fails when the store is opened, not on the first flush.
     ///
-    /// The `https://` refusal (ADR 0025) is not asserted here: it depends on an environment
-    /// variable, and `std::env::set_var` is `unsafe` in edition 2024 while `CLAUDE.md` denies
-    /// `unsafe_code` workspace-wide. `esker-s3`'s `an_https_endpoint_is_refused_with_a_reason`
-    /// covers it, at the layer that actually decides.
+    /// The `https://` behaviour (ADR 0025, then ADR 0055) is not asserted here: it depends on an
+    /// environment variable, and `std::env::set_var` is `unsafe` in edition 2024 while `CLAUDE.md`
+    /// denies `unsafe_code` workspace-wide. `esker-s3` covers it at the layer that actually
+    /// decides, once per build: `an_https_endpoint_is_refused_with_a_reason` without the `tls`
+    /// feature, `an_https_endpoint_parses_and_defaults_to_443` with it.
     #[test]
     fn a_bad_store_url_fails_early_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
