@@ -66,7 +66,9 @@ SELECT 'r', wealth, count(*) FROM m GROUP BY wealth ORDER BY wealth		r|-$567.89|
 SELECT 'r', '567.89'::money::numeric, pg_typeof('567.89'::money::numeric)	text,numeric,regtype	r|567.89|numeric
 SELECT 'r', 567.89::numeric::money, 12345::int8::money, 12345::int4::money	text,money,money,money	r|$567.89|$12,345.00|$12,345.00
 SELECT 'r', '{1.00,2.00}'::money[], pg_typeof('{1.00,2.00}'::money[])	text,money[],regtype	r|{$1.00,$2.00}|money[]
+SAVEPOINT w1		-
 SELECT 'r', '1.00'::money || 'x'	text,text	r|$1.00x
+ROLLBACK TO SAVEPOINT w1		-
 CREATE INDEX m_wealth_idx ON m (wealth)		-
 SELECT 'r', id FROM m WHERE wealth = '567.89'::money		r|1
 UPDATE m SET wealth = '987.65' WHERE id = 4		-

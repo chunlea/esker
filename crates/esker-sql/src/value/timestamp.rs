@@ -161,7 +161,7 @@ pub(super) fn from_text_without_zone(text: &str) -> Result<i64> {
 
 /// Reads the ISO subset, or says which construct it did not read.
 pub(super) fn from_text(text: &str) -> Result<i64> {
-    let body = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let body = super::datetime_body(text);
     let lower = body.to_ascii_lowercase();
     match lower.as_str() {
         "infinity" | "+infinity" => return Ok(POS_INFINITY),

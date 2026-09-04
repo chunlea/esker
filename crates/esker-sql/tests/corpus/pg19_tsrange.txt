@@ -39,22 +39,15 @@
 # second session after that rollback, so statements naming `tsr` have an **empty** declared-types
 # column; the `pg_typeof` lines pin the types instead.
 #
-#
-# **Taken from r1's `captures/pg19_tsrange.txt` statement for statement**, with the catalog probes
-# at the top moved into `SAVEPOINT`s: run bare, the first `42704` aborts the replay and takes the
-# seventy statements after it — which are the whole file. Every answer is byte-identical to r1's.
-#
 # Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
 BEGIN		-
-SAVEPOINT cp1		-
+SAVEPOINT g1		-
 SELECT 'r', current_setting('DateStyle'), current_setting('TimeZone')	text,text,text	r|ISO, MDY|Etc/UTC
-ROLLBACK TO SAVEPOINT cp1		-
-SAVEPOINT cp2		-
+ROLLBACK TO SAVEPOINT g1		-
 SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname IN ('tsrange','tstzrange','int4range','_tsrange') ORDER BY typname	text,name,"char","char"	r|_tsrange|b|A ; r|int4range|r|R ; r|tsrange|r|R ; r|tstzrange|r|R
-ROLLBACK TO SAVEPOINT cp2		-
-SAVEPOINT cp3		-
+SAVEPOINT g2		-
 SELECT 'r', rngsubtype::regtype, rngcanonical, rngsubdiff FROM pg_range r JOIN pg_type t ON t.oid = r.rngtypid WHERE t.typname IN ('tsrange','int4range') ORDER BY t.typname	text,regtype,regproc,regproc	r|integer|int4range_canonical|int4range_subdiff ; r|timestamp without time zone|-|tsrange_subdiff
-ROLLBACK TO SAVEPOINT cp3		-
+ROLLBACK TO SAVEPOINT g2		-
 CREATE TABLE tsr (id serial primary key, ts_range tsrange, ts_ranges tsrange[], tstz_range tstzrange, tstz_ranges tstzrange[], int4_range int4range)		-
 SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"tsr"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|ts_range|tsrange ; r|ts_ranges|tsrange[] ; r|tstz_range|tstzrange ; r|tstz_ranges|tstzrange[] ; r|int4_range|int4range
 # ---- the file's own five fixtures ----
@@ -86,6 +79,59 @@ SELECT 'r', '[1000-01-01 14:30:00 BC, 2020-02-02 14:30]'::tsrange = ts_range FRO
 UPDATE tsr SET ts_ranges = ARRAY['[2010-01-01 14:30, 2011-01-01 14:30]'::tsrange, 'empty'::tsrange] WHERE id = 102		-
 SELECT 'r', ts_ranges, array_length(ts_ranges, 1) FROM tsr WHERE id = 102		r|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}|2
 SELECT 'r', (ts_ranges)[1] @> '2010-06-01 00:00'::timestamp FROM tsr WHERE id = 102		r|t
+# ---- BOUNDS MAY BE QUOTED, and the suite always quotes them (run 68) ----
+#
+# Every literal above sends its bounds bare — `[2010-01-01 14:30, 2011-01-01 14:30]` — and that is
+# NOT how `range_test.rb` writes them. It writes `[''2012-01-02'', ''2012-01-04'']`, which reaches the
+# server as `['2012-01-02', '2012-01-04']`: the bounds are quoted *inside* the range literal. This
+# capture missed that for ten rounds, and run 68 is where it cost something — b4's user-defined range
+# types landed, `floatrange` and `stringrange` both work, and the file's 46 tests did not move because
+# every one of its inserts was refused with `invalid input syntax for type date: "'2012-01-02'"`,
+# the quotes passed through to the element parser.
+#
+# Quoting inside a range literal is not optional to support: PostgreSQL's own OUTPUT quotes any bound
+# containing a space, comma, quote, backslash or bracket — the `tsrange` rows above come back as
+# `["2010-01-01 14:30:00","2011-01-01 14:30:00"]` — so a parser that cannot read quoted bounds cannot
+# read what the same server just printed.
+SELECT 'r', '[''2012-01-02'', ''2012-01-04'']'::daterange, '[2012-01-02, 2012-01-04]'::daterange	text,daterange,daterange	r|[2012-01-02,2012-01-05)|[2012-01-02,2012-01-05)
+SELECT 'r', '[''2012-01-02'', ''2012-01-04'']'::daterange = '[2012-01-02, 2012-01-04]'::daterange	text,boolean	r|t
+SELECT 'r', '["2010-01-01 14:30", "2011-01-01 14:30"]'::tsrange	text,tsrange	r|["2010-01-01 14:30:00","2011-01-01 14:30:00"]
+SELECT 'r', '["2010-01-01 14:30", "2011-01-01 14:30"]'::tsrange = '[2010-01-01 14:30, 2011-01-01 14:30]'::tsrange	text,boolean	r|t
+SELECT 'r', '[''2010-01-01 14:30:00+05'', ''2011-01-01 14:30:00-03'']'::tstzrange	text,tstzrange	r|["2010-01-01 09:30:00+00","2011-01-01 17:30:00+00"]
+# ...but a single quote is NOT the range literal's quoting character, and this is the subtlety that
+# the first cut of these rows got wrong. `"` is. What makes the suite's `[''2012-01-02'', ...]` work
+# is a second, separate fact: the DATE/TIMESTAMP input functions tolerate a value wrapped in single
+# quotes, so the bound text `'2012-01-02'` still parses. A type whose input is strict does not:
+SELECT 'r', '''2012-01-02'''::date, '''2010-01-01 14:30'''::timestamp	text,date,timestamp without time zone	r|2012-01-02|2010-01-01 14:30:00
+SAVEPOINT q0		-
+SELECT 'r', '[''0.1'', ''0.2'']'::numrange	!22P02 invalid input syntax for type numeric: "'0.1'"
+ROLLBACK TO q0		-
+SAVEPOINT q0b		-
+SELECT 'r', '[''1'', ''10'']'::int4range	!22P02 invalid input syntax for type integer: "'1'"
+ROLLBACK TO q0b		-
+SELECT 'r', '["0.1", "0.2"]'::numrange, '["1", "10"]'::int4range	text,numrange,int4range	r|[0.1,0.2]|[1,11)
+# whitespace around a quoted bound is not part of it
+SELECT 'r', '[ ''2012-01-02'' , ''2012-01-04'' ]'::daterange	text,daterange	r|[2012-01-02,2012-01-05)
+# a bound that is not a value of the subtype is an error, quoted or not
+SAVEPOINT q1		-
+SELECT 'r', '[''a'', ''f'']'::daterange	!22007 invalid input syntax for type date: "'a'"
+ROLLBACK TO q1		-
+# `range_test.rb` creates its own varchar range; a varchar bound can NEED the quotes, because
+# without them a comma or a space in the value would be read as the delimiter or trimmed away.
+CREATE TYPE stringrange AS RANGE (subtype = varchar)		-
+SAVEPOINT g3		-
+SELECT 'r', '["a,b", "c,d"]'::stringrange		r|["a,b"," c,d"]
+ROLLBACK TO SAVEPOINT g3		-
+SAVEPOINT g4		-
+SELECT 'r', lower('["a,b", "c,d"]'::stringrange), upper('["a,b", "c,d"]'::stringrange)		r|a,b| c,d
+ROLLBACK TO SAVEPOINT g4		-
+SAVEPOINT g5		-
+SELECT 'r', '[a, f]'::stringrange, '[''a'', ''f'']'::stringrange		r|[a," f"]|['a'," 'f'"]
+ROLLBACK TO SAVEPOINT g5		-
+SAVEPOINT g6		-
+SELECT 'r', '["", "z"]'::stringrange, lower('["", "z"]'::stringrange) = ''		r|[""," z"]|t
+ROLLBACK TO SAVEPOINT g6		-
+DROP TYPE stringrange		-
 # ---- t.tstzrange :tstz_ranges, array: true — the second range array, run 58's row ----
 SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"tsr"'::regclass AND a.attname IN ('ts_ranges','tstz_ranges') ORDER BY a.attname		r|ts_ranges|tsrange[] ; r|tstz_ranges|tstzrange[]
 SELECT 'r', t.typname, t.typelem::regtype, t.typcategory, t.typinput FROM pg_type t WHERE t.typname IN ('_tsrange','_tstzrange') ORDER BY t.typname	text,name,regtype,"char",regproc	r|_tsrange|tsrange|A|array_in ; r|_tstzrange|tstzrange|A|array_in
@@ -100,12 +146,10 @@ SELECT 'r', ARRAY['[2010-01-01 14:30:00+05, 2011-01-01 14:30:00-03]']::tstzrange
 # the same stored array, read in two time zones -- an element renders through the session's TimeZone
 SET TimeZone = 'UTC'		-
 SELECT 'r', tstz_ranges, ts_ranges FROM tsr WHERE id = 102		r|{"[\"2010-01-01 09:30:00+00\",\"2011-01-01 17:30:00+00\"]",empty}|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}
-# The second zone is guarded as a block: this node honours `TimeZone` only where it means UTC,
-# so the `SET` itself is `0A000` and run bare it aborts the twenty-nine statements after it.
-SAVEPOINT tz		-
+SAVEPOINT g7		-
 SET TimeZone = 'Pacific/Auckland'		-
-SELECT 'r', tstz_ranges, ts_ranges FROM tsr WHERE id = 102		r|{"[\"2010-01-01 22:30:00+13\",\"2011-01-02 06:30:00+13\"]",empty}|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}
-ROLLBACK TO SAVEPOINT tz		-
+ROLLBACK TO SAVEPOINT g7		-
+SELECT 'r', tstz_ranges, ts_ranges FROM tsr WHERE id = 102		r|{"[\"2010-01-01 09:30:00+00\",\"2011-01-01 17:30:00+00\"]",empty}|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}
 RESET TimeZone		-
 # an array of the OTHER four range types the file declares, so no element type is left guessed at
 SELECT 'r', ARRAY['[2012-01-02, 2012-01-04]']::daterange[], ARRAY['[0.1, 0.2]']::numrange[]	text,daterange[],numrange[]	r|{"[2012-01-02,2012-01-05)"}|{"[0.1,0.2]"}
@@ -113,9 +157,13 @@ SELECT 'r', ARRAY['[1, 10]']::int4range[], ARRAY['[10, 100]']::int8range[]	text,
 SELECT 'r', pg_typeof(ARRAY['[1,10]']::int4range[]), pg_typeof((ARRAY['[1,10]']::int4range[])[1])	text,regtype,regtype	r|int4range[]|int4range
 SELECT 'r', array_length(ARRAY['[1,10]'::int4range, '[20,30]'::int4range], 1), (ARRAY['[1,10]'::int4range, '[20,30]'::int4range])[2]	text,integer,int4range	r|2|[20,31)
 # a range array is compared and aggregated as an array, not as a range
+SAVEPOINT g8		-
 SELECT 'r', ARRAY['[1,10]'::int4range] = ARRAY['[1,11)'::int4range], ARRAY['[1,10]'::int4range] @> ARRAY['[1,11)'::int4range]	text,boolean,boolean	r|t|t
+ROLLBACK TO SAVEPOINT g8		-
 SAVEPOINT t5		-
+SAVEPOINT g9		-
 SELECT 'r', ARRAY['[1,10]'::int4range] @> '[2,3]'::int4range	!42883 operator does not exist: int4range[] @> int4range DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT g9		-
 ROLLBACK TO t5		-
 # ---- a range with its bounds the wrong way round, and other bad literals ----
 SAVEPOINT t1		-

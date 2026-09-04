@@ -36,6 +36,36 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          ('tsrange','tstzrange','int4range','_tsrange') ORDER BY typname",
     ],
     answers: &[
+        // **The standing constant-width trade, seen through a range bound.** Every integer here
+        // is an `i64`, so `int4range`'s subtype reports `bigint` where a real server names
+        // `integer`. The `22P02` and the quoted text agree; only the type in the sentence differs,
+        // and it differs for the same reason `2147483648` is accepted as an `int8` literal.
+        (
+            "SELECT 'r', '[''1'', ''10'']'::int4range",
+            "an int4range's bound is read as an int8 here, so the message names bigint",
+        ),
+        // **The standing text-collation divergence, seen through a range bound**, and it is the
+        // bound *parsing* that makes it visible rather than any new rule: `["a,b", "c,d"]` has
+        // bounds `a,b` and ` c,d`, and whether that range is legal is a comparison. Under the
+        // oracle's `en_US.utf8` the leading space is ignored and `a,b < " c,d"`; under this node's
+        // byte order it is not, so the bounds are the wrong way round and the answer is `22000`.
+        // Measured on the oracle itself: `'a,b' < ' c,d'` is `t` and the same pair
+        // `COLLATE "C"` is `f`. Same divergence `tests/corpus/pg19_order.txt` records for `text`,
+        // and a project that compiles no C cannot close it (`crate::row`).
+        (
+            "SELECT 'r', '[\"a,b\", \"c,d\"]'::stringrange",
+            "the bounds compare byte-wise here and under en_US.utf8 there",
+        ),
+        (
+            "SELECT 'r', lower('[\"a,b\", \"c,d\"]'::stringrange), upper('[\"a,b\", \"c,d\"]'::stringrange)",
+            "the same collation divergence, one line on",
+        ),
+        // The same again with no quotes in sight: `[a, f]`'s bounds are `a` and ` f`, and the
+        // space is the whole of the difference.
+        (
+            "SELECT 'r', '[a, f]'::stringrange, '[''a'', ''f'']'::stringrange",
+            "a leading space in a bound is ignored by en_US.utf8 and is not by byte order",
+        ),
         // **`DateStyle` is not a run-time parameter here.** The text form of a timestamp depends on
         // it on a real server, and this node has one spelling — so the parameter would be a knob
         // that changes nothing, which is worse than not having it. `TimeZone` beside it answers,

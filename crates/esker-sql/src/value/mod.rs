@@ -262,6 +262,31 @@ fn refuse_if_longer(text: &str, limit: u32, ty: ColumnType, typmod: i32) -> Resu
     Ok(())
 }
 
+/// A datetime literal's body: the text with surrounding whitespace **and quote characters**
+/// stripped.
+///
+/// **PostgreSQL's datetime input skips `'` and `"` and the number types do not**, and the
+/// difference is what makes `range_test.rb` work on a real server: the file writes
+/// `date_range: "[''2012-01-02'', ''2012-01-04'']"`, so `['2012-01-02', '2012-01-04']` reaches the
+/// server and each bound arrives as `'2012-01-02'` — quotes included, because `'` is not the range
+/// literal's quoting character. `date_in` reads it anyway. Measured, and each half separately:
+///
+/// | probe | oracle |
+/// |---|---|
+/// | `'''2012-01-02'''::date` | `2012-01-02` |
+/// | `'"2012-01-02"'::date` | `2012-01-02` |
+/// | `'''2012-01-02'::date` (one quote, unbalanced) | `2012-01-02` |
+/// | `'''1'''::int4` | `22P02 invalid input syntax for type integer: "'1'"` |
+/// | `'[''0.1'', ''0.2'']'::numrange` | `22P02 … for type numeric: "'0.1'"` |
+///
+/// So it is a **strip of any number of quote characters at either end**, not a matched pair: the
+/// third row has one and no closing partner. `text` and `varchar` keep theirs, which is why this
+/// is a datetime function and not a general one.
+#[must_use]
+pub(crate) fn datetime_body(text: &str) -> &str {
+    text.trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\'' || ch == '"')
+}
+
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
 #[must_use]
 pub fn format_type(ty: ColumnType, typmod: i32) -> String {

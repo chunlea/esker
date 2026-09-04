@@ -40,6 +40,24 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', '1.00'::money || 'x'",
             "|| is not built for any type here",
         ),
+        // **Three refusals that agree except for the type named in them**, and all three name a
+        // standing trade rather than anything about `money`: an integer literal is an `int8` here
+        // and an `integer` there (the constant-width trade ADR 0033 records), and a decimal
+        // literal beside a non-numeric operand resolves to `double precision` here where a real
+        // server keeps it `numeric`. The `42883`, its DETAIL and its HINT agree in every case, and
+        // so does the fact that the operator does not exist.
+        (
+            "SELECT 'r', '1.00'::money + 1",
+            "an integer literal is a bigint here, so the refusal names bigint",
+        ),
+        (
+            "SELECT 'r', '1.00'::money = 1.00",
+            "a decimal literal is a double precision here, so the refusal names it",
+        ),
+        (
+            "SELECT 'r', 6 / '2.00'::money",
+            "an integer literal is a bigint here, so the refusal names bigint",
+        ),
     ],
 };
 

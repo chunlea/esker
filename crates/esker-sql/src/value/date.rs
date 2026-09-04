@@ -97,7 +97,7 @@ pub fn to_text(day: i32) -> String {
 /// per statement cannot come from here without a clock, and this crate has none of its own
 /// (`docs/DESIGN.md` §6: no node uses its wall clock).
 pub fn from_text(text: &str, now_micros: i64) -> Result<i32> {
-    let body = text.trim();
+    let body = super::datetime_body(text);
     if let Some(day) = keyword(body, now_micros) {
         return Ok(day);
     }

@@ -356,46 +356,82 @@ pub fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
 
 /// One bound's text, or `None` for an absent one — which is *unbounded*, and not the same thing as
 /// an `-infinity` that happens to be written there.
+///
+/// # A bound is quoted runs and unquoted runs, concatenated
+///
+/// Not "a quoted bound **or** an unquoted one", which is what this used to read and what made it
+/// unable to parse what a real server prints. `"` is the range literal's quoting character and it
+/// may open and close **inside** a bound, more than once, with literal text on either side.
+/// Measured, one shape at a time, on 19beta1 with a `varchar` subtype:
+///
+/// | written | lower bound |
+/// |---|---|
+/// | `[a"b"c, d]` | `abc` |
+/// | `["a" "b", c]` | `a b` |
+/// | `[a\,b, c]` | `a,b` — a backslash escapes anywhere, not only inside quotes |
+/// | `["a,b", "c,d"]` | `a,b`, and the **upper** is `" c,d"` |
+///
+/// That last row is the one that matters beyond the suite: **PostgreSQL quotes any bound
+/// containing a space or a comma**, so a parser that cannot read a quoted bound cannot read what
+/// the same server just printed — and the space after the comma is part of the next bound, not
+/// separator noise, which is why nothing here trims.
+///
+/// **Whitespace is never stripped.** `'[ , ]'::stringrange` is `[" "," "]` — a single space is a
+/// *value* — where `'[,]'` is `(,)`. So an absent bound is zero characters **and no quotes**: an
+/// explicitly quoted empty string (`'["", "z"]'`) is a bound whose value is `''`. The subtype's
+/// own input function is what tolerates surrounding space: `date_in` does and `numeric_in` does,
+/// which is why `'[ 2012-01-02 , 2012-01-04 ]'::daterange` works and a `stringrange` keeps every
+/// space it was given.
 fn bound(chars: &[char], at: &mut usize, whole: &str) -> Result<Option<String>> {
-    if chars.get(*at) == Some(&'"') {
-        *at += 1;
-        let mut out = String::new();
-        while let Some(ch) = chars.get(*at) {
-            match ch {
-                '\\' if *at + 1 < chars.len() => {
-                    out.push(chars[*at + 1]);
-                    *at += 2;
-                }
-                // **A doubled quote is one quote**, not the end of the bound — the rule every
-                // quoted PostgreSQL literal shares. `range_test.rb`'s own escaped row is
-                // `["ca""t","do\\g")`, whose lower bound is `ca"t`, and reading the second `"`
-                // as the closing one made that value `22P02 malformed range literal`.
-                '"' if chars.get(*at + 1) == Some(&'"') => {
-                    out.push('"');
-                    *at += 2;
-                }
-                '"' => {
-                    *at += 1;
-                    return Ok(Some(out));
-                }
-                other => {
-                    out.push(*other);
-                    *at += 1;
+    let mut out = String::new();
+    let mut quoted = false;
+    loop {
+        match chars.get(*at) {
+            // The literal ended inside a bound: `'["a"b", c]'` is
+            // `22P02 … DETAIL: Unexpected end of input.` on a real server, measured.
+            None => return Err(malformed(whole, "Unexpected end of input.")),
+            Some(',' | ']' | ')') => break,
+            // A backslash escapes the next character **anywhere in the bound**, inside quotes or
+            // out: `[a\,b, c]`'s lower bound is `a,b`.
+            Some('\\') if *at + 1 < chars.len() => {
+                out.push(chars[*at + 1]);
+                *at += 2;
+            }
+            Some('"') => {
+                quoted = true;
+                *at += 1;
+                loop {
+                    match chars.get(*at) {
+                        None => return Err(malformed(whole, "Unexpected end of input.")),
+                        // **A doubled quote is one quote**, not the end of the run — the rule
+                        // every quoted PostgreSQL literal shares. `range_test.rb`'s own escaped
+                        // row is `["ca""t","do\\g")`, whose lower bound is `ca"t`.
+                        Some('"') if chars.get(*at + 1) == Some(&'"') => {
+                            out.push('"');
+                            *at += 2;
+                        }
+                        Some('"') => {
+                            *at += 1;
+                            break;
+                        }
+                        Some('\\') if *at + 1 < chars.len() => {
+                            out.push(chars[*at + 1]);
+                            *at += 2;
+                        }
+                        Some(other) => {
+                            out.push(*other);
+                            *at += 1;
+                        }
+                    }
                 }
             }
+            Some(other) => {
+                out.push(*other);
+                *at += 1;
+            }
         }
-        return Err(malformed(whole, "Unexpected end of input."));
     }
-    let start = *at;
-    while let Some(ch) = chars.get(*at) {
-        if matches!(ch, ',' | ']' | ')') {
-            break;
-        }
-        *at += 1;
-    }
-    let text: String = chars[start..*at].iter().collect();
-    let text = text.trim().to_owned();
-    Ok((!text.is_empty()).then_some(text))
+    Ok((quoted || !out.is_empty()).then_some(out))
 }
 
 fn malformed(text: &str, detail: &'static str) -> SqlError {

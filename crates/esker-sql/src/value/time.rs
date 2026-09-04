@@ -57,7 +57,7 @@ pub fn to_text(micros: i64) -> String {
 /// rule `date` has for `20200101` — a `AM`/`PM` suffix, and the word `allballs`, which is
 /// midnight and is a `time` word only: the same literal against `date` is `22007`.
 pub fn from_text(text: &str) -> Result<i64> {
-    let body = text.trim();
+    let body = super::datetime_body(text);
     if body.eq_ignore_ascii_case("allballs") {
         return Ok(0);
     }
