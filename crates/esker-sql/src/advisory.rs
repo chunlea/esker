@@ -102,7 +102,9 @@ impl Key {
     /// `connection_test.rb` uses.
     #[must_use]
     pub fn pair(high: i32, low: i32) -> Self {
-        let packed = (i64::from(high) << 32) | i64::from(low as u32);
+        // The low half is masked rather than sign-extended: `pair(1, -1)` must pack as
+        // `0x0000_0001_ffff_ffff`, which is what `(classid << 32) | objid` reads back.
+        let packed = (i64::from(high) << 32) | (i64::from(low) & 0xffff_ffff);
         Key {
             key: packed,
             space: Space::Pair,
@@ -112,13 +114,13 @@ impl Key {
     /// `pg_locks.classid`: the high half, as an unsigned 32-bit the way an `oid` prints.
     #[must_use]
     pub fn classid(self) -> u32 {
-        ((self.key >> 32) & 0xffff_ffff) as u32
+        u32::try_from((self.key >> 32) & 0xffff_ffff).unwrap_or_default()
     }
 
     /// `pg_locks.objid`: the low half.
     #[must_use]
     pub fn objid(self) -> u32 {
-        (self.key & 0xffff_ffff) as u32
+        u32::try_from(self.key & 0xffff_ffff).unwrap_or_default()
     }
 }
 
@@ -183,32 +185,42 @@ impl Locks {
 
     /// `pg_try_advisory_lock` and its shared form: takes the lock or answers `false` at once.
     ///
-    /// **A session that already holds it always succeeds**, whatever anyone else holds, and its
-    /// depth goes up — that is what makes the function re-entrant rather than a self-deadlock.
+    /// **A session never conflicts with itself, and every other session does.** Both halves are
+    /// measured, and getting either wrong is a wrong answer rather than a missing one:
+    ///
+    /// * Alone, `pg_try_advisory_lock_shared(k)` then `pg_try_advisory_lock(k)` both answer `t`,
+    ///   and `pg_locks` then shows **two rows** — `ShareLock` and `ExclusiveLock`. It is not an
+    ///   upgrade: the session holds both, and each needs its own unlock.
+    /// * With *another* session holding a share, that same second call answers `f`. So the
+    ///   conflict test is over other holders only, and a session's own holds never block it.
+    ///
+    /// A holder is therefore `(session, mode)` rather than a session, which is also what makes
+    /// [`Locks::unlock`] release the right one. Reading it as re-entrancy per *session* is the
+    /// mistake this shape exists to refuse, and it answers `true` where a real server says `false`.
     pub fn try_lock(&self, session: Session, key: Key, mode: Mode) -> bool {
-        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let holders = held.entry(key).or_default();
-        if let Some((_, entry)) = holders.iter_mut().find(|(who, _)| *who == session) {
-            // Re-entrant. A session upgrading its own share to exclusive is the one case where the
-            // mode recorded is not the mode asked for, and a real server keeps both rows; here the
-            // stronger one wins, which is what `pg_locks.mode` then shows.
-            if mode == Mode::Exclusive {
-                entry.mode = Mode::Exclusive;
-            }
-            entry.depth += 1;
-            return true;
-        }
-        let blocked = holders
-            .iter()
-            .any(|(_, entry)| entry.mode == Mode::Exclusive || mode == Mode::Exclusive);
-        if blocked {
+        let conflict = holders.iter().any(|(who, entry)| {
+            *who != session && (entry.mode == Mode::Exclusive || mode == Mode::Exclusive)
+        });
+        if conflict {
             // Nothing was added, so an empty vector left behind would be a lock nobody holds.
             if holders.is_empty() {
                 held.remove(&key);
             }
             return false;
         }
-        holders.push((session, Held { mode, depth: 1 }));
+        if let Some((_, entry)) = holders
+            .iter_mut()
+            .find(|(who, entry)| *who == session && entry.mode == mode)
+        {
+            entry.depth += 1;
+        } else {
+            holders.push((session, Held { mode, depth: 1 }));
+        }
         true
     }
 
@@ -218,7 +230,10 @@ impl Locks {
     /// released, and one another session holds are all the same answer, and the caller turns it
     /// into PostgreSQL's `WARNING`.
     pub fn unlock(&self, session: Session, key: Key, mode: Mode) -> bool {
-        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(holders) = held.get_mut(&key) else {
             return false;
         };
@@ -240,7 +255,10 @@ impl Locks {
 
     /// `pg_advisory_unlock_all()`: everything this session holds, whatever the depth.
     pub fn unlock_all(&self, session: Session) {
-        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         held.retain(|_, holders| {
             holders.retain(|(who, _)| *who != session);
             !holders.is_empty()
@@ -252,7 +270,10 @@ impl Locks {
     /// Sorted so a `SELECT` without an `ORDER BY` is still repeatable — the rest of this crate's
     /// catalog views make the same promise for the same reason.
     pub fn rows(&self) -> Vec<Row> {
-        let held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rows: Vec<Row> = held
             .iter()
             .flat_map(|(key, holders)| {
@@ -263,7 +284,7 @@ impl Locks {
                 })
             })
             .collect();
-        rows.sort_by_key(|row| (row.key, row.session));
+        rows.sort_by_key(|row| (row.key, row.session, row.mode.name()));
         rows
     }
 }
@@ -308,8 +329,22 @@ mod tests {
         assert!(locks.try_lock(a, key, Mode::Shared));
         assert!(locks.try_lock(b, key, Mode::Shared), "two shares agree");
         assert!(!locks.try_lock(locks.session(), key, Mode::Exclusive));
-        locks.unlock_all(a);
+
+        // **A session holding a share cannot take an exclusive while *another* holds one** —
+        // measured `f`, and the case that reads as re-entrancy and is not.
+        assert!(
+            !locks.try_lock(b, key, Mode::Exclusive),
+            "b's own share does not excuse it from a's"
+        );
         locks.unlock_all(b);
+        // Alone, the same pair succeeds and is **two holds**, not an upgrade: a real server's
+        // `pg_locks` shows a `ShareLock` and an `ExclusiveLock` for the one session, and each
+        // needs its own unlock.
+        assert!(locks.try_lock(a, key, Mode::Exclusive));
+        let modes: Vec<&str> = locks.rows().iter().map(|row| row.mode.name()).collect();
+        assert_eq!(modes, ["ExclusiveLock", "ShareLock"]);
+        assert!(locks.unlock(a, key, Mode::Exclusive));
+        assert!(locks.unlock(a, key, Mode::Shared));
         assert!(locks.rows().is_empty());
     }
 

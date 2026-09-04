@@ -382,6 +382,17 @@ pub enum SqlError {
         value: String,
     },
 
+    /// `pg_advisory_unlock` for a lock this session does not hold: `01000`, **severity
+    /// `WARNING`**, and the function still answers `false`.
+    ///
+    /// Not an error, and that is the whole of what makes it usable: `ActiveRecord` reads the
+    /// `false` to decide a migration lock was never held (`migration.rb:1618`), and an `ERROR`
+    /// would abort the transaction the migration runs in instead. One sentence covers a key
+    /// nobody ever took, one already released, and one another session holds — measured, and the
+    /// mode is the only thing that varies.
+    #[error("you don't own a lock of type {0}")]
+    LockNotHeld(&'static str),
+
     /// An integer literal is well-formed and too big. PostgreSQL phrases the two numeric ranges
     /// differently — this one leads with `value` and [`SqlError::FloatOutOfRange`] does not — and
     /// both are copied verbatim because a client may be matching on either.
@@ -1976,6 +1987,7 @@ impl SqlError {
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
             }
+            SqlError::LockNotHeld(_) => sqlstate::WARNING,
             SqlError::IdleInTransactionTimeout => sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
             SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
@@ -2006,7 +2018,8 @@ impl SqlError {
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
-            | SqlError::SetTransactionOutsideBlock => Severity::Warning,
+            | SqlError::SetTransactionOutsideBlock
+            | SqlError::LockNotHeld(_) => Severity::Warning,
             SqlError::ProtocolViolation(_)
             | SqlError::InvalidPassword(_)
             | SqlError::IdleInTransactionTimeout => Severity::Fatal,

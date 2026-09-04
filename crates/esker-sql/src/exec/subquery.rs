@@ -727,6 +727,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Default
@@ -1203,6 +1204,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Outer { .. }
@@ -1290,6 +1292,7 @@ fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) ->
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. }
         | Expr::Column { .. }
         | Expr::Ordinal { .. }
         | Expr::Outer { .. }
