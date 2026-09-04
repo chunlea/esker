@@ -248,6 +248,32 @@ pub fn as_micros(day: i32) -> i64 {
     }
 }
 
+/// The calendar day an instant falls on — the **assignment** cast `timestamp`/`timestamptz` ->
+/// `date`.
+///
+/// **A calendar-day question, not a truncation.** `div_euclid` and not `/`, because a division
+/// that truncates toward zero puts every instant before 2000-01-01 on the *following* day: the
+/// microseconds are signed and the epoch is in the middle of the range this type covers.
+///
+/// The zone is the session's, and this node honours `TimeZone` only where it means UTC
+/// (`crate::parameter`) — so the same instant is the same date here whatever the session says,
+/// where a real server gives two different dates in two zones. That is the one thing about this
+/// cast that is *not* reproduced, and `tests/assignment_cast_date.rs` declares it with the two
+/// rows that show it.
+///
+/// The infinities are days of their own and stay themselves: an infinite instant is an infinite
+/// date, not a very large day number.
+#[must_use]
+pub fn from_micros(micros: i64) -> Option<i32> {
+    match micros {
+        super::timestamp::POS_INFINITY => Some(POS_INFINITY),
+        super::timestamp::NEG_INFINITY => Some(NEG_INFINITY),
+        _ => i32::try_from(micros.div_euclid(86_400_000_000))
+            .ok()
+            .filter(|day| (MIN_DAY..=MAX_DAY).contains(day)),
+    }
+}
+
 fn invalid(text: &str) -> SqlError {
     SqlError::InvalidDatetimeFormat {
         ty: ColumnType::Date.name(),

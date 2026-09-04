@@ -69,6 +69,18 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
         (Datum::Date(day), ColumnType::TimestampTz) => {
             Datum::TimestampTz(crate::value::date::as_micros(*day))
         }
+        // **The other direction, and it is an *assignment* cast only.** `pg_cast.castcontext` is
+        // `'a'` for both timestamp types to `date`: allowed when a value is assigned to a column,
+        // not when two values are combined — which is why it lives here and not in the promotion
+        // table `crate::value::arith` uses. `insert_all` is what needs it: `ActiveRecord` writes
+        // one `CURRENT_TIMESTAMP` into `created_at`, `updated_at` **and** `updated_on`, and the
+        // last of those is a `t.date`.
+        //
+        // A one-way relation, so it cannot be modelled as "these types are compatible": the
+        // reverse is `'i'`, implicit, and is the two arms above.
+        (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::Date) => {
+            Datum::Date(crate::value::date::from_micros(*micros)?)
+        }
         _ => return None,
     })
 }
