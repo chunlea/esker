@@ -1,0 +1,54 @@
+Cargo.lock
+  h_44076b318daf9c 69,80,148-157,373,539-540,591-596,733-742,798,915,930,1151-1164,1175-1218,1288-1293,1329,1402-1407,1440,1507,1592-1597,1641,1650-1658,1668-1731,1758-1763
+Cargo.toml
+  h_44076b318daf9c 24-36
+crates/esker-sql/Cargo.toml
+  h_44076b318daf9c 33-37,45-54
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 25,88-89,91,95,202-237,254-257,266-267,269-270,272-300,309-310
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 1297,1379-1399,1401-1402,1406-1411,1413
+crates/esker-sql/src/pgwire/mod.rs
+  h_44076b318daf9c 26
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 15,24,53-58,67,104,129-132,151-158,166,282-291,293,402-407,409-410,412,440,481-608,635
+crates/esker-sql/src/pgwire/tls.rs
+  h_44076b318daf9c 1-681
+crates/esker-sql/src/value/range.rs
+  h_44076b318daf9c 37-48,50,115-118,129-130,133,139,142,149-153,166-169,174,299-303,307
+crates/esker-sql/tests/corpus/pg19_crossed_bounds.txt
+  h_44076b318daf9c 1-42
+crates/esker-sql/tests/crossed_bounds.rs
+  h_44076b318daf9c 1-70
+crates/esker-sql/tests/fixtures/README.md
+  h_44076b318daf9c 1-29
+crates/esker-sql/tests/fixtures/ca-cert.pem
+  h_44076b318daf9c 1-11
+crates/esker-sql/tests/fixtures/localhost-test-cert.pem
+  h_44076b318daf9c 1-12
+crates/esker-sql/tests/fixtures/localhost-test-key.pem
+  h_44076b318daf9c 1-5
+crates/esker-sql/tests/pgwire_tls.rs
+  h_44076b318daf9c 1-545
+deny.toml
+  h_44076b318daf9c 11-13,15-40
+docs/DESIGN.md
+  h_44076b318daf9c 688-698,814-833
+docs/adr/0003-dependencies.md
+  h_44076b318daf9c 41-89,121-124
+docs/adr/0055-the-tls-options-across-three-surfaces-measured.md
+  h_44076b318daf9c 3-9,295-350
+docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md
+  h_44076b318daf9c 1-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "24d6444c494eb0d74350f09dcdb139f174d9e4ff",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
