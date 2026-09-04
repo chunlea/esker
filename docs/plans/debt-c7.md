@@ -273,3 +273,51 @@ alternate `JOIN` and `CONTROL` and compare medians, so shared load cancels — a
 off the noise floor so the ratio's denominator is not a 1.6 ms sample. `docs/plans/debt-c4.md` §9's
 rule applies to the diagnosis as much as to the fix: this was found by making it deterministic at
 one load, not by counting runs.
+
+## 8. `DROP DATABASE`: the reclaim, and the one thing it still needs
+
+`catalog::drop_database` walks every key the tenant owns inside a single Percolator transaction —
+`txn.scan(&start, &end, u32::MAX)` over 257 ranges, then `txn.delete` per key. `Txn::scan` answers
+`Vec<(Bytes, Bytes)>` **with values**, so a database of *n* bytes is *n* bytes of coordinator memory
+before one key is deleted, and every key then becomes a prewrite lock and a commit record in one
+transaction. It does not commit for a database of any size, and each delete is an MVCC version, so
+the data grows before it shrinks.
+
+[ADR 0069](../adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md) decides the
+shape: the catalog drop stays a small transaction and is what makes the database *gone*; the rows
+are not deleted, their **range is reclaimed**, gated on the GC safepoint and resumable from a
+cursor. The safepoint gate is the part that makes it correct rather than merely fast — a
+transaction whose snapshot predates the drop may still legally read those rows, so the clear waits
+until the drop's commit timestamp is below the floor PD publishes.
+
+The store half is built. `snapshot::clear_range` was already this exact operation — delete, flush,
+discharge, verify, over all three families and both physical namespaces — but only for a whole
+`Region`, and a tenant's range is part of one or spans several. The region-shaped calls are now the
+general ones (`physical_ranges_of`, `first_key_in_user_range`, `clear_user_range`), with
+`clear_range` delegating.
+
+Bounded and idempotent fell out of the operation rather than being added to it: the delete is six
+range tombstones in one synced batch, `O(1)` in the range's size and atomic across `kill -9`
+because the batch is either in the WAL or it is not; re-clearing an empty range takes the early
+return. The **compaction** is the unbounded step, so a whole-tenant reclaim walks the range a chunk
+at a time — and a test compares the chunked form against the whole one rather than against an
+assertion, because a chunk boundary is where a range mapping gets an off-by-one wrong.
+
+### Blocked on one wire message, deliberately
+
+The trigger crosses the wire and `esker-proto` is the coordinator's to sequence. ADR 0069 names
+what is needed and stops:
+
+```text
+TxnKvReq::ReclaimRange { start: Bytes, end: Bytes, below_ts: u64 }
+```
+
+a sibling of the `TxnKvReq::GcSafepoint` a store already answers — `below_ts` being the drop's
+commit timestamp, so the safepoint condition is a property of the request rather than of the
+caller's timing. Until it exists, `clear_user_range` is reachable in-process only and
+`DROP DATABASE` keeps its current behaviour.
+
+`esker-sql` also keeps a cheaper fallback that needs nothing from this crate: chunked *logical*
+deletes across many transactions, re-driven by the schema-job machinery that already exists. It is
+still `O(keys)` and still leaves the space to GC, but it is bounded, idempotent and crash-safe
+today. If the wire message is not sequenced, that is the answer.
