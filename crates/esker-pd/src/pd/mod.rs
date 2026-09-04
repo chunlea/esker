@@ -33,17 +33,17 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, cf};
+use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, WriteBatch, cf};
 use esker_proto::pd::{ColumnarWish, PdMemberInfo, PdMembership, PdRaftBatch};
 use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
-use esker_raft::{Config, NodeId, Term};
+use esker_raft::{ConfChange, ConfChangeKind, Config, NodeId, Term};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
 use crate::command::Command;
-use crate::driver::{Leadership, NoPeers, PdDriver, PdTransport};
+use crate::driver::{Leadership, NoPeers, PdDriver, PdTransport, conf_change_with_address};
 use crate::error::{PdError, Result};
 use crate::machine::{Answer, Machine};
 use crate::member::MemberList;
@@ -324,9 +324,14 @@ pub struct Pd {
     machine: Arc<Machine>,
     /// The Raft group underneath. Dropped last, which joins its thread.
     driver: PdDriver,
-    /// The group as this member was configured to see it. Configuration, not state
-    /// ([`crate::member`]).
-    members: MemberList,
+    /// The group this member believes it is in, and what that group is called.
+    ///
+    /// **It moves**, which is what dynamic membership means
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
+    /// a conf change appended to the log rewrites it, at append, before the messages of that same
+    /// `Ready` go out. The lock is its own, taken briefly and never across a propose — the same
+    /// rule the applied state follows and for the same reason ([`crate::driver`]).
+    members: Arc<RwLock<MemberList>>,
     /// Ids reserved per commit. Kept because a member rebuilds its allocator on taking office.
     alloc_batch: u64,
     /// How far ahead the mark is written. Kept for the same reason.
@@ -436,24 +441,37 @@ impl Pd {
             cf,
             Arc::clone(&options.clock),
         )?);
-        let log = PdLogStorage::open(
+        let mut log = PdLogStorage::open(
             Arc::clone(&db),
             esker_raft::ConfState::from_voters(options.members.ids()),
         )?;
+        // **Who this member is with, and what the group is called.** The record wins over the
+        // command line, which is `esker-raft`'s own rule for membership — after a membership change
+        // `--peers` is exactly the stale thing that rule is about
+        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        let members = settle_membership(&mut log, &options.members, &db)?;
         let applied = log.applied_index();
 
-        let mut config = Config::new(options.id, options.members.ids(), options.raft_seed);
+        let mut config = Config::new(options.id, members.ids(), options.raft_seed);
         config.applied = applied;
+        let alone = members.is_alone();
         let transport = options
             .transport
             .clone()
             .unwrap_or_else(|| Arc::new(NoPeers) as Arc<dyn PdTransport>);
-        let driver = PdDriver::start(config, log, Arc::clone(&machine), transport)?;
+        let shared = Arc::new(RwLock::new(members.clone()));
+        let driver = PdDriver::start(
+            config,
+            log,
+            Arc::clone(&machine),
+            transport,
+            Arc::clone(&shared),
+        )?;
 
         // A group of one wins with a quorum of itself, so it is leading and caught up before this
         // returns — which is what keeps `Pd::open` synchronous, runtime-free and behaviourally
         // identical to the single durable PD it replaces. A larger group elects on ticks.
-        if options.members.is_alone() {
+        if alone {
             driver.campaign()?;
             if !driver.leadership().serving {
                 return Err(PdError::internal(
@@ -482,7 +500,7 @@ impl Pd {
             clock: options.clock,
             machine,
             driver,
-            members: options.members,
+            members: shared,
             alloc_batch: options.alloc_batch,
             tso_save_interval_ms: options.tso_save_interval_ms,
             max_store_down_time_ms: options.max_store_down_time_ms,
@@ -538,10 +556,22 @@ impl Pd {
         self.driver.leadership()
     }
 
-    /// The group this member belongs to.
+    /// The group this member believes it is in.
+    ///
+    /// A clone, because it moves: holding a reference across a membership change would be holding
+    /// a list that is no longer the group's.
     #[must_use]
-    pub fn members(&self) -> &MemberList {
-        &self.members
+    pub fn members(&self) -> MemberList {
+        self.member_list()
+    }
+
+    /// The membership, or — if the lock is poisoned, which means a thread panicked holding it — a
+    /// group of this member alone. Poisoned means this process is finished either way; answering
+    /// something rather than panicking is `CLAUDE.md` invariant 9.
+    fn member_list(&self) -> MemberList {
+        self.members
+            .read()
+            .map_or_else(|_| MemberList::alone(self.driver.id()), |held| held.clone())
     }
 
     /// Whether this member may answer. A follower answers nothing but [`PdError::NotLeader`].
@@ -563,7 +593,8 @@ impl Pd {
     /// [ADR 0011](../../../docs/adr/0011-pd-service-and-the-cluster-id.md) was written about with
     /// a worse consequence.
     pub fn step_raft(&self, batch: &PdRaftBatch) -> Result<()> {
-        let expected = self.members.group_id();
+        let members = self.member_list();
+        let expected = members.group_id();
         if batch.group_id != expected {
             return Err(PdError::invalid(format!(
                 "a placement-driver batch from member {} is for group {:#018x}; this is group                  {expected:#018x} — check that every --pd-peers list names the same members",
@@ -573,7 +604,7 @@ impl Pd {
         // A correct group id implies a member this list names, so this can only fire on a
         // deliberate forgery or a hash collision. Refused rather than stepped: a message from
         // outside the configuration is one the core would have to reason about.
-        if !self.members.contains(batch.from) {
+        if !members.contains(batch.from) {
             return Err(PdError::invalid(format!(
                 "a placement-driver batch claims to come from member {}, which is not in this                  group",
                 batch.from
@@ -594,13 +625,13 @@ impl Pd {
     #[must_use]
     pub fn membership(&self) -> PdMembership {
         let office = self.driver.leadership();
+        let members = self.member_list();
         PdMembership {
-            group_id: self.members.group_id(),
+            group_id: members.group_id(),
             this_id: office.id,
             leader_id: office.leader.unwrap_or(0),
             term: office.term,
-            members: self
-                .members
+            members: members
                 .members()
                 .iter()
                 .map(|member| PdMemberInfo {
@@ -611,12 +642,145 @@ impl Pd {
         }
     }
 
+    /// One step of adding `id` at `address` to this group. Call again until it answers `true`.
+    ///
+    /// **A reconciliation, not a script**, and the shape is the whole of its correctness. Adding a
+    /// member is three things — propose a learner, wait for it to catch up, promote it — so there
+    /// are three places for a `kill -9` to land, and an operator who reruns the command after one
+    /// must not be told "that member already exists". So this looks at what is *there* and does
+    /// what is missing:
+    ///
+    /// | Found | Done |
+    /// |---|---|
+    /// | nothing | propose `AddLearner`, with the address in its context |
+    /// | a learner, behind | nothing; the answer is "not yet" |
+    /// | a learner, caught up | propose `AddVoter` — the promotion |
+    /// | a voter | nothing; the answer is "done" |
+    ///
+    /// **A learner first, because a voter would deadlock the group.** With three members and one
+    /// gone, `AddVoter` takes the quorum to three the instant its entry is appended — a
+    /// configuration is in force from then, not from when it commits — and the entry that made the
+    /// quorum three needs three to commit, while two are live and the new one has an empty log. A
+    /// learner is not counted in a quorum, so it commits, catches up, and *then* counts
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// §11.4).
+    pub fn add_member(&self, id: NodeId, address: &str) -> Result<bool> {
+        if id == 0 {
+            return Err(PdError::invalid("member id 0 is reserved for 'no member'"));
+        }
+        address
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| PdError::invalid(format!("`{address}` is not an address: {error}")))?;
+        let _serving = self.leading()?;
+        let conf = self.driver.conf_state()?;
+        if conf.voters.contains(&id) {
+            return Ok(true);
+        }
+
+        if conf.learners.contains(&id) {
+            let Some((commit, progress)) = self.driver.progress()? else {
+                return Err(self.not_leading());
+            };
+            let caught_up = progress
+                .iter()
+                .find(|peer| peer.id == id)
+                .is_some_and(|peer| peer.matched >= commit);
+            if !caught_up {
+                return Ok(false);
+            }
+            // The promotion carries no address: the one this member already holds for it came in
+            // with the `AddLearner`, and re-sending it would let a typo in a *second* command
+            // silently move a member that is already in the group.
+            self.driver
+                .propose_conf_change(ConfChange::new(ConfChangeKind::AddVoter, id))?;
+            return Ok(true);
+        }
+
+        if self.member_list().len() >= crate::member::MAX_MEMBERS {
+            return Err(PdError::invalid(format!(
+                "this placement driver's group already has {} members, which is what this build \
+                 supports",
+                self.member_list().len()
+            )));
+        }
+        self.driver.propose_conf_change(conf_change_with_address(
+            ConfChangeKind::AddLearner,
+            id,
+            address,
+        ))?;
+        Ok(false)
+    }
+
+    /// Removes `id` from this group. Idempotent: removing one that is not there answers `true`.
+    ///
+    /// Refused for the **last** member, and refused when the group would be left without a quorum
+    /// of members that have been heard from — which a leader can see, because `progress` says who
+    /// answered recently. Both are refusals rather than warnings: a placement driver that removed
+    /// its way out of a quorum could not undo it, because undoing needs the quorum it just lost.
+    pub fn remove_member(&self, id: NodeId) -> Result<bool> {
+        let _serving = self.leading()?;
+        let conf = self.driver.conf_state()?;
+        if !conf.voters.contains(&id) && !conf.learners.contains(&id) {
+            return Ok(true);
+        }
+        if conf.voters.len() == 1 && conf.voters.contains(&id) {
+            return Err(PdError::invalid(
+                "this is the group's last member; removing it would leave no placement driver",
+            ));
+        }
+        if conf.voters.contains(&id) {
+            let Some((_, progress)) = self.driver.progress()? else {
+                return Err(self.not_leading());
+            };
+            // This member is live by definition — it is the one answering. For the others,
+            // `recent_active` is what a leader knows: `esker-raft` clears it at every
+            // election-timeout boundary and sets it when a peer answers, so it means "heard from
+            // within the last window".
+            //
+            // It is **conservative in both directions and that is deliberate**. A leader that has
+            // only just taken office has it false for everyone — `Progress::new` starts it that
+            // way and the window has not closed yet — so a removal asked in the first moments
+            // after an election is refused although the group is healthy. That is the safe
+            // direction: the operator retries a second later, where the other direction is a group
+            // that has removed its way below a quorum and cannot undo it, because undoing needs
+            // the quorum it just lost.
+            //
+            // The reading it cannot make is "gone for hours" versus "quiet for one window", and it
+            // does not need to: either way this member has not heard from it, and a removal
+            // decided on a member nobody has heard from is the removal being refused.
+            let live_after = 1 + progress
+                .iter()
+                .filter(|peer| peer.id != self.driver.id() && peer.id != id && peer.recent_active)
+                .count();
+            let quorum_after = conf.voters.len() / 2 + 1;
+            if live_after < quorum_after {
+                return Err(PdError::invalid(format!(
+                    "removing member {id} would leave {live_after} live of the {quorum_after} a \
+                     quorum needs; bring a member back first, or add one"
+                )));
+            }
+        }
+        self.driver
+            .propose_conf_change(ConfChange::new(ConfChangeKind::Remove, id))?;
+        Ok(true)
+    }
+
     /// Waits until the group's Raft core has driven everything posted before this call.
     ///
     /// See [`crate::driver::PdDriver::settle`]. A barrier, for a caller that ticked or stepped and
     /// needs to know what came of it.
     pub fn settle(&self) -> Result<()> {
         self.driver.settle()
+    }
+
+    /// How far each member has got, as only a leader can say. For the tools and tests.
+    pub fn driver_progress(&self) -> Result<Option<(u64, Vec<esker_raft::PeerProgress>)>> {
+        self.driver.progress()
+    }
+
+    /// The membership in force — the latest in the log, committed or not. For the tools and tests.
+    pub fn conf_state(&self) -> Result<esker_raft::ConfState> {
+        self.driver.conf_state()
     }
 
     /// One logical tick of the group's Raft core.
@@ -1074,7 +1238,7 @@ impl Pd {
         PdError::NotLeader {
             leader_id,
             leader_address: self
-                .members
+                .member_list()
                 .address_of(leader_id)
                 .unwrap_or_default()
                 .to_owned(),
@@ -1133,6 +1297,69 @@ fn reserve(driver: &PdDriver, allocated_end: u64) -> Result<()> {
     driver
         .propose(Command::ReserveIds { end: allocated_end })
         .map(|_| ())
+}
+
+/// Settles what group this member is in, and what it is called, at open.
+///
+/// Three cases, and the first is the only one that writes:
+///
+/// * **a fresh database, or one written before there were group ids.** The id is derived from the
+///   configured list — *once* — and written down with the members. Deriving it is what makes the
+///   upgrade invisible: every deployment running today computes exactly this id on every start, so
+///   the first member upgraded keeps talking to the ones that have not been.
+/// * **a member joining an existing group**, which was told the id and the members by
+///   [`PdOptions::members`] and writes them before it starts.
+/// * **an existing member.** The record answers, and a `--peers` that disagrees is a warning rather
+///   than an argument — after a membership change that flag is exactly the out-of-date command line
+///   `esker_raft::Config` says not to believe.
+fn settle_membership(
+    log: &mut PdLogStorage,
+    configured: &MemberList,
+    db: &Arc<Db>,
+) -> Result<MemberList> {
+    let recorded = log.group_id();
+    let told = configured.recorded_group_id();
+
+    if recorded == 0 {
+        let group_id = told.unwrap_or_else(|| configured.derived_group_id());
+        let mut batch = WriteBatch::new();
+        log.stage_group(&mut batch, group_id, configured.members())?;
+        db.write(batch, &esker_engine::WriteOptions::synced())?;
+        tracing::info!(
+            group_id = format_args!("{group_id:#018x}"),
+            members = configured.len(),
+            minted = told.is_none(),
+            "placement-driver group settled"
+        );
+        return Ok(configured.clone().with_group_id(group_id));
+    }
+
+    if let Some(told) = told
+        && told != recorded
+    {
+        return Err(PdError::invalid(format!(
+            "this placement driver belongs to group {recorded:#018x} and was told to join \
+             {told:#018x}; a group id is minted once and never changes"
+        )));
+    }
+    if log.members().is_empty() {
+        // Recorded id, no address book: a version-1 record whose id was minted on a previous open
+        // of *this* build. Take the configured list, which is the only one there is.
+        let mut batch = WriteBatch::new();
+        log.stage_group(&mut batch, recorded, configured.members())?;
+        db.write(batch, &esker_engine::WriteOptions::synced())?;
+        return Ok(configured.clone().with_group_id(recorded));
+    }
+
+    let held = MemberList::new(log.members().to_vec())?.with_group_id(recorded);
+    if held.members() != configured.members() {
+        tracing::warn!(
+            recorded = ?held.members().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            configured = ?configured.members().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "the recorded membership and --peers disagree; believing the record"
+        );
+    }
+    Ok(held)
 }
 
 /// The clock a member resumes its oracle against on taking office.

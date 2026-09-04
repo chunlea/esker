@@ -44,6 +44,19 @@ impl StandIn {
     }
 
     fn answer(&self, cluster_id: u64, request: PdReq) -> PdResp {
+        fn lone_membership() -> esker_proto::PdMembership {
+            esker_proto::PdMembership {
+                group_id: 1,
+                this_id: 1,
+                leader_id: 1,
+                term: 1,
+                members: vec![esker_proto::PdMemberInfo {
+                    id: 1,
+                    address: "127.0.0.1:2379".to_owned(),
+                }],
+            }
+        }
+
         let mut state = self.lock();
         state.seen_cluster_ids.push(cluster_id);
         match request {
@@ -114,17 +127,14 @@ impl StandIn {
             // Between two placement drivers, never between a store and one. A stand-in that
             // answered it would be pretending to be a member of a group it is not in.
             PdReq::Raft(_) => PdResp::Raft,
+            // An operator's, not a store's. A stand-in that is a group of one has nothing to
+            // change and says so.
+            PdReq::MemberChange { .. } => PdResp::MemberChange {
+                membership: lone_membership(),
+                done: true,
+            },
             // An operator's question, not a store's, and this stand-in is a group of one.
-            PdReq::Members => PdResp::Members(esker_proto::PdMembership {
-                group_id: 1,
-                this_id: 1,
-                leader_id: 1,
-                term: 1,
-                members: vec![esker_proto::PdMemberInfo {
-                    id: 1,
-                    address: "127.0.0.1:2379".to_owned(),
-                }],
-            }),
+            PdReq::Members => PdResp::Members(lone_membership()),
         }
     }
 }
