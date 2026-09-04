@@ -18,6 +18,7 @@ use super::conn::{
     BoxFuture, FrameAction, FrameSink, InFlight, PING_REQUEST_ID, Waiter, WriterStop, read_frames,
     spawn_writer,
 };
+use super::tls::{MaybeTlsStream, RpcTls};
 use super::{Transport, TransportConfig};
 
 /// A connection to one peer.
@@ -61,14 +62,49 @@ impl TcpTransport {
         addr: SocketAddr,
         config: TransportConfig,
     ) -> Result<Self, ProtoError> {
+        Self::connect_over(addr, config, &RpcTls::disabled(), None).await
+    }
+
+    /// Connects over TLS, verifying the peer against `name` or against the address's IP.
+    ///
+    /// **The name is what the certificate is checked against**, and it is the configured name —
+    /// never something the peer says about itself. With `None` it is the IP of `addr`, which is
+    /// what an address book of `SocketAddr`s can offer and what a certificate for a cluster peer
+    /// therefore has to carry as an IP SAN; a deployment with DNS passes the name instead.
+    ///
+    /// A `tls` that is disabled connects in the clear — the caller decides, and every caller that
+    /// decides is a flag an operator set.
+    ///
+    /// # Errors
+    ///
+    /// As [`TcpTransport::connect_with`], plus a handshake the peer refused: an untrusted chain, a
+    /// certificate that does not cover the name, or — under mTLS — this node's own certificate
+    /// being refused by the peer.
+    pub async fn connect_with_tls(
+        addr: SocketAddr,
+        config: TransportConfig,
+        tls: &RpcTls,
+        name: Option<&str>,
+    ) -> Result<Self, ProtoError> {
+        Self::connect_over(addr, config, tls, name).await
+    }
+
+    /// The one connect path; TLS or not is decided by `tls`.
+    async fn connect_over(
+        addr: SocketAddr,
+        config: TransportConfig,
+        tls: &RpcTls,
+        name: Option<&str>,
+    ) -> Result<Self, ProtoError> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|error| ProtoError::not_sent(format!("connecting to {addr}: {error}")))?;
         // Requests are small and latency matters more than packet count; the writer already
         // batches whatever is queued into one write.
         let _ = stream.set_nodelay(true);
+        let stream = wrap_client(stream, addr, tls, name).await?;
 
-        let (source, sink) = stream.into_split();
+        let (source, sink) = tokio::io::split(stream);
         let (sink, stop) = spawn_writer(sink, &config);
 
         let in_flight = Arc::new(InFlight::new(config.max_in_flight));
@@ -581,3 +617,38 @@ impl Drop for BlockingTransport {
 /// Never a request id: [`PING_REQUEST_ID`] is the keepalive's and is checked here so the two
 /// constants cannot drift apart.
 const _: () = assert!(PING_REQUEST_ID < HELLO_REQUEST_ID);
+
+/// Wraps an outbound socket in a TLS session when one is configured.
+#[cfg(feature = "tls")]
+async fn wrap_client(
+    stream: TcpStream,
+    addr: SocketAddr,
+    tls: &RpcTls,
+    name: Option<&str>,
+) -> Result<MaybeTlsStream<TcpStream>, ProtoError> {
+    let Some(config) = tls.client() else {
+        return Ok(MaybeTlsStream::Plain(stream));
+    };
+    let server_name = match name {
+        Some(name) => rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| {
+            ProtoError::not_sent(format!("{name} is not a name a certificate can carry"))
+        })?,
+        None => rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
+    };
+    let encrypted = super::tls::connect(stream, config, server_name)
+        .await
+        .map_err(|error| ProtoError::not_sent(format!("the TLS handshake with {addr}: {error}")))?;
+    Ok(MaybeTlsStream::Tls(encrypted))
+}
+
+/// Without the feature there is nothing to wrap: `RpcTls` cannot be enabled.
+#[cfg(not(feature = "tls"))]
+#[expect(clippy::unused_async, reason = "one signature for both builds")]
+async fn wrap_client(
+    stream: TcpStream,
+    _addr: SocketAddr,
+    _tls: &RpcTls,
+    _name: Option<&str>,
+) -> Result<MaybeTlsStream<TcpStream>, ProtoError> {
+    Ok(MaybeTlsStream::Plain(stream))
+}
