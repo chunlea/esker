@@ -46,3 +46,28 @@ SELECT 'r', id FROM ot WHERE id = n	text,bigint	r|1
 SELECT 'r', id FROM ot WHERE s = v	text,bigint	r|1
 SELECT 'r', id FROM ot WHERE id = 'x'::text	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
 SELECT 'r', id FROM ot WHERE id = b	!42883 operator does not exist: bigint = boolean DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+# **An `unknown` stops being one the moment it passes through a constructor**, and that is the
+# other half of the rule above. `id = '1'` works because the literal takes the column's type;
+# `id = (SELECT '1')`, `id = CASE WHEN true THEN '1' ELSE '2' END`, `id = COALESCE('1','2')` and
+# `id = ANY(ARRAY['1','2'])` are each `42883 operator does not exist: bigint = text`, because a
+# scalar subquery, a `CASE`, a `COALESCE` and an `ARRAY[]` are **values of a settled type** and
+# the coercion does not reach through them. `pg_typeof` says so directly: each of the first three
+# is `text` and the fourth is `text[]`.
+#
+# The same four with one typed branch all answer, which is what makes this a rule about *unknown*
+# and not a ban on constructors — and `COALESCE(NULL, '1')` is `text` too, because a NULL carries
+# no type either, so a `COALESCE` of a NULL and an unknown is all-unknown.
+SELECT 'r', id FROM ot WHERE id = (SELECT '1')	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = CASE WHEN true THEN '1' ELSE '2' END	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE b = CASE WHEN true THEN 't' ELSE 'f' END	!42883 operator does not exist: boolean = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = COALESCE('1', '2')	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = ANY(ARRAY['1','2'])	!42883 operator does not exist: bigint = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', id FROM ot WHERE id = (SELECT 1)		r|1
+SELECT 'r', id FROM ot WHERE id = CASE WHEN true THEN 1 ELSE 2 END		r|1
+SELECT 'r', id FROM ot WHERE id = COALESCE(id, '7')		r|1
+SELECT 'r', id FROM ot WHERE id = ANY('{1,2}')		r|1
+SELECT 'r', n FROM ot WHERE n = COALESCE(NULL, '1')	!42883 operator does not exist: integer = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', pg_typeof((SELECT '1')), pg_typeof(CASE WHEN true THEN '1' ELSE '2' END)	text,regtype,regtype	r|text|text
+SELECT 'r', pg_typeof(COALESCE('1','2')), pg_typeof(ARRAY['1','2']), pg_typeof(COALESCE(NULL, NULL))	text,regtype,regtype,regtype	r|text|text[]|text
+SELECT 'r', id FROM ot WHERE id = '1'		r|1
+SELECT 'r', id FROM ot WHERE b = 't'		r|1

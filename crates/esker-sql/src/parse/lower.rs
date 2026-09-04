@@ -3948,13 +3948,57 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
 /// `IN` list before the planner sees it, and a `Datum` is never an array. That is the split ADR
 /// 0033's roadmap describes — expression-level arrays now, stored arrays with the tier-2 unit that
 /// needs a column of them.
+/// An `ARRAY[…]` on the right of `= ANY`, as a list of elements **typed by the constructor**.
+///
+/// `lower_array_constructor` folds the whole thing to one array value; this takes that value apart
+/// again, which is what the `IN`-list shape needs. Going through it rather than lowering each
+/// element on its own is the point: the constructor is where the common type is chosen, and a list
+/// of `unknown`s would take the column's type instead and answer where a real server raises.
+fn lower_array_constructor_elements(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
+    let Expr::Array(array) = expr else {
+        return Ok(None);
+    };
+    // **`ARRAY[]` has no elements to take a type from**, and on this side of `= ANY` it needs
+    // none: an empty list matches nothing, which is what `'x' = ANY(ARRAY[]::text[])` is `f` for.
+    // Asking the constructor would be `42P18 cannot determine type of empty array`, which is the
+    // right answer where the array is a *value* and the wrong one here.
+    if array.elem.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let plan::Expr::Literal(plan::Literal::Typed(value)) = lower_array_constructor(&array.elem)?
+    else {
+        return Ok(None);
+    };
+    let Datum::Array(array) = *value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        array
+            .values
+            .into_iter()
+            .map(|element| {
+                plan::Expr::Literal(match element {
+                    Some(value) => plan::Literal::Typed(Box::new(value)),
+                    None => plan::Literal::Null,
+                })
+            })
+            .collect(),
+    ))
+}
+
 fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
     Ok(Some(match expr {
-        Expr::Array(array) => array
-            .elem
-            .iter()
-            .map(lower_expr)
-            .collect::<Result<Vec<_>>>()?,
+        // **A constructor settles its elements' type, and a bare list does not.** `id IN ('1','2')`
+        // works on a real server because each literal is `unknown` and takes the column's type;
+        // `id = ANY(ARRAY['1','2'])` is `42883 operator does not exist: bigint = text`, because
+        // `ARRAY['1','2']` is a `text[]` **value** — `pg_typeof` says so — and the coercion does
+        // not reach into one. Lowering the constructor is what settles them: it reads each element
+        // at the array's own element type, so what comes out is typed rather than `unknown`, and
+        // the comparison then refuses exactly where a real server does.
+        Expr::Array(_) => match lower_array_constructor_elements(expr)? {
+            Some(elements) => elements,
+            None => return Ok(None),
+        },
         Expr::Nested(inner) => return lower_array(inner),
         // **`current_schemas(…)` is no longer a list this lowering can see.** Its value is the
         // session's `search_path`, which arrives at `crate::exec::Executor::bound`, so it stays an
