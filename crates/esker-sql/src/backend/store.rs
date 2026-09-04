@@ -25,7 +25,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use esker_client::{Error as ClientError, TimestampOracle, Transaction, TxnClient};
 
-use crate::backend::{Backend, Txn};
+use crate::backend::locks::RowLocks;
+use crate::backend::{Backend, Lock, Txn};
 use crate::error::{Result, SqlError};
 
 /// Opens transactions against a real cluster.
@@ -35,6 +36,19 @@ pub struct StoreBackend {
     oracle: Arc<dyn TimestampOracle>,
     /// Where this node's schema lease comes from, or `None` for a node with no placement driver.
     lease: Option<Arc<dyn SchemaLease>>,
+    /// The row locks **this node** holds
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    ///
+    /// The same table `MemoryBackend` uses, and deliberately not a second implementation of a
+    /// wait-for graph. What differs is its *scope*, and the difference is declared rather than
+    /// hidden: two sessions of **one** `esker-sql` process see each other's locks and block; two
+    /// sessions of different nodes do not, and their conflict resolves where it always did, at
+    /// prewrite, with the loser told `40001`.
+    ///
+    /// That is strictly better than what was here — a node that took no locks at all — and it is
+    /// not the end state: a lock every node can see is a store-side operation, and §5 of the ADR
+    /// says what it costs.
+    locks: Arc<std::sync::Mutex<RowLocks>>,
 }
 
 /// Where a node's schema lease comes from
@@ -74,6 +88,23 @@ impl StoreBackend {
             client,
             oracle,
             lease: None,
+            locks: Arc::new(std::sync::Mutex::new(RowLocks::default())),
+        }
+    }
+
+    /// One transaction, given this node's clock and its lock table.
+    ///
+    /// The id comes from the table rather than from `start_ts`, for the reason `RowLocks` records:
+    /// two transactions can share a timestamp, and a lock owned by "whoever has that stamp" is a
+    /// lock the second one believes it already holds.
+    fn wrap(&self, inner: Transaction) -> StoreTxn {
+        let id = self.locks.lock().map_or(0, |mut locks| locks.next_id());
+        StoreTxn {
+            inner: Some(inner),
+            oracle: Arc::clone(&self.oracle),
+            locks: Arc::clone(&self.locks),
+            id,
+            held: Vec::new(),
         }
     }
 
@@ -91,9 +122,7 @@ impl StoreBackend {
 
 impl Backend for StoreBackend {
     fn begin(&self) -> Result<Box<dyn Txn>> {
-        Ok(Box::new(StoreTxn {
-            inner: Some(self.client.begin().map_err(translate)?),
-        }))
+        Ok(Box::new(self.wrap(self.client.begin().map_err(translate)?)))
     }
 
     /// ADR 0021 Decision 1, and it really is three lines.
@@ -104,9 +133,9 @@ impl Backend for StoreBackend {
     /// come back as `22023` here, carrying the number the store named — so a user who asked too
     /// far back is told the floor that is actually in force rather than the one this node guessed.
     fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>> {
-        Ok(Box::new(StoreTxn {
-            inner: Some(self.client.begin_at(start_ts).map_err(translate)?),
-        }))
+        Ok(Box::new(
+            self.wrap(self.client.begin_at(start_ts).map_err(translate)?),
+        ))
     }
 
     /// This node's lease, or an unbounded one when nothing is publishing them.
@@ -148,6 +177,26 @@ impl Backend for StoreBackend {
 #[derive(Debug)]
 struct StoreTxn {
     inner: Option<Transaction>,
+    /// Where a statement's read timestamp comes from (`CLAUDE.md` invariant 6: never a wall clock).
+    oracle: Arc<dyn TimestampOracle>,
+    /// This node's lock table, shared with every other session on it.
+    locks: Arc<std::sync::Mutex<RowLocks>>,
+    /// This transaction's identity in that table, which `start_ts` is not.
+    id: u64,
+    /// The keys this transaction has locked, so they can all be given back at once.
+    held: Vec<Vec<u8>>,
+}
+
+/// **A lock dies with its transaction, including the way out nobody writes down.**
+///
+/// The same reason `MemoryTxn` has one: a session that disconnects mid-transaction takes neither
+/// `commit` nor `rollback`, so a lock released only by those two would be held for the life of the
+/// process — and with `lock_timeout` at PostgreSQL's default of 0, the next writer to that row
+/// waits forever. That cost four suite files a round (run 66).
+impl Drop for StoreTxn {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl StoreTxn {
@@ -165,6 +214,20 @@ impl StoreTxn {
         self.inner
             .take()
             .ok_or_else(|| SqlError::Internal("a transaction ended twice".into()))
+    }
+
+    /// Gives back every row lock this transaction took on this node.
+    ///
+    /// A poisoned lock table is ignored rather than panicked on: this runs from a destructor, and
+    /// a panic there while another thread already panicked holding the table would abort the
+    /// process (`CLAUDE.md` invariant 9).
+    fn release(&self) {
+        if self.held.is_empty() {
+            return;
+        }
+        if let Ok(mut locks) = self.locks.lock() {
+            locks.release(self.id, &self.held);
+        }
     }
 }
 
@@ -193,6 +256,88 @@ impl Txn for StoreTxn {
     /// the fake could not have caught it, which is why `tests/real_backend.rs` asks.
     fn is_read_only(&self) -> bool {
         self.inner.as_ref().is_some_and(Transaction::is_read_only)
+    }
+
+    /// Takes this node's row lock, or names the holder
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    ///
+    /// **Node-local, and that is a declared scope rather than an approximation.** Two sessions of
+    /// one `esker-sql` process block on each other exactly as they do on the in-process backend;
+    /// two sessions of different nodes do not see each other's locks, and their conflict resolves
+    /// where it always did — at prewrite, with the loser told `40001`. Nothing is weakened by that:
+    /// what a cross-node pair gets is what *every* pair got before this, and the per-key read
+    /// timestamp (§4, already on the wire) is what keeps it honest.
+    ///
+    /// A cluster-wide lock is a store-side operation with a wire and a log change behind it, and
+    /// the ADR asks the question rather than half-answering it here.
+    fn lock(&mut self, key: &[u8]) -> Result<Lock> {
+        // A read-only transaction writes nothing, so it needs nothing — and must not take a lock a
+        // live writer would then wait behind.
+        if self.is_read_only() {
+            return Ok(Lock::Taken);
+        }
+        let start_ts = self.start_ts();
+        let Ok(mut locks) = self.locks.lock() else {
+            // A poisoned table means another session panicked holding it. Refusing to lock is the
+            // safe direction: the caller proceeds without the wait, which is what this node did
+            // before locks existed at all.
+            return Ok(Lock::Taken);
+        };
+        let taken = locks.take(key, self.id, start_ts);
+        drop(locks);
+        if matches!(taken, Lock::Taken) && !self.held.iter().any(|held| held == key) {
+            self.held.push(key.to_vec());
+        }
+        Ok(taken)
+    }
+
+    /// A fresh read timestamp for the statement beginning now, from the oracle.
+    ///
+    /// **This is what makes READ COMMITTED real against a cluster**: without it every statement of
+    /// a transaction read at `BEGIN`'s snapshot, which is REPEATABLE READ wearing another name. The
+    /// timestamp costs one TSO call per statement, which is what a real server pays for a snapshot
+    /// per statement too.
+    ///
+    /// A read-only transaction is left alone: it was opened at a timestamp the caller chose — a
+    /// time-machine read — and moving its snapshot forward would answer a different past.
+    fn begin_statement(&mut self) -> Result<()> {
+        if self.is_read_only() {
+            return Ok(());
+        }
+        // The oracle's refusal is a `ProtoError` rather than the client's error type, so it is
+        // named here rather than run through `translate`: a statement that cannot get a timestamp
+        // is a statement that cannot read, and saying which is more use than a generic internal.
+        let at = self.oracle.timestamp().map_err(|error| {
+            SqlError::Internal(format!("no timestamp for this statement: {error}"))
+        })?;
+        if let Some(txn) = self.open_mut() {
+            txn.begin_statement(at);
+        }
+        Ok(())
+    }
+
+    /// The same, for a statement that waited and must now run again — and the writes of the
+    /// attempt that waited are **given back** first.
+    ///
+    /// A re-run is not a second statement. Its predecessor's writes were computed from a snapshot
+    /// this transaction has now left behind, so keeping them would validate the re-run against the
+    /// moment *before* the wait and kill it with a `40001` naming the commit it waited for — which
+    /// is what three real stores answered before this existed: `a commit at 1007 beat this
+    /// transaction at 1004`.
+    fn restart_statement(&mut self) -> Result<()> {
+        let at = self.oracle.timestamp().map_err(|error| {
+            SqlError::Internal(format!("no timestamp for this statement: {error}"))
+        })?;
+        if let Some(txn) = self.open_mut() {
+            txn.restart_statement(at);
+        }
+        Ok(())
+    }
+
+    /// Gives the deadlock victim's rows back at once, without ending the transaction.
+    fn abandon_locks(&mut self) {
+        self.release();
+        self.held.clear();
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {

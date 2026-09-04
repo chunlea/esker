@@ -401,6 +401,7 @@ impl TxnClient {
             buffer: BTreeMap::new(),
             read_ts: BTreeMap::new(),
             statement_ts: None,
+            statement_undo: BTreeMap::new(),
             read_only,
             refused_write: None,
             state: State::Open,
@@ -453,8 +454,14 @@ pub struct Transaction {
     /// *is* "the transaction's own snapshot" rather than a value repeated on every key.
     read_ts: BTreeMap<Bytes, u64>,
     /// The read timestamp of the statement running now, or `None` while it is the transaction's
-    /// own. Set by [`Transaction::reading_at`] when a statement is re-run after waiting.
+    /// own. Set by [`Transaction::begin_statement`].
     statement_ts: Option<u64>,
+    /// What the buffer held for each key **before the statement running now touched it**, so a
+    /// statement that has to be re-run can give its writes back.
+    ///
+    /// `None` against a key means the buffer had nothing there. Empty for every transaction whose
+    /// statements never waited, which is every transaction that never blocks.
+    statement_undo: BTreeMap<Bytes, Option<Write>>,
     /// Whether this transaction reads a past snapshot and so may not write
     /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
     read_only: bool,
@@ -500,11 +507,25 @@ impl Transaction {
         if self.refuse_write(key) {
             return;
         }
+        self.remember(key);
         self.stamp(key);
         self.buffer.insert(
             Bytes::copy_from_slice(key),
             Write::Put(Bytes::copy_from_slice(value)),
         );
+    }
+
+    /// The snapshot a **read** is served at: the running statement's where there is one, and the
+    /// transaction's own otherwise
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    ///
+    /// **Not [`Transaction::start_ts`], which never moves.** The transaction's own timestamp is its
+    /// identity — its lock records carry it and its data versions are written at it — while what a
+    /// statement *reads* under READ COMMITTED is whatever was committed when that statement began.
+    /// Conflating the two would either freeze every statement at `BEGIN` or move the identity of a
+    /// transaction under the locks other sessions are classifying it by.
+    fn read_ts(&self) -> u64 {
+        self.statement_ts.unwrap_or(self.start_ts)
     }
 
     /// Says which snapshot the value about to be written was computed from
@@ -516,6 +537,56 @@ impl Transaction {
     /// rather than repeated on every key.
     pub fn reading_at(&mut self, read_ts: u64) {
         self.statement_ts = Some(read_ts);
+    }
+
+    /// Begins a statement: a fresh read timestamp, and the previous statement's undo **discarded**.
+    ///
+    /// The pair to [`Transaction::restart_statement`], and the difference between them is the whole
+    /// reason they are two methods: a statement that ended normally keeps its writes, and one that
+    /// has to be re-run gives them back.
+    pub fn begin_statement(&mut self, read_ts: u64) {
+        self.statement_undo.clear();
+        self.statement_ts = Some(read_ts);
+    }
+
+    /// Gives back everything the statement running now wrote, and takes a fresh read timestamp.
+    ///
+    /// **A re-run is not a second statement, and the stamps say so.** A key an *earlier* statement
+    /// wrote keeps its older timestamp, because the value being written derives from that
+    /// statement's read (see [`Transaction::stamp`]) — but the writes of the attempt that *waited*
+    /// are discarded and recomputed from a fresh read, so their stamps must move forward with them.
+    /// Without this the waiter's prewrite is validated against the snapshot it held **before** the
+    /// wait, and it dies with `40001` naming the very commit it waited for: measured against three
+    /// real stores as `a commit at 1007 beat this transaction at 1004`.
+    ///
+    /// Restoring the buffer matters for a second reason a value-only view misses: a re-run may
+    /// decide **not** to write a key it wrote the first time — the row it matched has changed and
+    /// no longer matches — and a stale write left behind would be committed as if it had.
+    pub fn restart_statement(&mut self, read_ts: u64) {
+        for (key, before) in std::mem::take(&mut self.statement_undo) {
+            match before {
+                Some(write) => {
+                    self.buffer.insert(key, write);
+                }
+                None => {
+                    self.buffer.remove(&key);
+                    self.read_ts.remove(&key);
+                }
+            }
+        }
+        self.statement_ts = Some(read_ts);
+    }
+
+    /// Records what the buffer held for `key` before this statement wrote it, once per statement.
+    fn remember(&mut self, key: &[u8]) {
+        if self.statement_ts.is_none() {
+            return;
+        }
+        let key = Bytes::copy_from_slice(key);
+        if !self.statement_undo.contains_key(&key) {
+            let before = self.buffer.get(&key).cloned();
+            self.statement_undo.insert(key, before);
+        }
     }
 
     /// Records the current statement's read timestamp against a key, if there is one to record.
@@ -539,6 +610,7 @@ impl Transaction {
         if self.refuse_write(key) {
             return;
         }
+        self.remember(key);
         self.stamp(key);
         self.buffer
             .insert(Bytes::copy_from_slice(key), Write::Delete);
@@ -581,7 +653,7 @@ impl Transaction {
         }
         let request = TxnKvReq::Get {
             key: Bytes::copy_from_slice(key),
-            ts: self.start_ts,
+            ts: self.read_ts(),
         };
         match self.call_resolving(&request)? {
             TxnKvResp::Get { value } => Ok(value),
@@ -652,7 +724,7 @@ impl Transaction {
             start: start.clone(),
             end: Bytes::copy_from_slice(end),
             limit,
-            ts: self.start_ts,
+            ts: self.read_ts(),
             reverse: false,
         };
         match self.call_resolving(&request)? {
