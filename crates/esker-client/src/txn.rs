@@ -519,9 +519,18 @@ impl Transaction {
     }
 
     /// Records the current statement's read timestamp against a key, if there is one to record.
+    ///
+    /// **The earliest stamp for a key wins.** A key this transaction has already written is read
+    /// back from the *buffer* — read-your-writes — so a later statement writing it again computes
+    /// from the earlier statement's value and never saw a snapshot of its own. Taking the later
+    /// timestamp would claim it did, and the prewrite would then look for conflicts after a moment
+    /// too late to find them: a commit over somebody else's version, with no error. Measured in the
+    /// SQL layer's own buffer as six lost increments in two hundred and forty (run 66).
     fn stamp(&mut self, key: &[u8]) {
         if let Some(read_ts) = self.statement_ts {
-            self.read_ts.insert(Bytes::copy_from_slice(key), read_ts);
+            self.read_ts
+                .entry(Bytes::copy_from_slice(key))
+                .or_insert(read_ts);
         }
     }
 
