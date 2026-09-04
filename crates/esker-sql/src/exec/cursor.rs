@@ -2509,6 +2509,12 @@ fn catalog_function(
                 "a cast to a user-defined type reached the row evaluator unresolved".to_owned(),
             ));
         }
+        CatalogFunc::UserRegType => {
+            return Err(SqlError::Internal(
+                "a regtype over a user-defined type reached the row evaluator unresolved"
+                    .to_owned(),
+            ));
+        }
     })
 }
 
@@ -2526,6 +2532,10 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int8(oid)) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
+        // **And a real `oid`**, which is what `'integer'::regtype::oid` folds to now: the two
+        // spellings of that question had drifted, and this had only ever been handed the
+        // integer one.
+        Some(Datum::Oid(oid)) => Some(i64::from(*oid)),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
             let ty = crate::value::type_by_name(name)?

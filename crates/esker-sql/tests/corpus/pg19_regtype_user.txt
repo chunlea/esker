@@ -1,0 +1,41 @@
+# `'<name>'::regtype` over a type the **catalog** made — against PostgreSQL 19beta1.
+#
+# **`ActiveRecord`'s `lookup_cast_type` writes `SELECT '<sql_type>'::regtype::oid`**
+# (`connection_adapters/postgresql/quoting.rb:192`), so every `t.enum … enum_type: "color"` column
+# it checks goes through this. Run 70's `type "…" does not exist` row is `color` 3 tests and
+# `mood` 2 — both enums, both in `pg_type`, and neither resolvable because lowering has no
+# catalog to ask.
+#
+# Things reasoning would get wrong:
+#
+# * **The two halves of a `regtype` want opposite things.** `'mood'::regtype` prints `mood` and
+#   `'mood'::regtype::oid` is a number — the same value, and this node has no `regtype` type to be
+#   both at once (ADR 0053 records why `::regclass` took the oid side).
+# * **A built-in prints its *display* name**: `'int4'::regtype` is `integer`, where a user type
+#   prints the name it was given.
+# * **The oid is the one `pg_type` reports**, which is what makes `enumtypid = 'mood'::regtype`
+#   find the labels.
+# * A name nobody declared is `42704 type "nosuchtype" does not exist` — the same class as a
+#   built-in typo, not the `0A000` a missing feature gets.
+BEGIN		-
+CREATE TYPE mood AS ENUM ('sad','ok','happy')		-
+CREATE TYPE floatrange AS RANGE (subtype = float8)		-
+SELECT 'r', 'mood'::regtype::oid = (SELECT oid FROM pg_type WHERE typname = 'mood') AS mood_matches		r|t
+SELECT 'r', 'floatrange'::regtype::oid = (SELECT oid FROM pg_type WHERE typname = 'floatrange') AS range_matches		r|t
+SELECT 'r', 'int4'::regtype::oid, 'text'::regtype::oid, 'timestamp'::regtype::oid	text,oid,oid,oid	r|23|25|1114
+SELECT 'r', 'mood'::regtype::text, 'floatrange'::regtype::text, 'int4'::regtype::text		r|mood|floatrange|integer
+SELECT 'r', pg_typeof('mood'::regtype), pg_typeof('mood'::regtype::oid)		r|regtype|oid
+SAVEPOINT s1		-
+SELECT 'r', 'nosuchtype'::regtype	!42704 type "nosuchtype" does not exist
+ROLLBACK TO SAVEPOINT s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'mood'::regtype		r|mood
+ROLLBACK TO SAVEPOINT s2		-
+SAVEPOINT g1		-
+SELECT 'r', enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder		r|sad ; r|ok ; r|happy
+ROLLBACK TO SAVEPOINT g1		-
+SELECT 'r', 'character varying'::regtype::oid, 'bigint'::regtype::oid, '"mood"'::regtype::oid = (SELECT oid FROM pg_type WHERE typname = 'mood')		r|1043|20|t
+DROP TYPE floatrange		-
+DROP TYPE mood		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_type WHERE typname IN ('mood','floatrange')	text,bigint	r|0

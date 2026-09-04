@@ -62,9 +62,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'integer'::regtype",
         "SELECT 'int4'::regtype",
         "SELECT 'varchar'::regtype",
-        // `::oid` answers a `bigint` here, for the same reason: this node has no four-byte `oid`
-        // type either, and the *value* is what a client reads.
-        "SELECT 'integer'::regtype::oid",
+        // **`::oid` used to answer a `bigint` here and does not any more.** `oid` has been a
+        // real `ColumnType` since its own unit; this spelling had not caught up, and closing that
+        // drift deleted 27 entries from this list — every `'x'::regtype::oid` in it agreed on the
+        // value all along and now agrees on the type as well (ADR 0031's rule 2).
         "SELECT 'int4'::regtype::oid",
         "SELECT 'bigint'::regtype::oid",
         "SELECT 'int8'::regtype::oid",
@@ -88,35 +89,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // real server declares `oid` — the same one trade as every line above, and no longer the
         // "no such type" they were listed under. There is still no array *storage*: nothing can
         // create a column of one, and only the name is being asked for here.
-        "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, 'text[]'::regtype::oid",
-        "SELECT 'integer[][]'::regtype::oid, 'integer[3]'::regtype::oid",
-        "SELECT '_int4'::regtype::oid",
         "SELECT 'int4[]'::regtype::oid",
         // Every remaining spelling the corpus asks for, answering the right OID and declaring
         // `bigint` where a real server declares `oid` — the same one trade as the lines above,
         // and the reason this list is long rather than deep. `numeric`, `decimal`, `date` and
         // `time` are in it because they resolve now: `value::type_by_name` derives its names from
         // `ColumnType::ALL`, so a type that exists is a name that resolves.
-        "SELECT 'int'::regtype::oid, 'int4'::regtype::oid",
-        "SELECT 'character varying'::regtype::oid, 'varchar'::regtype::oid",
-        "SELECT 'character'::regtype::oid, 'char'::regtype::oid, 'bpchar'::regtype::oid",
-        "SELECT 'timestamp'::regtype::oid, 'timestamp without time zone'::regtype::oid",
-        "SELECT 'timestamptz'::regtype::oid, 'timestamp with time zone'::regtype::oid",
-        "SELECT 'bool'::regtype::oid, 'boolean'::regtype::oid",
-        "SELECT 'text'::regtype::oid, 'bytea'::regtype::oid",
-        "SELECT 'int8'::regtype::oid, 'bigint'::regtype::oid",
-        "SELECT 'int2'::regtype::oid, 'smallint'::regtype::oid",
-        "SELECT 'float4'::regtype::oid, 'real'::regtype::oid",
-        "SELECT 'float8'::regtype::oid, 'double precision'::regtype::oid",
-        "SELECT 'numeric'::regtype::oid, 'decimal'::regtype::oid",
-        "SELECT 'character varying(1024)'::regtype::oid",
-        "SELECT 'character varying(1)'::regtype::oid",
-        "SELECT 'numeric(10,2)'::regtype::oid",
-        "SELECT 'timestamp(6)'::regtype::oid",
-        "SELECT 'timestamp(9)'::regtype::oid",
-        "SELECT 'INTEGER'::regtype::oid, 'Integer'::regtype::oid",
-        "SELECT '  integer  '::regtype::oid",
-        "SELECT 'int4 '::regtype::oid, ' int4'::regtype::oid",
         "SELECT 'character varying(1024)'::regtype",
         "SELECT 'time'::regtype, 'timestamptz'::regtype",
     ],
@@ -149,21 +127,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             NO_SUCH_TYPE,
         ),
         (
-            "SELECT 'date'::regtype::oid, 'time'::regtype::oid, 'interval'::regtype::oid",
-            NO_SUCH_TYPE,
-        ),
-        (
             "SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, \
              'time with time zone'::regtype::oid",
             NO_SUCH_TYPE,
         ),
-        (
-            "SELECT 'uuid'::regtype::oid, 'json'::regtype::oid, 'jsonb'::regtype::oid",
-            NO_SUCH_TYPE,
-        ),
         ("SELECT '\"int4\"'::regtype::oid", NAME_SYNTAX),
         ("SELECT '\"varchar\"'::regtype::oid", NAME_SYNTAX),
-        ("SELECT '\"integer\"'::regtype::oid", NAME_SYNTAX),
         ("SELECT 'pg_catalog.int4'::regtype::oid", NAME_SYNTAX),
         (
             "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \

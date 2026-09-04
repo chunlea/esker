@@ -805,6 +805,15 @@ pub enum CatalogFunc {
     RangeLowerInc,
     /// See [`CatalogFunc::RangeLowerInc`].
     RangeUpperInc,
+    /// `'<name>'::regtype` and `'<name>'::regtype::oid` where the **catalog** is what knows the
+    /// name: a type a `CREATE TYPE` made.
+    ///
+    /// Carried rather than answered for the reason [`CatalogFunc::UserCast`] is — lowering has no
+    /// catalog — and resolved once per statement in the same pass (ADR 0053). The second argument
+    /// says which half of a `regtype` was asked for: `true` for the **oid**, which is what
+    /// `ActiveRecord`'s `lookup_cast_type` writes (`SELECT 'color'::regtype::oid`), and `false`
+    /// for the name it prints as.
+    UserRegType,
     /// See [`CatalogFunc::RangeLowerInc`]. **True for an absent bound, and that is the whole
     /// distinction from `-infinity`**, which is a *value* and answers false.
     RangeLowerInf,
@@ -1079,7 +1088,9 @@ impl CatalogFunc {
             CatalogFunc::HstoreBuild => "hstore",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
-            CatalogFunc::RegTypeName => "regtype",
+            // Both halves of a `regtype` are called that: one reads an oid and prints a name,
+            // the other reads a name and answers its oid.
+            CatalogFunc::RegTypeName | CatalogFunc::UserRegType => "regtype",
             // What a `42883` would call it, and nothing reaches one: the pass either
             // resolves it or raises about the type by name.
             CatalogFunc::UserCast => "cast",
@@ -1131,7 +1142,13 @@ impl CatalogFunc {
             | CatalogFunc::HstoreBuild => &[2],
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
-            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr => &[2, 3],
+            // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
+            // `pg_get_expr`'s two really are two forms as well.
+            // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
+            // `pg_get_expr`'s two really are two forms as well. A `UserRegType` is always two:
+            // the name and the flag saying which half of the `regtype` was asked for.
+            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr | CatalogFunc::UserRegType => &[2, 3],
+
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef
             | CatalogFunc::PgGetViewdef
@@ -1198,6 +1215,11 @@ impl CatalogFunc {
             // the projection form is replaced by is a `text` literal by then, so nothing
             // reads this for that shape.
             CatalogFunc::UserCast => ColumnType::Int2,
+            // **Never reached**: the pass that reads the catalog replaces it with the oid or the
+            // name before anything asks. The `oid` is the honest answer for the half that a
+            // client actually writes — `'color'::regtype::oid` — and the one this would be
+            // resolved to if the resolution were ever skipped.
+            CatalogFunc::UserRegType => ColumnType::Oid,
 
             // Every one of the five answers `integer` on a real server, including `cardinality`,
             // which counts every element of every dimension where `array_length` counts one.

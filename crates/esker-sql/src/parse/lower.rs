@@ -4879,10 +4879,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let named = value::named_type(&name)?
-                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
-            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
-                named.oid(),
+            // **A name the catalog might know**, which is where `ActiveRecord`'s
+            // `lookup_cast_type` lands: `SELECT 'color'::regtype::oid` over a type a
+            // `CREATE TYPE` made. Lowering has no catalog, so the name is carried and the
+            // executor answers (ADR 0053), exactly as a cast *to* a user type already is.
+            let Some(named) = value::named_type(&name)? else {
+                return Ok(user_regtype(&name, true));
+            };
+            // **An `oid`, not a `bigint`.** `'23'::oid` has been a real `ColumnType::Oid` since
+            // that type's own unit and this spelling had not caught up, so
+            // `pg_typeof('int4'::regtype::oid)` answered `bigint` where a real server says `oid`.
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Oid(named.oid()),
             ))))
         }
         // `'cb'::regclass::oid` — the same value, since a `regclass` here already *is* the oid.
@@ -4922,8 +4930,9 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let named = value::named_type(&name)?
-                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+            let Some(named) = value::named_type(&name)? else {
+                return Ok(user_regtype(&name, false));
+            };
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Text(named.printed()),
             ))))
@@ -5185,6 +5194,27 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
         }
         _ => None,
     })
+}
+
+/// A `regtype` over a name only the catalog can resolve, carried for the executor.
+///
+/// `oid` says which half was asked for: the number, which is what
+/// `SELECT 'color'::regtype::oid` wants, or the name it prints as.
+fn user_regtype(name: &str, oid: bool) -> plan::Expr {
+    // **A quoted name keeps its case and an unquoted one folds**, which is the identifier rule
+    // and is what `'"mood"'::regtype` needs — the same reading `'"companies"'::regclass` gets.
+    let trimmed = name.trim();
+    let name = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(quoted) if trimmed.len() > 1 => quoted.to_owned(),
+        _ => trimmed.to_ascii_lowercase(),
+    };
+    plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+        func: plan::CatalogFunc::UserRegType,
+        args: vec![
+            plan::Expr::Literal(plan::Literal::String(name)),
+            plan::Expr::Literal(plan::Literal::Bool(oid)),
+        ],
+    }))
 }
 
 /// `date + time` as an instant, when both sides are constants and one of each.

@@ -34,8 +34,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
         "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
          typname IN ('_int4','_text') ORDER BY oid",
-        "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, '_int4'::regtype::oid, \
-         'text[]'::regtype::oid",
     ],
     answers: &[
         (

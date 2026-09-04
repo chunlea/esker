@@ -454,7 +454,7 @@ fn load_table<'a>(
 /// `pg_type.oid` already makes and `tests/pg_catalog.rs` already declares. Saturating rather than
 /// wrapping: two relations sharing an oid is the failure this whole module exists to prevent, and
 /// a saturated one is at least visibly wrong.
-pub(super) fn as_oid(id: u64) -> i64 {
+pub(crate) fn as_oid(id: u64) -> i64 {
     i64::try_from(id).unwrap_or(i64::MAX)
 }
 

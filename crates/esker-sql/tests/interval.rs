@@ -115,7 +115,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             TYPMOD,
         ),
         ("SELECT '1 year 1 month'::interval::interval year", TYPMOD),
-        ("SELECT 'interval(9)'::regtype::oid", TYPMOD),
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \
              hours'::interval), justify_interval('1 mon 33 days 27 hours'::interval)",
