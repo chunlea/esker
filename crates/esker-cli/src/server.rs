@@ -151,20 +151,14 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     // **Before the database is opened.** A store told to speak TLS that came up without it would
     // serve in the clear on a port an operator believes is protected (ADR 0055).
     let tls = options.tls.build()?;
-    // **And a store that cannot encrypt *all* of its links refuses rather than encrypting some.**
-    // The inbound side is wired here; a replicated store's outbound peer dialling is reached
-    // through `RaftOptions` in `esker-store`, which this lane does not own — one field and one
-    // line at the `StoreTransport::spawn` call. Until that lands, a replicated store with these
-    // flags would encrypt what its clients see and leave Raft between stores in the clear, which
-    // is precisely the half-configured state every refusal in this project exists to prevent.
-    if tls.is_enabled() && !options.peers.is_empty() {
-        return Err(
-            "RPC TLS on a replicated store is not wired yet: the inbound side is, and the \
-             outbound peer links are reached through `RaftOptions` in \
-             crates/esker-store/src/server.rs, which needs one `tls` field passed to \
-             `StoreTransport::spawn_with_tls`. Refusing rather than encrypting one direction and \
-             not the other — run without --peers, or without the RPC TLS flags"
-                .to_owned(),
+    if tls.is_enabled() {
+        println!(
+            "esker server: the RPC links speak TLS{}",
+            if tls.is_mutual() {
+                " with client certificates"
+            } else {
+                ""
+            }
         );
     }
 
@@ -186,7 +180,13 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
                 .map_err(|error| format!("`--peer {id}@{address}` is not an address: {error}"))?;
             peers.push(PeerAddress::new(*id, *id, addr));
         }
-        Some(RaftOptions::new(peers, options.seed))
+        // The same configuration the listener uses, so a store cannot end up encrypting what its
+        // clients see while speaking to its peers in the clear — the half-configured state this
+        // whole surface refuses (ADR 0055).
+        Some(RaftOptions {
+            tls: tls.clone(),
+            ..RaftOptions::new(peers, options.seed)
+        })
     };
 
     // Connecting is lazy, so a placement driver that is not up yet fails the *bootstrap* with
