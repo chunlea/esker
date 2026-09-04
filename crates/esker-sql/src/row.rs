@@ -40,6 +40,10 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            // Every `f64`, `NaN` included: the round trip is over the bits.
+            ColumnType::Point => (any::<f64>(), any::<f64>())
+                .prop_map(|(x, y)| Datum::Point { x, y })
+                .boxed(),
             // An array of the element type's own values, NULL elements and a lower bound that is
             // sometimes not one — the parts of the value an index key has to order by.
             ColumnType::Int8Array
@@ -48,7 +52,7 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray

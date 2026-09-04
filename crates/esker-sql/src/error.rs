@@ -220,6 +220,15 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `NOWAIT` over a row another transaction holds.
+    ///
+    /// **`55P03`, and PostgreSQL's own sentence**, measured with two sessions: the relation is the
+    /// table's **own** name and not the alias the query used — `SELECT … FROM lk l … FOR UPDATE OF
+    /// l NOWAIT` says `relation "lk"`. Same code as [`SqlError::LockTimeout`] and a different
+    /// sentence; one code, two conditions, two messages.
+    #[error("could not obtain lock on row in relation \"{0}\"")]
+    LockNotAvailable(String),
+
     /// A row wait that ran out of `lock_timeout`.
     ///
     /// **`55P03`, and PostgreSQL's own sentence** — the same code `FOR UPDATE NOWAIT` answers and
@@ -1557,6 +1566,15 @@ pub enum SqlError {
     #[error("type \"{0}\" does not exist")]
     UndefinedType(String),
 
+    /// `CREATE INDEX` on a column whose type has no default btree operator class: `42704`, the
+    /// same class as a type that does not exist, and the message names the type.
+    ///
+    /// **Two types, measured one at a time**: `json` and `point`. `jsonb`, every range, `hstore`
+    /// and every array all have one on a real server and index fine there — a rule written from
+    /// "which types are not index keys *here*" would have refused five more.
+    #[error("data type {0} has no default operator class for access method \"btree\"")]
+    NoDefaultOperatorClass(&'static str),
+
     /// `CREATE TYPE` for a name that is already a type. `42710`, the same class a duplicate
     /// trigger gets, and the same one PostgreSQL uses.
     #[error("type \"{0}\" already exists")]
@@ -2157,6 +2175,7 @@ impl SqlError {
             SqlError::AmbiguousFunction { .. } => sqlstate::AMBIGUOUS_FUNCTION,
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
+            | SqlError::NoDefaultOperatorClass(_)
             | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. }
             | SqlError::ConstraintDoesNotExist(_)
@@ -2174,7 +2193,7 @@ impl SqlError {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
-            SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
+            SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
@@ -2549,6 +2568,11 @@ impl SqlError {
     #[must_use]
     pub fn hint(&self) -> Option<String> {
         match self {
+            // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
+            SqlError::NoDefaultOperatorClass(_) => Some(
+                "You must specify an operator class for the index or define a default operator class for the data type."
+                    .to_owned(),
+            ),
             SqlError::SetFunctionNotAllowed(message)
                 if message.starts_with("aggregate function calls") =>
             {

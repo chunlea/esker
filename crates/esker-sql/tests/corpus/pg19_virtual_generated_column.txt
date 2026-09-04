@@ -1,0 +1,74 @@
+# `GENERATED ALWAYS AS (…) VIRTUAL` — PostgreSQL 18's other kind of generated column.
+#
+# **Run 64: `a virtual generated column, which is not STORED is not supported`, 9 tests / 1 file.**
+# That row exists because the previous unit corrected it: those tests were ranked under
+# `CREATE UNLOGGED is not supported` while unlogged tables worked fine, and the refusal was naming
+# the wrong feature.
+#
+# The five statements the suite sends are one `CREATE` that mixes **three STORED columns with two
+# VIRTUAL ones**, two `ALTER TABLE … ADD … VIRTUAL`, one `ALTER … ADD … STORED`, and the schema
+# load's own `defaults` table. The mixed one matters: a rule written as "has GENERATED and lacks
+# STORED" is false there.
+#
+# Things reasoning would get wrong:
+#
+#   * **The two kinds are indistinguishable from SQL except in one catalog column.** Same results,
+#     same recompute on `UPDATE`, same `is_generated = ALWAYS`, same `generation_expression`, same
+#     refusal of a non-DEFAULT value. `pg_attribute.attgenerated` is `s` for stored and `v` for
+#     virtual, and that is the whole of the difference a client can see.
+#   * So "virtual" is a statement about **storage**, not about answers — which is why a node that
+#     computes and stores the value can report `v` and still be right about every query.
+#   * **A generated column is not a defaulted one**: `column_default` is NULL and
+#     `generation_expression` carries the text, for both kinds.
+#   * **Writing one is refused even with the right value**: `cannot insert a non-DEFAULT value into
+#     column "rev"`, with `DETAIL: Column "rev" is a generated column.` — `DEFAULT` is accepted.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`.
+
+BEGIN;		-
+
+CREATE TABLE vg (id bigint PRIMARY KEY, name text, up text GENERATED ALWAYS AS (UPPER(name)) STORED, rev text GENERATED ALWAYS AS (REVERSE(name)) VIRTUAL);		-
+
+-- ------------------------------------------------- the values, and they agree		-
+INSERT INTO vg (id, name) VALUES (1, 'abc');		-
+SELECT id, name, up, rev FROM vg ORDER BY id;		1|abc|ABC|cba
+UPDATE vg SET name = 'xyz' WHERE id = 1;		-
+SELECT id, name, up, rev FROM vg ORDER BY id;		1|xyz|XYZ|zyx
+
+-- ------------------------------------------------- the one column that tells them apart		-
+SELECT attname, attgenerated, attnotnull FROM pg_attribute WHERE attrelid = 'vg'::regclass AND attnum > 0 ORDER BY attnum;		id||t ; name||f ; up|s|f ; rev|v|f
+SELECT column_name, is_generated, generation_expression, column_default FROM information_schema.columns WHERE table_name = 'vg' ORDER BY ordinal_position;	name,character varying,character varying,character varying	id|NEVER|\N|\N ; name|NEVER|\N|\N ; up|ALWAYS|upper(name)|\N ; rev|ALWAYS|reverse(name)|\N
+
+-- ------------------------------------------------- neither may be written		-
+SAVEPOINT s1;		-
+INSERT INTO vg (id, name, rev) VALUES (2, 'q', 'nope');	!428C9 cannot insert a non-DEFAULT value into column "rev" DETAIL: Column "rev" is a generated column.
+ROLLBACK TO s1;		-
+SAVEPOINT s2;		-
+INSERT INTO vg (id, name, up) VALUES (2, 'q', 'NOPE');	!428C9 cannot insert a non-DEFAULT value into column "up" DETAIL: Column "up" is a generated column.
+ROLLBACK TO s2;		-
+SAVEPOINT s3;		-
+UPDATE vg SET rev = 'nope' WHERE id = 1;	!428C9 column "rev" can only be updated to DEFAULT DETAIL: Column "rev" is a generated column.
+ROLLBACK TO s3;		-
+-- `DEFAULT` is the one thing that may be written		-
+INSERT INTO vg (id, name, rev) VALUES (3, 'def', DEFAULT);		-
+SELECT id, rev FROM vg WHERE id = 3;		3|fed
+
+-- ------------------------------------------------- ALTER TABLE ADD, both kinds		-
+ALTER TABLE vg ADD lower_name text GENERATED ALWAYS AS (LOWER(name)) STORED;		-
+ALTER TABLE vg ADD reversed_name text GENERATED ALWAYS AS (REVERSE(name)) VIRTUAL;		-
+SELECT attname, attgenerated FROM pg_attribute WHERE attrelid = 'vg'::regclass AND attnum > 0 ORDER BY attnum;		id| ; name| ; up|s ; rev|v ; lower_name|s ; reversed_name|v
+SELECT id, lower_name, reversed_name FROM vg ORDER BY id;		1|xyz|zyx ; 3|def|fed
+
+-- ------------------------------------------------- the mixed table the suite actually sends		-
+CREATE TABLE virtual_columns (id bigint PRIMARY KEY, name character varying, upper_name character varying GENERATED ALWAYS AS (UPPER(name)) STORED, name_length integer GENERATED ALWAYS AS (LENGTH(name)) STORED, column1 integer, column3 integer GENERATED ALWAYS AS (column1 + 2) VIRTUAL, column4 integer GENERATED ALWAYS AS (column1 + 3) VIRTUAL);		-
+INSERT INTO virtual_columns (id, name, column1) VALUES (1, 'Rails', 10);		-
+SELECT id, name, upper_name, name_length, column1, column3, column4 FROM virtual_columns;		1|Rails|RAILS|5|10|12|13
+SELECT attname, attgenerated FROM pg_attribute WHERE attrelid = 'virtual_columns'::regclass AND attnum > 0 ORDER BY attnum;		id| ; name| ; upper_name|s ; name_length|s ; column1| ; column3|v ; column4|v
+
+-- ------------------------------------------------- and dropping the column it reads		-
+SAVEPOINT s4;		-
+ALTER TABLE virtual_columns DROP COLUMN column1;	!2BP01 cannot drop column column1 of table virtual_columns because other objects depend on it DETAIL: column column3 of table virtual_columns depends on column column1 of table virtual_columns HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s4;		-
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname IN ('vg', 'virtual_columns');	bigint	0

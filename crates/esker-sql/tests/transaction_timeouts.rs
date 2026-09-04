@@ -292,21 +292,6 @@ const DIVERGENCES: &[(char, &str, &str)] = &[
     ),
     (
         'A',
-        "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE NOWAIT",
-        "`0A000 a row-level locking clause is not supported`. PostgreSQL answers `55P03 could not \
-         obtain lock on row in relation \"tt_rows\"` — the same SQLSTATE as `lock_timeout` with a \
-         different sentence, which is why a client cannot tell the two apart by code. A row lock \
-         is what this node does not have, so the clause is refused by name rather than answered \
-         with a lock nobody took.",
-    ),
-    (
-        'A',
-        "SELECT id FROM tt_rows ORDER BY id FOR UPDATE SKIP LOCKED",
-        "The same refusal. PostgreSQL returns the rows it *could* take — `2`, with row 1 held by \
-         B — which is a report about locks and therefore unanswerable here.",
-    ),
-    (
-        'A',
         "UPDATE tt_rows SET n = n + 1 WHERE id = 2  (concurrent)",
         "**A deadlock cannot form where nobody waits.** PostgreSQL detects the cycle and kills \
          exactly one of the two transactions with `40P01`, leaving the other's `UPDATE` to \
@@ -620,18 +605,17 @@ fn two_writers_to_one_row_both_proceed_and_the_loser_fails_at_commit() {
     );
 }
 
-/// **The bare locking clause answers and the two non-blocking ones are refused by name**, which is
-/// the line drawn where this node's isolation can and cannot keep the promise.
+/// **Every locking clause answers its rows when nobody holds them**, `NOWAIT` and `SKIP LOCKED`
+/// included — which is what a real server does and what this file is placed to check, because it
+/// is the case a lock implementation gets wrong in the *other* direction.
 ///
-/// This test asserted a blanket refusal until `FOR UPDATE`/`FOR SHARE` landed
-/// (`tests/row_locking.rs`), and what replaced it is the distinction rather than the refusal: a
-/// Percolator transaction does not block a conflicting writer, it loses to one at commit with
-/// `40001` (ADR 0031), so the bare clause buys ordering the transaction already enforces and no
-/// session can see the difference. `NOWAIT` must raise `55P03` against a held row and
-/// `SKIP LOCKED` must leave that row out — promises a client checks, and ones this node would
-/// answer wrongly rather than not at all.
+/// This test asserted a blanket refusal, then a refusal of the two non-blocking modifiers, and now
+/// asserts neither: ADR 0057 §5 gave the clause a real row lock, so `NOWAIT` has a `55P03` to
+/// raise and `SKIP LOCKED` has a row to leave out. Both of those need a second session and live in
+/// `tests/row_locking.rs`. What is left here is the half that must not change when they arrive —
+/// an uncontended `SELECT … FOR UPDATE NOWAIT` is an ordinary answer, not a refusal.
 #[test]
-fn a_locking_clause_answers_unless_it_promises_something_this_node_cannot_keep() {
+fn every_locking_clause_answers_its_rows_when_nobody_holds_them() {
     let mut cluster = Cluster::new(&['A']);
     let session = cluster.session('A');
     session
@@ -643,23 +627,11 @@ fn a_locking_clause_answers_unless_it_promises_something_this_node_cannot_keep()
         "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE",
         "SELECT id FROM tt_rows FOR SHARE",
         "SELECT id FROM tt_rows FOR UPDATE OF tt_rows",
+        "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE NOWAIT",
+        "SELECT id FROM tt_rows ORDER BY id FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM tt_rows ORDER BY id FOR SHARE NOWAIT",
     ] {
         assert_eq!(session.rows(written), [["1"]], "for {written}");
-    }
-
-    for (written, named) in [
-        (
-            "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE NOWAIT",
-            "FOR UPDATE NOWAIT, on a node whose transactions do not block is not supported",
-        ),
-        (
-            "SELECT id FROM tt_rows ORDER BY id FOR UPDATE SKIP LOCKED",
-            "FOR UPDATE SKIP LOCKED, on a node with no row locks to skip is not supported",
-        ),
-    ] {
-        let error = session.run(written).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "for {written}");
-        assert_eq!(error.to_string(), named, "for {written}");
     }
 }
 

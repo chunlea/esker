@@ -44,6 +44,7 @@ pub mod interval;
 pub(crate) mod json;
 pub mod numeric;
 pub mod oid;
+pub mod point;
 /// Random bytes from the OS, and the version-4 UUID built from them.
 pub mod random;
 pub mod range;
@@ -513,7 +514,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::Int4RangeArray
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
-        | ColumnType::Int8RangeArray => 0,
+        | ColumnType::Int8RangeArray
+        | ColumnType::PointArray => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -523,6 +525,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::DateRange => 3913,
         ColumnType::NumRange => 3907,
         ColumnType::Int8Range => 3927,
+        ColumnType::Point => 1017,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -650,7 +653,8 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
+        | ColumnType::Point
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
 }
 
@@ -760,6 +764,7 @@ impl PgType for ColumnType {
             ColumnType::DateRange => 3912,
             ColumnType::NumRange => 3906,
             ColumnType::Int8Range => 3926,
+            ColumnType::Point => 600,
             ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
             ColumnType::Real => 700,
@@ -798,7 +803,8 @@ impl PgType for ColumnType {
             | ColumnType::Int4RangeArray
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
-            | ColumnType::Int8RangeArray => 0,
+            | ColumnType::Int8RangeArray
+            | ColumnType::PointArray => 0,
         }
     }
 
@@ -820,6 +826,8 @@ impl PgType for ColumnType {
             ColumnType::DateRange => "daterange",
             ColumnType::NumRange => "numrange",
             ColumnType::Int8Range => "int8range",
+            ColumnType::Point => "point",
+            ColumnType::PointArray => "point[]",
             ColumnType::TstzRangeArray => "tstzrange[]",
             ColumnType::Int4RangeArray => "int4range[]",
             ColumnType::DateRangeArray => "daterange[]",
@@ -874,7 +882,10 @@ impl PgType for ColumnType {
             ColumnType::Int2 => 2,
             // Sixteen fixed bytes, which is what `pg_type.typlen` says.
             // Sixteen fixed bytes each: a uuid is one value, an interval is three fields.
-            ColumnType::Uuid | ColumnType::Interval => 16,
+            // Sixteen fixed bytes each: a uuid is one value, an interval is three fields,
+            // and a point is two `float8` coordinates — `pg_type.typlen` says 16 for all
+            // three, measured.
+            ColumnType::Uuid | ColumnType::Interval | ColumnType::Point => 16,
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
@@ -888,7 +899,7 @@ impl PgType for ColumnType {
             | ColumnType::TsRange
             | ColumnType::TstzRange
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -967,6 +978,7 @@ impl PgDatum for Datum {
         Some(match self {
             Datum::Null => return None,
             Datum::Array(value) => array::to_text(value),
+            Datum::Point { x, y } => point::to_text(*x, *y),
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
@@ -1011,6 +1023,10 @@ impl PgDatum for Datum {
 
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
+            ColumnType::Point => {
+                let (x, y) = point::from_text(text)?;
+                Datum::Point { x, y }
+            }
             // The literal's *shape* is read here and each element by its own type's input
             // function, which is what makes `'{1,x}'::int[]` `int4`'s error and `'{a,,b}'` the
             // array's (`crate::value::array`).
@@ -1026,6 +1042,7 @@ impl PgDatum for Datum {
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
+            | ColumnType::PointArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1131,7 +1148,12 @@ impl PgDatum for Datum {
             // `array_send`'s form is a dimension header, a flags word, the element OID and then
             // each element's own binary form — a shape nothing here has ever sent or read, so an
             // array is refused with the `numeric` beside it rather than guessed.
-            Datum::Null | Datum::Numeric(_) | Datum::Array(_) => return None,
+            // **A point joins them.** `point_send` writes the two coordinates big-endian and
+            // nothing here has ever been asked for that shape — the suite reads a point as
+            // text — so it is refused rather than guessed, exactly as the other three are.
+            Datum::Null | Datum::Numeric(_) | Datum::Array(_) | Datum::Point { .. } => {
+                return None;
+            }
             // A `time` joins them: `time_send` is the microsecond count as eight big-endian
             // bytes, measured with `COPY ... (FORMAT binary)` — `12:34:56` is `0x0a8bda1c00`
             // (45_296_000_000) and `24:00:00` is `0x141dd76000`, the top of the closed range.
@@ -1168,9 +1190,11 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
-            // The mirror of `to_binary`: `array_recv`'s shape has never been read here, so a
-            // client that sends one is told so rather than given a value built from a guess.
-            ColumnType::Int8Array
+            // The mirror of `to_binary`: neither `point_recv`'s pair of coordinates nor
+            // `array_recv`'s shape has ever been read here, so a client that sends one is told
+            // so rather than given a value built from a guess.
+            ColumnType::Point
+            | ColumnType::Int8Array
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
@@ -1182,6 +1206,7 @@ impl PgDatum for Datum {
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
+            | ColumnType::PointArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1511,7 +1536,11 @@ fn variant_rank(value: &Datum) -> u8 {
     match value {
         // Above every scalar, which only decides the order between two values of *different*
         // types — a comparison SQL does not have and this crate's total order still needs.
-        Datum::Array(_) => 20,
+        // **Ranked, and neither is a SQL order.** An array's rank decides only the order
+        // between two values of *different* types; a point's is never reached at all, because
+        // `point = point` is `42883` — but `pg_cmp` is total by construction and a value with
+        // no rank would sort as some other type's.
+        Datum::Array(_) | Datum::Point { .. } => 20,
         Datum::Bool(_) => 0,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
@@ -1790,7 +1819,7 @@ mod tests {
                         | ColumnType::TsRange
                         | ColumnType::TstzRange
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

@@ -136,6 +136,7 @@ pub(super) fn create_table(
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -275,6 +276,7 @@ fn declared_columns(
             // for — and writing one would be a claim about rows that cannot exist.
             missing: None,
             generated: column.generated.clone(),
+            generated_virtual: column.generated_virtual,
             comment: None,
             dropped: false,
             user_type,
@@ -327,6 +329,22 @@ fn resolve_user_type(
             "a column of the composite type {name}"
         ))),
     }
+}
+
+/// **`json` and `point` cannot be indexed**, and they are the only two — measured, one type at a
+/// time, against a real server: `jsonb`, every range, `hstore` and every array all have a default
+/// btree operator class there and index fine.
+///
+/// The message is PostgreSQL's own, HINT included, and it names the *type* because that is what a
+/// client has to change. Without it this node **built the index**: `CREATE INDEX … (j)` on a
+/// `json` column answered `Done` where a real server refuses, and the first write into it then
+/// found the row codec's own "an index key column of type json, jsonb, hstore or a range", which
+/// is an internal corruption error for a table the user was allowed to create.
+fn refuse_unindexable(ty: ColumnType) -> Result<()> {
+    if matches!(ty, ColumnType::Json | ColumnType::Point) {
+        return Err(SqlError::NoDefaultOperatorClass(ty.name()));
+    }
+    Ok(())
 }
 
 /// A `CHECK` added after the fact.
@@ -1975,6 +1993,29 @@ fn drop_column(
     // **Before anything is changed**, so a refusal leaves the definition as it was.
     refuse_referencing_keys(txn, executor, updated, name, at, cascade)?;
 
+    // **A generated column that reads this one is a dependent**, and it is inside the same table —
+    // which makes it the cheapest edge of the three to find and the easiest to forget. The message
+    // names both columns.
+    if let Some(dependent) = generated_columns_reading(updated, name)
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind: "column",
+            name: format!(
+                "{} of table {}",
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+            detail: format!(
+                "column {} of table {} depends on column {} of table {}",
+                catalog::display_name(&dependent),
+                catalog::display_name(relation),
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+
     // A view that reads this column is a dependent too, and the message names the column rather
     // than the table. This was the recorded debt on the other side of `tests/drop_column.rs`'s two
     // divergence entries: the column went and the view was left reading one that is gone.
@@ -2943,6 +2984,59 @@ pub(super) fn alter_schema_rename(
     Ok(Outcome::done("ALTER SCHEMA"))
 }
 
+/// The first live generated column whose expression names `column`, if there is one.
+///
+/// Read out of the stored expression the way a view's dependency is read out of its definition: a
+/// generated expression is text and is re-lowered per write anyway, so parsing it here costs
+/// nothing new. A column whose own expression no longer parses is skipped — it cannot be a
+/// dependency this statement understands.
+fn generated_columns_reading(table: &TableDef, column: &str) -> Option<String> {
+    table.columns.iter().find_map(|candidate| {
+        if candidate.dropped || candidate.name == column {
+            return None;
+        }
+        let expr = candidate.generated.as_ref()?;
+        let parsed = crate::parse::parse_stored_expr(expr).ok()?;
+        let mut names = false;
+        super::bind::descend(&parsed, &mut |expr| {
+            if matches!(expr, plan::Expr::Column { name, .. } if name == column) {
+                names = true;
+            }
+        });
+        names.then(|| candidate.name.clone())
+    })
+}
+
+/// Computes every generated column for the rows already stored, after one was added.
+///
+/// The whole table is read and written in the statement's own transaction — the trade `backfill`
+/// and `set_column_type` already make, and for the same reason: the value is a function of each
+/// row, so there is no constant to pad with.
+fn fill_generated_for_existing_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+        }
+        Ok(())
+    })?;
+    let types = table.column_types();
+    for (key, mut row) in rows {
+        // A row written before the column exists is narrower than the schema; `decode_row` has
+        // already padded it, so the slot is there to fill.
+        row.resize(types.len(), Datum::Null);
+        super::dml::fill_generated(table, &mut row)?;
+        txn.put(&key, &crate::row::encode_row(&types, &row)?);
+    }
+    Ok(())
+}
+
 /// The view half of a `DROP`: refuse if anything is built on `relation`, or take it with `CASCADE`.
 ///
 /// Checked **before** the foreign keys, because PostgreSQL reports the first dependent it finds and
@@ -3340,10 +3434,13 @@ pub(super) fn create_index(
         .iter()
         .map(|key| {
             let part = match &key.part {
-                plan::KeyPartName::Column(column) => table
-                    .column(column)
-                    .map(KeyPart::Column)
-                    .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?,
+                plan::KeyPartName::Column(column) => {
+                    let at = table
+                        .column(column)
+                        .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?;
+                    refuse_unindexable(table.columns[at].ty)?;
+                    KeyPart::Column(at)
+                }
                 plan::KeyPartName::Expression { expr, shape } => {
                     let (expr, ty) = index_expression(&table, expr)?;
                     KeyPart::Expression {
@@ -4113,6 +4210,7 @@ pub(super) fn alter_table(
                     default: None,
                     missing: None,
                     generated: None,
+                    generated_virtual: false,
                     comment: None,
                     dropped: false,
                     user_type,
@@ -4138,11 +4236,19 @@ pub(super) fn alter_table(
             // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
             // first time somebody changed a default.
             missing: default,
-            generated: None,
+            generated: column.generated.clone(),
+            generated_virtual: column.generated_virtual,
             comment: None,
             dropped: false,
             user_type,
         });
+        // **A generated column added by `ALTER` has a value for the rows already there**, and it
+        // is not the missing value: it is the expression, over each row as it stands. Every other
+        // `ADD COLUMN` here pads from `missing` and touches no row, which is what makes it cheap;
+        // this one cannot, because the value is a function of the row rather than a constant.
+        if column.generated.is_some() {
+            fill_generated_for_existing_rows(txn, executor, &updated)?;
+        }
         changed = true;
     }
     if !changed {

@@ -336,6 +336,14 @@ const USER_DEFINED: &str = "USER-DEFINED";
 /// `format_type(oid, -1)` gives, and the distinction `crate::catalog::def_functions` calls
 /// `typemod_given`.
 fn data_type(ty: ColumnType) -> String {
+    // **Every array column is the literal `ARRAY`**, whatever it is an array of — the element is
+    // named in `udt_name` (`_text`, `_int4`, `_point`) and nowhere else. Measured across four
+    // element types at once, because one would not have shown that the rule is about arrays
+    // rather than about the element. This answered `text[]`, `integer[]`, `point[]` since arrays
+    // became column types, and the `point` corpus is the first statement to ask.
+    if esker_keys::array::ArrayValue::element_of(ty).is_some() {
+        return "ARRAY".to_owned();
+    }
     match ty {
         ColumnType::Bpchar => "character".to_owned(),
         other => value::format_type(other, value::NO_TYPMOD),

@@ -191,6 +191,7 @@ impl Aggregation {
                 | ColumnType::DateRangeArray
                 | ColumnType::NumRangeArray
                 | ColumnType::Int8RangeArray
+                | ColumnType::PointArray
                 | ColumnType::Bool
                 | ColumnType::Json
                 | ColumnType::Jsonb

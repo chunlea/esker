@@ -44,6 +44,19 @@
 #     SELECT id FROM lk ORDER BY id FOR UPDATE SKIP LOCKED   -> 2, 3   (1 is skipped)
 #     SELECT id FROM lk WHERE id = 2 FOR UPDATE NOWAIT       -> 2      (a row nobody holds)
 #     SELECT count(*) FROM lk                                -> 3      (a plain read never blocks)
+#     SELECT id FROM lk WHERE id = 1 FOR UPDATE              -> 55P03 canceling statement due to
+#                                                               lock timeout  (with lock_timeout
+#                                                               set; with PostgreSQL's default of
+#                                                               0 it waits for as long as A holds)
+#
+# AND THE ONE A PLAN CAN GET WRONG WHILE EVERY SINGLE-SESSION TEST PASSES (measured 2026-09-04):
+#
+#     SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED          -> 2
+#     SELECT id FROM lk ORDER BY id LIMIT 1 OFFSET 1 FOR UPDATE SKIP LOCKED -> 3
+#
+# `LIMIT` is applied to the rows that **survived** the skip, because PostgreSQL puts `Limit` above
+# `LockRows`. A limit applied first would answer nothing at all for the first of those — under
+# exactly the contention a queue is written for.
 #
 # And with A holding `FOR SHARE` instead, the compatibility matrix shows through: B's
 # `FOR SHARE NOWAIT` and `FOR KEY SHARE NOWAIT` both answer, and B's `FOR UPDATE NOWAIT` is the
@@ -86,5 +99,19 @@ ROLLBACK TO s7		-
 SAVEPOINT s8		-
 SELECT id FROM lk l FOR SHARE OF lk	!42P01 relation "lk" in FOR SHARE clause not found in FROM clause
 ROLLBACK TO s8		-
+CREATE TABLE nk (n text)		-
+INSERT INTO nk VALUES ('x'), ('y')		-
+CREATE VIEW lkv AS SELECT * FROM lk		-
+SELECT 'r', n FROM nk ORDER BY n FOR UPDATE		r|x ; r|y
+SELECT 'r', id FROM (SELECT id FROM lk) s ORDER BY id FOR UPDATE		r|1 ; r|2 ; r|3
+SELECT 'r', x FROM (VALUES (1),(2)) v(x) FOR UPDATE		r|1 ; r|2
+SELECT 'r', g FROM generate_series(1,3) g FOR UPDATE		r|1 ; r|2 ; r|3
+WITH c AS (SELECT 1 AS x) SELECT 'r', x FROM c FOR UPDATE		r|1
+SELECT 'r', id FROM lkv ORDER BY id FOR UPDATE		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id FOR UPDATE OF lk NOWAIT		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id FOR SHARE SKIP LOCKED		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id LIMIT 1 OFFSET 1 FOR UPDATE		r|2
+SELECT 'r', l.id FROM lk l ORDER BY l.id FOR UPDATE OF l NOWAIT		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk WHERE id = 99 FOR UPDATE NOWAIT	text,bigint	-
 ROLLBACK		-
 SELECT count(*) FROM pg_class WHERE relname = 'lk'	bigint	0

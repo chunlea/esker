@@ -184,6 +184,19 @@ pub enum ColumnType {
     NumRangeArray,
     /// `int8range[]`.
     Int8RangeArray,
+    /// `point`: **two `float8`s and no comparison at all.**
+    ///
+    /// `point = point` and `point < point` are each `42883 operator does not exist` on a real
+    /// server — only `~=` (same-as) and `<->` (distance) exist — so a point is **not an index
+    /// key**, cannot be `DISTINCT`ed and cannot be grouped. That is ADR 0042's rule at its
+    /// sharpest: `json` at least has no equality with *another* type, and a point has none with
+    /// itself. `CREATE INDEX` on one is `42704 data type point has no default operator class for
+    /// access method "btree"`.
+    ///
+    /// `typlen` is **16** rather than -1: two eight-byte coordinates and no length header.
+    Point,
+    /// `point[]`. `geometric_test.rb` declares one (`t.point :array_of_points, array: true`).
+    PointArray,
     /// `tsrange[]`, which `range_test.rb` declares as `t.tsrange :ts_ranges, array: true`.
     TsRangeArray,
     /// The `citext` extension's type: text whose **comparison folds case**.
@@ -314,7 +327,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 56] = [
+    pub const ALL: [ColumnType; 58] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -371,6 +384,8 @@ impl ColumnType {
         ColumnType::DateRangeArray,
         ColumnType::NumRangeArray,
         ColumnType::Int8RangeArray,
+        ColumnType::Point,
+        ColumnType::PointArray,
     ];
 }
 
@@ -466,6 +481,17 @@ pub enum Datum {
     /// **An element that is NULL is not a NULL array.** `'{NULL}'::int[] IS NULL` is false, and
     /// the two states are told apart here by `Datum::Null` against a `None` inside the value.
     Array(crate::array::ArrayValue),
+    /// A `point`: its two `float8` coordinates, which is exactly what a real server stores in the
+    /// sixteen bytes `typlen` reports.
+    ///
+    /// The coordinates rather than the text, so that a subscript is an arithmetic fact and not a
+    /// parse — `p[0]` is a `double precision` on a real server, and zero-based.
+    Point {
+        /// The first coordinate, `p[0]`.
+        x: f64,
+        /// The second, `p[1]`.
+        y: f64,
+    },
     /// [`ColumnType::Interval`]: months, days and microseconds, each with its own sign.
     Interval {
         /// Whole months. Years are twelve of these; nothing else carries into them.
@@ -497,6 +523,13 @@ impl PartialEq for Datum {
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
             (Datum::Array(a), Datum::Array(b)) => a == b,
+            // **By the bits, like every float in this impl**, so a `point` survives the round
+            // trip whatever it holds — `NaN` included. It is not a SQL equality and there is no
+            // SQL equality for a point to be confused with: `point = point` is `42883`, which is
+            // why `pg_cmp` has no arm for one either.
+            (Datum::Point { x: ax, y: ay }, Datum::Point { x: bx, y: by }) => {
+                ax.to_bits() == bx.to_bits() && ay.to_bits() == by.to_bits()
+            }
             // Representation equality, not value equality: `1 mon` and `30 days` are equal
             // *values* and different rows. `pg_cmp` is where the number of them is compared.
             (
@@ -560,6 +593,7 @@ impl Datum {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Citext(_) => ColumnType::Citext,
+            Datum::Point { .. } => ColumnType::Point,
             Datum::Hstore(_) => ColumnType::Hstore,
             // **The inverse of `crate::row::range_subtype`, and it is not total.** `int4range`
             // and `int8range` are both ranges *of* an `int8` here — an `int4` is read as one
