@@ -1,0 +1,19 @@
+crates/esker-sql/tests/pgwire_tls.rs
+  s_49075263d2b3e7::t_5575cef9fda7a8 303-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "46d9ab8456960dcde89849bf59558c7be628a68d",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
