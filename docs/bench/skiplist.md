@@ -159,7 +159,7 @@ Running the memtable's own unit and property tests under Miri:
 
 | store | Stacked Borrows (Miri's default) | Tree Borrows (`-Zmiri-tree-borrows`) |
 |---|---|---|
-| arena skiplist | **25 tests pass**, 71 s | — |
+| arena skiplist | **the whole `memtable` module passes — 35 tests**, 76 s | — |
 | `crossbeam-skiplist` | UB in `crossbeam-epoch-0.9.20/src/internal.rs:562` — `&*local_ptr`, "that tag does not exist in the borrow stack" | UB in `crossbeam-skiplist-0.1.3/src/base.rs:124` — `dealloc(...)`, "deallocation through `<tag>` is forbidden" |
 
 Both models reject it, in different crates and for different reasons. That is **not** a claim that
@@ -169,8 +169,16 @@ those crates rather than observed misbehaviour.
 
 What it does mean is concrete. The engine's memtable tests could not be run under Miri at all, so
 the arena skiplist's `unsafe` could never have been checked by the tool the ADR named for it —
-the run would abort inside a dependency before reaching any of it. That is why the Miri runs above
-name their tests explicitly, and it is one of the things removing the dependency buys.
+the run would abort inside a dependency before reaching any of it. With the dependency gone,
+`cargo +nightly miri test -p esker-engine --lib -- memtable` runs the module through, which is
+what the gate should have been all along.
+
+One thing had to change for that to be true, and it was a test rather than the code:
+`readers_and_writers_run_concurrently` ran four readers over a two-thousand-entry list five
+hundred times, which is millions of interpreted steps and never finished. Every other bulk test
+here was already scaled under `cfg(miri)`; that one predates them and was missed. Twenty rounds is
+still meaningful, because what Miri looks for is a missing happens-before edge and one insert
+either has it or does not.
 
 The red-first requirement of ADR 0041 item 3 is discharged the same way. Against a deliberately
 `Relaxed` publishing store (`SkipList::with_relaxed_publication`), Miri says:
