@@ -3167,7 +3167,7 @@ impl Executor {
             // leaves a `FROM (SELECT …)` in and `plan_subqueries` fills the rest.
             entry.derived = Some(Box::new(crate::plan::Derived::new(
                 Box::new(body),
-                view.columns.clone(),
+                view.columns.iter().map(|c| c.name.clone()).collect(),
             )));
         }
         Ok(())
@@ -3212,14 +3212,29 @@ impl Executor {
 
     /// What a `Describe` answers, read through one transaction.
     fn described_in(&self, txn: &dyn Txn, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
-        let statement = parsed.lower()?;
+        let mut statement = parsed.lower()?;
+        // **A view becomes the derived table it stands for here too**, exactly as
+        // [`Executor::plan_select`] does it and for the same reason: after the rewrite nothing
+        // below can tell a view from a sub-select somebody typed. Skipping it left `FROM v`
+        // reaching `relation_of` as a table name, which is `42P01` for a relation that is right
+        // there — and since `ActiveRecord` prepares by default, that was **every** read of a view
+        // it makes. `SELECT * FROM v` through the simple protocol answered all along, which is
+        // what made it look like a catalog gap rather than a describe one.
+        //
+        // Before the parameters are typed, so a `$1` compared against a view's column is typed
+        // against the column and not against nothing, and before the subqueries are planned,
+        // because a view may be named inside one.
+        if let Statement::Select(select) = &mut statement
+            && self.names_a_view(txn, select)?
+        {
+            self.expand_views(txn, select)?;
+        }
         let tables = self.tables_for(txn, &statement)?;
         let types = bind::infer(&statement, &tables, declared);
         let parameters = types.iter().copied().map(ColumnType::oid).collect();
 
         // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
         // is run, so a placeholder of the right type is all the planner needs to answer the shape.
-        let mut statement = statement;
         bind::substitute_placeholders(&mut statement, &types);
         // **A derived table has no shape until its sub-select is planned**, and the shape is the
         // whole of what a `Describe` answers. `Executor::plan_select` does this before it plans;

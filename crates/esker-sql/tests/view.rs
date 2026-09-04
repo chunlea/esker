@@ -51,17 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              was an error where PostgreSQL has a value, which aborted the block and hid every \
              statement after it. Two of those are now measured and one was a real gap.",
         ),
-        // **Also un-swallowed**, and also pre-existing: `pg_attribute` has no rows for a view.
-        // The columns a view has are worked out where it is *read*, from the shape its definition
-        // produces, and nothing writes them into the attribute catalog — so a client asking the
-        // catalog what columns a view has gets an empty answer where PostgreSQL lists them.
-        (
-            r#"SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"ebooks''"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"#,
-            "No rows: a view's columns are derived at read time and never written to \
-             `pg_attribute`. Its own unit — the fix is to publish the shape a view's definition \
-             produces into the attribute catalog when the view is created, which is the same \
-             resolution step a rename-following view body needs.",
-        ),
         // **Un-swallowed by the line above.** `information_schema.views` did not exist, so the
         // statement before this one aborted the transaction and this was never compared. It is a
         // pre-existing gap and not a view-formatting one: an `INSERT` through an automatically

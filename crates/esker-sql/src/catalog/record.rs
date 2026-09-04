@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 29;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 30;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -875,26 +875,42 @@ pub(super) fn view_name_of(tenant: u64, key: &[u8]) -> Result<String> {
 /// have to be invalidated with the `TableDef` that caches it, and re-lowering a short `SELECT` per
 /// statement is the cheaper mistake. It is also what `pg_get_viewdef` has to print back.
 #[must_use]
-pub(super) fn encode_view(id: u64, definition: &str, columns: &[String]) -> Vec<u8> {
+pub(super) fn encode_view(id: u64, definition: &str, columns: &[super::ViewColumn]) -> Vec<u8> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     out.extend_from_slice(&id.to_le_bytes());
     put_str(definition, &mut out);
     varint::put_u64(columns.len() as u64, &mut out);
     for column in columns {
-        put_str(column, &mut out);
+        put_str(&column.name, &mut out);
+        // **Version 30 adds the type and the typmod**, so `pg_attribute` can answer what columns a
+        // view has. Before it the record held names only; a record written then still reads, and
+        // reads back as a view with no published columns rather than as one whose types are
+        // invented — see [`decode_view`].
+        out.push(tag_of(column.ty));
+        out.extend_from_slice(&column.typmod.to_le_bytes());
     }
     out
 }
 
 /// Reads one back.
-pub(super) fn decode_view(bytes: &[u8]) -> Result<(u64, String, Vec<String>)> {
+pub(super) fn decode_view(bytes: &[u8]) -> Result<(u64, String, Vec<super::ViewColumn>)> {
     let mut reader = Reader::at_least(bytes, OLDEST_SCHEMA_VERSION)?;
     let id = reader.u64_le()?;
     let definition = reader.string()?;
     let count = reader.varint()?;
     let mut columns = Vec::new();
     for _ in 0..count {
-        columns.push(reader.string()?);
+        let name = reader.string()?;
+        // **A record older than 30 stops at the name.** Its columns are dropped rather than given
+        // a default type: the alias list a view is expanded through is rebuilt from the definition
+        // either way, and a wrong `pg_attribute` row is worse than no row — it would be a relation
+        // whose declared shape disagrees with the rows it returns.
+        if reader.version < 30 {
+            continue;
+        }
+        let ty = type_of(reader.byte()?)?;
+        let typmod = reader.i32_le()?;
+        columns.push(super::ViewColumn { name, ty, typmod });
     }
     reader.finish()?;
     Ok((id, definition, columns))

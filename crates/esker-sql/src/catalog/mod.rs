@@ -3114,7 +3114,24 @@ pub fn has_relations(txn: &dyn Txn, tenant: u64) -> Result<bool> {
     Ok(!txn.scan(&start, &end, 1)?.is_empty())
 }
 
-/// One view: what it is called, the `SELECT` it stands for, and the columns it was declared with.
+/// One column of a view, as the view publishes it.
+///
+/// **A view has columns in the catalog, not only where it is read.** `pg_attribute` is asked what
+/// columns a relation has by every client that reflects on a schema, and it cannot answer for a
+/// relation whose shape is only worked out at read time — so the shape a view's definition
+/// produces is resolved once, when the view is created, and stored beside the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewColumn {
+    /// The name the view gives it: the declared one where `CREATE VIEW v (a, b)` named it, and
+    /// otherwise the one the query produced.
+    pub name: String,
+    /// What the query's expression evaluates to.
+    pub ty: ColumnType,
+    /// `pg_attribute.atttypmod`, in PostgreSQL's own encoding — see [`ColumnDef::typmod`].
+    pub typmod: i32,
+}
+
+/// One view: what it is called, the `SELECT` it stands for, and the columns it publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewDef {
     /// Its own id, which is its `pg_class` oid.
@@ -3123,9 +3140,13 @@ pub struct ViewDef {
     pub name: String,
     /// The `SELECT` text, as written.
     pub definition: String,
-    /// `CREATE VIEW v (a, b) AS …` — the names the view gives its columns, or empty when it takes
-    /// them from the query.
-    pub columns: Vec<String>,
+    /// The columns the view publishes, in order — resolved from the definition when the view was
+    /// created, and renamed by the `CREATE VIEW v (a, b)` list where there was one.
+    ///
+    /// **Empty for a view stored before record version 30**, which had only names and no types;
+    /// such a view answers `pg_attribute` with nothing, exactly as it did before, rather than with
+    /// a guess.
+    pub columns: Vec<ViewColumn>,
 }
 
 /// Every view of one tenant, by stored name.
@@ -3875,7 +3896,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1d",               // catalog format version
+                "1e",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3968,7 +3989,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1d",       // catalog format version
+                "1e",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4050,7 +4071,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1d",                 // catalog format version
+                "1e",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5362,7 +5383,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1d",               // catalog format version
+                "1e",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

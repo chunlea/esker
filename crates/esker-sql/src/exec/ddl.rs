@@ -2933,7 +2933,7 @@ fn view_shape(
     txn: &dyn Txn,
     definition: &str,
     declared: &[String],
-) -> Result<Vec<String>> {
+) -> Result<Vec<catalog::ViewColumn>> {
     let parsed = crate::parse::parse_statements(definition)?;
     let [statement] = parsed.as_slice() else {
         return Err(SqlError::unsupported(
@@ -2946,10 +2946,17 @@ fn view_shape(
         ));
     };
     let planned = executor.plan_select(txn, &select)?;
-    let produced: Vec<String> = planned
+    // **The types come from the same plan the names do.** A view's column is whatever its
+    // expression evaluates to, and the planner has already decided that for the row description it
+    // would send — so nothing here re-derives it and the two can never disagree.
+    let produced: Vec<catalog::ViewColumn> = planned
         .columns
         .iter()
-        .map(|column| column.name.clone())
+        .map(|column| catalog::ViewColumn {
+            name: column.name.clone(),
+            ty: column.ty,
+            typmod: column.typmod,
+        })
         .collect();
     if declared.is_empty() {
         return Ok(produced);
@@ -2960,7 +2967,15 @@ fn view_shape(
             produced: produced.len(),
         });
     }
-    Ok(declared.to_vec())
+    // A declared list renames the columns and does not retype them.
+    Ok(declared
+        .iter()
+        .zip(produced)
+        .map(|(name, column)| catalog::ViewColumn {
+            name: name.clone(),
+            ..column
+        })
+        .collect())
 }
 
 /// `DROP VIEW [IF EXISTS] name [, …]`.

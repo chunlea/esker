@@ -151,6 +151,12 @@ pub struct Relations {
     /// anyway, so `pg_get_viewdef(oid)` costs no lookup per row. The same trade `user_types`
     /// makes, and for the same reason.
     view_definitions: BTreeMap<u64, String>,
+    /// Every view's published columns, by oid — resolved when the view was created and read out of
+    /// the same record `view_definitions` comes from, so `pg_attribute` can answer for a view
+    /// without planning its body per query.
+    ///
+    /// Empty for a view stored before record version 30, which held no types.
+    view_columns: BTreeMap<u64, Vec<super::ViewColumn>>,
 }
 
 impl Relations {
@@ -192,15 +198,18 @@ impl Relations {
             .into_iter()
             .map(|def| (def.oid, def))
             .collect();
-        let view_definitions = super::views(txn, tenant)?
-            .into_iter()
-            .map(|view| (view.id, view.definition))
-            .collect();
+        let mut view_definitions = BTreeMap::new();
+        let mut view_columns = BTreeMap::new();
+        for view in super::views(txn, tenant)? {
+            view_definitions.insert(view.id, view.definition);
+            view_columns.insert(view.id, view.columns);
+        }
         Ok(Relations {
             rows,
             tables,
             user_types,
             view_definitions,
+            view_columns,
         })
     }
 
@@ -212,6 +221,16 @@ impl Relations {
     #[must_use]
     pub fn view_definition(&self, oid: u64) -> Option<&str> {
         self.view_definitions.get(&oid).map(String::as_str)
+    }
+
+    /// The columns a view publishes, by oid, or `None` when the oid is not a view's.
+    ///
+    /// **`Some(&[])` and `None` are different answers.** An empty slice is a view stored before
+    /// record version 30 knew types — it publishes nothing to `pg_attribute` — and `None` is a
+    /// relation that is not a view at all.
+    #[must_use]
+    pub fn view_columns(&self, oid: u64) -> Option<&[super::ViewColumn]> {
+        self.view_columns.get(&oid).map(Vec::as_slice)
     }
 
     /// The name of the user-defined type with this oid, or `None`.
