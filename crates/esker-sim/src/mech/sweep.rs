@@ -220,8 +220,26 @@ pub fn check(case: &Case, observed: Observed) -> Result<(), Violation> {
 /// Exhaustive over what the decision actually reads. There is no seed here because there is
 /// nothing to draw: the state space *is* the answer table, and enumerating it is cheaper and
 /// stronger than sampling it.
+///
+/// # `hosted_conf_ver` has to leave room below it
+///
+/// The "older" case is `hosted_conf_ver - 1`, so a table generated at **zero** has an older record
+/// of zero — the same record as the "same membership" case, byte for byte. `esker-store`'s
+/// `sim_sweep` did exactly that, and the case named *an older membership than this store's* had
+/// never once put an older record in front of the sweep. It is refused here rather than left to
+/// the next caller to notice, because a duplicate case is a table that reports a coverage it does
+/// not have.
+///
+/// # Panics
+///
+/// If `hosted_conf_ver` is zero.
 #[must_use]
 pub fn cases(store_id: u64, region_id: u64, hosted_conf_ver: u64) -> Vec<Case> {
+    assert!(
+        hosted_conf_ver > 0,
+        "the table needs a hosted conf_ver of at least 1: \"older\" is one below it, and at zero \
+         that case is identical to \"the same membership this store already has\""
+    );
     let hosted = RegionSpan {
         region_id,
         conf_ver: hosted_conf_ver,
@@ -322,6 +340,29 @@ mod tests {
             "the table has to be fail-closed: everything but positive evidence of a removal is a \
              Keep, or this model would be asking the store to lose acknowledged writes"
         );
+    }
+
+    /// **No two cases may be the same case**, which is not as obvious as it sounds.
+    ///
+    /// `cases(2, 1, 0)` produced a table where "an older membership than this store's" and "the
+    /// same membership this store already has" were identical records — `0.saturating_sub(1)` is
+    /// `0` — so the table ran five cases and covered four. Red against that call, which is why the
+    /// zero is refused above and why this asserts the property rather than the guard.
+    #[test]
+    fn no_two_cases_put_the_same_thing_in_front_of_the_sweep() {
+        let table = cases(2, 1, 1);
+        for (i, one) in table.iter().enumerate() {
+            for other in table.iter().skip(i + 1) {
+                assert!(
+                    (&one.hosted, &one.answer, one.overlapping_hosted)
+                        != (&other.hosted, &other.answer, other.overlapping_hosted),
+                    "{:?} and {:?} are the same case under two names, so the table reports a \
+                     coverage it does not have",
+                    one.name,
+                    other.name
+                );
+            }
+        }
     }
 
     #[test]

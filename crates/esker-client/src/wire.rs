@@ -104,7 +104,7 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
     let keys =
         |keys: &[Bytes]| keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD;
     match request {
-        TxnKvReq::Get { key, .. } => key.len() + 2 * PER_FIELD,
+        TxnKvReq::Get { key, .. } | TxnKvReq::LatestCommit { key } => key.len() + 2 * PER_FIELD,
         TxnKvReq::Scan { start, end, .. } => start.len() + end.len() + 5 * PER_FIELD,
         TxnKvReq::Prewrite {
             primary, mutations, ..
@@ -116,7 +116,14 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
                         TxnMutation::Put { key, value, .. } => {
                             key.len() + value.len() + 2 * PER_FIELD
                         }
-                        TxnMutation::Delete { key, .. } => key.len() + PER_FIELD,
+                        TxnMutation::Delete { key, .. } | TxnMutation::Check { key } => {
+                            key.len() + PER_FIELD
+                        }
+                        // A range is two keys, and a read set of wide ranges is exactly what makes
+                        // a prewrite large enough for this estimate to matter (ADR 0062).
+                        TxnMutation::CheckRange { start, end } => {
+                            start.len() + end.len() + 2 * PER_FIELD
+                        }
                     })
                     .sum::<usize>()
                 + 4 * PER_FIELD

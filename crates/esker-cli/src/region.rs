@@ -138,7 +138,20 @@ pub(crate) struct PdConn {
 
 impl PdConn {
     pub(crate) fn connect(address: SocketAddr) -> Result<Self, String> {
-        let transport = BlockingTransport::connect_with(address, TransportConfig::new())
+        Self::connect_with(address, TransportConfig::new())
+    }
+
+    /// The same, with an explicit transport configuration.
+    ///
+    /// `request_timeout` bounds the wire handshake as well as every call on the connection, so a
+    /// caller that must not wait the default thirty seconds for a socket which accepts and then
+    /// says nothing sets it here. The one such caller is `cluster start`'s readiness probe
+    /// ([`crate::cluster`]), which asks a driver that may not be up yet.
+    pub(crate) fn connect_with(
+        address: SocketAddr,
+        config: TransportConfig,
+    ) -> Result<Self, String> {
+        let transport = BlockingTransport::connect_with(address, config)
             .map_err(|error| format!("connecting to the placement driver at {address}: {error}"))?;
         Ok(Self {
             transport,

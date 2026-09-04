@@ -470,6 +470,18 @@ fn golden_txn_read_requests() -> Vec<(&'static str, Request)> {
             ),
         ),
         (
+            // **A read, and pinned as one**: it carries a key and nothing else, and it is in this
+            // list rather than the write list because it takes no lock and writes no log entry
+            // (ADR 0067).
+            "txn-latest-commit",
+            Request::txn_kv(
+                h,
+                TxnKvReq::LatestCommit {
+                    key: Bytes::from_static(b"key"),
+                },
+            ),
+        ),
+        (
             "txn-scan",
             Request::txn_kv(
                 h,
@@ -501,6 +513,13 @@ fn golden_txn_read_requests() -> Vec<(&'static str, Request)> {
 /// The six methods that write: two phases, two ways to end, and the two pieces of
 /// housekeeping (a lock's TTL and the collection safepoint).
 fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
+    let mut requests = golden_txn_prewrite_requests();
+    requests.extend(golden_txn_finish_requests());
+    requests
+}
+
+/// The prewrites: the mutation tags live here, so this is the list that grows when one is added.
+fn golden_txn_prewrite_requests() -> Vec<(&'static str, Request)> {
     let h = header();
     vec![
         (
@@ -525,6 +544,37 @@ fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
+        (
+            // **A second prewrite golden rather than a changed one.** The row above pins tags 1 and
+            // 2 and must not move — that is what "additive" means here — so the check mutations get
+            // their own row (ADR 0067 §1).
+            "txn-prewrite-checks",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Prewrite {
+                    start_ts: TXN_TS,
+                    primary: Bytes::from_static(b"p"),
+                    ttl_ms: TXN_TTL_MS,
+                    mutations: vec![
+                        TxnMutation::Check {
+                            key: Bytes::from_static(b"c"),
+                        },
+                        TxnMutation::CheckRange {
+                            start: Bytes::from_static(b"a"),
+                            end: Bytes::from_static(b"z"),
+                        },
+                    ],
+                },
+            ),
+        ),
+    ]
+}
+
+/// `Commit`, `Rollback`, `ResolveLock`, `Heartbeat` and `GcSafepoint`: what finishes a
+/// transaction, or what a store is told about one.
+fn golden_txn_finish_requests() -> Vec<(&'static str, Request)> {
+    let h = header();
+    vec![
         (
             "txn-commit",
             Request::txn_kv(
@@ -619,6 +669,18 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
         // the two terminal shapes, and the empty batch.
         ("txn-prewrite", Response::TxnKv(TxnKvResp::prewrite_ok(2))),
         (
+            "txn-latest-commit",
+            Response::TxnKv(TxnKvResp::LatestCommit {
+                newest: Some(TXN_COMMIT_TS),
+            }),
+        ),
+        (
+            // **`None` is a different answer from any timestamp**, and a key nobody has written is
+            // the ordinary case, so it gets a golden of its own rather than being assumed.
+            "txn-latest-commit-never",
+            Response::TxnKv(TxnKvResp::LatestCommit { newest: None }),
+        ),
+        (
             "txn-prewrite-locked",
             Response::TxnKv(TxnKvResp::Prewrite {
                 keys: vec![
@@ -682,6 +744,16 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
                 },
             }),
         ),
+    ]
+    .into_iter()
+    .chain(golden_txn_housekeeping_responses())
+    .collect()
+}
+
+/// What a store answers about a transaction it is *tidying*: a lock resolved, a lease extended, a
+/// safepoint published.
+fn golden_txn_housekeeping_responses() -> Vec<(&'static str, Response)> {
+    vec![
         (
             "txn-resolve-lock",
             Response::TxnKv(TxnKvResp::ResolveLock { resolved: 3 }),
