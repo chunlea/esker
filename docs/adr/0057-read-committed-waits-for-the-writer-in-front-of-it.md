@@ -1,6 +1,6 @@
-# ADR 0056 — READ COMMITTED waits for the writer in front of it
+# ADR 0057 — READ COMMITTED waits for the writer in front of it
 
-Status: proposed · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
+Status: accepted (the wire change alone is held for the human) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
 
 ## Context
 
@@ -162,15 +162,90 @@ is expensive and most waits are short. The same applies here.
 * Statement re-execution can do more work than PostgreSQL's row-level re-evaluation under
   three-way contention, and can observe a third transaction's commit on a row it had already
   passed. Declared, with a corpus row.
-* Today's `40001` becomes rare rather than absent: it is still what a **prewrite conflict** is at
-  commit time under RC when the winner committed *after* this transaction's start and before its
-  prewrite. PostgreSQL has no equivalent because it locks eagerly. This is the residue of
-  optimism and it is what the measure will size.
+* Today's `40001` becomes rare rather than absent, **once §4 below is built**. Without it the wait
+  and the re-run move the failure from the `UPDATE` to the `COMMIT` and change nothing else — see
+  §4, which is the correction the coordinator's review made to a first draft that filed this under
+  "residue". It is not a residue: it is every waited-on conflict whose locker commits.
+
+## 4. The per-key read timestamp, without which none of the above works
+
+**A first draft of this ADR had a hole, and it is worth writing down because it is invisible until
+the walk is done.** `PrewriteDecision::Conflict` is first-committer-wins measured against the
+**transaction's** `start_ts`. Walk the first row of the contract table through it:
+
+> B starts at `start_ts` 10 and meets A's lock. It waits. A commits at 15. B re-runs at a fresh
+> read timestamp 20 and computes **111** — correct, and the whole point of the unit. Then B
+> commits, and prewrite finds A's `write` record on that key at `commit_ts` 15, which is greater
+> than B's `start_ts` 10. `Conflict`. **`40001`, at `COMMIT`.**
+
+So the wait and the re-run alone move the failure from the `UPDATE` to the `COMMIT` and the measure
+does not move at all. Every waited-on conflict whose locker commits ends this way, which is the
+entire Rails family — counter caches, optimistic locking, `lock!`-then-update.
+
+**Every buffered write carries the read timestamp of the statement that produced it.** A `read_ts`
+per key, equal to the transaction's `start_ts` unless that statement was re-run, and prewrite
+validates each key against **its own** `read_ts`: *no commit on this key after the snapshot this
+statement actually read.*
+
+Why that is sound rather than a weakening:
+
+* First-committer-wins is **preserved per key**, relative to the snapshot the value was computed
+  from. B's 111 was computed from A's committed row, so A's commit is not a conflict with it — it
+  is its input.
+* A key written by an **earlier** statement of the same transaction keeps its own, older `read_ts`.
+  A commit that slipped in between still conflicts, so there is no lost update on the rows the
+  transaction did not re-read. This is the half that makes it safe, and it is the half a
+  transaction-wide "latest read ts" would destroy.
+* Nothing else moves. The data version is still written at `start_ts` — visibility is by
+  `commit_ts` — and the lock record still carries `start_ts`, so waiters classify it exactly as
+  they do today and the TTL arithmetic is unchanged.
+
+This is TiDB's `for_update_ts` without the pessimistic lock.
+
+### The wire change, and the question for the human
+
+`Prewrite` gains a per-key read timestamp, which is an `esker-proto` message with a golden test —
+so per `CLAUDE.md` it needs a ruling before it lands. **The question, in one sentence: may
+`TxnKvReq::Prewrite` gain an optional per-key `read_ts` (absent means "the transaction's
+`start_ts`", so every existing golden stays byte-identical and an old client keeps working), or
+would you rather it were a new request variant that leaves `Prewrite` untouched?**
+
+The additive form is the one this ADR proposes, and the reason is the goldens: an optional field
+written only when it differs from `start_ts` means every frame this node writes today is the frame
+it writes tomorrow, and the format-version byte does not move. A new variant costs a second apply
+path in the store for the lifetime of the old one. Everything above this line is built first and
+independently; the field itself is **held in its own commit at the end of the branch**, so the rest
+lands whatever the ruling is.
+
+## 5. `SELECT … FOR UPDATE` locks nothing today, and must
+
+`plan::Locking` is lowered and then **dropped** — `exec/query.rs:932` builds `locking: Vec::new()`.
+So `FOR UPDATE` parses, is accepted, and takes nothing. Rails' pessimistic tests (`lock!`,
+`with_lock`) do `FOR UPDATE` and then `UPDATE`; with no eager lock two sessions both proceed and
+one dies at prewrite — the same failure this whole ADR is about, arriving by a second road.
+
+**The same mechanism answers it.** A row a `FOR UPDATE` selects is written with a **no-op
+mutation** — `Op::Lock`: a lock record now, and at commit a `write` record that changes no value.
+TiKV has exactly this op. Then a concurrent writer meets a live lock and waits, and this
+transaction's prewrite validates the key at that statement's `read_ts` (§4), which is what makes
+`lock!`-then-update commit rather than conflict with the transaction it just waited for.
+
+It also makes two refusals stop being true. `NOWAIT` and `SKIP LOCKED` are refused today "on a node
+whose transactions do not block"; with `Op::Lock` they become `55P03 could not obtain lock on row in
+relation "x"` on a `Locked` decision, and a skip, respectively — both measured in the contract
+table. `FOR SHARE` is served as `FOR UPDATE` for now, declared: it is stricter than the standard
+asks for, which costs concurrency and never correctness.
 
 ## The file list
 
 `crates/esker-txn/`: `percolator.rs` (the decision function — given a `Locked` and an isolation
-level, `Wait` or `Conflict`; pure, no I/O), `error.rs`.
+level, `Wait` or `Conflict`; pure, no I/O — plus the per-key `read_ts` in `check_prewrite` and
+`Op::Lock`), `mutation.rs`, `error.rs`.
+`crates/esker-store/src/`: `txn_command.rs`, `txnkv.rs` (applying `Op::Lock` and the per-key
+`read_ts`) — carved from c6's lane for this unit.
+`crates/esker-client/src/txn.rs`: the buffer's per-key `read_ts` and `Op::Lock`. The rest of that
+crate is not this lane's.
+`crates/esker-proto/src/txn.rs`: the framing diff, **in its own commit at the end of the branch**.
 `crates/esker-sql/src/`: `exec/mod.rs` (the statement loop, the implicit savepoint, the deadline),
 `exec/savepoint.rs`, `exec/dml.rs` and `exec/cursor.rs` (where a conflict surfaces),
 `plan/session.rs` and `parse/lower.rs`'s `SET TRANSACTION` arm (the isolation level — **the one
@@ -182,6 +257,10 @@ Docs: this ADR, `docs/DESIGN.md` §8, `docs/plans/phase-9-rails.md`.
 
 ## The test list
 
+0. **The red test for the whole unit, and the one that would have caught §4's hole**: the waiter's
+   locker **commits**, the waiter waits, re-runs — *and its own `COMMIT` succeeds, with the row at
+   111*. Asserted end to end through commit, not at the `UPDATE`. A version of this unit without
+   §4 passes every assertion up to that last one.
 1. **A two-session interleaving per row of the table above**, gated on the transaction's edges —
    thirteen of them, including the two that reasoning gets wrong (the arithmetic on the new
    version, and the skipped row).
@@ -198,7 +277,14 @@ Docs: this ADR, `docs/DESIGN.md` §8, `docs/plans/phase-9-rails.md`.
    table: for every pair of statements and every commit/abort of the locker, the final row is the
    one PostgreSQL's rules give.
 7. **The residue**: a corpus row for each declared divergence — SERIALIZABLE as SI, statement
-   re-execution under three-way contention, and the prewrite-time `40001` that optimism leaves.
+   re-execution under three-way contention, `FOR SHARE` served as `FOR UPDATE`, and the
+   prewrite-time `40001` that optimism leaves.
+8. **The per-key `read_ts` is not a blanket licence**: a transaction that writes row 1, then waits
+   on row 2 and re-runs, must still conflict if somebody committed row 1 in between. That is the
+   assertion that tells the per-key rule from a transaction-wide "latest read ts", and it is the
+   one that would catch the wrong fix.
+9. **`Op::Lock`**: a `FOR UPDATE` makes a concurrent writer wait; `lock!`-then-update commits;
+   `NOWAIT` is `55P03` and `SKIP LOCKED` skips; a `FOR UPDATE` that touches no row writes no lock.
 
 ## The measure
 
