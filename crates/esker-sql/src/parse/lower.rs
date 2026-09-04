@@ -88,6 +88,14 @@ impl Parsed {
                 actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
             }));
         }
+        // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
+        // statement it is a disguised form of, so the whole lowering is this.
+        if let Some((message, severity)) = self.raised() {
+            return Ok(plan::Statement::Raise {
+                message: message.clone(),
+                severity: *severity,
+            });
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -105,6 +113,11 @@ impl Parsed {
                     &create.name,
                 )?);
             }
+        }
+        // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
+        // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
+        if let plan::Statement::CreateType(create) = &mut lowered {
+            create.if_not_exists = self.is_do_guarded();
         }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
@@ -6812,7 +6825,12 @@ fn lower_create_type(
         // C function. There is nothing this node could put in one.
         None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
     };
-    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
+    Ok(plan::Statement::CreateType(plan::CreateType {
+        name,
+        kind,
+        // Set by the caller that can see the `DO` block this came out of, if it came out of one.
+        if_not_exists: false,
+    }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

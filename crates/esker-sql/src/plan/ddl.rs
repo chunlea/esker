@@ -559,6 +559,12 @@ pub struct CreateType {
     pub name: String,
     /// Which shape, already read into the catalog's own form.
     pub kind: crate::catalog::TypeKind,
+    /// Do nothing if a type of this name is already there, instead of `42710`.
+    ///
+    /// **There is no `CREATE TYPE IF NOT EXISTS` in PostgreSQL**, and this is not one: it is what
+    /// `ActiveRecord`'s `create_enum` gets by wrapping the statement in a `DO` block that tests
+    /// `pg_type` first (`crate::parse::strip_do_create_enum`). Nothing a user can write sets it.
+    pub if_not_exists: bool,
 }
 
 /// `DROP TYPE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`.
