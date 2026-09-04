@@ -11,6 +11,11 @@
 //! What is proved here is node-local by construction: both sessions are on one `StoreBackend`,
 //! which is one `esker-sql` process. Two *nodes* still do not see each other's row locks, and that
 //! is the ADR's declared scope rather than something this file forgot to test.
+//!
+//! SERIALIZABLE's read-set validation is here for the same reason and against the same cluster
+//! ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
+//! [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)): the
+//! read set only means anything if it survives the wire, and `MemoryBackend` never puts it there.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -266,4 +271,94 @@ fn a_statement_whose_row_moved_re_runs_rather_than_failing_against_real_stores()
         [[Some("12".to_owned())]],
         "the arithmetic is on the committed value, 2, and not on the 1 the statement first read"
     );
+}
+
+/// **A row read by primary key is validated as a key** (ADR 0067 §1, `Check` tag 5).
+///
+/// Every other real-store test of the read set reads with a scan, so it exercises `CheckRange` and
+/// says nothing about the point tag. Here the transaction reads one row by key and writes to a
+/// *different table*, so its own prewrite cannot catch anything — there is no write-write conflict
+/// to find, and no range over `watched` was ever scanned. The only thing that can refuse this
+/// commit is the `Check` on the key it read.
+///
+/// Shown red by removing `StoreTxn::record_key`: this test fails and `write_skew_is_refused_...`
+/// above does not, which is also the evidence that the two tests carry different tags.
+#[test]
+fn a_row_read_by_key_is_validated_against_real_stores() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE watched (id bigint primary key, n bigint)")
+        .unwrap();
+    setup
+        .run("CREATE TABLE elsewhere (id bigint primary key, n bigint)")
+        .unwrap();
+    setup
+        .run("INSERT INTO watched VALUES (1, 0), (2, 0)")
+        .unwrap();
+    setup.run("INSERT INTO elsewhere VALUES (1, 0)").unwrap();
+
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    assert_eq!(
+        a.rows("SELECT n FROM watched WHERE id = 1"),
+        [[Some("0".to_owned())]]
+    );
+    a.run("UPDATE elsewhere SET n = 1 WHERE id = 1").unwrap();
+
+    // Committed and finished before A commits, so no lock is held and nothing waits: the conflict
+    // is visible only to a transaction that remembers what it read.
+    let mut other = cluster.session();
+    other.run("UPDATE watched SET n = 9 WHERE id = 1").unwrap();
+
+    let refused = a
+        .run("COMMIT")
+        .expect_err("A's answer came from a row that has since changed");
+    assert_eq!(refused.sqlstate(), "40001", "{refused}");
+}
+
+/// **And validated as a key rather than as its table** — the half that makes the first test mean
+/// something.
+///
+/// The same shape, except the other session writes the row A did *not* read. A read set recorded at
+/// table granularity refuses this too, and a `CheckRange` over `watched` would report exactly the
+/// conflict the first test wants; only a per-key read set lets it through. So this is the test that
+/// says which tag carried the refusal above.
+///
+/// Shown red by widening `record_key` to record the key's whole prefix as a range: this test fails
+/// and the one above does not. So each of the pair is red under exactly one counterfactual, and a
+/// commit — which is what this one asserts, and what a great many broken things also produce — is
+/// evidence here rather than an absence of it.
+#[test]
+fn a_row_the_transaction_never_read_does_not_refuse_it_against_real_stores() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE watched (id bigint primary key, n bigint)")
+        .unwrap();
+    setup
+        .run("CREATE TABLE elsewhere (id bigint primary key, n bigint)")
+        .unwrap();
+    setup
+        .run("INSERT INTO watched VALUES (1, 0), (2, 0)")
+        .unwrap();
+    setup.run("INSERT INTO elsewhere VALUES (1, 0)").unwrap();
+
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    assert_eq!(
+        a.rows("SELECT n FROM watched WHERE id = 1"),
+        [[Some("0".to_owned())]]
+    );
+    a.run("UPDATE elsewhere SET n = 1 WHERE id = 1").unwrap();
+
+    let mut other = cluster.session();
+    other.run("UPDATE watched SET n = 9 WHERE id = 2").unwrap();
+
+    a.run("COMMIT")
+        .expect("row 2 is not a row A read, and its table is not what A recorded");
 }
