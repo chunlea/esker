@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::rpc_tls::RpcTlsFlags;
 use esker_pd::{MemberList, Pd, PdInspector, PdMember, PdOptions, PdService, PdTcpTransport};
 use esker_proto::{Server, TransportConfig};
 
@@ -21,6 +22,17 @@ use esker_proto::{Server, TransportConfig};
 /// The port PD's clients use in `TiKV`, which this layer is modelled on (`CLAUDE.md`): a
 /// familiar number is kinder than a new one.
 pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:2379";
+
+/// How long `pd members add` waits for a member to catch up before telling the operator to run it
+/// again.
+///
+/// Generous, because the catch-up may be a snapshot transfer, and bounded because a command that
+/// never returns is worse than one that says "not yet". Running it again costs nothing: it looks at
+/// what is there.
+pub(crate) const MEMBER_CHANGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Between two steps of a change. A poll, not a spin: the round trip is the cost.
+pub(crate) const MEMBER_CHANGE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Where PD keeps its state when nothing says otherwise.
 pub(crate) const DEFAULT_DATA_DIR: &str = "esker-pd-data";
@@ -38,18 +50,33 @@ pub(crate) enum PdCommand {
     Members(MembersOptions),
 }
 
-/// `esker pd members`.
+/// `esker pd members [add <id>@<host:port> | remove <id>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MembersOptions {
-    /// Any member of the group to ask. A follower answers this one, which is the point: it is
-    /// what an operator reaches for when the leader is the thing that is missing.
+    /// Any member of the group to ask, or several separated by commas.
+    ///
+    /// **Listing** is answered by a follower, which is the point: it is what an operator reaches
+    /// for when the leader is the thing that is missing. **Changing** is not — only a leader may
+    /// propose — so a change tries each endpoint until one of them leads.
     pub(crate) pd: String,
+    /// What to do. `None` lists.
+    pub(crate) change: Option<MembersChange>,
+}
+
+/// A `pd members add` or `pd members remove`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MembersChange {
+    /// Put a member in the group, at an address.
+    Add(PdMember),
+    /// Take one out.
+    Remove(u64),
 }
 
 impl Default for MembersOptions {
     fn default() -> Self {
         Self {
             pd: crate::region::DEFAULT_PD.to_owned(),
+            change: None,
         }
     }
 }
@@ -83,20 +110,34 @@ pub(crate) struct ServeOptions {
     pub(crate) id: u64,
     /// The whole group, as `id@host:port` separated by commas — **this member included**.
     ///
-    /// Empty means a group of one. Every member must be given the *same* list, in any order:
-    /// the group's identity is derived from it ([`esker_pd::MemberList`]), so two members given
-    /// different lists are two groups and will not talk to each other — which is a loud failure
-    /// rather than a quiet half-formed cluster.
+    /// Empty means a group of one. Every member founding a group must be given the *same* list,
+    /// in any order: the group's id is derived from it **once** and then written down
+    /// ([`esker_pd::MemberList`],
+    /// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
+    /// so two members given different lists found two groups and will not talk to each other —
+    /// which is a loud failure rather than a quiet half-formed cluster.
+    ///
+    /// Ignored on a member that has a database: after a membership change this flag is exactly the
+    /// out-of-date command line `esker_raft::Config` says not to believe.
     pub(crate) peers: String,
+    /// The address of any member of a group this one is **joining**.
+    ///
+    /// A member added at run time cannot derive the group's id — the derivation moved when it was
+    /// added — so it asks. Empty means this member is founding a group rather than joining one.
+    pub(crate) join: String,
+    /// The RPC TLS this member speaks to the rest of its group.
+    pub(crate) tls: RpcTlsFlags,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
+            tls: RpcTlsFlags::default(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             listen: DEFAULT_LISTEN.to_owned(),
             id: 1,
             peers: String::new(),
+            join: String::new(),
         }
     }
 }
@@ -155,7 +196,10 @@ pub(crate) fn run(command: &PdCommand) -> Result<(), String> {
         }
         PdCommand::Members(options) => {
             let mut stdout = std::io::stdout().lock();
-            members(options, &mut stdout)
+            match &options.change {
+                None => members(options, &mut stdout),
+                Some(change) => change_member(options, change, &mut stdout),
+            }
         }
     }
 }
@@ -182,6 +226,95 @@ pub(crate) fn members(
         return Err("the placement driver answered a different question".to_owned());
     };
     print_members(&membership, out)
+}
+
+/// Adds or removes a member, one step at a time, against whichever endpoint leads.
+///
+/// **A loop, because the command is a reconciliation.** Adding is three things with a catch-up
+/// between them, so each call does what is missing and says whether more is needed
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// That is also what makes it safe to run again after any failure, including a `kill -9` in the
+/// middle: it looks at what is there rather than at what it expected.
+pub(crate) fn change_member(
+    options: &MembersOptions,
+    change: &MembersChange,
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let endpoints = crate::server::pd_endpoints(&options.pd)?;
+    let request = match change {
+        MembersChange::Add(member) => esker_proto::PdReq::MemberChange {
+            change: esker_proto::MemberChange::Add,
+            id: member.id,
+            address: member.address.clone(),
+        },
+        MembersChange::Remove(id) => esker_proto::PdReq::MemberChange {
+            change: esker_proto::MemberChange::Remove,
+            id: *id,
+            address: String::new(),
+        },
+    };
+
+    let write = |error: std::io::Error| format!("writing: {error}");
+    let deadline = std::time::Instant::now() + MEMBER_CHANGE_BUDGET;
+    let mut reported = false;
+    loop {
+        let (membership, done) = ask_the_leader(&endpoints, &request)?;
+        if !reported {
+            writeln!(out, "group {:#018x}", membership.group_id).map_err(write)?;
+            reported = true;
+        }
+        if done {
+            return print_members(&membership, out);
+        }
+        if std::time::Instant::now() > deadline {
+            print_members(&membership, out)?;
+            return Err(format!(
+                "the change did not finish within {}s; run the same command again — it picks up \
+                 where it left off",
+                MEMBER_CHANGE_BUDGET.as_secs()
+            ));
+        }
+        // A learner catching up may be waiting on a snapshot, so this is a poll rather than a
+        // spin: the round trip is the cost, and there is nothing to do between them.
+        std::thread::sleep(MEMBER_CHANGE_POLL);
+    }
+}
+
+/// Sends `request` to whichever endpoint leads, following one redirect per endpoint.
+///
+/// A change may only be proposed by a leader, and an operator naming any member should not have to
+/// know which. A `PdNotLeader` names one; a list of endpoints covers the case where it does not,
+/// because an election is under way.
+fn ask_the_leader(
+    endpoints: &[SocketAddr],
+    request: &esker_proto::PdReq,
+) -> Result<(esker_proto::PdMembership, bool), String> {
+    let mut refusal = None;
+    for address in endpoints {
+        let pd = match crate::region::PdConn::connect(*address) {
+            Ok(pd) => pd,
+            Err(error) => {
+                refusal = Some(error);
+                continue;
+            }
+        };
+        match pd.call(request) {
+            Ok(esker_proto::PdResp::MemberChange { membership, done }) => {
+                return Ok((membership, done));
+            }
+            Ok(_) => return Err("the placement driver answered a different question".to_owned()),
+            Err(error) => refusal = Some(error.to_string()),
+        }
+    }
+    Err(format!(
+        "no placement driver in `{}` would take the change: {}",
+        endpoints
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        refusal.unwrap_or_else(|| "none answered".to_owned())
+    ))
 }
 
 fn print_members(
@@ -300,19 +433,41 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
 
-    let peers = parse_peers(&options.peers)?;
-    let members = if peers.is_empty() {
-        MemberList::alone(options.id)
+    let members = if options.join.is_empty() {
+        let peers = parse_peers(&options.peers)?;
+        let members = if peers.is_empty() {
+            MemberList::alone(options.id)
+        } else {
+            MemberList::new(peers).map_err(|error| format!("`--peers`: {error}"))?
+        };
+        if !members.contains(options.id) {
+            return Err(format!(
+                "`--id {}` is not in `--peers {}`; every member founding a group is given the \
+                 same list, itself included",
+                options.id, options.peers
+            ));
+        }
+        members
     } else {
-        MemberList::new(peers).map_err(|error| format!("`--peers`: {error}"))?
+        join_group(options)?
     };
-    if !members.contains(options.id) {
-        return Err(format!(
-            "`--id {}` is not in `--peers {}`; every member is given the same list, itself \
-             included",
-            options.id, options.peers
-        ));
+
+    // **Before the runtime and before the database.** A placement driver told to speak TLS that
+    // came up without it would carry the group's Raft log in the clear on a link an operator
+    // believes is protected; refusing here is the same rule every other surface follows
+    // (ADR 0055).
+    let tls = options.tls.build()?;
+    if tls.is_enabled() {
+        println!(
+            "esker pd: the group's links are TLS{}",
+            if tls.is_mutual() {
+                " with client certificates"
+            } else {
+                ""
+            }
+        );
     }
+    let tls_for_server = tls.clone();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -322,7 +477,7 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
     // Inside the runtime, because the transport's delivery tasks live on it — and before
     // `Pd::open`, because the driver it starts sends its first vote the moment it ticks.
     let transport = runtime.block_on(async {
-        PdTcpTransport::spawn(options.id, &members, TransportConfig::new())
+        PdTcpTransport::spawn_with_tls(options.id, &members, TransportConfig::new(), &tls)
             .map_err(|error| format!("connecting to the group: {error}"))
     })?;
 
@@ -347,6 +502,7 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
             TransportConfig::new(),
         )
         .await
+        .map(|server| server.with_tls(tls_for_server))
         .map_err(|error| format!("listening on {address}: {error}"))?;
         let bound = server
             .local_addr()
@@ -382,6 +538,66 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
         println!("esker pd: stopped");
         Ok(())
     })
+}
+
+/// Asks the group named by `--join` who it is, so this member can join rather than found.
+///
+/// A member added at run time **cannot derive the group's id**: the derivation is over the member
+/// list, and adding this member moved it
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// So it asks, with the one method every member answers whether or not it leads — which matters,
+/// because the operator running this has just been told a member is missing.
+///
+/// The group must already know about this member: `esker pd members add` is what puts it in the
+/// configuration, and starting a process the group has never heard of would leave it campaigning
+/// at a group that will not vote for it.
+fn join_group(options: &ServeOptions) -> Result<MemberList, String> {
+    let endpoints = crate::server::pd_endpoints(&options.join)?;
+    let mut refusal = None;
+    for address in &endpoints {
+        let pd = match crate::region::PdConn::connect(*address) {
+            Ok(pd) => pd,
+            Err(error) => {
+                refusal = Some(error);
+                continue;
+            }
+        };
+        match pd.call(&esker_proto::PdReq::Members) {
+            Ok(esker_proto::PdResp::Members(membership)) => {
+                if !membership.members.iter().any(|held| held.id == options.id) {
+                    return Err(format!(
+                        "the group at {address} has no member {}; run `esker pd members add \
+                         {}@<this member's --listen>` against it first",
+                        options.id, options.id
+                    ));
+                }
+                let members: Vec<PdMember> = membership
+                    .members
+                    .iter()
+                    .map(|held| PdMember::new(held.id, held.address.clone()))
+                    .collect();
+                println!(
+                    "esker pd: joining group {:#018x} as member {} ({} members)",
+                    membership.group_id,
+                    options.id,
+                    members.len()
+                );
+                return MemberList::joining(members, membership.group_id).map_err(|error| {
+                    format!(
+                        "the group at {address} named a membership this \
+                                              build cannot use: {error}"
+                    )
+                });
+            }
+            Ok(_) => return Err("the placement driver answered a different question".to_owned()),
+            Err(error) => refusal = Some(error.to_string()),
+        }
+    }
+    Err(format!(
+        "no placement driver in `--join {}` answered: {}",
+        options.join,
+        refusal.unwrap_or_else(|| "none reachable".to_owned())
+    ))
 }
 
 /// Resolves on the first ctrl-C.

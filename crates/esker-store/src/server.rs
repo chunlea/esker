@@ -157,6 +157,13 @@ pub struct RaftOptions {
     pub tick: std::time::Duration,
     /// How the connections between stores are configured.
     pub transport: TransportConfig,
+    /// The TLS those connections use, if any.
+    ///
+    /// Beside `transport` rather than inside it: `TransportConfig` is `Copy` and `Eq` and is
+    /// passed by value into every delivery task, and a configuration behind an `Arc` is neither
+    /// ([ADR 0055](../../../docs/adr/0055-the-tls-options-across-three-surfaces-measured.md)).
+    /// Disabled by default, which is every store that does not ask for it.
+    pub tls: esker_proto::transport::RpcTls,
     /// When each region's Raft log is compacted.
     pub compaction: LogCompaction,
     /// How many driver threads this store runs. Regions are pinned across them by id
@@ -174,6 +181,7 @@ impl RaftOptions {
             seed,
             tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             transport: TransportConfig::new(),
+            tls: esker_proto::transport::RpcTls::disabled(),
             compaction: LogCompaction::new(),
             driver_workers: crate::driver::DRIVER_WORKERS,
         }
@@ -591,10 +599,11 @@ impl Store {
         // A replicated store needs a runtime: the transport's tasks and the tickers live in one.
         // A store with no Raft options is exactly phase 2's and needs nothing.
         let transport = raft.as_ref().map(|raft| {
-            StoreTransport::spawn(
+            StoreTransport::spawn_with_tls(
                 store_id,
                 &StoreAddress::from_peers(&raft.peers),
                 raft.transport,
+                &raft.tls,
             )
         });
 

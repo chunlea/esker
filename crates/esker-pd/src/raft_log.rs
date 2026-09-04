@@ -46,9 +46,20 @@ use esker_raft::{
 };
 
 use crate::error::{PdError, Result};
+use crate::member::{MAX_MEMBERS, PdMember};
 
-/// Version byte on the state record. A change to any field's meaning bumps it.
-const STATE_FORMAT_VERSION: u8 = 1;
+/// Version byte on the state record.
+///
+/// **Version 2** appends the group id and the address book
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// A version-1 record still reads: it decodes as group id **zero** and no members, which is exactly
+/// the state a member written before dynamic membership is in — and zero is the signal to mint an
+/// id from the configured list and write it down. Every field version 1 had is byte-identical, and
+/// the two new ones are appended, so the upgrade is a decode branch rather than a migration.
+const STATE_FORMAT_VERSION: u8 = 2;
+
+/// The version this build still reads, and rewrites as [`STATE_FORMAT_VERSION`] on the next write.
+const STATE_FORMAT_VERSION_V1: u8 = 1;
 
 /// Version byte on a log entry's value.
 const ENTRY_FORMAT_VERSION: u8 = 1;
@@ -163,6 +174,20 @@ pub struct PersistedState {
     pub truncated_index: Index,
     /// The term of the entry at `truncated_index`.
     pub truncated_term: Term,
+    /// What identifies this group's traffic, minted once and never recomputed
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    ///
+    /// **Zero means "not yet minted"**, which is both a fresh database and a record written before
+    /// there was such a thing. Zero is not a group id anywhere in this codebase — `derived_group_id`
+    /// refuses to return it — so it is free to carry that meaning.
+    pub group_id: u64,
+    /// Where every member of the group is.
+    ///
+    /// Here rather than in the state machine because it answers the same question the two fields
+    /// above answer: what does this member need **before it has applied anything**. A member that
+    /// is catching up has no state machine to read, and it cannot catch up without reaching the
+    /// group.
+    pub members: Vec<PdMember>,
 }
 
 impl PersistedState {
@@ -187,6 +212,13 @@ impl PersistedState {
         out.put_varint(self.truncated_term);
         put_ids(&mut out, &self.conf_state.voters);
         put_ids(&mut out, &self.conf_state.learners);
+        // Version 2 appends from here. Everything above is byte-identical to version 1.
+        out.put_u64(self.group_id);
+        out.put_varint(self.members.len() as u64);
+        for member in &self.members {
+            out.put_varint(member.id);
+            out.put_str(&member.address);
+        }
         out.finish()
     }
 
@@ -197,10 +229,12 @@ impl PersistedState {
             |error: esker_proto::DecodeError| PdError::corrupt("raft state", error.to_string());
 
         let version = input.get_u8("state.version").map_err(field)?;
-        if version != STATE_FORMAT_VERSION {
+        if version != STATE_FORMAT_VERSION && version != STATE_FORMAT_VERSION_V1 {
             return Err(PdError::corrupt(
                 "raft state",
-                format!("format version {version}, expected {STATE_FORMAT_VERSION}"),
+                format!(
+                    "format version {version}, expected {STATE_FORMAT_VERSION_V1} or {STATE_FORMAT_VERSION}"
+                ),
             ));
         }
         let term = input.get_varint("state.term").map_err(field)?;
@@ -220,6 +254,22 @@ impl PersistedState {
         let truncated_term = input.get_varint("state.truncated_term").map_err(field)?;
         let voters = get_ids(&mut input, "state.voters")?;
         let learners = get_ids(&mut input, "state.learners")?;
+        // A version-1 record ends here, and reads as a group that has not minted an id and knows
+        // nowhere to send. Both are true of it.
+        let (group_id, members) = if version == STATE_FORMAT_VERSION_V1 {
+            (0, Vec::new())
+        } else {
+            let group_id = input.get_u64("state.group_id").map_err(field)?;
+            let count = input.get_count("state.members").map_err(field)?;
+            let mut members = Vec::with_capacity(count.min(MAX_MEMBERS));
+            for _ in 0..count {
+                members.push(PdMember::new(
+                    input.get_varint("state.member.id").map_err(field)?,
+                    input.get_str("state.member.address").map_err(field)?,
+                ));
+            }
+            (group_id, members)
+        };
         input.finish().map_err(field)?;
 
         let mut conf_state = ConfState { voters, learners };
@@ -234,6 +284,8 @@ impl PersistedState {
             applied_index,
             truncated_index,
             truncated_term,
+            group_id,
+            members,
         })
     }
 }
@@ -356,6 +408,49 @@ impl PdLogStorage {
     #[must_use]
     pub fn truncated_index(&self) -> Index {
         self.state.truncated_index
+    }
+
+    /// What identifies this group's traffic, or **zero** if it has not been minted yet.
+    #[must_use]
+    pub fn group_id(&self) -> u64 {
+        self.state.group_id
+    }
+
+    /// Where every member of the group is, as this member last recorded it.
+    #[must_use]
+    pub fn members(&self) -> &[PdMember] {
+        &self.state.members
+    }
+
+    /// Records the group's id and its address book, staging the write into `batch`.
+    ///
+    /// Two callers, and they are the two moments a member learns who it is with: `Pd::open`, which
+    /// mints the id for a founding group or writes the one a joining member was told, and the
+    /// driver, which learns an address from a conf change **at append** — before that `Ready`'s
+    /// messages go out, because a configuration is in force from the moment its entry is on disk.
+    ///
+    /// The id is refused if it would **change**: it is minted once and never recomputed
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
+    /// and a member that quietly adopted a different one would have rejoined a different group.
+    pub fn stage_group(
+        &mut self,
+        batch: &mut WriteBatch,
+        group_id: u64,
+        members: &[PdMember],
+    ) -> Result<()> {
+        if self.state.group_id != 0 && group_id != 0 && group_id != self.state.group_id {
+            return Err(PdError::invalid(format!(
+                "this placement driver belongs to group {:#018x} and was asked to join \
+                 {group_id:#018x}; a group id is minted once and never changes",
+                self.state.group_id
+            )));
+        }
+        if group_id != 0 {
+            self.state.group_id = group_id;
+        }
+        self.state.members = members.to_vec();
+        self.stage_state(batch);
+        Ok(())
     }
 
     /// Adds the state record to `batch`, in full.
@@ -551,8 +646,10 @@ mod tests {
     use super::{
         PdLogStorage, PersistedState, decode_entry, encode_entry, log_entry_key, state_key,
     };
+    use crate::member::PdMember;
     use bytes::Bytes;
     use esker_engine::{Db, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
+    use esker_proto::Encoder;
     use esker_raft::{ConfState, Entry, EntryKind, HardState, LogStorage};
     use std::sync::Arc;
 
@@ -665,6 +762,11 @@ mod tests {
             applied_index: 10,
             truncated_index: 4,
             truncated_term: 2,
+            group_id: 0x0123_4567_89AB_CDEF,
+            members: vec![
+                PdMember::new(1, "127.0.0.1:2379"),
+                PdMember::new(2, "127.0.0.1:2380"),
+            ],
         };
         assert_eq!(PersistedState::decode(&state.encode()).unwrap(), state);
 
@@ -674,9 +776,62 @@ mod tests {
                 voted_for: None,
                 ..state.hard_state
             },
-            ..state
+            ..state.clone()
         };
         assert_eq!(PersistedState::decode(&unvoted.encode()).unwrap(), unvoted);
+
+        // And the shape a group that has not minted an id is in.
+        let unnamed = PersistedState {
+            group_id: 0,
+            members: Vec::new(),
+            ..state
+        };
+        assert_eq!(PersistedState::decode(&unnamed.encode()).unwrap(), unnamed);
+    }
+
+    /// **A record written before there were group ids still reads**, and reads as what it is: a
+    /// member that has not minted one and knows nowhere to send. Everything version 1 wrote is
+    /// byte-identical, which is what makes this an appended field rather than a migration
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    #[test]
+    fn a_version_one_record_reads_as_a_group_that_has_not_been_named() {
+        let state = PersistedState {
+            hard_state: HardState {
+                term: 3,
+                voted_for: Some(2),
+                commit: 11,
+            },
+            conf_state: ConfState::from_voters(vec![1, 2, 3]),
+            applied_index: 10,
+            truncated_index: 4,
+            truncated_term: 2,
+            group_id: 7,
+            members: vec![PdMember::new(1, "127.0.0.1:2379")],
+        };
+        // Version 1's bytes are version 2's, minus the two appended fields — which is the claim
+        // being made, so it is built by truncation rather than by a second encoder agreeing.
+        let v2 = state.encode();
+        let appended = {
+            let mut out = Encoder::new();
+            out.put_u64(state.group_id);
+            out.put_varint(1);
+            out.put_varint(1);
+            out.put_str("127.0.0.1:2379");
+            out.finish()
+        };
+        let mut v1 = v2[..v2.len() - appended.len()].to_vec();
+        assert_eq!(&v2[v2.len() - appended.len()..], &appended[..]);
+        v1[0] = 1;
+
+        let read = PersistedState::decode(&v1).unwrap();
+        assert_eq!(read.hard_state, state.hard_state);
+        assert_eq!(read.conf_state, state.conf_state);
+        assert_eq!(read.applied_index, 10);
+        assert_eq!(read.group_id, 0, "a version-1 record named a group");
+        assert!(read.members.is_empty());
+
+        // And the next write rewrites it as version 2, so the branch is taken once per member.
+        assert_eq!(read.encode()[0], super::STATE_FORMAT_VERSION);
     }
 
     #[test]

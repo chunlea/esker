@@ -27,10 +27,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // PostgreSQL's own renderer and this node has no pretty-printer for a definition.
         (
             "SELECT 'r', pg_get_viewdef('rc_view'::regclass, true)",
-            "Refused by name: `pg_get_viewdef` prints a view's body through PostgreSQL's renderer, \
-             one column per line with its own indentation, and reproducing that is a \
-             pretty-printer for the whole expression language. Declared identically in \
-             `tests/view.rs`.",
+            "It answers with the stored text now; what differs is PostgreSQL's layout, one column \
+             per line with its own indentation. Declared identically in `tests/view.rs`.",
+        ),
+        // **Un-swallowed by the line above**, which used to abort the block — the same shape this
+        // file already records for `CREATE VIEW` seven lines further up.
+        (
+            "SELECT 'r', count(*) FROM rc_view",
+            "`42703`: **a view here stores text, and PostgreSQL's stores a parse tree.** Renaming \
+             a column the view reads leaves this node's definition naming a column that is gone, \
+             where a real server's view follows the rename because it never held the name in the \
+             first place. Fixing it means resolving a view's body to ordinals at `CREATE VIEW` \
+             time and re-rendering it on demand — the same shape as the row codec's positional \
+             columns (ADR 0030), and its own unit.",
         ),
         // **A pre-existing bug this unit made visible, and not a view divergence.** `CREATE VIEW`
         // used to abort the transaction seven lines above, so everything after it was swallowed

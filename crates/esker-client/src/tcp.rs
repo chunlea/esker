@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use esker_proto::transport::{BlockingTransport, TransportConfig};
+use esker_proto::transport::{BlockingTransport, RpcTls, TransportConfig};
 
 use crate::transport::StoreTransport;
 use crate::wire::{CallResult, ProtoError, Request};
@@ -44,7 +44,33 @@ impl TcpStores {
 
     /// [`TcpStores::connect`], with the transport configured explicitly.
     pub fn connect_with(addr: SocketAddr, config: TransportConfig) -> Result<Self, ProtoError> {
-        let connection = BlockingTransport::connect_with(addr, config)?;
+        Self::connect_over(addr, config, &RpcTls::disabled())
+    }
+
+    /// [`TcpStores::connect_with`], over TLS.
+    ///
+    /// This is the client↔store link, and it is the one where the two ends are **not** both ours:
+    /// the client may be a SQL node with no certificate of its own. A store that requires client
+    /// certificates would refuse it, which is why mTLS is a choice per link rather than a mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`TcpStores::connect_with`], plus a handshake the store refused.
+    pub fn connect_with_tls(
+        addr: SocketAddr,
+        config: TransportConfig,
+        tls: &RpcTls,
+    ) -> Result<Self, ProtoError> {
+        Self::connect_over(addr, config, tls)
+    }
+
+    /// The one connect path; TLS or not is decided by `tls`.
+    fn connect_over(
+        addr: SocketAddr,
+        config: TransportConfig,
+        tls: &RpcTls,
+    ) -> Result<Self, ProtoError> {
+        let connection = BlockingTransport::connect_with_tls(addr, config, tls, None)?;
         let store_id = connection.hello_ack().store_id;
         Ok(Self {
             // `TODO(debt-c6 #4)`: PD's store list would replace this, and one connection would

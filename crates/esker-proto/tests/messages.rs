@@ -14,7 +14,8 @@ use esker_proto::fragment::{
 };
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{
-    ColumnarWish, Operator, PdMemberInfo, PdMembership, PdRaftBatch, PdReq, PdResp, StoreInfo,
+    ColumnarWish, MemberChange, Operator, PdMemberInfo, PdMembership, PdRaftBatch, PdReq, PdResp,
+    StoreInfo,
 };
 use esker_proto::schema::{SchemaReq, SchemaResp};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
@@ -88,6 +89,26 @@ const PD_CLUSTER: u64 = 0xABCD;
 /// varint — a group id is a hash, so it is large in the ordinary case — and a value with repeated
 /// bytes would not catch a byte order that had been reversed.
 const PD_GROUP: u64 = 0x0123_4567_89AB_CDEF;
+
+/// The group a `Pd::MemberChange` golden answers with: member 4 has just been added beside 2.
+fn growing_membership() -> PdMembership {
+    PdMembership {
+        group_id: PD_GROUP,
+        this_id: 2,
+        leader_id: 2,
+        term: 9,
+        members: vec![
+            PdMemberInfo {
+                id: 2,
+                address: "127.0.0.1:2380".to_owned(),
+            },
+            PdMemberInfo {
+                id: 4,
+                address: "127.0.0.1:2382".to_owned(),
+            },
+        ],
+    }
+}
 
 /// The `Pd` goldens, in their own function: `docs/DESIGN.md` §9 gives the service six methods,
 /// and a corpus function holding every message of every service is one nobody reads.
@@ -198,6 +219,30 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
             Request::Pd {
                 cluster_id: PD_CLUSTER,
                 request: PdReq::Members,
+            },
+        ),
+        (
+            "pd-member-add",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::MemberChange {
+                    change: MemberChange::Add,
+                    id: 4,
+                    address: "127.0.0.1:2382".to_owned(),
+                },
+            },
+        ),
+        // A removal names no address, and the empty string is a *present* field rather than an
+        // absent one — a different byte, and the reason it has a golden of its own.
+        (
+            "pd-member-remove",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::MemberChange {
+                    change: MemberChange::Remove,
+                    id: 2,
+                    address: String::new(),
+                },
             },
         ),
         (
@@ -753,6 +798,23 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                     },
                 ],
             })),
+        ),
+        // Both answers to one step of a change: "call again" and "that is all". They differ in
+        // one byte, which is exactly why both are pinned — a `done` that was always true would
+        // pass a golden for the true case alone.
+        (
+            "pd-member-change-more",
+            Response::Pd(PdResp::MemberChange {
+                membership: growing_membership(),
+                done: false,
+            }),
+        ),
+        (
+            "pd-member-change-done",
+            Response::Pd(PdResp::MemberChange {
+                membership: growing_membership(),
+                done: true,
+            }),
         ),
         // "Nobody leads yet" is a different answer from "the leader is member zero", and only a
         // golden for both pins the difference — the same reason `not-leader-blind` has one.

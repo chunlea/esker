@@ -577,7 +577,8 @@ where
                     // From here the client starts a TLS handshake and then sends its real startup
                     // packet inside it, so there is nothing pending: the session reads it through
                     // the encrypted stream like any other.
-                    let encrypted = crate::pgwire::tls::accept(stream, server).await?;
+                    let encrypted =
+                        esker_proto::transport::tls::accept(stream, Arc::clone(server)).await?;
                     return Ok((MaybeTlsStream::Tls(encrypted), None));
                 }
                 refuse(&mut stream, tls).await?;

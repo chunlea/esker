@@ -240,7 +240,9 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 8 — ranges, enums and domains. **This node has ranges now**, so the partition
+    // 8 — ranges, enums and domains. **Six ranges now, not three**: `range_test.rb` declares two
+    // range *arrays* and an array type is built per element type, so the other five had to come
+    // too. The partition
     // `TypeMapInitializer#run` registers is no longer empty: three `typtype = 'r'` rows, which is
     // what makes `ActiveRecord` decode a `tsrange` column instead of handing back a string. The
     // query's `LEFT JOIN pg_range` is why it is asked without one here — `pg_range` is not a
@@ -253,8 +255,11 @@ fn activerecord_s_four_type_map_queries_answer() {
         ),
         vec![
             vec!["3904", "int4range", "r"],
+            vec!["3906", "numrange", "r"],
             vec!["3908", "tsrange", "r"],
             vec!["3910", "tstzrange", "r"],
+            vec!["3912", "daterange", "r"],
+            vec!["3926", "int8range", "r"],
         ]
     );
 
@@ -476,10 +481,64 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
+            // **Every range array joins them**, because the adapter's list holds all six
+            // range oids: an array is found by its element's oid, and these are the rows
+            // that make `t.tsrange :ranges, array: true` and `t.tstzrange :tstz_ranges,
+            // array: true` decode instead of coming back as strings.
+            vec![
+                "3905".to_owned(),
+                "_int4range".to_owned(),
+                "3904".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3907".to_owned(),
+                "_numrange".to_owned(),
+                "3906".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "3909".to_owned(),
                 "_tsrange".to_owned(),
                 "3908".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3911".to_owned(),
+                "_tstzrange".to_owned(),
+                "3910".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3913".to_owned(),
+                "_daterange".to_owned(),
+                "3912".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3927".to_owned(),
+                "_int8range".to_owned(),
+                "3926".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

@@ -18,6 +18,7 @@ use crate::{Frame, FrameKind, ProtoError, Request, Response, WIRE_VERSION};
 
 use super::TransportConfig;
 use super::conn::{BoxFuture, FrameAction, FrameSink, read_frames, spawn_writer};
+use super::tls::{MaybeTlsStream, RpcTls};
 
 /// What a server does with a request.
 ///
@@ -104,6 +105,11 @@ pub struct Server {
     listener: TcpListener,
     service: Arc<dyn Service>,
     config: TransportConfig,
+    /// What this server was told about TLS, if anything.
+    ///
+    /// Beside `config` rather than inside it: `TransportConfig` is `Copy` and `Eq` and is passed
+    /// by value into every connection task, and a configuration behind an `Arc` is neither.
+    tls: RpcTls,
 }
 
 impl Server {
@@ -119,7 +125,21 @@ impl Server {
             listener,
             service,
             config,
+            tls: RpcTls::disabled(),
         })
+    }
+
+    /// Serves TLS on every connection this server accepts.
+    ///
+    /// A `tls` that is enabled makes encryption **required**, not offered: this protocol has no
+    /// in-band upgrade like the PostgreSQL port's `SSLRequest`, so a peer that connects in the
+    /// clear fails its handshake rather than being served. That is the intended behaviour — a
+    /// cluster link is configured on both ends by the same operator — and it is why the flags
+    /// refuse to come up half-configured.
+    #[must_use]
+    pub fn with_tls(mut self, tls: RpcTls) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Adopts a listener that is **already bound**, so the port never has to be let go of.
@@ -147,6 +167,7 @@ impl Server {
             listener: TcpListener::from_std(listener)?,
             service,
             config,
+            tls: RpcTls::disabled(),
         })
     }
 
@@ -172,9 +193,10 @@ impl Server {
                         Ok((stream, peer)) => {
                             let service = Arc::clone(&self.service);
                             let config = self.config;
+                            let tls = self.tls.clone();
                             let stopping = stopping.clone();
                             connections.spawn(async move {
-                                if let Err(error) = serve_connection(stream, service, config, stopping).await {
+                                if let Err(error) = serve_connection(stream, service, config, &tls, stopping).await {
                                     tracing::debug!(%peer, %error, "connection ended");
                                 }
                             });
@@ -245,10 +267,15 @@ async fn serve_connection(
     stream: TcpStream,
     service: Arc<dyn Service>,
     config: TransportConfig,
+    tls: &RpcTls,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<(), ProtoError> {
     let _ = stream.set_nodelay(true);
-    let (source, sink) = stream.into_split();
+    // The handshake happens **before** the framed loop, so a peer that cannot be verified never
+    // reaches a `Service` at all — and under mTLS that is where a peer with no certificate, or one
+    // signed by a CA this node does not trust, is turned away.
+    let stream = wrap_server(stream, tls).await?;
+    let (source, sink) = tokio::io::split(stream);
     let (sink, stop) = spawn_writer(sink, &config);
 
     // The permits *are* the in-flight limit: a request that cannot take one is shed with a
@@ -439,6 +466,34 @@ impl ConnectionState {
 
 fn error_frame(request_id: u64, error: &ProtoError) -> Frame {
     Frame::new(FrameKind::Error, request_id, Bytes::from(error.encode()))
+}
+
+/// Wraps an accepted socket in a TLS session when one is configured.
+#[cfg(feature = "tls")]
+async fn wrap_server(
+    stream: TcpStream,
+    tls: &RpcTls,
+) -> Result<MaybeTlsStream<TcpStream>, ProtoError> {
+    let Some(config) = tls.server() else {
+        return Ok(MaybeTlsStream::Plain(stream));
+    };
+    let encrypted =
+        super::tls::accept(stream, config)
+            .await
+            .map_err(|error| ProtoError::Closed {
+                detail: format!("the TLS handshake failed: {error}"),
+            })?;
+    Ok(MaybeTlsStream::Tls(encrypted))
+}
+
+/// Without the feature there is nothing to wrap: `RpcTls` cannot be enabled.
+#[cfg(not(feature = "tls"))]
+#[expect(clippy::unused_async, reason = "one signature for both builds")]
+async fn wrap_server(
+    stream: TcpStream,
+    _tls: &RpcTls,
+) -> Result<MaybeTlsStream<TcpStream>, ProtoError> {
+    Ok(MaybeTlsStream::Plain(stream))
 }
 
 #[cfg(test)]

@@ -509,3 +509,329 @@ the hazard needs a caller that ticks in a tight loop, which is a test. The fix i
 code, and the honest limit of it is that the failure stays load-dependent: with the barrier gone it
 is green 10 of 10 on a quiet box. What is deterministic is the *success* path — 20 ticks, 2 grants,
 invariant under load — and that is what the new assertion pins.
+## 7. Two harness findings from gating this wave, and the one that is a real debt
+
+Not planned work. The wave's own gate failed four tests twice and passed them on a third run, and
+running that down produced two things worth keeping.
+
+### The gate's failures were the shared network namespace, except one
+
+`~/workspace/lab/esker-docker/run.sh` starts every container with
+`--network container:esker-minio`, so **two lanes gating at once share one port space**. Three
+runs of the same tree:
+
+| run | foreign `esker-test` containers | result |
+|---|---|---|
+| first | one observed during the test phase | 3065/3066 |
+| second | one observed during the test phase | 3066/3070 |
+| third | **0 of 49 samples** | **3070/3070** |
+
+The counter that separates them had to be the number of *test* containers, not of containers:
+an `esker-in` compile job overlapped 48 of 49 samples of the passing run and binds no test port.
+Counting any container made the passing run look as contended as the failing one, which nearly
+threw the explanation away.
+
+`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster` passed in
+the exclusive run after failing on a 60 s timeout in both contended ones. It is carried as a
+standing flake with an owner; this is evidence it is the same contention rather than a defect of
+its own.
+
+### The one that is not the namespace: a wall-clock kill racing CPU-bound progress
+
+`esker-client::crash_through_the_client every_acknowledged_write_survives_a_kill_of_the_server`
+fails **6 runs in 10** under twenty-four spinning threads **in a single container**, where no port
+collision is possible. So it is not the namespace, and the harness fix would have buried it.
+
+It is also **not a durability failure**, and the panic's line says so before any reasoning does.
+The failure is at `crash_through_the_client.rs:305`:
+
+```rust
+assert!(acked > 0, "round {round} acknowledged nothing, so it proved nothing");
+```
+
+— the round's own guard that it did any work. The durability assertion, *"acknowledged write
+{index} did not survive the kill"*, is at `:287` and fired in none of the six. No acknowledged
+write was lost. The child is killed at a random moment measured on the **wall clock** while the
+writes it is meant to interrupt are **CPU-bound**, so on a loaded box the kill can land before the
+first acknowledgement and the round has nothing to verify.
+
+The guard is right to fail rather than pass vacuously — a round that verified nothing must not
+count. The defect is that the round cannot say "I was starved, give me more time". A fix belongs
+on the test side: measure the kill point in *acknowledged writes* rather than in milliseconds, or
+retry a round that acked none before declaring it a failure.
+
+- **Site:** `crates/esker-client/tests/crash_through_the_client.rs:305`, and the kill timing that
+  feeds it. **Size:** small. **Reproduction:** 10 runs under 24 busy threads, one container.
+
+### And the wait rule needs its settle to re-arm
+
+The lane rule is one container at a time. Implemented as *empty → sleep 30 → check again*, a
+container that arrives inside the window and exits before the second check slips through. Looping
+back to the wait instead fired twice on one gate ("a container appeared during the settle; waiting
+again") before a slot was genuinely clear at 110 s. The check has to re-arm, not re-check.
+
+## 8. The two `snapshot.rs:228` sightings: a retry that never changed its mind
+
+Assigned as load-sensitive flakes: `esker-store::snapshot a_region_reaches_a_store_that_never_had_it`
+and `a_snapshot_replacing_a_held_region_routes_through_a_retire`, both panicking at
+`tests/snapshot.rs:228`.
+
+### Neither reproduced under load, and that is a result
+
+| stressor | outcome |
+|---|---|
+| 24 spinning threads, 8 runs each | 8/8 pass, both tests |
+| six full runs of this crate's 305 tests | 305/305 each, 0 hits |
+
+Both tests need an **election**, and an election needs a peer starved for the 250–500 ms this
+file's tick budget allows (25 ms ticks, 10–20 of them). Spinning threads preempt in far shorter
+slices, and three hundred concurrent tests do not reliably hold one thread off the CPU that long.
+More load would have been guessing at a bigger number.
+
+### What it is, found by reading and then driven
+
+`put` retries what the store tells it to retry — right — and re-reads the region's epoch each time
+round — also right, and not enough. **An election moves no epoch.** So a `NotLeader` is re-sent to
+the peer that just disclaimed leadership, at the same epoch, until the 30 s deadline; and in a
+two-voter group the office does not come back on its own. That is a livelock, and thirty seconds
+of it is indistinguishable from a hang.
+
+Both tests reach it after `AddPeer`, because `promote_caught_up_learners` makes the learner a
+voter and an election possible: `a_region_reaches_a_store_that_never_had_it` in its second write
+batch, and `a_snapshot_replacing_a_held_region_routes_through_a_retire` in the burst inside
+`announce_until_retired`. The batches that run while store 1 is the sole voter are innocent — a
+single voter cannot lose an election — which is why they keep the single-store form.
+
+The helper's own documentation had already recorded the symptom, and answered it with the retry:
+*"a two-voter group on a box that will not schedule its threads legitimately elects the other
+one… fifteen times in twenty runs."* Retrying is the honest reading of a retryable error. It was
+the right verb aimed at the wrong destination.
+
+### The deterministic test
+
+`a_write_follows_the_office_when_it_moves` drives the state instead of waiting for it: two voters,
+`TransferLeader`, assert the office actually moved, then write to the store that **stopped**
+leading. Red without the fix, in the words of the instrumentation:
+
+```
+writing b"k00001" never succeeded after 6711 attempts in 30.000960487s;
+last answer peer is not the leader of region 1;
+last asked store 1, whose peer says leader=Some(Some(2))
+```
+
+Six thousand seven hundred and eleven attempts, all to store 1, whose own peer knew the leader was
+peer 2. The caller never asked it. Green with the fix, and the whole file runs 13/13 in 1.2 s
+against 30.6 s to fail.
+
+### The honest limit of this unit
+
+The driven test proves the mechanism and the fix. It does **not** prove that this mechanism is
+what produced the two recorded sightings, because neither reproduced: the diagnosis fits their
+panic line, their timing and their position after `AddPeer`, and it remains an inference. If either
+recurs, the instrumentation now names the store asked, the attempts, the elapsed time and the
+leader the asked store believed in — enough to confirm or refute it from one red run.
+
+### The wider shape, recorded not fixed
+
+Seven of nine `esker-store` test files carry a retry helper of their own and only `cluster.rs`
+looks at a leader hint at all — `balance.rs`, `retire.rs`, `server.rs`, `sim_snapshot_ask.rs`,
+`sim_sweep.rs`, `split.rs`. Most write while a single voter leads and cannot hit this, but the
+shape is one bug per file rather than one bug, and it is the "count the parsers before fixing the
+caller" lesson in test code. Not swept here: each needs its own judgement about whether a second
+voter can exist at the moment it writes.
+
+## 9. `sim_sweep the_sweep_reclaims_on_evidence_and_never_otherwise`: a hypothesis that did not survive its own measurement
+
+The third assigned sighting, recorded as time-based.
+
+### The hypothesis, which was wrong
+
+The test judges every case inside a three-second wall-clock window, justified in the code as
+*"long enough for the throttle (50 leaderless rounds at a 5 ms tick) several times over"*. That
+arithmetic converts a **count** into **milliseconds**, and the interval it counts is
+`MissedTickBehavior::Skip` — a tick lost to a busy process is a round that never happens rather
+than one that happens late. So on a loaded box the window should shrink in rounds while still
+looking like three seconds, and a case that should reclaim should report `still_hosted: true`,
+which this test reads as the store's *decision*.
+
+It is a tidy story, it fits the recorded sighting, and it is false.
+
+### The measurement that refuted it
+
+| | quiet | 48 spinning threads | needed |
+|---|---|---|---|
+| reclamation, the one case that reclaims | 254 ms | 433 ms | window is 3000 ms |
+| rounds inside the window | ~590 | ~520–600 | throttle needs 50 |
+
+Beats held at 130–150 per three seconds under forty-eight spinners against ~150 quiet. The round
+rate does not collapse; the margin is about sevenfold in time and tenfold in rounds. Nor did the
+test reproduce: 5 runs quiet and 8 under load, all green.
+
+**So the window was not changed.** Widening it, or replacing it with a wait on beats, would have
+been repairing something that is not broken on the strength of a mechanism that measurement had
+already ruled out.
+
+### What did change, and why it is worth a commit
+
+The prose claim — *several times over* — was the only thing connecting a budget spent in wall
+clock to a throttle counted in rounds, and nothing checked it. A store beat is emitted every
+`store_heartbeat / tick` rounds (20 ms / 5 ms = 4), so the beats PD received **are** a count of the
+rounds that really ran, and the test now asserts that the full-window cases got at least twice the
+throttle's fifty. Erosion — a tighter tick, a larger `ORPHAN_PROBE_ROUNDS`, a slower box — now
+fails loudly saying the window ran out of clock, instead of arriving as `still_hosted: true` and
+being read as a decision.
+
+No bug was found. A stated precondition became a checked one.
+
+### The other clocks, measured too
+
+The watch window is not the only wall clock in the test: five `wait_for` calls carry 30 s
+deadlines over work that is round-driven, which is the same shape and had to be checked rather
+than assumed. Worst case across five runs under forty-eight spinning threads:
+
+| wait | quiet | loaded | deadline |
+|---|---|---|---|
+| a leader on the first store | 285 ms | 429 ms | 30 s |
+| the region to arrive on the second store | 30 ms | 75 ms | 30 s |
+| the second store's peer to become a voter | 63 ms | 190 ms | 30 s |
+| every column family to arrive | 354 µs | 61 µs | 30 s |
+| the peer to lose its leader | 270 ms | 276 ms | 30 s |
+
+About seventy times over at the tightest. So the deadlines are not the mechanism either, and the
+measurement is written into `wait_for`'s doc so the next reader does not have to take it on faith.
+
+### The sighting, left as a sighting
+
+Unreproduced across two load models and thirteen runs, and now with every clock in the test
+measured: the watch window has ~7x margin in time and ~10x in rounds, the five waits have ~70x.
+The recorded "time-based" label is wrong on both counts.
+
+Also excluded: this file has its own copy of the no-hint `put` helper that §8 fixed in
+`snapshot.rs`, and it does build a two-voter group — but `seed_all_three_families` runs **before**
+the second store is opened, so every write happens while store 1 is the sole voter and cannot lose
+office. Ruled out by ordering rather than by hope.
+
+Recorded rather than explained. What is eliminated: the window's length, the round rate under CPU
+load, the five wait deadlines, and the leader-hint livelock. What remains is one container run
+that failed once for a reason this lane could not find — and the window's precondition is now
+asserted, so the next occurrence says whether it ran out of clock instead of reporting a
+truncation as a decision.
+
+### The wider family, and the one that fails the other way
+
+Three instances of one mistake live in these crates, each converting a count into milliseconds
+once, on a quiet machine:
+
+| site | counted in | judged by | under load |
+|---|---|---|---|
+| `peer.rs`'s election pump (§6) | drives | tick iterations | flaky — **fixed** |
+| `sim_sweep.rs`'s watch window | leaderless rounds | 3 s | sound, margin now asserted |
+| `snapshot.rs:548` | heartbeat rounds | a 200 ms sleep | latently vacuous — **fixed in §11** |
+
+The third is the one worth chasing next. `sleep(200ms)` then *"an operator from a stale epoch was
+applied"* is a **negative** assertion behind a wall clock: what it proves is that nothing
+happened, and a store that has not yet *fetched* the operator also makes nothing happen, so where
+the sleep is too short it goes green rather than red.
+
+**Corrected in §11 by a mutation test, and the correction matters.** This paragraph originally
+said the test "fails only on the day the rejection breaks — and it will still pass". That is
+wrong: against a store forced to ignore the stale epoch, the 200 ms form **did** fail. On a quiet
+box the sleep was long enough and the test worked. The defect is *latent* — sound exactly while
+delivery fits inside the sleep — not a test that never worked.
+
+## 10. The retry-helper audit: seven files carry the shape, none of them is exposed
+
+`docs/plans/debt-c6.md` §8 ended by noting that seven of nine `esker-store` test files carry a
+retry helper of their own and only `cluster.rs` looks at a leader hint. That is a count of the
+*shape*. It is not a count of the *exposure*, and the difference is the whole of this section.
+
+### The audit
+
+A helper is exposed only if a write can run while the region has **more than one voter** — a sole
+voter cannot lose an election, so there is no office for the write to be aimed at wrongly.
+
+| file | multi-voter anywhere? | writes after its `AddPeer`? | exposed |
+|---|---|---|---|
+| `snapshot.rs` | yes | **yes**, three batches | **was — fixed in §8** |
+| `promotion.rs` | yes | yes | **no — already correct** |
+| `balance.rs` | yes, in `regions_reach_a_store_that_joins…` | no: its writes are in `a_dozen_regions_on_two_workers_all_make_progress`, which is single-node | no |
+| `retire.rs` | yes | no, every write precedes it | no |
+| `sim_sweep.rs` | yes | no, `seed_all_three_families` runs before the second store opens | no |
+| `server.rs` | no | — | no |
+| `sim_snapshot_ask.rs` | no | — | no |
+| `split.rs` | no | — | no |
+
+`balance.rs` is the one that looks exposed and is not: its `AddPeer` and its writes are in
+different tests, and the writing one builds `peers = vec![PeerAddress::new(1, 1, address)]` with
+`bootstrap_voters: Some(vec![1])` — one store, one voter, twelve regions after the splits.
+Leadership has nowhere to move to.
+
+`promotion.rs` had solved this independently, by scanning the group for whichever store's peer
+reports `is_leader()` rather than by following the hint, and its comment says why: *"a load
+generator that only knows one store measures the bug rather than the fix."*
+
+### Why no shared helper was extracted
+
+The instruction was to fix it once, in one place, if the files share it. **They do not share it** —
+there is no `tests/common/` module, and each integration test is its own binary — so "once, in one
+place" would mean creating a module and importing it into six binaries in order to change nothing
+about any of them.
+
+Worse than nothing: giving a single-voter test a group parameter states that its writes might be
+refused by the store they are aimed at, which is exactly false and is the fact that keeps those
+tests simple. The distinction is load-bearing, so it is now written down where a future sweep will
+hit it — `retire.rs` and `sim_sweep.rs`'s helpers each say in one paragraph why they take one store
+and what would have to change for that to stop being true.
+
+### The rule this leaves
+
+Count the shape to find candidates; count the *exposure* before changing any of them. Seven files
+matched a grep and one had the bug.
+
+## 11. `an_operator_against_a_stale_epoch_is_dropped`: a negative assertion behind a clock
+
+`crates/esker-store/tests/snapshot.rs`. Found while auditing §9's family, not assigned.
+
+The test issues an `AddPeer` carrying a stale epoch, slept 200 ms — *"long enough for several
+heartbeat rounds to have carried it"* — and then asserted the region still had one peer. A
+**negative** assertion behind a wall clock: the thing it proves is that nothing happened, and a
+store that has not yet *fetched* the operator also makes nothing happen.
+
+### The mutation test, and the answer it gave — which is not the one I predicted
+
+Three arms, against the same test:
+
+| arm | setup | result |
+|---|---|---|
+| A | the old form, sleep cut to **0 ms**, store healthy | **passed** |
+| B | the new form, store forced to ignore the stale epoch (`if false`) | **failed**, correctly |
+| C | the **old** form, against that same broken store | **failed** — it caught it |
+
+Arm A is the vacuity, exactly: with no wait at all the test passes over a working store, so the
+assertion on its own proves nothing and the sleep was carrying the entire weight.
+
+**Arm C is the correction.** I had recorded this in §9 as "silently vacuous" and said it would
+keep passing on the day the rejection broke. That is wrong, and the mutation is what says so: on a
+quiet box 200 ms *was* long enough, and the old test caught the break. The defect is **latent**,
+not active — the test is sound exactly while delivery fits inside the sleep, and goes quiet only
+where it does not. Worth stating plainly, because "this test never worked" and "this test stops
+working under load" call for the same fix and a very different level of alarm.
+
+### The fix
+
+Two tokens instead of a clock. `FakePd` hands an operator out **once**, removing it as it answers
+the heartbeat, so `operator_pending` going false is proof the store has *taken* it; and one
+further region heartbeat proves the iteration that ran it has finished, since `run_operator` is
+called in the same iteration as the beat that returned it. Both are facts about progress rather
+than about elapsed time, so the test is now sound at any speed.
+
+`FakePd::operator_pending` is the one new accessor, purely additive, inside the existing
+`#[cfg(any(test, feature = "testing"))] impl FakePd` block in `crates/esker-store/src/pd.rs` —
+the same place `FakePd` itself lives.
+
+### The rule
+
+A negative assertion needs evidence that the thing it denies had its chance to happen. A positive
+assertion behind a wall clock fails loudly when the clock is short; a negative one passes quietly,
+and the arm-A form of the question — *cut the wait to zero and see whether it still passes* — is
+what tells the two apart in one run.

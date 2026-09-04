@@ -147,6 +147,10 @@ pub struct Relations {
     /// enum column is per **row**, and a lookup per row is the mistake `d63e7d8` fixed for
     /// `::regclass`. Empty for a tenant that has declared none, which is most of them.
     user_types: BTreeMap<u64, super::TypeDef>,
+    /// Every view's stored `SELECT`, by oid — one more scan in the read that was happening
+    /// anyway, so `pg_get_viewdef(oid)` costs no lookup per row. The same trade `user_types`
+    /// makes, and for the same reason.
+    view_definitions: BTreeMap<u64, String>,
 }
 
 impl Relations {
@@ -188,11 +192,26 @@ impl Relations {
             .into_iter()
             .map(|def| (def.oid, def))
             .collect();
+        let view_definitions = super::views(txn, tenant)?
+            .into_iter()
+            .map(|view| (view.id, view.definition))
+            .collect();
         Ok(Relations {
             rows,
             tables,
             user_types,
+            view_definitions,
         })
+    }
+
+    /// A view's stored `SELECT`, by oid, or `None` when the oid is not a view's.
+    ///
+    /// **The text as it was written, not PostgreSQL's reconstruction of it.** A real server
+    /// deparses its own parse tree here; this returns what `pg_views.definition` returns, which is
+    /// the same trade that column already makes.
+    #[must_use]
+    pub fn view_definition(&self, oid: u64) -> Option<&str> {
+        self.view_definitions.get(&oid).map(String::as_str)
     }
 
     /// The name of the user-defined type with this oid, or `None`.

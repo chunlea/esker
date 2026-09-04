@@ -189,6 +189,13 @@ fn key(n: u32) -> Bytes {
 /// Writes one key, retrying while the answer is one the caller is told to retry. Every write in
 /// this file is an idempotent put of one fixed value from one writer, so repeating an ambiguous
 /// answer cannot be observed — the argument `tests/snapshot.rs` makes, and no wider.
+///
+/// **One store, deliberately, and not a group.** A retry that ignores a `NotLeader` hint livelocks
+/// once a region has two voters — the office does not come back on its own and the epoch never
+/// moves, so the refusal is re-sent to the peer that just disclaimed it
+/// (`snapshot.rs::a_write_follows_the_office_when_it_moves`). Every write in this file runs
+/// **before** its `AddPeer`, while store 1 is the sole voter and cannot lose an election, so the
+/// single store is safe by construction. Widening it would say otherwise.
 async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

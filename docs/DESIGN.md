@@ -532,12 +532,35 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
   hint the store checks against its epoch, so a stale route costs a redirect and never a wrong
   answer (invariant 5). The two answers that *cannot* be stale — an id and a timestamp — are the
   two that go through the log.
-- **Membership is configuration, not state.** The same `--peers` list on every member, and the
-  group's identity is `mix64` over it: a member refuses a Raft batch that does not carry its own
-  group id, so two clusters' placement drivers pointed at each other by a stale flag cannot form
-  one group and replicate one cluster's routing table over the other's. Dynamic membership is a
-  phase of its own and would have to mint that id into the log, as `Bootstrap` mints the cluster
-  id.
+- **A group is named once, and then it can grow.** The group's id is `mix64` over the member list
+  it was **founded** with, derived one time and written into each member's own state record; a
+  member refuses a Raft batch that does not carry it, so two clusters' placement drivers pointed at
+  each other by a stale flag cannot form one group and replicate one cluster's routing table over
+  the other's. Deriving it *again* on every start is what ADR 0059 did and what
+  [ADR 0061](adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) had to change
+  before membership could move at all: the derivation changes when a member is added, so a group
+  that recomputed it would partition itself at the moment it grew. A joining member is *told* the
+  id; a member whose record and whose `--peers` disagree believes the record, which is
+  `esker-raft`'s own rule for membership.
+- **Membership changes are single-server, and a member joins as a learner.** `esker pd members add`
+  is a **reconciliation** rather than a script — propose a learner, wait for it to catch up,
+  promote it — so a `kill -9` anywhere in it is recovered by running the same command again. The
+  address rides in the conf change's own `context`, so the voting set and the address book cannot
+  disagree about whether a change happened, and the route is learned at *append*, in the same
+  `Ready`, because a configuration is in force from the moment its entry is on disk.
+
+  The order is what an operator runs under pressure, and it is forced by arithmetic. Three members
+  with one gone is a quorum of 2 with two live; `AddVoter` would take the quorum to 3 the instant
+  its entry was appended, and the entry that made it 3 would need 3 to commit — the group stops,
+  and undoing needs the quorum it no longer has. A learner is not counted in a quorum, so it
+  commits, catches up by snapshot, and only then is promoted. Then the dead member goes. Removing
+  first would work and is worse: it leaves a quorum of 2 out of 2 until the replacement lands.
+  **Add before remove**, the same sentence [ADR 0013](adr/0013-repair-operators-are-requests-not-commands.md)
+  uses about region replicas.
+
+  A removal is refused when it would leave the group without a quorum of members PD has heard from,
+  and refused for the last member. Nothing *schedules* one: PD repairs region replicas because it
+  can watch a store go quiet, and there is no equivalent observer for its own group.
 
 - **State (*fixed*, version 1).** PD's own key space, under the `'m'` metadata prefix of §3, with ids
   big-endian so a scan runs in id order:
@@ -664,7 +687,9 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation
   rather than a repair.
 - **Tools:** `esker pd serve --data-dir --listen` runs one; `--id` and `--peers` make it a member
-  of a group. `esker pd inspect --data-dir` prints the whole state above — including the range
+  of a group being founded, and `--join` makes it one joining a group that already exists —
+  a member added at run time cannot derive the group's id, so it asks. `esker pd members add
+  ID@ADDR` and `remove ID` change the membership, one step per round trip. `esker pd inspect --data-dir` prints the whole state above — including the range
   index beside the records it points at, and the durable half of consensus — and it **creates
   nothing**: opening a placement driver campaigns, and a campaign is a write, so the inspector is a
   read-only view that names no column family and starts no driver. `esker pd members --pd` asks a
@@ -734,16 +759,21 @@ that goes silent is pinged, and one that stays silent is dropped with every wait
 | `request_timeout` | 30 s | How long a call waits for its answer before `Timeout`. |
 | `shutdown_grace` | 10 s | How long a graceful shutdown waits for in-flight requests before closing anyway. Graceful cannot mean "for ever": a handler wedged on a stuck disk must not hold the process open. |
 
-**Nothing on this wire is encrypted or authenticated**, and both halves of that are deliberate for
-now. A request carries a region epoch and a cluster id, neither of which is a credential: a store's
-`StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the socket,
-so the network boundary is the trust boundary. TLS here is one implementor away — the decision, the
-provider and the shape are settled by
-[ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md) and built once already on the
-SQL port — but this surface wants **mutual** authentication rather than server TLS, and a verified
-peer certificate is still not an authorization decision: mapping an identity to "may register as
-store 7" or "may vote in region 4" is application logic `esker-pd` does not have yet. That, not the
-encryption, is the bulk of the work here, and it is why this surface is not first.
+**This wire can be encrypted, and it still authorises nobody.** `connect_with_tls` and
+`Server::with_tls` put a TLS session under the framing, behind the same default-off `tls` feature
+the other two surfaces use ([ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md));
+`--rpc-tls-cert/-key/-ca` on `esker server` and `esker pd serve` turn it on, and `--rpc-tls-mutual`
+adds client certificates in both directions for the links where both ends are ours — store↔store
+and PD↔PD. Encryption here is **required, not offered**: there is no in-band upgrade like the
+PostgreSQL port's `SSLRequest`, so a server with TLS on refuses a peer that arrives in the clear.
+A node given an incomplete set of flags refuses to start rather than serving unencrypted on a port
+an operator believes is protected.
+What has *not* changed is who may say what. A request carries a region epoch and a cluster id,
+neither of which is a credential, and a verified certificate only says the peer holds a key this
+cluster's CA vouched for. Mapping that identity to "may register as store 7" or "may vote in
+region 4" is application logic `esker-pd` does not have, so a `StoreHeartbeat` or a
+`RaftTransport::Batch` from any peer the CA signed is still accepted on its own say-so. mTLS makes
+the identity available to check; the check is the work that remains.
 
 `HelloAck` reports the server's `max_frame_size` so a client can refuse an oversized request without
 spending a round trip on it. **A client is not obliged to adopt it**, and `esker-client` does not:
@@ -967,14 +997,16 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 
 ## 15. Open questions (turn into ADRs as they are decided)
 
-Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
-leader leases vs ReadIndex only · **dynamic PD membership** (adding or removing a placement driver
-at run time, which needs the group id minted into the log — [ADR 0059](adr/0059-pd-is-a-raft-group.md))
-· secondary-index encoding for composite keys · how much Postgres surface for the first SQL
-milestone.
+Joint consensus vs single-server changes only — live for the **store's** groups, where a scheduler
+issues the changes and might one day want to move two peers together · separate Raft log store ·
+async commit / 1PC · leader leases vs ReadIndex only · secondary-index encoding for composite keys ·
+how much Postgres surface for the first SQL milestone.
 
 *Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
-`esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above).
+`esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above). **Dynamic PD
+membership** — added and removed at run time through single-server conf changes, with the group id
+minted once instead of derived
+([ADR 0061](adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 
 ## 16. Columnar (`esker-columnar`)
 

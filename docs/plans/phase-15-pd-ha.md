@@ -443,3 +443,195 @@ would add coverage the current tests do not.
   comma-separated list, as `esker server`'s now does.
 - **Nothing is asked of `esker-raft`.** PD drives the same pure `RawNode` under the same `Ready`
   contract, and this lane found no gap in it.
+
+## 11. Dynamic membership — add and remove a placement driver at run time
+
+§7 listed this as a non-goal and ADR 0059 said what it would cost: *"the group id has to move into
+the log — minted once, like the cluster id"*. The coordinator put it in scope on 2026-09-04. This
+section is the design; the units are §11.5.
+
+### 11.1 Two carve-outs that shape it
+
+`crates/esker-pd/src/transport.rs`, `crates/esker-store/src/transport.rs`,
+`crates/esker-client/src/tcp.rs` and `crates/esker-proto/src/transport/**` belong to the `tls` lane
+until its RPC unit lands. That matters here because `PdTcpTransport` builds one queue and one
+delivery task **per peer, at `spawn`** — and dynamic membership is precisely the peer set changing.
+
+The answer is §11.2's fourth decision, and it needs no edit there at all. What the `tls` lane should
+fold in afterwards is written in §11.7.
+
+### 11.2 Five decisions
+
+**1. Single-server changes, not joint consensus.** `esker-raft` implements single-server, and this
+lane may read that crate but not change it. It is also sufficient: `pd members add` and
+`pd members remove` move one member at a time, and `RawNode::propose_conf_change` already refuses
+an overlapping one. What joint consensus would buy is 3 → 5 in a single change, which no command
+here asks for. `docs/DESIGN.md` §15 keeps the question open for the *store's* groups, where a
+scheduler issues changes and might one day want it.
+
+**2. The group id is minted once and persisted, not derived.** This is the change ADR 0059 named,
+and it has to come first: an id derived from the member list *moves* when a member is added, and
+every member would then refuse every other's traffic — the group would partition itself at the
+moment it grew.
+
+It is still **derived**, once, from the list the group was founded with, and then written down. So
+every deployment that exists today keeps the id it computes today and a rolling upgrade changes
+nothing. A member joining an existing group is *told* the id by the group and writes it before it
+starts. A member whose record and whose `--peers` disagree believes the record, which is
+`esker-raft`'s own rule for membership: *a restarting node takes its membership from its log, never
+from a command line that may be out of date.*
+
+**3. The address travels in the conf change's own `context`.** `esker_raft::ConfChange` carries
+opaque caller bytes for exactly this — "a store id, a peer address" — and `esker-store` already uses
+them that way (`apply::conf_change_context`). One entry, so the voting set and the address book can
+never disagree about *whether* a change happened.
+
+They can disagree briefly about *when*, because a configuration is in force from the moment its
+entry is **appended** (dissertation §4.1) while a state machine sees it on apply. So the route is
+learned at append, in the same `Ready`, before its messages go out — the rule
+`esker_store::peer::learn_routes` already states: *"the peer it adds has to be addressable now."*
+
+**4. The member list, and the group id, live in `PersistedState`.** Both are what a member needs
+**before it has applied anything** — which is what that record is already for, holding the hard
+state and the configuration for the same reason. Putting the address book in the `default` column
+family would make it a fact the state machine owns, and a member that has not caught up has no
+state machine.
+
+And it is what makes the carve-out survivable: `MemberList` gains an **explicit** group id, so
+`MemberList::group_id()` answers the recorded one when there is one and derives only for a founding
+group. `PdTcpTransport` reads `members.group_id()` and needs no edit — while, without this, it would
+be stamping a *derived* id onto every batch and would be wrong the moment a member was added.
+
+**5. Add before remove, and the added member is a learner first.** The rule this codebase already
+follows for regions (ADR 0013), for the same arithmetic — §11.4.
+
+### 11.3 What `pd members add` and `remove` do
+
+`add <id>@<host:port>`, against any member, redirected to the leader:
+
+1. propose `AddLearner(id, context = address)`. **A learner does not count towards a quorum**, so
+   this commits with a member down.
+2. wait until that learner's `matched` reaches the leader's commit index — it has caught up, by
+   entries or by a snapshot.
+3. propose `AddVoter(id)`: the promotion.
+
+**Resumable, because a kill lands between those.** Run again and it finds a learner where it
+expected nothing and promotes it; finds a voter and does nothing. That is the brief's kill -9 case,
+and it is why the command is a *reconciliation* rather than a script.
+
+`remove <id>`: propose `Remove(id)`. Refused when the member is the last one, and refused when
+removing it would leave the group without a quorum of members that are **live** — which PD can see,
+because a leader's `progress` says who answered recently.
+
+### 11.4 The recovery path: two of three, back to three of three
+
+A group of three with one member gone is quorum 2 of 3 with two live: alive, and one failure from
+dead. Getting back to three has to keep a quorum of *live* members at every step, and that is what
+decides the order.
+
+| Step | Voters | Quorum | Live | |
+|---|---:|---:|---:|---|
+| start | 3 | 2 | 2 | one failure from losing quorum |
+| `AddLearner(4)` | 3 | 2 | 2 | a learner is not in the quorum; this commits |
+| 4 catches up | 3 | 2 | 2 | by snapshot — PD's whole state machine is a couple of hundred kilobytes |
+| `AddVoter(4)` | 4 | 3 | 3 | commits, because 4 is caught up and counts |
+| `Remove(dead)` | 3 | 2 | 3 | back to full redundancy |
+
+**Removing first would also work and is worse.** 3 → 2 leaves quorum 2 of 2: both survivors must
+answer every commit, so the window between the remove and the add is one where *any* hiccup stops
+the group. Add-before-remove never has fewer live members than it needs.
+
+**Adding a voter directly would not work.** `AddVoter(4)` from a group of three takes the quorum to
+3 while only two members are live and the third has an empty log — the entry cannot commit, and the
+configuration is in force from the moment it was appended, so the group has just deadlocked itself.
+That is the trap, and the learner is what avoids it.
+
+### 11.5 Units
+
+8. **This section, and the ADR.** The group id's new life, the context, single-server, add-before-remove.
+9. **The group id is minted and persisted.** `PersistedState` v2; `MemberList` carries an explicit
+   id; `Pd::open` mints on a fresh database and reads on an existing one. **Behaviour unchanged** —
+   every existing test passes, and a version-1 record upgrades in place.
+10. **Conf changes apply.** The address out of the context, the route learned at append, `PdWiring`,
+    `Pd::add_member` / `promote_member` / `remove_member`.
+11. **The wire and the tools.** `Pd::MemberChange`, `esker pd members add|remove`, `pd serve --join`.
+12. **Stores and clients learn the list.** A hint outside the configured set is no longer a
+    misconfiguration — it may be a member added since the client started — so it triggers a
+    `Members` refresh, and the **group id** in that answer is what keeps the old protection: a list
+    from another group is refused.
+13. **Tests.** Kill -9 during a change; the 2-of-3 → 3-of-3 path; a re-run that reconciles a
+    half-done add; a batch for a group id that has since grown.
+14. **DESIGN.md** §7 and §15.
+
+### 11.6 Non-goals, still
+
+- **More than five members**, and no change to `MAX_MEMBERS` beyond what the recovery path needs.
+- **Automatic membership.** Nothing schedules a PD membership change; an operator asks for it. PD
+  schedules *region* replicas because it can see a store go quiet, and there is no equivalent
+  observer for PD's own group.
+- **Changing a member's address in place.** Remove and add.
+
+### 11.7 What the `tls` lane should fold in
+
+`PdWiring` (`crates/esker-pd/src/wiring.rs`) holds a `PdTcpTransport` and **replaces it** when the
+group changes, because it may not add a queue to one. That costs every connection on every change,
+including to members that did not move — acceptable, because a membership change is an operator
+action and Raft retransmits, but it is not what the code would look like if the two were written
+together.
+
+What it would look like: `PdTcpTransport::reconfigure(&self, members: &MemberList)`, adding and
+dropping one queue and one task per changed member and leaving the rest connected. Once the TLS RPC
+unit lands, that method makes `wiring.rs` disappear.
+
+`crates/esker-proto/src/transport/**` is used and not edited here.
+
+### 11.8 Progress
+
+- **Unit 8 — plan and ADR.** `docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md`.
+- **Unit 9 — the group is named once.** `PersistedState` v2 with the group id and the address book;
+  `MemberList` carries the recorded id. A version-1 record reads as "not yet named", which is the
+  signal to mint. The upgrade is invisible, asserted against the derivation rather than a constant.
+- **Unit 10 — conf changes apply.** The address out of the change's `context`, the route learned at
+  append, `PdWiring`, `add_member` / `remove_member` as reconciliations.
+- **Unit 11 — the wire and the tools.** `Pd::MemberChange` (`0x030d`) and four goldens,
+  `pd members add|remove`, `pd serve --join`.
+- **Unit 12 — clients learn a group that has grown.** A hint outside the list is a refresh, and the
+  group id is the guard that replaces the old refusal.
+- **Unit 13 — tests.** Nineteen in `failover.rs`, including the recovery path, an add finished by a
+  *different* leader, a member killed mid-change, and the two removals that must be refused.
+- **Unit 14 — DESIGN.md** §7 and §15.
+
+### 11.9 Two things the tests found, and one was mine
+
+**A guard justified by a mechanism that does not exist.** The removal check first required
+`recent_active && matched > 0`, with a comment explaining that a leader marks every peer recently
+active when it takes office — so `recent_active` alone would let a freshly elected leader remove its
+way below a quorum. That comment is wrong. `esker-raft`'s "a peer that becomes a voter here starts
+out recently active" is `rebuild_progress`, on a conf change; `become_leader` uses `Progress::new`,
+which starts it **false**. Writing the test that would need the guard produced a test whose own
+premise assertion fired, which is how it was caught. The extra condition added nothing in any
+reachable case, and a false explanation in the source is worse than none, so both are gone and the
+comment now says what is true: the reading is conservative in *both* directions, and refusing a
+healthy removal for one window is the safe direction.
+
+**A test that asked a question nobody asks.** The same test cut a member off and immediately asked
+whether a removal would be refused — but the group had not ticked, so it had not noticed, and PD
+answering "everybody is here" one tick after a death is honest rather than wrong. It waits for the
+group to notice now, which is what an operator does.
+
+Mutating the liveness check away turns it red with exactly the state it exists to prevent:
+`"stopped leading with this command in its log; it may still commit"` — a group that has removed its
+way below a quorum and cannot undo it, because undoing needs the quorum it just lost.
+
+### 11.10 Owed
+
+- **A three-process membership change**, as opposed to three members in one process. Same gap
+  §9.3 records for failover, and the same answer: the largest of these and the one with the most
+  to find.
+- **Roles in `esker pd members`.** The listing shows who leads but not who is a *learner*, so an
+  add that has stalled half-way is diagnosed from `pd members add` not returning rather than from
+  the listing. Adding `role` to `PdMemberInfo` would change a golden — one written in this same
+  phase, in a message no other lane consumes yet — so it is a one-line ask for the human rather
+  than something this lane took.
+- **`PdTcpTransport::reconfigure`**, which makes `wiring.rs` disappear. §11.7.
+
