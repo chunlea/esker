@@ -1,0 +1,40 @@
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1086-1118,1908-1913,1937-1939,1941-1944
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 576-580
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 27,2229-2244,2246,2248,2365-2441
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 906-907
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 4941-5055,5074-5076,5284,5286-5289
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 1377-1384
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 48-49
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 143-181,222-227
+crates/esker-sql/tests/corpus/pg19_row_locking.txt
+  h_44076b318daf9c 1-90
+crates/esker-sql/tests/describe_in_transaction.rs
+  h_44076b318daf9c 1-117
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 499-536
+crates/esker-sql/tests/row_locking.rs
+  h_44076b318daf9c 1-71
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 540-541,543-549,551,557,562-575,579
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1308-1310,1540,1556
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3a82e143411bdbccb8dd43daa275161adfe52459",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
