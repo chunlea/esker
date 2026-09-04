@@ -1,0 +1,37 @@
+crates/esker-sql/src/backend/mod.rs
+  s_2bed4ac2b1c944::t_eef97f1b61a509 130-150,167-204,278-311,319-321,338-356,449-454,459-463,480-485,514-539,548,553-581,601,610,621,654-707,712-716,725-726,736-738,741,748-756,787-791,796
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_9a066e93b365c1 223-251,2103-2104,2301-2303
+crates/esker-sql/src/exec/dml.rs
+  s_2bed4ac2b1c944::t_b867efbcab6d02 586-592
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_e90a9cb71ac8c4 237-294,612-634,636-638,885-905
+crates/esker-sql/src/exec/savepoint.rs
+  s_2bed4ac2b1c944::t_40f24c107507c1 217-229
+crates/esker-sql/src/parameter.rs
+  s_2bed4ac2b1c944::t_52b494d340c266 174-180,184,456-463,518-556
+crates/esker-sql/src/sqlstate.rs
+  s_2bed4ac2b1c944::t_c1b1f84142b908 261-272
+crates/esker-sql/tests/insert.rs
+  s_2bed4ac2b1c944::t_b492cd82fa16db 349-358,361-363
+crates/esker-sql/tests/read_committed.rs
+  s_2bed4ac2b1c944::t_3c8098c15ade31 1-123
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_2bed4ac2b1c944::t_1584e2daeb4069 217-227,444-449,455-469,534-536,539-540,542-551,554-571,584-585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e35189b2a93dbd23f66ed26ae3305073e66ff2ed",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
