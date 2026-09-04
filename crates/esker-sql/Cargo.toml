@@ -30,12 +30,27 @@ esker-proto.workspace = true
 # Contained to src/parse.rs by rule (docs/adr/0014-sqlparser.md); a `use sqlparser::`
 # anywhere else in this crate is a review failure.
 sqlparser.workspace = true
+# **Optional, and off by default** (`tls` below). Contained to `src/pgwire/tls.rs` by the same rule
+# `sqlparser` is: a `use rustls::` anywhere else in this crate is a review failure, because the
+# whole point of the seam is that one module knows what a TLS session is.
+rustls = { workspace = true, optional = true }
+rustls-graviola = { workspace = true, optional = true }
 thiserror.workspace = true
 # The socket edge only. The engine, the parser, the session state machine and every encoding in
 # this crate are synchronous and `std`-only; `tokio` appears in `pgwire::server` and nowhere else.
 tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+# TLS on the PostgreSQL port (ADR 0055 option 4, the human's ruling of 2026-09-04: graviola
+# accepted as the dependency exception, PG port first).
+#
+# **Off by default, and that is the contract.** With it off this crate links neither crate above,
+# the runtime graph is byte-for-byte what it was, and `SSLRequest` is answered `N` exactly as
+# before. Turning it on is what `just check` does (`--all-features`), so the gated tests are not
+# tests that never run.
+tls = ["dep:rustls", "dep:rustls-graviola"]
 
 [dev-dependencies]
 # The end-to-end tests run the corpus against real stores over real sockets, which is the only
