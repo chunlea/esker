@@ -1,0 +1,25 @@
+crates/esker-client/src/tcp.rs
+  s_49075263d2b3e7::t_34cf46ec455ca7 24,47-73
+crates/esker-pd/src/transport.rs
+  s_49075263d2b3e7::t_735f0268e8dd61 30,63-80,94-100,182,198-200
+crates/esker-proto/src/transport/client.rs
+  s_49075263d2b3e7::t_62f345b734b905 520-534,538-556
+crates/esker-store/src/transport.rs
+  s_49075263d2b3e7::t_e6b4a4906d72cb 42,147-160,166-171,409,425-427
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5fdcefe02a3839758860b5c14c1e26ae801b0091",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
