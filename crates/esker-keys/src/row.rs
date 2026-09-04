@@ -374,6 +374,11 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::TextArray
         | ColumnType::HstoreArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -418,6 +423,9 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -694,7 +702,12 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
         // The subtype comes from the *column*, which is where it is known: the bytes are only the
         // canonical text.
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => Datum::Range {
             subtype: Box::new(range_subtype(ty)),
             text: text_from_utf8(body)?,
         },
@@ -708,10 +721,22 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
 }
 
 /// The subtype a range column's bounds are, which the column type names and the bytes do not.
-fn range_subtype(ty: ColumnType) -> ColumnType {
+/// What a range type is a range **of**, which is `pg_range.rngsubtype` on a real server.
+///
+/// **`pub`, and the only copy.** `esker_sql::value::range_subtype` delegates here: it was a second
+/// table with the same three arms, and the day a fourth range type arrived only one of them
+/// learned it — the proptest round trip caught it at once, handing a `DateRange` column a range
+/// whose subtype said `Timestamp`. One table cannot drift from itself.
+///
+/// `int4range` and `int8range` both answer `bigint`: an `int4` is read as an `int8` everywhere in
+/// this crate, which is the standing constant-width trade and not a fact about ranges.
+#[must_use]
+pub fn range_subtype(ty: ColumnType) -> ColumnType {
     match ty {
         ColumnType::TstzRange => ColumnType::TimestampTz,
-        ColumnType::Int4Range => ColumnType::Int8,
+        ColumnType::Int4Range | ColumnType::Int8Range => ColumnType::Int8,
+        ColumnType::DateRange => ColumnType::Date,
+        ColumnType::NumRange => ColumnType::Numeric,
         _ => ColumnType::Timestamp,
     }
 }
@@ -881,6 +906,11 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1006,7 +1036,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonbArray
         | ColumnType::TsRange
         | ColumnType::TstzRange
-        | ColumnType::Int4Range => Err(not_a_key())?,
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => Err(not_a_key())?,
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
             return decode_key_text(ty, bytes);
         }
@@ -1643,6 +1676,11 @@ mod tests {
             | ColumnType::TextArray
             | ColumnType::HstoreArray
             | ColumnType::TsRangeArray
+            | ColumnType::TstzRangeArray
+            | ColumnType::Int4RangeArray
+            | ColumnType::DateRangeArray
+            | ColumnType::NumRangeArray
+            | ColumnType::Int8RangeArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1703,13 +1741,16 @@ mod tests {
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
             // A range's stored form is its canonical text, and `empty` is the one value every
             // subtype has — enough to state the round trip, which is what this property is.
-            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
-                Just(Datum::Range {
-                    subtype: Box::new(super::range_subtype(ty)),
-                    text: "empty".to_owned(),
-                })
-                .boxed()
-            }
+            ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::Int8Range => Just(Datum::Range {
+                subtype: Box::new(super::range_subtype(ty)),
+                text: "empty".to_owned(),
+            })
+            .boxed(),
             // A citext's *key* is its folded value, so the strategy is folded text: an unfolded
             // one would state a round trip the key encoding does not make.
             ColumnType::Citext => ".*"

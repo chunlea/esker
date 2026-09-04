@@ -23,6 +23,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          daterange('2026-01-15','2026-03-01')",
         "SELECT 'r', daterange(NULL,'2026-02-01'), daterange('2026-01-01',NULL), \
          daterange(NULL,NULL) && daterange('2026-01-01','2026-02-01')",
+        // **Three more, and every value in them agrees.** `conname` and `amname` are `name` on
+        // a real server and `text` here, and `pg_typeof` answers a `regtype` there and `text`
+        // here — the trade `'x'::regtype` already makes. The `pg_typeof` line's *values* are the
+        // point and they are right: `daterange` and `boolean`, which is what says the constructor
+        // answers a range and not a string.
+        "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = \
+         'tec_gist_x'",
+        "SELECT 'r', am.amname, x.indisexclusion FROM pg_class i JOIN pg_am am ON am.oid = \
+         i.relam JOIN pg_index x ON x.indexrelid = i.oid WHERE i.relname = 'tec_gist_x'",
+        "SELECT 'r', pg_typeof(daterange('2026-01-01','2026-02-01')), \
+         pg_typeof(daterange('2026-01-01','2026-02-01') && daterange('2026-01-01','2026-02-01'))",
     ],
     answers: &[
         // **A scalar key**, which a real server refuses for a reason this node cannot reach.
@@ -35,21 +46,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              exclusion it enforces and the refusal is raised where the constraint is read, before \
              any column type is in reach. Same outcome, different half of the sentence.",
         ),
-        // **`daterange` as a column type** — still not built, and two of the three lines that
-        // declared it have gone anyway. ADR 0050's `user_type_name` moved the "no such type"
-        // refusal from *lowering* to the executor, because only the catalog can tell a user type
-        // from a typo, and that changed which of two errors a statement gets: `tec_btree` and
-        // `tec_plain` are refused for their **access method** now, before any type is resolved,
-        // which is the half of the sentence a real server sends. The ratchet found both; neither
-        // was looked for, and the deferral turns out to sit closer to PostgreSQL's own precedence
-        // than the eager refusal did. `tec_gist` below is the one still standing, because `gist`
-        // with `&&` is accepted and the column type is then the thing that is missing.
-        (
-            "CREATE TABLE tec_gist (r daterange, CONSTRAINT tec_gist_x EXCLUDE USING gist (r WITH \
-             &&))",
-            "The same, and it is the table the three lines after it read — so those are the \
-             cascade of this one rather than divergences of their own.",
-        ),
+        // **`daterange` as a column type was the last of three here and it is gone.** Two went
+        // when ADR 0050's `user_type_name` moved the "no such type" refusal from *lowering* to the
+        // executor — `tec_btree` and `tec_plain` are refused for their **access method** now,
+        // before any type is resolved, which is the half of the sentence a real server sends. The
+        // third went with the six-range unit: `gist` with `&&` was already accepted and the column
+        // type was the thing that was missing, so `CREATE TABLE tec_gist (r daterange, …)` and the
+        // three statements that read that table all answer now. The ratchet found every one of
+        // them; none was looked for.
     ],
 };
 

@@ -22,17 +22,27 @@
 #   sets `intervalstyle` but not `DateStyle`, so the server default is what it reads.
 # * **`test_escaped_tsrange` uses year -1000**, which PostgreSQL renders `1000-01-01 … BC`. A parser
 #   that assumes four digits and no suffix fails that test and nothing else.
-#
-# **Re-captured from r1's `captures/pg19_tsrange.txt`, statement for statement**, with the three
-# catalog probes at the top moved into `SAVEPOINT`s: `current_setting('DateStyle')`, `pg_range` and
-# the `pg_type` row are none of them built here, and run bare the first `42704` aborted the replay
-# and took the forty-six statements after it — which are the whole file. Every answer is
-# byte-identical to r1's.
+# * **There are TWO range arrays in that file, not one**, and this capture only had the first until
+#   run 58: `t.tsrange :ts_ranges, array: true` (`:33`) and **`t.tstzrange :tstz_ranges, array:
+#   true`** (`:35`). Run 58 is why the second is here — `tsrange`, `tstzrange` and `tsrange[]` all
+#   landed and the file's 46 tests moved intact onto `the type tstzrange[] is not supported`, one
+#   type along. An array type has to be built per element type; three of the four is still zero
+#   tests passing.
+# * **An array of `tstzrange` carries the time-zone dependency twice over.** Each element renders
+#   through the session's `TimeZone`, so the *same stored array* prints differently in two sessions —
+#   the rows below take one array in `UTC` and again in `Pacific/Auckland` and they differ, while the
+#   `tsrange[]` beside it does not move. Anything that compares an array's text across sessions is
+#   comparing the wrong thing.
 #
 # The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
 # and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind. `\gdesc` runs in a
 # second session after that rollback, so statements naming `tsr` have an **empty** declared-types
 # column; the `pg_typeof` lines pin the types instead.
+#
+#
+# **Taken from r1's `captures/pg19_tsrange.txt` statement for statement**, with the catalog probes
+# at the top moved into `SAVEPOINT`s: run bare, the first `42704` aborts the replay and takes the
+# seventy statements after it — which are the whole file. Every answer is byte-identical to r1's.
 #
 # Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
 BEGIN		-
@@ -45,8 +55,9 @@ ROLLBACK TO SAVEPOINT cp2		-
 SAVEPOINT cp3		-
 SELECT 'r', rngsubtype::regtype, rngcanonical, rngsubdiff FROM pg_range r JOIN pg_type t ON t.oid = r.rngtypid WHERE t.typname IN ('tsrange','int4range') ORDER BY t.typname	text,regtype,regproc,regproc	r|integer|int4range_canonical|int4range_subdiff ; r|timestamp without time zone|-|tsrange_subdiff
 ROLLBACK TO SAVEPOINT cp3		-
-CREATE TABLE tsr (id serial primary key, ts_range tsrange, ts_ranges tsrange[], tstz_range tstzrange, int4_range int4range)		-
-SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"tsr"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|ts_range|tsrange ; r|ts_ranges|tsrange[] ; r|tstz_range|tstzrange ; r|int4_range|int4range
+CREATE TABLE tsr (id serial primary key, ts_range tsrange, ts_ranges tsrange[], tstz_range tstzrange, tstz_ranges tstzrange[], int4_range int4range)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"tsr"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|ts_range|tsrange ; r|ts_ranges|tsrange[] ; r|tstz_range|tstzrange ; r|tstz_ranges|tstzrange[] ; r|int4_range|int4range
+# ---- the file's own five fixtures ----
 INSERT INTO tsr (id, ts_range, tstz_range, int4_range) VALUES (101, '[2010-01-01 14:30, 2011-01-01 14:30]', '[2010-01-01 14:30:00+05, 2011-01-01 14:30:00-03]', '[1, 10]')		-
 INSERT INTO tsr (id, ts_range, tstz_range, int4_range) VALUES (102, '[2010-01-01 14:30, 2011-01-01 14:30)', '[2010-01-01 14:30:00+05, 2011-01-01 14:30:00-03)', '[1, 10)')		-
 INSERT INTO tsr (id, ts_range, tstz_range, int4_range) VALUES (103, '[2010-01-01 14:30,]', '[2010-01-01 14:30:00+05,]', '[1,]')		-
@@ -54,22 +65,59 @@ INSERT INTO tsr (id, ts_range, tstz_range, int4_range) VALUES (104, '[-infinity,
 INSERT INTO tsr (id, ts_range, tstz_range, int4_range) VALUES (105, 'empty', 'empty', 'empty')		-
 INSERT INTO tsr (id) VALUES (106)		-
 SELECT 'r', id, ts_range FROM tsr ORDER BY id		r|101|["2010-01-01 14:30:00","2011-01-01 14:30:00"] ; r|102|["2010-01-01 14:30:00","2011-01-01 14:30:00") ; r|103|["2010-01-01 14:30:00",) ; r|104|[-infinity,infinity] ; r|105|empty ; r|106|\N
+# ---- the discrete subtype canonicalises and the continuous one does not ----
 SELECT 'r', id, int4_range FROM tsr ORDER BY id		r|101|[1,11) ; r|102|[1,10) ; r|103|[1,) ; r|104|(,) ; r|105|empty ; r|106|\N
 SELECT 'r', '[1,10]'::int4range, '[2010-01-01 14:30, 2011-01-01 14:30]'::tsrange	text,int4range,tsrange	r|[1,11)|["2010-01-01 14:30:00","2011-01-01 14:30:00"]
+# ---- reading the bounds back ----
 SELECT 'r', id, lower(ts_range), upper(ts_range), isempty(ts_range) FROM tsr ORDER BY id		r|101|2010-01-01 14:30:00|2011-01-01 14:30:00|f ; r|102|2010-01-01 14:30:00|2011-01-01 14:30:00|f ; r|103|2010-01-01 14:30:00|\N|f ; r|104|-infinity|infinity|f ; r|105|\N|\N|t ; r|106|\N|\N|\N
 SELECT 'r', id, lower_inc(ts_range), upper_inc(ts_range), lower_inf(ts_range), upper_inf(ts_range) FROM tsr WHERE ts_range IS NOT NULL ORDER BY id		r|101|t|t|f|f ; r|102|t|f|f|f ; r|103|t|f|f|t ; r|104|t|t|f|f ; r|105|f|f|f|f
 SELECT 'r', ts_range IS NULL AS is_null, isempty(ts_range) AS is_empty FROM tsr WHERE id IN (105, 106) ORDER BY id		r|f|t ; r|t|\N
 SELECT 'r', pg_typeof(ts_range), pg_typeof(lower(ts_range)), pg_typeof(isempty(ts_range)) FROM tsr WHERE id = 101		r|tsrange|timestamp without time zone|boolean
+# ---- the operators the file uses ----
 SELECT 'r', ts_range @> '2010-06-01 00:00'::timestamp FROM tsr WHERE id = 101		r|t
 SELECT 'r', ts_range && '[2010-06-01 00:00, 2010-07-01 00:00]'::tsrange FROM tsr WHERE id = 101		r|t
 SELECT 'r', '[2010-06-01 00:00, 2010-07-01 00:00]'::tsrange <@ ts_range FROM tsr WHERE id = 101		r|t
 SELECT 'r', ts_range = '[2010-01-01 14:30, 2011-01-01 14:30]'::tsrange FROM tsr WHERE id = 101		r|t
+# ---- test_escaped_tsrange: a BC year ----
 UPDATE tsr SET ts_range = '[1000-01-01 14:30:00 BC, 2020-02-02 14:30]' WHERE id = 101		-
 SELECT 'r', ts_range, lower(ts_range) FROM tsr WHERE id = 101		r|["1000-01-01 14:30:00 BC","2020-02-02 14:30:00"]|1000-01-01 14:30:00 BC
 SELECT 'r', '[1000-01-01 14:30:00 BC, 2020-02-02 14:30]'::tsrange = ts_range FROM tsr WHERE id = 101		r|t
+# ---- t.tsrange :ts_ranges, array: true ----
 UPDATE tsr SET ts_ranges = ARRAY['[2010-01-01 14:30, 2011-01-01 14:30]'::tsrange, 'empty'::tsrange] WHERE id = 102		-
 SELECT 'r', ts_ranges, array_length(ts_ranges, 1) FROM tsr WHERE id = 102		r|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}|2
 SELECT 'r', (ts_ranges)[1] @> '2010-06-01 00:00'::timestamp FROM tsr WHERE id = 102		r|t
+# ---- t.tstzrange :tstz_ranges, array: true — the second range array, run 58's row ----
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"tsr"'::regclass AND a.attname IN ('ts_ranges','tstz_ranges') ORDER BY a.attname		r|ts_ranges|tsrange[] ; r|tstz_ranges|tstzrange[]
+SELECT 'r', t.typname, t.typelem::regtype, t.typcategory, t.typinput FROM pg_type t WHERE t.typname IN ('_tsrange','_tstzrange') ORDER BY t.typname	text,name,regtype,"char",regproc	r|_tsrange|tsrange|A|array_in ; r|_tstzrange|tstzrange|A|array_in
+SELECT 'r', b.typname, a.typname AS array_name, a.typelem = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN ('tsrange','tstzrange','daterange','numrange','int4range','int8range') ORDER BY b.typname	text,name,name,boolean	r|daterange|_daterange|t ; r|int4range|_int4range|t ; r|int8range|_int8range|t ; r|numrange|_numrange|t ; r|tsrange|_tsrange|t ; r|tstzrange|_tstzrange|t
+UPDATE tsr SET tstz_ranges = ARRAY['[2010-01-01 14:30:00+05, 2011-01-01 14:30:00-03]'::tstzrange, 'empty'::tstzrange] WHERE id = 102		-
+SELECT 'r', tstz_ranges, array_length(tstz_ranges, 1) FROM tsr WHERE id = 102		r|{"[\"2010-01-01 09:30:00+00\",\"2011-01-01 17:30:00+00\"]",empty}|2
+SELECT 'r', (tstz_ranges)[1] @> '2010-06-01 00:00+00'::timestamptz, isempty((tstz_ranges)[2]) FROM tsr WHERE id = 102		r|t|t
+SELECT 'r', pg_typeof(tstz_ranges), pg_typeof((tstz_ranges)[1]), pg_typeof(lower((tstz_ranges)[1])) FROM tsr WHERE id = 102		r|tstzrange[]|tstzrange|timestamp with time zone
+UPDATE tsr SET tstz_ranges = ARRAY['[2010-01-01 14:30:00+05,]'::tstzrange, '[-infinity, infinity]'::tstzrange, NULL] WHERE id = 103		-
+SELECT 'r', tstz_ranges, array_length(tstz_ranges, 1), (tstz_ranges)[3] IS NULL FROM tsr WHERE id = 103		r|{"[\"2010-01-01 09:30:00+00\",)","[-infinity,infinity]",NULL}|3|t
+SELECT 'r', ARRAY['[2010-01-01 14:30:00+05, 2011-01-01 14:30:00-03]']::tstzrange[]	text,tstzrange[]	r|{"[\"2010-01-01 09:30:00+00\",\"2011-01-01 17:30:00+00\"]"}
+# the same stored array, read in two time zones -- an element renders through the session's TimeZone
+SET TimeZone = 'UTC'		-
+SELECT 'r', tstz_ranges, ts_ranges FROM tsr WHERE id = 102		r|{"[\"2010-01-01 09:30:00+00\",\"2011-01-01 17:30:00+00\"]",empty}|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}
+# The second zone is guarded as a block: this node honours `TimeZone` only where it means UTC,
+# so the `SET` itself is `0A000` and run bare it aborts the twenty-nine statements after it.
+SAVEPOINT tz		-
+SET TimeZone = 'Pacific/Auckland'		-
+SELECT 'r', tstz_ranges, ts_ranges FROM tsr WHERE id = 102		r|{"[\"2010-01-01 22:30:00+13\",\"2011-01-02 06:30:00+13\"]",empty}|{"[\"2010-01-01 14:30:00\",\"2011-01-01 14:30:00\"]",empty}
+ROLLBACK TO SAVEPOINT tz		-
+RESET TimeZone		-
+# an array of the OTHER four range types the file declares, so no element type is left guessed at
+SELECT 'r', ARRAY['[2012-01-02, 2012-01-04]']::daterange[], ARRAY['[0.1, 0.2]']::numrange[]	text,daterange[],numrange[]	r|{"[2012-01-02,2012-01-05)"}|{"[0.1,0.2]"}
+SELECT 'r', ARRAY['[1, 10]']::int4range[], ARRAY['[10, 100]']::int8range[]	text,int4range[],int8range[]	r|{"[1,11)"}|{"[10,101)"}
+SELECT 'r', pg_typeof(ARRAY['[1,10]']::int4range[]), pg_typeof((ARRAY['[1,10]']::int4range[])[1])	text,regtype,regtype	r|int4range[]|int4range
+SELECT 'r', array_length(ARRAY['[1,10]'::int4range, '[20,30]'::int4range], 1), (ARRAY['[1,10]'::int4range, '[20,30]'::int4range])[2]	text,integer,int4range	r|2|[20,31)
+# a range array is compared and aggregated as an array, not as a range
+SELECT 'r', ARRAY['[1,10]'::int4range] = ARRAY['[1,11)'::int4range], ARRAY['[1,10]'::int4range] @> ARRAY['[1,11)'::int4range]	text,boolean,boolean	r|t|t
+SAVEPOINT t5		-
+SELECT 'r', ARRAY['[1,10]'::int4range] @> '[2,3]'::int4range	!42883 operator does not exist: int4range[] @> int4range DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO t5		-
+# ---- a range with its bounds the wrong way round, and other bad literals ----
 SAVEPOINT t1		-
 SELECT 'r', '[2011-01-01 14:30, 2010-01-01 14:30]'::tsrange	!22000 range lower bound must be less than or equal to range upper bound
 ROLLBACK TO t1		-
@@ -79,11 +127,14 @@ ROLLBACK TO t2		-
 SAVEPOINT t3		-
 SELECT 'r', 'nonsense'::tsrange	!22P02 malformed range literal: "nonsense" DETAIL: Missing left parenthesis or bracket.
 ROLLBACK TO t3		-
+# ---- a zero-width range collapses to empty, which is what assert_nil_round_trip is about ----
 SELECT 'r', '[2010-01-01 14:30, 2010-01-01 14:30)'::tsrange, isempty('[2010-01-01 14:30, 2010-01-01 14:30)'::tsrange)	text,tsrange,boolean	r|empty|t
 SELECT 'r', '[2010-01-01 14:30, 2010-01-01 14:30]'::tsrange, isempty('[2010-01-01 14:30, 2010-01-01 14:30]'::tsrange)	text,tsrange,boolean	r|["2010-01-01 14:30:00","2010-01-01 14:30:00"]|f
+# ---- the constructor form, and tstzrange where they meet ----
 SELECT 'r', tsrange('2010-01-01 14:30'::timestamp, '2011-01-01 14:30'::timestamp), tsrange('2010-01-01 14:30'::timestamp, '2011-01-01 14:30'::timestamp, '[]')	text,tsrange,tsrange	r|["2010-01-01 14:30:00","2011-01-01 14:30:00")|["2010-01-01 14:30:00","2011-01-01 14:30:00"]
 SELECT 'r', id, tstz_range FROM tsr WHERE id IN (101, 102) ORDER BY id		r|101|["2010-01-01 09:30:00+00","2011-01-01 17:30:00+00"] ; r|102|["2010-01-01 09:30:00+00","2011-01-01 17:30:00+00")
 SELECT 'r', pg_typeof(tstz_range), pg_typeof(lower(tstz_range)) FROM tsr WHERE id = 102		r|tstzrange|timestamp with time zone
+# ---- min/max over a range column: asked, not assumed ----
 SAVEPOINT t4		-
 SELECT 'r', min(ts_range), max(ts_range) FROM tsr	!42883 function min(tsrange) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
 ROLLBACK TO t4		-
