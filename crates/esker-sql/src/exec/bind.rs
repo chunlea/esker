@@ -1277,7 +1277,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::CitextArray
-        | ColumnType::XmlArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::XmlArray
+        | ColumnType::LtreeArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1316,6 +1317,10 @@ fn placeholder(ty: ColumnType) -> Datum {
         // smallest thing there is. It only ever stands in for a type while a `Describe` is
         // answered.
         ColumnType::Xml => Datum::Text(String::new()),
+        // The empty path, which is a value: zero labels, and never read — only its type is.
+        ColumnType::Ltree => Datum::Ltree(String::new()),
+        // `*`, which matches every path — never read, only its type is.
+        ColumnType::LQuery => Datum::Text("*".to_owned()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),
         ColumnType::TimestampTz => Datum::TimestampTz(0),

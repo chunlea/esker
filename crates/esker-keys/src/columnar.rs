@@ -142,6 +142,9 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Line => 79,
         ColumnType::Xml => 80,
         ColumnType::XmlArray => 81,
+        ColumnType::Ltree => 82,
+        ColumnType::LtreeArray => 83,
+        ColumnType::LQuery => 84,
     }
 }
 
@@ -227,6 +230,9 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         79 => ColumnType::Line,
         80 => ColumnType::Xml,
         81 => ColumnType::XmlArray,
+        82 => ColumnType::Ltree,
+        83 => ColumnType::LtreeArray,
+        84 => ColumnType::LQuery,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

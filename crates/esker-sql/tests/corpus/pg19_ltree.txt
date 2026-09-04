@@ -1,0 +1,69 @@
+# `ltree` — against PostgreSQL 19beta1.
+#
+# **Run 70's row: 4 tests in `adapters/postgresql/ltree_test.rb`.** One extension, one column
+# (`t.ltree "path"`), a round trip and a schema dump.
+#
+# Things reasoning would get wrong:
+#
+# * **The order is not the text's.** `'a.b'::ltree < 'a-b'::ltree` is `t` and `'a.b' < 'a-b'` as
+#   bytes is `f`: a real server compares label by label, and a `.` (0x2E) sits above a `-` (0x2D).
+#   Equality *is* the text's, so this is ADR 0042 with only half of it failing — the type may share
+#   `text`'s row representation and may not share its key.
+# * **Its refusal is a *syntax* error**: `42601 ltree syntax error at character N`, one-based, not
+#   the `22P02` every other input function gives. A trailing separator has no character to point
+#   at and says `DETAIL: Unexpected end of input.` instead.
+# * **A label is `A-Za-z0-9_-` or a non-ASCII letter** — `héllo` is a path, `a b` and `a@b` are
+#   not — and the **empty path** is a value with zero labels.
+# * **`min(ltree)` does not exist** even though the type is fully ordered and indexable, which is
+#   the list ADR 0031 turned into a rule, one type longer.
+CREATE EXTENSION IF NOT EXISTS ltree		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname = 'ltree'	text,name,text	r|ltree|1.3
+SELECT 'r', typname, typlen, typcategory, typinput, typtype, typdelim FROM pg_type WHERE typname IN ('ltree','_ltree') ORDER BY typname	text,name,smallint,"char",regproc,"char","char"	r|_ltree|-1|A|array_in|b|, ; r|ltree|-1|U|ltree_in|b|,
+SELECT 'r', typarray > 0, oid > 16383 FROM pg_type WHERE typname = 'ltree'	text,boolean,boolean	r|t|t
+CREATE TABLE ltrees (id bigserial PRIMARY KEY, path ltree)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"ltrees"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|path|ltree
+SELECT 'r', column_name, data_type, udt_name, character_maximum_length FROM information_schema.columns WHERE table_name = 'ltrees' ORDER BY ordinal_position	text,name,character varying,name,integer	r|id|bigint|int8|\N ; r|path|USER-DEFINED|ltree|\N
+INSERT INTO ltrees (path) VALUES ('1.2.3')		-
+SELECT 'r', id, path FROM ltrees ORDER BY id		r|1|1.2.3
+INSERT INTO ltrees (path) VALUES ('1.2.3.4'), ('Top.Science'), ('Top.Science.Astronomy'), ('a'), ('')		-
+SELECT 'r', id, path FROM ltrees ORDER BY id		r|1|1.2.3 ; r|2|1.2.3.4 ; r|3|Top.Science ; r|4|Top.Science.Astronomy ; r|5|a ; r|6|
+SELECT 'r', path, nlevel(path) FROM ltrees ORDER BY id		r|1.2.3|3 ; r|1.2.3.4|4 ; r|Top.Science|2 ; r|Top.Science.Astronomy|3 ; r|a|1 ; r||0
+SELECT 'r', pg_typeof(path) FROM ltrees ORDER BY id LIMIT 1		r|ltree
+SELECT 'r', count(*) FROM ltrees WHERE path = '1.2.3'		r|1
+SELECT 'r', count(DISTINCT path) FROM ltrees		r|6
+SELECT 'r', path FROM ltrees GROUP BY path ORDER BY path		r| ; r|1.2.3 ; r|1.2.3.4 ; r|Top.Science ; r|Top.Science.Astronomy ; r|a
+DELETE FROM ltrees		-
+# --- The order, which is the point of the type.
+INSERT INTO ltrees (path) VALUES ('a.b'), ('a-b'), ('ab'), ('a'), ('a.a'), ('b'), ('A'), ('a.B')		-
+SELECT 'r', path FROM ltrees ORDER BY path		r|A ; r|a ; r|a.B ; r|a.a ; r|a.b ; r|a-b ; r|ab ; r|b
+SELECT 'r', path FROM ltrees ORDER BY path::text COLLATE "C"		r|A ; r|a ; r|a-b ; r|a.B ; r|a.a ; r|a.b ; r|ab ; r|b
+SELECT 'r', 'a.b'::ltree < 'a-b'::ltree, 'a.b' < 'a-b' COLLATE "C"	text,boolean,boolean	r|t|f
+SELECT 'r', 'a.b'::ltree < 'ab'::ltree, 'A'::ltree = 'a'::ltree	text,boolean,boolean	r|t|f
+CREATE INDEX ltrees_path_idx ON ltrees (path)		-
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'ltrees' ORDER BY indexname	text,name	r|ltrees_path_idx ; r|ltrees_pkey
+SELECT 'r', path FROM ltrees WHERE path > 'a.a'::ltree ORDER BY path		r|a.b ; r|a-b ; r|ab ; r|b
+DROP INDEX ltrees_path_idx		-
+SELECT 'r', min(path) FROM ltrees	!42883 function min(ltree) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+DELETE FROM ltrees		-
+# --- What a path is, and what it is not.
+SELECT 'r', 'a.b.c'::ltree, 'a'::ltree, ''::ltree, 'a-b'::ltree, 'a_b'::ltree, 'a1.B2'::ltree	text,ltree,ltree,ltree,ltree,ltree,ltree	r|a.b.c|a||a-b|a_b|a1.B2
+SELECT 'r', 'héllo'::ltree, '0123456789'::ltree, '_-'::ltree	text,ltree,ltree,ltree	r|héllo|0123456789|_-
+SELECT 'r', 'a..b'::ltree	!42601 ltree syntax error at character 3
+SELECT 'r', '.a'::ltree	!42601 ltree syntax error at character 1
+SELECT 'r', 'a.'::ltree	!42601 ltree syntax error DETAIL: Unexpected end of input.
+SELECT 'r', 'a b'::ltree	!42601 ltree syntax error at character 2
+SELECT 'r', 'a@b'::ltree	!42601 ltree syntax error at character 2
+SELECT 'r', 'a*b'::ltree	!42601 ltree syntax error at character 2
+SELECT 'r', '"a b"'::ltree	!42601 ltree syntax error at character 1
+SELECT 'r', nlevel(''::ltree), nlevel('a'::ltree), nlevel('a.b.c.d'::ltree)	text,integer,integer,integer	r|0|1|4
+SELECT 'r', 'a.b.c'::ltree::text, 'x'::text::ltree	text,text,ltree	r|a.b.c|x
+SELECT 'r', ltree2text('a.b'::ltree), text2ltree('a.b')	text,text,ltree	r|a.b|a.b
+# --- The three operators the unit is asked for.
+SELECT 'r', 'a.b.c'::ltree <@ 'a'::ltree, 'a'::ltree @> 'a.b.c'::ltree	text,boolean,boolean	r|t|t
+SELECT 'r', 'a'::ltree @> 'ab'::ltree, 'a.b'::ltree @> 'a'::ltree	text,boolean,boolean	r|f|f
+SELECT 'r', 'a.b'::ltree @> 'a.b'::ltree, ''::ltree @> 'a.b'::ltree	text,boolean,boolean	r|t|t
+SELECT 'r', 'a.b'::ltree || 'c.d'::ltree, 'a.b'::ltree || 'c'::text	text,ltree,ltree	r|a.b.c.d|a.b.c
+SELECT 'r', 'a.b.c'::ltree ~ 'a.*'::lquery	text,boolean	r|t
+SELECT 'r', '{a.b,c.d}'::ltree[], pg_typeof('{a.b}'::ltree[])	text,ltree[],regtype	r|{a.b,c.d}|ltree[]
+DROP TABLE ltrees		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'ltrees'	text,bigint	r|0

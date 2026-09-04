@@ -429,6 +429,10 @@ fn data_type(ty: ColumnType) -> String {
         // **The bare name, where `pg_attribute`'s `format_type` says `bit(1)`.** The two views
         // disagree on purpose: `information_schema.data_type` names the type and
         // `character_maximum_length` beside it carries the 1.
+        // **`USER-DEFINED`, and `udt_name` beside it carries the name.** An extension's type is
+        // not one of the standard's, so `information_schema` refuses to name it here — measured,
+        // and it is what `ActiveRecord`'s schema dumper reads to reach for `udt_name`.
+        ColumnType::Ltree => USER_DEFINED.to_owned(),
         ColumnType::Bit => "bit".to_owned(),
         ColumnType::VarBit => "bit varying".to_owned(),
         other => value::format_type(other, value::NO_TYPMOD),

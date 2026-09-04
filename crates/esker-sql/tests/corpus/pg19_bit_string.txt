@@ -90,3 +90,24 @@ ROLLBACK TO SAVEPOINT s10		-
 DROP TABLE b		-
 ROLLBACK		-
 SELECT 'r', count(*) FROM pg_class WHERE relname = 'b'	text,bigint	r|0
+# --- The `B'…'` and `X'…'` literals, which is what `bit_string_test.rb` actually sends: the file
+# writes a *string* default and `ActiveRecord` renders it back out as `B'00000011'`.
+SELECT 'r', B'00000011', pg_typeof(B'00000011')	text,"bit",regtype	r|00000011|bit
+SELECT 'r', B'1010', length(B'1010'), B''	text,"bit",integer,"bit"	r|1010|4|
+SELECT 'r', X'F', X'ff', X'0', pg_typeof(X'ff')	text,"bit","bit","bit",regtype	r|1111|11111111|0000|bit
+SELECT 'r', b'1010', x'ff'	text,"bit","bit"	r|1010|11111111
+SELECT 'r', B'1010' = B'1010', B'1010' < B'1011', B'1010' = '1010'::bit(4)	text,boolean,boolean,boolean	r|t|t|t
+SELECT 'r', B'102'	!22P02 "2" is not a valid binary digit
+SELECT 'r', X'FG'	!22P02 "G" is not a valid hexadecimal digit
+SELECT 'r', '101'::bit, '101'::bit varying	text,bit(1),bit varying	r|1|101
+CREATE TABLE bl (id bigserial PRIMARY KEY, a_bit bit(8) DEFAULT B'00000011', a_bit_varying bit varying(4) DEFAULT B'0011', another_bit bit)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"bl"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|a_bit|bit(8) ; r|a_bit_varying|bit varying(4) ; r|another_bit|bit(1)
+SELECT 'r', column_name, data_type, character_maximum_length, column_default FROM information_schema.columns WHERE table_name = 'bl' ORDER BY ordinal_position	text,name,character varying,integer,character varying	r|id|bigint|\N|nextval('bl_id_seq'::regclass) ; r|a_bit|bit|8|'00000011'::"bit" ; r|a_bit_varying|bit varying|4|'0011'::"bit" ; r|another_bit|bit|1|\N
+INSERT INTO bl DEFAULT VALUES		-
+SELECT 'r', id, a_bit, a_bit_varying, another_bit FROM bl ORDER BY id		r|1|00000011|0011|\N
+INSERT INTO bl (a_bit, a_bit_varying) VALUES (B'11110000', B'1100')		-
+SELECT 'r', id, a_bit, a_bit_varying FROM bl ORDER BY id		r|1|00000011|0011 ; r|2|11110000|1100
+UPDATE bl SET a_bit = B'00001111' WHERE id = 1		-
+SELECT 'r', count(*) FROM bl WHERE a_bit = B'00001111'		r|1
+DROP TABLE bl		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'bl'	text,bigint	r|0

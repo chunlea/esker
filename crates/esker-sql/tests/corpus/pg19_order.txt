@@ -101,3 +101,4 @@ bit	0	1
 bit varying		0	01	010	1	10
 bit[]	{}	{0}	{0,1}	{1}	{NULL}
 bit varying[]	{}	{0}	{01}	{NULL}
+ltree		0	1.2.3	1.2.3.4	A	Top.Science	Top.Science.Astronomy	_	a	a.B	a.a	a.b	a-b	ab	b

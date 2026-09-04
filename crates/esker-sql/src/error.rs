@@ -590,6 +590,25 @@ pub enum SqlError {
     #[error("\"{0}\" is not a valid binary digit")]
     InvalidBinaryDigit(String),
 
+    /// `'a..b'::ltree`: a path that is not a path. **`42601`, a *syntax* error**, where every
+    /// other input function raises `22P02` — and the one-based character position is part of the
+    /// message. `Some(n)` is `ltree syntax error at character n`; `None` is a trailing separator,
+    /// which has nothing to point at and carries `DETAIL: Unexpected end of input.` instead.
+    /// Both measured on 19beta1.
+    #[error("ltree syntax error{}", .0.map(|at| format!(" at character {at}")).unwrap_or_default())]
+    LtreeSyntax(Option<usize>),
+
+    /// `'a.'::lquery`: a pattern that is not one. `ltree`'s sibling, spelled the same way and
+    /// with its own word — measured, `''::lquery` and `'a.'::lquery` are both
+    /// `42601 lquery syntax error` with `DETAIL: Unexpected end of input.`
+    #[error("lquery syntax error{}", .0.map(|at| format!(" at character {at}")).unwrap_or_default())]
+    LQuerySyntax(Option<usize>),
+
+    /// `X'FG'`: a character that is not a hexadecimal digit. Its own word beside
+    /// [`SqlError::InvalidBinaryDigit`], and the same shape — the message names the character.
+    #[error("\"{0}\" is not a valid hexadecimal digit")]
+    InvalidHexadecimalDigit(String),
+
     /// A bit string assigned to a `bit(n)` column that is not `n` long — **either way**, short or
     /// long, which is what makes a fixed-width bit string different from a `character(n)`.
     #[error("bit string length {length} does not match type {ty}")]
@@ -2313,7 +2332,11 @@ impl SqlError {
             // **PostgreSQL's own class for this**: an option its `CREATE DATABASE` does not have
             // is a syntax error there and not a feature refusal. Measured.
             | SqlError::HstoreSyntax(_)
-            | SqlError::UnrecognizedDatabaseOption(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::UnrecognizedDatabaseOption(_)
+            // **A syntax error and not a `22P02`**, which is `ltree`'s own choice on a real
+            // server: the input function reports where the path stopped being a path.
+            | SqlError::LtreeSyntax(_)
+            | SqlError::LQuerySyntax(_) => sqlstate::SYNTAX_ERROR,
             // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
             // the one place PostgreSQL spends that class on something it will never implement
             // rather than on something it has not implemented yet.
@@ -2426,6 +2449,7 @@ impl SqlError {
             SqlError::MalformedRangeLiteral { .. }
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
+            | SqlError::InvalidHexadecimalDigit(_)
             | SqlError::InvalidLineSpecification
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
@@ -2642,6 +2666,11 @@ impl SqlError {
             }
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
+            }
+            // A trailing separator has no character to point at, so a real server moves the
+            // whole of what it knows into the DETAIL. Measured: `'a.'::ltree`.
+            SqlError::LtreeSyntax(None) | SqlError::LQuerySyntax(None) => {
+                Some("Unexpected end of input.".to_owned())
             }
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
