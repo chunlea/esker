@@ -3,7 +3,7 @@
 //! Every record of [ADR 0010](../../../docs/adr/0010-pd-durable-state.md) is now written by
 //! exactly one place — [`Machine::apply`](crate::machine::Machine::apply) — and reached by exactly
 //! one route: a leader proposes one of these, waits for it to commit and apply, and only then
-//! answers ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+//! answers ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
 //!
 //! # The rule this module exists to keep
 //!
@@ -67,7 +67,7 @@ pub enum Command {
     /// `applied`, and PD's oracle and allocator are rebuilt out of applied state. Applying this
     /// means every entry before it has applied too — which is every entry committed under any
     /// earlier leader — so this is the moment the leader may start answering
-    /// ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+    /// ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
     ///
     /// It writes nothing. Its value is entirely in where it sits in the log.
     TakeOffice {

@@ -81,7 +81,7 @@ impl Service for PdService {
 
 /// One request, synchronously.
 fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError> {
-    // **Only the leader answers** ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)). A
+    // **Only the leader answers** ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)). A
     // follower that answered a `Tso` would hand out a timestamp the leader may also hand out, and
     // a duplicate commit timestamp corrupts MVCC ordering silently — so the refusal is here, at
     // the top, rather than method by method where the next method could miss it.
