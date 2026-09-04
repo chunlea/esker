@@ -1,0 +1,35 @@
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_5fcac3a5562ae2 133-141,388,663-695,1100-1103,1118-1121,1200,1433,1455
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_c3726282c43bbc 528-543
+crates/esker-sql/src/parse/mod.rs
+  s_6f7019c05b578b::t_6058eea2ed1882 194-199,1087-1089
+crates/esker-sql/src/pgwire/session.rs
+  s_6f7019c05b578b::t_6d1a56608bf5b2 309-321
+crates/esker-sql/src/plan/mod.rs
+  s_6f7019c05b578b::t_1d015ddab308bd 52
+crates/esker-sql/src/plan/session.rs
+  s_6f7019c05b578b::t_1d58e2debe2bde 40-47,81-89,94-128
+crates/esker-sql/tests/corpus/pg19_discard_all.txt
+  s_6f7019c05b578b::t_22e6cb57275b22 1-94
+crates/esker-sql/tests/discard_all.rs
+  s_6f7019c05b578b::t_139cd1134f9477 1-231
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_9ba084992e37e4 1531
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "68e154e75f6e155554d5035a04bbc4e792e6007c",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
