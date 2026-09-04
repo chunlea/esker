@@ -1771,8 +1771,12 @@ fn catalog_function(
                 return Ok(Datum::Null);
             };
             let relations = env.relations()?;
+            // **Its argument is a name inside a string**, so `pg_get_serial_sequence('s.t', 'id')`
+            // has to be split the way `::regclass`'s argument is — the table it names may be in
+            // any schema, and looking the whole string up finds nothing.
+            let stored = crate::catalog::parse_qualified(table);
             let sequence = relations
-                .by_name(table)
+                .by_name(&stored)
                 .and_then(|row| relations.table(row))
                 .and_then(|table| {
                     let at = table.column(column)?;
@@ -1782,7 +1786,13 @@ fn catalog_function(
                         .find(|sequence| sequence.column == Some(at))
                 });
             match sequence {
-                Some(sequence) => Datum::Text(format!("public.{}", sequence.name)),
+                // **The schema is the table's**, not `public`: a `bigserial` in `s` owns `s.t_id_seq`
+                // there, and the qualified text is what goes back out to `setval`.
+                Some(sequence) => Datum::Text(format!(
+                    "{}.{}",
+                    crate::catalog::split_qualified(&stored).0,
+                    crate::catalog::split_qualified(&sequence.name).1
+                )),
                 None => Datum::Null,
             }
         }

@@ -2784,24 +2784,83 @@ pub fn display_name(stored: &str) -> String {
 /// * `pg_catalog.x` is the relation `x`, which is how it is stored;
 /// * `information_schema.x` **is** the stored name, dot and all (`catalog::information_schema`).
 ///
-/// A name carrying a quote is left whole, because splitting `test_schema."things.table"` correctly
-/// needs the parser and `::regclass` does not have it. That is a gap in one spelling of one cast,
-/// and it answers `42P01` rather than the wrong relation.
+/// **A quoted part keeps its case and an unquoted one folds**, per part: `"public".CAP_ID_SEQ` and
+/// `PUBLIC."cap_id_seq"` are two different names, and only the first resolves. The dot that
+/// separates them is the first one *outside* quotes, which is what lets
+/// `test_schema."things.table"` split where the dot inside the quotes does not.
+///
+/// This is where run 50's top regression was: `reset_pk_sequence!` sends
+/// `setval('"public"."accounts_id_seq"', …)` once the adapter has a namespace to qualify with, and
+/// a rule that gave up on the first quote answered `42P01` for a sequence that was right there.
 #[must_use]
 pub fn parse_qualified(written: &str) -> String {
-    if written.contains('"') {
-        return written.to_owned();
-    }
-    let Some((schema, name)) = written.split_once('.') else {
+    let parts = written_parts(written);
+    let [schema, rest @ ..] = parts.as_slice() else {
         return written.to_owned();
     };
+    if rest.is_empty() {
+        return schema.clone();
+    }
+    // More than two parts is `database.schema.relation`, which PostgreSQL takes when the database
+    // is the current one. The first dot separates here as it does there, and what follows is the
+    // name — this node has one spelling of a relation below a schema, so nothing is lost by it.
+    let name = rest.join(".");
     if schema.eq_ignore_ascii_case("information_schema") {
-        return written.to_owned();
+        return format!("{schema}.{name}");
     }
     if schema.eq_ignore_ascii_case("pg_catalog") {
-        return name.to_owned();
+        return name;
     }
-    qualify(schema, name)
+    qualify(schema, &name)
+}
+
+/// The name a `42P01` quotes back for a relation written inside a string.
+///
+/// **What the user wrote, normalised — not what it would have been stored as.** A relation in
+/// `public` is stored without its schema, so the stored form has already forgotten a `public.`
+/// somebody typed; PostgreSQL has not, and prints `relation "public.nosuch_seq" does not exist`.
+/// [`display_name`] is the other direction and is for a name that came off disk.
+#[must_use]
+pub fn written_display(written: &str) -> String {
+    written_parts(written).join(".")
+}
+
+/// A name written inside a string, split on its unquoted dots with every part unquoted or folded.
+///
+/// Surrounding whitespace goes, which is what PostgreSQL does with `'  public.s  '::regclass`.
+fn written_parts(written: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut chars = written.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes => {
+                // `""` inside a quoted identifier is one quote, not the end of it.
+                if chars.peek() == Some(&'"') {
+                    part.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '"' => {
+                in_quotes = true;
+                // Remembered per part rather than per name: `public."Mixed"` folds one half and
+                // keeps the other.
+                quoted = true;
+            }
+            '.' if !in_quotes => {
+                parts.push(fold_identifier(&part, quoted).0);
+                part.clear();
+                quoted = false;
+            }
+            _ => part.push(c),
+        }
+    }
+    parts.push(fold_identifier(&part, quoted).0);
+    parts
 }
 
 /// Every relation stored in one schema, as stored names.
@@ -4057,6 +4116,66 @@ mod tests {
         let wide = format!("{}é", "x".repeat(62));
         let (folded, _) = fold_identifier(&wide, false);
         assert_eq!(folded, "x".repeat(62));
+    }
+
+    /// **A name written inside a string is read per part**, which is the whole of run 50's top
+    /// regression: `setval('"public"."accounts_id_seq"', …)` is the sequence `accounts_id_seq` in
+    /// `public`, and a rule that gave up on the first quote answered `42P01` for it.
+    #[test]
+    fn a_name_written_in_a_string_is_read_one_part_at_a_time() {
+        use super::{PUBLIC_SCHEMA, parse_qualified, qualify, written_display};
+
+        // The four spellings `ActiveRecord` and `psql` between them produce for one sequence.
+        for written in [
+            "accounts_id_seq",
+            "\"accounts_id_seq\"",
+            "public.accounts_id_seq",
+            "\"public\".\"accounts_id_seq\"",
+            "\"public\".accounts_id_seq",
+            "public.\"accounts_id_seq\"",
+            "  public.accounts_id_seq  ",
+            "PUBLIC.ACCOUNTS_ID_SEQ",
+        ] {
+            assert_eq!(parse_qualified(written), "accounts_id_seq", "{written}");
+        }
+
+        // **A quoted part keeps its case and an unquoted one folds**, and the difference is the
+        // whole of what a quote means: this one names no schema this cluster has.
+        assert_eq!(
+            parse_qualified("\"PUBLIC\".\"accounts_id_seq\""),
+            qualify("PUBLIC", "accounts_id_seq")
+        );
+        assert_eq!(
+            parse_qualified("s.\"Mixed\""),
+            qualify("s", "Mixed"),
+            "one part folds and the other does not"
+        );
+
+        // **The dot inside a quoted part is not a separator**, which is the case the old rule
+        // bailed out for and the reason it bailed: `schema_test.rb` really does create
+        // `test_schema.\"things.table\"`.
+        assert_eq!(
+            parse_qualified("test_schema.\"things.table\""),
+            qualify("test_schema", "things.table")
+        );
+        assert_eq!(parse_qualified("\"things.table\""), "things.table");
+        // And `\"\"` inside one is a single quote, not the end of it.
+        assert_eq!(parse_qualified("\"a\"\"b\""), "a\"b");
+
+        // The two schemas this node spells *into* a name keep their own rule.
+        assert_eq!(parse_qualified("pg_catalog.pg_class"), "pg_class");
+        assert_eq!(
+            parse_qualified("information_schema.tables"),
+            "information_schema.tables"
+        );
+
+        // **What a `42P01` prints is what was written**, normalised — not what would be stored. A
+        // relation in `public` stores bare, so the stored form has forgotten a `public.` the caller
+        // typed and PostgreSQL has not.
+        assert_eq!(written_display("\"public\".\"nosuch\""), "public.nosuch");
+        assert_eq!(written_display("nosuch"), "nosuch");
+        assert_eq!(written_display("\"PUBLIC\".\"s\""), "PUBLIC.s");
+        assert_eq!(parse_qualified(PUBLIC_SCHEMA), PUBLIC_SCHEMA);
     }
 
     /// **A cluster nobody has told about databases has one, and it is the one it is serving.**

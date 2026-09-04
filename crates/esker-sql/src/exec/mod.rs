@@ -1020,7 +1020,13 @@ impl Executor {
                     .sequences
                     .get(&sequence.id)
                     .map(|(next, _)| next - 1)
-                    .ok_or_else(|| SqlError::SequenceNotYetDefined(Some(name.to_owned()))),
+                    // **The sequence's own name, not the spelling that reached it**: by here the
+                    // name has resolved, and `currval('"public"."s"')` is about the sequence `s`.
+                    .ok_or_else(|| {
+                        SqlError::SequenceNotYetDefined(Some(
+                            crate::catalog::split_qualified(&sequence.name).1.to_owned(),
+                        ))
+                    }),
                 SequenceFunc::SetVal => self.set_sequence(sequence.id, call),
                 SequenceFunc::LastVal => unreachable!("handled above"),
             };
@@ -1036,13 +1042,26 @@ impl Executor {
 
     /// A sequence by name, or the two refusals a real server gives: `42P01` for a name that is
     /// nothing and `42809` for one that is something else.
+    ///
+    /// **The name arrives inside a string**, exactly as `::regclass`'s does, so a schema in it is a
+    /// dot rather than the separator the parser would have produced and either part may be quoted.
+    /// `reset_pk_sequence!` sends `setval('"public"."accounts_id_seq"', …)` on every fixture load,
+    /// and resolving that as one opaque name is run 50's top regression — 4,873 tests in 93 files.
+    ///
+    /// A name with no schema in it resolves along the `search_path`, which is what makes
+    /// `nextval('s')` find a sequence the session can see and nothing it cannot.
     pub(super) fn require_sequence(
         &self,
         txn: &dyn Txn,
         name: &str,
     ) -> Result<crate::catalog::SequenceDef> {
+        let stored = self.resolve_unqualified(txn, &crate::catalog::parse_qualified(name))?;
+        // **The name as written, not as it would be stored**: a sequence in `public` is stored
+        // bare, so the stored form has forgotten a `public.` the caller typed and PostgreSQL has
+        // not — `relation "public.nosuch_seq" does not exist`. Measured.
+        let printed = crate::catalog::written_display(name);
         let view = self.catalog_view(txn)?;
-        match view.relation(name)? {
+        match view.relation(&stored)? {
             // **Read straight from the record, not through the table**: a sequence no column
             // owns is filed under `STANDALONE_SEQUENCE_OWNER`, which has no `TableDef` behind it,
             // and a column may own more than one — neither of which the old lookup, which asked
@@ -1051,15 +1070,20 @@ impl Executor {
                 table_id,
                 sequence_id,
             }) => crate::catalog::sequence_by_id(txn, self.tenant, table_id, sequence_id)?
-                .ok_or_else(|| SqlError::UndefinedTable(name.to_owned())),
+                .ok_or(SqlError::UndefinedTable(printed)),
             // No `HINT`: PostgreSQL sends one only for the `DROP` statements, where there is
             // another verb to point at. `nextval` over a table has nothing to suggest.
+            //
+            // **The name is bare here where the `42P01` above is qualified**, and that is
+            // PostgreSQL's own asymmetry: by this point the name has resolved, so what is being
+            // reported is the relation rather than the spelling — `nextval('"public"."cap"')` is
+            // `"cap" is not a sequence`. Measured.
             Some(_) => Err(SqlError::WrongObjectType {
-                name: name.to_owned(),
+                name: crate::catalog::split_qualified(&stored).1.to_owned(),
                 expected: "a sequence",
                 found: "",
             }),
-            None => Err(SqlError::UndefinedTable(name.to_owned())),
+            None => Err(SqlError::UndefinedTable(printed)),
         }
     }
 
@@ -1605,7 +1629,10 @@ impl Executor {
         crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
             .by_name(&stored)
             .map(|relation| relation.oid)
-            .ok_or(SqlError::UndefinedTable(stored))
+            // **The message spells the name the caller wrote**, normalised: the schema goes
+            // *inside* the quotes, and a `public.` that the stored form drops is still printed —
+            // `relation "public.nosuch_seq" does not exist`.
+            .ok_or_else(|| SqlError::UndefinedTable(crate::catalog::written_display(name)))
     }
 
     /// The tables a statement is about, in the order their columns appear in a row.
