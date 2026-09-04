@@ -1,0 +1,35 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_e5c0c6e78b5662::t_ba6292ace728b9 1585-1590,3958,4051,4133,5450
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_e5c0c6e78b5662::t_ee413dd77c068d 219-220,294-298,447-450
+crates/esker-sql/src/catalog/record.rs
+  s_e5c0c6e78b5662::t_64f0de3b135830 106,1915-1921,1939-1949,2539,2543,2587
+crates/esker-sql/src/error.rs
+  s_e5c0c6e78b5662::t_026d98d0f2b897 913-924,2396
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_7f423dbe8c1ed5 565-572,577-616,1184-1195
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_f44e46f78c4c96 2074,2243-2246,2250,2567,2715
+crates/esker-sql/tests/check_constraint.rs
+  s_e5c0c6e78b5662::t_5f67ab6ed1358d 130,132-135,137,145-155,157-179,181-192
+crates/esker-sql/tests/check_not_valid.rs
+  s_e5c0c6e78b5662::t_319fb1fd02448e 1-46
+crates/esker-sql/tests/corpus/pg19_check_not_valid.txt
+  s_e5c0c6e78b5662::t_f58ade43d9c230 1-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ffe0d0346dbdadbb5c79278517ce1a74a19e15a8",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
