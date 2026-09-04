@@ -1102,6 +1102,68 @@ fn an_add_interrupted_halfway_is_finished_by_whoever_is_leading_next() {
     assert_eq!(group.at(next).conf_state().unwrap().voters.len(), 4);
 }
 
+/// **Killed mid-change**, in the other sense: a member's process dies while a membership change is
+/// half done, and comes back.
+///
+/// This is the path that proves the address book is durable and that a **replay** rebuilds it. The
+/// restarted member has never spoken to member 4; everything it knows about where member 4 is came
+/// out of a conf change in its own log, folded in at append and written into the same batch as the
+/// entry. A member that had only learned the address in memory would come back unable to reach the
+/// member it had just agreed to admit.
+#[test]
+fn a_member_killed_mid_change_comes_back_knowing_who_joined() {
+    let mut group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    group
+        .run("bootstrapping", || {
+            group.at(leader).bootstrap(1, "127.0.0.1:20160")
+        })
+        .unwrap();
+    group.admit(4, "127.0.0.1:32382");
+
+    // One step: member 4 is a learner, and every member has the entry.
+    assert!(
+        !group
+            .run("adding member 4", || {
+                group.at(leader).add_member(4, "127.0.0.1:32382")
+            })
+            .unwrap()
+    );
+    group.settle();
+
+    // A follower is killed and re-opened over the same directory. It keeps only what it had
+    // written down.
+    let killed = (1..=3).find(|id| *id != leader).unwrap();
+    group.restart(killed);
+    assert!(
+        group.at(killed).members().contains(4),
+        "member {killed} came back not knowing member 4 had joined"
+    );
+    assert_eq!(
+        group.at(killed).members().address_of(4),
+        Some("127.0.0.1:32382"),
+        "member {killed} came back knowing member 4 but not where it is"
+    );
+    assert_eq!(
+        group.at(killed).membership().group_id,
+        group.at(leader).membership().group_id,
+        "the restart renamed the group"
+    );
+
+    // And the change finishes, with the restarted member counting towards it.
+    group.until("finishing the add", || {
+        group.at(leader).add_member(4, "127.0.0.1:32382")
+    });
+    group.settle();
+    assert!(group.at(leader).conf_state().unwrap().voters.contains(&4));
+    for id in [killed, 4] {
+        assert!(
+            group.at(id).members().contains(4),
+            "member {id} does not hold the group it is in"
+        );
+    }
+}
+
 /// A placement driver may not remove its way out of a quorum, because undoing that needs the
 /// quorum it just lost.
 ///

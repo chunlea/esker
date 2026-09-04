@@ -585,3 +585,53 @@ unit lands, that method makes `wiring.rs` disappear.
 
 `crates/esker-proto/src/transport/**` is used and not edited here.
 
+### 11.8 Progress
+
+- **Unit 8 — plan and ADR.** `docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md`.
+- **Unit 9 — the group is named once.** `PersistedState` v2 with the group id and the address book;
+  `MemberList` carries the recorded id. A version-1 record reads as "not yet named", which is the
+  signal to mint. The upgrade is invisible, asserted against the derivation rather than a constant.
+- **Unit 10 — conf changes apply.** The address out of the change's `context`, the route learned at
+  append, `PdWiring`, `add_member` / `remove_member` as reconciliations.
+- **Unit 11 — the wire and the tools.** `Pd::MemberChange` (`0x030d`) and four goldens,
+  `pd members add|remove`, `pd serve --join`.
+- **Unit 12 — clients learn a group that has grown.** A hint outside the list is a refresh, and the
+  group id is the guard that replaces the old refusal.
+- **Unit 13 — tests.** Nineteen in `failover.rs`, including the recovery path, an add finished by a
+  *different* leader, a member killed mid-change, and the two removals that must be refused.
+- **Unit 14 — DESIGN.md** §7 and §15.
+
+### 11.9 Two things the tests found, and one was mine
+
+**A guard justified by a mechanism that does not exist.** The removal check first required
+`recent_active && matched > 0`, with a comment explaining that a leader marks every peer recently
+active when it takes office — so `recent_active` alone would let a freshly elected leader remove its
+way below a quorum. That comment is wrong. `esker-raft`'s "a peer that becomes a voter here starts
+out recently active" is `rebuild_progress`, on a conf change; `become_leader` uses `Progress::new`,
+which starts it **false**. Writing the test that would need the guard produced a test whose own
+premise assertion fired, which is how it was caught. The extra condition added nothing in any
+reachable case, and a false explanation in the source is worse than none, so both are gone and the
+comment now says what is true: the reading is conservative in *both* directions, and refusing a
+healthy removal for one window is the safe direction.
+
+**A test that asked a question nobody asks.** The same test cut a member off and immediately asked
+whether a removal would be refused — but the group had not ticked, so it had not noticed, and PD
+answering "everybody is here" one tick after a death is honest rather than wrong. It waits for the
+group to notice now, which is what an operator does.
+
+Mutating the liveness check away turns it red with exactly the state it exists to prevent:
+`"stopped leading with this command in its log; it may still commit"` — a group that has removed its
+way below a quorum and cannot undo it, because undoing needs the quorum it just lost.
+
+### 11.10 Owed
+
+- **A three-process membership change**, as opposed to three members in one process. Same gap
+  §9.3 records for failover, and the same answer: the largest of these and the one with the most
+  to find.
+- **Roles in `esker pd members`.** The listing shows who leads but not who is a *learner*, so an
+  add that has stalled half-way is diagnosed from `pd members add` not returning rather than from
+  the listing. Adding `role` to `PdMemberInfo` would change a golden — one written in this same
+  phase, in a message no other lane consumes yet — so it is a one-line ask for the human rather
+  than something this lane took.
+- **`PdTcpTransport::reconfigure`**, which makes `wiring.rs` disappear. §11.7.
+
