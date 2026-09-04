@@ -221,3 +221,185 @@ fn dropping_a_serial_column_takes_its_sequence_name_with_it() {
     node.run("INSERT INTO sq (id) VALUES (1)").unwrap();
     assert_eq!(node.rows("SELECT counter FROM sq"), [["1"]]);
 }
+
+/// **Run 56's cliff.** Five files stopped on `corrupt data: a name points at table N, which is not
+/// there`, and the standalone repro is one file: run `migration/rename_table_test.rb` on a fresh
+/// node and the next `SELECT count(*) FROM pg_class` cannot answer, while `SELECT 1` still can.
+///
+/// A *name* outliving its object again. This walks the statements that file sends and asks
+/// `pg_class` after **every one**, so the statement that leaks names itself rather than the one
+/// that trips over it afterwards.
+#[test]
+fn renaming_a_table_and_back_leaves_no_dangling_name() {
+    let mut node = parity::Node::new(&[]);
+
+    // `rename_table` sends up to four kinds of statement: the table, the primary key's index, the
+    // sequence, and then one `ALTER INDEX … RENAME TO` per index whose name follows the
+    // `index_<table>_on_<column>` convention (`rename_table_indexes`).
+    let script = [
+        "CREATE TABLE test_models (id bigserial PRIMARY KEY, created_at timestamptz, updated_at timestamptz)",
+        "CREATE INDEX index_test_models_on_created_at ON test_models (created_at)",
+        "CREATE TABLE \"references\" (id bigserial PRIMARY KEY, url text)",
+        "ALTER TABLE test_models ADD COLUMN url text",
+        "ALTER TABLE test_models DROP COLUMN created_at",
+        "ALTER TABLE test_models DROP COLUMN updated_at",
+        // `rename_table :test_models, :octopi`
+        "ALTER TABLE test_models RENAME TO octopi",
+        "ALTER INDEX test_models_pkey RENAME TO octopi_pkey",
+        "ALTER TABLE test_models_id_seq RENAME TO octopi_id_seq",
+        // the reserved-words test: a three-way shuffle
+        "ALTER TABLE \"references\" RENAME TO old_references",
+        "ALTER INDEX references_pkey RENAME TO old_references_pkey",
+        "ALTER TABLE references_id_seq RENAME TO old_references_id_seq",
+        "ALTER TABLE octopi RENAME TO \"references\"",
+        "ALTER INDEX octopi_pkey RENAME TO references_pkey",
+        "ALTER TABLE octopi_id_seq RENAME TO references_id_seq",
+        // and back again, which is what the `ensure` block does
+        "ALTER TABLE \"references\" RENAME TO test_models",
+        "ALTER INDEX references_pkey RENAME TO test_models_pkey",
+        "ALTER TABLE references_id_seq RENAME TO test_models_id_seq",
+        "ALTER TABLE old_references RENAME TO \"references\"",
+        "ALTER INDEX old_references_pkey RENAME TO references_pkey",
+        "ALTER TABLE old_references_id_seq RENAME TO references_id_seq",
+        // the teardown drops what the helper made
+        "DROP TABLE test_models",
+        "DROP TABLE \"references\"",
+    ];
+
+    // `test_rename_table_with_long_table_name_and_index` renames to a 63-byte name, and
+    // `rename_table_indexes` then builds index names from it that run past the limit — where this
+    // node **truncates** an identifier rather than refusing it, exactly as a real server does. A
+    // truncated name is a different string from the one the statement named, and every name record
+    // has to be written and deleted under the same one.
+    let long = "a".repeat(63);
+    let script: Vec<String> = script
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([
+            "CREATE TABLE lt (id bigserial PRIMARY KEY, url text)".to_owned(),
+            "CREATE INDEX index_lt_on_url ON lt (url)".to_owned(),
+            format!("ALTER TABLE lt RENAME TO {long}"),
+            format!("ALTER INDEX index_lt_on_url RENAME TO index_{long}_on_url"),
+            format!("ALTER INDEX index_{long}_on_url RENAME TO index_lt_on_url"),
+            format!("ALTER TABLE {long} RENAME TO lt"),
+            "DROP TABLE lt".to_owned(),
+        ])
+        .collect();
+
+    for statement in script {
+        let statement = statement.as_str();
+        let outcome = node.answer(statement).to_string();
+        assert!(!outcome.starts_with('!'), "{statement} -> {outcome}");
+        // **`pg_class` is the fsck**: reading it walks every name record and follows it, so a name
+        // that outlived its object is a `corrupt data` here and nowhere else. Asked after every
+        // statement, because the one that leaks is the one *before* the one that trips.
+        let seen = node.answer("SELECT count(*) FROM pg_class").to_string();
+        assert!(
+            !seen.starts_with('!'),
+            "after `{statement}` the catalog cannot be read: {seen}"
+        );
+    }
+}
+
+/// **A randomised walk over the DDL that writes name records**, with the catalog checked after
+/// every statement.
+///
+/// Run 56's cliff is a *name* pointing at a table that is gone, and five reconstructions of
+/// `rename_table_test.rb` by hand did not produce one — so this stops reconstructing and searches.
+/// The statements are the ones that write or delete a name record (create, drop, and the three
+/// renames), over a deliberately tiny universe of names so that collisions and re-uses happen
+/// often; reading `pg_class` walks every name and follows it, which is the only thing that can see
+/// the damage.
+///
+/// The generator is a plain LCG so a failure names a seed that reproduces it exactly.
+#[test]
+fn no_ddl_order_leaves_a_name_pointing_at_a_table_that_is_gone() {
+    const NAMES: [&str; 3] = ["ta", "tb", "tc"];
+
+    for seed in 0..64_u64 {
+        let mut node = parity::Node::new(&[]);
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        let mut history: Vec<String> = Vec::new();
+
+        for _ in 0..24 {
+            let name = NAMES[next() % NAMES.len()];
+            let other = NAMES[next() % NAMES.len()];
+            let statement = match next() % 7 {
+                0 => format!("CREATE TABLE {name} (id bigserial PRIMARY KEY, url text)"),
+                1 => format!("DROP TABLE IF EXISTS {name}"),
+                2 => format!("ALTER TABLE {name} RENAME TO {other}"),
+                3 => format!("ALTER INDEX {name}_pkey RENAME TO {other}_pkey"),
+                4 => format!("ALTER TABLE {name}_id_seq RENAME TO {other}_id_seq"),
+                5 => format!("CREATE INDEX index_{name}_on_url ON {name} (url)"),
+                // Renaming a **secondary** index, which is the one that leaked: the primary key's
+                // name lives in its own field and was already reconciled, so a fuzz that renamed
+                // only `_pkey` ran green against the code that had the bug.
+                _ => format!("ALTER INDEX index_{name}_on_url RENAME TO index_{other}_on_url"),
+            };
+            // A statement may fail — a name taken, a table absent — and that is ordinary. What may
+            // never happen is the catalog becoming unreadable afterwards.
+            let _ = node.answer(&statement);
+            history.push(statement);
+            let seen = node.answer("SELECT count(*) FROM pg_class").to_string();
+            assert!(
+                !seen.starts_with('!'),
+                "seed {seed}: the catalog cannot be read after this sequence:\n  {}\n{seen}",
+                history.join("\n  ")
+            );
+        }
+    }
+}
+
+/// **Run 56's error, made in three statements.** `corrupt data: a name points at table N, which is
+/// not there` — the message five files stopped on, and the sixth name-record leak.
+///
+/// `replace_table` reconciled index names by **id**, and a rename does not change an id: the
+/// comparison saw the index as still present, so the *old* name record stayed, pointing at the
+/// table. Nothing complains while the table is there — two names resolve to one index. Then the
+/// table is dropped, `drop_table` deletes the names the record still lists (the new one), and the
+/// old one is left pointing at a table that is gone. The next read of `pg_class` walks it and
+/// cannot answer, while `SELECT 1` still can — which is exactly the shape the cliff detector saw
+/// and the wedge detector could not.
+///
+/// `ALTER INDEX … RENAME TO` is what `rename_table` sends for the primary key's index and for every
+/// index named by convention, which is why `migration/rename_table_test.rb` is where it surfaced.
+#[test]
+fn a_renamed_index_leaves_no_name_behind_when_its_table_is_dropped() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE t (id bigint PRIMARY KEY, url text)")
+        .unwrap();
+    node.run("CREATE INDEX index_t_on_url ON t (url)").unwrap();
+
+    node.run("ALTER INDEX index_t_on_url RENAME TO index_t_on_url2")
+        .unwrap();
+    // The old name is gone *now*, which is the whole fix: one name, one index.
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'index_t_on_url'"),
+        [["0"]]
+    );
+
+    node.run("DROP TABLE t").unwrap();
+    // And the catalog is still readable. With the old name left behind this is
+    // `XX001 corrupt data: a name points at table N, which is not there`, from a statement that
+    // has nothing to do with the rename — and every later schema load meets it.
+    let seen = node.answer("SELECT count(*) FROM pg_class").to_string();
+    assert!(
+        !seen.starts_with('!'),
+        "the catalog must survive a renamed index whose table was dropped: {seen}"
+    );
+    // The same for the primary key's index, which is the one `rename_table` always renames.
+    node.run("CREATE TABLE t (id bigint PRIMARY KEY)").unwrap();
+    node.run("ALTER INDEX t_pkey RENAME TO t2_pkey").unwrap();
+    node.run("DROP TABLE t").unwrap();
+    let seen = node.answer("SELECT count(*) FROM pg_class").to_string();
+    assert!(
+        !seen.starts_with('!'),
+        "and for a renamed primary key: {seen}"
+    );
+}
