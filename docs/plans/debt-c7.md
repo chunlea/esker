@@ -192,3 +192,48 @@ wait, a commit budget or a transport timeout, and it is one line.
 So the ask is the capture: keep the gate's output unfiltered, or at minimum `grep -A 2 "panicked at"`.
 Until then a budget cannot be named honestly, and naming one from the timing alone would be a guess
 of the kind `debt-c6.md` §9 spent a unit refuting.
+
+## 7. Debt #7 `join_cost`: diagnosed, and it is not this lane's to fix
+
+The brief said to leave `esker-sql::join_cost::a_materialised_join_costs_what_it_pairs_and_not_the_cross_product`
+alone but to say so if unit 0's work explained it. It does, and this wave's own closing gate
+produced the message the register says was never captured:
+
+```
+8x the rows cost 10.3x the time where the control cost 3.4x (3.0x as much growth):
+1.620926ms at 250 rows, 16.701596ms at 2000.
+```
+
+Re-run alone 3 times: **3 of 3 green**. At four loads: green at 0, **red at 14**, green at 40 and
+80 —
+
+```
+LOAD=14  8x the rows cost 16.7x the time where the control cost 4.0x
+```
+
+**Non-monotonic, so a race rather than a slow test**, and for a ratio test that has a specific
+meaning. The four measurements are strictly sequential:
+
+```rust
+let (small, small_rows) = cost(250, JOIN);
+let (large, large_rows) = cost(2_000, JOIN);
+let (small_control, _) = cost(250, CONTROL);
+let (large_control, _) = cost(2_000, CONTROL);
+```
+
+so the control is measured **after** the subject, not beside it. Load that arrives or departs
+between the second and third measurement moves `growth` and `control` independently — and
+cancelling load common to both arms is the one thing a control is for. That also explains the shape
+of the curve: at eighty threads *both* arms are slow together and the ratio is stable again, while
+moderate bursty load is where they diverge. The danger zone is the middle, which is why more load
+did not make it worse.
+
+The denominator makes it sharper. `small` is **1.6 ms**, and it sits under `large` in `growth`, so
+one scheduler preemption of a few milliseconds is an error of over 100% in the numerator of the
+ratio the assertion reads.
+
+Two changes would close it, both in `esker-sql` and so not made here: **interleave** the arms —
+alternate `JOIN` and `CONTROL` and compare medians, so shared load cancels — and lift the small case
+off the noise floor so the ratio's denominator is not a 1.6 ms sample. `docs/plans/debt-c4.md` §9's
+rule applies to the diagnosis as much as to the fix: this was found by making it deterministic at
+one load, not by counting runs.
