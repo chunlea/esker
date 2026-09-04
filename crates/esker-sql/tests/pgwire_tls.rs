@@ -300,6 +300,42 @@ mod encrypted {
         );
     }
 
+    /// A message larger than every buffer between the socket and the session still arrives whole.
+    ///
+    /// The numbers this is about: the pump reads the socket 8 KiB at a time, a TLS record holds at
+    /// most about 16 KiB, and the plaintext pipe between the session and the protocol loop is
+    /// 64 KiB. A query bigger than all three crosses several records and fills the pipe, which is
+    /// the path where a reassembly bug or a backpressure deadlock would live — and neither shows up
+    /// in an exchange of small messages, which is every other test here.
+    #[tokio::test]
+    async fn a_message_larger_than_every_buffer_arrives_whole() {
+        let address = listen(server_tls()).await;
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(&request(SSL_REQUEST)).await.unwrap();
+        let mut answer = [0u8; 1];
+        socket.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"S");
+
+        let mut stream = handshake(socket).await;
+        stream.write_all(&startup_packet()).await.unwrap();
+        assert!(tags_until_ready(&mut stream).await.ends_with('Z'));
+
+        // A comment is the cheapest way to make a statement of any size that the parser must read
+        // to the end before it can answer.
+        let mut sql = format!("SELECT 1 -- {}", "x".repeat(200 * 1024));
+        sql.push('\0');
+        let mut query = vec![b'Q'];
+        query.extend_from_slice(&u32::try_from(sql.len() + 4).unwrap().to_be_bytes());
+        query.extend_from_slice(sql.as_bytes());
+        stream.write_all(&query).await.unwrap();
+
+        let tags = tags_until_ready(&mut stream).await;
+        assert!(
+            tags.ends_with('Z'),
+            "a 200 KiB statement is answered and the session is ready again: {tags}"
+        );
+    }
+
     /// A second `SSLRequest`, sent *inside* the established session, is refused rather than
     /// starting a second handshake inside the first.
     #[tokio::test]
