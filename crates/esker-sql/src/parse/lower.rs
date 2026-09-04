@@ -161,6 +161,11 @@ impl Parsed {
         // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
         if let plan::Statement::CreateType(create) = &mut lowered {
             create.if_not_exists = self.is_do_guarded();
+            // `NOT NULL` on a `CREATE DOMAIN` was cut out of the source so the statement would
+            // parse (`crate::parse::strip_domain_not_null`).
+            if let TypeKind::Domain { not_null, .. } = &mut create.kind {
+                *not_null = self.domain_not_null();
+            }
         }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
@@ -668,6 +673,56 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             )?;
             Ok(plan::Statement::Explain(Box::new(inner), *analyze))
         }
+        // **A domain lowers into a `CREATE TYPE`**, because that is what it is: a fourth
+        // `TypeKind` beside the range, the composite and the enum
+        // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
+        // Everything downstream — the record, `pg_type`, the drop, the dependency check — is the
+        // one path all four already take.
+        Statement::CreateDomain(create) => {
+            refuse_if(create.collation.is_some(), "CREATE DOMAIN ... COLLATE")?;
+            let (base, typmod) = lower_type(&create.data_type)?;
+            let mut check = None;
+            for constraint in &create.constraints {
+                match constraint {
+                    TableConstraint::Check(clause) => {
+                        // Kept as **text**, the same trade a table's `CHECK` and a view's body
+                        // make: it is re-read where it is evaluated, and a tree here would put a
+                        // `sqlparser` type in `plan`.
+                        check = Some(unwrap_nested(&clause.expr).to_string());
+                    }
+                    other => {
+                        return Err(SqlError::unsupported(format!(
+                            "CREATE DOMAIN with the constraint {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(plan::Statement::CreateType(plan::CreateType {
+                // **A domain takes a schema**, which is the shape `schema_test.rb` needs: it
+                // creates `schema_1.text`, a domain whose bare name is a built-in type's, and
+                // resolves it through the `search_path`. So the name is stored qualified the way
+                // a relation's is, and `relation_name` is the one reader of that grammar.
+                name: relation_name(&create.name)?,
+                kind: TypeKind::Domain {
+                    base,
+                    typmod,
+                    // `NOT NULL` is cut out of the source, because `sqlparser` 0.62.0 stops at the
+                    // keyword — the fact travels on `Parsed` and is applied in `lower_inline`.
+                    not_null: false,
+                    default: create.default.as_ref().map(ToString::to_string),
+                    check,
+                },
+                if_not_exists: false,
+            }))
+        }
+        Statement::DropDomain(drop) => Ok(plan::Statement::DropType(plan::DropType {
+            names: vec![relation_name(&drop.name)?],
+            if_exists: drop.if_exists,
+            cascade: matches!(
+                drop.drop_behavior,
+                Some(sqlparser::ast::DropBehavior::Cascade)
+            ),
+        })),
         Statement::CreateType {
             name,
             representation,
