@@ -608,12 +608,21 @@ mod tests {
     /// rather than a locked map.
     #[test]
     fn readers_and_writers_run_concurrently() {
+        // Miri interprets every instruction, and four readers each walking a two-thousand-entry
+        // list five hundred times is millions of them. Small is still meaningful here: what Miri
+        // is looking for is a missing happens-before edge, and one insert either has it or does
+        // not. Without this, `cargo miri test -- memtable` never finishes.
+        #[cfg(miri)]
+        const ROUNDS: u64 = 20;
+        #[cfg(not(miri))]
+        const ROUNDS: u64 = 500;
+
         let table = table();
         let writers: Vec<_> = (0..4u64)
             .map(|worker| {
                 let table = Arc::clone(&table);
                 std::thread::spawn(move || {
-                    for i in 0..500u64 {
+                    for i in 0..ROUNDS {
                         let key = format!("key-{:04}", i % 100);
                         table.add(worker * 1000 + i + 1, EntryKind::Put, key.as_bytes(), b"v");
                     }
@@ -628,7 +637,7 @@ mod tests {
                     // is little-endian and sorts descending, so `previous < key` on the raw
                     // bytes is exactly the mistake this crate exists to avoid.
                     let order = Arc::clone(table.comparator());
-                    for _ in 0..500 {
+                    for _ in 0..ROUNDS {
                         let mut iter = table.iter();
                         iter.seek_to_first();
                         let mut previous: Option<Vec<u8>> = None;
@@ -651,6 +660,10 @@ mod tests {
         for handle in writers.into_iter().chain(readers) {
             handle.join().unwrap();
         }
-        assert_eq!(table.len(), 2000, "every insert is present");
+        assert_eq!(
+            table.len(),
+            4 * usize::try_from(ROUNDS).unwrap(),
+            "every insert is present"
+        );
     }
 }
