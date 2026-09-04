@@ -1,0 +1,27 @@
+crates/esker-sql/src/error.rs
+  s_2d916f5f540186::t_43332d77485939 763-776,2176-2177,2378
+crates/esker-sql/src/exec/ddl.rs
+  s_2d916f5f540186::t_0a288f577188ab 2102-2113,4087-4097
+crates/esker-sql/tests/corpus/pg19_unique_over_existing_rows.txt
+  s_2d916f5f540186::t_f6c04d36276a31 1-68
+crates/esker-sql/tests/nulls_not_distinct.rs
+  s_2d916f5f540186::t_3587f3502b2045 18-23
+crates/esker-sql/tests/unique_over_existing_rows.rs
+  s_2d916f5f540186::t_8ebf00f59316b0 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cf275e32a86fb7a3787c91e667f7bd0e1ec208bd",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
