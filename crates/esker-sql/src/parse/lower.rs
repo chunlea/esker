@@ -819,7 +819,7 @@ fn verb_arguments(function: &sqlparser::ast::Function) -> Option<Vec<String>> {
 /// real server accepts and stores, and `SET TRANSACTION SNAPSHOT`, which a real server *acts* on
 /// and whose every precondition is one this feature wants anyway.
 fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
-    use sqlparser::ast::{ContextModifier, Set};
+    use sqlparser::ast::{ContextModifier, Set, SetSessionAuthorizationParamKind};
 
     match set {
         Set::SingleAssignment {
@@ -910,6 +910,24 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 plan::SessionStatement::SetSnapshot(id.clone()),
             ))
         }
+        // **`SET SESSION AUTHORIZATION` on a node with no roles**, which is the 12 refusals behind
+        // run 57's aborted-transaction row — every one of them in `schema_authorization_test.rb`,
+        // whose `set_session_auth` sends `DEFAULT` between each named user.
+        //
+        // `DEFAULT` asks for what is already the case and succeeds. Any *name* is
+        // `22023 role "x" does not exist`, which is true of every name here — and `22023` rather
+        // than the `42704` the same sentence takes for `CREATE DATABASE … OWNER`, because
+        // PostgreSQL reads an authorization name as a parameter value and an owner as an object.
+        // Measured, both. The file still needs `CREATE USER` to pass; what changes is that it now
+        // fails on the feature that is missing instead of aborting the transaction on this.
+        Set::SetSessionAuthorization(param) => match &param.kind {
+            SetSessionAuthorizationParamKind::Default => Ok(plan::Statement::Session(
+                plan::SessionStatement::SetSessionAuthorization,
+            )),
+            SetSessionAuthorizationParamKind::User(name) => {
+                Err(SqlError::UndefinedRoleForAuthorization(ident(name)))
+            }
+        },
         other => Err(SqlError::unsupported(set_feature_name(other))),
     }
 }
@@ -1984,8 +2002,21 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_storage_parameters(options)?);
             continue;
         }
-        if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
-            actions.push(lower_added_constraint(&table_name, constraint)?);
+        if let AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } = operation
+        {
+            let mut lowered = lower_added_constraint(&table_name, constraint)?;
+            // **`NOT VALID` is only a foreign key's here.** PostgreSQL takes it on `CHECK` too,
+            // and refusing it there by name is the honest answer while nothing skips that scan.
+            if *not_valid {
+                match &mut lowered {
+                    plan::AlterTableAction::AddForeignKey(key) => key.validated = false,
+                    _ => return Err(SqlError::unsupported("ADD CONSTRAINT ... NOT VALID")),
+                }
+            }
+            actions.push(lowered);
             continue;
         }
         if let AlterTableOperation::DisableTrigger { name }
@@ -1995,11 +2026,27 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_trigger_state(&table_name, name, disabled)?);
             continue;
         }
+        if let AlterTableOperation::ValidateConstraint { name } = operation {
+            actions.push(plan::AlterTableAction::ValidateConstraint(ident(name)));
+            continue;
+        }
         // `ALTER COLUMN c SET DEFAULT <expr>` and `DROP DEFAULT`. The **type is not known here** —
         // a plan is lowered without the catalog — so a literal is not folded until the executor
         // has the column, which is also where `22P02` for one the type will not take comes from.
         if let AlterTableOperation::AlterColumn { column_name, op } = operation {
             use sqlparser::ast::AlterColumnOperation;
+            // `SET NOT NULL` / `DROP NOT NULL` are their own action: they change a column's
+            // nullability rather than its default, and the executor has to scan for the first.
+            if matches!(
+                op,
+                AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull
+            ) {
+                actions.push(plan::AlterTableAction::SetNotNull {
+                    column: ident(column_name),
+                    not_null: matches!(op, AlterColumnOperation::SetNotNull),
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
@@ -2416,23 +2463,23 @@ fn lower_foreign_key(
             format!("FOREIGN KEY ... MATCH {kind}"),
         )?;
     }
-    let deferrable = match &key.characteristics {
-        None => false,
+    // **`INITIALLY DEFERRED` really waits**, the way a deferrable `UNIQUE` already does
+    // (`crate::exec::deferred`): the check is registered against the transaction and re-examined
+    // at `COMMIT`. It was refused by name until the transaction could owe one — accepting the
+    // clause while checking at the statement would refuse a transaction PostgreSQL commits, which
+    // is a wrong answer rather than a gap.
+    let (deferrable, initially_deferred) = match &key.characteristics {
+        None => (false, false),
         Some(characteristics) => {
-            // `INITIALLY DEFERRED` is the one form that would **change an answer**: a transaction
-            // that violates the constraint in the middle and repairs it before `COMMIT` succeeds
-            // on a real server and would be refused here, because every check in this crate is
-            // immediate. Refused by name rather than accepted, which is contract C2's whole rule.
-            // `ActiveRecord` writes `DEFERRABLE INITIALLY IMMEDIATE` and never this one.
-            refuse_if(
-                characteristics.initially == Some(DeferrableInitial::Deferred),
-                "FOREIGN KEY ... INITIALLY DEFERRED",
-            )?;
             refuse_if(
                 characteristics.enforced.is_some(),
                 "FOREIGN KEY ... ENFORCED, which is MySQL's",
             )?;
-            characteristics.deferrable.unwrap_or(false)
+            let deferred = characteristics.initially == Some(DeferrableInitial::Deferred);
+            (
+                characteristics.deferrable.unwrap_or(false) || deferred,
+                deferred,
+            )
         }
     };
     let columns: Vec<String> = key.columns.iter().map(ident).collect();
@@ -2444,28 +2491,34 @@ fn lower_foreign_key(
         columns,
         parent: relation_name(&key.foreign_table)?,
         parent_columns: key.referred_columns.iter().map(ident).collect(),
-        on_update: referential_action(key.on_update.as_ref())?,
-        on_delete: referential_action(key.on_delete.as_ref())?,
+        on_update: referential_action(key.on_update.as_ref()),
+        on_delete: referential_action(key.on_delete.as_ref()),
+        // The `NOT VALID` that may follow belongs to the `ALTER TABLE ... ADD CONSTRAINT` and not
+        // to the constraint's own grammar, so it is applied by the caller that can see it.
+        validated: true,
         deferrable,
+        initially_deferred,
     })
 }
 
 /// `ON UPDATE`/`ON DELETE`, defaulting to `NO ACTION` the way a real server does.
 ///
-/// `SET NULL` and `SET DEFAULT` are refused by name: each writes a value into the child's columns
-/// rather than refusing or removing, and neither appears in anything `ActiveRecord` emits.
+/// All five, including the two that **write** into the child rather than refusing or removing.
+///
+/// PostgreSQL 15 added a column list — `SET NULL (a, b)` — narrowing which columns are cleared.
+/// The parser this crate uses has no variant for it, so it does not reach here; nothing
+/// `ActiveRecord` writes uses it, and the whole clause is one `Option` away when something does.
 fn referential_action(
     action: Option<&sqlparser::ast::ReferentialAction>,
-) -> Result<catalog::ReferentialAction> {
+) -> catalog::ReferentialAction {
     use sqlparser::ast::ReferentialAction as Written;
-    Ok(match action {
+    match action {
         None | Some(Written::NoAction) => catalog::ReferentialAction::NoAction,
         Some(Written::Restrict) => catalog::ReferentialAction::Restrict,
         Some(Written::Cascade) => catalog::ReferentialAction::Cascade,
-        Some(other) => {
-            return Err(SqlError::unsupported(format!("ON DELETE/UPDATE {other}")));
-        }
-    })
+        Some(Written::SetNull) => catalog::ReferentialAction::SetNull,
+        Some(Written::SetDefault) => catalog::ReferentialAction::SetDefault,
+    }
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
@@ -2944,16 +2997,53 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
         // unknown is unknown and `NOT (NULL = NULL)` is therefore NULL where
         // `NULL IS DISTINCT FROM NULL` is `false`.
-        Expr::IsDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::Distinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
-        Expr::IsNotDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::NotDistinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
+        Expr::IsDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::Distinct)
+        }
+        Expr::IsNotDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::NotDistinct)
+        }
+        // **`a BETWEEN x AND y` is `a >= x AND a <= y`**, and the rewrite is the whole feature:
+        // every rule a corpus can ask about falls out of it rather than needing one of its own.
+        // The ends are inclusive because `>=` and `<=` are; reversed bounds match nothing because
+        // nothing is both above 3 and below 2; a NULL bound is **three-valued AND** rather than
+        // "NULL anywhere means NULL", so `3 BETWEEN NULL AND 2` is `false` and `1 BETWEEN NULL AND
+        // 2` is NULL; and a type mismatch is `42883 operator does not exist: character varying >=
+        // integer` — a real server's own message, naming `>=` rather than `BETWEEN`, which is what
+        // says PostgreSQL rewrites it too.
+        //
+        // `NOT BETWEEN` is `NOT (…)` around the pair, which inherits the NULL: `1 NOT BETWEEN NULL
+        // AND 2` is NULL and not true. Measured, all of it.
+        //
+        // `BETWEEN SYMMETRIC` is refused by name before the parser sees it
+        // (`crate::parse`'s unsupported list) and stays that way: `sqlparser` 0.62.0's `Between`
+        // has no flag for it, so there is nothing to lower even if the keyword got through.
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let value = lower_expr(expr)?;
+            let pair = plan::Expr::Binary {
+                op: plan::BinaryOp::And,
+                left: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::GtEq,
+                    left: Box::new(value.clone()),
+                    right: Box::new(lower_expr(low)?),
+                }),
+                right: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::LtEq,
+                    left: Box::new(value),
+                    right: Box::new(lower_expr(high)?),
+                }),
+            };
+            Ok(if *negated {
+                plan::Expr::Not(Box::new(pair))
+            } else {
+                pair
+            })
+        }
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
@@ -3075,10 +3165,18 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     return Err(SqlError::unsupported(format!("the operator {other}")));
                 }
             };
+            // **An untyped string literal in a boolean context is *read* as a boolean**, not
+            // refused: `WHERE 'true' AND true` runs on a real server and `WHERE 'text' AND
+            // true` is `22P02 invalid input syntax for type boolean: "text"` — a *value* error
+            // rather than a type one, because an unadorned literal takes the type its context
+            // wants and only then fails to be read as one. A `character varying` **column**
+            // cannot: it already has a type, and that is the `42804` next door. Measured, all
+            // three.
+            let boolean = matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or);
             Ok(plan::Expr::Binary {
                 op,
-                left: Box::new(lower_expr(left)?),
-                right: Box::new(lower_expr(right)?),
+                left: Box::new(lower_condition(left, boolean)?),
+                right: Box::new(lower_condition(right, boolean)?),
             })
         }
         Expr::InList {
@@ -4362,6 +4460,67 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
             args: vec![lower_cast(inner, inner_type)?],
         },
     ))))
+}
+
+/// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.
+///
+/// PostgreSQL types a bare literal from its context, so `'true'` in a boolean position *is* a
+/// boolean and `'text'` is `22P02` — the value could not be read as one, which is a different
+/// answer from a column whose declared type is wrong (`42804`). `boolean` is false everywhere
+/// else, and then this is [`lower_expr`].
+fn lower_condition(expr: &Expr, boolean: bool) -> Result<plan::Expr> {
+    if boolean
+        && let Expr::Value(value) = expr
+        && let Value::SingleQuotedString(text) = &value.value
+    {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            <Datum as PgDatum>::from_text(ColumnType::Bool, text)?,
+        ))));
+    }
+    lower_expr(expr)
+}
+
+/// `IS [NOT] DISTINCT FROM`, **re-associated around an `AND` or `OR` the parser swallowed**.
+///
+/// `sqlparser` 0.62.0 reads the right operand of these two with a precedence *below* `AND` and
+/// `OR`, so `a IS NOT DISTINCT FROM b AND c IS NOT DISTINCT FROM d` arrives as
+/// `a IS NOT DISTINCT FROM (b AND c IS NOT DISTINCT FROM d)` — one comparison swallowing a whole
+/// conjunction. PostgreSQL's grammar puts `IS` above `NOT`, `AND` and `OR` and below everything
+/// else, so the fix is a rotation and not a guess: the swallowed operator moves out and the
+/// comparison closes over the operand it should have had.
+///
+/// **Only `AND` and `OR` move.** Every other binary operator — `=`, `<`, `+`, `||` — binds
+/// *tighter* than `IS` on a real server, so a right operand that is one of those was parsed
+/// correctly and must stay where it is.
+///
+/// The shape is what `ActiveRecord`'s `upsert_all` writes (`postgresql_adapter.rb:675`), which is
+/// how it was found: seven tests answering `42804 argument of AND/OR must be type boolean` because
+/// the `AND`'s left operand was a *column's value* rather than a comparison.
+fn lower_distinct(left: &Expr, right: &Expr, op: plan::BinaryOp) -> Result<plan::Expr> {
+    if let Expr::BinaryOp {
+        left: inner_left,
+        op: inner_op,
+        right: inner_right,
+    } = right
+    {
+        let boolean = match inner_op {
+            BinaryOperator::And => Some(plan::BinaryOp::And),
+            BinaryOperator::Or => Some(plan::BinaryOp::Or),
+            _ => None,
+        };
+        if let Some(boolean) = boolean {
+            return Ok(plan::Expr::Binary {
+                op: boolean,
+                left: Box::new(lower_distinct(left, inner_left, op)?),
+                right: Box::new(lower_expr(inner_right)?),
+            });
+        }
+    }
+    Ok(plan::Expr::Binary {
+        op,
+        left: Box::new(lower_expr(left)?),
+        right: Box::new(lower_expr(right)?),
+    })
 }
 
 /// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.

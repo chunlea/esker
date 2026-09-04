@@ -160,7 +160,7 @@ fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
 /// A `timestamptz` column takes it as it is and a `timestamp` column takes the same number: this
 /// node stores both as microseconds from 2000-01-01 UTC, and the assignment cast a real server
 /// applies here is a zone conversion that is the identity at UTC.
-fn column_default_value(
+pub(super) fn column_default_value(
     table: &TableDef,
     column: &crate::catalog::ColumnDef,
     txn: &dyn Txn,

@@ -2040,12 +2040,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             match op {
                 // Three-valued AND and OR, and they are not symmetric: a definite `false` makes an
                 // AND false whatever the other side is, and a definite `true` makes an OR true.
-                BinaryOp::And => match (truth(&left)?, truth(&right)?) {
+                BinaryOp::And => match (truth_of(&left, "AND")?, truth_of(&right, "AND")?) {
                     (Some(false), _) | (_, Some(false)) => Datum::Bool(false),
                     (Some(true), Some(true)) => Datum::Bool(true),
                     _ => Datum::Null,
                 },
-                BinaryOp::Or => match (truth(&left)?, truth(&right)?) {
+                BinaryOp::Or => match (truth_of(&left, "OR")?, truth_of(&right, "OR")?) {
                     (Some(true), _) | (_, Some(true)) => Datum::Bool(true),
                     (Some(false), Some(false)) => Datum::Bool(false),
                     _ => Datum::Null,
@@ -2654,12 +2654,22 @@ fn array_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
     })
 }
 
-fn truth(value: &Datum) -> Result<Option<bool>> {
+/// One operand of `AND`/`OR` as a three-valued boolean, or PostgreSQL's `42804`, naming the
+/// construct the condition belongs to.
+///
+/// **The message names the type and never the value.** It was built from the datum a row happened
+/// to hold — `not Text("one")` — which leaks a user's row into an error and gives one query a
+/// different message per row. A real server says `argument of AND must be type boolean, not type
+/// character varying`, with the word `type` twice, and names the one construct rather than the
+/// pair `AND/OR`: measured, along with `argument of CASE/WHEN` for the other place a condition is
+/// read.
+fn truth_of(value: &Datum, construct: &'static str) -> Result<Option<bool>> {
     match value {
         Datum::Bool(value) => Ok(Some(*value)),
         Datum::Null => Ok(None),
-        other => Err(SqlError::DatatypeMismatch(format!(
-            "argument of AND/OR must be type boolean, not {other:?}"
-        ))),
+        other => Err(SqlError::NonBooleanArgument {
+            construct,
+            found: other.column_type().map_or("text", PgType::name).to_owned(),
+        }),
     }
 }

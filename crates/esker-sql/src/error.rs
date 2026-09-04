@@ -220,6 +220,38 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `SET SESSION AUTHORIZATION <name>` on a node that has no roles.
+    ///
+    /// **`22023`, not `42704`** — measured, and it is not the class the same condition takes
+    /// elsewhere: `CREATE DATABASE … OWNER x` is `42704 role "x" does not exist` and this is
+    /// `22023` with the identical sentence. PostgreSQL treats the authorization name as a
+    /// *parameter value* and the owner as an object reference, so a rule copied from one to the
+    /// other would give the right words under the wrong code.
+    ///
+    /// Every name reaches this, because this node has no roles at all — the sentence is true of
+    /// all of them rather than of the ones somebody mistyped. `DEFAULT` is accepted: it asks for
+    /// what is already the case.
+    #[error("role \"{0}\" does not exist")]
+    UndefinedRoleForAuthorization(String),
+
+    /// A condition that is not a boolean: `WHERE name AND true`, `CASE WHEN name THEN …`.
+    ///
+    /// **The type, never the value.** PostgreSQL says `argument of AND must be type boolean, not
+    /// type character varying` — the word `type` twice — and names the one construct rather than
+    /// the pair, `CASE/WHEN` included. A message built from the datum a row happened to hold leaks
+    /// that row into an error and differs per row of one query.
+    ///
+    /// A *literal* is not this: an untyped `'true'` takes the type its context wants, so
+    /// `WHERE 'true' AND true` runs and `WHERE 'text' AND true` is `22P02` — a value error, not a
+    /// type one. Only something that already has a type reaches here. Measured, all four.
+    #[error("argument of {construct} must be type boolean, not type {found}")]
+    NonBooleanArgument {
+        /// `AND`, `OR` or `CASE/WHEN`.
+        construct: &'static str,
+        /// The type the operand actually has, as `format_type` prints it.
+        found: String,
+    },
+
     /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
     /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
     /// relation that outlives the transaction. Measured.
@@ -668,6 +700,25 @@ pub enum SqlError {
         /// values joined with `, ` and `null` for a NULL, with no quoting.
         row: Option<String>,
     },
+
+    /// `ALTER COLUMN … SET NOT NULL` over a column that already holds one: `23502`.
+    ///
+    /// **A different sentence from the one an offending `INSERT` gets**, and deliberately: there
+    /// is no constraint to name yet, so PostgreSQL reports the column and the relation and stops.
+    #[error("column \"{column}\" of relation \"{relation}\" contains null values")]
+    ColumnContainsNulls {
+        /// The column the scan found a NULL in.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+    },
+
+    /// `ALTER COLUMN … DROP NOT NULL` on a column the primary key is built from: `42P16`.
+    ///
+    /// The `NOT NULL` is the primary key's, not the column's, so there is nothing to drop — and
+    /// dropping it would leave a key that could hold a NULL.
+    #[error("column \"{0}\" is in a primary key")]
+    ColumnIsInPrimaryKey(String),
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
@@ -2030,7 +2081,9 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::PermanentReferencesUnlogged | SqlError::OnCommitNotTemporary => {
+            SqlError::PermanentReferencesUnlogged
+            | SqlError::OnCommitNotTemporary
+            | SqlError::ColumnIsInPrimaryKey(_) => {
                 sqlstate::INVALID_TABLE_DEFINITION
             }
             SqlError::UndefinedColumn(_)
@@ -2060,7 +2113,9 @@ impl SqlError {
             | SqlError::DuplicateColumnInRelation { .. }
             | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
             SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
-            SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
+            SqlError::ColumnContainsNulls { .. }
+            | SqlError::NotNullViolation(_)
+            | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
@@ -2099,7 +2154,9 @@ impl SqlError {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            SqlError::DatatypeMismatch(_) | SqlError::DatatypeMismatchInColumn { .. } => {
+            SqlError::DatatypeMismatch(_)
+            | SqlError::NonBooleanArgument { .. }
+            | SqlError::DatatypeMismatchInColumn { .. } => {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
@@ -2188,7 +2245,11 @@ impl SqlError {
             | SqlError::ParameterOutOfRange { .. }
             | SqlError::InvalidDestinationEncoding(_)
             | SqlError::ZeroStep
-            | SqlError::InvalidCreateDatabaseStrategy(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::InvalidCreateDatabaseStrategy(_)
+            // **`22023`, not the `42704` the identical sentence takes for `CREATE DATABASE … OWNER`.**
+            // PostgreSQL reads an authorization name as a *parameter value* and an owner as an
+            // object reference. Measured, both.
+            | SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
