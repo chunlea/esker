@@ -1,0 +1,37 @@
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_6a6c35e760810e 561-565,570-576,617-621
+crates/esker-sql/src/exec/cursor.rs
+  s_2bed4ac2b1c944::t_47ed5172479f04 2406-2411
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_0919b0d388d9b1 1485,1760-1902
+crates/esker-sql/src/exec/typedef.rs
+  s_2bed4ac2b1c944::t_bbf2cd796e9622 36-47
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_b515abbcf464ad 4245-4249,4269-4291
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_82789004d6af60 775-788,989-991,1023-1024,1097-1100
+crates/esker-sql/tests/corpus/pg19_enum_value.txt
+  s_2bed4ac2b1c944::t_30ec943f6760a8 62,106,157-206
+crates/esker-sql/tests/enum_value.rs
+  s_2bed4ac2b1c944::t_a7f9a97b2c7daa 77-79,81-82,84-89,91-93,95-102,104-106,109-111
+docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md
+  s_2bed4ac2b1c944::t_4355dedbed5f69 1-88
+docs/plans/phase-9-rails.md
+  s_2bed4ac2b1c944::t_f9b3450357ecea 1560
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b6a6006d0cd89922bd48d4e73fcaee624d9d9615",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
