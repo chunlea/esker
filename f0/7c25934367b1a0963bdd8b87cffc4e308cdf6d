@@ -1,0 +1,65 @@
+crates/esker-keys/src/columnar.rs
+  s_6f7019c05b578b::t_1509e65a535099 123-124,188-189
+crates/esker-keys/src/row.rs
+  s_6f7019c05b578b::t_39ed1eb461a75b 448-449,716-719,739-741,771-772,928-959,966-971,1119-1121,1835-1837,1891-1902,1904-1924
+crates/esker-keys/src/value.rs
+  s_6f7019c05b578b::t_55f48c64b71d6d 175-192,347-352,413-427,647-648
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_bb30797e7f60dd 26-32,669,1414-1458,1735-1740,1793-1795,1845-1846,1908-1912
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_e27732dcc05e3a 291-292,375-376,483-484
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_7ce19692eb01b1 1569-1575,2177,2571-2575
+crates/esker-sql/src/exec/aggregate.rs
+  s_6f7019c05b578b::t_dad35eebe92207 188-189
+crates/esker-sql/src/exec/assign.rs
+  s_6f7019c05b578b::t_0380cf343e64cb 121,125-140
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_42aa9fd26be3e5 1237-1240
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_a6076cd8aca2b1 264,281-290,314-326,342-350,357-417,425-433,437-443,3462,4216-4225,4239-4240
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_0038cac2647aaf 648-649
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_7cf8057e187a1f 2180-2182,2184,2186-2188,2202-2228
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_2cd6d157efc235 306,312-324,331,2113,2339,2651-2654,2715
+crates/esker-sql/src/exec/typedef.rs
+  s_6f7019c05b578b::t_0acb95376803d9 42-56
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_1c69c1e9a9cee6 1686,1763,1834
+crates/esker-sql/src/row.rs
+  s_6f7019c05b578b::t_607fbab91e66a5 156-157,213-224
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_7b9e77fc0577c7 518-523,661,787-795,843-850,924,1115-1117,1336-1338,1499-1503,1505-1513,1714-1768,1913,2117-2168
+crates/esker-sql/src/value/range.rs
+  s_6f7019c05b578b::t_ae371df6fa5b3c 369-376,424-432,446,549-572
+crates/esker-sql/tests/corpus/pg19_floatrange.txt
+  s_6f7019c05b578b::t_808bc6169b951b 1-96
+crates/esker-sql/tests/floatrange.rs
+  s_6f7019c05b578b::t_b6310207f69d49 1-91
+crates/esker-sql/tests/pg_catalog.rs
+  s_6f7019c05b578b::t_e4558a884df699 652-657,661-672
+crates/esker-store/src/columnar/decode.rs
+  s_6f7019c05b578b::t_268a2fdc467bf5 219-220
+docs/adr/0062-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md
+  s_6f7019c05b578b::t_6626fc38377613 1-92
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_5300482d46eb78 1595
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f07c25934367b1a0963bdd8b87cffc4e308cdf6d",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
