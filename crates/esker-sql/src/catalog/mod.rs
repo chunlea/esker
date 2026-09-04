@@ -1417,11 +1417,15 @@ pub struct ForeignKeyDef {
     /// the constraint exists; what the clause skips is the scan of the rows already there. So this
     /// flag governs one scan and one catalog column, and never the writes.
     pub validated: bool,
-    /// `DEFERRABLE`, which is recorded and **changes nothing**: every check here is immediate,
-    /// and `DEFERRABLE INITIALLY IMMEDIATE` — the only deferrable form `ActiveRecord` writes — is
-    /// immediate on a real server too. `INITIALLY DEFERRED` is `0A000` naming itself, because
-    /// accepting it and checking immediately would refuse a transaction PostgreSQL commits.
+    /// `DEFERRABLE`: whether the check **may** be moved to `COMMIT`, by declaration or by
+    /// `SET CONSTRAINTS`. `condeferrable`.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: whether it **starts** deferred. `condeferred`.
+    ///
+    /// Never true without [`Self::deferrable`] — `INITIALLY DEFERRED` implies `DEFERRABLE` in the
+    /// grammar. The pair says when the check runs, and `SET CONSTRAINTS` moves it either way
+    /// (`crate::exec::deferred`).
+    pub initially_deferred: bool,
 }
 
 /// What a `FOREIGN KEY` does when the row it points at is deleted or its key is changed.
@@ -3699,7 +3703,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",               // catalog format version
+                "1b",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3792,7 +3796,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",       // catalog format version
+                "1b",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3874,7 +3878,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",                 // catalog format version
+                "1b",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5174,7 +5178,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",               // catalog format version
+                "1b",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

@@ -465,7 +465,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
                 }),
             }),
             condeferrable: key.deferrable,
-            condeferred: false,
+            condeferred: key.initially_deferred,
             convalidated: key.validated,
         });
     }
@@ -610,6 +610,9 @@ fn foreign_key_definition(
     }
     if key.deferrable {
         out.push_str(" DEFERRABLE");
+    }
+    if key.initially_deferred {
+        out.push_str(" INITIALLY DEFERRED");
     }
     // **Last, after `DEFERRABLE`** — measured: `pg_get_constraintdef` prints the clauses in the
     // order the grammar takes them, and `NOT VALID` closes the definition.

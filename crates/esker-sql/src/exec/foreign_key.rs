@@ -68,12 +68,24 @@ pub(super) fn check_references(
     if !enforcing(table) {
         return Ok(());
     }
-    for key in &table.foreign_keys {
+    for (at, key) in table.foreign_keys.iter().enumerate() {
         let Some(values) = referencing_values(key, row) else {
             // A NULL in the key: `MATCH SIMPLE` admits it, and this is the whole of that rule.
             continue;
         };
-        if parent_row(executor, txn, key, &values)?.is_none() {
+        let parent = executor.table_by_id(txn, key.parent)?;
+        // **Deferred: the question is asked at `COMMIT` instead**, against the transaction as it
+        // stands then — which is what lets a child be written before its parent and both commit.
+        if key.deferrable && executor.constraint_is_deferred(&key.name, key.initially_deferred) {
+            executor.defer_check(super::deferred::Check::ForeignKey {
+                table: Executor::table_arc(table),
+                at,
+                parent,
+                values,
+            });
+            continue;
+        }
+        if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
                 relation: table.name.clone(),
                 constraint: key.name.clone(),
@@ -81,7 +93,7 @@ pub(super) fn check_references(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
                     super::index::render_values(&values),
-                    parent_name(executor, txn, key)?
+                    parent.name
                 ),
             });
         }
@@ -114,8 +126,9 @@ pub(super) fn validate(
         }
         Ok(())
     })?;
+    let parent = executor.table_by_id(txn, key.parent)?;
     for values in pending {
-        if parent_row(executor, txn, key, &values)?.is_none() {
+        if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
                 relation: table.name.clone(),
                 constraint: key.name.clone(),
@@ -123,7 +136,7 @@ pub(super) fn validate(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
                     super::index::render_values(&values),
-                    parent_name(executor, txn, key)?
+                    parent.name
                 ),
             });
         }
@@ -406,15 +419,15 @@ fn referencing_rows(
 ///
 /// The parent's referenced columns are its primary key or a unique index — checked when the
 /// constraint was made (`42830` otherwise) — so this is a point read and not a scan.
-fn parent_row(
-    executor: &Executor,
+pub(super) fn parent_row(
+    parent: &TableDef,
+    tenant: u64,
     txn: &dyn Txn,
     key: &ForeignKeyDef,
     values: &[Datum],
 ) -> Result<Option<Vec<Datum>>> {
-    let parent = executor.table_by_id(txn, key.parent)?;
     if parent.primary_key == key.parent_columns {
-        let row_key = row::row_key(executor.tenant, parent.id, values)?;
+        let row_key = row::row_key(tenant, parent.id, values)?;
         return match txn.get(&row_key)? {
             Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded)?)),
             None => Ok(None),
@@ -432,7 +445,7 @@ fn parent_row(
             key.name
         )));
     };
-    let index_key = row::index_key(executor.tenant, parent.id, index.id, values, None)?;
+    let index_key = row::index_key(tenant, parent.id, index.id, values, None)?;
     let Some(encoded) = txn.get(&index_key)? else {
         return Ok(None);
     };
@@ -440,7 +453,7 @@ fn parent_row(
         &row::RowSchema::nullable(parent.primary_key_types()),
         &encoded,
     )?;
-    let row_key = row::row_key(executor.tenant, parent.id, &primary_key)?;
+    let row_key = row::row_key(tenant, parent.id, &primary_key)?;
     match txn.get(&row_key)? {
         Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded)?)),
         None => Ok(None),
@@ -473,16 +486,10 @@ fn referenced_values(key: &ForeignKeyDef, row: &[Datum]) -> Option<Vec<Datum>> {
 }
 
 /// `a, b` for a message's `Key (…)`.
-fn column_names(table: &TableDef, ordinals: &[usize]) -> String {
+pub(super) fn column_names(table: &TableDef, ordinals: &[usize]) -> String {
     ordinals
         .iter()
         .filter_map(|at| table.columns.get(*at).map(|column| column.name.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// The referenced table's name, for a message. Read out of its own record, so a rename is
-/// reflected without the constraint being rewritten.
-fn parent_name(executor: &Executor, txn: &dyn Txn, key: &ForeignKeyDef) -> Result<String> {
-    Ok(executor.table_by_id(txn, key.parent)?.name.clone())
 }

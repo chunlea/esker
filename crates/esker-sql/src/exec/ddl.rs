@@ -1686,6 +1686,7 @@ fn resolve_foreign_key(
         on_delete: key.on_delete,
         validated: key.validated,
         deferrable: key.deferrable,
+        initially_deferred: key.initially_deferred,
     })
 }
 

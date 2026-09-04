@@ -70,6 +70,23 @@ pub(crate) enum Check {
         /// The row that was written.
         row: Vec<Datum>,
     },
+    /// A `FOREIGN KEY`, for one child row's key.
+    ///
+    /// **Both tables are carried.** The check is a lookup in the *parent*, and re-reading the
+    /// parent's record at `COMMIT` would need a catalog view this call does not have; the parent's
+    /// rows are read from the transaction as it stands, which is what "re-examined" means here —
+    /// a parent inserted later in the same transaction satisfies it, which is the case
+    /// `INITIALLY DEFERRED` exists for.
+    ForeignKey {
+        /// The child, as it stood when the row was written.
+        table: Arc<TableDef>,
+        /// Which of its `foreign_keys`.
+        at: usize,
+        /// The parent's record, resolved when the check was registered.
+        parent: Arc<TableDef>,
+        /// The referencing values to look up again.
+        values: Vec<Datum>,
+    },
 }
 
 impl Check {
@@ -85,6 +102,10 @@ impl Check {
                 .excludes
                 .get(*at)
                 .map_or("", |exclude| exclude.name.as_str()),
+            Check::ForeignKey { table, at, .. } => table
+                .foreign_keys
+                .get(*at)
+                .map_or("", |key| key.name.as_str()),
         }
     }
 
@@ -133,6 +154,30 @@ impl Check {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
+            }
+            Check::ForeignKey {
+                table,
+                at,
+                parent,
+                values,
+            } => {
+                let Some(key) = table.foreign_keys.get(*at) else {
+                    // Dropped inside this transaction: the reading the two arms above take.
+                    return Ok(());
+                };
+                if super::foreign_key::parent_row(parent, tenant, txn, key, values)?.is_some() {
+                    return Ok(());
+                }
+                Err(SqlError::ForeignKeyViolation {
+                    relation: table.name.clone(),
+                    constraint: key.name.clone(),
+                    detail: format!(
+                        "Key ({})=({}) is not present in table \"{}\".",
+                        super::foreign_key::column_names(table, &key.columns),
+                        super::index::render_values(values),
+                        parent.name
+                    ),
+                })
             }
         }
     }

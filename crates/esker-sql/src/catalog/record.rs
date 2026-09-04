@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 26;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 27;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1470,6 +1470,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         // because a foreign key's fields are already a group and the reader walks them in one
         // loop; the version guard in `read_foreign_keys` is what keeps an older record readable.
         out.push(u8::from(key.validated));
+        out.push(u8::from(key.initially_deferred));
     }
 
     // Version 11. One flag per index, at the **very end** — after the foreign keys, not beside
@@ -1938,6 +1939,10 @@ fn read_foreign_keys(reader: &mut Reader<'_>, columns: usize) -> Result<Vec<Fore
             // could skip that scan — so an older record's keys are validated, and reading them as
             // anything else would report a schema the node never had.
             validated: reader.version < 26 || reader.flag()?,
+            // **Version 27 added deferred foreign keys.** Before it, `INITIALLY DEFERRED` was
+            // `0A000`, so nothing an older record holds can start deferred — and `deferrable`
+            // alone meant `INITIALLY IMMEDIATE`, which is what reading `false` here gives.
+            initially_deferred: reader.version >= 27 && reader.flag()?,
         });
     }
     Ok(keys)

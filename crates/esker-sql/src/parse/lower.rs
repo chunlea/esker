@@ -2421,23 +2421,23 @@ fn lower_foreign_key(
             format!("FOREIGN KEY ... MATCH {kind}"),
         )?;
     }
-    let deferrable = match &key.characteristics {
-        None => false,
+    // **`INITIALLY DEFERRED` really waits**, the way a deferrable `UNIQUE` already does
+    // (`crate::exec::deferred`): the check is registered against the transaction and re-examined
+    // at `COMMIT`. It was refused by name until the transaction could owe one — accepting the
+    // clause while checking at the statement would refuse a transaction PostgreSQL commits, which
+    // is a wrong answer rather than a gap.
+    let (deferrable, initially_deferred) = match &key.characteristics {
+        None => (false, false),
         Some(characteristics) => {
-            // `INITIALLY DEFERRED` is the one form that would **change an answer**: a transaction
-            // that violates the constraint in the middle and repairs it before `COMMIT` succeeds
-            // on a real server and would be refused here, because every check in this crate is
-            // immediate. Refused by name rather than accepted, which is contract C2's whole rule.
-            // `ActiveRecord` writes `DEFERRABLE INITIALLY IMMEDIATE` and never this one.
-            refuse_if(
-                characteristics.initially == Some(DeferrableInitial::Deferred),
-                "FOREIGN KEY ... INITIALLY DEFERRED",
-            )?;
             refuse_if(
                 characteristics.enforced.is_some(),
                 "FOREIGN KEY ... ENFORCED, which is MySQL's",
             )?;
-            characteristics.deferrable.unwrap_or(false)
+            let deferred = characteristics.initially == Some(DeferrableInitial::Deferred);
+            (
+                characteristics.deferrable.unwrap_or(false) || deferred,
+                deferred,
+            )
         }
     };
     let columns: Vec<String> = key.columns.iter().map(ident).collect();
@@ -2455,6 +2455,7 @@ fn lower_foreign_key(
         // to the constraint's own grammar, so it is applied by the caller that can see it.
         validated: true,
         deferrable,
+        initially_deferred,
     })
 }
 

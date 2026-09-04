@@ -540,8 +540,10 @@ pub struct ForeignKey {
     pub on_delete: ReferentialAction,
     /// `NOT VALID`: skip the scan of the rows already there. New rows are checked either way.
     pub validated: bool,
-    /// `DEFERRABLE`, which is recorded and changes nothing here.
+    /// `DEFERRABLE`: the check may move to `COMMIT`.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: it starts there.
+    pub initially_deferred: bool,
 }
 
 /// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
