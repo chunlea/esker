@@ -1,0 +1,16 @@
+crates/esker-store/tests/retire_crash_kill.rs
+  h_44076b318daf9c 1-266
+docs/plans/debt-c6.md
+  h_44076b318daf9c 192-216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f1ab22ca733a8b42fff5ab10913879ef1558bec9",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
