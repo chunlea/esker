@@ -1,0 +1,19 @@
+crates/esker-engine/tests/ingest_overlap.proptest-regressions
+  s_dc640bf0df4adb::t_ad52dcef7fdd40 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "88af55945b48cb9dc9ad7fd7e5d23445811c8f69",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
