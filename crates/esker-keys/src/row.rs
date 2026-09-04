@@ -445,6 +445,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::DateRange
         | ColumnType::NumRange
         | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -711,6 +713,10 @@ fn not_a_key() -> RowError {
     corrupt("an index key column of type json, jsonb, hstore or a range")
 }
 
+/// The message [`not_a_key`] carries, so a test can tell that refusal from every other one.
+#[cfg(test)]
+const NOT_A_KEY: &str = "an index key column of type json, jsonb, hstore or a range";
+
 /// A text-shaped column's value, chosen by the column's type rather than by the bytes.
 ///
 /// **The bytes are the same for all of these** — a length and the UTF-8 — and what differs is which
@@ -730,7 +736,9 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         | ColumnType::Int4Range
         | ColumnType::DateRange
         | ColumnType::NumRange
-        | ColumnType::Int8Range => Datum::Range {
+        | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => Datum::Range {
             subtype: Box::new(range_subtype(ty)),
             text: text_from_utf8(body)?,
         },
@@ -760,6 +768,8 @@ pub fn range_subtype(ty: ColumnType) -> ColumnType {
         ColumnType::Int4Range | ColumnType::Int8Range => ColumnType::Int8,
         ColumnType::DateRange => ColumnType::Date,
         ColumnType::NumRange => ColumnType::Numeric,
+        ColumnType::FloatRange => ColumnType::Double,
+        ColumnType::VarcharRange => ColumnType::Varchar,
         _ => ColumnType::Timestamp,
     }
 }
@@ -915,12 +925,50 @@ pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec
     Ok((values, total - bytes.len()))
 }
 
+/// Whether a column of this type can be **part of an index key**.
+///
+/// The one list, and `decode_key_column` obeys it — named plainly rather than linked,
+/// because it is private and a public doc may not point into private scope. Two kinds of type are on it and only the
+/// first is PostgreSQL's rule: `json` and `point` have no default btree operator class *there*
+/// either, and the rest — `jsonb`, `hstore`, the json and hstore arrays, every range — index fine
+/// on a real server and not here, because their key encoding has not been written. A caller that
+/// asks before building an index turns that gap into a refusal a client can read; without one,
+/// the index is built and the first row written to it is an internal corruption error
+/// (`esker_sql::exec::ddl::refuse_unindexable`, which is that caller).
+#[must_use]
+pub fn is_index_key(ty: ColumnType) -> bool {
+    !matches!(
+        ty,
+        ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Point
+            | ColumnType::Hstore
+            | ColumnType::HstoreArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::Int8Range
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one match over the whole type vocabulary; splitting it would hide which types are \
               keys and which are not, which is the only thing this function says"
 )]
 fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    // Asked here rather than only in the arms below, so that the one list a caller can read is the
+    // same list this function obeys. The arms stay: a type missing from **either** is still
+    // refused by the other, which is the direction a disagreement has to fail in.
+    if !is_index_key(ty) {
+        return Err(not_a_key());
+    }
     let decoded = |error: codec::CodecError| corrupt(format!("index key column: {error}"));
     Ok(match ty {
         ColumnType::Int8Array
@@ -1068,7 +1116,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int4Range
         | ColumnType::DateRange
         | ColumnType::NumRange
-        | ColumnType::Int8Range => Err(not_a_key())?,
+        | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => Err(not_a_key())?,
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
             return decode_key_text(ty, bytes);
         }
@@ -1782,7 +1832,9 @@ mod tests {
             | ColumnType::Int4Range
             | ColumnType::DateRange
             | ColumnType::NumRange
-            | ColumnType::Int8Range => Just(Datum::Range {
+            | ColumnType::Int8Range
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange => Just(Datum::Range {
                 subtype: Box::new(super::range_subtype(ty)),
                 text: "empty".to_owned(),
             })
@@ -1836,14 +1888,40 @@ mod tests {
         rows: usize,
     ) -> impl proptest::strategy::Strategy<Value = (Vec<ColumnType>, Vec<Vec<Datum>>)> {
         use proptest::prelude::*;
-        proptest::collection::vec(
-            proptest::sample::select(ColumnType::ALL.as_slice()),
-            columns,
+        // `ALL` and the user-range representations beside it: the second list is not in the
+        // first for the reason `ColumnType::USER_RANGES` gives, and a codec property that
+        // skipped it would leave two stored types unchecked.
+        let every: Vec<ColumnType> = ColumnType::ALL
+            .into_iter()
+            .chain(ColumnType::USER_RANGES)
+            .collect();
+        proptest::collection::vec(proptest::sample::select(every), columns).prop_flat_map(
+            move |types| {
+                let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
+                (Just(types), proptest::collection::vec(row, rows..=rows))
+            },
         )
-        .prop_flat_map(move |types| {
-            let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
-            (Just(types), proptest::collection::vec(row, rows..=rows))
-        })
+    }
+
+    /// **`is_index_key` and the decoder say the same thing about every type.**
+    ///
+    /// Two readers of one list, which is what [`super::is_index_key`] exists to be: `esker_sql`
+    /// asks it before building an index, and `decode_key_column` asks it before reading a key.
+    /// They are checked against each other here because a type on one list and not the other is
+    /// exactly the shape of bug this crate keeps finding — a table with a second copy — and the
+    /// consequence is the bad one: an index a client is allowed to create and cannot write to.
+    #[test]
+    fn every_type_agrees_with_itself_about_being_an_index_key() {
+        for ty in ColumnType::ALL.into_iter().chain(ColumnType::USER_RANGES) {
+            // A present marker and no body: every type errors, and only these error *this* way.
+            let refused = decode_key_columns(&[ty], &[super::KEY_PRESENT])
+                .is_err_and(|error| error.to_string().contains(super::NOT_A_KEY));
+            assert_eq!(
+                refused,
+                !super::is_index_key(ty),
+                "{ty:?} is refused by the decoder and allowed by `is_index_key`, or the reverse"
+            );
+        }
     }
 
     /// **The key bytes sort the way the numbers do**, and equal numbers written differently

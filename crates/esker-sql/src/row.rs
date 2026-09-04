@@ -153,7 +153,8 @@ mod tests {
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
             // A range's stored form is its canonical text; `empty` is the one value every subtype
             // has, which is enough to state the ordering property these tests are for.
-            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => {
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+            | ColumnType::FloatRange | ColumnType::VarcharRange => {
                 Just(Datum::Range {
                     subtype: Box::new(crate::value::range_subtype(ty)),
                     text: "empty".to_owned(),
@@ -209,14 +210,19 @@ mod tests {
         rows: usize,
     ) -> impl Strategy<Value = (Vec<ColumnType>, Vec<Vec<Datum>>)> {
         use proptest::prelude::*;
-        proptest::collection::vec(
-            proptest::sample::select(ColumnType::ALL.as_slice()),
-            columns,
+        // `ALL` and the user-range representations beside it: the second list is not in the
+        // first for the reason `ColumnType::USER_RANGES` gives, and a codec property that
+        // skipped it would leave two stored types unchecked.
+        let every: Vec<ColumnType> = ColumnType::ALL
+            .into_iter()
+            .chain(ColumnType::USER_RANGES)
+            .collect();
+        proptest::collection::vec(proptest::sample::select(every), columns).prop_flat_map(
+            move |types| {
+                let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
+                (Just(types), proptest::collection::vec(row, rows..=rows))
+            },
         )
-        .prop_flat_map(move |types| {
-            let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
-            (Just(types), proptest::collection::vec(row, rows..=rows))
-        })
     }
 
     /// Two values PostgreSQL considers equal. Enumerated rather than filtered, because the

@@ -1234,12 +1234,10 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::Int4Range
         | ColumnType::DateRange
         | ColumnType::NumRange
-        | ColumnType::Int8Range => Datum::Range {
-            subtype: Box::new(match ty {
-                ColumnType::TstzRange => ColumnType::TimestampTz,
-                ColumnType::Int4Range => ColumnType::Int8,
-                _ => ColumnType::Timestamp,
-            }),
+        | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => Datum::Range {
+            subtype: Box::new(esker_keys::row::range_subtype(ty)),
             text: "empty".to_owned(),
         },
         // The empty string is not a document, so a `json` placeholder is the smallest one that

@@ -515,7 +515,12 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
-        | ColumnType::PointArray => 0,
+        | ColumnType::PointArray
+        // **And a user range**, which has no array type here: a real server builds `_floatrange`
+        // with the type and `range_test.rb` never declares a column of one, so this is a named
+        // gap rather than a guess at an oid that is allocated per database anyway.
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -653,6 +658,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                        | ColumnType::FloatRange | ColumnType::VarcharRange
         | ColumnType::Point
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
@@ -778,7 +784,15 @@ impl PgType for ColumnType {
             ColumnType::Interval => 1186,
             ColumnType::Oid => 26,
             // Unreachable: the four array types answered above, from their element's `typarray`.
-            ColumnType::Int8Array
+            //
+            // **A user-defined range joins them with a reason of its own**: its oid is allocated
+            // by the `CREATE TYPE` that made it, so there is no constant to give. The wire gets
+            // it from `crate::exec::query::OutputColumn::user_type`, the road an enum's oid
+            // already travels (ADR 0050), and this is the `InvalidOid` a column that lost it
+            // reports.
+            ColumnType::FloatRange
+            | ColumnType::VarcharRange
+            | ColumnType::Int8Array
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
@@ -826,6 +840,14 @@ impl PgType for ColumnType {
             ColumnType::DateRange => "daterange",
             ColumnType::NumRange => "numrange",
             ColumnType::Int8Range => "int8range",
+            // **Not PostgreSQL type names**: PostgreSQL has no built-in range over `float8` or
+            // over `varchar`, and these are representations rather than types. A column of one
+            // always carries a `user_type` oid and every client-visible name comes from the
+            // catalog with it, so what is here is what an *internal* error prints — which is why
+            // it names the subtype, the way `22P02 invalid input syntax for type double
+            // precision: "abc"` names it on a real server for a bad `floatrange` bound.
+            ColumnType::FloatRange => "float8range",
+            ColumnType::VarcharRange => "varcharrange",
             ColumnType::Point => "point",
             ColumnType::PointArray => "point[]",
             ColumnType::TstzRangeArray => "tstzrange[]",
@@ -899,6 +921,7 @@ impl PgType for ColumnType {
             | ColumnType::TsRange
             | ColumnType::TstzRange
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                        | ColumnType::FloatRange | ColumnType::VarcharRange
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
@@ -1089,7 +1112,9 @@ impl PgDatum for Datum {
             | ColumnType::Int4Range
             | ColumnType::DateRange
             | ColumnType::NumRange
-            | ColumnType::Int8Range => {
+            | ColumnType::Int8Range
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange => {
                 let subtype = range_subtype(ty);
                 Datum::Range {
                     subtype: Box::new(subtype),
@@ -1308,7 +1333,9 @@ impl PgDatum for Datum {
             | ColumnType::Int4Range
             | ColumnType::DateRange
             | ColumnType::NumRange
-            | ColumnType::Int8Range => binary_range(ty, bytes)?,
+            | ColumnType::Int8Range
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange => binary_range(ty, bytes)?,
             ColumnType::Json | ColumnType::Jsonb => {
                 return Err(SqlError::unsupported(
                     "a json or jsonb parameter in the binary format",
@@ -1469,12 +1496,21 @@ impl PgDatum for Datum {
             // server says 5, and only a corpus row could see it. The same trap citext's
             // `PartialEq` fell into; a pair-exhaustive match has no compiler to remind it.
             //
-            // It is **not** PostgreSQL's range ordering, which compares the lower bound, then its
-            // inclusivity, then the upper — declared, and the reason a range is not an index key.
+            // The *order* is a different question and the text answers it wrong: sorted as text,
+            // `empty` comes last where PostgreSQL puts it first, and `[10,21)` comes before
+            // `[2,4)` because `1` precedes `2`. Both are wrong answers to `ORDER BY`, so the
+            // bounds are compared as bounds — see [`range_cmp`], which agrees with the text
+            // wherever the text is right, equality included.
             (
-                Datum::Range { text: a, .. },
-                Datum::Range { text: b, .. },
-            ) => a.as_bytes().cmp(b.as_bytes()),
+                Datum::Range {
+                    subtype: sa,
+                    text: a,
+                },
+                Datum::Range {
+                    subtype: sb,
+                    text: b,
+                },
+            ) => range_cmp(**sa, a, **sb, b),
             // **A citext compares folded**, which is the whole type: `'ABC' = 'abc'` is true, two
             // rows differing only in case are one group and one `DISTINCT`, and a unique index
             // over the column refuses the second. It is the *comparison* that folds and never the
@@ -1675,6 +1711,61 @@ fn parse_int8(text: &str) -> Result<i64> {
 /// PostgreSQL's `parse_bool_with_len`: case-insensitive, whitespace-trimmed, and satisfied by any
 /// prefix that can only be one word. `o` is the one that cannot, because `on` and `off` both start
 /// with it.
+/// Two ranges, ordered the way PostgreSQL orders them.
+///
+/// **Not their canonical text's order**, which is what this used to be and is wrong twice:
+/// `empty` sorts *first* on a real server and last as text, and `[10,21)` sorts *after* `[2,4)`
+/// where the text puts it first. Measured — `ORDER BY float_range` over `range_test.rb`'s own
+/// fixtures is `empty`, `(,)`, `[-Infinity,Infinity]`, `[0.5,0.7)`, `[0.5,0.7]`, `[0.5,)`.
+///
+/// Four rules, in this order, and each of the last three has a side that is *absent*:
+///
+/// 1. `empty` is below every non-empty range.
+/// 2. The lower bound, where **absent is unbounded below** and sorts first — `(,)` before
+///    `[-Infinity,Infinity]`, because `-Infinity` is a `float8` *value* and not an absent bound.
+/// 3. On an equal lower bound, **inclusive first**: `[0.5,` before `(0.5,`.
+/// 4. Then the upper bound, where **absent is unbounded above** and sorts *last*, and on an equal
+///    one **exclusive first**: `[0.5,0.7)` before `[0.5,0.7]` before `[0.5,)`.
+///
+/// A text that will not parse falls back to comparing the text, so the function stays total: the
+/// only way to get one is a value this node did not write.
+fn range_cmp(
+    left_subtype: ColumnType,
+    left: &str,
+    right_subtype: ColumnType,
+    right: &str,
+) -> Ordering {
+    let (Ok(a), Ok(b)) = (
+        range::from_text(left_subtype, left),
+        range::from_text(right_subtype, right),
+    ) else {
+        return left.as_bytes().cmp(right.as_bytes());
+    };
+    match (a.empty, b.empty) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    let lower = match (&a.lower, &b.lower) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => x.pg_cmp(y),
+    };
+    // `true` before `false`, which `bool`'s own order has backwards.
+    let lower = lower.then_with(|| b.lower_inc.cmp(&a.lower_inc));
+    let upper = match (&a.upper, &b.upper) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => x.pg_cmp(y),
+    };
+    lower
+        .then(upper)
+        .then_with(|| a.upper_inc.cmp(&b.upper_inc))
+}
+
 fn parse_bool(text: &str) -> Result<bool> {
     let body = text.trim_matches(|c: char| c.is_ascii_whitespace());
     let lower = body.to_ascii_lowercase();
@@ -1819,6 +1910,7 @@ mod tests {
                         | ColumnType::TsRange
                         | ColumnType::TstzRange
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                        | ColumnType::FloatRange | ColumnType::VarcharRange
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
@@ -2021,5 +2113,57 @@ mod binary_tests {
         assert!(Datum::from_binary(ColumnType::Double, &[]).is_err());
         // A variable-length type takes whatever it is given.
         assert!(Datum::from_binary(ColumnType::Bytea, &[]).is_ok());
+    }
+
+    /// **Ranges sort by their bounds, not by their text**, and the fixture is the capture: this is
+    /// `ORDER BY float_range` over `range_test.rb`'s own rows on a real server.
+    ///
+    /// Sorted as text — which is what this used to do — `empty` lands last instead of first,
+    /// because `e` is above `[` and `(`. The second pair below is the case text order gets wrong
+    /// even without an `empty` in sight: `[10,21)` precedes `[2,4)` as characters and follows it
+    /// as a range.
+    #[test]
+    fn a_range_sorts_by_its_bounds_and_not_by_its_text() {
+        use std::cmp::Ordering;
+
+        let float = |text: &str| Datum::Range {
+            subtype: Box::new(ColumnType::Double),
+            text: text.to_owned(),
+        };
+        let order = [
+            "empty",
+            "(,)",
+            "[-Infinity,Infinity]",
+            "[0.5,0.7)",
+            "[0.5,0.7]",
+            "[0.5,)",
+        ];
+        for pair in order.windows(2) {
+            assert_eq!(
+                float(pair[0]).pg_cmp(&float(pair[1])),
+                Ordering::Less,
+                "{} should sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The same value twice is equal, which is what keeps `DISTINCT` and `=` agreeing with the
+        // canonical text they are still compared by.
+        assert_eq!(
+            float("[0.5,0.7]").pg_cmp(&float("[0.5,0.7]")),
+            Ordering::Equal
+        );
+
+        // And the digits, where the text is wrong without any `empty` involved.
+        let ints = |text: &str| Datum::Range {
+            subtype: Box::new(ColumnType::Int8),
+            text: text.to_owned(),
+        };
+        assert_eq!(ints("[2,4)").pg_cmp(&ints("[10,21)")), Ordering::Less);
+        assert_eq!(
+            "[10,21)".cmp("[2,4)"),
+            Ordering::Less,
+            "the text really does disagree, which is why this test exists"
+        );
     }
 }

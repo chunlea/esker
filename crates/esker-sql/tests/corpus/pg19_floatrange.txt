@@ -1,0 +1,96 @@
+# `floatrange` and `stringrange` — a column of a **user-defined range type**, against PG 19beta1.
+#
+# **Run 64's row: 46 tests in `adapters/postgresql/range_test.rb`**, which had moved from
+# `tstzrange[]` to `a column of the range type floatrange is not supported`. The file's `setup`
+# declares *two* user range types in one transaction and adds a column of each, so either one
+# missing fails all 46 — `floatrange` (`subtype = float8, subtype_diff = float8mi`) and
+# `stringrange` (`subtype = varchar`).
+#
+# The six values are the file's own `insert_range(id: 101…106)` fixtures plus the two rows that
+# are not ranges: 108 is NULL and 109 is `range_test.rb`'s escaped string range, whose bounds are
+# `ca"t` and `do\g`.
+#
+# Things reasoning would get wrong:
+#
+# * **A continuous subtype does not canonicalise.** `[0.5,0.7]` comes back exactly as written,
+#   where `int8range '[10,100]'` comes back `[10,101)`. `pg_range.rngcanonical` is `-` for a
+#   `float8` range, as it is for `numrange` — measured, both.
+# * **`[0.5,0.5)` is `empty` and `[,]` prints `(,)`**: an absent bound is never inclusive whatever
+#   bracket was written beside it.
+# * **`-Infinity` is a value, not an unbounded bound.** `[-Infinity,Infinity]` keeps its square
+#   brackets and `upper_inf` is `f`, where `[0.5,]` prints `[0.5,)` and `upper_inf` is `t`.
+# * **A `varchar` bound is quoted and keeps its whitespace**: `["ca""t","do\g")` round-trips byte
+#   for byte, and `'["a b","c d")'` keeps the quotes it needs.
+# * **Range order is not text order.** `ORDER BY float_range` is `empty`, `(,)`,
+#   `[-Infinity,Infinity]`, `[0.5,0.7)`, `[0.5,0.7]`, `[0.5,)` — sorted by lower bound and then by
+#   inclusivity, so `empty` comes **first**. Sorting the canonical text agrees on everything
+#   except `empty`, which the text sorts last.
+# * **A range type is its own type.** `float_range = '[0.5,0.7]'::numrange` is `42883`, and
+#   `min(floatrange)` does not exist any more than `min(tsrange)` does.
+# * **`CREATE TYPE … AS RANGE (subtype = point)` is `42704`**, with the *same* message
+#   `CREATE INDEX` on a point column gives and a different HINT: a range needs its subtype to have
+#   a btree operator class, because that is what orders the bounds.
+#
+BEGIN		-
+CREATE TYPE floatrange AS RANGE (subtype = float8, subtype_diff = float8mi)		-
+CREATE TYPE stringrange AS RANGE (subtype = varchar)		-
+SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname IN ('floatrange','stringrange') ORDER BY typname	text,name,"char","char"	r|floatrange|r|R ; r|stringrange|r|R
+SELECT 'r', t.typname, r.rngsubtype::regtype FROM pg_range r JOIN pg_type t ON t.oid = r.rngtypid WHERE t.typname IN ('floatrange','stringrange') ORDER BY 2	text,name,regtype	r|floatrange|double precision ; r|stringrange|character varying
+CREATE TABLE fr (id int primary key, float_range floatrange)		-
+ALTER TABLE fr ADD COLUMN string_range stringrange		-
+SELECT 'r', column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'fr' ORDER BY ordinal_position	text,name,character varying,name	r|id|integer|int4 ; r|float_range|USER-DEFINED|floatrange ; r|string_range|USER-DEFINED|stringrange
+INSERT INTO fr (id, float_range) VALUES (101, '[0.5, 0.7]')		-
+INSERT INTO fr (id, float_range) VALUES (102, '[0.5, 0.7)')		-
+INSERT INTO fr (id, float_range) VALUES (103, '[0.5,]')		-
+INSERT INTO fr (id, float_range) VALUES (104, '[,]')		-
+INSERT INTO fr (id, float_range) VALUES (105, '[0.5, 0.5)')		-
+INSERT INTO fr (id, float_range) VALUES (106, '[-Infinity,Infinity]')		-
+INSERT INTO fr (id) VALUES (108)		-
+INSERT INTO fr (id, string_range) VALUES (109, '["ca""t","do\\g")')		-
+SELECT 'r', id, float_range FROM fr ORDER BY id		r|101|[0.5,0.7] ; r|102|[0.5,0.7) ; r|103|[0.5,) ; r|104|(,) ; r|105|empty ; r|106|[-Infinity,Infinity] ; r|108|\N ; r|109|\N
+SELECT 'r', id, string_range FROM fr WHERE id = 109		r|109|["ca""t","do\\g")
+SELECT 'r', id, lower(float_range), upper(float_range), isempty(float_range) FROM fr ORDER BY id		r|101|0.5|0.7|f ; r|102|0.5|0.7|f ; r|103|0.5|\N|f ; r|104|\N|\N|f ; r|105|\N|\N|t ; r|106|-Infinity|Infinity|f ; r|108|\N|\N|\N ; r|109|\N|\N|\N
+SELECT 'r', id, lower_inc(float_range), upper_inc(float_range), lower_inf(float_range), upper_inf(float_range) FROM fr WHERE float_range IS NOT NULL ORDER BY id		r|101|t|t|f|f ; r|102|t|f|f|f ; r|103|t|f|f|t ; r|104|f|f|t|t ; r|105|f|f|f|f ; r|106|t|t|f|f
+SELECT 'r', pg_typeof(float_range), pg_typeof(string_range) FROM fr WHERE id = 101		r|floatrange|stringrange
+SELECT 'r', pg_typeof(lower(float_range)), pg_typeof(upper(float_range)) FROM fr WHERE id = 101		r|double precision|double precision
+SELECT 'r', pg_typeof(lower(string_range)), pg_typeof(upper(string_range)) FROM fr WHERE id = 109		r|character varying|character varying
+SELECT 'r', float_range = '[0.5,0.7]'::floatrange, float_range = '[0.5,0.7)'::floatrange FROM fr WHERE id = 101		r|t|f
+SELECT 'r', '[0.5, 0.7]'::floatrange, '(0.5,0.7]'::floatrange, '[0.5,0.5]'::floatrange, 'empty'::floatrange		r|[0.5,0.7]|(0.5,0.7]|[0.5,0.5]|empty
+SELECT 'r', '[a,b]'::stringrange, '["a b","c d")'::stringrange		r|[a,b]|["a b","c d")
+SELECT 'r', count(DISTINCT float_range) FROM fr		r|6
+SELECT 'r', id, float_range FROM fr WHERE float_range IS NOT NULL ORDER BY float_range, id		r|105|empty ; r|104|(,) ; r|106|[-Infinity,Infinity] ; r|102|[0.5,0.7) ; r|101|[0.5,0.7] ; r|103|[0.5,)
+SELECT 'r', id FROM fr WHERE float_range = '[0.5,0.7]'::floatrange		r|101
+SAVEPOINT s1		-
+SELECT 'r', '[0.7,0.5]'::floatrange	!22000 range lower bound must be less than or equal to range upper bound
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', '[abc,def]'::floatrange	!22P02 invalid input syntax for type double precision: "abc"
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT 'r', ''::floatrange	!22P02 malformed range literal: "" DETAIL: Missing left parenthesis or bracket.
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT 'r', float_range = '[0.5,0.7]'::numrange FROM fr WHERE id = 101	!42883 operator does not exist: floatrange = numrange DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+DROP TYPE floatrange	!2BP01 cannot drop type floatrange because other objects depend on it DETAIL: column float_range of table fr depends on type floatrange HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+SELECT 'r', min(float_range) FROM fr	!42883 function min(floatrange) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+CREATE TYPE norange AS RANGE (subtype = point)	!42704 data type point has no default operator class for access method "btree" HINT: You must specify an operator class for the range type or define a default operator class for the subtype.
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+CREATE TYPE norange AS RANGE (subtype = nosuchtype)	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s8		-
+CREATE INDEX fr_range_idx ON fr (float_range)		-
+UPDATE fr SET float_range = '[1.5, 2.5)' WHERE id = 101		-
+SELECT 'r', id, float_range FROM fr WHERE id = 101		r|101|[1.5,2.5)
+DELETE FROM fr WHERE id = 109		-
+SELECT 'r', count(*) FROM fr		r|7
+DROP TABLE fr		-
+DROP TYPE floatrange		-
+DROP TYPE stringrange		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('floatrange','stringrange')	bigint	0

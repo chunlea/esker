@@ -216,6 +216,8 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::DateRange
         | StoredType::NumRange
         | StoredType::Int8Range
+        | StoredType::FloatRange
+        | StoredType::VarcharRange
         | StoredType::TstzRangeArray
         | StoredType::Int4RangeArray
         | StoredType::DateRangeArray
