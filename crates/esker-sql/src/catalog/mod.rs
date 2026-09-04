@@ -737,6 +737,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         dropped: false,
     };
     Arc::new(TableDef {
+        on_commit: OnCommit::default(),
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
         name: name.to_owned(),
         columns: vec![
@@ -865,6 +866,11 @@ pub struct TableDef {
     /// its table (`crate::catalog::pg_catalog`) is what makes both of those true at once, and it
     /// is the only arrangement in which they cannot disagree.
     pub persistence: Persistence,
+    /// What a **temporary** table does with its rows at every commit, and `PreserveRows` for
+    /// every other table — which is what a table with no clause is, so nothing written before
+    /// [ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)
+    /// changes meaning.
+    pub on_commit: OnCommit,
     /// Unique across the tenant.
     pub name: String,
     /// In declaration order, which is the order a row's values are encoded in.
@@ -1016,6 +1022,34 @@ pub enum Persistence {
     /// change (`CLAUDE.md` invariant 1) rather than a catalog one. What the suite needs is the
     /// statement to work and the column to be right; what it does not need is the data loss.
     Unlogged,
+    /// `t`. **A table in a schema that belongs to one session** — the whole of what makes it
+    /// temporary is where it lives, not how it is stored
+    /// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// Like [`Persistence::Unlogged`] it is recorded and not acted on by the engine: a temp
+    /// table's rows go through the WAL and Raft like anything else, so this node pays full write
+    /// cost for data defined to be throwaway. What a client can see is the column, the schema and
+    /// the lifetime, and all three are right.
+    Temporary,
+}
+
+/// What a temporary table does with its rows at the end of every transaction
+/// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// **"Every transaction" includes the implicit one**, which is the fact easiest to get wrong: a
+/// plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero
+/// rows behind, because that statement's own commit fires the rule. Measured, and an
+/// implementation that only acted at an explicit `COMMIT` looks right inside a transaction and
+/// answers one where a real server answers none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCommit {
+    /// `ON COMMIT PRESERVE ROWS`, and what a temporary table is without the clause.
+    #[default]
+    PreserveRows,
+    /// `ON COMMIT DELETE ROWS`: the table is emptied, and stays.
+    DeleteRows,
+    /// `ON COMMIT DROP`: the table goes at the end of the transaction that made it.
+    Drop,
 }
 
 impl Persistence {
@@ -1025,6 +1059,7 @@ impl Persistence {
         match self {
             Persistence::Permanent => "p",
             Persistence::Unlogged => "u",
+            Persistence::Temporary => "t",
         }
     }
 }
@@ -2293,7 +2328,14 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // A relation id is never reused, so an orphan override could not be mistaken for another
     // table's -- but it would sit in the collector's scan of every override for ever.
     clear_table_retention(txn, tenant, table.id);
-    txn.delete(&record::row_id_key(tenant, table.id));
+    // **The row-id allocator's key is deliberately NOT deleted here**, and that is a correctness
+    // fix rather than an omission. The allocator is non-transactional on purpose — it reserves a
+    // batch in a short transaction of its own, the way a sequence does — so a *transactional*
+    // write to its key conflicts with any allocation made after this transaction's snapshot. That
+    // made `BEGIN; CREATE TABLE t; INSERT INTO t …; DROP TABLE t; COMMIT` answer `40001` where a
+    // real server commits: the `INSERT` allocated, and the `DROP` then wrote the key the
+    // allocation had written. Leaving it costs one 21-byte key per dropped table that had rows,
+    // and cannot be wrong: a relation id is never reused, so nothing can ever read it again.
     txn.delete(&record::name_key(tenant, &table.name));
     if !table.primary_key_name.is_empty() {
         txn.delete(&record::name_key(tenant, &table.primary_key_name));
@@ -3287,6 +3329,17 @@ pub const RESERVED_SCHEMAS: [(&str, u64); 2] = [("pg_catalog", 12), ("informatio
 /// `{public}`, which is what makes `pg_class` reachable and invisible to a table list at once.
 pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
+/// `pg_temp` written with no number: **the asking session's own temporary schema**.
+///
+/// Not a schema and never a record — it is the word a client writes, resolved to `pg_temp_<n>`
+/// where the session is in reach. A relation stored under this qualifier cannot exist, which is
+/// what makes it safe to use as the marker
+/// ([ADR 0053](../../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+pub const PG_TEMP_ALIAS: &str = "pg_temp";
+
+/// The prefix every session-scoped temporary schema's name begins with.
+pub const PG_TEMP_PREFIX: &str = "pg_temp_";
+
 /// The schema the SQL-standard views live in. **Not** in the search path: a client has to qualify
 /// `information_schema.tables`, which is why its stored names carry the qualifier already.
 pub const INFORMATION_SCHEMA: &str = "information_schema";
@@ -3686,6 +3739,7 @@ mod tests {
 
     fn accounts(id: u64) -> TableDef {
         TableDef {
+            on_commit: super::OnCommit::default(),
             id,
             persistence: super::Persistence::Permanent,
             name: "accounts".into(),

@@ -45,8 +45,9 @@ INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b WH
 statement error (0A000)
 INSERT INTO t SELECT * FROM t
 
-statement error (0A000)
-CREATE TEMPORARY TABLE tmp (id int8 PRIMARY KEY)
+# **`CREATE TEMPORARY TABLE` left this file** with ADR 0053: a temp table is an ordinary relation
+# in a schema that belongs to one session, and the search path does the rest. What is still refused
+# beside it is `CREATE UNLOGGED` — and the two together are a syntax error on a real server too.
 
 statement error (0A000)
 CREATE TABLE copy AS SELECT * FROM t

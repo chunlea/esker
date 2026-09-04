@@ -53,20 +53,48 @@ pub(super) fn create_table(
     txn: &mut dyn Txn,
     create: &CreateTable,
 ) -> Result<Outcome> {
-    if let Some(existing) = existing_relation(executor, txn, &create.name)? {
-        let _ = existing;
-        if create.if_not_exists {
-            executor.notice(SqlError::AlreadyExistsSkipping(create.name.clone()));
-            return Ok(Outcome::done("CREATE TABLE"));
-        }
-        return Err(SqlError::DuplicateTable(create.name.clone()));
-    }
-
     // **An unqualified `CREATE` goes to the first schema of the path**, not to `public`: measured,
     // with `sp_a, sp_b` a `CREATE TABLE made_here` lands in `sp_a`. The name is qualified here, so
     // everything below — the record, the derived key and index names, the messages — is about the
     // relation where it actually is.
-    let create = &qualified_create(&*txn, executor, create)?;
+    //
+    // **A temporary table goes in the session's own schema**, whatever the `search_path` says, and
+    // the schema is written on demand — a session that makes none writes no record (ADR 0053).
+    // This happens **before** the duplicate check, and that order is the whole of why a permanent
+    // `things` does not stop a temporary one: they are in different schemas, so the name is only
+    // taken when the *temp* schema already has it. Measured — a `CREATE TABLE` of a name a temp
+    // table holds succeeds too, in the other direction.
+    let temporary = create.persistence == catalog::Persistence::Temporary
+        && !create.name.contains(catalog::SCHEMA_SEPARATOR);
+    let placed = if temporary {
+        let schema = executor.ensure_temp_schema(txn)?;
+        let mut moved = create.clone();
+        moved.name = catalog::qualify(&schema, &create.name);
+        moved
+    } else {
+        qualified_create(&*txn, executor, create)?
+    };
+    let written = create.name.clone();
+    let create = &placed;
+
+    // **The schema it is going in, and no other.** This was a `search_path` walk, which is wrong
+    // for a `CREATE`: a permanent `things` and a temporary `things` coexist on a real server, and
+    // a walk finds the temp one and refuses the permanent one it is not making. The message quotes
+    // the name **as written** — `relation "things" already exists`, not the placed
+    // `pg_temp_3.things` — measured.
+    if catalog::pg_catalog::view(&create.name).is_some()
+        || executor
+            .catalog_view(&*txn)?
+            .relation(&create.name)?
+            .is_some()
+    {
+        if create.if_not_exists {
+            executor.notice(SqlError::AlreadyExistsSkipping(written));
+            return Ok(Outcome::done("CREATE TABLE"));
+        }
+        return Err(SqlError::DuplicateTable(written));
+    }
+
     refuse_missing_schema(&*txn, executor, &create.name)?;
     let declared = declared_columns(&*txn, executor, create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
@@ -145,6 +173,7 @@ pub(super) fn create_table(
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
     let table = TableDef {
+        on_commit: create.on_commit,
         id: table_id,
         persistence: create.persistence,
         name: create.name.clone(),
@@ -2729,6 +2758,79 @@ pub(super) fn drop_table(
 /// Factored out so `CASCADE` can reach an inheriting child with it: a child dropped that way needs
 /// exactly the same removal the named table gets, and doing it by hand at the second call site is
 /// how one of the three steps gets forgotten.
+/// Every relation in one session's temporary schema, and then the schema
+/// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// The same path `DROP SCHEMA … CASCADE` walks, so each table takes its own indexes, sequences and
+/// primary key with it and nothing is left half-dropped.
+pub(super) fn drop_temp_schema(executor: &Executor, txn: &mut dyn Txn, schema: &str) -> Result<()> {
+    for stored in catalog::relations_in_schema(&*txn, executor.tenant, schema)? {
+        if let Some(catalog::Relation::Table { table_id }) =
+            executor.catalog_view(&*txn)?.relation(&stored)?
+        {
+            let table = executor.table_by_id(txn, table_id)?;
+            drop_one_table(executor, txn, &table)?;
+        }
+    }
+    catalog::drop_schema(txn, executor.tenant, schema)
+}
+
+/// `ON COMMIT` for every temporary table this session has, run at the end of **every** transaction
+/// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// **"Every transaction" includes the implicit one**, which is the fact this exists to get right:
+/// a plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero
+/// rows behind, because that statement's own commit fires the rule. Measured, and an
+/// implementation hooked only to an explicit `COMMIT` looks right inside a block and answers one
+/// where a real server answers none.
+///
+/// It runs inside the committing transaction, so the emptying and the statement's own writes are
+/// one atomic step — and a transaction that rolls back undoes both, which is what makes a rollback
+/// need no rule of its own.
+pub(super) fn run_on_commit(executor: &Executor, txn: &mut dyn Txn) -> Result<()> {
+    let Some(schema) = executor.temp_schema() else {
+        return Ok(());
+    };
+    let held = catalog::relations_in_schema(&*txn, executor.tenant, schema)?;
+    for stored in held {
+        let Some(catalog::Relation::Table { table_id }) =
+            executor.catalog_view(&*txn)?.relation(&stored)?
+        else {
+            continue;
+        };
+        let table = executor.table_by_id(txn, table_id)?;
+        match table.on_commit {
+            catalog::OnCommit::PreserveRows => {}
+            catalog::OnCommit::DeleteRows => empty_table(executor, txn, &table)?,
+            catalog::OnCommit::Drop => drop_one_table(executor, txn, &table)?,
+        }
+    }
+    Ok(())
+}
+
+/// Every row and every index entry of one table, deleted — the table itself stays.
+///
+/// The row half of [`drop_one_table`], and paged for the same reason.
+fn empty_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    super::for_each_page(txn, &start, &end, |txn, page| {
+        for (key, _) in page {
+            txn.delete(key);
+        }
+        Ok(())
+    })?;
+    for index in &table.indexes {
+        let (start, end) = crate::row::index_range(executor.tenant, table.id, index.id);
+        super::for_each_page(txn, &start, &end, |txn, page| {
+            for (key, _) in page {
+                txn.delete(key);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Result<()> {
     // The rows go with the table. A range delete is what this wants and the transaction layer
     // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a

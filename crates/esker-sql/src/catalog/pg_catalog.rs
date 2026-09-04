@@ -836,6 +836,7 @@ impl CatalogView {
                     Arc::new(TableDef {
                         // Synthetic and never stored, so its persistence is the default.
                         persistence: crate::catalog::Persistence::Permanent,
+                        on_commit: super::OnCommit::default(),
                         id: view.id(),
                         name: view.name().to_owned(),
                         columns: view

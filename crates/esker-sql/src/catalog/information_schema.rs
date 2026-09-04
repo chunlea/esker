@@ -52,8 +52,12 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     Ok(relations
         .of_kind(RelKind::Table)
         .map(|relation| {
+            // **The schema the relation is actually in**, not a constant. It was `public` while
+            // that was the only schema a relation could be in; a temporary table is in
+            // `pg_temp_<n>` and a real server lists it there (ADR 0053), and a table in a user
+            // schema was being reported in `public` — a *wrong* row rather than a missing one.
             vec![
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
+                Datum::Text(relation.schema.clone()),
                 Datum::Text(relation.name.clone()),
                 // `BASE TABLE` for every one of them: a view, a materialised view, a partitioned
                 // table and a foreign table are the other four values and this node has none.

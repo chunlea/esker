@@ -220,6 +220,12 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
+    /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
+    /// relation that outlives the transaction. Measured.
+    #[error("ON COMMIT can only be used on temporary tables")]
+    OnCommitNotTemporary,
+
     /// `DROP SCHEMA pg_catalog`. **`2BP01`, not `42501`** — the schema is not forbidden to you,
     /// it is depended on, and the message says so in PostgreSQL's own words. The name is
     /// **unquoted** here, unlike every other schema message; measured.
@@ -2008,7 +2014,9 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::PermanentReferencesUnlogged => sqlstate::INVALID_TABLE_DEFINITION,
+            SqlError::PermanentReferencesUnlogged | SqlError::OnCommitNotTemporary => {
+                sqlstate::INVALID_TABLE_DEFINITION
+            }
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)

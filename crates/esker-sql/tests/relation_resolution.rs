@@ -34,6 +34,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          pg_range as r ON t.oid = r.rngtypid WHERE t.typname IN ('int2','int4','int8') ORDER BY \
          t.typname",
         "SELECT 'r', relname FROM pg_class WHERE relname IN ('rr','RR')",
+        "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS in_a_temp_schema, c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'rr' ORDER BY \
+         in_a_temp_schema",
         // **`name[]` there and `text` here**, which is the array half of the same trade:
         // `current_schemas` answers an array on a real server and this node prints the `{a,b}`
         // literal it renders as. The rows are byte-identical, which is what a client reads.
@@ -74,16 +77,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              schema dump. The two changes are one unit and it is a namespace unit, not a `relkind` \
              one. `pg_stat_activity` is `v` on both sides, which is the row this unit needed.",
         ),
-        (
-            "CREATE TEMP TABLE rr (id int)",
-            "**A temporary table is refused by name** (`tests/slt/unsupported.slt`), so the \
-             capture's last third — a temp table shadowing a permanent one of the same name, and \
-             `DROP TABLE pg_temp.rr` uncovering it — is a feature this node does not have rather \
-             than an answer it gets wrong. It needs a per-session schema whose name carries the \
-             backend id, a search path that puts it first, and relations that die with the \
-             session; none of that exists, and the session registry it would want is the same one \
-             `DROP DATABASE` is waiting for (ADR 0052).",
-        ),
     ],
 };
 
@@ -99,14 +92,14 @@ fn every_relation_resolution_answer_is_postgresql_19_s() {
         "the corpus shrank: {} statements",
         replayed.checked
     );
-    // **The number this file loses, said out loud.** `CREATE TEMP TABLE` is `0A000` here and a
-    // statement there, so it aborts the transaction and the capture's last third — the temp
-    // table shadowing a permanent one, `DROP TABLE pg_temp.rr` uncovering it, and the two
-    // savepoint-visibility probes after it — comes back `25P02` and is compared by nobody. A
-    // corpus that only counted what it checked would look complete; this one says what it did
-    // not reach, and the number falls to zero when temporary tables arrive.
+    // **Zero, and it was twenty.** `CREATE TEMP TABLE` was `0A000` here and a statement there, so
+    // it aborted the transaction and the capture's last third — the temp table shadowing a
+    // permanent one, `DROP TABLE pg_temp.rr` uncovering it, and the two savepoint-visibility
+    // probes after it — came back `25P02` and was compared by nobody. This assertion is what the
+    // temp-table unit ([ADR 0053]) was measured by, and it stays as the thing that catches the
+    // next refusal to open a hole in the middle of this file.
     assert_eq!(
-        replayed.swallowed, 20,
-        "the aborted transaction swallowed a different number of statements than the temp-table          refusal accounts for"
+        replayed.swallowed, 0,
+        "an aborted transaction is swallowing statements this corpus is supposed to compare"
     );
 }

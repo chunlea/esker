@@ -65,9 +65,9 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
-    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, Persistence,
-    RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
-    TypeDef, TypeField, TypeKind, UniqueKind,
+    IndexKey, KeyOrder, KeyPart, OnCommit, PartitionBound, PartitionKey, PartitionStrategy,
+    Persistence, RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
+    TriggerDef, TypeDef, TypeField, TypeKind, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 25;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 26;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1644,6 +1644,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     out.push(match table.persistence {
         Persistence::Permanent => 0,
         Persistence::Unlogged => 1,
+        Persistence::Temporary => 2,
     });
 
     // Version 24. The tombstoned columns, by ordinal, on the end for the twelfth time and the same
@@ -1673,7 +1674,34 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         varint::put_u64(column.user_type.unwrap_or(0), &mut out);
     }
 
+    // Version 26. One byte: what a **temporary** table does with its rows at every commit (ADR
+    // 0053). Fourteenth section, appended like every one before it. A table written before 26 has
+    // none and decodes `PreserveRows`, which is what a table with no `ON COMMIT` clause is — so
+    // every table ever written means exactly what it meant.
+    out.push(match table.on_commit {
+        OnCommit::PreserveRows => 0,
+        OnCommit::DeleteRows => 1,
+        OnCommit::Drop => 2,
+    });
+
     Ok(out)
+}
+
+/// The version 26 tail: a temporary table's `ON COMMIT` action.
+///
+/// Read **after** version 25's user types, because the sections come off in the order they went
+/// on. A table written before 26 answers `PreserveRows`, which is both the default clause and what
+/// every table had while `CREATE TEMPORARY TABLE` was `0A000`.
+fn read_on_commit(reader: &mut Reader<'_>) -> Result<OnCommit> {
+    if reader.version < 26 {
+        return Ok(OnCommit::PreserveRows);
+    }
+    match reader.byte()? {
+        0 => Ok(OnCommit::PreserveRows),
+        1 => Ok(OnCommit::DeleteRows),
+        2 => Ok(OnCommit::Drop),
+        other => Err(corrupt(format!("ON COMMIT byte {other}"))),
+    }
 }
 
 /// The version 25 tail: each column's user-defined type oid, or 0 for a column declared as one of
@@ -1707,6 +1735,10 @@ fn read_persistence(reader: &mut Reader<'_>) -> Result<Persistence> {
     match reader.byte()? {
         0 => Ok(Persistence::Permanent),
         1 => Ok(Persistence::Unlogged),
+        // Added by ADR 0053 to a byte version 23 already writes, which is why it needs no section
+        // of its own: an older reader never sees it, because a table written before 0053 cannot be
+        // temporary and one written after it lives in a schema an older node would not resolve.
+        2 => Ok(Persistence::Temporary),
         other => Err(corrupt(format!("relpersistence byte {other}"))),
     }
 }
@@ -2256,9 +2288,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let persistence = read_persistence(&mut reader)?;
     read_dropped(&mut reader, &mut columns)?;
     read_user_types(&mut reader, &mut columns)?;
+    let on_commit = read_on_commit(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
+        on_commit,
         id,
         persistence,
         name,

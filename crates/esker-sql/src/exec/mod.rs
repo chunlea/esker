@@ -164,6 +164,15 @@ pub struct Executor {
     /// block may be read-only because the user asked, because the snapshot is historical, or both.
     block_read_only: bool,
     /// Where columnar placement is reported, on a node that has a placement driver.
+    /// The schema this session's **temporary** relations live in, once it has made one
+    /// ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// `None` until the first `CREATE TEMP TABLE`, which is what keeps a session that makes none
+    /// from writing a schema record — and what keeps `pg_namespace` from growing a row per
+    /// connection. The name is `pg_temp_<n>` where `n` comes from the **tenant's** id allocator
+    /// rather than a process-local counter: two `esker-sql` nodes serve one tenant, and a
+    /// per-process number would hand `pg_temp_1` to a session on each of them.
+    temp_schema: Option<String>,
     columnar: Option<Arc<dyn crate::pd::ColumnarReport>>,
     /// Where this node sends fragments, or `None` for a node that cannot ask one.
     ///
@@ -193,6 +202,36 @@ struct ReadAsOf {
     retention_ms: u64,
     /// `SET LOCAL`: undone when the transaction ends, whichever way it ends.
     local: bool,
+}
+
+/// **A session takes its temporary relations with it**, which is the third of the four rules a
+/// temporary table is ([ADR 0053](../../../docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// Best effort, deliberately: this runs where a failure cannot be reported to anybody, so a
+/// backend that will not answer leaves the schema behind rather than panicking in a destructor.
+/// That is the same outcome an abrupt disconnect has, and the ADR says what it costs — the
+/// records and rows stay, unreachable, until the sweeper the session registry unblocks.
+///
+/// A session that made no temporary relation does nothing at all, which is almost every session:
+/// the field is `None` and there is no transaction to open.
+impl Drop for Executor {
+    fn drop(&mut self) {
+        let Some(schema) = self.temp_schema.take() else {
+            return;
+        };
+        // The open transaction goes first: a session that disconnects mid-block has its writes
+        // rolled back, and dropping the schema is a *new* transaction rather than a rider on one
+        // that is about to be abandoned.
+        if let Some(txn) = self.open.take() {
+            let _ = txn.rollback();
+        }
+        let Ok(mut txn) = self.backend.begin() else {
+            return;
+        };
+        if crate::exec::ddl::drop_temp_schema(self, &mut *txn, &schema).is_ok() {
+            let _ = txn.commit();
+        }
+    }
 }
 
 impl Executor {
@@ -286,7 +325,13 @@ impl Executor {
     ///
     /// A failed check leaves nothing committed: the transaction is rolled back, which is what a
     /// real server does and is visible afterwards as the rows not being there.
-    fn checked_and_committed(&mut self, txn: Box<dyn Txn>, written: &Written) -> Result<()> {
+    fn checked_and_committed(&mut self, mut txn: Box<dyn Txn>, written: &Written) -> Result<()> {
+        // **The implicit transaction ends here**, so this is where `ON COMMIT` fires for a
+        // statement outside a block — the half an implementation hooked to `COMMIT` alone misses.
+        if let Err(error) = ddl::run_on_commit(self, &mut *txn) {
+            let _ = txn.rollback();
+            return Err(error);
+        }
         let owed = self.constraints.borrow_mut().take();
         for check in &owed {
             if let Err(error) = check.verify(&*txn, self.tenant) {
@@ -392,6 +437,7 @@ impl Executor {
             read_as_of: None,
             open_used: false,
             block_read_only: false,
+            temp_schema: None,
             columnar: None,
             fragments: None,
             columnar_changed: false,
@@ -1652,6 +1698,80 @@ impl Executor {
         Ok(out)
     }
 
+    /// The path a **name** resolves along: this session's temp schema first, then the rest.
+    ///
+    /// **Not the same list as [`Executor::resolved_search_path`]**, and the difference is the whole
+    /// of how a temporary table hides. PostgreSQL keeps two: the *implicit* path
+    /// (`current_schemas(true)`) begins with the session's temp schema and `pg_catalog`, and the
+    /// *explicit* one (`current_schemas(false)`) has neither. A name resolves along the first; a
+    /// table list and a schema dump filter on the second. So a temp table shadows a permanent one
+    /// of the same name **and** is invisible to `ActiveRecord`'s `tables()`, with no rule anywhere
+    /// that says "hide temporary tables" — measured, the implicit path is 3 long and the explicit
+    /// path is 1 while a temp table exists.
+    pub(crate) fn resolution_path(&self, txn: &dyn Txn) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(temp) = &self.temp_schema {
+            out.push(temp.clone());
+        }
+        out.extend(self.resolved_search_path(txn)?);
+        Ok(out)
+    }
+
+    /// This session's temp schema, **creating it** if this is its first temporary relation.
+    ///
+    /// The schema is an ordinary schema record, so `pg_namespace` reports it, `DROP SCHEMA` is
+    /// what reclaims it, and it is transactional: a temp table made in a transaction that rolls
+    /// back takes its schema with it, and the next one allocates a fresh number. That last part is
+    /// a small waste of ids and the alternative — a schema that survives its own rollback — would
+    /// be a record no statement wrote.
+    pub(crate) fn ensure_temp_schema(&mut self, txn: &mut dyn Txn) -> Result<String> {
+        if let Some(temp) = &self.temp_schema
+            && crate::catalog::schema_exists(&*txn, self.tenant, temp)?
+        {
+            return Ok(temp.clone());
+        }
+        let id = crate::catalog::allocate_id(txn, self.tenant)?;
+        let name = format!("pg_temp_{id}");
+        crate::catalog::create_schema(txn, self.tenant, &name, id)?;
+        self.temp_schema = Some(name.clone());
+        Ok(name)
+    }
+
+    /// The stored name a **written** one names — `::regclass`'s input, and `to_regclass`'s.
+    ///
+    /// **The search path applies only when the name wrote no schema**, which is what tells
+    /// `'tt_temp'::regclass` from `'public.tt_temp'::regclass`: the first walks the path and finds
+    /// the session's temporary table, the second says `public` and must find nothing when the only
+    /// `tt_temp` is temporary. A lookup that walked the path for both answered about a relation the
+    /// caller did not name — measured, and the reason this is a function rather than one line.
+    fn stored_name_written(&self, txn: &dyn Txn, name: &str) -> Result<String> {
+        let written = crate::catalog::parse_qualified(name);
+        if let Some(rewritten) = self.named_pg_temp(&written) {
+            return Ok(rewritten);
+        }
+        if crate::catalog::reach_of(name) == crate::catalog::Reach::SearchPath {
+            return self.resolve_unqualified(txn, &written);
+        }
+        Ok(written)
+    }
+
+    /// A name qualified with the bare word `pg_temp`, rewritten to this session's own schema.
+    ///
+    /// `None` for every other name. A session that has made no temporary relation has no schema to
+    /// rewrite to, and the name is left as it was written — so `pg_temp.x` is `42P01` naming
+    /// `pg_temp.x`, which is what a real server says for a temp table that is not there.
+    fn named_pg_temp(&self, name: &str) -> Option<String> {
+        let bare = name
+            .strip_prefix(crate::catalog::PG_TEMP_ALIAS)?
+            .strip_prefix(crate::catalog::SCHEMA_SEPARATOR)?;
+        Some(crate::catalog::qualify(self.temp_schema.as_ref()?, bare))
+    }
+
+    /// This session's temp schema if it has one, without creating it.
+    pub(crate) fn temp_schema(&self) -> Option<&str> {
+        self.temp_schema.as_deref()
+    }
+
     /// The stored name an **unqualified** relation name resolves to.
     ///
     /// Each schema on the path in order, and the first that has it wins: with `sp_b, sp_a` a bare
@@ -1659,11 +1779,14 @@ impl Executor {
     /// measured. A name that is found nowhere comes back **unchanged**, so the `42P01` quotes the
     /// bare name the user wrote rather than a schema they did not.
     pub(crate) fn resolve_unqualified(&self, txn: &dyn Txn, name: &str) -> Result<String> {
+        if let Some(bare) = self.named_pg_temp(name) {
+            return Ok(bare);
+        }
         if name.contains(crate::catalog::SCHEMA_SEPARATOR) {
             return Ok(name.to_owned());
         }
         let view = self.catalog_view(txn)?;
-        for schema in self.resolved_search_path(txn)? {
+        for schema in self.resolution_path(txn)? {
             let candidate = crate::catalog::qualify(&schema, name);
             if view.relation(&candidate)?.is_some() {
                 return Ok(candidate);
@@ -1697,6 +1820,7 @@ impl Executor {
             return Ok(());
         }
         let path = self.resolved_search_path(txn)?;
+        let temp = self.temp_schema.clone();
         let mut resolve = |expr: &mut Expr| {
             let Expr::CurrentSchema { all } = expr else {
                 return;
@@ -1713,6 +1837,10 @@ impl Executor {
                 Some(implicit) => {
                     let mut all = Vec::new();
                     if *implicit {
+                        // **The temp schema is first, before `pg_catalog`** — measured: with a
+                        // temp table the implicit path is `{pg_temp_n,pg_catalog,public}`, which
+                        // is the order a name resolves in.
+                        all.extend(temp.iter().map(|name| Some(name.clone())));
                         all.push(Some("pg_catalog".to_owned()));
                     }
                     all.extend(path.iter().map(|name| Some(name.clone())));
@@ -1841,7 +1969,7 @@ impl Executor {
         txn: &dyn Txn,
         name: &str,
     ) -> Result<Option<String>> {
-        let stored = crate::catalog::parse_qualified(name);
+        let stored = self.stored_name_written(txn, name)?;
         let reach = crate::catalog::reach_of(name);
         if reach.catalog()
             && let Some(view) = crate::catalog::pg_catalog::view(&stored)
@@ -1879,7 +2007,7 @@ impl Executor {
         // `se_idx`, and looking it up whole would find nothing. It is also where the quoting is
         // undone: `ActiveRecord` writes `'\"pg_type\"'::regclass`, which found nothing until the
         // catalog was consulted with the *normalised* name rather than the written one.
-        let stored = crate::catalog::parse_qualified(name);
+        let stored = self.stored_name_written(txn, name)?;
         let reach = crate::catalog::reach_of(name);
         if reach.catalog()
             && let Some(view) = crate::catalog::pg_catalog::view(&stored)
@@ -2394,6 +2522,17 @@ impl Execute for Executor {
         if let Err(error) = self.run_deferred_checks() {
             let _ = self.rollback();
             return Err(error);
+        }
+        // **The explicit end of a block**, the other half of the pair: the same actions the
+        // implicit commit runs, against the transaction that is about to close. Taken out and put
+        // back because they need the executor *and* the transaction, and one borrows the other.
+        if let Some(mut txn) = self.open.take() {
+            let outcome = ddl::run_on_commit(self, &mut *txn);
+            self.open = Some(txn);
+            if let Err(error) = outcome {
+                let _ = self.rollback();
+                return Err(error);
+            }
         }
         self.savepoints.clear();
         let written = std::mem::take(&mut self.written);

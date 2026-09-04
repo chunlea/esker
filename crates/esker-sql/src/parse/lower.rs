@@ -1764,7 +1764,6 @@ fn lower_retention(value: &Expr) -> Result<Option<u64>> {
 /// function stops being read and starts being skimmed.
 fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<()> {
     refuse_if(create.or_replace, "CREATE OR REPLACE TABLE")?;
-    refuse_if(create.temporary, "CREATE TEMPORARY TABLE")?;
     refuse_if(create.external, "CREATE EXTERNAL TABLE")?;
     refuse_if(create.global.is_some(), "CREATE GLOBAL/LOCAL TABLE")?;
     refuse_if(create.transient, "CREATE TRANSIENT TABLE")?;
@@ -1774,7 +1773,6 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
 
-    refuse_if(create.on_commit.is_some(), "CREATE TABLE ... ON COMMIT")?;
     refuse_if(create.without_rowid, "CREATE TABLE ... WITHOUT ROWID")?;
     refuse_if(create.strict, "CREATE TABLE ... STRICT")?;
     refuse_if(create.comment.is_some(), "CREATE TABLE ... COMMENT")?;
@@ -1909,9 +1907,34 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         &mut foreign_keys,
     )?;
 
+    // **`TEMPORARY` and `TEMP` are one keyword** and `sqlparser` folds them into one flag, so
+    // there is nothing to tell apart here. `UNLOGGED` reaches this crate through the source
+    // rewrite instead (`crate::parse::strip_unlogged`), and the two are set in different places —
+    // which is what makes `CREATE TEMPORARY UNLOGGED TABLE` a *syntax error* here as it is on a
+    // real server, rather than a table that is quietly one of the two.
+    let persistence = if create.temporary {
+        catalog::Persistence::Temporary
+    } else {
+        catalog::Persistence::Permanent
+    };
+    let on_commit = match create.on_commit {
+        None => catalog::OnCommit::PreserveRows,
+        Some(sqlparser::ast::OnCommit::PreserveRows) => catalog::OnCommit::PreserveRows,
+        Some(sqlparser::ast::OnCommit::DeleteRows) => catalog::OnCommit::DeleteRows,
+        Some(sqlparser::ast::OnCommit::Drop) => catalog::OnCommit::Drop,
+    };
+    // **`ON COMMIT` is a temporary table's clause and nothing else's**, and PostgreSQL says so in
+    // its own class: `42P16`, an invalid *table definition*, rather than a syntax error or a
+    // refusal. Measured.
+    if create.on_commit.is_some() && !create.temporary {
+        return Err(SqlError::OnCommitNotTemporary);
+    }
+
     Ok(plan::CreateTable {
-        // Overridden in `Parsed::lower`, which is where the stripped keyword is in reach.
-        persistence: catalog::Persistence::Permanent,
+        // `UNLOGGED` is overridden in `Parsed::lower`, which is where the stripped keyword is in
+        // reach; `TEMPORARY` is a flag the parser does read, so it is decided here.
+        persistence,
+        on_commit,
         name,
         checks,
         foreign_keys,
@@ -6394,6 +6417,16 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         // `relation "nosuch" does not exist` where PostgreSQL quotes the qualifier back.
         // Nothing is ever *written* under this prefix — creating in it is `42501` — so it is a
         // lookup key and never a record's name.
+        // **`pg_temp` with no number is the session's own**, and the session is not in reach
+        // here — so it is stored as the bare word and rewritten to `pg_temp_<n>` where the name is
+        // resolved (`crate::exec::Executor::resolve_unqualified`). The same shape the qualifier
+        // below takes, and for the same reason: a qualifier is where to look.
+        if schema.eq_ignore_ascii_case(catalog::PG_TEMP_ALIAS) {
+            return Ok(catalog::qualify(
+                catalog::PG_TEMP_ALIAS,
+                &fold_identifier(relation, false).0,
+            ));
+        }
         if schema.eq_ignore_ascii_case(catalog::PG_CATALOG_SCHEMA) {
             return Ok(catalog::qualify(
                 catalog::PG_CATALOG_SCHEMA,
