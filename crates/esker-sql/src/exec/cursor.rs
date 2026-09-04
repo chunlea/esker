@@ -1833,7 +1833,44 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         }
         // **A fresh value per call**, which is what volatile means: two of these in one statement
         // are two different UUIDs, and neither is cached.
-        Expr::Uuid(_) => Datum::Uuid(crate::value::random::uuid_v4()?),
+        // **Which function it is decides which UUID it is**, and the four namespaces are
+        // constants: RFC 4122's own, byte for byte, and the same numbers a real server answers.
+        Expr::Uuid(func) => Datum::Uuid(match func {
+            crate::plan::UuidFunc::GenRandomUuid | crate::plan::UuidFunc::UuidGenerateV4 => {
+                crate::value::random::uuid_v4()?
+            }
+            crate::plan::UuidFunc::UuidGenerateV1 | crate::plan::UuidFunc::UuidGenerateV1Mc => {
+                let Some(txn) = env.txn else {
+                    return Err(SqlError::Internal(format!(
+                        "{}() reached an evaluator with no transaction",
+                        func.name()
+                    )));
+                };
+                // The transaction's instant, from the same place `now()` reads it — invariant 6
+                // says the TSO's physical half is the only clock this node may read, and a
+                // version-1 UUID is a timestamp. Two calls in one transaction are told apart by
+                // the tick counter, not by the clock.
+                crate::value::random::uuid_v1(
+                    crate::time_machine::micros_of_ts(txn.start_ts()),
+                    matches!(func, crate::plan::UuidFunc::UuidGenerateV1Mc),
+                )?
+            }
+            crate::plan::UuidFunc::UuidNil => [0; 16],
+            crate::plan::UuidFunc::UuidNsDns => {
+                crate::value::uuid::from_text("6ba7b810-9dad-11d1-80b4-00c04fd430c8")?
+            }
+            crate::plan::UuidFunc::UuidNsUrl => {
+                crate::value::uuid::from_text("6ba7b811-9dad-11d1-80b4-00c04fd430c8")?
+            }
+            crate::plan::UuidFunc::UuidNsOid => {
+                crate::value::uuid::from_text("6ba7b812-9dad-11d1-80b4-00c04fd430c8")?
+            }
+            // **`814`, not `813`.** RFC 4122 skips one: the X.500 namespace is `…814…` and there
+            // is no `…813…`. Measured, because it is exactly the digit a reader would fill in.
+            crate::plan::UuidFunc::UuidNsX500 => {
+                crate::value::uuid::from_text("6ba7b814-9dad-11d1-80b4-00c04fd430c8")?
+            }
+        }),
         Expr::Literal(Literal::Null | Literal::TypedNull(_)) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),

@@ -13,7 +13,38 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[],
+    answers: &[
+        // **This node has no MAC address, and RFC 4122 §4.5 says what to do about it**: a node
+        // without one uses a *random* node id with the multicast bit set. A real server reads the
+        // host's card, so its `uuid_generate_v1()` is unicast and this line is `f` there and `t`
+        // here — the one bit of the sixteen bytes that differs, and it differs by the standard's
+        // own instruction rather than by an approximation.
+        //
+        // The half that matters agrees and is checked where it can be: the node id is the **same
+        // for every call** of the plain form and **new for every call** of the `mc` one, which is
+        // the whole difference between them. A corpus cannot ask it — this node has no
+        // `substring` to cut the node bytes out with — so `value::random`'s own test does.
+        (
+            "SELECT 'r', uuid_generate_v1()::text ~ '^.{24}[0-9a-f][13579bdf]' AS v1_multicast",
+            "no MAC address here, so RFC 4122's random multicast node id is used instead",
+        ),
+        // **`uuid_generate_v3` and `v5` hash**, with MD5 and SHA-1, and this project writes its
+        // own primitives rather than linking C — so each is a unit of its own and neither is
+        // approximated in the meantime. The four **namespace constants** they take are here
+        // already, measured, because they cost nothing and are what that unit needs first.
+        (
+            "SELECT 'r', uuid_generate_v3(uuid_ns_dns(), 'www.postgresql.org')",
+            "uuid_generate_v3 is MD5 over a namespace and a name; MD5 is a unit of its own",
+        ),
+        (
+            "SELECT 'r', uuid_generate_v5(uuid_ns_dns(), 'www.postgresql.org')",
+            "uuid_generate_v5 is SHA-1 over a namespace and a name; SHA-1 is a unit of its own",
+        ),
+        (
+            "SELECT 'r', uuid_generate_v3(uuid_ns_dns())",
+            "the same gap, reached through the arity error: both refuse and only the code differs",
+        ),
+    ],
 };
 
 #[test]
