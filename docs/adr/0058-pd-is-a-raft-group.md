@@ -1,4 +1,4 @@
-# ADR 0056 — the placement driver is a Raft group, and its durable records are the log's
+# ADR 0058 — the placement driver is a Raft group, and its durable records are the log's
 
 Status: accepted (phase 15) · Date: 2026-09-04
 Context: `CLAUDE.md` invariants 1, 4, 6 · `docs/DESIGN.md` §7, §9 · `docs/plans/phase-15-pd-ha.md`

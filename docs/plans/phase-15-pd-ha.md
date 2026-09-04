@@ -190,7 +190,7 @@ when it is not.
 - `crates/esker-pd/src/member.rs` — the member list, the group id, and the PD↔PD transport.
 - `crates/esker-pd/tests/failover.rs` — three members in one process; unit 5's tests.
 - `crates/esker-pd/tests/tso_window.rs` — the property test for the window.
-- `docs/adr/0056-pd-is-a-raft-group.md`.
+- `docs/adr/0058-pd-is-a-raft-group.md`.
 
 **Changed**
 - `crates/esker-pd/src/pd/mod.rs` — every durable write becomes propose-and-await; the applied
@@ -205,8 +205,9 @@ when it is not.
 - `crates/esker-store/src/{pd.rs,pd_remote.rs}` — an endpoint list and the redirect.
 - `crates/esker-client/src/` — the PD-endpoint side. **Declared before editing:** a new
   `pd.rs` holding the endpoint list and the redirect loop, plus the `pub use` line in `lib.rs`.
-  Nothing in `router.rs`, `tcp.rs` or the region cache. If that turns out to be wrong, the
-  coordinator hears about it before the edit.
+  Nothing in `router.rs`, `tcp.rs`, `retry.rs`, `txn.rs` or the region cache — `txn.rs` is the
+  `h1` lane's (coordinator, 2026-09-04). If that turns out to be wrong, the coordinator hears
+  about it before the edit.
 - `crates/esker-cli/src/{args.rs,pd.rs,server.rs}` — `--pd-peers`, `pd members`, the leader in
   `inspect`.
 - `docs/DESIGN.md` §7 and §15, `docs/plans/phase-4.md` §15 (the cost table is closed).
@@ -216,7 +217,7 @@ when it is not.
 
 ## 5. Units, one commit each
 
-0. **Plan and ADR.** This file, `docs/adr/0056-pd-is-a-raft-group.md`.
+0. **Plan and ADR.** This file, `docs/adr/0058-pd-is-a-raft-group.md`.
 1. **The state machine behind a single-member group.** `command.rs`, `machine.rs`,
    `raft_log.rs`, `driver.rs`; `Pd::open` keeps its signature and campaigns synchronously, so a
    one-member PD is leader before `open` returns. **Every existing test passes unchanged** —
@@ -285,7 +286,7 @@ when it is not.
 
 ## 9. Progress
 
-- **Unit 0 — plan and ADR.** Done: `docs/adr/0056-pd-is-a-raft-group.md`.
+- **Unit 0 — plan and ADR.** Done: `docs/adr/0058-pd-is-a-raft-group.md`.
 - **Unit 1 — the state machine behind a single-member group.** Done, in two commits rather than
   one: the wire addition came first because a typed refusal is what everything above it branches
   on, and a temporary mapping onto `Internal` would have been a lie that later commits had to

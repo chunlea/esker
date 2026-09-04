@@ -124,7 +124,7 @@ pub enum ProtoError {
     },
 
     /// This placement driver is not the leader of its own Raft group, so it answers nothing
-    /// ([ADR 0056](../../docs/adr/0056-pd-is-a-raft-group.md)).
+    /// ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md)).
     ///
     /// A **separate code** from [`ProtoError::NotLeader`], and the separation is load-bearing.
     /// That one is region-scoped: it names a region, its hint is a *peer* id, and a client

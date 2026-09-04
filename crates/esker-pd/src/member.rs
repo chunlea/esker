@@ -1,7 +1,7 @@
 //! Who the placement drivers are, and what tells one group's traffic from another's.
 //!
 //! PD's membership is **configuration, not state**
-//! ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)): the same list on every member,
+//! ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)): the same list on every member,
 //! given on the command line, never changed at run time. Dynamic membership is a phase of its
 //! own, and what it would have to move is written down at the bottom of this file.
 //!

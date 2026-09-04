@@ -320,7 +320,7 @@ pub struct Pd {
     db: Arc<Db>,
     clock: Arc<dyn Clock>,
     /// The replicated state machine every durable write goes through
-    /// ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
+    /// ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
     machine: Arc<Machine>,
     /// The Raft group underneath. Dropped last, which joins its thread.
     driver: PdDriver,
@@ -419,7 +419,7 @@ impl Pd {
         // Two families, one WAL: the records in `default` and the Raft log in `raft`, so an apply
         // writes the record and the apply index in one atomic batch. A 4a directory has no `raft`
         // family and gains one here; nothing else about it changes
-        // ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
+        // ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
         let db = Db::open_with(
             path,
             options.engine.clone(),
@@ -588,7 +588,7 @@ impl Pd {
             state.alloc.allocate(2, |end| reserve(driver, end))?
         };
         // Minted here rather than at apply, so that three members do not mint three
-        // ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)). Ignored by an apply that
+        // ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)). Ignored by an apply that
         // finds a cluster already there.
         let cluster_id = mint_cluster_id(now_ms, store_id, address);
         drop(state);
@@ -650,7 +650,7 @@ impl Pd {
     ///
     /// Read out of applied state rather than out of `Pd`'s own, because the wishes are replicated:
     /// PD cannot re-derive them from any heartbeat, so they go through the log like every other
-    /// record ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
+    /// record ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
     pub(crate) fn columnar_wanted_for(&self, start: &[u8], end: &[u8]) -> u8 {
         self.applied()
             .map_or(0, |applied| applied.columnar.wanted_for(start, end))
@@ -797,7 +797,7 @@ impl Pd {
         // proposed would be deciding against a state the log may have moved past by the time the
         // entry lands; letting the log's order settle which beat is newer is what the guard means,
         // and under Raft the log's order is the same on every member
-        // ([`crate::machine`], [ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
+        // ([`crate::machine`], [ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
         let serving = self.leading()?;
         let record = RegionRecord {
             region: beat.region.clone(),
@@ -927,7 +927,7 @@ impl Pd {
     /// * **Rebuild on a new term.** A member that has just taken office reloads its allocator and
     ///   its oracle from what it has *applied* — `allocated_end + 1` and `max(clock, mark)` — which
     ///   is the same pair of constructors a restart uses, because a failover is a restart that
-    ///   kept its socket ([ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md)).
+    ///   kept its socket ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
     fn leading(&self) -> Result<std::sync::MutexGuard<'_, State>> {
         let office = self.driver.leadership();
         if !office.serving {
@@ -1019,7 +1019,7 @@ fn unreachable_stale(beat: &RegionBeat) -> RegionRecord {
 /// Commits the oracle's mark. Called *before* a timestamp at or above it is handed out.
 ///
 /// "Durable" now means "applied", and the difference is the whole of
-/// [ADR 0056](../../../docs/adr/0056-pd-is-a-raft-group.md): this returns only once the entry has
+/// [ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md): this returns only once the entry has
 /// committed and this member has applied it, so a leader that has quietly lost office fails here
 /// rather than handing out a timestamp its successor will hand out again.
 fn commit_tso(driver: &PdDriver, high_water_ms: u64) -> Result<()> {
