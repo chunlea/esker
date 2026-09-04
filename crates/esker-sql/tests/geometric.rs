@@ -22,6 +22,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          table_name = 'g' ORDER BY ordinal_position",
         "SELECT 'r', pg_typeof('(2,3),(5.5,7)'::lseg), pg_typeof('2,3,5.5,7'::box), \
          pg_typeof('{2,3,5.5}'::line)",
+        // The standing `name`/`"char"` trade again, and **every value agrees**: `box` is the one
+        // type in the catalog whose array delimiter is a semicolon, which r1's run-75 provenance
+        // probe found answering `,` here.
+        "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN \
+         ('box','lseg','path','polygon','circle','line','point','xml') ORDER BY typname",
     ],
     answers: &[
         // **`typarray` is `0` for all six**, which is the one declared gap and it is a named one:

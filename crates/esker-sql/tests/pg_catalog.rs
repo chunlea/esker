@@ -205,7 +205,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // and every one of them answering nothing until now. `poly_in`, not `polygon_in`.
             vec!["601", "lseg", "0", ",", "lseg_in", "\\N", "b", "0"],
             vec!["602", "path", "0", ",", "path_in", "\\N", "b", "0"],
-            vec!["603", "box", "0", ",", "box_in", "\\N", "b", "0"],
+            // **`;`, alone among the seventy-eight** — a box's own text holds commas, so an array
+            // of them needs another separator. Found by r1's run-75 provenance probe against the
+            // oracle, and it is `pg_type.typdelim` a client reads to parse one.
+            vec!["603", "box", "0", ";", "box_in", "\\N", "b", "0"],
             vec!["604", "polygon", "0", ",", "poly_in", "\\N", "b", "0"],
             vec!["628", "line", "0", ",", "line_in", "\\N", "b", "0"],
             vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],

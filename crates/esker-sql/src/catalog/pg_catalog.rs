@@ -1541,7 +1541,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 Datum::Int8(
                     ArrayValue::element_of(*ty).map_or(0, |element| i64::from(element.oid())),
                 ),
-                Datum::Text(",".to_owned()),
+                Datum::Text(typdelim(*ty).to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
                 Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
@@ -1979,6 +1979,24 @@ fn typcategory(ty: ColumnType) -> &'static str {
 /// `ActiveRecord` reads it, and reads it by comparison — `row["typinput"] == "array_in"` is how it
 /// tells an array type from everything else — so the value is load-bearing and the spelling is the
 /// capture's, underscore and all: `timestamptz_in` has one and `int8in` does not.
+/// `pg_type.typdelim`: the character that separates two elements inside an array literal.
+///
+/// **A comma for every type but one.** `box` uses a **semicolon**, because a box's own text
+/// already contains commas — `(1,1),(0,0)` — so `{(1,1),(0,0);(3,3),(2,2)}` is a two-element
+/// `box[]` and the same string with commas would be four points. Measured the only way that
+/// settles it, by asking a real server which types disagree with the default:
+/// `SELECT typname, typdelim FROM pg_type WHERE typdelim <> ','` answers `box` and `_box`, and
+/// nothing else.
+///
+/// The `,` was a constant here before, which is a right answer for 77 types and a wrong one for
+/// the seventy-eighth.
+fn typdelim(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Box => ";",
+        _ => ",",
+    }
+}
+
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
