@@ -103,8 +103,11 @@ ALTER TABLE t ADD COLUMN c int8 UNIQUE
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY
 
+# `ALTER COLUMN a TYPE text` converts now (`tests/alter_column_type.rs`). What is still refused is
+# a `USING` that computes rather than converts: there is no per-row expression evaluator, and
+# running the type change while ignoring the expression would store a different value in every row.
 statement error (0A000)
-ALTER TABLE t ALTER COLUMN a TYPE text
+ALTER TABLE t ALTER COLUMN a TYPE text[] USING string_to_array(a, ',')
 
 statement error (0A000)
 ALTER TABLE ONLY t ADD COLUMN c int8

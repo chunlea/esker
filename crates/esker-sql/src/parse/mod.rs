@@ -1737,7 +1737,22 @@ const UNSUPPORTED: &[Unsupported] = &[
     // SEQUENCE` and its relatives, which is why the name stayed general.
     u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
     u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
-    u("CREATE UNLOGGED", &["CREATE", "UNLOGGED"], &[]),
+    // **Not `CREATE UNLOGGED TABLE`**, whose keyword is cut out of the source and parses
+    // (`strip_unlogged`). This entry matched it anyway, so a `CREATE UNLOGGED TABLE` that failed
+    // to parse for a reason of its own — a virtual generated column, in the suite — was reported
+    // as `CREATE UNLOGGED is not supported`, sending the reader to a feature that works. Ten tests
+    // over two files were ranked under that name while `relpersistence` had answered `u` all
+    // along. The `SEQUENCE` and `MATERIALIZED VIEW` spellings are what is left.
+    u(
+        "CREATE UNLOGGED SEQUENCE",
+        &["CREATE", "UNLOGGED", "SEQUENCE"],
+        &[],
+    ),
+    u(
+        "CREATE UNLOGGED",
+        &["CREATE", "UNLOGGED"],
+        &["MATERIALIZED"],
+    ),
     // **`CREATE TABLE` is not here**: an `EXCLUDE` constraint is cut out of the source and read on
     // its own (`strip_exclude_constraints`). What stays a refusal is `ALTER TABLE ... ADD
     // CONSTRAINT ... EXCLUDE`, which has no such path.
@@ -1879,6 +1894,30 @@ fn recognize_unsupported(sql: &str, words: &[&str]) -> Option<&'static str> {
         .eq_ignore_ascii_case("SELECT")
     {
         return Some("SELECT with an empty target list");
+    }
+    // **A generated column that is not `STORED`** — PostgreSQL 18's virtual generated column,
+    // which this parser has no grammar for: it reports `Expected: STORED`, a syntax error about
+    // valid SQL. Written with `VIRTUAL` or with no keyword at all, and `ActiveRecord` sends both —
+    // it tries the bare form first and re-sends with the keyword.
+    //
+    // **Counted rather than searched**, because one `CREATE TABLE` can declare both kinds: the
+    // suite's `virtual_columns` has three `STORED` columns and two virtual ones, so "contains
+    // `GENERATED` and does not contain `STORED`" is false there and misses it. More `GENERATED`
+    // clauses than `STORED` keywords means at least one is virtual.
+    let generated = words
+        .windows(3)
+        .filter(|window| {
+            window[0].eq_ignore_ascii_case("GENERATED")
+                && window[1].eq_ignore_ascii_case("ALWAYS")
+                && window[2].eq_ignore_ascii_case("AS")
+        })
+        .count();
+    let stored = words
+        .iter()
+        .filter(|word| word.eq_ignore_ascii_case("STORED"))
+        .count();
+    if generated > stored {
+        return Some("a virtual generated column, which is not STORED");
     }
     UNSUPPORTED
         .iter()
