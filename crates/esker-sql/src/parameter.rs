@@ -130,6 +130,18 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Free,
         read_only: false,
     },
+    // **The text-search configuration a bare `to_tsvector(text)` uses.** PostgreSQL reports it
+    // schema-qualified — `pg_catalog.english` — which is what `full_text_test.rb`'s server reads
+    // back and what `captures/pg19_tsvector.txt` pins. `Values::Free` because the capture measures
+    // only the boot value: refusing a name without having measured which names PostgreSQL refuses
+    // is how this lane has invented rules before.
+    Parameter {
+        name: "default_text_search_config",
+        reported: "default_text_search_config",
+        boot: "pg_catalog.english",
+        values: Values::Free,
+        read_only: false,
+    },
     Parameter {
         name: "search_path",
         reported: "search_path",

@@ -58,6 +58,8 @@ pub mod regex;
 pub mod temporal;
 pub mod time;
 mod timestamp;
+pub mod tsquery;
+pub mod tsvector;
 pub mod uuid;
 /// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
 pub mod vector;
@@ -604,6 +606,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
@@ -694,6 +698,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // it installs them, so their oids are above 16384 and differ per database; fixed ones here
         // are invisible to a client that reads them the way `ActiveRecord` does — by `typname`.
         ColumnType::Hstore => HSTORE_ARRAY_OID,
+        ColumnType::TsVector => 3643,
+        ColumnType::TsQuery => 3645,
         // **No `citext[]` here.** `citext_test.rb` never declares one and a real server's
         // `typarray` is non-zero, which the corpus reads as a boolean rather than a number — so
         // `0` would be a wrong answer there. `CITEXT_ARRAY_OID` is reserved and reported, and the
@@ -818,6 +824,10 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
         | ColumnType::Hstore
         | ColumnType::HstoreArray
+        | ColumnType::TsVector
+        | ColumnType::TsQuery
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::Citext
         | ColumnType::TsRange
         | ColumnType::TstzRange
@@ -939,6 +949,8 @@ impl PgType for ColumnType {
             ColumnType::Xml => 142,
             ColumnType::Jsonb => 3802,
             ColumnType::Hstore => HSTORE_OID,
+            ColumnType::TsVector => 3614,
+            ColumnType::TsQuery => 3615,
             ColumnType::Citext => CITEXT_OID,
             ColumnType::Ltree => LTREE_OID,
             ColumnType::LQuery => LQUERY_OID,
@@ -971,6 +983,8 @@ impl PgType for ColumnType {
             ColumnType::Point => 600,
             ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
+            ColumnType::TsVectorArray => 3643,
+            ColumnType::TsQueryArray => 3645,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
@@ -1033,6 +1047,8 @@ impl PgType for ColumnType {
             ColumnType::NumericArray => "numeric[]",
             ColumnType::TextArray => "text[]",
             ColumnType::Hstore => "hstore",
+            ColumnType::TsVector => "tsvector",
+            ColumnType::TsQuery => "tsquery",
             ColumnType::Citext => "citext",
             ColumnType::TsRange => "tsrange",
             ColumnType::TstzRange => "tstzrange",
@@ -1098,6 +1114,8 @@ impl PgType for ColumnType {
             ColumnType::LtreeArray => "ltree[]",
             ColumnType::LQuery => "lquery",
             ColumnType::HstoreArray => "hstore[]",
+            ColumnType::TsVectorArray => "tsvector[]",
+            ColumnType::TsQueryArray => "tsquery[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
             ColumnType::Int2 => "smallint",
@@ -1154,6 +1172,10 @@ impl PgType for ColumnType {
             // adapter's own boot query.
             ColumnType::Hstore
             | ColumnType::HstoreArray
+            | ColumnType::TsVector
+            | ColumnType::TsQuery
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::Citext
             | ColumnType::TsRange
             | ColumnType::TstzRange
@@ -1269,6 +1291,8 @@ impl PgDatum for Datum {
             | Datum::Citext(v)
             | Datum::Ltree(v)
             | Datum::Hstore(v)
+            | Datum::TsVector(v)
+            | Datum::TsQuery(v)
             | Datum::Range { text: v, .. } => v.clone(),
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
@@ -1352,6 +1376,8 @@ impl PgDatum for Datum {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray
             | ColumnType::TstzRangeArray
             | ColumnType::Int4RangeArray
@@ -1412,6 +1438,8 @@ impl PgDatum for Datum {
             // Read and written back **canonical**, the same road `jsonb` takes: the stored form is
             // what the type prints, so equality and ordering are the text's (`crate::value::hstore`).
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
+            ColumnType::TsVector => Datum::TsVector(tsvector::to_text(&tsvector::from_text(text)?)),
+            ColumnType::TsQuery => Datum::TsQuery(tsquery::to_text(&tsquery::from_text(text)?)),
             // **As written.** The folding is the comparison's, so nothing here touches the case.
             ColumnType::Citext => Datum::Citext(text.to_owned()),
             // **As written too**, once the labels are known to be labels. Nothing is normalised —
@@ -1529,6 +1557,8 @@ impl PgDatum for Datum {
             | Datum::Citext(v)
             | Datum::Ltree(v)
             | Datum::Hstore(v)
+            | Datum::TsVector(v)
+            | Datum::TsQuery(v)
             | Datum::Range { text: v, .. } => {
                 v.as_bytes().to_vec()
             }
@@ -1577,6 +1607,8 @@ impl PgDatum for Datum {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray
             | ColumnType::TstzRangeArray
             | ColumnType::Int4RangeArray
@@ -1684,6 +1716,16 @@ impl PgDatum for Datum {
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(
                 std::str::from_utf8(bytes).map_err(|_| {
                     SqlError::ProtocolViolation("a binary hstore is not UTF-8".into())
+                })?,
+            )?)),
+            ColumnType::TsVector => Datum::TsVector(tsvector::to_text(&tsvector::from_text(
+                std::str::from_utf8(bytes).map_err(|_| {
+                    SqlError::ProtocolViolation("a binary tsvector is not UTF-8".into())
+                })?,
+            )?)),
+            ColumnType::TsQuery => Datum::TsQuery(tsquery::to_text(&tsquery::from_text(
+                std::str::from_utf8(bytes).map_err(|_| {
+                    SqlError::ProtocolViolation("a binary tsquery is not UTF-8".into())
                 })?,
             )?)),
             // The wire carries the printed form either way, so this is `from_text`'s road with the
@@ -1883,7 +1925,9 @@ impl PgDatum for Datum {
             // none of the six is an index key, so nothing here has to reproduce one.
             (Datum::Geometry { text: a, .. }, Datum::Geometry { text: b, .. })
             | (Datum::Text(a), Datum::Text(b))
-            | (Datum::Hstore(a), Datum::Hstore(b)) => {
+            | (Datum::Hstore(a), Datum::Hstore(b))
+            | (Datum::TsVector(a), Datum::TsVector(b))
+            | (Datum::TsQuery(a), Datum::TsQuery(b)) => {
                 a.as_bytes().cmp(b.as_bytes())
             }
             // **A range compares by its canonical text**, which is right because the text *is*
@@ -2007,7 +2051,12 @@ fn variant_rank(value: &Datum) -> u8 {
         // nothing else, so this rank exists to give the cross-type order a total answer rather
         // than to describe an operator a real server has.
         Datum::Time(_) => 8,
-        Datum::Text(_) | Datum::Citext(_) | Datum::Ltree(_) | Datum::Hstore(_) => 4,
+        Datum::Text(_)
+        | Datum::Citext(_)
+        | Datum::Ltree(_)
+        | Datum::Hstore(_)
+        | Datum::TsVector(_)
+        | Datum::TsQuery(_) => 4,
         // Its own rank in the cross-type total order, above every scalar's text.
         Datum::Range { .. } => 21,
         Datum::Bytea(_) => 5,

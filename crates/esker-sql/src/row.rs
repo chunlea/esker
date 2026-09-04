@@ -52,6 +52,8 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
@@ -159,6 +161,8 @@ mod tests {
             // An hstore is a `Datum::Text` holding the canonical form; the ordering property
             // these tests state is the text's, which is exactly the claim.
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            ColumnType::TsVector => ".*".prop_map(Datum::TsVector).boxed(),
+            ColumnType::TsQuery => ".*".prop_map(Datum::TsQuery).boxed(),
             // A range's stored form is its canonical text; `empty` is the one value every subtype
             // has, which is enough to state the ordering property these tests are for.
             // Cents, the whole `i64` of them: both ends of the range are values a client can

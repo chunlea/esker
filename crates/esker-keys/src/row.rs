@@ -188,6 +188,8 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // from `text` is the *comparison*, and the row keeps the value.
         | Datum::Ltree(v)
         | Datum::Hstore(v)
+        | Datum::TsVector(v)
+        | Datum::TsQuery(v)
         | Datum::Range { text: v, .. }
         | Datum::Geometry { text: v, .. } => {
             varint::put_u64(v.len() as u64, out);
@@ -451,6 +453,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray
         | ColumnType::TstzRangeArray
         | ColumnType::Int4RangeArray
@@ -509,6 +513,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Ltree
         | ColumnType::LQuery
         | ColumnType::Hstore
+        | ColumnType::TsVector
+        | ColumnType::TsQuery
         | ColumnType::Citext
         | ColumnType::TsRange
         | ColumnType::TstzRange
@@ -700,7 +706,13 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // IEEE has; `sort_bits_of_f64` handles both.
         Datum::Double(v) => codec::encode_u64(sort_bits_of_f64(*v), out),
         // An hstore's key is its canonical text: its comparison *is* text's, unlike citext's.
-        Datum::Text(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+        // **A tsvector's and a tsquery's are too**, for the reason ADR 0066 turns on — the
+        // canonical form is a function of the content, so two that print alike are one value.
+        Datum::Text(v)
+        | Datum::Hstore(v)
+        | Datum::TsVector(v)
+        | Datum::TsQuery(v)
+        | Datum::Range { text: v, .. } => {
             codec::encode_bytes(v.as_bytes(), out);
         }
         // **The key is the folded value**, which is the whole of how citext works: byte order over
@@ -836,6 +848,8 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
         ColumnType::Ltree => Datum::Ltree(text_from_utf8(body)?),
         ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
+        ColumnType::TsVector => Datum::TsVector(text_from_utf8(body)?),
+        ColumnType::TsQuery => Datum::TsQuery(text_from_utf8(body)?),
         // **The kind comes from the column**, which is where it is known: the bytes are only the
         // canonical text, exactly as a range's are.
         ColumnType::Lseg
@@ -1324,6 +1338,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Point
         | ColumnType::Hstore
         | ColumnType::HstoreArray
+        | ColumnType::TsVector
+        | ColumnType::TsQuery
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::TsRange
@@ -1987,6 +2005,8 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray
             | ColumnType::TstzRangeArray
             | ColumnType::Int4RangeArray
@@ -2060,6 +2080,8 @@ mod tests {
             // stores the canonical form and `esker_sql::value::hstore` is what makes one, so the
             // strategy is text and the round trip is the text's.
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            ColumnType::TsVector => ".*".prop_map(Datum::TsVector).boxed(),
+            ColumnType::TsQuery => ".*".prop_map(Datum::TsQuery).boxed(),
             // A range's stored form is its canonical text, and `empty` is the one value every
             // subtype has — enough to state the round trip, which is what this property is.
             ColumnType::TsRange

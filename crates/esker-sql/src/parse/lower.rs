@@ -6908,6 +6908,11 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
         DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
+        // **`sqlparser` has a variant for each of these**, so they never reach the `Custom` arm
+        // below and a name-based resolver would never have seen them: the refusal was the
+        // catch-all's, which is why it shouted `TSVECTOR` in `sqlparser`'s own Display casing.
+        DataType::TsVector => ColumnType::TsVector,
+        DataType::TsQuery => ColumnType::TsQuery,
         // Neither takes a typmod, and the refusal is the *parser's*: `json(10)` is a syntax error
         // before it reaches here, like `integer(4)`. ADR 0042.
         DataType::JSON => ColumnType::Json,
