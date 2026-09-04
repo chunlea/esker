@@ -1,0 +1,22 @@
+crates/esker-store/src/snapshot.rs
+  h_44076b318daf9c 25-28
+crates/esker-store/tests/retire.rs
+  h_44076b318daf9c 23
+docs/DESIGN.md
+  h_44076b318daf9c 78,84,89-99,110-113,123-124,413-416,423-429,747-752
+docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md
+  h_44076b318daf9c 1
+docs/plans/debt-c6.md
+  h_44076b318daf9c 127-130,319-421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "040cc0fabb7fcb2d7185012d721a36bbfb57ba02",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
