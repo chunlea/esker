@@ -727,7 +727,8 @@ fn a_star_expands_to_every_column_of_the_view() {
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0", "f",
+            "\\N"
         ]]
     );
     assert_eq!(
