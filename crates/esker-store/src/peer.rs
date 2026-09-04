@@ -2599,8 +2599,50 @@ mod tests {
 
     /// Elects `peer` in a two-voter group whose other voter grants its vote and then says nothing
     /// — a leader that can append and can never commit, which is what makes a proposal sit.
+    /// Drives an election by hand: tick until the peer campaigns, then grant every vote it asks
+    /// for, until it takes office. Peer 2 exists only as an address to answer from — nothing
+    /// replicates, which is what makes the proposals in the tests below orphanable.
+    ///
+    /// # `settled` is what makes it terminate, and it was missing
+    ///
+    /// [`RaftPeer::status`] is answered **inside the driver's handling of a message**, which runs
+    /// before the batch is driven — and it is the drive that hands the core's `RequestVote` to the
+    /// transport. So a loop that ticks, awaits `status`, and then looks in the auditor for the
+    /// message its own tick produced can find nothing, tick again, and time the election out. This
+    /// helper did exactly that, and it failed 3 runs in 10 with the box loaded, in two shapes that
+    /// are the same cause seen at two depths:
+    ///
+    /// ```text
+    /// the peer never took office: 400 ticks, 0 votes granted, and it is PreCandidate in term 0
+    /// the peer never took office: 400 ticks, 25 votes granted, and it is Candidate in term 1
+    /// ```
+    ///
+    /// Zero grants in four hundred ticks is not a slow drive: the driver handled four hundred
+    /// ticks and never drove once, so no message ever reached the auditor. Twenty-five is the same
+    /// starvation one layer up — grants arriving about once per sixteen ticks, each for a term the
+    /// candidate's next timeout had already left behind.
+    ///
+    /// It is the defect `RaftPeer::settled`'s own documentation describes, in the helper that was
+    /// missed when the two tests beside it were fixed (`5662300`). The barrier is not a wait for
+    /// *time*, and adding a sleep here would only make the window narrower.
+    ///
+    /// # What replaces the 400 tries, and why it is the assertion that matters
+    ///
+    /// With the barrier every iteration is one fully driven tick, so the election is
+    /// **deterministic**: measured at exactly 20 ticks and 2 grants, six runs, three of them with
+    /// twenty-four spinning threads on the box. So the loop is bounded at 40 rather than 400, and
+    /// the grants are asserted to be exactly two — one pre-vote, one vote.
+    ///
+    /// That count is the bug stated as a number. Two means the peer campaigned once and won; the
+    /// failures above were 0 (no message ever observed) and 25 (a campaign restarting about every
+    /// sixteen ticks, each grant answering a term already abandoned). Neither is 2, and neither
+    /// could be reached by a slow machine alone — which is what makes this an assertion about
+    /// synchronisation rather than about speed, and what stops the 400 tries from hiding the next
+    /// one behind sheer number of attempts.
     async fn lead_without_a_quorum(peer: &Arc<RaftPeer>, auditor: &Arc<Auditor>) {
-        for _ in 0..400 {
+        let mut granted = 0usize;
+        let mut ticks = 0usize;
+        for _ in 0..40 {
             for message in auditor.take_sent() {
                 if let Message::RequestVote {
                     from,
@@ -2618,14 +2660,30 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                    granted += 1;
                 }
             }
             peer.tick().await.unwrap();
+            ticks += 1;
+            // The barrier. Without it the next `take_sent` looks for a message the driver has
+            // handled the cause of and not yet sent.
+            peer.settled().await.unwrap();
             if peer.status().await.unwrap().role == Role::Leader {
+                assert_eq!(
+                    granted, 2,
+                    "it took office after {granted} vote grants in {ticks} ticks, not the one \
+                     pre-vote and one vote a single uninterrupted campaign needs — so an election \
+                     restarted, which means the loop ticked past messages it had not yet seen"
+                );
                 return;
             }
         }
-        panic!("the peer never took office");
+        let status = peer.status().await.unwrap();
+        panic!(
+            "the peer never took office: {ticks} ticks, {granted} votes granted, and it is \
+             {:?} in term {} (voted for {:?})",
+            status.role, status.term, status.voted_for
+        );
     }
 
     /// **(a) A proposal orphaned by a step-down is answered, promptly, with `Unknown`.**

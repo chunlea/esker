@@ -419,3 +419,75 @@ second, "it resets on a redirect" reads as a budget that cannot expire.
 No disagreement was found in §4.3–§4.9, §6's other bullets, or §10's remaining rules; the §14
 defaults table was checked against the constants it names and matches, including the two rows this
 wave brushed against (`store WAL sync mode` and `SST data block … 4 KiB local, 16 KiB tiered`).
+
+## 6. The election flake: `status()` is not a barrier, and one helper never got the memo
+
+Escalated by `h1`: `peer::tests::a_proposal_orphaned_by_a_step_down_is_answered_unknown_rather_than_hanging`
+failed 2 of 3 full-workspace container runs and passed 5 of 5 alone, panicking at
+`crates/esker-store/src/peer.rs:2628`.
+
+### The line number was the finding
+
+2628 is not in the test. It is `panic!("the peer never took office")` inside
+`lead_without_a_quorum`, the **setup helper** both that test and
+`a_proposal_a_retire_jumps_past_is_answered_unknown` use to drive an election by hand. So nothing
+about orphaned proposals was failing; the peer never became leader, and the test never reached its
+subject. `a_proposal_a_retire_jumps_past_is_answered_unknown` had its own sighting recorded on
+09-03 — the same helper, seen from the other test.
+
+### What it was
+
+`RaftPeer::settled`'s documentation had already written this bug down, one screen above the helper:
+
+> Every other query is answered inside the driver's handling of a message, which runs **before the
+> batch is driven**, so awaiting one of those and then looking for the messages your own input
+> produced can find nothing.
+
+`lead_without_a_quorum` did precisely that: `take_sent()` for the core's `RequestVote`, grant it,
+`tick()`, `status()`, repeat — where `status()` is answered during *handling* and the drive is what
+hands a message to the transport. It is the defect wave `5662300` fixed in the two tests beside it
+(`a_lone_voter_applies_its_own_proposals`,
+`a_message_is_never_sent_before_its_entries_are_durable`) and did not fix here.
+
+### Red on demand, and the instrumentation is what made it a diagnosis
+
+The panic said only "the peer never took office". Instrumented with ticks, grants, role and term,
+and run ten times with twenty-four spinning threads on the box, it failed **3 of 10** in two shapes:
+
+```
+the peer never took office: 400 ticks, 0 votes granted, and it is PreCandidate in term 0
+the peer never took office: 400 ticks, 25 votes granted, and it is Candidate in term 1
+```
+
+**Zero grants in four hundred ticks is the whole mechanism in one number.** It is not a slow drive:
+the driver handled four hundred ticks and never drove once, so no message ever reached the auditor
+and the loop had nothing to answer. The 25-grant shape is the same starvation one layer up — grants
+landing about once per sixteen ticks, each answering a term the candidate's next timeout had
+already left behind.
+
+### The fix, and what replaced the 400 tries
+
+`peer.settled().await` after the tick. With it, every iteration is one fully driven tick and the
+election becomes **deterministic**: exactly **20 ticks and 2 grants**, measured six times, three of
+them under the same twenty-four-thread load. So the loop is bounded at 40 rather than 400, and the
+grant count is asserted to be exactly two — one pre-vote, one vote.
+
+That assertion is the bug stated as a number. Two means one uninterrupted campaign; the failures
+were 0 and 25, and neither is reachable by a slow machine alone. It is an assertion about
+synchronisation rather than about speed, and it stops four hundred tries from hiding the next
+occurrence behind sheer number of attempts.
+
+| | quiet | 24 spinning threads |
+|---|---|---|
+| before, bound 400 | passed | **3 of 10 failed** |
+| before, bound 40 | passed 10 of 10 | **9 of 10 failed** |
+| after | passed | **20 of 20 passed** |
+
+### What it is not, stated plainly
+
+**Not a defect in `esker-store`'s source, and the report should not be read as one.** In production
+the clock is `spawn_ticker` at 100 ms, so ticks cannot outrun the driver the way a spin loop can;
+the hazard needs a caller that ticks in a tight loop, which is a test. The fix is therefore in test
+code, and the honest limit of it is that the failure stays load-dependent: with the barrier gone it
+is green 10 of 10 on a quiet box. What is deterministic is the *success* path — 20 ticks, 2 grants,
+invariant under load — and that is what the new assertion pins.
