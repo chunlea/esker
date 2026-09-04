@@ -397,3 +397,34 @@ fn a_waiter_with_no_block_of_its_own_waits_and_then_writes() {
         "the arithmetic is on A's committed version"
     );
 }
+
+/// **A session that disappears mid-transaction must not hold its rows forever.**
+///
+/// `Executor::drop` rolls the open transaction back only for a session that made a *temporary
+/// schema*; every other session's transaction is dropped without a `rollback`, so the lock it took
+/// was never given back and the row stayed held for the life of the process. With `lock_timeout`
+/// at PostgreSQL's default of 0 — wait forever — the next writer to that row waits forever, which
+/// is what an abandoned `psql` did to this project once already.
+///
+/// The second session sets a `lock_timeout` on purpose: without one, a regression here **hangs the
+/// test suite** instead of failing it.
+#[test]
+fn a_transaction_dropped_without_rollback_gives_its_locks_back() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    {
+        let mut gone = pair.session();
+        gone.run("BEGIN").unwrap();
+        gone.run("SELECT n FROM rc WHERE id = 1 FOR UPDATE")
+            .unwrap();
+        // No COMMIT and no ROLLBACK: the session ends here, as an abrupt disconnect ends one.
+    }
+
+    let mut next = pair.session();
+    next.run("SET lock_timeout = '2s'").unwrap();
+    next.run("UPDATE rc SET n = 99 WHERE id = 1")
+        .expect("the lock died with the session that took it");
+    assert_eq!(next.rows("SELECT n FROM rc WHERE id = 1"), [["99"]]);
+}

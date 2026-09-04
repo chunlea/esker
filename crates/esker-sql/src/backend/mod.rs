@@ -603,6 +603,23 @@ impl MemoryTxn {
     }
 }
 
+/// **Every way out includes the one nobody writes down.**
+///
+/// A session that disconnects mid-transaction drops its `Box<dyn Txn>` without a `commit` or a
+/// `rollback` — `Executor::drop` rolls one back only for a session that made a temporary schema —
+/// so a lock released only by those two methods stayed held for the life of the process. With
+/// `lock_timeout` at PostgreSQL's default of 0 the next writer to that row waits forever, and an
+/// abandoned `psql` did exactly that to this project once already.
+///
+/// Putting it here makes "the lock dies with its transaction" a property of the type rather than a
+/// rule every exit has to remember. Releasing twice is safe: `release` removes a lock only if this
+/// transaction still holds it, and ids are never reused.
+impl Drop for MemoryTxn {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl Txn for MemoryTxn {
     fn start_ts(&self) -> u64 {
         self.start_ts
