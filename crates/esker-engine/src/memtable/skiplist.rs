@@ -207,16 +207,26 @@ impl SkipList {
 
     // ---- reading a node -------------------------------------------------------------------
 
-    /// Header word `index` of `node`.
+    /// All four header words of `node` at once, or an empty slice for a node this list never
+    /// allocated.
     ///
-    /// `Relaxed` on purpose: a header is written before the node is published and never again,
-    /// and the reader got here by an `Acquire` load of the pointer that reaches it, so the
-    /// header is already ordered before that. A word this list never allocated reads as zero,
-    /// which for every header field is the empty answer rather than a wrong one.
-    fn header(&self, node: u32, index: u32) -> u32 {
-        self.words
-            .word(node.saturating_add(index))
-            .map_or(0, |word| word.load(Memory::Relaxed))
+    /// One arena resolution rather than one per field, and that is a measured choice rather
+    /// than a tidy one. Turning an offset into an address costs a dozen instructions — the
+    /// chunk index, the bounds, the directory load — and a seek compares thirty-odd keys, each
+    /// of which reads this. The first interleaved A/B (`docs/bench/skiplist.md`) had a scan
+    /// eighteen times cheaper than `crossbeam-skiplist`'s and a *seek and an insert
+    /// substantially dearer*, which is the shape of paying that cost once per field on the
+    /// comparison path.
+    ///
+    /// `alloc` never straddles a chunk, so four words that start at `node` are four words in
+    /// one chunk and one resolution reaches all of them.
+    ///
+    /// `Relaxed` at the point of use: a header is written before the node is published and
+    /// never again, and the reader got here by an `Acquire` load of the pointer that reaches
+    /// it, so the header is already ordered before that.
+    #[inline]
+    fn header(&self, node: u32) -> &[AtomicU32] {
+        self.words.get(node, HEADER)
     }
 
     /// The forward pointer of `node` at `level`, or `NIL` past the end.
@@ -224,6 +234,7 @@ impl SkipList {
     /// The `Acquire` here is one half of the publication rule; [`SkipList::publish`] is the
     /// other. A level this node does not have reads as zero — `NIL` — which ends a traversal
     /// rather than following a pointer that was never written.
+    #[inline]
     fn next(&self, node: u32, level: u32) -> u32 {
         self.words
             .word(node.saturating_add(HEADER).saturating_add(level))
@@ -235,20 +246,33 @@ impl SkipList {
     /// The returned slice borrows the arena through `&self`, so it cannot outlive the table —
     /// which is the lifetime the cursor needed and could not have while entries were owned by
     /// `crossbeam-skiplist`.
+    #[inline]
     pub(super) fn key(&self, node: u32) -> &[u8] {
-        self.bytes.get(self.header(node, 0), self.header(node, 1))
+        let Some([offset, key_len, _, _]) = self.header(node).first_chunk::<4>() else {
+            return &[];
+        };
+        self.bytes
+            .get(offset.load(Memory::Relaxed), key_len.load(Memory::Relaxed))
     }
 
     /// The value stored at `node`. Empty for a tombstone and for [`HEAD`].
+    #[inline]
     pub(super) fn value(&self, node: u32) -> &[u8] {
-        let offset = self.header(node, 0).saturating_add(self.header(node, 1));
-        self.bytes.get(offset, self.header(node, 2))
+        let Some([offset, key_len, value_len, _]) = self.header(node).first_chunk::<4>() else {
+            return &[];
+        };
+        let offset = offset
+            .load(Memory::Relaxed)
+            .saturating_add(key_len.load(Memory::Relaxed));
+        self.bytes.get(offset, value_len.load(Memory::Relaxed))
     }
 
     /// The height `node` was built at. Read only by the tests that check a shape replays.
     #[cfg(test)]
     fn height_of(&self, node: u32) -> u32 {
-        self.header(node, 3)
+        self.header(node)
+            .get(3)
+            .map_or(0, |word| word.load(Memory::Relaxed))
     }
 
     // ---- searching ------------------------------------------------------------------------
@@ -259,6 +283,7 @@ impl SkipList {
     }
 
     /// Whether `node` exists and sorts strictly before `key`.
+    #[inline]
     fn is_before(&self, node: u32, key: &[u8]) -> bool {
         node != NIL && self.comparator.cmp(self.key(node), key) == Ordering::Less
     }
@@ -432,21 +457,16 @@ impl SkipList {
             // slower and just as correct. Level zero has everything either way.
             self.height.store(height, Memory::Release);
         }
-        self.set_word(node, 0, bytes);
-        self.set_word(node, 1, key_len);
-        self.set_word(node, 2, value_len);
-        self.set_word(node, 3, height);
+        // One resolution for all four, for the same reason `header` reads them in one.
+        if let Some([offset, key, value, tall]) = self.header(node).first_chunk::<4>() {
+            offset.store(bytes, Memory::Relaxed);
+            key.store(key_len, Memory::Relaxed);
+            value.store(value_len, Memory::Relaxed);
+            tall.store(height, Memory::Relaxed);
+        }
         self.publish(node, height, &writer.prev);
         self.len.fetch_add(1, Memory::Relaxed);
         true
-    }
-
-    /// Writes a header word of a node nothing can reach yet. `Relaxed`, because the `Release`
-    /// in [`SkipList::publish`] is what orders every one of these against a reader.
-    fn set_word(&self, node: u32, index: u32, value: u32) {
-        if let Some(word) = self.words.word(node.saturating_add(index)) {
-            word.store(value, Memory::Relaxed);
-        }
     }
 
     /// Links `node` into the list at every level below `height`.
@@ -461,10 +481,13 @@ impl SkipList {
     /// Levels above the one being linked are still `NIL` in the fresh arena words, and no
     /// reader can reach the node at those levels yet, so they are never observed unwritten.
     fn publish(&self, node: u32, height: u32, prev: &[u32; MAX_HEIGHT]) {
+        // The new node's own forward pointers are one contiguous run inside one chunk — its
+        // whole allocation is — so they cost one arena resolution rather than one per level.
+        let links = self.words.get(node.saturating_add(HEADER), height);
         for level in 0..height {
             let previous = prev[level as usize];
             let after = self.next(previous, level);
-            if let Some(word) = self.words.word(node + HEADER + level) {
+            if let Some(word) = links.get(level as usize) {
                 word.store(after, Memory::Relaxed);
             }
             if let Some(word) = self.words.word(previous.saturating_add(HEADER) + level) {

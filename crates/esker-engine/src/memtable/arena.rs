@@ -123,6 +123,7 @@ impl<T: ChunkElem> Chunks<T> {
     /// `2^(first_shift + slots) - 2^first_shift`, which for a real arena is `2^32 - 2^first_shift`
     /// — so every valid offset fits in a `u32` with room to spare and the arithmetic below never
     /// has to think about wrapping.
+    #[inline]
     fn capacity(&self) -> u64 {
         (1u64 << (self.first_shift + self.slots)) - (1u64 << self.first_shift)
     }
@@ -131,16 +132,19 @@ impl<T: ChunkElem> Chunks<T> {
     ///
     /// Chunk `i` covers `[2^(f+i) - 2^f, 2^(f+i+1) - 2^f)`, so shifting the offset up by `2^f`
     /// puts it in `[2^(f+i), 2^(f+i+1))` and the chunk index is what `ilog2` reads off.
+    #[inline]
     fn chunk_of(&self, offset: u64) -> u32 {
         (offset + (1u64 << self.first_shift)).ilog2() - self.first_shift
     }
 
     /// The element index chunk `index` starts at.
+    #[inline]
     fn chunk_start(&self, index: u32) -> u64 {
         (1u64 << (self.first_shift + index)) - (1u64 << self.first_shift)
     }
 
     /// How many elements chunk `index` holds.
+    #[inline]
     fn chunk_len(&self, index: u32) -> u64 {
         1u64 << (self.first_shift + index)
     }
@@ -220,6 +224,7 @@ impl<T: ChunkElem> Chunks<T> {
         reason = "ADR 0041: turning an offset into a borrow is the point of the arena. The \
                   bounds are checked in the three lines above the block."
     )]
+    #[inline]
     pub(super) fn get(&self, offset: u32, len: u32) -> &[T] {
         let offset = u64::from(offset);
         let len = u64::from(len);
@@ -297,6 +302,7 @@ impl Chunks<u8> {
 
 impl Chunks<AtomicU32> {
     /// The word at `offset`, or `None` if this arena never handed that offset out.
+    #[inline]
     pub(super) fn word(&self, offset: u32) -> Option<&AtomicU32> {
         self.get(offset, 1).first()
     }
