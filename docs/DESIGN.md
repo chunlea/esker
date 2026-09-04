@@ -75,22 +75,28 @@ pub trait Iterator { seek, seek_for_prev, next, prev, key, value, valid }
 
 impl Db {
   fn open(path, Options) -> Result<Db>;
-  fn write(&self, batch: WriteBatch, WriteOptions { sync: bool }) -> Result<SeqNo>;
+  fn write(&self, batch: WriteBatch, WriteOptions { durability: Durability }) -> Result<SeqNo>;
   fn get(&self, cf, key, ReadOptions { snapshot, fill_cache }) -> Result<Option<Bytes>>;
   fn iter(&self, cf, ReadOptions) -> Result<impl Iterator>;   // prefix_same_as_start option
   fn snapshot(&self) -> Snapshot;
   fn create_cf(&self, name, CfOptions) -> Result<u32> / drop_cf(&self, name) -> Result<()>;
   fn checkpoint(&self, dir, Option<(cf, range)>) -> Result<()>;   // hard-links SSTs, writes a manifest
-  fn ingest(&self, cf, sst_paths) -> Result<()>;                   // phase 4 snapshots, phase 6 bulk load
+  fn ingest(&self, cf, sst_paths) -> Result<()>;                   // phase 6 bulk load; refuses a shared key
   fn flush(&self, cf) / compact_range(&self, cf, range) / property(&self, name)
 }
 ```
 
-**`WriteOptions::sync` defaults to `true`**, which is the deliberate inverse of LevelDB's and
-RocksDB's default. Invariant 1 says a write is acknowledged only once its bytes are durable
-"unless the caller explicitly passed `sync = false`", so the un-durable acknowledgement is the
-thing a caller opts into rather than the thing they have to know to opt out of. A `Db` used
-without reading its documentation is therefore slow and correct rather than fast and lossy.
+**A write says what it wants of the log with a `Durability`, which has three states and not two**
+([ADR 0036](adr/0036-a-write-may-have-no-opinion-about-durability.md)). `Durable` and `Buffered` are
+invariant 1's demand and its one sanctioned opt-out, and they outrank the database's policy in both
+directions. The third, `Policy`, is the default and is the one a `bool` could not express: **no
+opinion**, which leaves the decision to whoever opened the database. Without it a caller taking the
+default was indistinguishable from one demanding durability, `WalSyncMode` had nothing left to
+decide, and `Never` disabled nothing.
+
+The default remains slow and correct rather than fast and lossy, because the default `WalSyncMode`
+is `PerWrite`: a write that expressed no preference is still synced. What moved is that a database
+opened `Never` or `Interval` can now actually be opened that way.
 
 A `Snapshot` belongs to the `Db` instance that issued it and is refused by any other: sequence
 numbers survive a reopen, so a stale handle names a plausible number, but the reopened
@@ -101,7 +107,10 @@ database's snapshot list has never heard of it and the compaction floor can pass
 `write()` → assign seqno → group commit → WAL append (+ fsync if `sync`) → insert into the active
 memtable of each touched CF → return. Group commit: the first writer to take the write lock becomes
 leader, drains the queue (bounded by 1 MiB or 128 batches, *default*), writes one WAL record group,
-syncs once, then wakes everyone. Sync mode per write; `Options::wal_sync_mode = {PerWrite, Interval(ms), Never}`.
+syncs once, then wakes everyone. Each write states a `Durability`; the database's policy decides for
+those that state `Policy`, and `Options::wal_sync_mode = {PerWrite, Interval(d), Never}` is that
+policy — `Interval` by a real background thread, and `Never` syncing only for a `Durable` write and
+at a clean close.
 
 Two rules the implementation is not free to relax. The queue lock is **never held across the
 `fsync`**, or every arriving writer serialises behind a disk flush and group commit becomes a
@@ -111,8 +120,8 @@ published**, so no batch is observable at a sequence number before it is readabl
 The leader does the log write for everyone, so **its failure is everyone's**: each batch in the
 group is refused with `Error::GroupCommit` carrying the leader's message, because reporting
 success to a writer whose bytes never reached the log would break invariant 1 for a write that
-looked fine. A `sync = false` batch that rides a synced group gets durability for free, which
-is correct — `sync = false` is permission to acknowledge early, never a requirement to.
+looked fine. A `Buffered` batch that rides a synced group gets durability for free, which is
+correct — `Buffered` is permission to acknowledge early, never a requirement to.
 
 A failed *append* ends the log segment for good. A partial write and a full disk are
 indistinguishable from inside `write(2)`, so after one the segment's length is unknown: writing
@@ -401,17 +410,23 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
     region held, which is [ADR 0032](adr/0032-a-snapshot-carries-every-column-family.md).
   - **Key-value pairs, not SST files, in v1.** §6 originally described `engine.checkpoint(range)` →
     `ingest()`, and two things stop it: a checkpoint links *whole files* and a file straddles a
-    region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses any
-    overlap including tombstones (§4.1), so a receive retried after a partial one could never
-    ingest again. The bytes cross a network either way, so what is given up is one write on the
+    region boundary, so the receiver would get its neighbour's keys; and `Db::ingest` refuses a file
+    holding a key the column family already has an entry for (§4.1), so a receive retried after a
+    partial one could never ingest again — the partial receive's own keys are what it would
+    collide with. The bytes cross a network either way, so what is given up is one write on the
     receiver. `TODO(post-v1)`: sequence-number rewriting plus a range-clipped checkpoint makes the
     link-only transfer possible, and only `esker-store/src/snapshot.rs` changes.
   - **A snapshot is never half-visible**, which is the property everything else is arranged around.
     The receive is four durable steps — announce, stage, ingest, adopt — and nothing serves the
     region until the last. A crash leaves an announcement record naming the region, and the next
     open clears the keys that record's *range* names, so the retry finds the empty range it needs.
-  - **Only into a range this store holds nothing in**, which is the case a new replica is. A peer
-    that already has data is refused and stays behind; PD sees it in the heartbeats.
+  - **A region this store already holds is replaced, not refused.** Refusing it was 4c's
+    limitation and phase-4 acceptance showed it is not an edge case: a peer that falls behind its
+    leader's compaction boundary can be repaired no other way, and until `snapshot::clear_range`
+    it could not be repaired at all (`docs/plans/phase-4.md` §18). The old peer is retired first,
+    so nothing is driving the region while its range is emptied and refilled, and the clear
+    **verifies** the range is empty rather than assuming it — a refill over survivors would serve
+    a mix of two states that looks exactly like correct data.
 - **Membership:** `AddPeer` and `RemovePeer` ride on the answer to a region heartbeat (§7) and the
   leader proposes the matching conf-change entry. The **store id of a new replica travels in the
   change's context**, which `esker-raft` never interprets — so the core moves the membership and
@@ -740,7 +755,12 @@ that jumps rather than waits.
   not create one — and `Err` when it could not say, which is usually retryable; collapsing the two
   would turn a momentary PD outage into a terminal error on every call in the process.
 - **Retries** are bounded by both a budget (8 retries *default*) and a per-call deadline (10 s
-  *default*), whichever ends first. Which errors are retryable is `ProtoError::is_retryable()` —
+  *default*), whichever ends first. The budget counts **failures, not attempts**: a refusal that
+  moved the region's epoch taught the client something and resets it, because a request that keeps
+  being redirected to fresher routing is making progress, and spending a budget on progress is how
+  a client gives up on a region that is merely splitting. Only an epoch change resets it — a
+  `NotLeader` hint moves no epoch, and chasing leadership around an unchanging region is the loop
+  the budget exists to stop. Which errors are retryable is `ProtoError::is_retryable()` —
   asked, not duplicated, so the client and the store cannot drift: `NotLeader` (follow the peer-id
   hint), `EpochNotMatch` (take the replacement regions), `RegionNotFound` (drop the entry, ask the
   resolver), `ServerIsBusy` (wait). Backoff is exponential to a 2 s ceiling with **equal jitter**
