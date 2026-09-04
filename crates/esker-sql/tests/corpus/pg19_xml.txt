@@ -1,0 +1,104 @@
+# `xml` — against PostgreSQL 19beta1.
+#
+# **Run 74's row: 5 tests in `adapters/postgresql/xml_test.rb`.** One column, `t.xml "payload"`, a
+# round trip of `<foo>bar</foo>`, an `update_all`, a NULL, and a schema dump asserting
+# `t.xml "payload"`.
+#
+# Things reasoning would get wrong:
+#
+# * **`'plain text'::xml` is a value**, and so is `'<a/><b/>'`. The type takes XML *content*,
+#   which may be bare text or several top-level elements — not only a document. What it refuses is
+#   text that is not well formed, and the class is its own: `2200N`, where every other input
+#   function raises `22P02`.
+# * **Nothing is normalised**, exactly as `json` keeps what it was sent: `'  <a/>  '` keeps its
+#   spaces and `'<a></a>'` does not become `'<a/>'`. The one exception is an XML **declaration**,
+#   which the type's output function drops.
+# * **No equality at all, and four different sentences for it** — `=`, `DISTINCT`, `ORDER BY` and
+#   `CREATE INDEX` each get their own, and `min(xml)` is a fifth that none of them implies.
+# * **The two line numbers in a refusal are different questions**: the `line N:` prefix is where
+#   the parser stopped and the number inside names where the tag was *opened*.
+CREATE TABLE xml_data_type (id bigserial PRIMARY KEY, payload xml)		-
+SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput, typtype, typdelim FROM pg_type WHERE typname IN ('xml','_xml') ORDER BY typname	text,name,oid,oid,smallint,"char",regproc,"char","char"	r|_xml|143|0|-1|A|array_in|b|, ; r|xml|142|143|-1|U|xml_in|b|,
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"xml_data_type"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|payload|xml
+SELECT 'r', column_name, data_type, udt_name, character_maximum_length, numeric_precision FROM information_schema.columns WHERE table_name = 'xml_data_type' ORDER BY ordinal_position	text,name,character varying,name,integer,integer	r|id|bigint|int8|\N|64 ; r|payload|xml|xml|\N|\N
+SELECT 'r', 'xml'::regtype::oid, 'xml[]'::regtype::oid, '_xml'::regtype::oid	text,oid,oid,oid	r|142|143|143
+SELECT 'r', format_type('xml'::regtype, NULL), format_type('xml[]'::regtype, NULL)	text,text,text	r|xml|xml[]
+# --- The round trip xml_test.rb makes, and the update_all after it.
+INSERT INTO xml_data_type (payload) VALUES ('<foo>bar</foo>')		-
+SELECT 'r', id, payload FROM xml_data_type ORDER BY id		r|1|<foo>bar</foo>
+UPDATE xml_data_type SET payload = '<bar>baz</bar>'		-
+SELECT 'r', id, payload FROM xml_data_type ORDER BY id		r|1|<bar>baz</bar>
+INSERT INTO xml_data_type (payload) VALUES (null)		-
+SELECT 'r', id, payload IS NULL FROM xml_data_type ORDER BY id		r|1|f ; r|2|t
+INSERT INTO xml_data_type DEFAULT VALUES		-
+SELECT 'r', id, payload IS NULL FROM xml_data_type ORDER BY id		r|1|f ; r|2|t ; r|3|t
+SELECT 'r', count(*) FROM xml_data_type		r|3
+DELETE FROM xml_data_type		-
+# --- What the type stores: the characters, unchanged.
+INSERT INTO xml_data_type (payload) VALUES ('  <a/>  '), ('<a></a>'), ('<a/>'), ('plain text'), (''), ('<a><b c="d">e</b></a>'), ('<a/><b/>'), ('<a></a >')		-
+SELECT 'r', id, payload FROM xml_data_type ORDER BY id		r|4|  <a/>   ; r|5|<a></a> ; r|6|<a/> ; r|7|plain text ; r|8| ; r|9|<a><b c="d">e</b></a> ; r|10|<a/><b/> ; r|11|<a></a >
+SELECT 'r', id, length(payload::text) FROM xml_data_type ORDER BY id		r|4|8 ; r|5|7 ; r|6|4 ; r|7|10 ; r|8|0 ; r|9|21 ; r|10|8 ; r|11|8
+SELECT 'r', pg_typeof(payload) FROM xml_data_type ORDER BY id LIMIT 1		r|xml
+SELECT 'r', payload::text FROM xml_data_type ORDER BY id LIMIT 1		r|  <a/>  
+SELECT 'r', '<a/>'::text::xml	text,xml	r|<a/>
+SELECT 'r', '<!-- <a> --><b/>'::xml	text,xml	r|<!-- <a> --><b/>
+SELECT 'r', '<?php echo 1; ?><a/>'::xml	text,xml	r|<?php echo 1; ?><a/>
+SELECT 'r', '<a><![CDATA[<not a tag>]]></a>'::xml	text,xml	r|<a><![CDATA[<not a tag>]]></a>
+SELECT 'r', '&amp;'::xml, '&#65;'::xml	text,xml,xml	r|&amp;|&#65;
+SELECT 'r', '<_a/>'::xml, '<a-b/>'::xml, '<a:b/>'::xml	text,xml,xml,xml	r|<_a/>|<a-b/>|<a:b/>
+SELECT 'r', '<a b="1" c=''2''/>'::xml	text,xml	r|<a b="1" c='2'/>
+DELETE FROM xml_data_type		-
+# --- The declaration, which is the one thing that does not survive.
+SELECT 'r', '<?xml version="1.0"?><a/>'::xml	text,xml	r|<a/>
+SELECT 'r', '<?xml version="1.0" encoding="UTF-8"?><a>x</a>'::xml	text,xml	r|<a>x</a>
+SELECT 'r', length(('<?xml version="1.0"?><a/>'::xml)::text)	text,integer	r|25
+SELECT 'r', ' <?xml version="1.0"?><a/>'::xml	!2200N invalid XML content DETAIL: line 1: XML declaration allowed only at the start of the document
+SELECT 'r', '<a/><?xml version="1.0"?>'::xml	!2200N invalid XML content DETAIL: line 1: XML declaration allowed only at the start of the document
+# --- Content that is not well formed. Every message is libxml's own.
+SELECT 'r', '<a>'::xml	!2200N invalid XML content DETAIL: line 1: Premature end of data in tag a line 1
+SELECT 'r', '<a><b>'::xml	!2200N invalid XML content DETAIL: line 1: Premature end of data in tag b line 1
+SELECT 'r', '<a><b/>'::xml	!2200N invalid XML content DETAIL: line 1: Premature end of data in tag a line 1
+SELECT 'r', '<a>x'::xml	!2200N invalid XML content DETAIL: line 1: Premature end of data in tag a line 1
+SELECT 'r', '</a>'::xml	!2200N invalid XML content DETAIL: line 1: chunk is not well balanced
+SELECT 'r', 'x</a>'::xml	!2200N invalid XML content DETAIL: line 1: chunk is not well balanced
+SELECT 'r', '<a></b>'::xml	!2200N invalid XML content DETAIL: line 1: Opening and ending tag mismatch: a line 1 and b
+SELECT 'r', '<a><b></a>'::xml	!2200N invalid XML content DETAIL: line 1: Opening and ending tag mismatch: b line 1 and a
+SELECT 'r', '<a></b></c>'::xml	!2200N invalid XML content DETAIL: line 1: Opening and ending tag mismatch: a line 1 and b
+SELECT 'r', '<'::xml	!2200N invalid XML content DETAIL: line 1: StartTag: invalid element name
+SELECT 'r', '< a/>'::xml	!2200N invalid XML content DETAIL: line 1: StartTag: invalid element name
+SELECT 'r', '<1a/>'::xml	!2200N invalid XML content DETAIL: line 1: StartTag: invalid element name
+SELECT 'r', '<a'::xml	!2200N invalid XML content DETAIL: line 1: Couldn't find end of Start Tag a line 1
+SELECT 'r', '<a b=1/>'::xml	!2200N invalid XML content DETAIL: line 1: AttValue: " or ' expected
+SELECT 'r', '<a b/>'::xml	!2200N invalid XML content DETAIL: line 1: Specification mandates value for attribute b
+SELECT 'r', '&'::xml	!2200N invalid XML content DETAIL: line 1: xmlParseEntityRef: no name
+SELECT 'r', 'a & b'::xml	!2200N invalid XML content DETAIL: line 1: xmlParseEntityRef: no name
+SELECT 'r', '<a>&</a>'::xml	!2200N invalid XML content DETAIL: line 1: xmlParseEntityRef: no name
+SELECT 'r', '&foo;'::xml	!2200N invalid XML content DETAIL: line 1: Entity 'foo' not defined
+SELECT 'r', '<!-- unterminated'::xml	!2200N invalid XML content DETAIL: line 1: Comment not terminated
+SELECT 'r', '<![CDATA[unterminated'::xml	!2200N invalid XML content DETAIL: line 1: CData section not finished
+SELECT 'r', E'<a>\n</b>'::xml	!2200N invalid XML content DETAIL: line 2: Opening and ending tag mismatch: a line 1 and b
+SELECT 'r', E'<a>\n<b>\n'::xml	!2200N invalid XML content DETAIL: line 3: Premature end of data in tag b line 2
+INSERT INTO xml_data_type (payload) VALUES ('<a>')	!2200N invalid XML content DETAIL: line 1: Premature end of data in tag a line 1
+SELECT 'r', count(*) FROM xml_data_type		r|0
+# --- No equality: five refusals, each its own sentence.
+INSERT INTO xml_data_type (payload) VALUES ('<a/>'), ('<b/>')		-
+SELECT 'r', payload = payload FROM xml_data_type	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', count(DISTINCT payload) FROM xml_data_type	!42883 could not identify an equality operator for type xml
+SELECT 'r', id FROM xml_data_type ORDER BY payload	!42883 could not identify an ordering operator for type xml HINT: Use an explicit ordering operator or modify the query.
+SELECT DISTINCT payload FROM xml_data_type	!42883 could not identify an equality operator for type xml
+SELECT payload FROM xml_data_type GROUP BY payload	!42883 could not identify an equality operator for type xml
+SELECT 'r', min(payload) FROM xml_data_type	!42883 function min(xml) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', max(payload) FROM xml_data_type	!42883 function max(xml) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+CREATE INDEX xml_payload_idx ON xml_data_type (payload)	!42704 data type xml has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+SELECT 'r', count(*) FROM xml_data_type		r|2
+# --- The aggregate that does work, and the array type.
+SELECT 'r', array_agg(payload ORDER BY id)::text FROM xml_data_type		r|{<a/>,<b/>}
+SELECT 'r', '{"<a/>"}'::xml[], pg_typeof('{"<a/>"}'::xml[])	text,xml[],regtype	r|{<a/>}|xml[]
+SELECT 'r', ('{"<a/>","<b/>"}'::xml[])[1]::text	text,text	r|<a/>
+SELECT 'r', count(DISTINCT x) FROM (SELECT ARRAY['<a/>'::xml] AS x) t	!42883 could not identify an equality operator for type xml[]
+# --- A range over xml, which a btree cannot order.
+CREATE TYPE xmlrange AS RANGE (subtype = xml)	!42704 data type xml has no default operator class for access method "btree" HINT: You must specify an operator class for the range type or define a default operator class for the subtype.
+# --- And the count that proves nothing was left behind.
+SELECT 'r', count(*), count(payload) FROM xml_data_type		r|2|2
+DROP TABLE xml_data_type		-
+SELECT 'r', count(*) FROM information_schema.tables WHERE table_name = 'xml_data_type'	text,bigint	r|0

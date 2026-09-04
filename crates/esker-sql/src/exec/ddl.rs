@@ -521,6 +521,9 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef) -> Result<()> {
             | ColumnType::Polygon
             | ColumnType::Circle
             | ColumnType::Line
+            // **And `xml`**, measured: `data type xml has no default operator class for access
+            // method "btree"`, the same `42704` with the same HINT.
+            | ColumnType::Xml
     ) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
     }

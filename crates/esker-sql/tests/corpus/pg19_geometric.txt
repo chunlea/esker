@@ -22,6 +22,10 @@
 #   `cash_in`.
 BEGIN		-
 SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname	text,name,oid,oid,smallint,"char",regproc	r|box|603|1020|32|G|box_in ; r|circle|718|719|24|G|circle_in ; r|line|628|629|24|G|line_in ; r|lseg|601|1018|32|G|lseg_in ; r|path|602|1019|-1|G|path_in ; r|polygon|604|1027|-1|G|poly_in
+# **A `box` separates array elements with a semicolon**, alone among the 78 — its own text
+# holds commas, so `{(1,1),(0,0);(3,3),(2,2)}` is two boxes and not four points. Found by
+# r1's run-75 provenance probe; the catalog answered `,` here for every type.
+SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN ('box','lseg','path','polygon','circle','line','point','xml') ORDER BY typname	text,name,"char"	r|box|; ; r|circle|, ; r|line|, ; r|lseg|, ; r|path|, ; r|point|, ; r|polygon|, ; r|xml|,
 CREATE TABLE g (id int8 primary key, a_line_segment lseg, a_box box, a_path path, a_polygon polygon, a_circle circle)		-
 SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"g"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|a_line_segment|lseg ; r|a_box|box ; r|a_path|path ; r|a_polygon|polygon ; r|a_circle|circle
 SELECT 'r', column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'g' ORDER BY ordinal_position	text,name,character varying,name	r|id|bigint|int8 ; r|a_line_segment|lseg|lseg ; r|a_box|box|box ; r|a_path|path|path ; r|a_polygon|polygon|polygon ; r|a_circle|circle|circle

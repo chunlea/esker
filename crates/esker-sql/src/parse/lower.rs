@@ -6604,6 +6604,9 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "polygon" => Some(ColumnType::Polygon),
         "circle" => Some(ColumnType::Circle),
         "line" => Some(ColumnType::Line),
+        // **And `xml`**, which `sqlparser` has no variant for either. `xml_test.rb` writes
+        // `t.xml "payload"`, which the adapter sends as the bare word.
+        "xml" => Some(ColumnType::Xml),
         _ => None,
     }
 }

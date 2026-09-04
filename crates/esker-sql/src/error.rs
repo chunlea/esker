@@ -564,6 +564,20 @@ pub enum SqlError {
     #[error("could not identify an equality operator for type {0}")]
     NoEqualityOperator(&'static str),
 
+    /// `ORDER BY payload` over a type with no **ordering** operator class — `xml`, `json`,
+    /// `point` and the six shapes. A sibling of [`SqlError::NoEqualityOperator`] one question
+    /// over, with a HINT of its own, and measured for all nine: PostgreSQL words the sort
+    /// refusal differently from the `DISTINCT` one even where both come from the same missing
+    /// btree family.
+    #[error("could not identify an ordering operator for type {0}")]
+    NoOrderingOperator(&'static str),
+
+    /// `'<a>'::xml`: text that is not well-formed XML content. **`2200N`, its own class**, where
+    /// every other input function raises `22P02` — and the DETAIL names the line, which is
+    /// `libxml`'s own message reaching the client through PostgreSQL.
+    #[error("invalid XML content")]
+    InvalidXmlContent(String),
+
     /// `'{0,0,0}'::line`: `Ax + By + C = 0` names no line when both `A` and `B` are zero. Its own
     /// sentence, measured, and not the ordinary input-syntax one.
     #[error("invalid line specification: A and B cannot both be zero")]
@@ -2384,6 +2398,7 @@ impl SqlError {
                 sqlstate::NOT_NULL_VIOLATION
             }
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
+            SqlError::InvalidXmlContent(_) => sqlstate::INVALID_XML_CONTENT,
             SqlError::MalformedRangeLiteral { .. }
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
@@ -2434,6 +2449,7 @@ impl SqlError {
             // Not "operator does not exist": `=` may answer and still not be the member of a
             // btree family `DISTINCT` needs. Same class, different sentence.
             | SqlError::NoEqualityOperator(_)
+            | SqlError::NoOrderingOperator(_)
             | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
@@ -2647,7 +2663,12 @@ impl SqlError {
             | SqlError::DependentExtension { detail, .. }
             | SqlError::DependentFunction { detail, .. }
             | SqlError::DependentSchema { detail, .. }
-            | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
+            | SqlError::NoPartitionForRow { detail, .. }
+            // The whole first DETAIL line, `line N:` prefix and all — the scanner in
+            // `crate::value::xml` builds it, because only it knows which line the parser stopped
+            // on. Merged with the arms above because the body is theirs: the detail *is* the
+            // payload, which is what every variant on this arm has in common.
+            | SqlError::InvalidXmlContent(detail) => Some(detail.clone()),
             SqlError::OnConflictMovesPartition => Some(
                 "The result tuple would appear in a different partition than the original tuple."
                     .to_owned(),
@@ -2739,6 +2760,11 @@ impl SqlError {
             SqlError::NoDefaultOperatorClass(_) => Some(
                 "You must specify an operator class for the index or define a default operator class for the data type."
                     .to_owned(),
+            ),
+            // PostgreSQL's own, word for word. The `DISTINCT` sibling has **no** hint at all,
+            // measured beside this one — so the two are not one message with a shared tail.
+            SqlError::NoOrderingOperator(_) => Some(
+                "Use an explicit ordering operator or modify the query.".to_owned(),
             ),
             SqlError::SetFunctionNotAllowed(message)
                 if message.starts_with("aggregate function calls") =>

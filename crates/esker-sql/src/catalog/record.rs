@@ -297,6 +297,8 @@ const TAG_PATH: u8 = 75;
 const TAG_POLYGON: u8 = 76;
 const TAG_CIRCLE: u8 = 77;
 const TAG_LINE: u8 = 78;
+const TAG_XML: u8 = 79;
+const TAG_XML_ARRAY: u8 = 80;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -399,6 +401,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Polygon => TAG_POLYGON,
         ColumnType::Circle => TAG_CIRCLE,
         ColumnType::Line => TAG_LINE,
+        ColumnType::Xml => TAG_XML,
+        ColumnType::XmlArray => TAG_XML_ARRAY,
         ColumnType::Bit => TAG_BIT,
         ColumnType::VarBit => TAG_VARBIT,
         ColumnType::BitArray => TAG_BIT_ARRAY,
@@ -525,6 +529,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_POLYGON => ColumnType::Polygon,
         TAG_CIRCLE => ColumnType::Circle,
         TAG_LINE => ColumnType::Line,
+        TAG_XML => ColumnType::Xml,
+        TAG_XML_ARRAY => ColumnType::XmlArray,
         TAG_BIT => ColumnType::Bit,
         TAG_VARBIT => ColumnType::VarBit,
         TAG_BIT_ARRAY => ColumnType::BitArray,

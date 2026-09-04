@@ -119,6 +119,12 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::Polygon
                 | ColumnType::Circle
                 | ColumnType::Line
+                // **And `xml`, and `xml[]` with it**, for `json`'s reason exactly: the type has
+                // no equality operator at all — `'<a/>'::xml = '<a/>'::xml` is `42883 operator
+                // does not exist: xml = xml` — so `ORDER BY` over one is `42883 could not
+                // identify an ordering operator for type xml` and there is no order to fix.
+                | ColumnType::Xml
+                | ColumnType::XmlArray
         ) {
             assert!(
                 !types_seen.contains(&ty),

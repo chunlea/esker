@@ -676,6 +676,10 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::Polygon
         | Row::Circle
         | Row::Line
+        // `xml` has no columnar run for `json`'s reason without `json`'s exception: that crate's
+        // vocabulary has a `Json` and no `Xml`, and adding one is a unit in `esker-columnar`.
+        | Row::Xml
+        | Row::XmlArray
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray

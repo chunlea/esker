@@ -1617,7 +1617,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 Datum::Int8(
                     ArrayValue::element_of(*ty).map_or(0, |element| i64::from(element.oid())),
                 ),
-                Datum::Text(",".to_owned()),
+                Datum::Text(typdelim(*ty).to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
                 Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
@@ -1908,6 +1908,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpchar",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
+        ColumnType::Xml => "xml",
+        ColumnType::XmlArray => "_xml",
         ColumnType::Hstore => "hstore",
         ColumnType::Citext => "citext",
         ColumnType::TsRange => "tsrange",
@@ -2042,6 +2044,9 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Bytea
         | ColumnType::Json
         | ColumnType::Jsonb
+        // **And an `xml`**, which is `U` and not `S`: it is a string to a reader and a
+        // user-defined type to `pg_type`. Measured.
+        | ColumnType::Xml
         | ColumnType::Hstore
         | ColumnType::Uuid
         // **And a `macaddr`**, which a real server groups with them rather than with the two
@@ -2057,7 +2062,7 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`, all seven.
@@ -2082,6 +2087,24 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
 /// `ActiveRecord` reads it, and reads it by comparison — `row["typinput"] == "array_in"` is how it
 /// tells an array type from everything else — so the value is load-bearing and the spelling is the
 /// capture's, underscore and all: `timestamptz_in` has one and `int8in` does not.
+/// `pg_type.typdelim`: the character that separates two elements inside an array literal.
+///
+/// **A comma for every type but one.** `box` uses a **semicolon**, because a box's own text
+/// already contains commas — `(1,1),(0,0)` — so `{(1,1),(0,0);(3,3),(2,2)}` is a two-element
+/// `box[]` and the same string with commas would be four points. Measured the only way that
+/// settles it, by asking a real server which types disagree with the default:
+/// `SELECT typname, typdelim FROM pg_type WHERE typdelim <> ','` answers `box` and `_box`, and
+/// nothing else.
+///
+/// The `,` was a constant here before, which is a right answer for 77 types and a wrong one for
+/// the seventy-eighth.
+fn typdelim(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Box => ";",
+        _ => ",",
+    }
+}
+
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
@@ -2122,7 +2145,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
-        | ColumnType::VarBitArray => "array_in",
+        | ColumnType::VarBitArray
+        | ColumnType::XmlArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -2131,6 +2155,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpcharin",
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",
+        ColumnType::Xml => "xml_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
         ColumnType::TsRange => "tsrange_in",

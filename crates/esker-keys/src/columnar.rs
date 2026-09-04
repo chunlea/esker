@@ -140,6 +140,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Polygon => 77,
         ColumnType::Circle => 78,
         ColumnType::Line => 79,
+        ColumnType::Xml => 80,
+        ColumnType::XmlArray => 81,
     }
 }
 
@@ -223,6 +225,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         77 => ColumnType::Polygon,
         78 => ColumnType::Circle,
         79 => ColumnType::Line,
+        80 => ColumnType::Xml,
+        81 => ColumnType::XmlArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"
