@@ -1,0 +1,61 @@
+crates/esker-keys/proptest-regressions/row.txt
+  s_2d916f5f540186::t_a27e7a58b6c1d4 1-9
+crates/esker-keys/src/columnar.rs
+  s_2d916f5f540186::t_b0f492469daa47 92,125
+crates/esker-keys/src/row.rs
+  s_2d916f5f540186::t_8cb7ecc8e52a44 147-149,395,404-410,412-417,559-565,660-675,920-921,923,1596-1601
+crates/esker-keys/src/value.rs
+  s_2d916f5f540186::t_e24c5a3283423a 154-162,245,255,298-316,400-411,432-433,474
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2d916f5f540186::t_a1708b4212f412 848-849,1389,1422-1424,1477
+crates/esker-sql/src/catalog/record.rs
+  s_2d916f5f540186::t_89d79a2988c6b8 248-249,301,377
+crates/esker-sql/src/exec/bind.rs
+  s_2d916f5f540186::t_812cb334492dbe 1014
+crates/esker-sql/src/exec/cursor.rs
+  s_2d916f5f540186::t_3975896d7f4d58 1011-1012,1054,1126,1201,1362-1366,1412-1415
+crates/esker-sql/src/exec/fragment.rs
+  s_2d916f5f540186::t_f9821176e16630 636-637,650-652
+crates/esker-sql/src/exec/query.rs
+  s_2d916f5f540186::t_4059d11bb77ee9 2213-2216,2219,2544-2545,3324-3340
+crates/esker-sql/src/parse/lower.rs
+  s_2d916f5f540186::t_5997e90b2e97a5 2836-2856,5732-5737
+crates/esker-sql/src/plan/expr.rs
+  s_2d916f5f540186::t_eff3d75948657e 1510-1512,1581-1583,1626-1628
+crates/esker-sql/src/row.rs
+  s_2d916f5f540186::t_1083557ea81f9e 131-136
+crates/esker-sql/src/value/mod.rs
+  s_2d916f5f540186::t_b48ee0ae3b0a98 77-91,102-105,460-464,554-555,657,689,732,814-816,882-884,950,1057-1060,1200-1219,1283,1522,1535
+crates/esker-sql/tests/citext.rs
+  s_2d916f5f540186::t_47c102ddce0ebf 1-80
+crates/esker-sql/tests/corpus/pg19_citext.txt
+  s_2d916f5f540186::t_035ce43545c911 1-92
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_2d916f5f540186::t_f630072ff90989 12-17,59
+crates/esker-sql/tests/create_extension.rs
+  s_2d916f5f540186::t_9f5a45964f0364 98-101
+crates/esker-sql/tests/pg_catalog.rs
+  s_2d916f5f540186::t_6bd7d3d7a8d8c0 239
+crates/esker-sql/tests/row_order.rs
+  s_2d916f5f540186::t_8eccb7be558678 89
+crates/esker-store/src/columnar/decode.rs
+  s_2d916f5f540186::t_cb005b5e7c0616 205-209,218-220
+docs/plans/phase-9-rails.md
+  s_2d916f5f540186::t_c9970c475216e3 1539
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7b358e4f9c54bac109d5816981ad9050f82126d9",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
