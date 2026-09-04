@@ -159,7 +159,7 @@ Running the memtable's own unit and property tests under Miri:
 
 | store | Stacked Borrows (Miri's default) | Tree Borrows (`-Zmiri-tree-borrows`) |
 |---|---|---|
-| arena skiplist | **the whole `memtable` module passes — 35 tests**, 76 s | — |
+| arena skiplist | **the whole `memtable` module passes — 37 tests: 36 run, 1 ignored**, 60 s | — |
 | `crossbeam-skiplist` | UB in `crossbeam-epoch-0.9.20/src/internal.rs:562` — `&*local_ptr`, "that tag does not exist in the borrow stack" | UB in `crossbeam-skiplist-0.1.3/src/base.rs:124` — `dealloc(...)`, "deallocation through `<tag>` is forbidden" |
 
 Both models reject it, in different crates and for different reasons. That is **not** a claim that
@@ -170,8 +170,19 @@ those crates rather than observed misbehaviour.
 What it does mean is concrete. The engine's memtable tests could not be run under Miri at all, so
 the arena skiplist's `unsafe` could never have been checked by the tool the ADR named for it —
 the run would abort inside a dependency before reaching any of it. With the dependency gone,
-`cargo +nightly miri test -p esker-engine --lib -- memtable` runs the module through, which is
-what the gate should have been all along.
+
+```
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p esker-engine --lib -- memtable
+```
+
+runs the module through, which is what the gate should have been all along.
+
+**`-Zmiri-disable-isolation` is part of the command, not a convenience.** Without it the run aborts
+at `the_skiplist_answers_what_a_sorted_map_would`: proptest's default `FileFailurePersistence` wants
+to write a `.proptest-regressions` file beside the source, so it calls `std::env::current_dir`, and
+Miri refuses `getcwd` under isolation. The harness dies there with 22 tests unrun — a *failure to
+run the gate*, which is easy to mistake for the gate failing. The ignored test in the count is
+`relaxed_publication_is_a_data_race`, the red-first control below, which is meant to fail.
 
 One thing had to change for that to be true, and it was a test rather than the code:
 `readers_and_writers_run_concurrently` ran four readers over a two-thousand-entry list five
