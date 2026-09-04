@@ -6899,6 +6899,20 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             Some(ty) => ty,
             None => return Err(SqlError::unsupported(format!("the type {other}"))),
         },
+        // **A type's *internal* name is a type name.** `bpchar` is what PostgreSQL calls
+        // `character(n)` in `pg_type`, and `'a'::bpchar`, `c bpchar` and `CREATE DOMAIN d AS
+        // bpchar` are all ordinary on a real server — the name is not a second-class spelling, it
+        // is the one the catalog itself reports. Anything not in the grammar arrives here as a
+        // custom name, so this is the one place the three paths meet; without it `bpchar` was a
+        // *user* type nobody had declared and the answer was `0A000 the type bpchar is not
+        // supported` about a type this node has.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.0.len() == 1
+                && let Ok(Some(ty)) = value::type_by_name(&name.to_string()) =>
+        {
+            ty
+        }
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
 }
