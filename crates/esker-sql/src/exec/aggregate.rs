@@ -573,7 +573,11 @@ pub(super) fn ordinal(position: i64, select: &Select, clause: &str) -> Result<Ex
 }
 
 /// Whether an expression contains an aggregate call anywhere inside it.
-pub(super) fn contains_aggregate(expr: &Expr) -> bool {
+///
+/// `pub(crate)` because the lowering asks it too: `FOR UPDATE` is `0A000` over a target list with
+/// an aggregate in it, and a second walker written there would be a second opinion about what an
+/// aggregate is.
+pub(crate) fn contains_aggregate(expr: &Expr) -> bool {
     !aggregate_calls(expr).is_empty()
 }
 

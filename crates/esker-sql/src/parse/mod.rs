@@ -1374,6 +1374,14 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("DROP SUBSCRIPTION", &["DROP", "SUBSCRIPTION"], &[]),
     u("CREATE FOREIGN TABLE", &["CREATE", "FOREIGN"], &[]),
     u("IMPORT FOREIGN SCHEMA", &["IMPORT", "FOREIGN"], &[]),
+    // **`DROP SERVER` and not `CREATE SERVER`**, and the asymmetry is `sqlparser`'s rather than
+    // ours: it reads the create and not the drop, so the create reaches the lowering's fallthrough
+    // and is named there, while the drop stops at the parser with an expected-token list. That
+    // list is a `42601` claiming the SQL was malformed, and it was not — it is valid PostgreSQL
+    // this node does not implement. `foreign_table_test.rb`'s teardown sends it
+    // (`DROP SERVER IF EXISTS foreign_server CASCADE`), so every test in that file met the wrong
+    // class on the way out.
+    u("DROP SERVER", &["DROP", "SERVER"], &[]),
 ];
 
 /// Builds a row of [`UNSUPPORTED`]. A free function because a `const` table cannot call a method.

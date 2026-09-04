@@ -496,3 +496,41 @@ fn an_unnamed_alter_action_still_gets_a_name_and_no_identifiers() {
         assert_eq!(error.to_string(), format!("{expected} is not supported"));
     }
 }
+
+/// **Contract C2 for `foreign_table_test.rb`'s four statements**, which run 53 found answering a
+/// parser's expected-token list instead of naming what they asked for.
+///
+/// A client that asks for a feature is owed the name of what it asked for. `42601` with
+/// `Expected: …, found: SERVER` says the SQL was malformed, and it was not — it is valid
+/// PostgreSQL this node does not implement, which is `0A000` naming the construct. The file's
+/// setup sends the first three and its teardown the fourth, so every test in it stops on the first
+/// one either way; what changes is whether a reader can tell why.
+///
+/// The four arrive by **two different routes** and the test does not care which, because a client
+/// does not: `CREATE SERVER` and `DROP SERVER` parse and are named by the lowering's fallthrough,
+/// while `CREATE USER MAPPING` and `CREATE FOREIGN TABLE` are refused by `parse`'s table because
+/// `sqlparser` cannot read them at all. Asserting the answer rather than the stage is what keeps
+/// that free to change.
+#[test]
+fn the_foreign_data_statements_are_refused_by_name() {
+    let cases = [
+        (
+            "CREATE SERVER foreign_server FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'x')",
+            "CREATE SERVER",
+        ),
+        (
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server",
+            "CREATE USER MAPPING",
+        ),
+        (
+            "CREATE FOREIGN TABLE foreign_professors (id int, name character varying NOT NULL) \
+             SERVER foreign_server OPTIONS (table_name 'professors')",
+            "CREATE FOREIGN TABLE",
+        ),
+        (
+            "DROP SERVER IF EXISTS foreign_server CASCADE",
+            "DROP SERVER",
+        ),
+    ];
+    refuses_by_name(&cases);
+}
