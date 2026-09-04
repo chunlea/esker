@@ -434,7 +434,20 @@ pub(super) fn range_representation(subtype: ColumnType) -> Option<ColumnType> {
 /// and not as the representation holding it.
 fn refuse_unindexable(table: &TableDef, column: &ColumnDef) -> Result<()> {
     let ty = column.ty;
-    if matches!(ty, ColumnType::Json | ColumnType::Point) {
+    if matches!(
+        ty,
+        ColumnType::Json
+            | ColumnType::Point
+            // **And the other six geometric shapes**, measured one at a time: `CREATE INDEX` on
+            // an `lseg` column is the same `42704` with the same HINT. The list that started as
+            // "exactly two" is eight now, and every one of them was probed.
+            | ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line
+    ) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
     }
     if !esker_keys::row::is_index_key(ty) {

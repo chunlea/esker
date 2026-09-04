@@ -775,6 +775,12 @@ pub enum CatalogFunc {
     DateRange,
     /// `isempty(range)`: whether a range contains no day at all.
     IsEmpty,
+    /// `isopen(path)` and `isclosed(path)`: **which bracket the path has**, and that is the whole
+    /// of it — a `path` written `[…]` is open and one written `(…)` is closed, so the answer is
+    /// in the canonical text rather than in the geometry. `geometric_test.rb` reads both.
+    PathIsOpen,
+    /// See [`CatalogFunc::PathIsOpen`].
+    PathIsClosed,
     /// `a && b`: whether two ranges share a day.
     ///
     /// Written as an operator and carried as a call, because it is not a comparison — `pg_cmp` says
@@ -1009,6 +1015,8 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("clock_timestamp") => Some(CatalogFunc::ClockTimestamp),
             () if name.eq_ignore_ascii_case("daterange") => Some(CatalogFunc::DateRange),
             () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
+            () if name.eq_ignore_ascii_case("isopen") => Some(CatalogFunc::PathIsOpen),
+            () if name.eq_ignore_ascii_case("isclosed") => Some(CatalogFunc::PathIsClosed),
             // The hstore functions. `hstore(…)` is two shapes of one name, told apart by whether
             // its arguments are arrays — an overload, the way a real server tells them apart.
             () if name.eq_ignore_ascii_case("lower_inc") => Some(CatalogFunc::RangeLowerInc),
@@ -1072,6 +1080,8 @@ impl CatalogFunc {
             CatalogFunc::PgGetTriggerdef => "pg_get_triggerdef",
             CatalogFunc::DateRange => "daterange",
             CatalogFunc::IsEmpty => "isempty",
+            CatalogFunc::PathIsOpen => "isopen",
+            CatalogFunc::PathIsClosed => "isclosed",
             CatalogFunc::RangeOverlaps => "&&",
             CatalogFunc::RangeLowerInc => "lower_inc",
             CatalogFunc::RangeUpperInc => "upper_inc",
@@ -1167,6 +1177,8 @@ impl CatalogFunc {
             | CatalogFunc::RegTypeName
             | CatalogFunc::ToRegClass
             | CatalogFunc::IsEmpty
+            | CatalogFunc::PathIsOpen
+            | CatalogFunc::PathIsClosed
             | CatalogFunc::Cardinality
             | CatalogFunc::PgTypeof => &[1],
             CatalogFunc::Now
@@ -1230,7 +1242,9 @@ impl CatalogFunc {
             | CatalogFunc::Cardinality => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
-            CatalogFunc::IsEmpty
+            CatalogFunc::PathIsOpen
+            | CatalogFunc::PathIsClosed
+            | CatalogFunc::IsEmpty
             | CatalogFunc::RangeOverlaps
             | CatalogFunc::RangeContains
             | CatalogFunc::RangeLowerInc
@@ -1734,6 +1748,7 @@ impl Literal {
                 | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
+                | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
 
@@ -1816,6 +1831,7 @@ impl Literal {
                 | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
+                | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
 
@@ -1892,6 +1908,7 @@ impl Literal {
                 | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
+                | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
         }

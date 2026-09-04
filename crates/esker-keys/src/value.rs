@@ -262,6 +262,25 @@ pub enum ColumnType {
     BitArray,
     /// See [`ColumnType::BitArray`].
     VarBitArray,
+    /// PostgreSQL's `lseg`, `box`, `path`, `polygon`, `circle` and `line`.
+    ///
+    /// Six types and **one representation** — the canonical text, the road `hstore` and the ranges
+    /// take — because the canonical form is a function of the content: two shapes that print the
+    /// same are the same shape. None of the six is an index key, for `point`'s reason one family
+    /// along: `CREATE INDEX` on an `lseg` is `42704 … has no default operator class` and
+    /// `count(DISTINCT)` over one is `42883 could not identify an equality operator`, both
+    /// measured, even though the `=` operator itself answers.
+    Lseg,
+    /// See [`ColumnType::Lseg`]. **Its corners are reordered on the way in**: upper right first.
+    Box,
+    /// See [`ColumnType::Lseg`]. **Its bracket is data**: `[…]` is open and `(…)` is closed.
+    Path,
+    /// See [`ColumnType::Lseg`].
+    Polygon,
+    /// See [`ColumnType::Lseg`].
+    Circle,
+    /// See [`ColumnType::Lseg`]. `{A,B,C}`, and `A` and `B` may not both be zero.
+    Line,
     /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
     /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
     /// `can't quote Array` tests.
@@ -407,7 +426,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 70] = [
+    pub const ALL: [ColumnType; 76] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -478,6 +497,12 @@ impl ColumnType {
         ColumnType::VarBit,
         ColumnType::BitArray,
         ColumnType::VarBitArray,
+        ColumnType::Lseg,
+        ColumnType::Box,
+        ColumnType::Path,
+        ColumnType::Polygon,
+        ColumnType::Circle,
+        ColumnType::Line,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in
@@ -570,6 +595,18 @@ pub enum Datum {
         /// The digits, most significant first — `'101'::bit(8)` is `10100000` and not
         /// `00000101`, which is the half of the padding rule a reader gets wrong.
         bits: String,
+    },
+    /// One of the six geometric shapes, as its **canonical text**, and which of the six it is.
+    ///
+    /// The kind rides along for the reason [`Datum::Range`]'s subtype does: a folded
+    /// `'…'::circle` constant that came out as a `Text` would have nothing left saying it is a
+    /// circle, so `pg_typeof` could not tell one shape from another.
+    Geometry {
+        /// Which shape, as `esker_sql::value::geometric::Kind` spells it — carried here as the
+        /// column type it corresponds to, so this crate needs no vocabulary of its own for it.
+        kind: Box<ColumnType>,
+        /// The canonical text, which is what `esker_sql::value::geometric` renders.
+        text: String,
     },
     /// [`ColumnType::MacAddr`]: six bytes, which is the whole type.
     MacAddr([u8; 6]),
@@ -690,6 +727,11 @@ impl PartialEq for Datum {
                 },
             ) => af == bf && ab == bb && ac == bc && aa == ba,
             (Datum::MacAddr(a), Datum::MacAddr(b)) => a == b,
+            // Kind and text, which together are the value: two shapes that print the same and are
+            // the same type are the same row.
+            (Datum::Geometry { kind: ak, text: at }, Datum::Geometry { kind: bk, text: bt }) => {
+                ak == bk && at == bt
+            }
             // Representation equality, flag included — see the variant's own note.
             (
                 Datum::Bit {
@@ -782,6 +824,7 @@ impl Datum {
             Datum::Inet { cidr: true, .. } => ColumnType::Cidr,
             Datum::Inet { .. } => ColumnType::Inet,
             Datum::MacAddr(_) => ColumnType::MacAddr,
+            Datum::Geometry { kind, .. } => **kind,
             Datum::Bit { varying: true, .. } => ColumnType::VarBit,
             Datum::Bit { .. } => ColumnType::Bit,
             Datum::Hstore(_) => ColumnType::Hstore,

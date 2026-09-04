@@ -197,12 +197,20 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
             // **`cidr`, `macaddr` and `inet`** — three more names the adapter's list has always
             // held and got nothing back for. `cidr_in`, `macaddr_in`, `inet_in`.
+            // **The six geometric shapes**, every one of them already in the adapter's own list
+            // and every one of them answering nothing until now. `poly_in`, not `polygon_in`.
+            vec!["601", "lseg", "0", ",", "lseg_in", "\\N", "b", "0"],
+            vec!["602", "path", "0", ",", "path_in", "\\N", "b", "0"],
+            vec!["603", "box", "0", ",", "box_in", "\\N", "b", "0"],
+            vec!["604", "polygon", "0", ",", "poly_in", "\\N", "b", "0"],
+            vec!["628", "line", "0", ",", "line_in", "\\N", "b", "0"],
             vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             // **`money` is in the adapter's own list** and was one of the names it asked about
             // and got nothing back for. `cash_in`, not `money_in`: the input function is named
             // for the C type behind it.
+            vec!["718", "circle", "0", ",", "circle_in", "\\N", "b", "0"],
             vec!["790", "money", "0", ",", "cash_in", "\\N", "b", "0"],
             vec!["829", "macaddr", "0", ",", "macaddr_in", "\\N", "b", "0"],
             vec!["869", "inet", "0", ",", "inet_in", "\\N", "b", "0"],

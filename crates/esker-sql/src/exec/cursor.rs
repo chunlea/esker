@@ -2509,6 +2509,16 @@ fn catalog_function(
                 "a cast to a user-defined type reached the row evaluator unresolved".to_owned(),
             ));
         }
+        // **The bracket, not the geometry.** A `path` keeps the one it was written with — `[…]`
+        // open, `(…)` closed — so the two functions read the first character of the canonical
+        // text. A NULL path is a NULL answer, which is what every strict function here does.
+        CatalogFunc::PathIsOpen | CatalogFunc::PathIsClosed => match args.first() {
+            Some(Datum::Geometry { text, .. }) => {
+                let open = text.starts_with('[');
+                Datum::Bool(open == (call.func == CatalogFunc::PathIsOpen))
+            }
+            _ => Datum::Null,
+        },
         CatalogFunc::UserRegType => {
             return Err(SqlError::Internal(
                 "a regtype over a user-defined type reached the row evaluator unresolved"

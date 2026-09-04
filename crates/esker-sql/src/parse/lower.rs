@@ -6521,6 +6521,14 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "inet" => Some(ColumnType::Inet),
         "cidr" => Some(ColumnType::Cidr),
         "macaddr" => Some(ColumnType::MacAddr),
+        // **The five `geometric_test.rb` declares in one `create_table`, and `line` beside them.**
+        // `sqlparser` has no variant for any of the six, so each is a `Custom` name here.
+        "lseg" => Some(ColumnType::Lseg),
+        "box" => Some(ColumnType::Box),
+        "path" => Some(ColumnType::Path),
+        "polygon" => Some(ColumnType::Polygon),
+        "circle" => Some(ColumnType::Circle),
+        "line" => Some(ColumnType::Line),
         _ => None,
     }
 }

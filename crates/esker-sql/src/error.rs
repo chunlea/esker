@@ -556,6 +556,19 @@ pub enum SqlError {
     #[error("you don't own a lock of type {0}")]
     LockNotHeld(&'static str),
 
+    /// `count(DISTINCT a_line_segment)` over a type with no equality **operator class**. Its own
+    /// sentence — not "operator does not exist" — because `=` may answer and still not be the
+    /// member of a btree family that `DISTINCT` needs. Measured: `count(DISTINCT lseg)` is
+    /// `42883 could not identify an equality operator for type lseg` while
+    /// `'…'::lseg = '…'::lseg` is `t`.
+    #[error("could not identify an equality operator for type {0}")]
+    NoEqualityOperator(&'static str),
+
+    /// `'{0,0,0}'::line`: `Ax + By + C = 0` names no line when both `A` and `B` are zero. Its own
+    /// sentence, measured, and not the ordinary input-syntax one.
+    #[error("invalid line specification: A and B cannot both be zero")]
+    InvalidLineSpecification,
+
     /// `'FF'::bit(8)`: a character that is not a binary digit. **The message names the
     /// character**, not the type, which is its own sentence and not the
     /// `invalid input syntax for type …` every other type gives. Measured, `0x` included:
@@ -2357,6 +2370,7 @@ impl SqlError {
             SqlError::MalformedRangeLiteral { .. }
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
+            | SqlError::InvalidLineSpecification
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {
@@ -2400,6 +2414,9 @@ impl SqlError {
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
             SqlError::NotImmutableInIndex => sqlstate::INVALID_OBJECT_DEFINITION,
             SqlError::UndefinedUnaryOperator { .. }
+            // Not "operator does not exist": `=` may answer and still not be the member of a
+            // btree family `DISTINCT` needs. Same class, different sentence.
+            | SqlError::NoEqualityOperator(_)
             | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)

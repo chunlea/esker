@@ -40,6 +40,7 @@ pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
 pub(crate) mod float;
+pub mod geometric;
 pub mod hstore;
 pub mod inet;
 pub mod interval;
@@ -297,6 +298,24 @@ fn refuse_if_longer(text: &str, limit: u32, ty: ColumnType, typmod: i32) -> Resu
 #[must_use]
 pub(crate) fn datetime_body(text: &str) -> &str {
     text.trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\'' || ch == '"')
+}
+
+/// Which of the six shapes a column type names, or `None` for a type that is not one.
+///
+/// The two vocabularies are deliberately separate: `esker_keys` carries the column type and knows
+/// nothing about shapes, and `geometric::Kind` is what the reader and the writer are written
+/// against. This is the one place they meet.
+#[must_use]
+pub fn geometric_kind(ty: ColumnType) -> Option<geometric::Kind> {
+    Some(match ty {
+        ColumnType::Lseg => geometric::Kind::Lseg,
+        ColumnType::Box => geometric::Kind::Box,
+        ColumnType::Path => geometric::Kind::Path,
+        ColumnType::Polygon => geometric::Kind::Polygon,
+        ColumnType::Circle => geometric::Kind::Circle,
+        ColumnType::Line => geometric::Kind::Line,
+        _ => return None,
+    })
 }
 
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
@@ -572,7 +591,16 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // with the type and `range_test.rb` never declares a column of one, so this is a named
         // gap rather than a guess at an oid that is allocated per database anyway.
         | ColumnType::FloatRange
-        | ColumnType::VarcharRange => 0,
+        | ColumnType::VarcharRange
+        // **And no array of a shape here.** A real server pairs each with one (`_lseg` 1018 and
+        // so on) and `geometric_test.rb` declares none, so this is a named gap rather than six
+        // more types — the same call `floatrange[]` got.
+        | ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -699,7 +727,13 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // **A `money` has scale 2 and does not take one.** `information_schema` reports both
         // `numeric_precision` and `numeric_scale` as NULL for a money column, measured — the
         // `scale: 2` `ActiveRecord`'s schema dumper prints is the adapter's own constant.
-        ColumnType::Money
+        ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line
+        | ColumnType::Money
         | ColumnType::Inet
         | ColumnType::Cidr
         | ColumnType::MacAddr
@@ -863,6 +897,12 @@ impl PgType for ColumnType {
             ColumnType::CidrArray => 651,
             ColumnType::MacAddr => 829,
             ColumnType::MacAddrArray => 1040,
+            ColumnType::Lseg => 601,
+            ColumnType::Box => 603,
+            ColumnType::Path => 602,
+            ColumnType::Polygon => 604,
+            ColumnType::Circle => 718,
+            ColumnType::Line => 628,
             ColumnType::Bit => 1560,
             ColumnType::BitArray => 1561,
             ColumnType::VarBit => 1562,
@@ -957,6 +997,12 @@ impl PgType for ColumnType {
             ColumnType::MacAddrArray => "macaddr[]",
             // **`bit`, not `"bit"`.** The quoted spelling is what `format_type` writes inside a
             // default expression, and that is `format_type`'s business rather than the name's.
+            ColumnType::Lseg => "lseg",
+            ColumnType::Box => "box",
+            ColumnType::Path => "path",
+            ColumnType::Polygon => "polygon",
+            ColumnType::Circle => "circle",
+            ColumnType::Line => "line",
             ColumnType::Bit => "bit",
             ColumnType::BitArray => "bit[]",
             ColumnType::VarBit => "bit varying",
@@ -1023,6 +1069,11 @@ impl PgType for ColumnType {
             // agrees. The two addresses are varlenas (`-1`) below, because an IPv4 and an IPv6
             // are not the same width.
             ColumnType::MacAddr => 6,
+            // Measured, and not guessable: an `lseg` and a `box` are four `float8`s, a `circle`
+            // and a `line` three, and a `path` and a `polygon` hold as many points as they were
+            // given — which is what `-1` says.
+            ColumnType::Lseg | ColumnType::Box => 32,
+            ColumnType::Circle | ColumnType::Line => 24,
             ColumnType::Int8
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
@@ -1040,7 +1091,7 @@ impl PgType for ColumnType {
             | ColumnType::TstzRange
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
-                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
+                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
@@ -1137,6 +1188,7 @@ impl PgDatum for Datum {
             ),
             Datum::MacAddr(mac) => inet::mac_to_text(*mac),
             Datum::Bit { bits, .. } => bits.clone(),
+            Datum::Geometry { text, .. } => text.clone(),
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
@@ -1202,6 +1254,18 @@ impl PgDatum for Datum {
                 }
             }
             ColumnType::MacAddr => Datum::MacAddr(inet::mac_from_text(text)?),
+            ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line => Datum::Geometry {
+                kind: Box::new(ty),
+                text: geometric::from_text(
+                    geometric_kind(ty).unwrap_or(geometric::Kind::Lseg),
+                    text,
+                )?,
+            },
             ColumnType::Bit | ColumnType::VarBit => Datum::Bit {
                 varying: ty == ColumnType::VarBit,
                 bits: bit::from_text(text)?,
@@ -1353,6 +1417,9 @@ impl PgDatum for Datum {
             | Datum::MacAddr(_)
             // `bit_send` writes a length and the packed bits; nothing here has read that shape.
             | Datum::Bit { .. }
+            // Each of the six has a `*_send` of its own, packing `float8`s; none has been read
+            // here, and a guess is a wrong parse of every value in a column.
+            | Datum::Geometry { .. }
             | Datum::Money(_) => {
                 return None;
             }
@@ -1401,6 +1468,12 @@ impl PgDatum for Datum {
             | ColumnType::MacAddr
             | ColumnType::Bit
             | ColumnType::VarBit
+            | ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line
             | ColumnType::Point
             | ColumnType::Int8Array
             | ColumnType::Int4Array
@@ -1702,7 +1775,12 @@ impl PgDatum for Datum {
             // decision and not an oversight.
             // An hstore's comparison **is** text's — the canonical form is a function of the
             // content — which is the half citext does not share.
-            (Datum::Text(a), Datum::Text(b)) | (Datum::Hstore(a), Datum::Hstore(b)) => {
+            // A shape joins them: the canonical text **is** the value, the road `hstore` and the
+            // ranges take. It is not PostgreSQL's geometric order, which is by area or by length —
+            // none of the six is an index key, so nothing here has to reproduce one.
+            (Datum::Geometry { text: a, .. }, Datum::Geometry { text: b, .. })
+            | (Datum::Text(a), Datum::Text(b))
+            | (Datum::Hstore(a), Datum::Hstore(b)) => {
                 a.as_bytes().cmp(b.as_bytes())
             }
             // **A range compares by its canonical text**, which is right because the text *is*
@@ -1802,6 +1880,7 @@ fn variant_rank(value: &Datum) -> u8 {
         Datum::Inet { .. } => 23,
         Datum::MacAddr(_) => 24,
         Datum::Bit { .. } => 25,
+        Datum::Geometry { .. } => 26,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
         // An `oid` shares the integers' rank: it is one, and `pg_cmp` answers every pairing
@@ -2135,7 +2214,7 @@ mod tests {
                         | ColumnType::TstzRange
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
-                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
+                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
