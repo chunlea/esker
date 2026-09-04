@@ -11,6 +11,14 @@
 //! | `ESKER_S3_KEY` | `eskertest` |
 //! | `ESKER_S3_SECRET` | `eskertest123` |
 //! | `ESKER_S3_REGION` | `us-east-1` |
+//! | `ESKER_S3_CA_CERT` | unset — the host's own CA bundle |
+//!
+//! `ESKER_S3_CA_CERT` names a PEM file of roots for an `https://` endpoint, which is what a
+//! self-signed `MinIO` needs; unset, the host's bundle is used. It is a variable rather than a
+//! flag for consistency with the four above, not for secrecy — a CA certificate is public, and
+//! the reason those four are variables is that a secret on a command line is in everybody's `ps`
+//! output. An `https://` endpoint on a build without the `tls` feature is refused by
+//! `Endpoint::parse` with a message naming the feature, never downgraded to plaintext.
 //!
 //! The defaults are the local container's, which makes the flag usable in a test without four
 //! more environment variables and useless against anything real without them — which is the
@@ -56,6 +64,13 @@ fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
 }
 
+/// Which roots verify an `https://` endpoint: the one `ESKER_S3_CA_CERT` names, or the host's.
+fn tls_roots() -> esker_s3::TlsRoots {
+    std::env::var_os("ESKER_S3_CA_CERT").map_or(esker_s3::TlsRoots::Platform, |path| {
+        esker_s3::TlsRoots::File(path.into())
+    })
+}
+
 /// The store URL for one node of a cluster: `s3://bucket/prefix` becomes
 /// `s3://bucket/prefix/node-N`.
 ///
@@ -82,10 +97,12 @@ pub(crate) fn object_store(
         env_or("ESKER_S3_SECRET", "eskertest123"),
     );
     let region = env_or("ESKER_S3_REGION", "us-east-1");
-    let config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
+    let mut config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
         .map_err(|err| err.to_string())?;
+    config.tls_roots = tls_roots();
     let prefix = config.prefix.clone();
-    Ok((Arc::new(esker_s3::S3Client::new(config)), prefix))
+    let client = esker_s3::S3Client::open(config).map_err(|err| err.to_string())?;
+    Ok((Arc::new(client), prefix))
 }
 
 /// The filesystem the engine should run on.
@@ -117,10 +134,13 @@ pub(crate) fn filesystem(
     );
     let region = env_or("ESKER_S3_REGION", "us-east-1");
 
-    let config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
+    let mut config = esker_s3::Config::from_store_url(store_url, endpoint, region, credentials)
         .map_err(|err| err.to_string())?;
+    config.tls_roots = tls_roots();
     let key_prefix = config.prefix.clone();
-    let client = Arc::new(esker_s3::S3Client::new(config));
+    // `open` rather than `new`: a trust store that cannot be read is a startup error here, not a
+    // failure on the first upload an hour later.
+    let client = Arc::new(esker_s3::S3Client::open(config).map_err(|err| err.to_string())?);
 
     // The directory has to exist before the tier lists it for half-written fetches — and before
     // the claim id is written into it.
@@ -176,10 +196,11 @@ mod tests {
 
     /// A bad URL fails when the store is opened, not on the first flush.
     ///
-    /// The `https://` refusal (ADR 0025) is not asserted here: it depends on an environment
-    /// variable, and `std::env::set_var` is `unsafe` in edition 2024 while `CLAUDE.md` denies
-    /// `unsafe_code` workspace-wide. `esker-s3`'s `an_https_endpoint_is_refused_with_a_reason`
-    /// covers it, at the layer that actually decides.
+    /// The `https://` behaviour (ADR 0025, then ADR 0055) is not asserted here: it depends on an
+    /// environment variable, and `std::env::set_var` is `unsafe` in edition 2024 while `CLAUDE.md`
+    /// denies `unsafe_code` workspace-wide. `esker-s3` covers it at the layer that actually
+    /// decides, once per build: `an_https_endpoint_is_refused_with_a_reason` without the `tls`
+    /// feature, `an_https_endpoint_parses_and_defaults_to_443` with it.
     #[test]
     fn a_bad_store_url_fails_early_and_says_why() {
         let dir = tempfile::tempdir().unwrap();

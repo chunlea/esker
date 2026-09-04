@@ -23,6 +23,7 @@
 pub mod message;
 pub mod server;
 pub mod session;
+pub mod tls;
 
 use crate::error::{Severity, SqlError};
 use message::{Backend, ErrorField, PROTOCOL_MAJOR, PROTOCOL_MINOR, Startup};

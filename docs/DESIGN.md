@@ -674,6 +674,17 @@ that goes silent is pinged, and one that stays silent is dropped with every wait
 | `request_timeout` | 30 s | How long a call waits for its answer before `Timeout`. |
 | `shutdown_grace` | 10 s | How long a graceful shutdown waits for in-flight requests before closing anyway. Graceful cannot mean "for ever": a handler wedged on a stuck disk must not hold the process open. |
 
+**Nothing on this wire is encrypted or authenticated**, and both halves of that are deliberate for
+now. A request carries a region epoch and a cluster id, neither of which is a credential: a store's
+`StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the socket,
+so the network boundary is the trust boundary. TLS here is one implementor away — the decision, the
+provider and the shape are settled by
+[ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md) and built once already on the
+SQL port — but this surface wants **mutual** authentication rather than server TLS, and a verified
+peer certificate is still not an authorization decision: mapping an identity to "may register as
+store 7" or "may vote in region 4" is application logic `esker-pd` does not have yet. That, not the
+encryption, is the bulk of the work here, and it is why this surface is not first.
+
 `HelloAck` reports the server's `max_frame_size` so a client can refuse an oversized request without
 spending a round trip on it. **A client is not obliged to adopt it**, and `esker-client` does not:
 `Transport::max_frame_size` returns the client's own limit, so a client configured more generously
@@ -789,17 +800,33 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   in the database's own directory rather than `(cluster_id, store_id)`, which two benchmarks do not have
   and two misconfigured stores share (ADR 0029). A prefix holding objects and no marker — every pre-6c
   prefix — is refused until `--adopt-sst-store` says otherwise; nothing is ever adopted silently.
-- **TLS — settled for S3 by ADR 0025, and measured for all three surfaces by
-  [ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md).** S3: plain HTTP to `MinIO`
-  or to a TLS-terminating sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at
-  ADR 0025, rather than accepting it and speaking plaintext — a configuration that looks encrypted and
-  is not is the worst of the three outcomes. The PostgreSQL port answers the same way: `SSLRequest`
-  gets a plain `N` (`pgwire::server`), and the RPC layer (§9) carries no TLS at all today. All
-  three are one dependency decision, not three: ADR 0055 measured the pure-Rust `rustls`
-  `CryptoProvider` options against `deny.toml` and found the crate cost is paid once, for whichever
-  surface adopts it first. `esker_s3::Transport` is a trait with a blocking `std::net` implementation
-  and `pgwire::server::Connection<S>` is already generic over its stream — both are a second
-  implementor away from TLS, not a refactor, once a provider is chosen.
+- **TLS — built on the PostgreSQL port, deferred on the other two
+  ([ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md), accepted 2026-09-04).**
+  All three surfaces are **one dependency decision, not three**, and it has been taken: `rustls` with
+  `rustls-graviola` as the `CryptoProvider`, behind `esker-sql`'s **`tls` feature, off by default**.
+  graviola was chosen on measurement — `rustls-rustcrypto`, the better-known pure-Rust provider,
+  fails this repo's own `cargo deny check` today. With the feature off the runtime graph does not
+  move by a crate; with it on it grows by nine.
+  **The PG port**: `SSLRequest` is answered `S` when the node holds a `--tls-cert`/`--tls-key` pair,
+  and the whole session including the client's real startup packet runs inside TLS records; a node
+  with no certificate answers `N` and carries on in the clear, and a node given a certificate it
+  cannot serve — the flags without the feature — **refuses to start** rather than serving plaintext
+  on a port an operator believes is encrypted. `pgwire::tls` is the only module that knows what TLS
+  is; the session is driven by a task over a duplex pipe rather than a hand-written poll adapter,
+  because the adapter is a third crate or a class of hang.
+  **S3 — built, and it cost no further crates.** `esker_s3::tls` is the second implementor the
+  transport trait was designed for (ADR 0025 decision 1, which needed no change), and
+  `Endpoint::parse` now accepts `https://` under the feature and refuses it without, naming the
+  feature. The root store is **not** `webpki-roots`: the host's CA bundle is a file, `SSL_CERT_FILE`
+  overrides it and `ESKER_S3_CA_CERT` names one for a self-signed `MinIO`, so the vendored-roots
+  crate and its `CDLA-Permissive-2.0` licence line are both avoided and the exception stays at nine
+  crates for both surfaces. Its connection pool absorbs post-handshake messages rather than peeking
+  at the socket, because a TLS 1.3 server sends tickets and key updates whenever it likes and the
+  plain transport's check would throw away a good connection for them — silently, since every
+  response stays correct. `esker-s3` costs nothing with the feature off, as it always has.
+  **The RPC layer (§9) is what is left.** It carries no TLS and no peer authentication, and ADR 0055
+  says why the second is the larger half of that work: mTLS makes a peer identity available, and
+  nothing in `esker-pd` yet decides what a given identity is *allowed* to be.
 - **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
   extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →

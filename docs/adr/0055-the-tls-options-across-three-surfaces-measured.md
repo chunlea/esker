@@ -1,6 +1,13 @@
 # 0055 — The TLS options across three surfaces, measured
 
-Status: **proposed — the choice below is for the maintainer.** [ADR 0025](0025-s3-transport-and-tls.md)
+Status: **accepted 2026-09-04, and built for the PostgreSQL port and the S3 tier.** The maintainer
+took option 4 and named `rustls-graviola` as the exception: refusal discipline everywhere now,
+`rustls` + `rustls-graviola` behind a default-off `tls` feature, PG port first, then S3, then RPC.
+Two of the three surfaces are done and **the second one cost no crates at all**. What that turned
+into is at the end of this file, under "What was built, and what is still owed"; the option list
+below is unchanged from the measurement that produced it.
+
+[ADR 0025](0025-s3-transport-and-tls.md)
 settled S3's transport for phase 6b (plain HTTP now, `https://` refused at parse time) and wrote down
 four things that have to be true before TLS lands there. This ADR does the first of those four —
 measure the dependency cost of a pure-Rust `rustls` provider against `deny.toml` — and widens the
@@ -286,3 +293,85 @@ the PostgreSQL port, or the RPC layer — gets it first.
 - **Option 4:** the same `ADR 0003`/`deny.toml` additions as option 2, latent behind the feature, plus
   the `[graph] all-features = true` decision named above — a real edit either way, decided once rather
   than discovered when `cargo deny check` turns red on a branch that thought the feature was invisible.
+
+## What was built, and what is still owed
+
+Written after the fact, because two of the numbers above moved once the crates were in a real
+workspace rather than a probe, and because building it found things the measurement could not.
+
+### The PostgreSQL port, built
+
+`SSLRequest` is answered `S` when the node holds a certificate, and the whole session — the
+client's real startup packet included — runs inside TLS records. `--tls-cert` and `--tls-key` take
+PEM. The provider is passed explicitly rather than installed with `install_default`, which is
+process-global and would decide for anything else linking rustls in the same binary.
+
+`esker-sql`'s `tls` feature is off by default, and the default build's runtime graph is unchanged —
+36 crates by `dep_budget.rs`'s method, name for name, before and after. **With the feature on it is
+nine crates, not the twelve measured standalone**, because `once_cell`, `cfg-if` and `libc` are
+already in this workspace. `cargo deny check`, which always evaluates with `all-features = true`,
+is green with them in the graph.
+
+Three things the measurement did not predict, all now written down where someone will hit them:
+
+* **`ring` and `cc` are in `Cargo.lock` and nothing builds them.** Cargo locks a version for every
+  optional dependency edge, and `rustls-webpki` declares an unused optional `ring`. `deny.toml` and
+  ADR 0003 carry the three checks that prove it is not in the graph.
+* **`dep_budget.rs` would report that unused `ring` as a banned crate** the moment anything measured
+  the feature-on graph, because it walks `resolve.nodes[].deps` without consulting the activated
+  feature list. That is a false positive in the one test that must not have them, and it is owed to
+  whoever owns `crates/esker-cli/`. The same flaw inflates the default count by two.
+* **The PEM reader and the test certificates now exist twice.** `esker_sql::pgwire::tls` and
+  `esker_s3::tls` each carry a base64 decoder and a PEM block scanner, and each crate's tests carry
+  their own throwaway CA and leaf. `esker-base` is where both belong — it is already the home of
+  `crc32c`, the varints and the hashes, and both crates already depend on it. Neither TLS lane owned
+  that crate, so this is written down rather than done. It is duplication, not divergence: the two
+  readers agree on the same strictness (padding required, no guessing), and the S3 test's third
+  reader is deliberate, so a bug in the client's cannot hide itself in the test's.
+* **The budget has four crates of headroom, not twenty.** ADR 0025 said "the teens"; the real number
+  today is 36 of 40, `sqlparser` and tokio's chain having landed since. Nothing here needs the
+  budget raised, and the next thing that wants a crate should re-measure rather than trust either
+  number.
+
+### The S3 tier, built — and the root store that cost nothing
+
+`esker_s3::tls` is the second implementor ADR 0025 decision 1 built its trait for, and it is much
+smaller than the PostgreSQL port's: that surface is `tokio` and needed a task and a pipe to drive a
+sans-io state machine, while this crate blocks by rule and `rustls::StreamOwned` is a `Read + Write`
+over a session. `Endpoint::parse` accepts `https://` under the feature and refuses it without,
+naming the feature.
+
+**The prediction above was wrong in the project's favour, and the correction is the interesting
+part.** This surface was expected to want `webpki-roots` — one crate, plus a `CDLA-Permissive-2.0`
+line in `deny.toml`'s licence allow-list, which that file does not have. It wants neither. A CA
+bundle is a PEM file; every platform this builds for ships one; reading a file is not a dependency.
+`TlsRoots::Platform` takes the first bundle it finds (honouring `SSL_CERT_FILE`) and
+`ESKER_S3_CA_CERT` names one for a self-signed `MinIO`. **Measured after: 43 crates with both
+surfaces on, the same nine, and the licence list untouched.** Vendored roots remain a defensible
+choice for a client that must behave identically on every machine; a database talking to its own
+object store is not that client.
+
+Two things this surface found that the PG port did not:
+
+* **A TLS connection pool cannot use the plain one's liveness check.** TLS 1.3 lets a server send
+  session tickets and key updates after the handshake, so bytes waiting on an idle connection's
+  socket are normal. The plain transport reads "readable" as "not at a message boundary" and would
+  discard the connection — every response still correct, every request paying for a handshake, and
+  only the connection count showing it (ADR 0039's saving, silently undone). The check absorbs
+  pending bytes into the session instead, and `tests/https.rs` tells the two apart with a server
+  that talks between requests: 8 handshakes against the naive check, 1 against this one.
+* **A handshake failure is two kinds of error.** A reset or a timeout is `Io` and retryable, because
+  a server may be restarting; a certificate that does not verify is `Tls` and is not, because the
+  uploader retries forever (ADR 0024 decision 2) and would hide a wrong CA indefinitely.
+### What RPC still needs
+
+* **RPC** (`esker-proto`, DESIGN.md §9): the harder one, and not because of TLS. It is the surface
+  where both ends are ours, so it is the one that wants **mutual** authentication — and mTLS gives
+  a verified peer identity, not an authorization decision. Nothing in `esker-pd` today maps an
+  identity to "may register as this store id" or "may vote in this region": a store's
+  `StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the
+  socket. Encrypting that link without also deciding who is allowed on it moves the problem rather
+  than solving it, and the deciding is application logic no option in this ADR provides. Whoever
+  takes this surface should expect the certificate-issuance story (a private CA, most likely) and
+  the identity check to be the bulk of the work, with the TLS itself the small part — `TlsConfig`
+  and the session driver in `pgwire::tls` are the shape it can reuse.
