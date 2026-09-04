@@ -151,8 +151,9 @@ active + a bounded queue of immutable memtables per CF. Flush when active reache
 expose both as metrics so the stall is visible, never mysterious.
 
 `crossbeam-skiplist` held this place until phase 11's debt was cleared, and was the last piece of
-concurrent code the project bought rather than wrote. Both implementations are compiled and both are
-held to the same differential; one `type Selected = …` line in `memtable.rs` says which the engine uses.
+concurrent code the project bought rather than wrote; it and the two crates behind it are gone from
+the runtime graph. One `type Selected = …` line in `memtable.rs` names the storage, behind a `Store`
+trait, because the benchmark that decided it was mixed and a third layout may yet be tried.
 The structure is single-writer (group commit serialises inserts, §4.2), multi-reader, and **append-only**
 — nothing is ever removed, so no node is freed until the last `Arc<MemTable>` drops and the reclamation
 question a lock-free map has to answer never arises. Key and value bytes and the node's forward pointers

@@ -272,9 +272,39 @@ Item 3's red-first requirement is the mitigation and is not negotiable.
 format, and it does not touch anything above `memtable.rs`. If a later phase wants multi-writer
 memtables, that is a different ADR and it starts by changing group commit.
 
+## The outcome, measured
+
+`docs/bench/skiplist.md` has the numbers and the method. In one paragraph:
+
+**The bench plan in this ADR could not answer its own question, and that is the first finding.**
+`crates/esker-cli/src/bench.rs` flushes the memtable before the measured phase of every read
+workload, so `readseq` and `scanrange` — the two this document said would make "the whole scan the
+memtable cursor" — run against an empty memtable whatever `--write-buffer-size` says. Run anyway,
+the whole plan is flat: 0.98× to 1.05×, against a **5% noise floor measured from a control that
+never touches the engine**. That is the "equal or faster" the removal of `crossbeam-skiplist` was
+gated on, and it is why unit 6 went ahead.
+
+**On its own the structure is much faster to scan and slower to fill.** A full scan of a 100 k
+memtable is 26.14 ms against **1.41 ms**, eighteen-fold, and that is the cost paid on every flush,
+because `db/flush.rs`'s `build_table` walks an immutable memtable end to end to build its SST. A
+short scan is 6.7× cheaper and every other read is between 1.06× and 1.31× cheaper. An insert is
+**1.2× to 1.8× dearer** — 181 ns against 317 ns sequentially — which is what addressing an arena
+by offset costs against dereferencing a pointer, and it is the thing left on the table. Two
+resolutions per key comparison is the floor for a separate byte arena and word arena; below it is
+`LevelDB`'s layout, with the key bytes inside the node's own allocation, which is a redesign.
+
+**The `unsafe` is checked, and it could not have been before.** Miri passes over the arena, the
+skiplist and the concurrency test, and against a deliberately `Relaxed` publishing store it
+reports the data race that a missing `Release` is — item 3's red-first requirement, discharged.
+What was not expected: the memtable's tests could never have been run under Miri at all while
+`crossbeam-skiplist` was in the graph. Stacked Borrows rejects `crossbeam-epoch`'s `&*local_ptr`
+and Tree Borrows rejects `crossbeam-skiplist`'s own `dealloc`, so the run aborts inside a
+dependency before reaching any code of ours. Item 5 was unpassable as written, and nobody had
+tried it.
+
 ## Status of this ADR
 
-Accepted and built. `docs/plans/phase-11-engine.md` §6 records that the lane which wrote this ADR
+Accepted, built and measured. `docs/plans/phase-11-engine.md` §6 records that the lane which wrote this ADR
 stopped here deliberately and did not write a line of the code; the code arrived later, and the
 five corrections above are what the writing of it found.
 
