@@ -57,6 +57,7 @@ pub mod pd_remote;
 pub mod peer;
 pub mod raft_log;
 pub mod rawkv;
+pub mod reclaim;
 pub mod region;
 pub mod regions;
 pub mod server;
@@ -121,8 +122,25 @@ pub mod raft_cf {
     /// and one grave.
     pub const RETIRING: u8 = b'R';
 
+    /// `'D' ++ start_key` → a key range this store is reclaiming for a dropped database, and how
+    /// far it has got ([`crate::reclaim`],
+    /// [ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    ///
+    /// The only prefix here whose key is **not** a region id: a dropped tenant's range is part of
+    /// one region or spans several, so the record is keyed by the range's own start. Upper case
+    /// for [`RETIRING`]'s reason — it is not a record of something this store has, it is one of
+    /// something it is still getting rid of.
+    pub const RECLAIMING: u8 = b'D';
+
     /// Every prefix this column family uses.
-    pub const ALL: [u8; 5] = [LOG_ENTRY, STATE, METADATA, PENDING_SNAPSHOT, RETIRING];
+    pub const ALL: [u8; 6] = [
+        LOG_ENTRY,
+        STATE,
+        METADATA,
+        PENDING_SNAPSHOT,
+        RETIRING,
+        RECLAIMING,
+    ];
 }
 
 /// A region is split once it grows past this many bytes (`docs/DESIGN.md` §14).

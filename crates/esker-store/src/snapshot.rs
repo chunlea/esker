@@ -510,7 +510,7 @@ pub fn key_counts(
 /// Every family, because the question this answers is "is this range empty" and a range that is
 /// empty in `default` and not in `write` is not empty. Every physical namespace too, for the same
 /// reason: a user key reaches the engine as `'r' ++ key` or as `'x' ++ enc(key) ++ !ts`.
-fn first_key_in_user_range(
+pub(crate) fn first_key_in_user_range(
     db: &Db,
     start: &[u8],
     end: &[u8],
