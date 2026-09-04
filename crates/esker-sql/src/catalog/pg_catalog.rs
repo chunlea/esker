@@ -235,7 +235,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 32] = [
+    pub const ALL: [CatalogView; 33] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -403,9 +403,13 @@ impl CatalogView {
                 // above records.
                 CatalogView::PgMatviews => 29,
                 CatalogView::PgStatActivity => 28,
-                // 30: the next free reserved relation id. Two views sharing one resolve to
-                // each other, which is the mistake the note above records.
-                CatalogView::PgLocks => 30,
+                // **31, because 30 is `InformationSchemaDomains`'s.** This view and g1's
+                // domains view were written in parallel and both took 30, which git merged
+                // without a word: the arrays combined cleanly and the id collided. Two views
+                // sharing one resolve to each other, and what it broke was *their* test —
+                // `information_schema.domains` answered no rows — which is the third time this
+                // file has recorded that failure.
+                CatalogView::PgLocks => 31,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
@@ -2296,5 +2300,42 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Uuid => "uuid_in",
         ColumnType::Interval => "interval_in",
         ColumnType::Oid => "oidin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatalogView;
+
+    /// **Every view's reserved relation id is its own**, and this test exists because that has now
+    /// failed three times.
+    ///
+    /// The ids are a hand-maintained table, and two lanes adding a view in parallel cannot see each
+    /// other: the arrays merge cleanly and the numbers collide in silence. Two views sharing an id
+    /// **resolve to each other**, so what breaks is not the new view but some *other* one — which is
+    /// how it was found each time. `pg_views` taking `pg_sequence`'s id turned eight unrelated tests
+    /// red; `pg_locks` taking `information_schema.domains`'s id emptied that view in another lane's
+    /// corpus, and neither lane could have seen it coming.
+    ///
+    /// A duplicated name resolves the same way and costs the same to check, so both are here.
+    #[test]
+    fn no_two_views_share_a_relation_id_or_a_name() {
+        let mut by_id: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
+        let mut by_name: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for view in CatalogView::ALL {
+            let (id, name) = (view.id(), view.name());
+            // `insert` hands back what was there **before**, which is the other view's name. Read
+            // the map after inserting and the message names the new view twice, which is a
+            // failure that tells you nothing about who it collided with.
+            if let Some(other) = by_id.insert(id, name) {
+                panic!(
+                    "{name} and {other} both reserve relation id {id}; they resolve to each other"
+                );
+            }
+            if let Some(other) = by_name.insert(name, id) {
+                panic!("two views are both named {name}, with ids {id} and {other}");
+            }
+        }
+        assert_eq!(by_id.len(), CatalogView::ALL.len());
     }
 }
