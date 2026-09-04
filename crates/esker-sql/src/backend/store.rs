@@ -105,6 +105,9 @@ impl StoreBackend {
             locks: Arc::clone(&self.locks),
             id,
             held: Vec::new(),
+            validating: false,
+            read_keys: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            read_ranges: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -185,6 +188,12 @@ struct StoreTxn {
     id: u64,
     /// The keys this transaction has locked, so they can all be given back at once.
     held: Vec<Vec<u8>>,
+    /// Whether this transaction's reads are recorded for commit-time validation (ADR 0062).
+    validating: bool,
+    /// The keys it has read, and the ranges it has scanned. Behind `RefCell` because a read takes
+    /// `&self` — a read is not a mutation of the database, and it *is* a mutation of the read set.
+    read_keys: std::cell::RefCell<std::collections::BTreeSet<Vec<u8>>>,
+    read_ranges: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 /// **A lock dies with its transaction, including the way out nobody writes down.**
@@ -214,6 +223,31 @@ impl StoreTxn {
         self.inner
             .take()
             .ok_or_else(|| SqlError::Internal("a transaction ended twice".into()))
+    }
+
+    /// Records a key this transaction read, when it is recording at all.
+    ///
+    /// **The catalog is excluded**, and that is a correctness statement rather than a saving: every
+    /// statement reads the catalog, so validating it would make every concurrent `CREATE TABLE` a
+    /// serialization failure for every transaction in flight (ADR 0062 §1). The decision is here,
+    /// in the SQL layer, because the client is byte-opaque (`CLAUDE.md` invariant 7).
+    fn record_key(&self, key: &[u8]) {
+        if !self.validating || key.first() == Some(&esker_keys::prefix::META) {
+            return;
+        }
+        if let Ok(mut keys) = self.read_keys.try_borrow_mut() {
+            keys.insert(key.to_vec());
+        }
+    }
+
+    /// The same for a range a scan walked, which is what makes a phantom visible.
+    fn record_range(&self, start: &[u8], end: &[u8]) {
+        if !self.validating || start.first() == Some(&esker_keys::prefix::META) || start >= end {
+            return;
+        }
+        if let Ok(mut ranges) = self.read_ranges.try_borrow_mut() {
+            ranges.push((start.to_vec(), end.to_vec()));
+        }
     }
 
     /// Gives back every row lock this transaction took on this node.
@@ -350,11 +384,30 @@ impl Txn for StoreTxn {
             .unwrap_or_default()
     }
 
+    fn validate_reads(&mut self, on: bool) {
+        self.validating = self.validating || on;
+    }
+
+    /// **The question ADR 0066 added, asked** — the store path's answer is exact now.
+    ///
+    /// One round trip per locked key per statement, and only for a write statement under READ
+    /// COMMITTED whose lock was taken without waiting: the writer in front may have committed and
+    /// released between this statement's read and its lock, and a lock taken at once cannot say.
+    fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
+        let txn = self.open()?;
+        Ok(txn
+            .latest_commit(key)
+            .map_err(translate)?
+            .is_some_and(|newest| newest > txn.reading_ts()))
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.record_key(key);
         self.open()?.get(key).map_err(translate)
     }
 
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
+        self.record_range(start, end);
         self.open()?.scan(start, end, limit).map_err(translate)
     }
 
@@ -374,7 +427,25 @@ impl Txn for StoreTxn {
     }
 
     fn commit(mut self: Box<Self>) -> Result<Option<u64>> {
-        self.take()?.commit().map_err(translate)
+        // **The read set is handed over here, at the last moment**, because a transaction records
+        // right up to its commit and the client only needs it once (ADR 0062 §1).
+        let keys: Vec<Bytes> = self
+            .read_keys
+            .borrow()
+            .iter()
+            .map(|key| Bytes::copy_from_slice(key))
+            .collect();
+        let ranges: Vec<(Bytes, Bytes)> = self
+            .read_ranges
+            .borrow()
+            .iter()
+            .map(|(start, end)| (Bytes::copy_from_slice(start), Bytes::copy_from_slice(end)))
+            .collect();
+        let mut inner = self.take()?;
+        if !keys.is_empty() || !ranges.is_empty() {
+            inner.checking(keys, ranges);
+        }
+        inner.commit().map_err(translate)
     }
 
     fn rollback(mut self: Box<Self>) -> Result<()> {

@@ -539,7 +539,20 @@ fn a_prewrite_conflict_ends_the_transaction() {
         }
         other => panic!("expected a conflict, got {other:?}"),
     }
-    assert_eq!(transport.call_count(), 1, "it stopped at the primary");
+    // **Two calls: the prewrite that lost, and the rollback that takes its lock back.** It still
+    // stops at the primary — no secondary is prewritten after a conflict — and it no longer leaves
+    // a live lock behind for a reader to wait out. A loser that cleans up after itself is what a
+    // real server does when it aborts, and it stopped being a rare path when SERIALIZABLE began
+    // refusing commits on purpose (ADR 0062).
+    assert_eq!(
+        transport
+            .calls()
+            .iter()
+            .map(|call| call.request.method())
+            .collect::<Vec<_>>(),
+        vec![Method::TxnPrewrite, Method::TxnRollback],
+        "it stopped at the primary and gave its lock back"
+    );
 }
 
 /// Which key lost, in a batch where only one did.
