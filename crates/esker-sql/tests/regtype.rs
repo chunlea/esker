@@ -36,14 +36,6 @@ const PG_TYPEOF: &str = "`pg_typeof` is not implemented at all, so this is `0A00
      function rather than a wrong type — the honest answer under contract C2. Several of these \
      lines would *prove* the `regtype`-is-`text` divergence above if the function existed.";
 
-/// Names with quoting or a schema on them.
-const NAME_SYNTAX: &str = "**A type name is parsed, not compared.** PostgreSQL reads \
-     `'\"int4\"'::regtype` and `'pg_catalog.int4'::regtype` with its own name grammar — quoting \
-     suppresses the alias folding, so `'\"int4\"'` is 23 and `'\"integer\"'` is `42704`, and a \
-     schema qualifier is stripped when it is `pg_catalog`. This node lower-cases and looks the \
-     whole string up, so every one of these is `42704`. It closes when the name is tokenised \
-     rather than matched.";
-
 /// The other direction: an OID back to a name.
 const REVERSE: &str = "**The reverse direction answers now** — `t.typelem::regtype` is how \
      `ActiveRecord` reads what an array type is over, which is the caller this half never had — \
@@ -131,9 +123,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              'time with time zone'::regtype::oid",
             NO_SUCH_TYPE,
         ),
-        ("SELECT '\"int4\"'::regtype::oid", NAME_SYNTAX),
-        ("SELECT '\"varchar\"'::regtype::oid", NAME_SYNTAX),
-        ("SELECT 'pg_catalog.int4'::regtype::oid", NAME_SYNTAX),
         (
             "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \
              'jsonb'::regtype, 'interval'::regtype",
