@@ -235,7 +235,7 @@ fn write_skew_is_caught_with_a_savepoint_open() {
 /// statement the client had already been told succeeded.
 ///
 /// Measured against the suite rather than reasoned:
-/// `transaction_nested_test.rb`'s *"SerializationFailure inside nested SavepointTransaction is
+/// `transaction_nested_test.rb`'s *"`SerializationFailure` inside nested `SavepointTransaction` is
 /// recoverable"* asserts the raise around the **inner** block, so a `40001` at `COMMIT` arrives
 /// after the assertion has already failed. That test is why this exists, and it is the shape the
 /// savepoint-forward fix did **not** close.
