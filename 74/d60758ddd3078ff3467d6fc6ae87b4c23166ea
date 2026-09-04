@@ -1,0 +1,23 @@
+crates/esker-sql/src/exec/subquery.rs
+  s_2bed4ac2b1c944::t_44fdbe7f8b60ef 403-418
+crates/esker-sql/tests/row_locking.rs
+  s_2bed4ac2b1c944::t_43f3c58be288b2 224-256
+docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md
+  s_2bed4ac2b1c944::t_05216cf1b07f3c 312-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "74d60758ddd3078ff3467d6fc6ae87b4c23166ea",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
