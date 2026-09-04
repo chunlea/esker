@@ -1,0 +1,44 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 3611-3620
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 845-858,2147-2150,2522-2524,2616-2617,2693-2698
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 235,770,985,1072
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 3109-3232,4415-4424,4460-4462
+crates/esker-sql/src/exec/foreign_key.rs
+  h_44076b318daf9c 365
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 790,1778-1808,2762
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 655-680,2357-2361
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 314-330
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 38,112-113,211,274
+crates/esker-sql/tests/add_column_not_null.rs
+  h_44076b318daf9c 1-45
+crates/esker-sql/tests/corpus/pg19_add_column_not_null.txt
+  h_44076b318daf9c 1-88
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 179-181
+crates/esker-sql/tests/schema_change.rs
+  h_44076b318daf9c 246-249,253,256,258-268
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 85-89
+docs/DESIGN.md
+  h_44076b318daf9c 714-721,895-901,950-951,966-969,978-991
+docs/plans/phase-6e.md
+  h_44076b318daf9c 3,70-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8d3ae82c49cb5686cb08febffadd656a38c08427",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
