@@ -68,7 +68,7 @@ fn every_increment_lands_under_three_concurrent_writers() {
     let landed: i64 = admin.rows("SELECT n FROM rc_conflict WHERE id = 1")[0][0]
         .parse()
         .unwrap();
-    let expected = (WRITERS * ROUNDS * 2) as i64;
+    let expected = i64::try_from(WRITERS * ROUNDS * 2).unwrap();
     assert!(
         other.is_empty(),
         "errors that are not a serialization failure: {other:?}"
