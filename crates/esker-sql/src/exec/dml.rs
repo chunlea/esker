@@ -164,6 +164,7 @@ pub(super) fn column_default_value(
     table: &TableDef,
     column: &crate::catalog::ColumnDef,
     txn: &dyn Txn,
+    tenant: u64,
 ) -> Result<Datum> {
     let Some(expr) = &column.default_expr else {
         return Ok(column.default.clone().unwrap_or(Datum::Null));
@@ -189,6 +190,29 @@ pub(super) fn column_default_value(
             table.name, column.name
         ))
     })?;
+    // **A call to a stored function is inlined here too**, and it has to be: this path parses the
+    // default's text per row and never went through the statement pass that resolves one, so a
+    // default naming a function reached the row evaluator with a call nothing had replaced —
+    // `XX000 … reached the row evaluator unresolved`, which says *this server has a bug* about a
+    // statement a user can write.
+    let mut parsed = parsed;
+    let mut failure = None;
+    let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
+        if let crate::plan::Expr::CatalogFunc(call) = &*expr
+            && call.func == crate::plan::CatalogFunc::UserFunc
+            && let Some(crate::plan::Expr::Literal(crate::plan::Literal::String(name))) =
+                call.args.first().cloned()
+        {
+            match super::inline_user_function(txn, tenant, &name, &call.args[1..]) {
+                Ok(body) => *expr = body,
+                Err(error) => failure = Some(error),
+            }
+        }
+        Ok(())
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let scope = query::Scope::single(table);
     let resolved = query::resolve(&parsed, &scope).map_err(|error| {
         SqlError::Internal(format!(
@@ -339,6 +363,7 @@ fn row_at_defaults(
     targets: &[usize],
     values: &[crate::plan::Expr],
     txn: &dyn Txn,
+    tenant: u64,
 ) -> Result<Vec<Datum>> {
     let supplied: std::collections::BTreeSet<usize> = targets
         .iter()
@@ -354,7 +379,7 @@ fn row_at_defaults(
             if supplied.contains(&at) {
                 return Ok(Datum::Null);
             }
-            column_default_value(table, column, txn)
+            column_default_value(table, column, txn, tenant)
         })
         .collect()
 }
@@ -402,7 +427,7 @@ pub(super) fn insert(
         // into a table whose `id` defaults to a function this node stores and cannot run was
         // `0A000` for a row that never needed the function. `DEFAULT` written for a column is not
         // supplying it — that spelling *asks* for the default — so it is not in this set.
-        let mut row = row_at_defaults(&table, &targets, values, &*txn)?;
+        let mut row = row_at_defaults(&table, &targets, values, &*txn, executor.tenant)?;
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
             // `DEFAULT` written for a column is the column keeping its own default, which is what
@@ -609,7 +634,7 @@ fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<
                 at.table.columns[at.ordinal].ty,
                 at.executor.next_sequence_value(sequence.id)?,
             ),
-            None => column_default_value(at.table, at.column, at.txn),
+            None => column_default_value(at.table, at.column, at.txn, at.executor.tenant),
         },
         // An enum column takes a label, so the literal keeps its own type here and `into_column`
         // reads it against the enum rather than against the `int2` the row holds.

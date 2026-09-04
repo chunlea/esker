@@ -3,7 +3,9 @@
 **Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
 list — three items that were reported as open turned out to be closed, and two that were not on the
 list are open (#5 and #8). Two more were opened and closed within a wave and are gone from this
-table; §2 records both. Each row names its site, a size, and who it belongs to.
+table, and **#7 has since been diagnosed and closed out of it**; §2 records all three. The numbers
+are quoted across lanes, so a closed row leaves a gap rather than renumbering the rows after it.
+Each row names its site, a size, and who it belongs to.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -20,7 +22,6 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 | 4 | **Cross-node deadlock detection.** The wait-for graph is node-local, which covers every deadlock two sessions of one `esker-sql` process can make. A cycle *across* nodes needs a graph both can see. Named in the code as a follow-on, and PD's job. | `crates/esker-sql/src/backend/locks.rs:46` | large — needs a PD-held graph | PD / pdha |
 | 5 | **`crash_through_the_client` starves under load.** Fails 6 runs in 10 under 24 spinning threads **in one container**, so it is not the network-namespace contention the harness fix addressed. It is **not a durability failure**: the round's own guard `acked > 0` fires, and the durability assertion at `:311` fired in none of the six. The child is killed on a **wall clock** while the writes it should interrupt are CPU-bound. | `crates/esker-client/tests/crash_through_the_client.rs:331` (c6's record says `:305`; the file has moved) | small — measure the kill point in acknowledged writes, or retry a round that acked none | client |
 | 6 | **`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`.** Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it as a standing flake with an owner and treats the exclusive pass as evidence it is the same contention rather than a defect of its own. | `crates/esker-cli/tests/cluster_start.rs` | small, and may be closed by the per-container network namespaces | cli |
-| 7 | **`esker-sql::join_cost::a_materialised_join_costs_what_it_pairs_and_not_the_cross_product`.** One failure in a full 3,281-test parallel run; 3/3 in isolation and green on the next two full runs. A timing-**ratio** test with a control, so load-sensitive by construction. Unexplained, not diagnosed. | `crates/esker-sql/tests/join_cost.rs` | small to diagnose; unknown to fix | h1 (join cost) |
 | 8 | **The Miri gate needs `-Zmiri-disable-isolation`, which the code could make unnecessary.** proptest's default `FileFailurePersistence` calls `std::env::current_dir` to place a `.proptest-regressions` file, and Miri refuses `getcwd` under isolation, so the run aborts with 22 tests unrun. Setting `failure_persistence: None` under `cfg(miri)` in the memtable's `ProptestConfig` would make the plain documented command true — and matters because the failure looks like the gate *failing* rather than the gate *not running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state the flag. | `crates/esker-engine/src/memtable/differential.rs:316` (`ProptestConfig::with_cases`) | ~3 lines | engine |
 
 ## 2. Reported as open, and closed on inspection
@@ -54,6 +55,40 @@ keystroke — an alias — changes the answer, which is what makes an enum the s
 Only a projection whose derived name is not its own column's is substituted, which is the whole of
 what differs and leaves every aggregated query on the path it was already taking.
 `tests/order_by_output_column.rs`.
+
+### #7 `join_cost` — **closed by c7's diagnosis and a change to the test's shape**
+
+Recorded as "unexplained, not diagnosed": one failure in a full parallel run, 3/3 in isolation.
+`docs/plans/debt-c7.md` §7 made it deterministic instead of counting runs — green at load 0, **red
+at 14**, green again at 40 and 80. Non-monotonic, so a race in the *measurement*, and the cost
+model was never in question.
+
+The test took its four cells strictly in sequence — subject small, subject large, then control
+small, control large — so **the control was measured after the subject rather than beside it**, and
+load arriving or departing between the arms moved `growth` and `control` independently. Cancelling
+load common to both arms is the one thing a control is for.
+
+**The first reshape fixed that and still could not see the bug**, which is what the red-first run
+found before it landed. Disabling the inner-side grouping so a materialised join is a cross product
+again, the test **passed in 131 seconds**:
+
+| | subject ÷ control at 1,000 | at 8,000 | growth ÷ growth |
+|---|---:|---:|---:|
+| grouped | 3.3 | 2.8 | 0.9 |
+| cross product | 130 | 321 | **2.9** (bound 3.0) |
+
+Two facts no amount of reading would have produced. **The cross product is already fully visible at
+the small size**, so a growth term carries only the extra eight-fold rather than the fault. And
+**`count(*)` is not linear across these sizes** — it grew 26x for 8x the rows — so dividing by its
+growth removed most of what was left.
+
+So what is asserted is the **level, not the growth**: at each size, the median over five rounds of
+one *adjacent* pair — the join, then a scan of the same rows — must be under twenty scans. It needs
+nothing to be linear, only that a scan and a join of the same rows meet the same machine. Measured
+on both sides: **3.3 and 2.8 scans grouped, 130 and 321 as a cross product**, and the red-first run
+now fails at **163.8 scans in 2.6 seconds** where it used to pass in 131. Both sizes are still
+measured, smallest first, because a plan that is linear at one size and quadratic at the next is
+what one size cannot see. `tests/join_cost.rs`.
 
 ## 3. ADR numbering
 

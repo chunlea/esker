@@ -878,6 +878,17 @@ pub enum CatalogFunc {
     /// `SELECT 'happy'::mood` prints `happy`; **the ordinal** everywhere else, so
     /// `'sad'::mood < 'happy'::mood` is `1 < 3` and is `t`.
     UserCast,
+    /// A call to a function **the catalog holds**, carried for the executor.
+    ///
+    /// Lowering has no catalog, so a name its own vocabulary lacks cannot be told from a user's
+    /// `CREATE FUNCTION` — the same seam `UserCast` and `UserRegType` sit on, and the same one a
+    /// column `DEFAULT` naming a function already uses. The first argument is the name as a
+    /// string literal; the rest are the call's own arguments.
+    ///
+    /// It never reaches the row evaluator: `crate::exec::Executor::resolve_user_function`
+    /// replaces it with the body's expression, or raises the `0A000` naming it that lowering used
+    /// to raise directly.
+    UserFunc,
     /// `to_regclass('name')`: the relation of that name, or **NULL** where a bare reference would
     /// raise `42P01`.
     ///
@@ -1080,6 +1091,8 @@ impl CatalogFunc {
     pub fn name(self) -> &'static str {
         match self {
             CatalogFunc::FormatType => "format_type",
+            // The user's own name is in the call's first argument; this is what it is *called*.
+            CatalogFunc::UserFunc => "a user-defined function",
             CatalogFunc::PgGetExpr => "pg_get_expr",
             CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::PgGetConstraintdef => "pg_get_constraintdef",
@@ -1147,6 +1160,11 @@ impl CatalogFunc {
     #[must_use]
     pub fn arities(self) -> &'static [usize] {
         match self {
+            // **Checked against the function's own declaration, not here.** The name is argument
+            // zero and the user's arguments follow, so the count this carrier takes is whatever
+            // was written — `crate::exec::Executor::resolve_user_function` is where a wrong one is
+            // answered, because only the catalog knows how many the function has.
+            CatalogFunc::UserFunc => &[1, 2, 3, 4, 5, 6, 7, 8],
             CatalogFunc::FormatType
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
@@ -1216,7 +1234,11 @@ impl CatalogFunc {
     #[must_use]
     pub fn result_type(self) -> ColumnType {
         match self {
-            CatalogFunc::FormatType
+            // **`UserFunc` is never evaluated and never typed** — it is replaced by the body's
+            // expression before anything asks — so it joins the text-returning group rather than
+            // claiming an answer of its own.
+            CatalogFunc::UserFunc
+            | CatalogFunc::FormatType
             | CatalogFunc::PgGetExpr
             | CatalogFunc::PgGetIndexdef
             | CatalogFunc::PgGetConstraintdef

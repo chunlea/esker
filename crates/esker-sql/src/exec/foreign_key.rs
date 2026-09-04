@@ -216,7 +216,7 @@ pub(super) fn cascade_update(
         };
         // `CASCADE` follows the parent's new key; `SET NULL` and `SET DEFAULT` write their own
         // value instead and do not.
-        let after = match written_by(txn, &child, &key, key.on_update)? {
+        let after = match written_by(txn, executor.tenant, &child, &key, key.on_update)? {
             Some(values) => values,
             None => referenced_values(&key, new).unwrap_or_default(),
         };
@@ -269,7 +269,7 @@ fn cascade_delete(
         // `SET NULL` and `SET DEFAULT` keep the child row and clear what pointed at the parent.
         // Nothing recurses: the child's **own** key is untouched, so its children still point at
         // a row that is exactly where it was.
-        if let Some(values) = written_by(txn, &child, &key, key.on_delete)? {
+        if let Some(values) = written_by(txn, executor.tenant, &child, &key, key.on_delete)? {
             let mut written = super::Written::default();
             for old_child in referencing {
                 let mut new_child = old_child.clone();
@@ -305,6 +305,7 @@ fn cascade_delete(
 /// not there is `23503` from the `DELETE`, which is what a real server answers.
 fn written_by(
     txn: &dyn Txn,
+    tenant: u64,
     child: &TableDef,
     key: &ForeignKeyDef,
     action: catalog::ReferentialAction,
@@ -326,7 +327,7 @@ fn written_by(
                             child.name
                         ))
                     })?;
-                    super::dml::column_default_value(child, column, txn)
+                    super::dml::column_default_value(child, column, txn, tenant)
                 })
                 .collect::<Result<Vec<_>>>(),
         ),

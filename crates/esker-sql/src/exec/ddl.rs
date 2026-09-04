@@ -336,16 +336,27 @@ fn refuse_unknown_default_function(
     let Some(text) = &column.default_expr else {
         return Ok(());
     };
-    let Err(error) = crate::parse::parse_stored_expr(text) else {
-        return Ok(());
-    };
-    let Some(name) = crate::parse::lower::unsupported_function_name(&error) else {
-        return Err(error);
-    };
-    if catalog::function(txn, executor.tenant, name)?.is_some() {
-        return Ok(());
+    let mut parsed = crate::parse::parse_stored_expr(text)?;
+    // **The call is looked for, not a parse failure.** Lowering carries an unknown name out as a
+    // `UserFunc` rather than raising, so the parse now succeeds for a name nobody declared — and
+    // this asked whether it had failed. Second detector of this shape in one change: making a name
+    // resolvable breaks everything that recognised it by *failing to resolve* it.
+    let mut missing = None;
+    let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
+        if let plan::Expr::CatalogFunc(call) = &*expr
+            && call.func == plan::CatalogFunc::UserFunc
+            && let Some(plan::Expr::Literal(plan::Literal::String(name))) = call.args.first()
+            && missing.is_none()
+            && catalog::function(txn, executor.tenant, name)?.is_none()
+        {
+            missing = Some(name.clone());
+        }
+        Ok(())
+    });
+    match missing {
+        Some(name) => Err(SqlError::unsupported(format!("the function {name}"))),
+        None => Ok(()),
     }
-    Err(error)
 }
 
 /// The `TypeKind` of a column's user type when it is a **domain**, and `None` otherwise.
@@ -1913,10 +1924,28 @@ fn default_naming(
             let Some(text) = &column.default_expr else {
                 continue;
             };
-            let Err(error) = crate::parse::parse_stored_expr(text) else {
+            let Ok(mut parsed) = crate::parse::parse_stored_expr(text) else {
                 continue;
             };
-            if crate::parse::lower::unsupported_function_name(&error) == Some(function) {
+            // **The call is looked for, not a parse failure.** This asked whether the expression
+            // *failed to parse* naming the function, which was true only while a stored function
+            // could not be resolved at all — the moment one could be, every default stopped
+            // looking like a dependency and `DROP FUNCTION` took the function out from under a
+            // table whose every insert then failed. The dependency is a call in the tree, and
+            // that is what this now reads.
+            let mut names_it = false;
+            let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
+                if let plan::Expr::CatalogFunc(call) = &*expr
+                    && call.func == plan::CatalogFunc::UserFunc
+                    && let Some(plan::Expr::Literal(plan::Literal::String(named))) =
+                        call.args.first()
+                    && named == function
+                {
+                    names_it = true;
+                }
+                Ok(())
+            });
+            if names_it {
                 return Ok(Some((column.name.clone(), table.name.clone())));
             }
         }
