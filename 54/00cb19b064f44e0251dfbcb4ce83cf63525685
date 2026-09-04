@@ -1,0 +1,18 @@
+crates/esker-engine/src/memtable.rs
+  h_44076b318daf9c 31-32
+crates/esker-engine/src/memtable/differential.rs
+  h_44076b318daf9c 1-442
+crates/esker-engine/src/memtable/skiplist.rs
+  h_44076b318daf9c 55,118-121,155-174,178-189,376-380,466,491-497,511-514,519,669,698,712
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5400cb19b064f44e0251dfbcb4ce83cf63525685",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
