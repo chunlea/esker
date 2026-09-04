@@ -1599,3 +1599,77 @@ deliberately *not* `42501` (`DROP INDEX` is `42809`, `CREATE TABLE` is `42P07`).
 | **`'<name>'::regtype` over a type the catalog made** — run 70's `type "…" does not exist`, `color` 3 tests and `mood` 2 | **done**, and the ranking row was not a missing type: both names are enums that are *in* `pg_type`, and the call that fails is `ActiveRecord`'s `lookup_cast_type` writing `SELECT '<sql_type>'::regtype::oid` (`connection_adapters/postgresql/quoting.rb:192`). Lowering resolved that name against `ColumnType::ALL` and nothing else, so a type a `CREATE TYPE` made was `42704` — the same shape a cast *to* a user type had before ADR 0053, and it takes the same answer: the name is **carried** to the executor and resolved in the pass that already reads the catalog once per statement. **Two halves, and only one of them can be answered without a `regtype` type.** A real `regtype` is an oid that *prints* as a name; this node has neither, so `'mood'::regtype` is the name as text and `'mood'::regtype::oid` is the number `pg_type` reports — and the number is the half `ActiveRecord` writes. ADR 0053's projection rule (*the label in a projection, the ordinal everywhere else*) was **tried here and is wrong**: `'mood'::regtype::text` sits outside a projection and still wants the name, so position does not decide it. What is left declared is `WHERE enumtypid = 'mood'::regtype`, which wants the oid from a position that cannot say so — the same statement `pg19_do_create_enum.txt` has on `SWALLOWING_DEBT`. Two things fell out on the way: `::regtype::oid` folded to a `bigint` where `'23'::oid` has been a real `ColumnType::Oid` since that type's own unit — the two spellings had drifted — and a **quoted** name (`'"mood"'::regtype`) needed the identifier rule `::regclass` already has, keeping its case where an unquoted one folds. 22 statements, 2 answers declared and none type-only | this commit |
 | **`bit(n)` and `bit varying(n)`** — run 71's `type "…" does not exist`, 6 tests in `bit_string_test.rb` | **done.** One representation and two types, the shape `inet`/`cidr` has: `B'101'::bit varying = B'101'::bit(3)` is `t`, so the value carries which of the two it is and the flag sits in the row and not in the key. **The length rule is the whole type and a cast and an assignment disagree** — `'101'::bit(8)` is `10100000`, padded on the **right**, and `'101010101'::bit(4)` is `1010`, while the same values *assigned* to those columns are `22026 bit string length 3 does not match type bit(8)` and `22001 bit string too long for type bit varying(4)`. `fit_to_typmod` serves both paths here, so it does the **cast's** rule and the three refusals are declared: a refusal where a real server pads is the worse of the two wrong answers. **A bare `bit` column is `bit(1)`** and a bare `bit varying` has no length, and the two catalog views disagree on purpose — `format_type` says `bit(1)` where `information_schema.data_type` says `bit` with the 1 in `character_maximum_length` beside it. The typmod **is** the length, unlike a `varchar`'s length-plus-header. **`0xF` is not a bit string**: `'0xF'::bit(4)` is `22P02 "x" is not a valid binary digit` on a real server — the message names the *character* — and `bit_string_test.rb`'s `"0xF"` is converted by `ActiveRecord` before the statement exists, which is why that assertion passes there. The default reads back `'00000011'::"bit"`, quoted, because `bit` is reserved. **One wrong answer found**: `min(bit)`/`max(bit)` **answered** where a real server raises `42883` — the seventh member of the list ADR 0031 turned into a rule, *the aggregate set is per type and cannot be derived from whether the type is ordered*. 71 statements, 6 answers declared — the `B'…'` and `x'…'` literals, `integer -> bit`, `length`/`octet_length`, the bitwise operators and the shifts, one unit and none of it in the suite — and 8 type-only, the catalog trade plus the standing one where a typmod does not survive a cast | this commit |
 | **The six geometric shapes** — `lseg`, `box`, `path`, `polygon`, `circle`, `line`; run 71's row, 9 tests in `geometric_test.rb` | **done**, and it is six types because the file declares five in one `create_table` and `line` in a table of its own. **The canonicalisation is the subject, not the storage**: the file inserts every value *twice*, in two different spellings, and asserts one answer — so what had to be measured is what each type *writes*, not what it reads. Six types share **one representation**, the canonical text, the road `hstore` and the ranges take, because the canonical form is a function of the content. **A `box` reorders its corners** — upper right first, whatever order it was given — which the suite has a comment on and which nothing else would suggest. **A `path`'s bracket is data**: `[…]` open, `(…)` closed, a bare point list closed, and `isopen`/`isclosed` read exactly that character. A `circle` takes four input spellings and writes `<(x,y),r>`. `{0,0,0}` is `22P02 invalid line specification: A and B cannot both be zero`, its own sentence, and `poly_in` is the input function's name where `polygon_in` would be the guess. **Two wrong answers found, both of the worst class.** `CREATE INDEX` on one gave this node's `0A000` where a real server gives the same `42704 … has no default operator class` that `json` and `point` get — the list that started as "exactly two, measured" is eight now and every one of them was probed. And `count(DISTINCT a_line_segment)` **answered `1`** where PostgreSQL raises `42883 could not identify an equality operator for type lseg` — which is not "operator does not exist": `'…'::lseg = '…'::lseg` is `t`, and `DISTINCT` needs an equality *operator class* that the `=` is not a member of. 45 statements, 1 answer declared — `typarray` is `0` for all six, the named no-array gap `floatrange[]` already has — and 2 type-only | this commit |
+
+---
+
+## Unit 9 (planned, **blocked on a ruling**): `changed_since_statement` on the store path
+
+`docs/plans/debts-v1.md` #1 and #2. Written before any code, because the answer to the first
+question decides whether there is code to write at all.
+
+### What the store has to answer
+
+After a statement takes a row lock **without waiting**, one question decides whether it may keep the
+value it already read: *has this key a committed version newer than the statement's read timestamp?*
+A lock taken at once is not proof that nothing moved — the writer in front may have committed **and
+released** between this statement's read and its lock. `MemoryTxn` answers it with
+`written_since(key, statement_ts)`, and that check is what turned ~100 spurious `40001`s in 1,200
+transactions into zero (run 66's shrink).
+
+### Can it be asked over the wire today? **No.**
+
+* `TxnKvResp::Get` carries `{ value }` and nothing else. There is no timestamp in it.
+* The `TxnKv` methods are `Get`, `Scan`, `Prewrite`, `Commit`, `Rollback`, `ResolveLock`,
+  `Heartbeat`, `GcSafepoint`. None returns a version.
+* **The store already computes the answer** — `TxnSnapshot::newest_write_after(key, ts)`
+  (`crates/esker-txn/src/snapshot.rs:69`), which is exactly what `check_prewrite` calls at
+  `percolator.rs:385`. The primitive is there; only the wire cannot carry the question.
+
+So this needs a **wire change**, and per `CLAUDE.md` that is the human's call — which is why this
+section stops here.
+
+**It is a smaller ask than tags 3/4/5 were, in a way worth stating: it is read-only.** A question
+about the newest write is not a replicated command, so there is **no Raft log change** and no
+`TxnWrite` variant. Existing messages keep their bytes; an older peer meets an unknown method and
+refuses, exactly as it does an unknown tag.
+
+### The three shapes, and what each costs
+
+1. **A new read method** — `TxnKvReq::CommittedAfter { key, ts }` → `TxnKvResp::CommittedAfter {
+   newest: Option<u64> }`. Exact. One round trip per locked key per statement, and only for a
+   *write* statement under READ COMMITTED whose lock was taken without waiting. The store side is
+   three lines over a primitive that already exists.
+2. **Two `Get`s and a value comparison** — read at the statement's snapshot, read at a fresh one,
+   and call them changed if the bytes differ. **No wire change**, and it is the option this plan
+   recommends *against*: it misses a rewrite to identical bytes, so the residual case still ends in
+   a `40001` at commit; it needs a fresh timestamp and so a TSO call as well as the extra read; and
+   a read at a fresh timestamp can meet a live lock and turn a cheap check into a resolve. It buys
+   most of the benefit by putting a silent approximation in a correctness-adjacent path, which is
+   the trade this project has refused everywhere else.
+3. **Fold it into unit 8b's lock message.** ADR 0062's store path needs a cluster-wide lock, and a
+   real one — TiKV's `AcquirePessimisticLock` is the shape — **returns the newest commit on the key
+   as part of acquiring it**, because that is what the caller needs to decide whether to re-run.
+   One wire change instead of two, and the same message answers both units.
+
+**Recommendation: 3 if unit 8b is approved, 1 if it is not, and never 2.** If the tag-6 ruling comes
+back yes, this unit is a field on a message that is being added anyway; if it comes back no, option 1
+is a self-contained read method that can land alone.
+
+### What lands when it is approved
+
+* `StoreTxn::changed_since_statement` calls it, and the answer is exact.
+* Debt #2 needs **no code**: `savepoint::Recording` already forwards `changed_since_statement`
+  (landed with the ADR 0062 savepoint fix). #2 is #1's consequence under a savepoint and closes with
+  it.
+* Tests in the shape unit 7 used — `tests/store_locking.rs`, three real stores over real sockets: a
+  writer whose lock is free but whose value is stale must **re-run** rather than answer `40001`, and
+  the same with a savepoint open. The distinguishing assertion is the one unit 5 taught: assert the
+  outcome only the intended mechanism can produce, not the final value, which a lost update also
+  produces.
+* The measure: `transaction_nested_test.rb`'s two cases against a store-backed node, and the
+  spurious-`40001` count in the three-writers probe run against a cluster rather than in process.
+
+### What it does not close
+
+Cross-node deadlock (debt #4) is untouched by this: it needs a graph both nodes can see, which is
+PD's.
