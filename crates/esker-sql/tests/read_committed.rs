@@ -392,3 +392,54 @@ fn the_isolation_level_is_a_session_setting() {
     ));
     node.run("COMMIT").unwrap();
 }
+
+/// **A statement with no transaction block of its own waits too — and its wait must not reach the
+/// client.**
+///
+/// The restart loop ADR 0057 built lives in the *open-block* branch, so every test above sends a
+/// `BEGIN` before the statement that waits. `ActiveRecord` does not: `update_attribute`,
+/// `increment!` and `touch` are single statements in autocommit, and two workers touching one row
+/// is the ordinary case rather than the exotic one.
+///
+/// What a client saw is the signal itself. `SqlError::StatementMustRestart`'s own comment says it
+/// "reaches a client only if something forgot to catch it, which is exactly an internal error" —
+/// and `XX000` is what an autocommit writer got the moment the transaction in front of it
+/// committed. PostgreSQL answers `UPDATE 1`.
+#[test]
+fn a_waiter_with_no_block_of_its_own_waits_and_then_writes() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A's write is buffered");
+        reached(&b_says, "B is about to write");
+        // No `BEGIN`: one statement, its own transaction, and it blocks on A's lock exactly as a
+        // statement inside a block does.
+        b.run("UPDATE rc SET n = n + 100 WHERE id = 1")
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE rc SET n = n + 1 WHERE id = 1").unwrap();
+    reached(&a_says, "A's write is buffered");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("COMMIT").unwrap();
+
+    waiter
+        .join()
+        .unwrap()
+        .expect("an autocommit UPDATE must wait for A and then write, not report a signal");
+
+    let mut reader = pair.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM rc WHERE id = 1"),
+        [["111"]],
+        "the arithmetic is on A's committed version"
+    );
+}

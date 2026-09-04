@@ -672,7 +672,6 @@ impl Executor {
 
         let mut txn = self.open_txn()?;
         self.catalog_written = false;
-        let mut written = Written::default();
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
             Err(error) => {
@@ -680,25 +679,53 @@ impl Executor {
                 return Err(error);
             }
         };
-        let outcome = match self.run_recording(&mut *txn, &bound, &mut written) {
-            // **A statement outside a block is its own transaction, so its commit is here** — and
-            // a deferred check runs at every commit, this one included. Measured: the second of
-            // two colliding inserts fails on its own, with the row not written, exactly as an
-            // immediate constraint would refuse it; deferral is a property of the *transaction*,
-            // and an implicit transaction is one statement long.
-            Ok(outcome) => match self.checked_and_committed(txn, &written) {
-                Ok(()) => {
-                    // After the commit, and only after it.
-                    self.report_columnar();
-                    Ok(outcome)
+        // **A statement outside a block waits for a row lock exactly as one inside a block does,
+        // so it needs the same restart** (ADR 0057). Without this loop the signal itself reached
+        // the client as an `XX000`, and the statements that meet it are the ordinary ones:
+        // `update_attribute`, `increment!` and `touch` are single statements in autocommit.
+        //
+        // The restart is a **whole new transaction** rather than the block path's undo-and-re-run,
+        // and that is not a shortcut — an implicit transaction is one statement long, so a fresh
+        // one *is* the re-run, at a fresh read timestamp, holding nothing from the attempt that
+        // waited.
+        let mut attempt = 0;
+        let outcome = loop {
+            let mut written = Written::default();
+            match self.run_recording(&mut *txn, &bound, &mut written) {
+                // **A statement outside a block is its own transaction, so its commit is here** —
+                // and a deferred check runs at every commit, this one included. Measured: the
+                // second of two colliding inserts fails on its own, with the row not written,
+                // exactly as an immediate constraint would refuse it; deferral is a property of
+                // the *transaction*, and an implicit transaction is one statement long.
+                Ok(outcome) => {
+                    break match self.checked_and_committed(txn, &written) {
+                        Ok(()) => {
+                            // After the commit, and only after it.
+                            self.report_columnar();
+                            Ok(outcome)
+                        }
+                        Err(error) => Err(error),
+                    };
                 }
-                Err(error) => Err(error),
-            },
-            Err(error) => {
-                // The rollback's own failure is not what the client asked about; the statement's
-                // error is. Reporting the second would hide the first.
-                let _ = txn.rollback();
-                Err(error)
+                Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                    attempt += 1;
+                    let _ = txn.rollback();
+                    txn = self.open_txn()?;
+                    self.catalog_written = false;
+                }
+                Err(error) => {
+                    // The rollback's own failure is not what the client asked about; the
+                    // statement's error is. Reporting the second would hide the first.
+                    let _ = txn.rollback();
+                    // A statement that restarted this many times is waiting behind a queue that
+                    // keeps refilling, which is a livelock rather than a wait — and the signal is
+                    // never what a client is told.
+                    break Err(if matches!(error, SqlError::StatementMustRestart) {
+                        SqlError::LockTimeout
+                    } else {
+                        error
+                    });
+                }
             }
         };
         self.catalog_written = false;
