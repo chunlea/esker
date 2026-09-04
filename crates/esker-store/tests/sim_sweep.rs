@@ -162,6 +162,16 @@ fn keys_held(store: &Arc<Store>) -> usize {
     held
 }
 
+/// What the orphan probe waits for, mirrored from the private
+/// `esker_store::server::ORPHAN_PROBE_ROUNDS`. A copy, because the constant is not public and the
+/// window below is only meaningful next to it; if the two ever disagree the assertion fires,
+/// which is the failure mode this pair is here to produce rather than to hide.
+const PROBE_ROUNDS: usize = 50;
+
+/// Heartbeat rounds per store beat: `store_heartbeat` 20 ms over `heartbeat_tick` 5 ms, both set
+/// by [`open`]. This is what turns the beats PD received into a count of the rounds that ran.
+const ROUNDS_PER_BEAT: usize = 4;
+
 async fn put(store: &Arc<Store>, region: &Region, k: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -427,8 +437,6 @@ async fn observe(case: &Case) -> Observed {
     // against the 50 the throttle needs — quiet and under forty-eight spinning threads alike, so
     // the margin is real and this assertion is not a flake waiting to happen. It exists to make
     // the erosion loud if it ever starts.
-    const PROBE_ROUNDS: usize = 50; // `esker_store::server::ORPHAN_PROBE_ROUNDS`, which is private.
-    const ROUNDS_PER_BEAT: usize = 4; // store_heartbeat 20 ms / tick 5 ms.
     if !reclaimed_inside_the_window {
         let rounds = (pd.store_beats().len() - beats_before) * ROUNDS_PER_BEAT;
         assert!(

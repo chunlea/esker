@@ -368,7 +368,7 @@ async fn a_write_follows_the_office_when_it_moves() {
         )
         .await
         .unwrap(),
-        esker_proto::RawKvResp::Get {
+        RawKvResp::Get {
             value: Some(Bytes::from_static(b"after"))
         },
         "the write did not reach the store that now leads"
