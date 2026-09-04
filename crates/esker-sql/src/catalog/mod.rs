@@ -2044,6 +2044,18 @@ pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &s
     );
 }
 
+/// Whether any relation of this tenant already answers to that name.
+///
+/// The one check a rename needs: a table, an index, a sequence and a primary key all live in the
+/// same name space, so `RENAME TO` has to ask about all of them and not only about tables.
+///
+/// # Errors
+///
+/// Any failure reading the name key.
+pub fn name_exists(txn: &dyn Txn, tenant: u64, name: &str) -> Result<bool> {
+    Ok(txn.get(&record::name_key(tenant, name))?.is_some())
+}
+
 /// Removes an installed extension. The caller has already checked it is installed and that nothing
 /// depends on it.
 ///
@@ -2203,6 +2215,13 @@ pub fn replace_table(
     previous: &TableDef,
     table: &TableDef,
 ) -> Result<()> {
+    // **And the table's own name**, which `ALTER TABLE … RENAME TO` changes. Same rule, same
+    // reason: `write_table` writes a name record for it, and a rename that left the old key behind
+    // would leave two names pointing at one table — the second of which `DROP TABLE` would not
+    // remove.
+    if previous.name != table.name {
+        txn.delete(&record::name_key(tenant, &previous.name));
+    }
     // **The primary key's name is reconciled here too**, and it has to be: it is a name record
     // like an index's, written by `write_table` and pointing at a relation nothing else owns. A
     // `DROP CONSTRAINT` on the primary key clears the name in the definition, and leaving the key

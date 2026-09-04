@@ -103,13 +103,7 @@ statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY
 
 statement error (0A000)
-ALTER TABLE t RENAME COLUMN a TO b
-
-statement error (0A000)
 ALTER TABLE t ALTER COLUMN a TYPE text
-
-statement error (0A000)
-ALTER TABLE t RENAME TO t2
 
 statement error (0A000)
 ALTER TABLE ONLY t ADD COLUMN c int8

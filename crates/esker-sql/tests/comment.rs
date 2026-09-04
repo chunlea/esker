@@ -26,37 +26,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          = 'cm' ORDER BY i.relname",
     ],
     answers: &[
-        // **`ALTER TABLE … RENAME` and `DROP COLUMN` are not implemented**, so the three
-        // statements below are refused and the five that read `cm2` afterwards cannot find it.
-        // They are kept rather than deleted because of what they measure: a comment is keyed by
-        // the object and not by its name, so it survives a rename and dies with a dropped column.
-        // Here that falls out of where the comment lives — a field of the record the rename
-        // rewrites — so the day those statements land, these entries will start agreeing and this
-        // test will say so.
-        (
-            "ALTER TABLE cm RENAME TO cm2",
-            "ALTER TABLE ... RENAME TO is not implemented",
-        ),
-        (
-            "ALTER TABLE cm2 RENAME COLUMN b TO c",
-            "ALTER TABLE ... RENAME COLUMN is not implemented",
-        ),
-        (
-            "ALTER TABLE cm2 DROP COLUMN c",
-            "ALTER TABLE ... DROP COLUMN is not implemented",
-        ),
-        (
-            "SELECT 'r', col_description('cm2'::regclass, 3)",
-            "the rename that would have made `cm2` is refused above",
-        ),
-        (
-            "SELECT 'r', obj_description('cm2'::regclass, 'pg_class')",
-            "the rename that would have made `cm2` is refused above",
-        ),
-        (
-            "SELECT 'r', obj_description('cm2'::regclass, 'pg_type')",
-            "the rename that would have made `cm2` is refused above",
-        ),
+        // **The six entries that stood here are deleted, and that deletion is the point.** They
+        // covered `ALTER TABLE … RENAME TO`, `RENAME COLUMN` and `DROP COLUMN` and the three reads
+        // of `cm2` that followed, and their own note said what would happen: *the day those
+        // statements land, these entries will start agreeing and this test will say so.* All three
+        // have landed, the harness said so, and ADR 0031's rule 2 makes the deletion a commit.
+        //
+        // What they were measuring now holds for real: a comment is keyed by the **object** and not
+        // by its name, so it survives a rename and dies with a dropped column — which falls out of
+        // where the comment lives, a field of the record the rename rewrites (ADR 0049).
         // **`pg_description` is not a view here.** The comments are fields of the table record
         // rather than rows of a catalog table (ADR 0049), and nothing this node is for reads them
         // that way: `ActiveRecord` uses the two functions. A view over them is a small unit of its
