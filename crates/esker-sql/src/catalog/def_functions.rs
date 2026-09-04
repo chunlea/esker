@@ -167,6 +167,13 @@ pub fn constant_expression(value: &Datum, ty: ColumnType) -> String {
         Some(literal) => literal,
         // Quoted, with every `'` doubled, and cast to this column's type written bare — no length
         // and no precision, which is what `format_type(oid, -1)` gives and what the capture shows.
+        // **`::"bit"`, quoted.** `bit` is a reserved word, so a default expression names it the
+        // way a real server prints one — measured, `'00000011'::"bit"` — where `bit varying`
+        // needs no quoting. The bare name is what `format_type` gives and it is not this.
+        None if ty == ColumnType::Bit => format!("'{}'::\"bit\"", text.replace('\'', "''")),
+        None if ty == ColumnType::VarBit => {
+            format!("'{}'::bit varying", text.replace('\'', "''"))
+        }
         None => format!(
             "'{}'::{}",
             text.replace('\'', "''"),

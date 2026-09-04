@@ -73,6 +73,8 @@ mod tests {
             | ColumnType::InetArray
             | ColumnType::CidrArray
             | ColumnType::MacAddrArray
+            | ColumnType::BitArray
+            | ColumnType::VarBitArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
@@ -187,6 +189,13 @@ mod tests {
                 .boxed(),
             ColumnType::MacAddr => prop::array::uniform6(any::<u8>())
                 .prop_map(Datum::MacAddr)
+                .boxed(),
+            // The flag is the column's, for the reason `inet`'s is.
+            ColumnType::Bit | ColumnType::VarBit => "[01]*"
+                .prop_map(move |bits: String| Datum::Bit {
+                    varying: ty == ColumnType::VarBit,
+                    bits,
+                })
                 .boxed(),
             ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
             | ColumnType::FloatRange | ColumnType::VarcharRange => {

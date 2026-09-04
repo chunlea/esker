@@ -1192,7 +1192,13 @@ fn placeholder(ty: ColumnType) -> Datum {
             addr: [0; 16],
         },
         ColumnType::MacAddr => Datum::MacAddr([0; 6]),
-        ColumnType::InetArray
+        ColumnType::Bit | ColumnType::VarBit => Datum::Bit {
+            varying: ty == ColumnType::VarBit,
+            bits: String::new(),
+        },
+        ColumnType::BitArray
+        | ColumnType::VarBitArray
+        | ColumnType::InetArray
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
         | ColumnType::MoneyArray => {

@@ -94,3 +94,10 @@ macaddr	00:00:00:00:00:00	00:00:00:00:00:01	01:23:45:67:89:0a	ab:cd:ef:01:02:03	
 inet[]	{}	{0.0.0.0}	{10.0.0.1}	{10.0.0.1,10.0.0.2}	{NULL}
 cidr[]	{}	{10.0.0.0/8}	{192.168.1.0/24}	{NULL}
 macaddr[]	{}	{00:00:00:00:00:00}	{ff:ff:ff:ff:ff:ff}	{NULL}
+# `bit` and `bit varying`. PostgreSQL compares a bit string **bit by bit and then by length**,
+# which is what the digits' byte order already gives: `0` below `1`, and a prefix below what
+# extends it — `0` `01` `010` `1` `10`. The empty string is the first `bit varying` value.
+bit	0	1
+bit varying		0	01	010	1	10
+bit[]	{}	{0}	{0,1}	{1}	{NULL}
+bit varying[]	{}	{0}	{01}	{NULL}

@@ -239,6 +239,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
             // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
             vec!["1186", "interval", "0", ",", "interval_in", "\\N", "b", "0"],
+            // **`bit` and `varbit`**, two more names the adapter's list has always held: the
+            // internal name of `bit varying` is `varbit`, as `bigint`'s is `int8`.
+            vec!["1560", "bit", "0", ",", "bit_in", "\\N", "b", "0"],
+            vec!["1562", "varbit", "0", ",", "varbit_in", "\\N", "b", "0"],
             vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
             // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
             // refusals in `postgresql_specific_schema.rb`.
@@ -523,6 +527,26 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1231".to_owned(),
                 "_numeric".to_owned(),
                 "1700".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1561".to_owned(),
+                "_bit".to_owned(),
+                "1560".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1563".to_owned(),
+                "_varbit".to_owned(),
+                "1562".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

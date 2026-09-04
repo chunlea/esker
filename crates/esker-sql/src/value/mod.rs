@@ -35,6 +35,7 @@
 pub mod arith;
 /// `array_in` and `array_out`: an array literal read, and an array value printed.
 pub mod array;
+pub mod bit;
 pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
@@ -206,6 +207,16 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
             }
             Datum::Array(fitted)
         }
+        // **The cast's rule, which is not the assignment's**, and this function serves both — so
+        // what is here is the one that answers where PostgreSQL answers. A *cast* pads on the
+        // right and truncates in silence (`'101'::bit(8)` is `10100000`, `'101010101'::bit(4)` is
+        // `1010`); an *assignment* refuses either way (`22026` for a `bit(n)`, `22001` for a
+        // `bit varying(n)`). The refusals are declared in `tests/bit_string.rs` rather than
+        // answered, because a refusal where a real server pads would be the worse of the two.
+        (Datum::Bit { varying, bits }, ColumnType::Bit | ColumnType::VarBit) => Datum::Bit {
+            varying: *varying,
+            bits: bit::fit(bits, usize::try_from(typmod).ok(), *varying),
+        },
         // The declared scale is applied here rather than at the parse, which is what makes one
         // rule serve the cast, the assignment and the `INSERT`: `1.245::numeric(10,2)` and a
         // `1.245` written into a `numeric(10,2)` column are the same rounding.
@@ -297,6 +308,10 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         // `varchar` is `character varying` either way. It is what `min(c)` reports, since an
         // aggregate carries no typmod.
         (ColumnType::Bpchar, NO_TYPMOD) => "bpchar".to_owned(),
+        // **A bare `bit` column is `bit(1)`** — measured, `t.bit :another_bit` reports
+        // `character_maximum_length` 1 — and a bare `bit varying` has no length at all. Before
+        // the general `NO_TYPMOD` arm below, which would answer the bare name.
+        (ColumnType::Bit, NO_TYPMOD) => "bit(1)".to_owned(),
         (_, NO_TYPMOD) => ty.name().to_owned(),
         // **`character varying(255)[]`, not `character varying[](255)`.** The typmod is the
         // element's and prints inside the element's name, with the brackets after the whole of
@@ -308,6 +323,10 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
                 None => ty.name().to_owned(),
             }
         }
+        // The typmod **is** the length here, where a `varchar`'s is the length plus a varlena
+        // header.
+        (ColumnType::Bit, length) => format!("bit({length})"),
+        (ColumnType::VarBit, length) => format!("bit varying({length})"),
         (ColumnType::Varchar | ColumnType::Bpchar, _) => match length_of_typmod(typmod) {
             Some(length) => format!("{}({length})", ty.name()),
             None => ty.name().to_owned(),
@@ -547,6 +566,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::InetArray
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
+        | ColumnType::BitArray
+        | ColumnType::VarBitArray
         // **And a user range**, which has no array type here: a real server builds `_floatrange`
         // with the type and `range_test.rb` never declares a column of one, so this is a named
         // gap rather than a guess at an oid that is allocated per database anyway.
@@ -568,6 +589,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Inet => 1041,
         ColumnType::Cidr => 651,
         ColumnType::MacAddr => 1040,
+        ColumnType::Bit => 1561,
+        ColumnType::VarBit => 1563,
         ColumnType::Point => 1017,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
@@ -668,6 +691,10 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // *bitmask*, fields in the high bits and precision in the low, not a plain number. The
         // name resolves; what the mask would restrict is declared in `tests/interval.rs`.
         | ColumnType::Interval
+        // **The length is a typmod**, which is what `character_maximum_length` reports and what
+        // the schema dumper writes as `limit: 8`.
+        | ColumnType::Bit
+        | ColumnType::VarBit
         | ColumnType::Numeric => true,
         // **A `money` has scale 2 and does not take one.** `information_schema` reports both
         // `numeric_precision` and `numeric_scale` as NULL for a money column, measured — the
@@ -704,7 +731,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::TstzRange
         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
-                        | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
+                        | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
@@ -728,6 +755,17 @@ fn validate_typmod(ty: ColumnType, arguments: &str) -> Result<()> {
             .map_err(|_| SqlError::TypeNameSyntax(text.to_owned()))
     };
     match ty {
+        // One length, and it is the typmod itself.
+        ColumnType::Bit | ColumnType::VarBit => {
+            let length = number(parts.first().copied().unwrap_or_default())?;
+            if length < 1 {
+                return Err(SqlError::TypeLengthTooSmall(if ty == ColumnType::Bit {
+                    "bit"
+                } else {
+                    "varbit"
+                }));
+            }
+        }
         // One length, and the message spells the type **short**: `length for type varchar`, not
         // `character varying`. Measured, both types and both bounds.
         ColumnType::Varchar | ColumnType::Bpchar => {
@@ -825,6 +863,10 @@ impl PgType for ColumnType {
             ColumnType::CidrArray => 651,
             ColumnType::MacAddr => 829,
             ColumnType::MacAddrArray => 1040,
+            ColumnType::Bit => 1560,
+            ColumnType::BitArray => 1561,
+            ColumnType::VarBit => 1562,
+            ColumnType::VarBitArray => 1563,
             ColumnType::Point => 600,
             ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
@@ -913,6 +955,12 @@ impl PgType for ColumnType {
             ColumnType::CidrArray => "cidr[]",
             ColumnType::MacAddr => "macaddr",
             ColumnType::MacAddrArray => "macaddr[]",
+            // **`bit`, not `"bit"`.** The quoted spelling is what `format_type` writes inside a
+            // default expression, and that is `format_type`'s business rather than the name's.
+            ColumnType::Bit => "bit",
+            ColumnType::BitArray => "bit[]",
+            ColumnType::VarBit => "bit varying",
+            ColumnType::VarBitArray => "bit varying[]",
             ColumnType::TstzRangeArray => "tstzrange[]",
             ColumnType::Int4RangeArray => "int4range[]",
             ColumnType::DateRangeArray => "daterange[]",
@@ -992,7 +1040,7 @@ impl PgType for ColumnType {
             | ColumnType::TstzRange
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
-                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
+                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
@@ -1088,6 +1136,7 @@ impl PgDatum for Datum {
                 *cidr,
             ),
             Datum::MacAddr(mac) => inet::mac_to_text(*mac),
+            Datum::Bit { bits, .. } => bits.clone(),
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
@@ -1153,6 +1202,10 @@ impl PgDatum for Datum {
                 }
             }
             ColumnType::MacAddr => Datum::MacAddr(inet::mac_from_text(text)?),
+            ColumnType::Bit | ColumnType::VarBit => Datum::Bit {
+                varying: ty == ColumnType::VarBit,
+                bits: bit::from_text(text)?,
+            },
             // The literal's *shape* is read here and each element by its own type's input
             // function, which is what makes `'{1,x}'::int[]` `int4`'s error and `'{a,,b}'` the
             // array's (`crate::value::array`).
@@ -1173,6 +1226,8 @@ impl PgDatum for Datum {
             | ColumnType::InetArray
             | ColumnType::CidrArray
             | ColumnType::MacAddrArray
+            | ColumnType::BitArray
+            | ColumnType::VarBitArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1296,6 +1351,8 @@ impl PgDatum for Datum {
             | Datum::Point { .. }
             | Datum::Inet { .. }
             | Datum::MacAddr(_)
+            // `bit_send` writes a length and the packed bits; nothing here has read that shape.
+            | Datum::Bit { .. }
             | Datum::Money(_) => {
                 return None;
             }
@@ -1342,6 +1399,8 @@ impl PgDatum for Datum {
             | ColumnType::Inet
             | ColumnType::Cidr
             | ColumnType::MacAddr
+            | ColumnType::Bit
+            | ColumnType::VarBit
             | ColumnType::Point
             | ColumnType::Int8Array
             | ColumnType::Int4Array
@@ -1360,6 +1419,8 @@ impl PgDatum for Datum {
             | ColumnType::InetArray
             | ColumnType::CidrArray
             | ColumnType::MacAddrArray
+            | ColumnType::BitArray
+            | ColumnType::VarBitArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1532,6 +1593,10 @@ impl PgDatum for Datum {
                 },
             ) => af.cmp(bf).then_with(|| aa.cmp(ba)).then_with(|| ab.cmp(bb)),
             (Datum::MacAddr(a), Datum::MacAddr(b)) => a.cmp(b),
+            // **The digits and not the flag**, which is what makes `bit varying = bit` true.
+            // PostgreSQL compares bit by bit and then by length; `'0'` below `'1'` and a prefix
+            // below what extends it is exactly that.
+            (Datum::Bit { bits: a, .. }, Datum::Bit { bits: b, .. }) => a.as_bytes().cmp(b.as_bytes()),
             (Datum::Int8(a), Datum::Int8(b))
             // Plain integer order, and only against another `time`: this type compares with
             // nothing else, so there is no promotion arm to write beside it.
@@ -1736,6 +1801,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // A rank each, above the numbers: neither meets one in a comparison a schema can produce.
         Datum::Inet { .. } => 23,
         Datum::MacAddr(_) => 24,
+        Datum::Bit { .. } => 25,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
         // An `oid` shares the integers' rank: it is one, and `pg_cmp` answers every pairing
@@ -2069,7 +2135,7 @@ mod tests {
                         | ColumnType::TstzRange
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
-                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
+                        | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value

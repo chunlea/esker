@@ -6486,6 +6486,20 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
 
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
+    // **The typmod is the length**, not the length plus a header: `character_maximum_length` for
+    // `bit(8)` is 8 and `format_type(1560, 8)` is `bit(8)`, both measured. A bare `bit` keeps
+    // `NO_TYPMOD` and reads back as `bit(1)`, which is where that rule lives.
+    if let DataType::Bit(length) | DataType::BitVarying(length) = data_type {
+        let ty = if matches!(data_type, DataType::Bit(_)) {
+            ColumnType::Bit
+        } else {
+            ColumnType::VarBit
+        };
+        return Ok((
+            ty,
+            length.map_or(NO_TYPMOD, |n| i32::try_from(n).unwrap_or(i32::MAX)),
+        ));
+    }
     match data_type {
         // **`int8[]` is a column type**, over every element type this node has. The element's own
         // declaration is read first and **its typmod is the array's**: `character varying(255)[]`

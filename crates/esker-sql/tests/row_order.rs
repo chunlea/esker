@@ -129,6 +129,11 @@ fn column_type(name: &str) -> ColumnType {
         // the fixture, because a `money` really can hold either.
         "money" => ColumnType::Money,
         // Family, then address, then prefix — an order no sorting of the printed text gives.
+        // Bit by bit, then by length — which the digits' byte order already gives.
+        "bit" => ColumnType::Bit,
+        "bit varying" => ColumnType::VarBit,
+        "bit[]" => ColumnType::BitArray,
+        "bit varying[]" => ColumnType::VarBitArray,
         "inet" => ColumnType::Inet,
         "cidr" => ColumnType::Cidr,
         "macaddr" => ColumnType::MacAddr,

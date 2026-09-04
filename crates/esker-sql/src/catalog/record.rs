@@ -288,6 +288,10 @@ const TAG_DATE_RANGE_ARRAY: u8 = 54;
 const TAG_NUM_RANGE_ARRAY: u8 = 55;
 const TAG_INT8_RANGE_ARRAY: u8 = 56;
 /// `point` and `point[]` — 57 and 58, read off the constants above rather than counted.
+const TAG_BIT: u8 = 69;
+const TAG_VARBIT: u8 = 70;
+const TAG_BIT_ARRAY: u8 = 71;
+const TAG_VARBIT_ARRAY: u8 = 72;
 const TAG_INET: u8 = 63;
 const TAG_CIDR: u8 = 64;
 const TAG_MACADDR: u8 = 65;
@@ -380,6 +384,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::DateRangeArray => TAG_DATE_RANGE_ARRAY,
         ColumnType::NumRangeArray => TAG_NUM_RANGE_ARRAY,
         ColumnType::Int8RangeArray => TAG_INT8_RANGE_ARRAY,
+        ColumnType::Bit => TAG_BIT,
+        ColumnType::VarBit => TAG_VARBIT,
+        ColumnType::BitArray => TAG_BIT_ARRAY,
+        ColumnType::VarBitArray => TAG_VARBIT_ARRAY,
         ColumnType::Inet => TAG_INET,
         ColumnType::Cidr => TAG_CIDR,
         ColumnType::MacAddr => TAG_MACADDR,
@@ -496,6 +504,10 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_DATE_RANGE_ARRAY => ColumnType::DateRangeArray,
         TAG_NUM_RANGE_ARRAY => ColumnType::NumRangeArray,
         TAG_INT8_RANGE_ARRAY => ColumnType::Int8RangeArray,
+        TAG_BIT => ColumnType::Bit,
+        TAG_VARBIT => ColumnType::VarBit,
+        TAG_BIT_ARRAY => ColumnType::BitArray,
+        TAG_VARBIT_ARRAY => ColumnType::VarBitArray,
         TAG_INET => ColumnType::Inet,
         TAG_CIDR => ColumnType::Cidr,
         TAG_MACADDR => ColumnType::MacAddr,

@@ -2816,6 +2816,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::InetArray => 65,
             ColumnType::CidrArray => 66,
             ColumnType::MacAddrArray => 67,
+            // **One family for the two**, which is the point of them sharing a representation:
+            // `B'101'::bit varying = B'101'::bit(3)` is `t` on a real server.
+            ColumnType::Bit | ColumnType::VarBit => 68,
+            ColumnType::BitArray => 69,
+            ColumnType::VarBitArray => 70,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

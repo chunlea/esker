@@ -117,6 +117,8 @@ impl ArrayValue {
             ColumnType::Inet => ColumnType::InetArray,
             ColumnType::Cidr => ColumnType::CidrArray,
             ColumnType::MacAddr => ColumnType::MacAddrArray,
+            ColumnType::Bit => ColumnType::BitArray,
+            ColumnType::VarBit => ColumnType::VarBitArray,
             _ => return None,
         })
     }
@@ -158,6 +160,8 @@ impl ArrayValue {
             ColumnType::InetArray => ColumnType::Inet,
             ColumnType::CidrArray => ColumnType::Cidr,
             ColumnType::MacAddrArray => ColumnType::MacAddr,
+            ColumnType::BitArray => ColumnType::Bit,
+            ColumnType::VarBitArray => ColumnType::VarBit,
             _ => return None,
         })
     }

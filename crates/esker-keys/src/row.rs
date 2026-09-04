@@ -159,6 +159,14 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         }
         // Six, which is what `pg_type.typlen` says a `macaddr` is.
         Datum::MacAddr(v) => out.extend_from_slice(v),
+        // **A length, the flag, then the digits.** The flag is in the row and not in the key, for
+        // the same reason `inet`'s is: a `bit` and a `bit varying` holding the same digits are one
+        // value to a comparison and two rows to a round trip.
+        Datum::Bit { varying, bits } => {
+            varint::put_u64(bits.len() as u64 + 1, out);
+            out.push(u8::from(*varying));
+            out.extend_from_slice(bits.as_bytes());
+        }
         // Sixteen bytes, the three fields in their own widths and in declaration order.
         Datum::Interval {
             months,
@@ -462,7 +470,9 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::MoneyArray
         | ColumnType::InetArray
         | ColumnType::CidrArray
-        | ColumnType::MacAddrArray => return decode_array(ty, bytes),
+        | ColumnType::MacAddrArray
+        | ColumnType::BitArray
+        | ColumnType::VarBitArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -496,6 +506,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int8Range
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
+        | ColumnType::Bit
+        | ColumnType::VarBit
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -638,6 +650,10 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
             out.push(*bits);
         }
         Datum::MacAddr(v) => out.extend_from_slice(v),
+        // **The digits and not the flag**: PostgreSQL compares a bit string bit by bit and then
+        // by length, which is exactly what the memcomparable text encoding gives — `'0'` sorts
+        // below `'1'` and a prefix below what extends it.
+        Datum::Bit { bits, .. } => codec::encode_bytes(bits.as_bytes(), out),
         // Widened to the `i64` encoding rather than given one of its own: an index key has to sort
         // by value and the memcomparable `i64` form already does, for every `i32` there is. A
         // second encoding would be a second thing to get wrong for no gain — a key is not a row,
@@ -794,6 +810,16 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
     Ok(match ty {
         ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
         ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
+        // The flag, then the digits — the length header the caller wrote covers both.
+        ColumnType::Bit | ColumnType::VarBit => {
+            let (&flag, digits) = body.split_first().ok_or_else(|| {
+                corrupt("a bit column is missing the byte that says which of the two it is")
+            })?;
+            Datum::Bit {
+                varying: flag != 0,
+                bits: text_from_utf8(digits)?,
+            }
+        }
         // The subtype comes from the *column*, which is where it is known: the bytes are only the
         // canonical text.
         ColumnType::TsRange
@@ -1065,7 +1091,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::MoneyArray
         | ColumnType::InetArray
         | ColumnType::CidrArray
-        | ColumnType::MacAddrArray => return decode_key_array(ty, bytes),
+        | ColumnType::MacAddrArray
+        | ColumnType::BitArray
+        | ColumnType::VarBitArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
@@ -1095,6 +1123,19 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 .split_first_chunk::<6>()
                 .ok_or_else(|| corrupt("an index key column of type macaddr is truncated"))?;
             (Datum::MacAddr(*head), rest)
+        }
+        // **The key does not say which of the two it is**, so the decode picks the fixed one. An
+        // index key is not where a value is read from — the row is — the rule `decode_key_text`
+        // already states for a citext.
+        ColumnType::Bit | ColumnType::VarBit => {
+            let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
+            (
+                Datum::Bit {
+                    varying: false,
+                    bits: text_from_utf8(&body)?,
+                },
+                rest,
+            )
         }
         // **A money is an index key**, unlike every other type added since `point`: `CREATE INDEX`
         // on one succeeds on a real server, and cents in an `i64` have exactly the order the key
@@ -1888,7 +1929,9 @@ mod tests {
             | ColumnType::MoneyArray
             | ColumnType::InetArray
             | ColumnType::CidrArray
-            | ColumnType::MacAddrArray => {
+            | ColumnType::MacAddrArray
+            | ColumnType::BitArray
+            | ColumnType::VarBitArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 (
                     proptest::collection::vec(
@@ -1985,6 +2028,14 @@ mod tests {
                 .boxed(),
             ColumnType::MacAddr => proptest::array::uniform6(proptest::num::u8::ANY)
                 .prop_map(Datum::MacAddr)
+                .boxed(),
+            // The flag is the column's, for the reason `inet`'s is: a value whose flag disagrees
+            // with its column does not `fit` it.
+            ColumnType::Bit | ColumnType::VarBit => "[01]*"
+                .prop_map(move |bits: String| Datum::Bit {
+                    varying: ty == ColumnType::VarBit,
+                    bits,
+                })
                 .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",

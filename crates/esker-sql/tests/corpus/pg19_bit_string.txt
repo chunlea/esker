@@ -1,0 +1,92 @@
+# `bit(n)` and `bit varying(n)` — against PostgreSQL 19beta1.
+#
+# **Run 71's `type "…" does not exist` row: 6 tests in `bit_string_test.rb`**, whose `setup`
+# declares four columns — `bit(8)` and `bit varying(4)` with defaults, and a bare one of each.
+#
+# Things reasoning would get wrong:
+#
+# * **`bit` and `bit varying` are one representation and two types**: `B'101'::bit varying =
+#   B'101'::bit(3)` is `t`, so ADR 0042 allows the sharing, and the value carries which it is.
+# * **A cast pads on the right and an assignment refuses.** `'101'::bit(8)` is `10100000` — the
+#   padding is on the *right*, which is the half a reader gets wrong — and `'101010101'::bit(4)`
+#   is `1010`, while the same values assigned to a column are `22026 bit string length 3 does not
+#   match type bit(8)` and `22001 bit string too long for type bit varying(4)`.
+# * **A bare `bit` column is `bit(1)`** and a bare `bit varying` has no length at all.
+# * **`0xF` is not a bit string.** `'0xF'::bit(4)` is `22P02 "x" is not a valid binary digit` — the
+#   message names the *character*, not the type — and the hexadecimal form is the literal `x'F'`,
+#   which is `1111`. `bit_string_test.rb`'s `"0xF"` is converted by `ActiveRecord` before the
+#   statement is built; the server never sees it.
+# * **`typcategory` is `V`**, a category of its own, and `typname` for the varying one is
+#   `varbit`. The default reads back `'00000011'::"bit"` — quoted, because `bit` is reserved.
+# * `min(bit)` does not exist; `bit = text` is `42883`.
+BEGIN		-
+SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('bit','varbit','_bit','_varbit') ORDER BY typname	text,name,oid,oid,smallint,"char",regproc	r|_bit|1561|0|-1|A|array_in ; r|_varbit|1563|0|-1|A|array_in ; r|bit|1560|1561|-1|V|bit_in ; r|varbit|1562|1563|-1|V|varbit_in
+CREATE TABLE b (id int8 primary key, a_bit bit(8) DEFAULT '00000011', a_bit_varying bit varying(4) DEFAULT '0011', another_bit bit, another_bit_varying bit varying)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"b"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|a_bit|bit(8) ; r|a_bit_varying|bit varying(4) ; r|another_bit|bit(1) ; r|another_bit_varying|bit varying
+SELECT 'r', column_name, data_type, udt_name, character_maximum_length, column_default FROM information_schema.columns WHERE table_name = 'b' ORDER BY ordinal_position	text,name,character varying,name,integer,character varying	r|id|bigint|int8|\N|\N ; r|a_bit|bit|bit|8|'00000011'::"bit" ; r|a_bit_varying|bit varying|varbit|4|'0011'::bit varying ; r|another_bit|bit|bit|1|\N ; r|another_bit_varying|bit varying|varbit|\N|\N
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid = '"b"'::regclass ORDER BY d.adnum		r|'00000011'::"bit" ; r|'0011'::bit varying
+INSERT INTO b (id, a_bit, a_bit_varying) VALUES (1, '00001010', '0101')		-
+INSERT INTO b (id) VALUES (2)		-
+SELECT 'r', id, a_bit, a_bit_varying, another_bit, another_bit_varying FROM b ORDER BY id		r|1|00001010|0101|\N|\N ; r|2|00000011|0011|\N|\N
+UPDATE b SET a_bit = '11111111', a_bit_varying = '1111' WHERE id = 1		-
+SELECT 'r', id, a_bit, a_bit_varying FROM b WHERE id = 1		r|1|11111111|1111
+SAVEPOINT k1		-
+SELECT 'r', B'101', B'0'	text,"bit","bit"	r|101|0
+ROLLBACK TO SAVEPOINT k1		-
+SELECT 'r', '101'::bit(3), '101'::bit varying(5)	text,bit(3),bit varying(5)	r|101|101
+SELECT 'r', pg_typeof('101'::bit(3)), pg_typeof('101'::bit varying(5))	text,regtype,regtype	r|bit|bit varying
+SAVEPOINT h1		-
+SELECT 'r', '0xF'::bit(4)	!22P02 "x" is not a valid binary digit
+ROLLBACK TO SAVEPOINT h1		-
+SAVEPOINT h2		-
+SELECT 'r', x'F'::bit(4), x'1A'::bit(8)	text,bit(4),bit(8)	r|1111|00011010
+ROLLBACK TO SAVEPOINT h2		-
+SELECT 'r', '101'::bit(3) = '101'::bit(3), '101'::bit(3) < '110'::bit(3)	text,boolean,boolean	r|t|t
+SAVEPOINT m1		-
+SELECT 'r', length('10101'::bit(5)), octet_length('10101'::bit(5))	text,integer,integer	r|5|1
+ROLLBACK TO SAVEPOINT m1		-
+SAVEPOINT m2		-
+SELECT 'r', '101'::bit(3)::text, 5::int4::bit(8)	text,text,bit(8)	r|101|00000101
+ROLLBACK TO SAVEPOINT m2		-
+SELECT 'r', id, a_bit FROM b ORDER BY a_bit		r|2|00000011 ; r|1|11111111
+SELECT 'r', count(DISTINCT a_bit) FROM b		r|2
+SELECT 'r', '{101,010}'::bit(3)[], pg_typeof('{101}'::bit(3)[])	text,bit(3)[],regtype	r|{101,010}|bit[]
+CREATE INDEX b_bit_idx ON b (a_bit)		-
+SELECT 'r', id FROM b WHERE a_bit = '11111111'::bit(8)		r|1
+SAVEPOINT s1		-
+SELECT 'r', 'FF'::bit(8)	!22P02 "F" is not a valid binary digit
+ROLLBACK TO SAVEPOINT s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'F'::bit varying(4)	!22P02 "F" is not a valid binary digit
+ROLLBACK TO SAVEPOINT s2		-
+SAVEPOINT s3		-
+INSERT INTO b (id, a_bit) VALUES (3, 'FF')	!22P02 "F" is not a valid binary digit
+ROLLBACK TO SAVEPOINT s3		-
+SAVEPOINT s4		-
+SELECT 'r', '101'::bit(8)	text,bit(8)	r|10100000
+ROLLBACK TO SAVEPOINT s4		-
+SAVEPOINT s5		-
+SELECT 'r', '101010101'::bit(4)	text,bit(4)	r|1010
+ROLLBACK TO SAVEPOINT s5		-
+SAVEPOINT s6		-
+SELECT 'r', '10101'::bit varying(3)	text,bit varying(3)	r|101
+ROLLBACK TO SAVEPOINT s6		-
+SAVEPOINT s7		-
+SELECT 'r', '101'::bit(3) = '101'::text	!42883 operator does not exist: bit = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s7		-
+SAVEPOINT s8		-
+SELECT 'r', min(a_bit), max(a_bit) FROM b	!42883 function min(bit) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s8		-
+SAVEPOINT s9		-
+SAVEPOINT m3		-
+SELECT 'r', '101'::bit(3) & '110'::bit(3), '101'::bit(3) | '110'::bit(3)	text,"bit","bit"	r|100|111
+ROLLBACK TO SAVEPOINT m3		-
+ROLLBACK TO SAVEPOINT s9		-
+SAVEPOINT s10		-
+SAVEPOINT m4		-
+SELECT 'r', '101'::bit(3) << 1, '101'::bit(3) >> 1	text,"bit","bit"	r|010|010
+ROLLBACK TO SAVEPOINT m4		-
+ROLLBACK TO SAVEPOINT s10		-
+DROP TABLE b		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'b'	text,bigint	r|0
