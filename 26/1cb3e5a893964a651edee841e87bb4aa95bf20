@@ -1,0 +1,16 @@
+crates/esker-store/tests/sim_sweep.rs
+  h_44076b318daf9c 402,404,409,414-441
+docs/plans/debt-c6.md
+  h_44076b318daf9c 642-706
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "261cb3e5a893964a651edee841e87bb4aa95bf20",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
