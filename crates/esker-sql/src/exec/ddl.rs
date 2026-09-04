@@ -608,6 +608,52 @@ fn sequence_start(start: i64) -> Result<u64> {
 /// that one droppable without `CASCADE` on the very next line. A node that added the new sequence
 /// beside the old one would leave the column drawing from two counters and would answer `2BP01`
 /// to the drop, which is PostgreSQL's own correct answer to a state it should not be in.
+/// `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL` — what `change_column_null` sends.
+///
+/// **`SET NOT NULL` reads the table.** PostgreSQL scans for a NULL before it writes the flag and
+/// refuses `23502` if it finds one; a node that set the flag regardless would leave rows that
+/// contradict their own catalog and answer the next `INSERT … VALUES (NULL)` differently from the
+/// rows already stored. The scan is paged for the reason [`backfill`]'s is.
+///
+/// Both directions are **idempotent** — setting a flag that is set, or dropping one that is not,
+/// is a success — which is what makes `change_column_null` safe to re-run.
+fn set_column_not_null(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    column: &str,
+    not_null: bool,
+) -> Result<()> {
+    let at = updated
+        .column(column)
+        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+            column: column.to_owned(),
+            relation: updated.name.clone(),
+        })?;
+    // The primary key's own `NOT NULL` is not the column's to drop.
+    if !not_null && updated.primary_key.contains(&at) {
+        return Err(SqlError::ColumnIsInPrimaryKey(column.to_owned()));
+    }
+    if not_null && !updated.columns[at].not_null {
+        let (start, end) = crate::row::table_row_range(executor.tenant, updated.id);
+        let schema = updated.row_schema();
+        super::for_each_page(txn, &start, &end, |_, page| {
+            for (_, value) in page {
+                let row = crate::row::decode_row(&schema, value)?;
+                if matches!(row.get(at), Some(Datum::Null)) {
+                    return Err(SqlError::ColumnContainsNulls {
+                        column: column.to_owned(),
+                        relation: updated.name.clone(),
+                    });
+                }
+            }
+            Ok(())
+        })?;
+    }
+    updated.columns[at].not_null = not_null;
+    Ok(())
+}
+
 fn set_column_default(
     txn: &mut dyn Txn,
     executor: &mut Executor,
@@ -3314,7 +3360,9 @@ fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
             | AlterTableAction::AddUnique(_),
         ) => "ADD CONSTRAINT",
         Some(AlterTableAction::DropConstraint { .. }) => "DROP CONSTRAINT",
-        Some(AlterTableAction::SetDefault { .. }) => "ALTER COLUMN",
+        Some(AlterTableAction::SetDefault { .. } | AlterTableAction::SetNotNull { .. }) => {
+            "ALTER COLUMN"
+        }
         Some(_) => "ALTER",
     }
 }
@@ -3417,6 +3465,11 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+            continue;
+        }
+        if let AlterTableAction::SetNotNull { column, not_null } = action {
+            set_column_not_null(txn, executor, &mut updated, column, *not_null)?;
+            changed = true;
             continue;
         }
         if let AlterTableAction::SetDefault { column, default } = action {

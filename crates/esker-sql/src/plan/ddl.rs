@@ -834,6 +834,20 @@ pub enum AlterTableAction {
         /// referencing it; without it those are `2BP01`.
         cascade: bool,
     },
+    /// `ALTER COLUMN <name> SET NOT NULL` / `DROP NOT NULL`, which is what `change_column_null`
+    /// sends (`abstract/schema_statements.rb`).
+    ///
+    /// **`SET NOT NULL` scans the table.** PostgreSQL refuses it with `23502 column "c" of
+    /// relation "t" contains null values` if a row already holds one — a different message from
+    /// the `23502` an offending *insert* gets, and it names no constraint because the constraint
+    /// does not exist yet. Adding the flag without the scan would leave a table whose rows
+    /// contradict its own catalog.
+    SetNotNull {
+        /// The column, folded.
+        column: String,
+        /// `SET` (true) or `DROP` (false).
+        not_null: bool,
+    },
     /// `ADD CONSTRAINT <name> UNIQUE (…)`, which is what `add_unique_constraint` sends — and the
     /// setup every `remove_unique_constraint` test needs before it can remove one.
     ///

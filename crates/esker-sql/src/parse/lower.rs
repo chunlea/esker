@@ -1976,6 +1976,18 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         // has the column, which is also where `22P02` for one the type will not take comes from.
         if let AlterTableOperation::AlterColumn { column_name, op } = operation {
             use sqlparser::ast::AlterColumnOperation;
+            // `SET NOT NULL` / `DROP NOT NULL` are their own action: they change a column's
+            // nullability rather than its default, and the executor has to scan for the first.
+            if matches!(
+                op,
+                AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull
+            ) {
+                actions.push(plan::AlterTableAction::SetNotNull {
+                    column: ident(column_name),
+                    not_null: matches!(op, AlterColumnOperation::SetNotNull),
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
