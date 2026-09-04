@@ -33,11 +33,11 @@ pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault,
     Comment, CommentObject, CreateDatabase, CreateExtension, CreateFunction, CreateIndex,
-    CreateSchema, CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
-    DropExtension, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
-    DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, Truncate,
-    UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
-    unique_constraint_name,
+    CreateMaterializedView, CreateSchema, CreateSequence, CreateTable, CreateTrigger, CreateType,
+    CreateView, DropDatabase, DropExtension, DropFunction, DropIndex, DropMaterializedView,
+    DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
+    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -109,6 +109,13 @@ pub enum Statement {
     CreateView(CreateView),
     /// `DROP VIEW`.
     DropView(DropView),
+    /// `CREATE MATERIALIZED VIEW` — a table that carries the `SELECT` its rows came from
+    /// ([ADR 0064](../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
+    CreateMaterializedView(CreateMaterializedView),
+    /// `REFRESH MATERIALIZED VIEW` — the statement that recomputes those rows.
+    RefreshMaterializedView(RefreshMaterializedView),
+    /// `DROP MATERIALIZED VIEW`.
+    DropMaterializedView(DropMaterializedView),
     /// `TRUNCATE [TABLE] …` — every row of the tables named, and their sequences only if asked.
     Truncate(Truncate),
     /// `CREATE DATABASE` — a second **tenant**, which is what a database is (ADR 0052).
@@ -213,6 +220,11 @@ impl Statement {
             Statement::Update(_) => Some("UPDATE"),
             Statement::Delete(_) => Some("DELETE"),
             Statement::CreateTable(_) => Some("CREATE TABLE"),
+            // A materialized view **writes rows**: creating and refreshing one both run the
+            // definition and store what it produced (ADR 0064).
+            Statement::CreateMaterializedView(_) => Some("CREATE MATERIALIZED VIEW"),
+            Statement::RefreshMaterializedView(_) => Some("REFRESH MATERIALIZED VIEW"),
+            Statement::DropMaterializedView(_) => Some("DROP MATERIALIZED VIEW"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
             Statement::CreateExtension(_) => Some("CREATE EXTENSION"),
             Statement::DropExtension(_) => Some("DROP EXTENSION"),
@@ -273,6 +285,9 @@ impl Statement {
             Statement::Raise { .. } => "DO",
             Statement::Truncate(_) => "TRUNCATE TABLE",
             Statement::CreateTable(_) => "CREATE TABLE",
+            Statement::CreateMaterializedView(_) => "CREATE MATERIALIZED VIEW",
+            Statement::RefreshMaterializedView(_) => "REFRESH MATERIALIZED VIEW",
+            Statement::DropMaterializedView(_) => "DROP MATERIALIZED VIEW",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropExtension(_) => "DROP EXTENSION",
             Statement::AlterIndexRename(_) => "ALTER INDEX",

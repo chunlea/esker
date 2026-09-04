@@ -795,6 +795,13 @@ impl Executor {
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
             Statement::CreateView(create) => ddl::create_view(self, txn, create),
             Statement::DropView(drop) => ddl::drop_view(self, txn, drop),
+            Statement::CreateMaterializedView(create) => {
+                ddl::create_materialized_view(self, txn, create)
+            }
+            Statement::RefreshMaterializedView(refresh) => {
+                ddl::refresh_materialized_view(self, txn, refresh)
+            }
+            Statement::DropMaterializedView(drop) => ddl::drop_materialized_view(self, txn, drop),
             Statement::CreateDatabase(create) => ddl::create_database(self, txn, create),
             Statement::DropDatabase(drop) => ddl::drop_database(self, txn, drop),
             Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
@@ -1215,11 +1222,19 @@ impl Executor {
     }
 
     /// `SELECT`: plan it, then pull every row through.
-    fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
-        // A sequence function is a **write**, not a value of a row, so it runs here — once, in the
-        // order the target list names it — and what the planner sees is the number it produced.
-        // Running it inside the plan would run it once per row, which is what PostgreSQL does over
-        // a `FROM` and is why that shape is refused rather than approximated.
+    /// Plans a `SELECT`, runs it, and hands back the plan and the rows **as stored** — before any
+    /// of the presentation [`Executor::select`] does.
+    ///
+    /// Extracted so that `CREATE MATERIALIZED VIEW` and `REFRESH` run a definition through exactly
+    /// the machinery an ordinary `SELECT` goes through — the fragments, the subqueries, the
+    /// sequence reads and the lock pass, in that order and for the reasons given below. A second
+    /// copy of this sequence is the way a materialized view would come to disagree with the query
+    /// it claims to be.
+    fn planned_rows(
+        &mut self,
+        txn: &mut dyn Txn,
+        select: &crate::plan::Select,
+    ) -> Result<(query::Planned, Vec<Vec<Datum>>)> {
         let resolved = self.resolve_sequence_calls(&*txn, select)?;
         let select = resolved.as_ref();
         let mut planned = self.plan_select(txn, select)?;
@@ -1248,6 +1263,15 @@ impl Executor {
         // `&dyn Txn` and a lock needs `&mut`, and a `SELECT` materialises its rows anyway, so the
         // second pass costs nothing that was not already spent (ADR 0057 §5).
         let raw = self.lock_rows(txn, &planned, raw)?;
+        Ok((planned, raw))
+    }
+
+    fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
+        // A sequence function is a **write**, not a value of a row, so it runs there — once, in
+        // the order the target list names it — and what the planner sees is the number it
+        // produced. Running it inside the plan would run it once per row, which is what
+        // PostgreSQL does over a `FROM` and is why that shape is refused rather than approximated.
+        let (planned, raw) = self.planned_rows(txn, select)?;
         let mut rows = Vec::new();
         for row in raw {
             let row = &row[..row.len() - planned.junk];
@@ -2773,6 +2797,18 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
         Statement::CreateView(create) => vec![format!("Create View on {}", create.name)],
         Statement::DropView(drop) => vec![format!("Drop View on {}", drop.names.join(", "))],
+        Statement::CreateMaterializedView(create) => {
+            vec![format!("Create Materialized View on {}", create.name)]
+        }
+        Statement::RefreshMaterializedView(refresh) => {
+            vec![format!("Refresh Materialized View on {}", refresh.name)]
+        }
+        Statement::DropMaterializedView(drop) => {
+            vec![format!(
+                "Drop Materialized View on {}",
+                drop.names.join(", ")
+            )]
+        }
         Statement::CreateDatabase(create) => vec![format!("Create Database on {}", create.name)],
         Statement::DropDatabase(drop) => {
             vec![format!("Drop Database on {}", drop.names.join(", "))]

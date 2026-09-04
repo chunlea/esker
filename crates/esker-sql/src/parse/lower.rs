@@ -96,7 +96,25 @@ impl Parsed {
                 severity: *severity,
             });
         }
+        // `REFRESH MATERIALIZED VIEW`'s tree is a placeholder too (`crate::parse::read_refresh`):
+        // `sqlparser` has no `REFRESH` statement, so the source was read directly and this is the
+        // whole lowering.
+        if let Some(refresh) = self.refresh() {
+            return Ok(plan::Statement::RefreshMaterializedView(
+                plan::RefreshMaterializedView {
+                    name: fold_identifier(&refresh.name, refresh.quoted).0,
+                    concurrently: refresh.concurrently,
+                    with_data: refresh.with_data,
+                },
+            ));
+        }
         let mut lowered = lower_statement(&self.statement)?;
+        // `WITH [NO] DATA` was cut off the source so the statement would parse.
+        if let plan::Statement::CreateMaterializedView(create) = &mut lowered
+            && let Some(with_data) = self.with_data()
+        {
+            create.with_data = with_data;
+        }
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
             drop.concurrently = self.is_concurrently();
@@ -484,11 +502,13 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         }
         // `CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT …`.
         Statement::CreateView(create) => {
-            refuse_if(create.materialized, "CREATE MATERIALIZED VIEW")?;
             refuse_if(create.temporary, "CREATE TEMPORARY VIEW")?;
             refuse_if(create.or_alter, "CREATE OR ALTER VIEW")?;
             refuse_if(create.secure, "CREATE SECURE VIEW")?;
-            refuse_if(create.if_not_exists, "CREATE VIEW IF NOT EXISTS")?;
+            refuse_if(
+                create.if_not_exists && !create.materialized,
+                "CREATE VIEW IF NOT EXISTS",
+            )?;
             refuse_if(create.with_no_schema_binding, "WITH NO SCHEMA BINDING")?;
             refuse_if(create.to.is_some(), "CREATE VIEW ... TO")?;
             refuse_if(create.params.is_some(), "CREATE VIEW with view parameters")?;
@@ -499,14 +519,32 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 refuse_if(column.data_type.is_some(), "a type on a view column")?;
                 refuse_if(column.options.is_some(), "an option on a view column")?;
             }
+            // **Rendered back rather than kept verbatim**, because the parser is what this node
+            // re-reads it with: a definition that round-trips through `sqlparser`'s own rendering
+            // is one it can certainly parse again, where the user's text may carry comments and
+            // line breaks that no catalog needs.
+            let definition = create.query.to_string();
+            let columns: Vec<String> = create.columns.iter().map(|c| ident(&c.name)).collect();
+            if create.materialized {
+                // `OR REPLACE` has no meaning for one: PostgreSQL's grammar does not have it,
+                // because replacing a relation that holds rows is not a rename of a definition.
+                refuse_if(create.or_replace, "CREATE OR REPLACE MATERIALIZED VIEW")?;
+                return Ok(plan::Statement::CreateMaterializedView(
+                    plan::CreateMaterializedView {
+                        name: object_name(&create.name)?,
+                        columns,
+                        definition,
+                        // Filled from `Parsed::with_data` where the clause was cut out of the
+                        // source; with no clause at all PostgreSQL's default is `WITH DATA`.
+                        with_data: true,
+                        if_not_exists: create.if_not_exists,
+                    },
+                ));
+            }
             Ok(plan::Statement::CreateView(plan::CreateView {
                 name: object_name(&create.name)?,
-                columns: create.columns.iter().map(|c| ident(&c.name)).collect(),
-                // **Rendered back rather than kept verbatim**, because the parser is what this
-                // node re-reads it with: a definition that round-trips through `sqlparser`'s own
-                // rendering is one it can certainly parse again, where the user's text may carry
-                // comments and line breaks that no catalog needs.
-                definition: create.query.to_string(),
+                columns,
+                definition,
                 or_replace: create.or_replace,
             }))
         }
@@ -578,6 +616,13 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                ObjectType::MaterializedView => {
+                    plan::Statement::DropMaterializedView(plan::DropMaterializedView {
+                        names,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    })
+                }
                 ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,

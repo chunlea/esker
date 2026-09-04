@@ -68,11 +68,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ("REINDEX TABLE CONCURRENTLY t;", "G05"),
     // G06 -- views: recursive, materialized
     ("CREATE RECURSIVE VIEW v (n) AS SELECT 1;", "G06"),
-    (
-        "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA;",
-        "G06",
-    ),
-    ("REFRESH MATERIALIZED VIEW CONCURRENTLY mv;", "G06"),
     // G07 -- sequence options
     ("CREATE SEQUENCE s START WITH 1 INCREMENT BY 1;", "G07"),
     ("ALTER SEQUENCE s RESTART WITH 1;", "G07"),

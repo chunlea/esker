@@ -274,6 +274,35 @@ pub struct Parsed {
     /// ([`Parsed::lower`]). Every other rewrite in this module keeps the tree and adds to it;
     /// this one is the exception, and it is why the field carries the whole statement.
     raise: Option<(String, crate::error::Severity)>,
+    /// `WITH DATA` / `WITH NO DATA` on a `CREATE MATERIALIZED VIEW`: `Some(false)` for `NO DATA`.
+    ///
+    /// `sqlparser` 0.62.0 reads `CREATE MATERIALIZED VIEW … AS <query>` and then expects the
+    /// statement to end, so either spelling is a parse error — the clause is cut out of the source
+    /// and travels here ([`strip_with_data`]). `None` is a statement with no clause, which
+    /// PostgreSQL defines as `WITH DATA`.
+    with_data: Option<bool>,
+    /// The relation and the `CONCURRENTLY` flag of a `REFRESH MATERIALIZED VIEW`, if that is what
+    /// this was.
+    ///
+    /// **The parsed tree is a placeholder**, the same exception `raise` is: `sqlparser` 0.62.0 has
+    /// no `REFRESH` statement at all — it stops at the first word — and a refresh is not another
+    /// statement in disguise, so the source is replaced by one that parses and the lowering throws
+    /// that tree away for this ([`Parsed::lower`]).
+    refresh: Option<Refresh>,
+}
+
+/// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`, read out of the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refresh {
+    /// The relation named, exactly as written — folded where the lowering folds every other name.
+    pub name: String,
+    /// Whether it was written `"quoted"`, which is the only thing that decides whether it folds.
+    pub quoted: bool,
+    /// `CONCURRENTLY`, which requires a unique index and which this node checks for
+    /// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
+    pub concurrently: bool,
+    /// `WITH NO DATA` on a refresh, which **empties** the relation and marks it unpopulated.
+    pub with_data: bool,
 }
 
 impl Parsed {
@@ -317,6 +346,18 @@ impl Parsed {
     #[must_use]
     pub fn raised(&self) -> Option<&(String, crate::error::Severity)> {
         self.raise.as_ref()
+    }
+
+    /// `WITH DATA` / `WITH NO DATA`, or `None` when the statement carried neither.
+    #[must_use]
+    pub fn with_data(&self) -> Option<bool> {
+        self.with_data
+    }
+
+    /// The `REFRESH MATERIALIZED VIEW` this statement was, if it was one.
+    #[must_use]
+    pub fn refresh(&self) -> Option<&Refresh> {
+        self.refresh.as_ref()
     }
 
     /// Whether this `BEGIN` asked for a **read-only** transaction.
@@ -424,11 +465,21 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = virtual_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
-    let sql = match (&guarded, &raise) {
-        (Some(rewritten), _) => rewritten.as_str(),
-        // Parsed and thrown away: what this statement *is* travels in `Parsed::raise`.
-        (None, Some(_)) => "SELECT 1",
-        (None, None) => sql,
+    // `WITH [NO] DATA` is the last thing in a `CREATE MATERIALIZED VIEW` and the parser stops at
+    // it; the clause comes off and the answer travels on `Parsed`.
+    let with_data_rewrite = strip_with_data(sql, &scanned);
+    let sql = with_data_rewrite
+        .as_ref()
+        .map_or(sql, |(text, _)| text.as_str());
+    let refresh = read_refresh(sql);
+    let sql = match (&guarded, &raise, &refresh) {
+        (Some(rewritten), _, _) => rewritten.as_str(),
+        // **Parsed and thrown away**, both of them: what a `DO … RAISE` is travels in
+        // `Parsed::raise`, and what a `REFRESH MATERIALIZED VIEW` is travels in `Parsed::refresh`.
+        // `sqlparser` can read neither statement — it has no `DO` and no `REFRESH` — so the source
+        // is replaced by one that parses and the lowering throws that tree away for each.
+        (None, Some(_), _) | (None, None, Some(_)) => "SELECT 1",
+        (None, None, None) => sql,
     };
     Ok(parse(sql)?
         .into_iter()
@@ -448,6 +499,8 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                     .as_ref()
                     .map(|(_, flags)| flags.clone())
                     .unwrap_or_default(),
+                with_data: with_data_rewrite.as_ref().map(|(_, data)| *data),
+                refresh: refresh.clone(),
             }
         })
         .collect())
@@ -488,6 +541,118 @@ fn do_body(sql: &str) -> Option<&str> {
 /// **`EXCEPTION` is deliberately not here.** It is an error — `P0001` with the raised text as the
 /// whole message — and routing it through the notice path would turn a failed statement into a
 /// successful one. It stays refused by name until something needs it.
+/// Cuts a trailing `WITH [NO] DATA` off a `CREATE MATERIALIZED VIEW`, returning the rest of the
+/// statement and whether data was asked for.
+///
+/// `sqlparser` 0.62.0 parses the `CREATE MATERIALIZED VIEW … AS <query>` and then expects the end
+/// of the statement, so both spellings are `Expected: end of statement, found: WITH`. The clause is
+/// the last thing in the statement and cannot appear inside the query it follows — `WITH` there is
+/// a CTE and comes *before* the `SELECT` — so cutting the tail is unambiguous.
+fn strip_with_data(sql: &str, scanned: &Scan<'_>) -> Option<(String, bool)> {
+    if !contains_words(&scanned.words, &["MATERIALIZED", "VIEW"]) {
+        return None;
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    let upper = trimmed.to_ascii_uppercase();
+    for (suffix, data) in [(" WITH NO DATA", false), (" WITH DATA", true)] {
+        if let Some(kept) = upper.strip_suffix(suffix) {
+            return Some((trimmed.get(..kept.len())?.to_owned(), data));
+        }
+    }
+    None
+}
+
+/// Reads a whole `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`.
+///
+/// `sqlparser` 0.62.0 has no `REFRESH` statement — it stops at the first word — so this reads the
+/// statement itself rather than rewriting it into one the parser can take.
+///
+/// **The name is read out of the source and not out of [`Scan::words`]**, because a `Scan` does not
+/// treat a quoted identifier as a word — and `view_test.rb` names its materialized view `ebooks'`,
+/// with an apostrophe, so the quoted form is the one the suite actually sends. Taking it from the
+/// word list would have made every quoted name a parse error, which is a C1 break in the one case
+/// most likely to appear.
+fn read_refresh(sql: &str) -> Option<Refresh> {
+    let mut rest = sql.trim().trim_end_matches(';').trim_end();
+    for keyword in ["REFRESH", "MATERIALIZED", "VIEW"] {
+        rest = strip_leading_word(rest, keyword)?;
+    }
+    let concurrently = match strip_leading_word(rest, "CONCURRENTLY") {
+        Some(tail) => {
+            rest = tail;
+            true
+        }
+        None => false,
+    };
+    let (name, quoted, tail) = read_identifier(rest)?;
+    let rest = tail.trim_start();
+    let with_data = if rest.is_empty() {
+        true
+    } else {
+        let after_with = strip_leading_word(rest, "WITH")?;
+        match strip_leading_word(after_with, "NO") {
+            Some(after_no) => strip_leading_word(after_no, "DATA")?
+                .trim()
+                .is_empty()
+                .then_some(false)?,
+            None => strip_leading_word(after_with, "DATA")?
+                .trim()
+                .is_empty()
+                .then_some(true)?,
+        }
+    };
+    Some(Refresh {
+        name,
+        quoted,
+        concurrently,
+        with_data,
+    })
+}
+
+/// The text after `word`, when the text starts with it as a whole word.
+fn strip_leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let text = text.trim_start();
+    let rest = text
+        .get(..word.len())?
+        .eq_ignore_ascii_case(word)
+        .then(|| text.get(word.len()..))??;
+    // A whole word: what follows must not continue the identifier.
+    match rest.chars().next() {
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => None,
+        _ => Some(rest),
+    }
+}
+
+/// One identifier — `"quoted"` with `""` for an embedded quote, or a bare run — and what follows.
+fn read_identifier(text: &str) -> Option<(String, bool, &str)> {
+    let text = text.trim_start();
+    if let Some(body) = text.strip_prefix('"') {
+        let mut name = String::new();
+        let mut chars = body.char_indices();
+        while let Some((at, c)) = chars.next() {
+            if c != '"' {
+                name.push(c);
+                continue;
+            }
+            // `""` inside the quotes is one quote character.
+            if body.get(at + 1..)?.starts_with('"') {
+                name.push('"');
+                chars.next();
+                continue;
+            }
+            return Some((name, true, body.get(at + 1..)?));
+        }
+        return None;
+    }
+    let end = text
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(text.len());
+    if end == 0 {
+        return None;
+    }
+    Some((text.get(..end)?.to_owned(), false, text.get(end..)?))
+}
+
 fn strip_do_raise(sql: &str, scanned: &Scan<'_>) -> Option<(String, crate::error::Severity)> {
     let [first, ..] = scanned.words.as_slice() else {
         return None;
@@ -1539,8 +1704,19 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
         .or_else(|| strip_unlogged(sql, &scanned))
         .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept))
-        .or_else(|| strip_create_database_options(sql, &scanned).map(|(kept, _)| kept));
-    let text = rewritten.as_deref().unwrap_or(sql);
+        .or_else(|| strip_create_database_options(sql, &scanned).map(|(kept, _)| kept))
+        // **Here as well as in `parse_statements`**, and for the reason `strip_unlogged` is in
+        // both: this function is an entry point of its own, and a clause that only comes off on
+        // the other path makes the same statement parse through one door and not the other.
+        .or_else(|| strip_with_data(sql, &scanned).map(|(kept, _)| kept));
+    // **A recognised `REFRESH` parses as a placeholder here too.** `sqlparser` has no `REFRESH`
+    // statement at all, so without this the same statement parsed through `parse_statements` and
+    // was a bare `42601` through this door — and `42601` about valid PostgreSQL is the one answer
+    // contract C1 exists to prevent. What the statement *is* still travels on `Parsed::refresh`;
+    // a spelling `read_refresh` does not recognise still fails here and is named by the refusal
+    // table, which is the honest `0A000`.
+    let refresh_placeholder = read_refresh(sql).map(|_| "SELECT 1");
+    let text = refresh_placeholder.or(rewritten.as_deref()).unwrap_or(sql);
 
     let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
         parse_inner(text)
@@ -1905,7 +2081,12 @@ const UNSUPPORTED: &[Unsupported] = &[
     ),
     u("REINDEX", &["REINDEX"], &[]),
     u("CREATE RECURSIVE VIEW", &["CREATE", "RECURSIVE"], &[]),
-    u("CREATE MATERIALIZED VIEW", &["CREATE", "MATERIALIZED"], &[]),
+    // **Only the spellings `read_refresh` cannot read reach this.** A `REFRESH MATERIALIZED VIEW`
+    // it recognises parses, so the refusal table — which is consulted only after a parse fails —
+    // never fires for one. Keeping the row is what turns an unrecognised spelling into a named
+    // `0A000` instead of a `42601` about valid SQL. It names the statement rather than a feature
+    // that works, which is the mistake `CREATE UNLOGGED` made and the reason `CREATE MATERIALIZED
+    // VIEW` has no row here at all: that one would blame the feature for an unrelated parse error.
     u("REFRESH MATERIALIZED VIEW", &["REFRESH"], &[]),
     u("CREATE SEQUENCE", &["CREATE", "SEQUENCE"], &[]),
     u("ALTER SEQUENCE", &["ALTER", "SEQUENCE"], &[]),

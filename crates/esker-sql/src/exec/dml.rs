@@ -279,6 +279,23 @@ fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
     })
 }
 
+/// **A materialized view is not writable**, and this is the only thing that says so.
+///
+/// The relation is a table underneath
+/// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)),
+/// so without this every row-writing path would happily write to one — and the next `REFRESH`
+/// would silently throw the writes away, which is worse than refusing. Measured: `INSERT`, `UPDATE`
+/// and `DELETE` all give the identical sentence, and it is not the `is not a table` message
+/// `TRUNCATE` gives for the same relation.
+fn refuse_matview_write(table: &TableDef, named: &str) -> Result<()> {
+    if table.matview.is_some() {
+        return Err(SqlError::CannotChangeMatview(crate::catalog::display_name(
+            named,
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn insert(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -287,6 +304,7 @@ pub(super) fn insert(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&insert.table)?;
     let table = executor.require_table(txn, &insert.table)?;
+    refuse_matview_write(&table, &insert.table)?;
     let targets = target_columns(&table, insert)?;
     let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
     // The row keys this statement has written, for the `21000` above. Only `ON CONFLICT` fills it:
@@ -725,6 +743,7 @@ pub(super) fn update(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
     let named = executor.require_table(txn, &update.table)?;
+    refuse_matview_write(&named, &update.table)?;
     let chain = update.chain();
     // Resolved once and **before the first row is read**, so a `FROM` naming nothing is `42P01`
     // with nothing written. The same lookup a `SELECT`'s `FROM` entry gets, which is what makes a
@@ -855,6 +874,7 @@ pub(super) fn delete(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
     let named = executor.require_table(txn, &delete.table)?;
+    refuse_matview_write(&named, &delete.table)?;
     let mut returned = Returned::open(delete.returning.as_ref(), &named)?;
     let mut count = 0;
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,

@@ -62,14 +62,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `YES` for this view, which is the right answer about the *query* — PostgreSQL would \
              accept the insert and this node does not. Its own unit; the read side is complete.",
         ),
-        (
-            "REFRESH MATERIALIZED VIEW ebooks_mat",
-            "**A materialized view is a different feature.** It holds its own rows — storage \
-             rather than a rewrite — and `REFRESH` is the statement that rewrites them; this \
-             node's views are stored `SELECT`s expanded where they are read, so there is nothing \
-             to refresh. `CREATE`/`DROP MATERIALIZED VIEW` and `pg_matviews` are refused by name \
-             beside it, and `view_test.rb:218-222` is the part of the file that needs them.",
-        ),
     ],
 };
 

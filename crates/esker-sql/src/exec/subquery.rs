@@ -201,6 +201,7 @@ pub(super) fn table_function_def(
         _ => ColumnType::Int4,
     };
     std::sync::Arc::new(crate::catalog::TableDef {
+        matview: None,
         on_commit: crate::catalog::OnCommit::default(),
         // Synthetic and never stored, so its persistence is the default.
         persistence: crate::catalog::Persistence::Permanent,
@@ -339,6 +340,7 @@ fn plan_derived(
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
+        matview: None,
         on_commit: crate::catalog::OnCommit::default(),
         // Synthetic and never stored, so its persistence is the default.
         persistence: crate::catalog::Persistence::Permanent,
@@ -457,7 +459,7 @@ pub(super) fn relation_of(
             {
                 return Err(SqlError::UndefinedTable(written.clone()));
             }
-            tables.get(&entry.name).map_err(|error| match error {
+            let table = tables.get(&entry.name).map_err(|error| match error {
                 SqlError::UndefinedTable(name) if entry.hidden_cte => {
                     SqlError::ForwardCteReference(name)
                 }
@@ -468,7 +470,21 @@ pub(super) fn relation_of(
                     SqlError::UndefinedTable(entry.written.clone().unwrap_or(name))
                 }
                 other => other,
-            })
+            })?;
+            // **A materialized view created `WITH NO DATA` refuses to be read**, and this is the
+            // one place every read path passes through. Answering zero rows instead would be a
+            // different claim — that the query produced none — and it is the claim a client would
+            // act on. Measured: `55000`, with PostgreSQL's own hint (ADR 0064).
+            if table
+                .matview
+                .as_ref()
+                .is_some_and(|matview| !matview.populated)
+            {
+                return Err(SqlError::MatviewNotPopulated(crate::catalog::display_name(
+                    &table.name,
+                )));
+            }
+            Ok(table)
         }
         Some(derived) => derived.def.clone().ok_or_else(|| {
             SqlError::Internal("a derived table reached the planner without a shape".to_owned())

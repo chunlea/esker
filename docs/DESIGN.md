@@ -962,11 +962,19 @@ is in its first sentence.
   under a reserved relation id, so name resolution, `SELECT *`, `EXPLAIN` and the join machinery are
   unchanged by it; a non-recursive CTE is **inlined at each reference** and is therefore one of those,
   which costs no executor at all and no observable difference — `MATERIALIZED` and `NOT MATERIALIZED`
-  return the same rows, measured. Every one of them is bounded where `Sort` is (`53400`), and none of
+  return the same rows, measured.
+  **A view is a stored `SELECT` expanded where it is read, and a materialized view is a table whose
+  rows are recomputed** ([ADR 0064](adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)):
+  `CREATE MATERIALIZED VIEW` plans its definition once, stores the columns that plan named and the
+  rows it produced, and `REFRESH` replaces those rows inside the caller's transaction. It is a table
+  underneath, so it has `pg_attribute` rows, takes indexes and rolls back — and the refusals that
+  keep it read-only (`42809` on a write, `55000` on a read of one created `WITH NO DATA`) are the
+  only thing between a client and a writable one. A view publishes its columns to `pg_attribute`
+  too, resolved when it is created rather than at each read. Every one of them is bounded where `Sort` is (`53400`), and none of
   them routes to the columnar engine.
   **`pg_catalog` and `information_schema` are computed relations**
-  ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)): **thirty**
-  views — twenty-four in `pg_catalog` and six in `information_schema` — over the same `'m'`-space
+  ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)):
+  **thirty-one** views — twenty-five in `pg_catalog` and six in `information_schema` — over the same `'m'`-space
   records the planner already reads, materialised per query, with no second store to keep in step.
   The count is `CatalogView::ALL`, which a test walks so that none is added without one. Their oids are the ids those records already carry — a table's, an
   index's, a sequence's — from **one** snapshot read once per statement and bounded like every other

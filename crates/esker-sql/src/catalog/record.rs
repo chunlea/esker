@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 30;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 31;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1820,7 +1820,37 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         OnCommit::Drop => 2,
     });
 
+    // Version 31. What makes this relation a materialized view: a flag, then the definition and
+    // whether it has been populated (ADR 0064). Fifteenth section, on the end like every one
+    // before it — a table written before 31 reads back `matview: None`, which is exactly what it
+    // was.
+    match &table.matview {
+        None => out.push(0),
+        Some(matview) => {
+            out.push(1);
+            put_str(&matview.definition, &mut out);
+            out.push(u8::from(matview.populated));
+        }
+    }
+
     Ok(out)
+}
+
+/// The version 31 tail: whether this table is a materialized view, and the `SELECT` behind it.
+///
+/// Read **after** version 26's `ON COMMIT` byte, because the sections come off in the order they
+/// went on. A table written before 31 answers `None` — an ordinary table, which is all any of them
+/// could have been while `CREATE MATERIALIZED VIEW` was `0A000`.
+fn read_matview(reader: &mut Reader<'_>) -> Result<Option<super::MatviewDef>> {
+    if reader.version < 31 || reader.byte()? == 0 {
+        return Ok(None);
+    }
+    let definition = reader.string()?;
+    let populated = reader.flag()?;
+    Ok(Some(super::MatviewDef {
+        definition,
+        populated,
+    }))
 }
 
 /// The version 26 tail: a temporary table's `ON COMMIT` action.
@@ -2447,9 +2477,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_dropped(&mut reader, &mut columns)?;
     read_user_types(&mut reader, &mut columns)?;
     let on_commit = read_on_commit(&mut reader)?;
+    let matview = read_matview(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
+        matview,
         on_commit,
         id,
         persistence,

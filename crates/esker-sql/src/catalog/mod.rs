@@ -750,6 +750,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         dropped: false,
     };
     Arc::new(TableDef {
+        matview: None,
         on_commit: OnCommit::default(),
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
         name: name.to_owned(),
@@ -871,6 +872,12 @@ impl TypeKind {
 pub struct TableDef {
     /// From the tenant's relation-id sequence. Part of every key of every row.
     pub id: u64,
+    /// `Some` when this relation is a **materialized view** rather than an ordinary table.
+    ///
+    /// Every other field means what it always meant: a materialized view has columns, rows and
+    /// indexes like any table, and this is what decides its `relkind`, keeps it out of
+    /// `information_schema.tables`, and makes a write to it `42809` (ADR 0064).
+    pub matview: Option<MatviewDef>,
     /// Whether the table was created `UNLOGGED`.
     ///
     /// **Stored on the table and nowhere else.** A real server marks the sequence a `bigserial`
@@ -3131,6 +3138,25 @@ pub struct ViewColumn {
     pub typmod: i32,
 }
 
+/// What makes a table a **materialized view**: the `SELECT` its rows were computed from, and
+/// whether they have been computed yet.
+///
+/// [ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md):
+/// a materialized view is a table that carries this. There is no second kind of relation and no
+/// second row store — rows, indexes, per-column types and transactionality are the whole of what a
+/// table already is, and the capture shows PostgreSQL giving a materialized view all four.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatviewDef {
+    /// The `SELECT` text, as the parser renders it back — the same trade a view's definition makes.
+    pub definition: String,
+    /// `false` only between `CREATE … WITH NO DATA` and the first `REFRESH`.
+    ///
+    /// **A relation that is not populated refuses to be read**, with `55000` and PostgreSQL's own
+    /// hint, rather than answering zero rows. Zero rows is a different claim: it says the query
+    /// produced none.
+    pub populated: bool,
+}
+
 /// One view: what it is called, the `SELECT` it stands for, and the columns it publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewDef {
@@ -3808,6 +3834,7 @@ mod tests {
 
     fn accounts(id: u64) -> TableDef {
         TableDef {
+            matview: None,
             on_commit: super::OnCommit::default(),
             id,
             persistence: super::Persistence::Permanent,
@@ -3896,7 +3923,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1e",               // catalog format version
+                "1f",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3989,7 +4016,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1e",       // catalog format version
+                "1f",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4071,7 +4098,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1e",                 // catalog format version
+                "1f",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4168,6 +4195,11 @@ mod tests {
                 // Version 26. One byte: `ON COMMIT PRESERVE ROWS`, which is what a table with no
                 // clause is and what every table that is not temporary is (ADR 0054). So a table
                 // written before 26 decodes to exactly this and means what it always meant.
+                "00",
+                // Version 31. One byte: this table is **not** a materialized view, so the
+                // definition and the populated flag that would follow it are absent
+                // (ADR 0064). A table written before 31 has no byte here at all and decodes the
+                // same way — an ordinary table, which is all any of them could have been.
                 "00",
             )
         );
@@ -5383,7 +5415,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1e",               // catalog format version
+                "1f",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

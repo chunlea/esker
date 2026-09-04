@@ -174,6 +174,7 @@ pub(super) fn create_table(
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
     let table = TableDef {
+        matview: None,
         on_commit: create.on_commit,
         id: table_id,
         persistence: create.persistence,
@@ -2978,6 +2979,313 @@ fn view_shape(
         .collect())
 }
 
+/// `CREATE MATERIALIZED VIEW name [(cols)] AS SELECT … [WITH [NO] DATA]`.
+///
+/// **The relation it creates is a table** that carries its definition
+/// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
+/// The `SELECT` is planned once here — which proves the body and names every column's type, the
+/// same step `create_view` takes — and then run, and what it produced is stored as rows.
+pub(super) fn create_materialized_view(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateMaterializedView,
+) -> Result<Outcome> {
+    catalog::pg_catalog::refuse_write(&create.name)?;
+    let name = if create.name.contains(catalog::SCHEMA_SEPARATOR) {
+        create.name.clone()
+    } else {
+        let schema = executor.creation_schema(txn)?;
+        catalog::qualify(&schema, &create.name)
+    };
+    if existing_relation(executor, txn, &name)?.is_some() {
+        if create.if_not_exists {
+            executor.notice(SqlError::AlreadyExistsSkipping(create.name.clone()));
+            return Ok(Outcome::done("CREATE MATERIALIZED VIEW"));
+        }
+        // Measured: `42P07 relation "mv_ebooks" already exists` — the same answer a second
+        // `CREATE TABLE` of the name gets, because it competes in the same namespace.
+        return Err(SqlError::DuplicateTable(create.name.clone()));
+    }
+
+    let select = matview_body(&create.definition)?;
+    // Planned **and run** in one step, because both are needed and the plan is what types the
+    // columns: a relation whose declared types came from anywhere but the query that fills it
+    // would be a relation whose shape can disagree with its rows.
+    let (planned, rows) = executor.planned_rows(txn, &select)?;
+    let columns = matview_columns(&planned, &create.columns)?;
+
+    let table_id = catalog::allocate_id(txn, executor.tenant)?;
+    let table = matview_table(
+        table_id,
+        name,
+        columns,
+        &create.definition,
+        create.with_data,
+    );
+    catalog::create_table(txn, executor.tenant, &table)?;
+    executor.catalog_written = true;
+    if create.with_data {
+        fill_matview(executor, txn, &table, rows)?;
+    }
+    Ok(Outcome::done("CREATE MATERIALIZED VIEW"))
+}
+
+/// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`.
+///
+/// **The rows are replaced inside the caller's transaction**, which is the whole of what makes a
+/// refresh transactional — measured, a `REFRESH` inside `BEGIN … ROLLBACK` leaves the old rows.
+/// Nothing here arranges that; the storage layer does, because these are ordinary table rows.
+pub(super) fn refresh_materialized_view(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    refresh: &plan::RefreshMaterializedView,
+) -> Result<Outcome> {
+    let stored = executor.resolve_unqualified(txn, &refresh.name)?;
+    let table = match existing_relation(executor, txn, &stored)? {
+        Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
+        // Measured: a `REFRESH` of a name that is not there is `42P01 relation "…" does not
+        // exist` — the plain relation message, not one that says "materialized view".
+        _ => return Err(SqlError::UndefinedTable(refresh.name.clone())),
+    };
+    let Some(matview) = table.matview.clone() else {
+        return Err(SqlError::WrongObjectType {
+            name: refresh.name.clone(),
+            expected: "a materialized view",
+            found: relation_drop_verb(&table),
+        });
+    };
+    // **`CONCURRENTLY` needs a unique index**, and the name in the message is schema-qualified
+    // where almost nothing else is. Copied from the capture rather than composed.
+    if refresh.concurrently && !table.indexes.iter().any(|index| index.unique) {
+        let (schema, bare) = catalog::split_qualified(&table.name);
+        return Err(SqlError::CannotRefreshConcurrently(format!(
+            "{schema}.{bare}"
+        )));
+    }
+
+    // The old rows first, through the ordinary removal path, so every index entry goes with each
+    // one rather than being reasoned about separately here.
+    truncate_one_table(executor, txn, &table, false)?;
+    let rows = if refresh.with_data {
+        let select = matview_body(&matview.definition)?;
+        let (_, rows) = executor.planned_rows(txn, &select)?;
+        rows
+    } else {
+        Vec::new()
+    };
+    fill_matview(executor, txn, &table, rows)?;
+
+    // **`WITH NO DATA` on a refresh un-populates it**, so a read afterwards is `55000` again
+    // rather than an honest-looking empty answer.
+    let mut updated = (*table).clone();
+    updated.matview = Some(catalog::MatviewDef {
+        definition: matview.definition,
+        populated: refresh.with_data,
+    });
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    executor.catalog_written = true;
+    Ok(Outcome::done("REFRESH MATERIALIZED VIEW"))
+}
+
+/// `DROP MATERIALIZED VIEW [IF EXISTS] name [, …] [CASCADE]`.
+pub(super) fn drop_materialized_view(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropMaterializedView,
+) -> Result<Outcome> {
+    for name in &drop.names {
+        catalog::pg_catalog::refuse_write(name)?;
+        let stored = executor.resolve_unqualified(txn, name)?;
+        let table = match existing_relation(executor, txn, &stored)? {
+            Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
+            // A plain view under this name is the wrong kind, and PostgreSQL hints the verb that
+            // would have worked: `Use DROP VIEW to remove a view.`
+            Some(catalog::Relation::View { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a materialized view",
+                    found: "DROP VIEW",
+                });
+            }
+            None => {
+                if drop.if_exists {
+                    executor.notice(SqlError::DoesNotExistSkipping {
+                        kind: "materialized view",
+                        name: name.clone(),
+                    });
+                    continue;
+                }
+                // Measured, and it is **not** the plain relation message a `REFRESH` gets:
+                // `42P01 materialized view "mv_nosuch" does not exist`.
+                return Err(SqlError::UndefinedMatviewForDrop(name.clone()));
+            }
+            _ => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a materialized view",
+                    found: "DROP TABLE",
+                });
+            }
+        };
+        if table.matview.is_none() {
+            return Err(SqlError::WrongObjectType {
+                name: name.clone(),
+                expected: "a materialized view",
+                found: relation_drop_verb(&table),
+            });
+        }
+        refuse_or_drop_dependent_views(
+            executor,
+            txn,
+            &table.name,
+            "materialized view",
+            drop.cascade,
+        )?;
+        truncate_one_table(executor, txn, &table, false)?;
+        catalog::drop_table(txn, executor.tenant, &table)?;
+        executor.catalog_written = true;
+    }
+    Ok(Outcome::done("DROP MATERIALIZED VIEW"))
+}
+
+/// The `DROP` verb that would have worked for a relation, for a `42809`'s `HINT`.
+fn relation_drop_verb(table: &TableDef) -> &'static str {
+    if table.matview.is_some() {
+        "DROP MATERIALIZED VIEW"
+    } else {
+        "DROP TABLE"
+    }
+}
+
+/// A materialized view's stored `SELECT`, parsed and lowered.
+fn matview_body(definition: &str) -> Result<plan::Select> {
+    let parsed = crate::parse::parse_statements(definition)?;
+    let [statement] = parsed.as_slice() else {
+        return Err(SqlError::unsupported(
+            "a materialized view definition that is more than one statement",
+        ));
+    };
+    match statement.lower()? {
+        plan::Statement::Select(select) => Ok(*select),
+        _ => Err(SqlError::unsupported(
+            "a materialized view definition that is not a SELECT",
+        )),
+    }
+}
+
+/// The columns a materialized view stores: the query's, renamed by a declared list if there was one.
+///
+/// **Every one is nullable and none carries a default**, measured: a materialized view over a
+/// `NOT NULL` base column reports `attnotnull` `f`, for the same reason a view does — the value is
+/// an expression's, and the constraint belongs to the table it read.
+fn matview_columns(planned: &super::query::Planned, declared: &[String]) -> Result<Vec<ColumnDef>> {
+    if !declared.is_empty() && declared.len() != planned.columns.len() {
+        return Err(SqlError::ViewColumnCount {
+            declared: declared.len(),
+            produced: planned.columns.len(),
+        });
+    }
+    Ok(planned
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(at, column)| ColumnDef {
+            name: declared
+                .get(at)
+                .cloned()
+                .unwrap_or_else(|| column.name.clone()),
+            ty: column.ty,
+            typmod: column.typmod,
+            default_expr: None,
+            not_null: false,
+            default: None,
+            missing: None,
+            generated: None,
+            generated_virtual: false,
+            comment: None,
+            dropped: false,
+            user_type: column.user_type.as_ref().map(|ty| ty.oid),
+        })
+        .collect())
+}
+
+/// The `TableDef` a materialized view is.
+///
+/// **No primary key**, measured: `pg_constraint` and `pg_index` are both empty for a fresh one, and
+/// `view_test.rb`'s `test_does_not_assume_id_column_as_primary_key` asserts exactly that. So it
+/// takes the internal row id every keyless table takes, at position 0.
+fn matview_table(
+    id: u64,
+    name: String,
+    columns: Vec<ColumnDef>,
+    definition: &str,
+    populated: bool,
+) -> TableDef {
+    let mut with_row_id = Vec::with_capacity(columns.len() + 1);
+    with_row_id.push(ColumnDef {
+        name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
+        ty: ColumnType::Int8,
+        typmod: crate::value::NO_TYPMOD,
+        default_expr: None,
+        not_null: true,
+        default: None,
+        missing: None,
+        generated: None,
+        generated_virtual: false,
+        comment: None,
+        dropped: false,
+        user_type: None,
+    });
+    with_row_id.extend(columns);
+    TableDef {
+        matview: Some(catalog::MatviewDef {
+            definition: definition.to_owned(),
+            populated,
+        }),
+        on_commit: catalog::OnCommit::PreserveRows,
+        id,
+        persistence: catalog::Persistence::Permanent,
+        name,
+        columns: with_row_id,
+        primary_key: vec![0],
+        indexes: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers_disabled: false,
+        parents: Vec::new(),
+        partition_by: None,
+        partition_bound: None,
+        children: Vec::new(),
+        triggers: Vec::new(),
+        excludes: Vec::new(),
+        child_scans: Vec::new(),
+        primary_key_name: String::new(),
+        schema_version: 1,
+        sequences: Vec::new(),
+        comment: None,
+        primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Writes what the definition produced, through the ordinary row-writing path.
+fn fill_matview(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    rows: Vec<Vec<Datum>>,
+) -> Result<()> {
+    for row in rows {
+        let mut stored = Vec::with_capacity(row.len() + 1);
+        // Column 0 is the internal row id the relation has instead of a key.
+        stored.push(Datum::Int8(executor.next_row_id(table.id)?));
+        stored.extend(row);
+        let mut written = super::Written::default();
+        super::dml::write_row(executor, txn, table, &stored, &mut written)?;
+    }
+    Ok(())
+}
+
 /// `DROP VIEW [IF EXISTS] name [, …]`.
 pub(super) fn drop_view(
     executor: &mut Executor,
@@ -2995,7 +3303,17 @@ pub(super) fn drop_view(
                 executor.catalog_written = true;
             }
             // **`42809`, with a `HINT` naming the verb that would have worked** — the same shape
-            // `DROP TABLE` over a view gets, measured in both directions.
+            // `DROP TABLE` over a view gets, measured in both directions. A **materialized** view
+            // is a table record and reaches this arm too, and its hint is a third one: measured,
+            // `Use DROP MATERIALIZED VIEW to remove a materialized view.`
+            Some(catalog::Relation::Table { table_id }) => {
+                let table = executor.table_by_id(txn, table_id)?;
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a view",
+                    found: relation_drop_verb(&table),
+                });
+            }
             Some(_) => {
                 return Err(SqlError::WrongObjectType {
                     name: name.clone(),
@@ -3162,7 +3480,18 @@ pub(super) fn truncate(
         else {
             return Err(SqlError::UndefinedTableForDrop(name.clone()));
         };
-        tables.push((*executor.table_by_id(txn, table_id)?).clone());
+        let table = executor.table_by_id(txn, table_id)?;
+        // **A materialized view is not a table to `TRUNCATE`**, and the message says exactly that
+        // with **no** `HINT` — measured, where the `DROP TABLE` of the same relation carries one.
+        // Emptying it would also be a lie: the next `REFRESH` puts every row back.
+        if table.matview.is_some() {
+            return Err(SqlError::WrongObjectType {
+                name: name.clone(),
+                expected: "a table",
+                found: "TRUNCATE",
+            });
+        }
+        tables.push((*table).clone());
     }
     // **A table something references is refused before anything is emptied**, so a statement that
     // names three tables and cannot empty the second empties none of them. `CASCADE` truncates the
@@ -3287,21 +3616,26 @@ fn refuse_or_drop_dependent_views(
     kind: &'static str,
     cascade: bool,
 ) -> Result<()> {
-    let dependents = dependent_views(executor, txn, relation)?;
-    if let Some(view) = dependents.first()
+    let dependents = dependent_relations(executor, txn, relation)?;
+    if let Some((dependent, dependent_kind)) = dependents.first()
         && !cascade
     {
         return Err(SqlError::ViewDependsOnRelation {
             kind,
             name: catalog::display_name(relation),
+            // **The dependent's noun, not a constant `view`** — a materialized view says so.
             detail: format!(
-                "view {} depends on {kind} {}",
-                catalog::display_name(view),
+                "{dependent_kind} {} depends on {kind} {}",
+                catalog::display_name(dependent),
                 catalog::display_name(relation)
             ),
         });
     }
-    drop_views_cascading(executor, txn, dependents)
+    drop_views_cascading(
+        executor,
+        txn,
+        dependents.into_iter().map(|(name, _)| name).collect(),
+    )
 }
 
 /// Drops each view and everything built on it, depth first.
@@ -3374,16 +3708,48 @@ fn views_depending_on_column(
 /// statement understands, and refusing every `DROP TABLE` in the database because one view is
 /// unreadable would be the worse answer.
 fn dependent_views(executor: &Executor, txn: &dyn Txn, relation: &str) -> Result<Vec<String>> {
+    Ok(dependent_relations(executor, txn, relation)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Every view **and materialized view** whose definition names `relation`, with the noun
+/// PostgreSQL uses for each in the `DETAIL`.
+///
+/// **A materialized view is a dependency exactly as a view is** — measured, `DROP TABLE` of its
+/// base is `2BP01 … DETAIL: materialized view mv_ebooks depends on table mv_books`. The noun
+/// differs and the edge does not, which is why both come out of one walk rather than two.
+fn dependent_relations(
+    executor: &Executor,
+    txn: &dyn Txn,
+    relation: &str,
+) -> Result<Vec<(String, &'static str)>> {
     let mut found = Vec::new();
-    for view in catalog::views(txn, executor.tenant)? {
-        let Ok(parsed) = crate::parse::parse_statements(&view.definition) else {
-            continue;
+    let names_it = |definition: &str| -> bool {
+        let Ok(parsed) = crate::parse::parse_statements(definition) else {
+            return false;
         };
         let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
+            return false;
+        };
+        super::bind::table_names(&lowered).contains(&relation)
+    };
+    for view in catalog::views(txn, executor.tenant)? {
+        if names_it(&view.definition) {
+            found.push((view.name.clone(), "view"));
+        }
+    }
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    for row in relations.of_kind(catalog::pg_relations::RelKind::MaterializedView) {
+        let Some(table) = relations.table(row) else {
             continue;
         };
-        if super::bind::table_names(&lowered).contains(&relation) {
-            found.push(view.name.clone());
+        let Some(matview) = table.matview.as_ref() else {
+            continue;
+        };
+        if names_it(&matview.definition) {
+            found.push((table.name.clone(), "materialized view"));
         }
     }
     Ok(found)
@@ -3435,6 +3801,15 @@ pub(super) fn drop_table(
                 return Err(SqlError::UndefinedTableForDrop(name.clone()));
             }
         };
+        // **A materialized view is a table record**, so `DROP TABLE` finds one and has to refuse:
+        // `"m" is not a table`, hinting the verb that works. Measured.
+        if table.matview.is_some() {
+            return Err(SqlError::WrongObjectType {
+                name: name.clone(),
+                expected: "a table",
+                found: "DROP MATERIALIZED VIEW",
+            });
+        }
         refuse_or_drop_dependent_views(executor, txn, &table.name, "table", drop.cascade)?;
         // **A table something references cannot be dropped**, and `2BP01` names the constraint
         // that stops it — unless `CASCADE`, which takes the constraint with the table instead.
@@ -4228,7 +4603,20 @@ pub(super) fn alter_table(
     let done = Ok(Outcome::done("ALTER TABLE"));
     catalog::pg_catalog::refuse_write(&alter.name)?;
     let table = match existing_relation(executor, txn, &alter.name)? {
-        Some(catalog::Relation::Table { table_id }) => executor.table_by_id(txn, table_id)?,
+        Some(catalog::Relation::Table { table_id }) => {
+            let table = executor.table_by_id(txn, table_id)?;
+            // **A materialized view is a table record, and `ALTER TABLE` must not act on one.**
+            // PostgreSQL names the *action* rather than saying "is not a table" — the same shape
+            // an index gets, with its own `DETAIL`. Measured.
+            if table.matview.is_some() {
+                return Err(SqlError::AlterActionOnWrongObject {
+                    action: "ADD COLUMN",
+                    name: alter.name.clone(),
+                    kind: "materialized views",
+                });
+            }
+            table
+        }
         // An index is a relation, so PostgreSQL does not say "is not a table" here -- it says the
         // action cannot be performed on it, and adds that indexes do not take one. Captured.
         Some(catalog::Relation::Index { .. } | catalog::Relation::PrimaryKey { .. }) => {

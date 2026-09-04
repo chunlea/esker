@@ -214,7 +214,11 @@ fn columns_of<'a>(
         // row on a real server, and the adapter's own query is the one that filters it out
         // (`AND NOT a.attisdropped`). Hiding it here would answer that query correctly and still
         // be wrong — `attnum` would close over the gap, where PostgreSQL leaves it (ADR 0051).
-        RelKind::Table => table
+        // **A materialized view describes its own columns exactly as a table does**, because it
+        // is one (ADR 0064) — measured: `pg_attribute` over one lists the query's columns with
+        // their types, and `attnotnull` is `f` for every one of them, which is what a keyless
+        // table with no `NOT NULL` column reports anyway.
+        RelKind::Table | RelKind::MaterializedView => table
             .all_user_columns()
             .map(|(at, column)| (Cow::Borrowed(column), Some(at)))
             .collect(),
