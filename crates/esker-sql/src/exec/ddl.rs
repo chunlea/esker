@@ -1523,9 +1523,24 @@ fn drop_column(
 
     // A foreign key **declared on** the column: on this table, so it goes silently. This is the
     // half that is not `refuse_referencing_keys`'s, and the two are easy to confuse.
+    //
+    // **And its back-reference goes with it**, which is the half run 50 found missing: the
+    // constraint lives in this record and the `(parent, child)` key lives under the *parent*, so
+    // dropping one and not the other leaves a parent that outlives the constraint still being told
+    // it is referenced. `DROP TABLE` says the same thing about its own keys and was the only place
+    // that had to, until a column could take a constraint with it.
+    let parents: Vec<u64> = updated
+        .foreign_keys
+        .iter()
+        .filter(|key| key.columns.contains(&at))
+        .map(|key| key.parent)
+        .collect();
     updated
         .foreign_keys
         .retain(|key| !key.columns.contains(&at));
+    for parent in parents {
+        forget_backref_if_last(txn, executor.tenant, updated, parent);
+    }
 
     // The sequence the column owned. `serial` makes one and the column owns it, so
     // `DROP COLUMN "id"` takes `dc_id_seq` with it — which does not follow from the statement's
@@ -1551,6 +1566,19 @@ fn drop_column(
     });
 
     Ok(true)
+}
+
+/// Deletes a child's back-reference to one parent, **only once nothing points there any more**.
+///
+/// The key is `(parent, child)` and not `(parent, child, constraint)`, so a child holding two
+/// foreign keys to one parent has **one** back-reference between them. Deleting it while the second
+/// still points there would tell the parent it is unreferenced, and the `DROP TABLE` that should
+/// have been `2BP01` would go through instead — a wrong answer rather than a stale key. Call this
+/// after the constraints have been removed from `child`, which is what makes the test right.
+fn forget_backref_if_last(txn: &mut dyn Txn, tenant: u64, child: &TableDef, parent: u64) {
+    if !child.foreign_keys.iter().any(|key| key.parent == parent) {
+        txn.delete(&catalog::foreign_key_backref_key(tenant, parent, child.id));
+    }
 }
 
 /// Whether a stored expression still names only columns this table has.
@@ -1593,21 +1621,29 @@ fn refuse_referencing_keys(
             })
             .map(|constraint| constraint.name.clone())
             .collect();
-        for constraint in depends {
-            if !cascade {
-                return Err(SqlError::DependentColumn {
-                    column: name.to_owned(),
-                    relation: table.name.clone(),
-                    detail: format!(
-                        "constraint {constraint} on table {} depends on column {name} of table {}",
-                        child.name, table.name
-                    ),
-                });
-            }
-            let mut without = (*child).clone();
-            without.foreign_keys.retain(|key| key.name != constraint);
-            catalog::replace_table(txn, executor.tenant, &child, &without)?;
+        if depends.is_empty() {
+            continue;
         }
+        if !cascade {
+            return Err(SqlError::DependentColumn {
+                column: name.to_owned(),
+                relation: table.name.clone(),
+                detail: format!(
+                    "constraint {} on table {} depends on column {name} of table {}",
+                    depends[0], child.name, table.name
+                ),
+            });
+        }
+        // **All of them in one rewrite**, the way `DROP TABLE`'s cascade does it: a child may hold
+        // two keys into this column, and replacing the record once per constraint would write the
+        // second rewrite over a `child` read before the first.
+        let mut without = (*child).clone();
+        without
+            .foreign_keys
+            .retain(|key| !depends.contains(&key.name));
+        without.schema_version += 1;
+        catalog::replace_table(txn, executor.tenant, &child, &without)?;
+        forget_backref_if_last(txn, executor.tenant, &without, table.id);
     }
     Ok(())
 }
