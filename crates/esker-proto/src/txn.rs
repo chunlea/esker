@@ -514,7 +514,8 @@ impl TxnKvReq {
     #[must_use]
     pub fn routing_key(&self) -> &[u8] {
         match self {
-            Self::Get { key, .. } => key,
+            // A read of one key routes by it, whether the answer is a value or a timestamp.
+            Self::Get { key, .. } | Self::LatestCommit { key } => key,
             Self::Scan { start, .. } => start,
             Self::Prewrite { mutations, .. } => mutations.first().map_or(&[][..], |m| m.key()),
             Self::Commit { keys, .. }
@@ -522,7 +523,6 @@ impl TxnKvReq {
             | Self::ResolveLock { keys, .. } => keys.first().map_or(&[][..], |key| &key[..]),
             Self::Heartbeat { primary, .. } => primary,
             Self::GcSafepoint { .. } => &[],
-            Self::LatestCommit { key } => key,
         }
     }
 

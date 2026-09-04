@@ -513,6 +513,13 @@ fn golden_txn_read_requests() -> Vec<(&'static str, Request)> {
 /// The six methods that write: two phases, two ways to end, and the two pieces of
 /// housekeeping (a lock's TTL and the collection safepoint).
 fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
+    let mut requests = golden_txn_prewrite_requests();
+    requests.extend(golden_txn_finish_requests());
+    requests
+}
+
+/// The prewrites: the mutation tags live here, so this is the list that grows when one is added.
+fn golden_txn_prewrite_requests() -> Vec<(&'static str, Request)> {
     let h = header();
     vec![
         (
@@ -560,6 +567,14 @@ fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
+    ]
+}
+
+/// `Commit`, `Rollback`, `ResolveLock`, `Heartbeat` and `GcSafepoint`: what finishes a
+/// transaction, or what a store is told about one.
+fn golden_txn_finish_requests() -> Vec<(&'static str, Request)> {
+    let h = header();
+    vec![
         (
             "txn-commit",
             Request::txn_kv(
@@ -729,6 +744,16 @@ fn golden_txn_responses() -> Vec<(&'static str, Response)> {
                 },
             }),
         ),
+    ]
+    .into_iter()
+    .chain(golden_txn_housekeeping_responses())
+    .collect()
+}
+
+/// What a store answers about a transaction it is *tidying*: a lock resolved, a lease extended, a
+/// safepoint published.
+fn golden_txn_housekeeping_responses() -> Vec<(&'static str, Response)> {
+    vec![
         (
             "txn-resolve-lock",
             Response::TxnKv(TxnKvResp::ResolveLock { resolved: 3 }),
