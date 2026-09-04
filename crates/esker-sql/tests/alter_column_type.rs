@@ -53,3 +53,53 @@ fn every_alter_column_type_answer_is_postgresql_19_s() {
         "only {checked} statements ran; the corpus did not load"
     );
 }
+
+/// **`CREATE UNLOGGED TABLE` works, and the row that said otherwise named the wrong feature.**
+///
+/// Run 59 ranked `CREATE UNLOGGED is not supported` at 10 tests over 2 files. The keyword is cut
+/// out of the source and the statement parses (`crate::parse::strip_unlogged`), `relpersistence`
+/// answers `u`, and none of that changed in this unit — what those ten tests actually hit is a
+/// **virtual generated column**, which this parser has no grammar for. The refusal table matched
+/// `CREATE UNLOGGED` on the original words and reported that instead, sending the reader to a
+/// feature that works.
+///
+/// The rule counts rather than searches, because one `CREATE TABLE` declares both kinds: the
+/// suite's `virtual_columns` has three `STORED` columns and two virtual ones.
+#[test]
+fn an_unlogged_table_works_and_a_virtual_column_names_itself() {
+    let mut node = parity::Node::new(&[]);
+    // Unlogged, with a stored generated column: this has worked all along.
+    node.run(
+        "CREATE UNLOGGED TABLE vc (id bigint PRIMARY KEY, c1 integer, c2 integer GENERATED ALWAYS \
+         AS (c1 + 1) STORED)",
+    )
+    .unwrap();
+    assert_eq!(
+        node.rows("SELECT relpersistence FROM pg_class WHERE relname = 'vc'"),
+        [["u"]],
+        "the flag is stored and reported; nothing here is actually unlogged"
+    );
+    node.run("CREATE TABLE lg (id bigint PRIMARY KEY)").unwrap();
+    assert_eq!(
+        node.rows("SELECT relpersistence FROM pg_class WHERE relname = 'lg'"),
+        [["p"]]
+    );
+
+    // A virtual generated column names **itself**, in both spellings and on both persistences —
+    // and in a table that also has a stored one, which is the case the first rule missed.
+    for written in [
+        "CREATE TABLE v1 (id bigint PRIMARY KEY, c1 integer, c3 integer GENERATED ALWAYS AS (c1 + \
+         2))",
+        "CREATE TABLE v2 (id bigint PRIMARY KEY, c1 integer, c3 integer GENERATED ALWAYS AS (c1 + \
+         2) VIRTUAL)",
+        "CREATE UNLOGGED TABLE v3 (id bigint PRIMARY KEY, c1 integer, c2 integer GENERATED ALWAYS \
+         AS (c1 + 1) STORED, c3 integer GENERATED ALWAYS AS (c1 + 2) VIRTUAL)",
+    ] {
+        let error = node.run(written).unwrap_err();
+        assert_eq!(error.sqlstate(), "0A000", "for {written}");
+        assert!(
+            error.to_string().contains("virtual generated column"),
+            "the refusal names the real gap rather than UNLOGGED: {error}"
+        );
+    }
+}
