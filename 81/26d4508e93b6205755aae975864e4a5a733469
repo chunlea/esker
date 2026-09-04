@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/savepoint.rs
+  s_2d916f5f540186::t_fc1bd58cb8ec50 238-252
+crates/esker-sql/tests/serializable.rs
+  s_2d916f5f540186::t_ff4409be8c2490 177-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8126d4508e93b6205755aae975864e4a5a733469",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
