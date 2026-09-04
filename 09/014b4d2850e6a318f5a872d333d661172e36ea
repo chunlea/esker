@@ -1,0 +1,55 @@
+crates/esker-keys/src/columnar.rs
+  s_6f7019c05b578b::t_80ef8bcebf7c59 92-95,184-187
+crates/esker-keys/src/row.rs
+  s_6f7019c05b578b::t_dbb82d8ab19465 191-192,456-457,516-517,709-715,851-852,1341-1344,2008-2009,2083-2084
+crates/esker-keys/src/value.rs
+  s_6f7019c05b578b::t_82bb71d2870174 154-174,350-356,485,501-504,618-626,875-877,922-923
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_c919f24ae7d2a4 141-149,247,260,301,402,543-550,872,974,2026-2053,2116-2117,2178-2179,2262-2263,2278-2279,2335-2336,2382-2383
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_53c48ec9cdee40 305-308,375-376,378-379,510-511,513-514
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_f8a9cf55bb15f2 529-541,2351-2352
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_24e904f2415ecc 1257-1258,1303-1304
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_ed5018a7bf360b 640-643,736-737
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_4be25c5b951c15 2814-2815,2842-2843
+crates/esker-sql/src/parameter.rs
+  s_6f7019c05b578b::t_319d05fb516491 133-144
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_edd96da441b440 6911-6915
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_a5acbc2e2fb589 1785-1788,1872-1875,1968-1971
+crates/esker-sql/src/row.rs
+  s_6f7019c05b578b::t_fab5d16acd7e45 55-56,164-165
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_8b8a261b19c974 61-62,609-610,701-702,827-830,952-953,986-987,1050-1051,1117-1118,1175-1178,1294-1295,1379-1380,1441-1442,1560-1561,1610-1611,1721-1730,1928-1930,2054-2059
+crates/esker-sql/src/value/tsquery.rs
+  s_6f7019c05b578b::t_ce1229a60eabb1 1-287
+crates/esker-sql/src/value/tsvector.rs
+  s_6f7019c05b578b::t_0ada4c3745d5ba 1-276
+crates/esker-sql/tests/corpus/pg19_tsvector.txt
+  s_6f7019c05b578b::t_0a98d8a43737f4 1-131
+crates/esker-sql/tests/tsvector.rs
+  s_6f7019c05b578b::t_1f2be73df4474d 1-76
+crates/esker-store/src/columnar/decode.rs
+  s_6f7019c05b578b::t_26803bfc206543 206-211,284-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "09014b4d2850e6a318f5a872d333d661172e36ea",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
