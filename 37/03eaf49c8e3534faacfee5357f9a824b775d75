@@ -1,0 +1,18 @@
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 800-802,839,851,997-1010,1031,1043-1052
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 47-52,960-966,968-1039
+docs/plans/debt-c6.md
+  h_44076b318daf9c 964-1025
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3703eaf49c8e3534faacfee5357f9a824b775d75",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
