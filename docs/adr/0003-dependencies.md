@@ -49,6 +49,17 @@ feature on the compiled graph goes 34 → 43 (`cargo tree -e normal`); with it o
 The nine: `rustls`, `rustls-graviola`, `graviola`, `rustls-pki-types`, `rustls-webpki`,
 `getrandom`, `subtle`, `untrusted`, `zeroize`.
 
+**The build-script audit `deny.toml` asks for, done.** That file says a build script "has to be
+looked at by a human rather than discovered in a profile six months later", so: of the nine, two
+have one and neither compiles anything. `rustls`'s is thirteen lines and sets one `cfg` for the
+nightly-only `read_buf` feature, which is not enabled here. `getrandom`'s runs `rustc -vV` to read
+the compiler's minor version and emits `cfg`s from it. **No `links` key on any of the nine**, and no
+`cc` anywhere in the graph. Graviola, the one that actually contains assembly, has **no build script
+at all**: its `Cargo.toml` says `build = false` and its x86-64 and aarch64 routines are `.rs` files
+that rustc assembles inline — the same shape `CLAUDE.md` already blesses for `crc32c`'s
+`std::arch` paths, and the reason a crate full of hand-written assembly is still pure Rust by this
+project's definition.
+
 **`Cargo.lock` now names `ring` and `cc`, and nothing builds them.** This is worth knowing before
 someone greps for it and concludes the rule was broken. Cargo locks a version for every optional
 dependency edge that could ever be selected, so `rustls-webpki`'s unused optional `ring` — and

@@ -21,6 +21,7 @@ use crate::pgwire::message::{
     decode_startup,
 };
 use crate::pgwire::session::{Execute, Session};
+use crate::pgwire::tls::TlsConfig;
 use crate::pgwire::{Negotiation, error_fields, error_message, negotiation};
 
 /// How a connecting client proves who it is.
@@ -49,6 +50,12 @@ pub struct Config {
     /// Reported to the client as `server_version`. PostgreSQL clients parse this and change
     /// behaviour on it, so it names a real PostgreSQL version and then says what is actually here.
     pub server_version: String,
+    /// Whether this node terminates TLS, and what with.
+    ///
+    /// [`TlsConfig::disabled`] is the default and answers `SSLRequest` with `N`, which is what
+    /// every build without the `tls` feature can do. Building an enabled one is a startup-time
+    /// decision the binary makes ([`TlsConfig::from_pem_files`]), never a per-connection one.
+    pub tls: TlsConfig,
 }
 
 impl Default for Config {
@@ -57,6 +64,7 @@ impl Default for Config {
             address: "127.0.0.1:5432".to_owned(),
             auth: Auth::Trust,
             server_version: "19.0 (Esker)".to_owned(),
+            tls: TlsConfig::disabled(),
         }
     }
 }
@@ -259,10 +267,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             };
             match startup {
-                // We terminate no TLS and no GSSAPI. A single `N` is the documented refusal, and
-                // the client then either continues in the clear or gives up — either way this is
-                // not an error, which is why the loop goes round rather than returning.
+                // A single `N` is the documented refusal, and the client then either continues in
+                // the clear or gives up — either way this is not an error, which is why the loop
+                // goes round rather than returning.
+                //
+                // **The refusal is logged, because the client's half of it is invisible here.** A
+                // client on `sslmode=require` reads the `N` and closes without sending a startup
+                // packet, so what an operator sees from this end is a connection that opened and
+                // went away: no user, no database, no error. The line below is the only place that
+                // says why, and it names the way out. GSSAPI encryption is refused the same way
+                // and stays refused — nothing in this project speaks it (ADR 0055).
                 Startup::SslRequest | Startup::GssEncRequest => {
+                    tracing::debug!(
+                        tls_available = self.config.tls.is_enabled(),
+                        "refusing an encryption request: this node terminates none; put a \
+                         TLS-terminating proxy in front of it, or build with `--features tls` \
+                         and pass --tls-cert/--tls-key"
+                    );
                     self.stream.write_all(b"N").await?;
                     self.stream.flush().await?;
                 }
