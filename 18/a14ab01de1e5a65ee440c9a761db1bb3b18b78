@@ -1,0 +1,25 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_e34fd594950f35 1544,1982-1999
+crates/esker-sql/tests/corpus/pg19_geometric.txt
+  s_2bed4ac2b1c944::t_9265caadac9db9 25-28
+crates/esker-sql/tests/geometric.rs
+  s_2bed4ac2b1c944::t_7fb7ed1fd274d2 25-29
+crates/esker-sql/tests/pg_catalog.rs
+  s_2bed4ac2b1c944::t_d2be5934c693d7 208-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "18a14ab01de1e5a65ee440c9a761db1bb3b18b78",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
