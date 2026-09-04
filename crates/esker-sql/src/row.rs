@@ -47,7 +47,8 @@ mod tests {
         | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray
-            | ColumnType::HstoreArray => {
+            | ColumnType::HstoreArray
+            | ColumnType::TsRangeArray => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
                 (
@@ -129,6 +130,15 @@ mod tests {
             // An hstore is a `Datum::Text` holding the canonical form; the ordering property
             // these tests state is the text's, which is exactly the claim.
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            // A range's stored form is its canonical text; `empty` is the one value every subtype
+            // has, which is enough to state the ordering property these tests are for.
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+                Just(Datum::Range {
+                    subtype: Box::new(crate::value::range_subtype(ty)),
+                    text: "empty".to_owned(),
+                })
+                .boxed()
+            }
             // Folded, because a citext's *key* is its folded value: the ordering property these
             // tests state is the folded text's, which is exactly the claim.
             ColumnType::Citext => ".*"

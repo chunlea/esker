@@ -151,6 +151,20 @@ pub enum ColumnType {
     /// why nothing may hard-code it — a fixed one on this side is invisible to a client that
     /// reads it the way the adapter does.
     Hstore,
+    /// PostgreSQL's `tsrange`: a range of `timestamp without time zone`.
+    ///
+    /// Stored as the canonical text `crate::value::range` renders, the road `hstore` takes and for
+    /// the same reason — the canonical form is a function of the content, so equality, ordering
+    /// and grouping are the text's. **Not canonicalised** the way `int4range` is: a timestamp has
+    /// no successor, so `'[a,b]'` keeps its brackets.
+    TsRange,
+    /// PostgreSQL's `tstzrange`: the same, over `timestamp with time zone`.
+    TstzRange,
+    /// PostgreSQL's `int4range`. **Canonicalised**, because an integer has a successor:
+    /// `'[1,10]'` is stored and printed `[1,11)`.
+    Int4Range,
+    /// `tsrange[]`, which `range_test.rb` declares as `t.tsrange :ts_ranges, array: true`.
+    TsRangeArray,
     /// The `citext` extension's type: text whose **comparison folds case**.
     ///
     /// Stored exactly as it was written — `'Cased Text'` comes back `Cased Text` — and compared
@@ -242,7 +256,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 28] = [
+    pub const ALL: [ColumnType; 32] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -253,6 +267,10 @@ impl ColumnType {
         ColumnType::Jsonb,
         ColumnType::Hstore,
         ColumnType::Citext,
+        ColumnType::TsRange,
+        ColumnType::TstzRange,
+        ColumnType::Int4Range,
+        ColumnType::TsRangeArray,
         ColumnType::HstoreArray,
         ColumnType::Bool,
         ColumnType::Bytea,
@@ -303,6 +321,22 @@ pub enum Datum {
     /// `text` and `||` could not tell which concatenation it was. Its **comparison is `text`'s**,
     /// unlike citext's, because the canonical form is a function of the content.
     Hstore(String),
+    /// [`ColumnType::TsRange`] and its siblings: the range, as its canonical text.
+    ///
+    /// The subtype rides along because a folded constant would otherwise lose it — the lesson
+    /// [`Datum::Hstore`] records: `'…'::tsrange` folds at plan time, and a `Text` coming out of
+    /// that fold has nothing left saying which range it is, so `pg_typeof` and the operators
+    /// cannot tell a `tsrange` from a `tstzrange`.
+    ///
+    /// Its comparison is the **text's**, which is right because the text is canonical: two ranges
+    /// print the same exactly when they are the same range. The subtype is not compared — a
+    /// `tsrange` and an `int4range` are different types and no operator puts them together.
+    Range {
+        /// What the bounds are: `ColumnType::Timestamp` for a `tsrange`, and so on.
+        subtype: Box<ColumnType>,
+        /// The canonical text, which is what `crate::value::range` renders.
+        text: String,
+    },
     /// [`ColumnType::Citext`]: the text **as it was written**, compared **folded**.
     ///
     /// A variant of its own rather than a `Text` under a different column type, because the
@@ -411,6 +445,18 @@ impl PartialEq for Datum {
             (Datum::Text(a), Datum::Text(b))
             | (Datum::Citext(a), Datum::Citext(b))
             | (Datum::Hstore(a), Datum::Hstore(b)) => a == b,
+            // The canonical text and the subtype together: two ranges are one row when they print
+            // the same *and* are the same type.
+            (
+                Datum::Range {
+                    subtype: a,
+                    text: at,
+                },
+                Datum::Range {
+                    subtype: b,
+                    text: bt,
+                },
+            ) => a == b && at == bt,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
             // Bitwise, so a round-trip test cannot pass by turning -0.0 into 0.0 or one NaN
@@ -433,6 +479,11 @@ impl Datum {
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Citext(_) => ColumnType::Citext,
             Datum::Hstore(_) => ColumnType::Hstore,
+            Datum::Range { subtype, .. } => match **subtype {
+                ColumnType::TimestampTz => ColumnType::TstzRange,
+                ColumnType::Int4 | ColumnType::Int8 => ColumnType::Int4Range,
+                _ => ColumnType::TsRange,
+            },
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Date(_) => ColumnType::Date,
             Datum::Time(_) => ColumnType::Time,

@@ -721,6 +721,22 @@ pub enum CatalogFunc {
     HstoreAvals,
     /// `hstore(k, v)` and `hstore(keys[], vals[])`: the two constructors the adapter reaches for.
     HstoreBuild,
+    /// `lower_inc(range)`, `upper_inc`, `lower_inf`, `upper_inf`: the four bracket questions.
+    ///
+    /// `lower`/`upper` are **not** here — they are the text functions of the same name, overloaded
+    /// on a range operand, which is how a real server spells them too.
+    RangeLowerInc,
+    /// See [`CatalogFunc::RangeLowerInc`].
+    RangeUpperInc,
+    /// See [`CatalogFunc::RangeLowerInc`]. **True for an absent bound, and that is the whole
+    /// distinction from `-infinity`**, which is a *value* and answers false.
+    RangeLowerInf,
+    /// See [`CatalogFunc::RangeLowerInc`].
+    RangeUpperInf,
+    /// `a @> b` and `b <@ a` over ranges: whether one contains the other, or a bare value.
+    RangeContains,
+    /// `tsrange(lower, upper)` and `tsrange(lower, upper, '[]')`.
+    RangeBuild,
     /// `pg_get_triggerdef(oid)`: a trigger's `CREATE TRIGGER`, re-printed.
     ///
     /// **It normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`**, so the text that comes out is
@@ -873,6 +889,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
             // The hstore functions. `hstore(…)` is two shapes of one name, told apart by whether
             // its arguments are arrays — an overload, the way a real server tells them apart.
+            () if name.eq_ignore_ascii_case("lower_inc") => Some(CatalogFunc::RangeLowerInc),
+            () if name.eq_ignore_ascii_case("upper_inc") => Some(CatalogFunc::RangeUpperInc),
+            () if name.eq_ignore_ascii_case("lower_inf") => Some(CatalogFunc::RangeLowerInf),
+            () if name.eq_ignore_ascii_case("upper_inf") => Some(CatalogFunc::RangeUpperInf),
+            () if name.eq_ignore_ascii_case("tsrange") => Some(CatalogFunc::RangeBuild),
             () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
             () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
             () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
@@ -927,9 +948,15 @@ impl CatalogFunc {
             CatalogFunc::DateRange => "daterange",
             CatalogFunc::IsEmpty => "isempty",
             CatalogFunc::RangeOverlaps => "&&",
+            CatalogFunc::RangeLowerInc => "lower_inc",
+            CatalogFunc::RangeUpperInc => "upper_inc",
+            CatalogFunc::RangeLowerInf => "lower_inf",
+            CatalogFunc::RangeUpperInf => "upper_inf",
+            CatalogFunc::RangeBuild => "tsrange",
             CatalogFunc::HstoreFetch => "->",
             CatalogFunc::HstoreHasKey => "?",
-            CatalogFunc::HstoreContains => "@>",
+            // One symbol, two containments — see `exec::cursor`, where the operand decides.
+            CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
             CatalogFunc::HstoreConcat => "||",
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
@@ -973,15 +1000,22 @@ impl CatalogFunc {
             | CatalogFunc::ConvertTo
             | CatalogFunc::DateRange
             | CatalogFunc::RangeOverlaps
+            | CatalogFunc::RangeContains
             | CatalogFunc::HstoreFetch
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
             | CatalogFunc::HstoreBuild => &[2],
-            CatalogFunc::PgGetExpr => &[2, 3],
+            // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
+            // `pg_get_expr`'s two really are two forms as well.
+            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::HstoreAkeys
+            CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInf
+            | CatalogFunc::HstoreAkeys
             | CatalogFunc::HstoreAvals
             | CatalogFunc::PgEncodingToChar
             | CatalogFunc::PgGetPartkeydef
@@ -1042,12 +1076,18 @@ impl CatalogFunc {
             // `WHERE` without a comparison around it.
             CatalogFunc::IsEmpty
             | CatalogFunc::RangeOverlaps
+            | CatalogFunc::RangeContains
+            | CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInf
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains => ColumnType::Bool,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
+            CatalogFunc::RangeBuild => ColumnType::TsRange,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.
             CatalogFunc::Now
@@ -1523,7 +1563,12 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1594,7 +1639,12 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1639,7 +1689,12 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray => mismatch(),
             },
         }
     }

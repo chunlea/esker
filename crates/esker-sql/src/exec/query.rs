@@ -2543,6 +2543,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Hstore => 27,
             // Its own family: a citext compares only with a citext and with an `unknown`.
             ColumnType::Citext => 28,
+            // A family each: a range compares only with a range of the same subtype.
+            ColumnType::TsRange => 29,
+            ColumnType::TstzRange => 30,
+            ColumnType::Int4Range => 31,
+            ColumnType::TsRangeArray => 32,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

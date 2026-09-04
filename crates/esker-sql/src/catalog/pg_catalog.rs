@@ -1139,7 +1139,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 ),
                 Datum::Text(",".to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
-                Datum::Text("b".to_owned()),
+                Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
                 // No collation on any type here, which is what makes
                 // `a.attcollation <> t.typcollation` false for every column — the
@@ -1203,6 +1203,8 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
             Datum::Int8(oid),
             Datum::Text(",".to_owned()),
             Datum::Text("array_in".to_owned()),
+            // An array **of** a user-defined type is a base type: the `r`/`e` belongs to the type
+            // it is an array of, not to the array.
             Datum::Text("b".to_owned()),
             Datum::Int8(0),
             Datum::Int8(0),
@@ -1387,6 +1389,10 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb",
         ColumnType::Hstore => "hstore",
         ColumnType::Citext => "citext",
+        ColumnType::TsRange => "tsrange",
+        ColumnType::TstzRange => "tstzrange",
+        ColumnType::Int4Range => "int4range",
+        ColumnType::TsRangeArray => "_tsrange",
         ColumnType::HstoreArray => "_hstore",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
@@ -1400,6 +1406,18 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Uuid => "uuid",
         ColumnType::Interval => "interval",
         ColumnType::Oid => "oid",
+    }
+}
+
+/// `pg_type.typtype`: **`r` for a range** and `b` for a base type.
+///
+/// Measured: `tsrange`, `tstzrange` and `int4range` are `r` while `_tsrange` — the array — is `b`,
+/// which is the pair a reader would get wrong. An enum's is `e` and lives on its `TypeDef`
+/// (ADR 0050); this is only the types the column vocabulary has.
+fn typtype(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "r",
+        _ => "b",
     }
 }
 
@@ -1442,7 +1460,10 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => "A",
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray => "A",
+        // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "R",
     }
 }
 
@@ -1463,7 +1484,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => "array_in",
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -1474,6 +1496,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
+        ColumnType::TsRange => "tsrange_in",
+        ColumnType::TstzRange => "tstzrange_in",
+        ColumnType::Int4Range => "int4range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

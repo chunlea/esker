@@ -146,7 +146,7 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
         // **A citext is stored as it was written** — the folding is the comparison's, not the
         // value's, so the row keeps the user's capitals and only the key below is folded.
-        Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => {
+        Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v.as_bytes());
         }
@@ -367,7 +367,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => return decode_array(ty, bytes),
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -393,6 +394,9 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Jsonb
         | ColumnType::Hstore
         | ColumnType::Citext
+        | ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -401,21 +405,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (body, rest) = bytes[consumed..]
                 .split_at_checked(len)
                 .ok_or_else(|| corrupt(format!("a column of {len} bytes is truncated")))?;
-            let value = match ty {
-                // **A citext comes back as a citext**, not as a `Text` under a different column
-                // type: the difference between the two is the *comparison*, and a comparison sees
-                // only values. A row that decoded to `Datum::Text` would sort, group and
-                // deduplicate by bytes — which is what it did before this line, and what made
-                // `count(DISTINCT cival)` answer 2 where a real server says 1.
-                ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
-                ColumnType::Text
-                | ColumnType::Varchar
-                | ColumnType::Bpchar
-                | ColumnType::Json
-                | ColumnType::Jsonb => Datum::Text(text_from_utf8(body)?),
-                ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
-                _ => Datum::Bytea(body.to_vec()),
-            };
+            let value = text_shaped(ty, body)?;
             (value, rest)
         }
     })
@@ -557,7 +547,9 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // IEEE has; `sort_bits_of_f64` handles both.
         Datum::Double(v) => codec::encode_u64(sort_bits_of_f64(*v), out),
         // An hstore's key is its canonical text: its comparison *is* text's, unlike citext's.
-        Datum::Text(v) | Datum::Hstore(v) => codec::encode_bytes(v.as_bytes(), out),
+        Datum::Text(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+            codec::encode_bytes(v.as_bytes(), out);
+        }
         // **The key is the folded value**, which is the whole of how citext works: byte order over
         // folded bytes is case-insensitive order, byte equality over them is case-insensitive
         // equality, and a unique index therefore refuses two rows differing only in case — which
@@ -655,6 +647,52 @@ fn decode_array(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
 /// A dimension or a lower bound, which are `i32` on a real server too.
 fn narrow_dimension(value: i64) -> Result<i32> {
     i32::try_from(value).map_err(|_| corrupt(format!("an array dimension of {value}")))
+}
+
+/// The types whose *ordering* is not their stored bytes', and which therefore cannot be an index
+/// key.
+///
+/// A `jsonb`'s equality is not its bytes'; an hstore's and a range's **are**, and their *order* is
+/// not — which is the same disqualification arrived at from the other side. Reaching this means the
+/// bytes claim a key this crate never wrote.
+fn not_a_key() -> RowError {
+    corrupt("an index key column of type json, jsonb, hstore or a range")
+}
+
+/// A text-shaped column's value, chosen by the column's type rather than by the bytes.
+///
+/// **The bytes are the same for all of these** — a length and the UTF-8 — and what differs is which
+/// `Datum` they become, which is the column's business and not the encoding's. A citext comes back
+/// as a citext and not as a `Text` under a different column type: the difference between the two is
+/// the *comparison*, and a comparison sees only values. A row that decoded to `Datum::Text` would
+/// sort, group and deduplicate by bytes, which is what made `count(DISTINCT cival)` answer 2 where
+/// a real server says 1. An hstore and a range are here for the same reason.
+fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
+    Ok(match ty {
+        ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
+        ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
+        // The subtype comes from the *column*, which is where it is known: the bytes are only the
+        // canonical text.
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+            subtype: Box::new(range_subtype(ty)),
+            text: text_from_utf8(body)?,
+        },
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Json
+        | ColumnType::Jsonb => Datum::Text(text_from_utf8(body)?),
+        _ => Datum::Bytea(body.to_vec()),
+    })
+}
+
+/// The subtype a range column's bounds are, which the column type names and the bytes do not.
+fn range_subtype(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::TstzRange => ColumnType::TimestampTz,
+        ColumnType::Int4Range => ColumnType::Int8,
+        _ => ColumnType::Timestamp,
+    }
 }
 
 /// A text-shaped index key column.
@@ -808,6 +846,11 @@ pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec
     Ok((values, total - bytes.len()))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary; splitting it would hide which types are \
+              keys and which are not, which is the only thing this function says"
+)]
 fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let decoded = |error: codec::CodecError| corrupt(format!("index key column: {error}"));
     Ok(match ty {
@@ -815,7 +858,8 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => return decode_key_array(ty, bytes),
+        | ColumnType::TextArray
+        | ColumnType::TsRangeArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
@@ -914,9 +958,18 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // ordered key would return an index scan in an order a real server does not, which is
         // ADR 0042's rule one type later: a type may share another's representation only if it
         // shares its comparison, and hstore shares half of one.
-        ColumnType::Json | ColumnType::Jsonb | ColumnType::Hstore | ColumnType::HstoreArray => {
-            return Err(corrupt("an index key column of type json, jsonb or hstore"));
-        }
+        // **Not a key column.** A range's *ordering* is not its canonical text's — PostgreSQL
+        // compares the lower bound, then its inclusivity, then the upper — so a byte-ordered key
+        // would scan in an order a real server does not, which is the trap `hstore` fell into and
+        // `tests/row_order.rs` caught. Its equality *is* its text's, which is why it groups and
+        // deduplicates correctly without one.
+        ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Hstore
+        | ColumnType::HstoreArray
+        | ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range => Err(not_a_key())?,
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
             return decode_key_text(ty, bytes);
         }
@@ -1551,7 +1604,8 @@ mod tests {
             | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray
-            | ColumnType::HstoreArray => {
+            | ColumnType::HstoreArray
+            | ColumnType::TsRangeArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 (
                     proptest::collection::vec(
@@ -1594,6 +1648,15 @@ mod tests {
             // stores the canonical form and `esker_sql::value::hstore` is what makes one, so the
             // strategy is text and the round trip is the text's.
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            // A range's stored form is its canonical text, and `empty` is the one value every
+            // subtype has — enough to state the round trip, which is what this property is.
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+                Just(Datum::Range {
+                    subtype: Box::new(super::range_subtype(ty)),
+                    text: "empty".to_owned(),
+                })
+                .boxed()
+            }
             // A citext's *key* is its folded value, so the strategy is folded text: an unfolded
             // one would state a round trip the key encoding does not make.
             ColumnType::Citext => ".*"

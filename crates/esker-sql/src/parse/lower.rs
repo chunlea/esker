@@ -2899,10 +2899,22 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                         args: vec![lower_expr(left)?, lower_expr(right)?],
                     })));
                 }
+                // **`@>` is spelled the same for an hstore and a range**, so it lowers to one
+                // call and the evaluator dispatches on the operands — the rule the `||` regression
+                // taught: an operator this crate carries for one type must not answer for
+                // another's, and the only place that can be decided is where the values are.
                 BinaryOperator::AtArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreContains,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                // `b <@ a` is `a @> b` with the arguments the other way round, so there is one
+                // containment rule and not two.
+                BinaryOperator::ArrowAt => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::RangeContains,
+                        args: vec![lower_expr(right)?, lower_expr(left)?],
                     })));
                 }
                 BinaryOperator::StringConcat => {
@@ -3729,21 +3741,27 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
     let mut texts: Vec<Option<String>> = Vec::with_capacity(elements.len());
     let mut element = None;
     for expr in elements {
-        // **An `'…'::hstore` element is a constant too.** `hstore_test.rb` writes
-        // `t.hstore "payload", array: true` and then `ARRAY['"AA"=>"BB"'::hstore, …]`, which is a
-        // cast of a string constant and folds here exactly as the string would — narrowed to
-        // hstore rather than to every type, because a cast to any other one is a declared
-        // divergence and widening it would move answers this unit did not measure.
+        // **An `'…'::hstore` or `'…'::tsrange` element is a constant too.** Both suites write it —
+        // `t.hstore "payload", array: true` and `t.tsrange :ts_ranges, array: true` — and a cast of
+        // a string constant folds here exactly as the string would. Named types rather than every
+        // type, because a cast to any other one is a declared divergence and widening it would
+        // move answers these units did not measure.
         if let Expr::Cast {
             expr: inner,
             data_type,
             ..
         } = strip_nesting(expr)
-            && matches!(lower_type(data_type), Ok((ColumnType::Hstore, _)))
+            && matches!(
+                lower_type(data_type),
+                Ok((ColumnType::Hstore | ColumnType::TsRange, _))
+            )
             && let Expr::Value(value) = strip_nesting(inner)
             && let Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) = &value.value
         {
-            element = Some(ColumnType::Hstore);
+            element = Some(match lower_type(data_type) {
+                Ok((ty, _)) => ty,
+                Err(_) => ColumnType::Hstore,
+            });
             texts.push(Some(text.clone()));
             continue;
         }
@@ -5599,6 +5617,16 @@ fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<St
 /// Whether a custom type name is one of the `serial` spellings, which are integers plus a sequence
 /// and never a user-defined type — a table with a column called `serial` would otherwise resolve
 /// against the catalog and get a worse error than the one [`lower_type`] already gives it.
+/// The range column type one of PostgreSQL's built-in range names spells, or `None`.
+fn range_type_name(name: &str) -> Option<ColumnType> {
+    match name.to_ascii_lowercase().as_str() {
+        "tsrange" => Some(ColumnType::TsRange),
+        "tstzrange" => Some(ColumnType::TstzRange),
+        "int4range" => Some(ColumnType::Int4Range),
+        _ => None,
+    }
+}
+
 fn is_serial_spelling(data_type: &DataType) -> bool {
     serial_identity(data_type).is_some()
 }
@@ -5796,6 +5824,17 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("citext") =>
         {
             ColumnType::Citext
+        }
+        // The range types, which `sqlparser` also has no variant for. Built in on a real server
+        // rather than an extension's, so they need no `CREATE EXTENSION` in front of them.
+        //
+        // **Matched by name and not by a guard on `Custom` alone**: a catch-all here swallows
+        // `serial`, whose arm is below, and turns every `id serial primary key` into
+        // `0A000 the type serial is not supported`.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && range_type_name(&name.to_string()).is_some() =>
+        {
+            range_type_name(&name.to_string()).unwrap_or(ColumnType::TsRange)
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

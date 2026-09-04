@@ -240,16 +240,22 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 8 — ranges, enums and domains. This node has none of the three, and neither the empty
-    // answer nor an error is a guess: `TypeMapInitializer#run` partitions what it is given and
-    // registers each partition, so an empty one registers nothing.
-    assert!(
+    // 8 — ranges, enums and domains. **This node has ranges now**, so the partition
+    // `TypeMapInitializer#run` registers is no longer empty: three `typtype = 'r'` rows, which is
+    // what makes `ActiveRecord` decode a `tsrange` column instead of handing back a string. The
+    // query's `LEFT JOIN pg_range` is why it is asked without one here — `pg_range` is not a
+    // relation this node has, and `tests/tsrange.rs` declares that; the adapter reads `typname`
+    // and `typtype`, and `rngsubtype` only to name the subtype it already got from `format_type`.
+    assert_eq!(
         node.rows(
-            "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
-             t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = \
-             rngtypid WHERE t.typtype IN ('r', 'e', 'd')"
-        )
-        .is_empty()
+            "SELECT t.oid, t.typname, t.typtype FROM pg_type as t WHERE t.typtype IN \
+             ('r', 'e', 'd') ORDER BY t.oid"
+        ),
+        vec![
+            vec!["3904", "int4range", "r"],
+            vec!["3908", "tsrange", "r"],
+            vec!["3910", "tstzrange", "r"],
+        ]
     );
 
     // 9 — array types, found by their element type. **This one answers now**: the four array
@@ -317,6 +323,19 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1231".to_owned(),
                 "_numeric".to_owned(),
                 "1700".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            // `_tsrange` joins them because its element `tsrange` is in the adapter's list: an
+            // array is found by its element's oid, and this is the row that makes
+            // `t.tsrange :ranges, array: true` decode instead of coming back as a string.
+            vec![
+                "3909".to_owned(),
+                "_tsrange".to_owned(),
+                "3908".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

@@ -1074,7 +1074,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1094,6 +1095,15 @@ fn placeholder(ty: ColumnType) -> Datum {
             Datum::Text(String::new())
         }
         ColumnType::Citext => Datum::Citext(String::new()),
+        // The empty range, which is a real value and not a NULL.
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+            subtype: Box::new(match ty {
+                ColumnType::TstzRange => ColumnType::TimestampTz,
+                ColumnType::Int4Range => ColumnType::Int8,
+                _ => ColumnType::Timestamp,
+            }),
+            text: "empty".to_owned(),
+        },
         // The empty string is not a document, so a `json` placeholder is the smallest one that
         // is. It only ever stands in for a type while a `Describe` is answered.
         ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),

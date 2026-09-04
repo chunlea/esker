@@ -206,7 +206,13 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // Not columnar either, and for a sharper reason than hstore's: a citext's comparison is
         // not its bytes', so a columnar run that filtered or sorted one would have to fold, and
         // that crate's `ColumnType` has no way to say so.
-        | StoredType::Citext => return None,
+        | StoredType::Citext
+        // A range is not columnar either: its ordering is not its text's, so a columnar run could
+        // not sort or filter one without the comparison this vocabulary has no way to carry.
+        | StoredType::TsRange
+        | StoredType::TstzRange
+        | StoredType::Int4Range
+        | StoredType::TsRangeArray => return None,
     })
 }
 
@@ -217,7 +223,11 @@ fn value_of(datum: &Datum) -> Value {
     match datum {
         // A citext never reaches this either — the column is refused above, for the same reason
         // an array is: this vocabulary has no way to carry a comparison that folds.
-        Datum::Null | Datum::Array(_) | Datum::Citext(_) | Datum::Hstore(_) => Value::Null,
+        Datum::Null
+        | Datum::Array(_)
+        | Datum::Citext(_)
+        | Datum::Hstore(_)
+        | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),

@@ -90,6 +90,7 @@ impl ArrayValue {
             ColumnType::Numeric => ColumnType::NumericArray,
             ColumnType::Text => ColumnType::TextArray,
             ColumnType::Hstore => ColumnType::HstoreArray,
+            ColumnType::TsRange => ColumnType::TsRangeArray,
             _ => return None,
         })
     }
@@ -104,6 +105,7 @@ impl ArrayValue {
             ColumnType::NumericArray => ColumnType::Numeric,
             ColumnType::TextArray => ColumnType::Text,
             ColumnType::HstoreArray => ColumnType::Hstore,
+            ColumnType::TsRangeArray => ColumnType::TsRange,
             _ => return None,
         })
     }

@@ -247,6 +247,12 @@ const TAG_HSTORE: u8 = 26;
 const TAG_HSTORE_ARRAY: u8 = 27;
 /// The `citext` extension's type. 28, checked against the constants above rather than counted.
 const TAG_CITEXT: u8 = 28;
+/// The range types. 29-32, checked against the constants above rather than counted — 25 was
+/// already `smallint[]` when `hstore` reached for "the next one".
+const TAG_TSRANGE: u8 = 29;
+const TAG_TSTZRANGE: u8 = 30;
+const TAG_INT4RANGE: u8 = 31;
+const TAG_TSRANGE_ARRAY: u8 = 32;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -299,6 +305,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Hstore => TAG_HSTORE,
         ColumnType::HstoreArray => TAG_HSTORE_ARRAY,
         ColumnType::Citext => TAG_CITEXT,
+        ColumnType::TsRange => TAG_TSRANGE,
+        ColumnType::TstzRange => TAG_TSTZRANGE,
+        ColumnType::Int4Range => TAG_INT4RANGE,
+        ColumnType::TsRangeArray => TAG_TSRANGE_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -375,6 +385,10 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_HSTORE => ColumnType::Hstore,
         TAG_HSTORE_ARRAY => ColumnType::HstoreArray,
         TAG_CITEXT => ColumnType::Citext,
+        TAG_TSRANGE => ColumnType::TsRange,
+        TAG_TSTZRANGE => ColumnType::TstzRange,
+        TAG_INT4RANGE => ColumnType::Int4Range,
+        TAG_TSRANGE_ARRAY => ColumnType::TsRangeArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,

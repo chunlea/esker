@@ -65,9 +65,21 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
         // sorts it after `"a"=>"2"`. Half of `text`'s comparison is shared and half is not, which
         // ADR 0042's rule already forbids: a fixture here would have to claim an order the key
         // encoding cannot produce.
+        // **The ranges join them, with a third reason.** A `jsonb`'s equality is not its bytes';
+        // an hstore's *order* is not its text's; and a range's ordering is PostgreSQL's own —
+        // lower bound, then its inclusivity, then upper — which the canonical text does not
+        // reproduce. All three are disqualified from being an index key, and a fixture here would
+        // have to claim an order the key encoding cannot produce.
         if matches!(
             ty,
-            ColumnType::Json | ColumnType::Jsonb | ColumnType::Hstore | ColumnType::HstoreArray
+            ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Hstore
+                | ColumnType::HstoreArray
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray
         ) {
             assert!(
                 !types_seen.contains(&ty),
