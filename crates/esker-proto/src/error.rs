@@ -63,9 +63,11 @@ pub mod code {
     pub const NOT_BOOTSTRAPPED: u16 = 17;
     /// [`super::ProtoError::ClusterMismatch`].
     pub const CLUSTER_MISMATCH: u16 = 18;
+    /// [`super::ProtoError::PdNotLeader`].
+    pub const PD_NOT_LEADER: u16 = 19;
 
     /// Every code this version defines, for the tests that sweep them.
-    pub const ALL: [u16; 18] = [
+    pub const ALL: [u16; 19] = [
         NOT_LEADER,
         EPOCH_NOT_MATCH,
         KEY_NOT_IN_REGION,
@@ -84,6 +86,7 @@ pub mod code {
         TIMEOUT,
         NOT_BOOTSTRAPPED,
         CLUSTER_MISMATCH,
+        PD_NOT_LEADER,
     ];
 }
 
@@ -118,6 +121,27 @@ pub enum ProtoError {
         region_id: u64,
         /// Which peer to try instead, if this one knows.
         leader_hint: Option<u64>,
+    },
+
+    /// This placement driver is not the leader of its own Raft group, so it answers nothing
+    /// ([ADR 0055](../../docs/adr/0055-pd-is-a-raft-group.md)).
+    ///
+    /// A **separate code** from [`ProtoError::NotLeader`], and the separation is load-bearing.
+    /// That one is region-scoped: it names a region, its hint is a *peer* id, and a client
+    /// answers it by repairing its region cache. A PD redirect sent through it would either name
+    /// a region that does not exist or poison a cache entry for one — so this is a different
+    /// question with a different answer and its own code.
+    ///
+    /// The hint is an **address** rather than a member id, so that finding the leader needs no
+    /// agreement between operator and client about the order the endpoints were listed in. It is
+    /// empty when this member does not know who leads, which is the honest answer during an
+    /// election and is the caller's signal to back off rather than to chase a hint.
+    #[error("placement driver is not the leader")]
+    PdNotLeader {
+        /// The member it believes leads, or zero when it has no opinion.
+        leader_id: u64,
+        /// Where that member is, or empty when this one does not know.
+        leader_address: String,
     },
 
     /// The region's epoch has moved on: it split, merged, or changed membership. The regions
@@ -298,6 +322,7 @@ impl ProtoError {
     pub fn code(&self) -> u16 {
         match self {
             Self::NotLeader { .. } => code::NOT_LEADER,
+            Self::PdNotLeader { .. } => code::PD_NOT_LEADER,
             Self::EpochNotMatch { .. } => code::EPOCH_NOT_MATCH,
             Self::KeyNotInRegion { .. } => code::KEY_NOT_IN_REGION,
             Self::ServerIsBusy { .. } => code::SERVER_IS_BUSY,
@@ -329,6 +354,7 @@ impl ProtoError {
     pub fn outcome(&self) -> RequestOutcome {
         match self {
             Self::NotLeader { .. }
+            | Self::PdNotLeader { .. }
             | Self::EpochNotMatch { .. }
             | Self::KeyNotInRegion { .. }
             | Self::ServerIsBusy { .. }
@@ -368,6 +394,13 @@ impl ProtoError {
     /// demonstrably did not take effect, and something about where or when to send it has
     /// changed. Everything else — a decode failure, an unsupported operation, a closed
     /// connection whose request may have been applied — is returned to the caller.
+    ///
+    /// [`ProtoError::PdNotLeader`] is **deliberately excluded**, though it carries a hint. This
+    /// set exists so that a *generic* loop can retry safely, and the only repair for a PD redirect
+    /// is to send the request to a different placement driver — a loop that swallowed it without
+    /// changing endpoint would spin against a follower for ever, because a follower's answer never
+    /// changes. Only a caller that holds the endpoint list may act on it, and such a caller matches
+    /// the variant rather than asking this.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -420,6 +453,13 @@ impl ProtoError {
                     }
                     None => out.put_bool(false),
                 }
+            }
+            Self::PdNotLeader {
+                leader_id,
+                leader_address,
+            } => {
+                out.put_varint(*leader_id);
+                out.put_str(leader_address);
             }
             Self::EpochNotMatch { current_regions } => {
                 out.put_varint(current_regions.len() as u64);
@@ -477,6 +517,10 @@ impl ProtoError {
                     .get_bool("leader_hint")?
                     .then(|| input.get_varint("leader_hint"))
                     .transpose()?,
+            },
+            code::PD_NOT_LEADER => Self::PdNotLeader {
+                leader_id: input.get_varint("leader_id")?,
+                leader_address: input.get_str("leader_address")?.to_owned(),
             },
             code::EPOCH_NOT_MATCH => {
                 let count = input.get_count("current_regions")?;
@@ -664,6 +708,10 @@ mod tests {
                 expected: 0xDEAD_BEEF,
                 actual: 1,
             },
+            ProtoError::PdNotLeader {
+                leader_id: 2,
+                leader_address: "127.0.0.1:2380".to_owned(),
+            },
         ]
     }
 
@@ -773,5 +821,27 @@ mod tests {
             );
             assert_eq!(error.is_retryable(), expected, "{error:?}");
         }
+    }
+
+    /// A placement driver's redirect is a refusal — nothing happened — but it is **not** in the
+    /// generic retry set, because the only repair is to ask a different placement driver and a
+    /// loop that does not know that would spin against a follower whose answer never changes.
+    #[test]
+    fn a_placement_driver_redirect_is_a_refusal_but_not_a_generic_retry() {
+        let redirect = ProtoError::PdNotLeader {
+            leader_id: 2,
+            leader_address: "127.0.0.1:2380".to_owned(),
+        };
+        assert_eq!(redirect.outcome(), RequestOutcome::NotApplied);
+        assert!(!redirect.is_retryable());
+        assert_ne!(
+            redirect.code(),
+            ProtoError::NotLeader {
+                region_id: 0,
+                leader_hint: None,
+            }
+            .code(),
+            "a region redirect and a placement-driver redirect are different answers"
+        );
     }
 }

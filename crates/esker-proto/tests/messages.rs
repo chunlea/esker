@@ -870,8 +870,9 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
     responses
 }
 
-// A list of sixteen literals, one per error code. Splitting it to satisfy a line count would
-// make it harder to check against the golden file, which is the whole job of this function.
+// One literal per error code, and two apiece for the two that carry an optional hint. Splitting
+// it to satisfy a line count would make it harder to check against the golden file, which is the
+// whole job of this function.
 #[allow(clippy::too_many_lines)]
 fn golden_errors() -> Vec<(&'static str, ProtoError)> {
     vec![
@@ -1000,6 +1001,23 @@ fn golden_errors() -> Vec<(&'static str, ProtoError)> {
             ProtoError::ClusterMismatch {
                 expected: 0xDEAD_BEEF,
                 actual: 1,
+            },
+        ),
+        (
+            "pd-not-leader",
+            ProtoError::PdNotLeader {
+                leader_id: 2,
+                leader_address: "127.0.0.1:2380".to_owned(),
+            },
+        ),
+        // The blind case is its own golden for the reason `not-leader-blind` is: "I do not know
+        // who leads" is a different answer from "the leader is at the empty address", and only a
+        // golden for both pins the difference.
+        (
+            "pd-not-leader-blind",
+            ProtoError::PdNotLeader {
+                leader_id: 0,
+                leader_address: String::new(),
             },
         ),
     ]

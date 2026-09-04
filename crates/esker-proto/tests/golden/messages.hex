@@ -88,6 +88,8 @@ error not-sent 0f0012636f6e6e656374696f6e2072656675736564
 error timeout 1000106e6f20616e7377657220696e20333073
 error not-bootstrapped 1100
 error cluster-mismatch 1200effdb6f50d01
+error pd-not-leader 1300020e3132372e302e302e313a32333830
+error pd-not-leader-blind 13000000
 
 # TxnKv (service 0x02): Get 0x0201, Scan 0x0202, Prewrite 0x0203, Commit 0x0204,
 # Rollback 0x0205, ResolveLock 0x0206, Heartbeat 0x0207, GcSafepoint 0x0208. Every one
