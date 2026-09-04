@@ -216,8 +216,10 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 // constraint that is not deferrable is `f`/`f` and cannot be either.
                 Datum::Bool(constraint.condeferrable),
                 Datum::Bool(constraint.condeferred),
-                // Every constraint here is validated: there is no `NOT VALID` to leave one behind.
-                Datum::Bool(true),
+                // `convalidated`: false only for a foreign key added `NOT VALID` and not yet
+                // validated. It was a constant `true` until `NOT VALID` existed, which made
+                // `ActiveRecord`'s `validate: false` schema dump wrong rather than incomplete.
+                Datum::Bool(constraint.convalidated),
                 Datum::Int8(relation.oid),
                 Datum::Int8(constraint.conindid),
                 Datum::Int8(
@@ -349,6 +351,9 @@ struct Constraint {
     /// at the statement and never movable, `t`/`f` at the statement until `SET CONSTRAINTS` says
     /// otherwise, `t`/`t` at `COMMIT` (`crate::exec::deferred`).
     condeferred: bool,
+    /// `convalidated`: whether the rows already there were checked. Only a `NOT VALID` foreign
+    /// key that has not been validated since is false.
+    convalidated: bool,
 }
 
 /// What a `FOREIGN KEY` row carries that no other constraint does.
@@ -398,6 +403,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: false,
             condeferred: false,
+            convalidated: true,
         })
         .collect();
     if !table.primary_key_name.is_empty() {
@@ -416,6 +422,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: false,
             condeferred: false,
+            convalidated: true,
         });
     }
     // `CHECK`, contype `c`. It has no index behind it, so `conindid` is zero for the same reason
@@ -430,6 +437,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: false,
             condeferred: false,
+            convalidated: true,
         });
     }
     // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint
@@ -458,6 +466,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             }),
             condeferrable: key.deferrable,
             condeferred: false,
+            convalidated: key.validated,
         });
     }
     // `UNIQUE`, contype `u`. **Only an index a constraint made**: `CREATE UNIQUE INDEX` builds an
@@ -483,6 +492,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: matches!(kind, UniqueKind::Deferrable | UniqueKind::Deferred),
             condeferred: kind == UniqueKind::Deferred,
+            convalidated: true,
         });
     }
     // `EXCLUDE`, contype `x`. The constraint **is** its index, so the oid and `conindid` are one
@@ -502,6 +512,7 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: exclude.deferrable,
             condeferred: exclude.deferred,
+            convalidated: true,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -599,6 +610,11 @@ fn foreign_key_definition(
     }
     if key.deferrable {
         out.push_str(" DEFERRABLE");
+    }
+    // **Last, after `DEFERRABLE`** — measured: `pg_get_constraintdef` prints the clauses in the
+    // order the grammar takes them, and `NOT VALID` closes the definition.
+    if !key.validated {
+        out.push_str(" NOT VALID");
     }
     out
 }

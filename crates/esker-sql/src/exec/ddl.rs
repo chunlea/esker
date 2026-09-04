@@ -362,6 +362,12 @@ fn add_foreign_key(
     }
     let resolved = resolve_foreign_key(txn, executor, updated, key)?;
     let parent_id = resolved.parent;
+    // **The rows already there are checked, unless `NOT VALID` says not to.** A real server scans
+    // here, and skipping it left a table whose rows contradict a constraint it advertises as
+    // validated — reachable from `ADD CONSTRAINT` alone, with no later statement to blame.
+    if resolved.validated {
+        super::foreign_key::validate(executor, txn, updated, &resolved)?;
+    }
     // **Creation order, not name order.** `pg_constraint` sorts by name where it is read
     // (`catalog::pg_constraint::constraints_of`), and the one place the order in this list shows
     // is the `2BP01` a `DROP TABLE` gives: a real server names the *first* constraint that
@@ -608,6 +614,35 @@ fn sequence_start(start: i64) -> Result<u64> {
 /// that one droppable without `CASCADE` on the very next line. A node that added the new sequence
 /// beside the old one would leave the column drawing from two counters and would answer `2BP01`
 /// to the drop, which is PostgreSQL's own correct answer to a state it should not be in.
+/// `ALTER TABLE … VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
+///
+/// It runs the scan the `ADD` skipped and, when every row satisfies the constraint, records it as
+/// validated. **Validating a constraint that is already valid is a success**, measured, and so is
+/// validating one that was never `NOT VALID`; only a name the table does not have is an error, and
+/// it names the relation.
+fn validate_constraint(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    name: &str,
+) -> Result<()> {
+    let at = updated
+        .foreign_keys
+        .iter()
+        .position(|key| key.name == name)
+        .ok_or_else(|| SqlError::UndefinedConstraint {
+            constraint: name.to_owned(),
+            relation: updated.name.clone(),
+        })?;
+    if updated.foreign_keys[at].validated {
+        return Ok(());
+    }
+    let key = updated.foreign_keys[at].clone();
+    super::foreign_key::validate(executor, txn, updated, &key)?;
+    updated.foreign_keys[at].validated = true;
+    Ok(())
+}
+
 /// `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL` — what `change_column_null` sends.
 ///
 /// **`SET NOT NULL` reads the table.** PostgreSQL scans for a NULL before it writes the flag and
@@ -1649,6 +1684,7 @@ fn resolve_foreign_key(
         parent_columns,
         on_update: key.on_update,
         on_delete: key.on_delete,
+        validated: key.validated,
         deferrable: key.deferrable,
     })
 }
@@ -3363,6 +3399,7 @@ fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
         Some(AlterTableAction::SetDefault { .. } | AlterTableAction::SetNotNull { .. }) => {
             "ALTER COLUMN"
         }
+        Some(AlterTableAction::ValidateConstraint(_)) => "VALIDATE CONSTRAINT",
         Some(_) => "ALTER",
     }
 }
@@ -3465,6 +3502,11 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+            continue;
+        }
+        if let AlterTableAction::ValidateConstraint(name) = action {
+            validate_constraint(txn, executor, &mut updated, name)?;
+            changed = true;
             continue;
         }
         if let AlterTableAction::SetNotNull { column, not_null } = action {

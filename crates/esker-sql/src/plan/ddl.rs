@@ -538,6 +538,8 @@ pub struct ForeignKey {
     pub on_update: ReferentialAction,
     /// `ON DELETE …`.
     pub on_delete: ReferentialAction,
+    /// `NOT VALID`: skip the scan of the rows already there. New rows are checked either way.
+    pub validated: bool,
     /// `DEFERRABLE`, which is recorded and changes nothing here.
     pub deferrable: bool,
 }
@@ -834,6 +836,12 @@ pub enum AlterTableAction {
         /// referencing it; without it those are `2BP01`.
         cascade: bool,
     },
+    /// `VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
+    ///
+    /// It scans the rows the `ADD` skipped and, if they all satisfy the constraint, marks it
+    /// validated. **On an already-valid constraint it is a success, not an error**, and so it is
+    /// on one that was never `NOT VALID`; a name the table does not have is `42704`.
+    ValidateConstraint(String),
     /// `ALTER COLUMN <name> SET NOT NULL` / `DROP NOT NULL`, which is what `change_column_null`
     /// sends (`abstract/schema_statements.rb`).
     ///

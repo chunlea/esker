@@ -89,6 +89,48 @@ pub(super) fn check_references(
     Ok(())
 }
 
+/// Check the rows **already there** against one constraint — the scan `NOT VALID` skips.
+///
+/// A plain `ADD CONSTRAINT … FOREIGN KEY` runs it and refuses `23503` naming the first row that
+/// fails; `NOT VALID` does not, and `VALIDATE CONSTRAINT` runs it later. The rows are collected a
+/// page at a time before any parent is looked up, because the lookup needs the transaction the
+/// walk is holding.
+pub(super) fn validate(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    key: &ForeignKeyDef,
+) -> Result<()> {
+    let (start, end) = row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut pending: Vec<Vec<Datum>> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            let decoded = row::decode_row(&schema, value)?;
+            // A NULL key points at nothing and is not a violation, here as at an `INSERT`.
+            if let Some(values) = referencing_values(key, &decoded) {
+                pending.push(values);
+            }
+        }
+        Ok(())
+    })?;
+    for values in pending {
+        if parent_row(executor, txn, key, &values)?.is_none() {
+            return Err(SqlError::ForeignKeyViolation {
+                relation: table.name.clone(),
+                constraint: key.name.clone(),
+                detail: format!(
+                    "Key ({})=({}) is not present in table \"{}\".",
+                    column_names(table, &key.columns),
+                    super::index::render_values(&values),
+                    parent_name(executor, txn, key)?
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Every constraint that points **at** this row, before it is removed.
 ///
 /// `NO ACTION` and `RESTRICT` refuse; `CASCADE` deletes the referencing rows, which may in turn
@@ -159,7 +201,12 @@ pub(super) fn cascade_update(
         let Some(before) = moved(&key, old, new) else {
             continue;
         };
-        let after = referenced_values(&key, new).unwrap_or_default();
+        // `CASCADE` follows the parent's new key; `SET NULL` and `SET DEFAULT` write their own
+        // value instead and do not.
+        let after = match written_by(txn, &child, &key, key.on_update)? {
+            Some(values) => values,
+            None => referenced_values(&key, new).unwrap_or_default(),
+        };
         for old_child in referencing_rows(executor, txn, &child, &key, &before)? {
             let mut new_child = old_child.clone();
             for (at, value) in key.columns.iter().zip(after.iter()) {
@@ -206,6 +253,27 @@ fn cascade_delete(
         if key.on_delete.refuses() {
             return Err(still_referenced(table, &child, &key, &values));
         }
+        // `SET NULL` and `SET DEFAULT` keep the child row and clear what pointed at the parent.
+        // Nothing recurses: the child's **own** key is untouched, so its children still point at
+        // a row that is exactly where it was.
+        if let Some(values) = written_by(txn, &child, &key, key.on_delete)? {
+            let mut written = super::Written::default();
+            for old_child in referencing {
+                let mut new_child = old_child.clone();
+                for (at, value) in key.columns.iter().zip(values.iter()) {
+                    new_child[*at] = value.clone();
+                }
+                super::dml::rewrite_row(
+                    executor,
+                    txn,
+                    &child,
+                    &old_child,
+                    &new_child,
+                    &mut written,
+                )?;
+            }
+            continue;
+        }
         for child_row in referencing {
             // Depth-first: the grandchildren go before the child, so no row is ever removed while
             // something still points at it.
@@ -214,6 +282,44 @@ fn cascade_delete(
         }
     }
     Ok(())
+}
+
+/// What `SET NULL` and `SET DEFAULT` put into the child's referencing columns.
+///
+/// **`SET DEFAULT` re-reads the column's default**, expression and all, rather than reusing a
+/// value folded at `CREATE TABLE`: the two differ for anything non-constant, and the rewritten row
+/// is checked against the constraint afterwards like any other — a default naming a parent that is
+/// not there is `23503` from the `DELETE`, which is what a real server answers.
+fn written_by(
+    txn: &dyn Txn,
+    child: &TableDef,
+    key: &ForeignKeyDef,
+    action: catalog::ReferentialAction,
+) -> Result<Option<Vec<Datum>>> {
+    match action {
+        catalog::ReferentialAction::SetNull => Some(
+            key.columns
+                .iter()
+                .map(|_| Ok(Datum::Null))
+                .collect::<Result<Vec<_>>>(),
+        ),
+        catalog::ReferentialAction::SetDefault => Some(
+            key.columns
+                .iter()
+                .map(|at| {
+                    let column = child.columns.get(*at).ok_or_else(|| {
+                        SqlError::Internal(format!(
+                            "a foreign key on \"{}\" names column {at}, which is not there",
+                            child.name
+                        ))
+                    })?;
+                    super::dml::column_default_value(child, column, txn)
+                })
+                .collect::<Result<Vec<_>>>(),
+        ),
+        _ => None,
+    }
+    .transpose()
 }
 
 /// `23503` from the parent's side, which names **both** tables — the one difference between the
