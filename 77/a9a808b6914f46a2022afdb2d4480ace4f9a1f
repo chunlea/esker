@@ -1,0 +1,25 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_ff7e251cff926e 164-170,542,1140-1173
+crates/esker-sql/tests/corpus/pg19_enum_value.txt
+  s_6f7019c05b578b::t_07ba15396f3324 144-157,159
+crates/esker-sql/tests/enum_value.rs
+  s_6f7019c05b578b::t_8b1d0e69a40f9a 32-56
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_d0d21a3ba70920 1558
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "77a9a808b6914f46a2022afdb2d4480ace4f9a1f",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
