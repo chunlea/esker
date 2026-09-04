@@ -2060,6 +2060,38 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 });
                 continue;
             }
+            // `ALTER COLUMN c TYPE t [USING e]`. The `USING` is read only far enough to tell
+            // "cast this column to this type" — which is all `change_column` ever writes — from
+            // anything else, which is refused by name because there is no per-row evaluator.
+            if let AlterColumnOperation::SetDataType {
+                data_type, using, ..
+            } = op
+            {
+                let (ty, typmod, user_type) = lower_column_type(data_type)?;
+                if let Some(name) = user_type {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER TABLE ... ALTER COLUMN ... TYPE {name}"
+                    )));
+                }
+                let using = match using {
+                    None => None,
+                    Some(expr) => match using_cast_target(expr, &ident(column_name)) {
+                        Some(cast_to) => Some(lower_column_type(cast_to)?.0),
+                        None => {
+                            return Err(SqlError::unsupported(format!(
+                                "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING {expr}"
+                            )));
+                        }
+                    },
+                };
+                actions.push(plan::AlterTableAction::SetColumnType {
+                    column: ident(column_name),
+                    ty,
+                    typmod,
+                    using,
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
@@ -6157,6 +6189,28 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// takes a typmod here — and `test_schema.mood` is a type in a schema, which is
 /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
 /// the namespace lane's. Both keep the refusal `lower_type` gives them.
+/// The type a `USING` casts this column to, or `None` if it is anything but such a cast.
+///
+/// `change_column` writes `USING CAST("c" AS timestamp)` and `USING c::integer`; both spell the
+/// conversion the statement already names, so they license it without asking for any computation
+/// this node cannot do. **Anything else is refused by name** — `USING string_to_array(c, ',')`
+/// included — because evaluating it would need a per-row expression evaluator that does not exist,
+/// and ignoring it would silently answer a different question than the one asked.
+fn using_cast_target<'a>(expr: &'a Expr, column: &str) -> Option<&'a DataType> {
+    let Expr::Cast {
+        expr: inner,
+        data_type,
+        ..
+    } = unwrap_nested(expr)
+    else {
+        return None;
+    };
+    let names_the_column = matches!(unwrap_nested(inner), Expr::Identifier(name) if ident(name) == column)
+        || matches!(unwrap_nested(inner), Expr::CompoundIdentifier(parts)
+            if parts.last().is_some_and(|part| ident(part) == column));
+    names_the_column.then_some(data_type)
+}
+
 fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<String>)> {
     match lower_type(data_type) {
         Ok((ty, typmod)) => Ok((ty, typmod, None)),
@@ -6253,6 +6307,17 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
             ColumnType::Timestamp,
             value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
         )),
+        // The same for the zoned spelling, which `change_column` sends as `timestamptz(6)`. The
+        // bound and the fall-through are the arm above's, because the difference between the two
+        // types is the label and not the precision.
+        DataType::Timestamp(Some(precision), TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
+            if *precision <= 6 =>
+        {
+            Ok((
+                ColumnType::TimestampTz,
+                value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
+            ))
+        }
         // **`time(7)` is `time(6)`, not an error.** A precision past the maximum is reduced to it
         // — a `WARNING` on a real server and no complaint at all in the answer — where a
         // `varchar` length past *its* bound is `22023`. The asymmetry is PostgreSQL's, measured:
