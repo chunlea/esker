@@ -219,16 +219,14 @@ impl RemotePd {
         if !self.refresh() {
             return false;
         }
-        match self.endpoint_list().iter().position(|end| *end == hinted) {
-            Some(at) => self.at.swap(at, Ordering::AcqRel) != at,
-            None => {
-                tracing::warn!(
-                    %hinted,
-                    "the placement driver named a leader its own group does not contain"
-                );
-                false
-            }
-        }
+        let Some(at) = self.endpoint_list().iter().position(|end| *end == hinted) else {
+            tracing::warn!(
+                %hinted,
+                "the placement driver named a leader its own group does not contain"
+            );
+            return false;
+        };
+        self.at.swap(at, Ordering::AcqRel) != at
     }
 
     /// Asks the current endpoint who is in its group, and adopts the answer.

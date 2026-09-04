@@ -2,7 +2,7 @@
 //!
 //! # Why this exists, and why it should not for long
 //!
-//! [`PdTcpTransport`](crate::transport::PdTcpTransport) builds one queue and one delivery task per
+//! [`crate::transport::PdTcpTransport`] builds one queue and one delivery task per
 //! peer **at `spawn`**, and dynamic membership is exactly the peer set changing
 //! ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 //! The right shape is a `reconfigure` on that type, adding and dropping one queue per changed
