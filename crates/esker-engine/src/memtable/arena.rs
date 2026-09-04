@@ -109,12 +109,22 @@ impl<T: ChunkElem> Chunks<T> {
         }
     }
 
+    /// An arena that gives up after `slots` chunks, so a test can reach the exhaustion path
+    /// without allocating four gigabytes to get there.
+    #[cfg(test)]
+    pub(super) fn cramped(first_shift: u32, slots: u32) -> Self {
+        let mut arena = Self::new(first_shift);
+        arena.slots = slots;
+        arena
+    }
+
     /// One past the highest element index this arena can ever hand out.
     ///
-    /// `2^32 - 2^first_shift`, so every valid offset fits in a `u32` with room to spare and the
-    /// arithmetic below never has to think about wrapping.
+    /// `2^(first_shift + slots) - 2^first_shift`, which for a real arena is `2^32 - 2^first_shift`
+    /// — so every valid offset fits in a `u32` with room to spare and the arithmetic below never
+    /// has to think about wrapping.
     fn capacity(&self) -> u64 {
-        (1u64 << 32) - (1u64 << self.first_shift)
+        (1u64 << (self.first_shift + self.slots)) - (1u64 << self.first_shift)
     }
 
     /// Which chunk holds element `offset`. Only meaningful for `offset < capacity()`.
@@ -241,7 +251,10 @@ impl<T: ChunkElem> Chunks<T> {
 }
 
 impl Chunks<u8> {
-    /// Copies `key` then `value` into one contiguous run and returns its offset.
+    /// Copies `parts` end to end into one contiguous run and returns its offset.
+    ///
+    /// Several parts rather than one because the skiplist's key arrives in pieces — a user key
+    /// and an eight-byte tag — and joining them in the caller would be an allocation per insert.
     ///
     /// **Writer only.** Allocating and copying in one call is deliberate: it is what keeps the
     /// "these bytes are reserved and nothing can see them yet" precondition inside this
@@ -251,9 +264,12 @@ impl Chunks<u8> {
         reason = "ADR 0041: the writer copies into space `alloc` has just reserved, which no \
                   published node names and therefore no reader can reach."
     )]
-    pub(super) fn alloc_bytes(&self, key: &[u8], value: &[u8]) -> Option<u32> {
-        let total = u32::try_from(key.len().checked_add(value.len())?).ok()?;
-        let offset = self.alloc(total)?;
+    pub(super) fn alloc_bytes(&self, parts: &[&[u8]]) -> Option<u32> {
+        let mut total = 0usize;
+        for part in parts {
+            total = total.checked_add(part.len())?;
+        }
+        let offset = self.alloc(u32::try_from(total).ok()?)?;
         let index = self.chunk_of(u64::from(offset));
         #[allow(
             clippy::cast_possible_truncation,
@@ -264,13 +280,16 @@ impl Chunks<u8> {
         debug_assert!(!base.is_null(), "alloc reserved the chunk it returned into");
         // SAFETY: `alloc` has just reserved `[offset, offset + total)` and guarantees it lies
         // inside chunk `index`, which `reserve_chunk` allocated; `base` is that chunk. The
-        // range is past everything previously handed out, so no published node names it and no
-        // reader can be reading it. `key` and `value` are the caller's, and neither can overlap
-        // an arena the caller has no way to name.
+        // parts sum to exactly the length reserved, so the writes stay inside it. The range is
+        // past everything previously handed out, so no published node names it and no reader
+        // can be reading it. The parts are the caller's, and none can overlap an arena the
+        // caller has no way to name.
         unsafe {
-            let dst = base.add(within);
-            std::ptr::copy_nonoverlapping(key.as_ptr(), dst, key.len());
-            std::ptr::copy_nonoverlapping(value.as_ptr(), dst.add(key.len()), value.len());
+            let mut dst = base.add(within);
+            for part in parts {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), dst, part.len());
+                dst = dst.add(part.len());
+            }
         }
         Some(offset)
     }
@@ -368,7 +387,7 @@ mod tests {
         for i in 0..200u32 {
             let key = format!("k{i}").into_bytes();
             let value = format!("value-{i}-{}", "x".repeat((i % 7) as usize)).into_bytes();
-            let offset = arena.alloc_bytes(&key, &value).unwrap();
+            let offset = arena.alloc_bytes(&[&key, &value]).unwrap();
             placed.push((offset, key, value));
         }
         for (offset, key, value) in &placed {
@@ -390,7 +409,7 @@ mod tests {
     #[test]
     fn a_slice_outlives_the_growth_that_follows_it() {
         let arena = Chunks::<u8>::new(TINY);
-        let first = arena.alloc_bytes(b"ab", b"cd").unwrap();
+        let first = arena.alloc_bytes(&[b"ab", b"cd"]).unwrap();
         // The borrow is live from here to the end of the test, across every allocation below.
         let borrowed: &[u8] = arena.get(first, 4);
         assert_eq!(borrowed, b"abcd");
@@ -398,7 +417,7 @@ mod tests {
         let mut grew = 0;
         for i in 0..64u32 {
             arena
-                .alloc_bytes(&i.to_le_bytes(), &[b'z'; 13])
+                .alloc_bytes(&[&i.to_le_bytes(), &[b'z'; 13]])
                 .expect("the arena has room");
             let chunks = (0..MAX_CHUNKS)
                 .filter(|&c| !arena.directory[c].load(Ordering::Relaxed).is_null())
@@ -438,7 +457,7 @@ mod tests {
     #[test]
     fn a_bogus_offset_reads_as_empty_rather_than_as_something() {
         let arena = Chunks::<u8>::new(TINY);
-        let offset = arena.alloc_bytes(b"ab", b"cd").unwrap();
+        let offset = arena.alloc_bytes(&[b"ab", b"cd"]).unwrap();
         assert_eq!(arena.get(offset, 4), b"abcd");
         assert!(arena.get(offset, 5).is_empty(), "past the end of chunk 0");
         assert!(arena.get(u32::MAX, 1).is_empty(), "past capacity");
@@ -458,12 +477,19 @@ mod tests {
         assert_eq!(arena.alloc(4), Some(0), "the arena still works afterwards");
     }
 
-    /// A key or a value big enough to overflow the `u32` offset space is refused, not truncated.
+    /// The parts of a key land end to end, which is what lets the skiplist hand its internal
+    /// key over as a user key and a tag without joining them first.
     #[test]
-    fn alloc_bytes_refuses_what_it_cannot_address() {
+    fn alloc_bytes_joins_its_parts() {
         let arena = Chunks::<u8>::new(TINY);
-        assert_eq!(arena.alloc_bytes(b"", b""), Some(0), "empty is fine");
+        assert_eq!(arena.alloc_bytes(&[b"", b""]), Some(0), "empty is fine");
         assert!(arena.get(0, 0).is_empty());
+        assert_eq!(arena.used(), 0, "and an empty run consumes nothing");
+
+        // Six bytes do not fit in chunk 0's four, so this lands at the start of chunk 1.
+        let offset = arena.alloc_bytes(&[b"a", b"bc", b"def"]).unwrap();
+        assert_eq!(offset, 4);
+        assert_eq!(arena.get(offset, 6), b"abcdef");
     }
 
     /// Words come out zero, which is what lets `NIL == 0` mean "no node" without anyone having

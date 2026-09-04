@@ -28,6 +28,11 @@
     reason = "the skiplist that uses the arena lands in the next commit"
 )]
 mod arena;
+#[allow(
+    dead_code,
+    reason = "the memtable moves onto the skiplist in unit 4 of ADR 0041"
+)]
+mod skiplist;
 
 use std::cmp::Ordering;
 use std::ops::Bound;
