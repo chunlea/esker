@@ -231,12 +231,12 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
 /// An array never reaches it: [`columnar_type`] refuses the column before a decoder exists.
 fn value_of(datum: &Datum) -> Value {
     match datum {
-        // A point never reaches this: `columnar_type` refuses the column, the same way it
-        // refuses a citext and an array.
-        Datum::Point { .. } => Value::Null,
         // A citext never reaches this either — the column is refused above, for the same reason
         // an array is: this vocabulary has no way to carry a comparison that folds.
-        Datum::Null
+        // A point never reaches this either: `columnar_type` refuses the column, the same way
+        // it refuses a citext and an array.
+        Datum::Point { .. }
+        | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)
         | Datum::Hstore(_)

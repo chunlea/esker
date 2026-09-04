@@ -515,7 +515,6 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
-        | ColumnType::PointArray
         | ColumnType::PointArray => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
@@ -805,7 +804,6 @@ impl PgType for ColumnType {
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
-            | ColumnType::PointArray
             | ColumnType::PointArray => 0,
         }
     }
@@ -1126,10 +1124,6 @@ impl PgDatum for Datum {
 
     fn to_binary(&self) -> Option<Vec<u8>> {
         Some(match self {
-            // `point_send` writes the two coordinates big-endian, which is a shape this node has
-            // never been asked for — the suite reads a point as text. Refused rather than guessed,
-            // like `numeric` and the arrays beside it.
-            Datum::Point { .. } => return None,
             // A NULL, and a `numeric`, whose binary wire form is its own four-`i16` header plus
             // base-10000 digit groups (`numeric_send(1.5)` is `\x000200000000000100011388`) —
             // nothing here has ever sent or read that shape, so it is refused rather than
@@ -1154,7 +1148,12 @@ impl PgDatum for Datum {
             // `array_send`'s form is a dimension header, a flags word, the element OID and then
             // each element's own binary form — a shape nothing here has ever sent or read, so an
             // array is refused with the `numeric` beside it rather than guessed.
-            Datum::Null | Datum::Numeric(_) | Datum::Array(_) => return None,
+            // **A point joins them.** `point_send` writes the two coordinates big-endian and
+            // nothing here has ever been asked for that shape — the suite reads a point as
+            // text — so it is refused rather than guessed, exactly as the other three are.
+            Datum::Null | Datum::Numeric(_) | Datum::Array(_) | Datum::Point { .. } => {
+                return None;
+            }
             // A `time` joins them: `time_send` is the microsecond count as eight big-endian
             // bytes, measured with `COPY ... (FORMAT binary)` — `12:34:56` is `0x0a8bda1c00`
             // (45_296_000_000) and `24:00:00` is `0x141dd76000`, the top of the closed range.
@@ -1191,16 +1190,11 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
-            // The mirror of `to_binary`, and the same answer.
-            ColumnType::Point | ColumnType::PointArray => {
-                return Err(SqlError::unsupported(format!(
-                    "a binary-format {}",
-                    ty.name()
-                )));
-            }
-            // The mirror of `to_binary`: `array_recv`'s shape has never been read here, so a
-            // client that sends one is told so rather than given a value built from a guess.
-            ColumnType::Int8Array
+            // The mirror of `to_binary`: neither `point_recv`'s pair of coordinates nor
+            // `array_recv`'s shape has ever been read here, so a client that sends one is told
+            // so rather than given a value built from a guess.
+            ColumnType::Point
+            | ColumnType::Int8Array
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
@@ -1542,11 +1536,11 @@ fn variant_rank(value: &Datum) -> u8 {
     match value {
         // Above every scalar, which only decides the order between two values of *different*
         // types — a comparison SQL does not have and this crate's total order still needs.
-        Datum::Array(_) => 20,
-        // **Ranked, and it is not a SQL order.** `point = point` is `42883` on a real server, so
-        // nothing SQL asks ever reaches this — but `pg_cmp` is total by construction and a value
-        // with no rank would sort as some other type's.
-        Datum::Point { .. } => 21,
+        // **Ranked, and neither is a SQL order.** An array's rank decides only the order
+        // between two values of *different* types; a point's is never reached at all, because
+        // `point = point` is `42883` — but `pg_cmp` is total by construction and a value with
+        // no rank would sort as some other type's.
+        Datum::Array(_) | Datum::Point { .. } => 20,
         Datum::Bool(_) => 0,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.

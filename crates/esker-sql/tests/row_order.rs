@@ -93,7 +93,6 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::DateRangeArray
                 | ColumnType::NumRangeArray
                 | ColumnType::Int8RangeArray
-                | ColumnType::PointArray
                 | ColumnType::JsonArray
                 | ColumnType::JsonbArray
                 // **And `point`, with the sharpest reason of the four.** `json` has no equality

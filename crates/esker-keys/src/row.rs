@@ -563,11 +563,11 @@ pub fn unique_index_key_is_unique_by_value(columns: &[Datum]) -> bool {
 
 fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
-        Datum::Null => {}
-        // **A point is not an index key**, so nothing is written: `point = point` is `42883` on a
-        // real server and a key space needs an order the type does not have. The column type is
-        // refused in `decode_key_column`, which is where the error a caller sees comes from.
-        Datum::Point { .. } => {}
+        // Nothing is written for a NULL — the bitmap records it — nor for a **point**, which is
+        // not an index key at all: `point = point` is `42883` on a real server and a key space
+        // needs an order the type does not have. The column type is refused in
+        // `decode_key_column`, which is where the error a caller sees comes from.
+        Datum::Null | Datum::Point { .. } => {}
         Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
             codec::encode_i64(*v, out);
         }
@@ -923,9 +923,6 @@ pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec
 fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let decoded = |error: codec::CodecError| corrupt(format!("index key column: {error}"));
     Ok(match ty {
-        // **Not a key column**, for a reason sharper than `json`'s: a point has no equality even
-        // with itself (`point = point` is `42883`), so there is no order for a key to reproduce.
-        ColumnType::Point => Err(not_a_key())?,
         ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -1057,6 +1054,11 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // deduplicates correctly without one.
         ColumnType::Json
         | ColumnType::Jsonb
+        // **A point joins them with the sharpest reason of the four**: `json` has no equality
+        // with another type, an hstore's *order* is not its text's, a range's order is not its
+        // canonical text's — and a point has no equality even with itself, so there is no order
+        // for a key to reproduce at all.
+        | ColumnType::Point
         | ColumnType::Hstore
         | ColumnType::HstoreArray
         | ColumnType::JsonArray

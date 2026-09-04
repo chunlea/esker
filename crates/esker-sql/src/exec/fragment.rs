@@ -677,16 +677,16 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
 fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
     use esker_columnar::Value;
     match datum {
-        // A point never reaches this either: `column_type` refuses the column, for the reason
-        // a citext's is refused — this vocabulary has no way to carry a type with no
-        // comparison at all.
-        Datum::Point { .. } => Value::Null,
         // An array never reaches this: `column_type` refuses the column, so no fragment is built
         // over one. `Null` rather than a panic — a total function over a value vocabulary, where
         // a wrong *answer* would be a filter that silently matched.
         // A citext never reaches this either — the column is refused above, for the same reason
         // an array is: this vocabulary has no way to carry a comparison that folds.
-        Datum::Null
+        // A point never reaches this either: `column_type` refuses the column, for the reason
+        // a citext's is refused — this vocabulary has no way to carry a type with no
+        // comparison at all.
+        Datum::Point { .. }
+        | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)
         | Datum::Hstore(_)

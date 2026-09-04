@@ -5,8 +5,9 @@
 //! the parser. Measured, all three.
 //!
 //! The coordinates print exactly as a `float8` does, which is why this module formats through
-//! [`super::float`] rather than through `{}`: `1e10` is `10000000000` and `2e-10` stays `2e-10`,
-//! and a formatter of its own would get one of those two wrong.
+//! the crate's own float formatter rather than through `{}`: `1e10` is `10000000000` and `2e-10`
+//! stays `2e-10`, and a formatter of its own would get one of those two wrong. (Written plainly
+//! rather than linked: `value::float` is `pub(crate)`, and a public doc may not link to one.)
 
 use crate::error::{Result, SqlError};
 
