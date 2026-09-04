@@ -2594,6 +2594,11 @@ impl SqlError {
     /// do instead, and PostgreSQL answers it in the same message. Only the conditions where a real
     /// server was seen to send one have one here.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per condition PostgreSQL was seen to hint on, like `sqlstate` and \
+                  `detail` beside it; splitting it would scatter the vocabulary across functions"
+    )]
     pub fn hint(&self) -> Option<String> {
         match self {
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
