@@ -84,7 +84,15 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range
+                | ColumnType::DateRange
+                | ColumnType::NumRange
+                | ColumnType::Int8Range
                 | ColumnType::TsRangeArray
+                | ColumnType::TstzRangeArray
+                | ColumnType::Int4RangeArray
+                | ColumnType::DateRangeArray
+                | ColumnType::NumRangeArray
+                | ColumnType::Int8RangeArray
                 | ColumnType::JsonArray
                 | ColumnType::JsonbArray
         ) {

@@ -39,7 +39,52 @@ SELECT gen_random_uuid() IS NULL	boolean	f
 SELECT gen_random_uuid() = gen_random_uuid()	boolean	f
 SELECT gen_random_uuid()::text = gen_random_uuid()::text	boolean	f
 SELECT uuid_generate_v4()	!42883 function uuid_generate_v4() does not exist DETAIL: There is no function of that name.
+
+# **`uuid_generate_v1` and the rest of `uuid-ossp`.** Run 56's row is 9 tests in one file,
+# `adapters/postgresql/uuid_test.rb`, which writes `uuid_generate_v1()` as a **column default**
+# and reads it back out of the schema dumper — so the name has to survive `pg_get_expr` unchanged
+# as well as evaluate.
+#
+# A v1 is a timestamp, a clock sequence and a node id where a v4 is sixteen random bytes, so what
+# a corpus can pin is its **shape**. One regex does the whole of it — the length, the dashes, the
+# version nibble and the RFC variant — and it is written as a regex rather than as `substring`
+# because that is the question **both** servers can be asked here.
+#
+# Things reasoning would get wrong:
+#
+# * **`uuid_generate_v1` and `uuid_generate_v1mc` differ in the node id and nowhere else**, and
+#   the difference is one bit: the `mc` form's node is random with the **multicast** bit set, the
+#   plain form's is the host's MAC and is unicast. That bit is the low bit of the first node byte,
+#   which is the 26th character — odd for `mc`, and `f` for the plain form on a real server.
+# * **The timestamp is split low half first**, so two v1s made a moment apart do not sort in the
+#   order they were made. Nothing here asks them to.
+# * **The X.500 namespace is `…814…`, not `…813…`** — RFC 4122 skips one, and that is exactly the
+#   digit a reader would fill in.
+# * **An arity error has a different DETAIL from a missing name**: `uuid_generate_v1(1)` is "No
+#   function of that name accepts the given number of arguments" where `uuid_generate_v1()` before
+#   the extension is "There is no function of that name."
+SELECT 'r', uuid_generate_v1()	!42883 function uuid_generate_v1() does not exist DETAIL: There is no function of that name.
+SELECT 'r', uuid_generate_v1mc()	!42883 function uuid_generate_v1mc() does not exist DETAIL: There is no function of that name.
+SELECT 'r', uuid_nil()	!42883 function uuid_nil() does not exist DETAIL: There is no function of that name.
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
 SELECT uuid_generate_v4() IS NULL	boolean	f
 SELECT uuid_generate_v4() = uuid_generate_v4()	boolean	f
+SELECT 'r', uuid_generate_v1()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' AS shape_v1		r|t
+SELECT 'r', uuid_generate_v1mc()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' AS shape_v1mc		r|t
+SELECT 'r', uuid_generate_v4()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' AS shape_v4		r|t
+SELECT 'r', gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' AS shape_gen_random	text,boolean	r|t
+SELECT 'r', uuid_generate_v1()::text ~ '^.{24}[0-9a-f][13579bdf]' AS v1_multicast		r|f
+SELECT 'r', uuid_generate_v1mc()::text ~ '^.{24}[0-9a-f][13579bdf]' AS v1mc_multicast		r|t
+SELECT 'r', uuid_generate_v1() IS NULL, uuid_generate_v1() = uuid_generate_v1()		r|f|f
+SELECT 'r', uuid_generate_v1mc() = uuid_generate_v1mc()		r|f
+SELECT 'r', pg_typeof(uuid_generate_v1()), pg_typeof(uuid_nil())		r|uuid|uuid
+CREATE TABLE uv (id uuid PRIMARY KEY DEFAULT uuid_generate_v1(), name text)		-
+INSERT INTO uv (name) VALUES ('a'), ('b')		-
+SELECT 'r', count(DISTINCT id), count(*) FROM uv		r|2|2
+SELECT 'r', id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' FROM uv ORDER BY name		r|t ; r|t
+SELECT 'r', uuid_nil(), uuid_ns_dns(), uuid_ns_url(), uuid_ns_oid(), uuid_ns_x500()		r|00000000-0000-0000-0000-000000000000|6ba7b810-9dad-11d1-80b4-00c04fd430c8|6ba7b811-9dad-11d1-80b4-00c04fd430c8|6ba7b812-9dad-11d1-80b4-00c04fd430c8|6ba7b814-9dad-11d1-80b4-00c04fd430c8
+SELECT 'r', uuid_generate_v3(uuid_ns_dns(), 'www.postgresql.org')		r|9a0d5f51-76ff-394e-ba97-b28a9ff12209
+SELECT 'r', uuid_generate_v5(uuid_ns_dns(), 'www.postgresql.org')		r|1826c6c4-4d1f-534f-9dcd-7a15978dfeb9
+SELECT 'r', uuid_generate_v1(1)	!42883 function uuid_generate_v1(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT 'r', uuid_generate_v3(uuid_ns_dns())	!42883 function uuid_generate_v3(uuid) does not exist DETAIL: No function of that name accepts the given number of arguments.
 SELECT count(*) FROM pg_extension WHERE extname = 'uuid-ossp'	bigint	1

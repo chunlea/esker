@@ -48,7 +48,7 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
-            | ColumnType::TsRangeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -149,7 +149,7 @@ mod tests {
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
             // A range's stored form is its canonical text; `empty` is the one value every subtype
             // has, which is enough to state the ordering property these tests are for.
-            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => {
                 Just(Datum::Range {
                     subtype: Box::new(crate::value::range_subtype(ty)),
                     text: "empty".to_owned(),
