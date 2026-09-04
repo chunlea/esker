@@ -810,6 +810,18 @@ fn finish_plan(
         select.distinct || expands,
     )?;
     refuse_json_sort(&sort_keys)?;
+    // **`SELECT DISTINCT` deduplicates over the target list**, so every column in it needs the
+    // same equality operator class a grouping key needs. The third reader of one list; before it
+    // was shared, `count(DISTINCT j)` refused and `SELECT DISTINCT j` answered.
+    if select.distinct {
+        for expr in &exprs {
+            if let Expr::Ordinal { ty, .. } = expr
+                && !crate::value::has_equality_operator(*ty)
+            {
+                return Err(SqlError::NoEqualityOperator(ty.name()));
+            }
+        }
+    }
     if !select.distinct && !expands && !sort_keys.is_empty() {
         node = Node::Sort {
             input: Box::new(node),
@@ -948,9 +960,32 @@ fn stricter(left: LockWait, right: LockWait) -> LockWait {
 /// would be a wrong answer, which is what ADR 0042 is about.
 fn refuse_json_sort(keys: &[SortKey]) -> Result<()> {
     for key in keys {
-        if let Expr::Ordinal { ty, .. } = &key.expr
-            && matches!(ty, ColumnType::Json | ColumnType::Jsonb)
-        {
+        let Expr::Ordinal { ty, .. } = &key.expr else {
+            continue;
+        };
+        // **PostgreSQL's own refusal, for the types that genuinely have no ordering operator.**
+        // Measured on 19beta1 for `xml`, `json` and `lseg`, all three the same sentence with the
+        // same HINT — and `jsonb` is *not* among them, which is why the two halves of this
+        // function say different things. Answering these from `pg_cmp`'s text comparison was a
+        // number where a real server raises, ADR 0031's worst class.
+        if matches!(
+            ty,
+            ColumnType::Json
+                | ColumnType::Xml
+                | ColumnType::Point
+                | ColumnType::Lseg
+                | ColumnType::Box
+                | ColumnType::Path
+                | ColumnType::Polygon
+                | ColumnType::Circle
+                | ColumnType::Line
+        ) {
+            return Err(SqlError::NoOrderingOperator(ty.name()));
+        }
+        // **A `jsonb` is ordered on a real server** — it has a btree operator class and its
+        // comparison is the *document's*, kind first and numbers numerically, which the stored
+        // canonical text does not reproduce. So this half stays a `0A000` gap this node owns.
+        if matches!(ty, ColumnType::Jsonb) {
             return Err(SqlError::unsupported(format!(
                 "ORDER BY over a {} column",
                 ty.name()
@@ -2843,6 +2878,9 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
             // type added here is a compile error rather than a silent family 9.
             ColumnType::Json => 9,
+            // Unreachable for the same reason, both of them: `xml` is `json`'s shape and has no
+            // equality operator either.
+            ColumnType::Xml | ColumnType::XmlArray => 77,
         }
     }
     // **And `json[]` with it.** `ARRAY['{"a":1}'::json] = ARRAY['{"a":1}'::json]` is
@@ -2852,12 +2890,20 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // **And `point` with them.** `'(1,2)'::point = '(1,2)'::point` is
     // `42883 operator does not exist: point = point` — a type with no equality even with
     // itself, which is why `CREATE INDEX` on one is `42704` and why it is not a key here.
+    // **And `xml` with `json`.** `'<a/>'::xml = '<a/>'::xml` is
+    // `42883 operator does not exist: xml = xml`, measured — the same sentence `json` gets, from
+    // a type with the same shape.
+    // **Not [`crate::value::has_equality_operator`], and the geometric corpus is what proves the
+    // two are different questions.** That one asks whether a btree family exists, which is what
+    // `DISTINCT` needs; this one asks whether `=` answers at all. An `lseg` splits them —
+    // `'…'::lseg = '…'::lseg` is `t` and `count(DISTINCT lseg)` raises — so the shapes are on
+    // that list and not on this one.
     if matches!(
         left,
-        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point | ColumnType::Xml
     ) || matches!(
         right,
-        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point | ColumnType::Xml
     ) {
         return false;
     }

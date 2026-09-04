@@ -191,6 +191,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["26", "oid", "0", ",", "oidin", "\\N", "b", "0"],
             // Tier 2's first pair, and `ActiveRecord`'s list of forty names holds both.
             vec!["114", "json", "0", ",", "json_in", "\\N", "b", "0"],
+            // **`xml` is one of the forty names too**, and had been answering nothing. A `b`ase
+            // type, `typelem` 0 — an xml is not an array of anything — and `xml_in`, which is
+            // the string the adapter compares to decide the column is *not* an array.
+            vec!["142", "xml", "0", ",", "xml_in", "\\N", "b", "0"],
             // **`point` is one of the forty names this query asks for**, and it answers now: a
             // geometric type is a `b`ase type like any other, and its `typelem` is 0 because a
             // point is not an array of its coordinates.
@@ -201,7 +205,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // and every one of them answering nothing until now. `poly_in`, not `polygon_in`.
             vec!["601", "lseg", "0", ",", "lseg_in", "\\N", "b", "0"],
             vec!["602", "path", "0", ",", "path_in", "\\N", "b", "0"],
-            vec!["603", "box", "0", ",", "box_in", "\\N", "b", "0"],
+            // **`;`, alone among the seventy-eight** — a box's own text holds commas, so an array
+            // of them needs another separator. Found by r1's run-75 provenance probe against the
+            // oracle, and it is `pg_type.typdelim` a client reads to parse one.
+            vec!["603", "box", "0", ";", "box_in", "\\N", "b", "0"],
             vec!["604", "polygon", "0", ",", "poly_in", "\\N", "b", "0"],
             vec!["628", "line", "0", ",", "line_in", "\\N", "b", "0"],
             vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],
@@ -288,7 +295,7 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **Twenty-one rows**, which is every array
+    // 9 — array types, found by their element type. **Thirty-four rows**, which is every array
     // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
     // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
     // is an array at all. It answered nothing while this node had no arrays and five rows while
@@ -306,6 +313,18 @@ fn activerecord_s_four_type_map_queries_answer() {
              13369, 3904, 3906, 3908, 3910, 3912, 3926) ORDER BY t.oid"
         ),
         vec![
+            // **`_xml`, and it sorts first** — 143, below `_json`'s 199, which is the shape
+            // `xml`'s pair has and `json`'s does not: 142 and 143 are adjacent.
+            vec![
+                "143".to_owned(),
+                "_xml".to_owned(),
+                "142".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "199".to_owned(),
                 "_json".to_owned(),
@@ -713,17 +732,22 @@ fn a_star_expands_to_every_column_of_the_view() {
     // every type reports it, as every relation's `relnamespace` does. The `8` and `N` are `typlen`
     // and `typcategory`, appended last again for the uuid unit. `1016` and `0` are `typarray` and
     // `typrelid`, appended last for the **fourth** time by `CREATE TYPE`: `_int8` really is 1016
-    // on a real server, and nothing but a composite owns a `pg_class` row.
+    // on a real server, and nothing but a composite owns a `pg_class` row. The `f` and the NULL
+    // are `typnotnull` and `typdefault`, appended last for the **fifth** time by `CREATE DOMAIN`
+    // (ADR 0065): only a domain can constrain its own values, so every other type answers exactly
+    // this pair.
     assert_eq!(
         node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0", "f",
+            "\\N"
         ]]
     );
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0", "f",
+            "\\N"
         ]]
     );
     assert_eq!(

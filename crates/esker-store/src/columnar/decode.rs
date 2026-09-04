@@ -234,6 +234,10 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::Polygon
         | StoredType::Circle
         | StoredType::Line
+        // **`xml` is not columnar**, for `json`'s reason without `json`'s exception: that crate's
+        // `ColumnType` has a `Json` and no `Xml`, and teaching it one is that crate's unit.
+        | StoredType::Xml
+        | StoredType::XmlArray
         | StoredType::FloatRange
         | StoredType::VarcharRange
         | StoredType::TstzRangeArray

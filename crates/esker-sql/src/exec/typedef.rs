@@ -47,7 +47,9 @@ pub(super) fn create(
     if let catalog::TypeKind::Range { subtype, .. } = create.kind
         && matches!(
             subtype,
-            crate::value::ColumnType::Json | crate::value::ColumnType::Point
+            crate::value::ColumnType::Json
+                | crate::value::ColumnType::Point
+                | crate::value::ColumnType::Xml
         )
     {
         return Err(SqlError::RangeSubtypeNotOrdered(

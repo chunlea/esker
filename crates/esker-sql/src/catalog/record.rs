@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 31;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 32;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -136,6 +136,9 @@ const OLDEST_TYPE_VERSION: u8 = 22;
 const TYPE_KIND_RANGE: u8 = 1;
 const TYPE_KIND_COMPOSITE: u8 = 2;
 const TYPE_KIND_ENUM: u8 = 3;
+/// Version 32. A domain: a base type, its typmod, and the constraints every value is checked
+/// against ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
+const TYPE_KIND_DOMAIN: u8 = 4;
 
 /// What every catalog key begins with, after the `'m'` namespace byte.
 const SQL: &[u8] = b"sql";
@@ -294,6 +297,8 @@ const TAG_PATH: u8 = 75;
 const TAG_POLYGON: u8 = 76;
 const TAG_CIRCLE: u8 = 77;
 const TAG_LINE: u8 = 78;
+const TAG_XML: u8 = 79;
+const TAG_XML_ARRAY: u8 = 80;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -396,6 +401,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Polygon => TAG_POLYGON,
         ColumnType::Circle => TAG_CIRCLE,
         ColumnType::Line => TAG_LINE,
+        ColumnType::Xml => TAG_XML,
+        ColumnType::XmlArray => TAG_XML_ARRAY,
         ColumnType::Bit => TAG_BIT,
         ColumnType::VarBit => TAG_VARBIT,
         ColumnType::BitArray => TAG_BIT_ARRAY,
@@ -522,6 +529,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_POLYGON => ColumnType::Polygon,
         TAG_CIRCLE => ColumnType::Circle,
         TAG_LINE => ColumnType::Line,
+        TAG_XML => ColumnType::Xml,
+        TAG_XML_ARRAY => ColumnType::XmlArray,
         TAG_BIT => ColumnType::Bit,
         TAG_VARBIT => ColumnType::VarBit,
         TAG_BIT_ARRAY => ColumnType::BitArray,
@@ -784,6 +793,23 @@ pub(super) fn encode_type(def: &TypeDef) -> Vec<u8> {
                 put_str(label, &mut out);
             }
         }
+        // Version 32. A fourth kind rather than a section on the end: a type record's kind byte
+        // already selects what follows it, so a new kind adds a case and changes nothing that was
+        // written before.
+        TypeKind::Domain {
+            base,
+            typmod,
+            not_null,
+            default,
+            check,
+        } => {
+            out.push(TYPE_KIND_DOMAIN);
+            out.push(tag_of(*base));
+            out.extend_from_slice(&typmod.to_le_bytes());
+            out.push(u8::from(*not_null));
+            put_str(default.as_deref().unwrap_or(""), &mut out);
+            put_str(check.as_deref().unwrap_or(""), &mut out);
+        }
     }
     out
 }
@@ -799,6 +825,20 @@ pub(super) fn decode_type(name: &str, bytes: &[u8]) -> Result<TypeDef> {
             TypeKind::Range {
                 subtype,
                 subtype_diff: (!diff.is_empty()).then_some(diff),
+            }
+        }
+        TYPE_KIND_DOMAIN => {
+            let base = type_of(reader.byte()?)?;
+            let typmod = reader.i32_le()?;
+            let not_null = reader.flag()?;
+            let default = reader.string()?;
+            let check = reader.string()?;
+            TypeKind::Domain {
+                base,
+                typmod,
+                not_null,
+                default: (!default.is_empty()).then_some(default),
+                check: (!check.is_empty()).then_some(check),
             }
         }
         TYPE_KIND_COMPOSITE => {

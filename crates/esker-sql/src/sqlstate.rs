@@ -59,6 +59,9 @@ pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
 
 /// A literal could not be read as its target type — `'abc'::int8`.
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+/// `2200N invalid_xml_content` — `'<a>'::xml`. **Its own class**, not the `22P02` every other
+/// input function raises, because the SQL/XML standard gives XML its own set of data exceptions.
+pub const INVALID_XML_CONTENT: &str = "2200N";
 /// A value is outside its type's range.
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 

@@ -476,7 +476,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
-        | ColumnType::VarBitArray => return decode_array(ty, bytes),
+        | ColumnType::VarBitArray
+        | ColumnType::XmlArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -500,6 +501,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Jsonb
+        | ColumnType::Xml
         | ColumnType::Hstore
         | ColumnType::Citext
         | ColumnType::TsRange
@@ -858,7 +860,8 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         | ColumnType::Varchar
         | ColumnType::Bpchar
         | ColumnType::Json
-        | ColumnType::Jsonb => Datum::Text(text_from_utf8(body)?),
+        | ColumnType::Jsonb
+        | ColumnType::Xml => Datum::Text(text_from_utf8(body)?),
         _ => Datum::Bytea(body.to_vec()),
     })
 }
@@ -1059,6 +1062,8 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Line
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Xml
+            | ColumnType::XmlArray
             | ColumnType::Point
             | ColumnType::Hstore
             | ColumnType::HstoreArray
@@ -1272,6 +1277,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // deduplicates correctly without one.
         ColumnType::Json
         | ColumnType::Jsonb
+        // **`xml` joins `json` because it is `json`'s shape**: a string with no equality operator
+        // of its own, so there is no comparison for a byte-ordered key to reproduce.
+        | ColumnType::Xml
+        | ColumnType::XmlArray
         // **A point joins them with the sharpest reason of the four**: `json` has no equality
         // with another type, an hstore's *order* is not its text's, a range's order is not its
         // canonical text's — and a point has no equality even with itself, so there is no order
@@ -1965,6 +1974,7 @@ mod tests {
             | ColumnType::InetArray
             | ColumnType::CidrArray
             | ColumnType::MacAddrArray
+            | ColumnType::XmlArray
             | ColumnType::BitArray
             | ColumnType::VarBitArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
@@ -2084,6 +2094,17 @@ mod tests {
                     bits,
                 })
                 .boxed(),
+            // Well-formed content, and each of these round-trips **unchanged**: the type has no
+            // canonical form to normalise towards, so the encoding is all there is to check.
+            ColumnType::Xml => proptest::sample::select(vec![
+                "<foo>bar</foo>",
+                "  <a/>  ",
+                "<a></a>",
+                "plain text",
+                "",
+            ])
+            .prop_map(|text: &str| Datum::Text(text.to_owned()))
+            .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",

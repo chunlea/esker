@@ -60,6 +60,7 @@ mod timestamp;
 pub mod uuid;
 /// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
 pub mod vector;
+pub mod xml;
 
 use std::cmp::Ordering;
 
@@ -316,6 +317,39 @@ pub fn geometric_kind(ty: ColumnType) -> Option<geometric::Kind> {
         ColumnType::Line => geometric::Kind::Line,
         _ => return None,
     })
+}
+
+/// Whether the type has an equality **operator class** — what `DISTINCT` and `GROUP BY` need.
+///
+/// Not the same question as "does `=` answer": an `lseg` has an `=` operator and no btree family
+/// to put it in, so `'…'::lseg = '…'::lseg` is `t` and `count(DISTINCT a_line_segment)` is
+/// `42883 could not identify an equality operator for type lseg`. Measured on 19beta1 for every
+/// member, and for `jsonb` — which is **not** one, since it has a btree opclass and groups fine.
+///
+/// One list, read by the three places that ask: `count(DISTINCT x)`, `SELECT DISTINCT` and
+/// `GROUP BY`. It was three lists that disagreed — `count(DISTINCT json)` refused where
+/// `SELECT DISTINCT json` answered — which is exactly the drift a shared predicate removes.
+///
+/// It is **not** the list `esker_sql::exec::query`'s `same_family` keeps, and the difference is
+/// the sentence above: that one asks whether `=` answers, and the shapes are on this list and not
+/// on that one. Sharing the two was tried and the geometric corpus refused it in one run.
+#[must_use]
+pub fn has_equality_operator(ty: ColumnType) -> bool {
+    !matches!(
+        ty,
+        ColumnType::Json
+            | ColumnType::JsonArray
+            | ColumnType::Xml
+            | ColumnType::XmlArray
+            | ColumnType::Point
+            | ColumnType::PointArray
+            | ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line
+    )
 }
 
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
@@ -600,7 +634,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::Path
         | ColumnType::Polygon
         | ColumnType::Circle
-        | ColumnType::Line => 0,
+        | ColumnType::Line
+        | ColumnType::XmlArray => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -628,6 +663,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Text => 1009,
         ColumnType::Oid => 1028,
         ColumnType::Json => 199,
+        // Measured: `xml` is 142 and `_xml` is 143, adjacent where `json`'s pair is not.
+        ColumnType::Xml => 143,
         ColumnType::Real => 1021,
         ColumnType::Double => 1022,
         ColumnType::Bpchar => 1014,
@@ -733,6 +770,9 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Polygon
         | ColumnType::Circle
         | ColumnType::Line
+        // `xml` takes no typmod: there is no `xml(n)`, and `XMLSERIALIZE`'s type modifiers are a
+        // function's arguments rather than the type's.
+        | ColumnType::Xml
         | ColumnType::Money
         | ColumnType::Inet
         | ColumnType::Cidr
@@ -767,7 +807,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray => false,
     }
 }
 
@@ -878,6 +918,7 @@ impl PgType for ColumnType {
             ColumnType::Varchar => 1043,
             ColumnType::Bpchar => 1042,
             ColumnType::Json => 114,
+            ColumnType::Xml => 142,
             ColumnType::Jsonb => 3802,
             ColumnType::Hstore => HSTORE_OID,
             ColumnType::Citext => CITEXT_OID,
@@ -950,6 +991,7 @@ impl PgType for ColumnType {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::CitextArray
+            | ColumnType::XmlArray
             | ColumnType::TstzRangeArray
             | ColumnType::Int4RangeArray
             | ColumnType::DateRangeArray
@@ -1029,6 +1071,8 @@ impl PgType for ColumnType {
             ColumnType::JsonbArray => "jsonb[]",
             ColumnType::OidArray => "oid[]",
             ColumnType::CitextArray => "citext[]",
+            ColumnType::Xml => "xml",
+            ColumnType::XmlArray => "xml[]",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
@@ -1092,12 +1136,13 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Xml
             | ColumnType::Numeric
             | ColumnType::Bytea
             // However many elements it has, which is the definition of a varlena.
@@ -1307,7 +1352,8 @@ impl PgDatum for Datum {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
-            | ColumnType::CitextArray => {
+            | ColumnType::CitextArray
+            | ColumnType::XmlArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -1326,6 +1372,14 @@ impl PgDatum for Datum {
                 Datum::Text(text.to_owned())
             }
             ColumnType::Jsonb => Datum::Text(json::canonicalise(text)?),
+            // **`json`'s arm with a different validator**, and a different refusal class: the
+            // text is kept exactly as sent once it is known to be well-formed XML *content*
+            // (`crate::value::xml`), which `'plain text'` is and `'<a>'` is not.
+            ColumnType::Xml => {
+                let text = xml::strip_declaration(text);
+                xml::validate(text)?;
+                Datum::Text(text.to_owned())
+            }
             // Read and written back **canonical**, the same road `jsonb` takes: the stored form is
             // what the type prints, so equality and ordering are the text's (`crate::value::hstore`).
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
@@ -1468,6 +1522,7 @@ impl PgDatum for Datum {
             | ColumnType::MacAddr
             | ColumnType::Bit
             | ColumnType::VarBit
+            | ColumnType::Xml
             | ColumnType::Lseg
             | ColumnType::Box
             | ColumnType::Path
@@ -1509,7 +1564,8 @@ impl PgDatum for Datum {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
-            | ColumnType::CitextArray => {
+            | ColumnType::CitextArray
+            | ColumnType::XmlArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -2207,6 +2263,7 @@ mod tests {
                         | ColumnType::Bpchar
                         | ColumnType::Json
                         | ColumnType::Jsonb
+                        | ColumnType::Xml
                         | ColumnType::Hstore
                         | ColumnType::HstoreArray
                         | ColumnType::Citext
@@ -2216,6 +2273,7 @@ mod tests {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+                        | ColumnType::XmlArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

@@ -96,6 +96,10 @@ pub enum CatalogView {
     /// **`YES`/`NO` text, not a boolean** — the standard spells these `character varying(3)`, and
     /// a client comparing against the string would read a boolean as neither.
     InformationSchemaViews,
+    /// `information_schema.domains`: one row per **domain**, describing its base type the way the
+    /// standard describes a column's
+    /// ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
+    InformationSchemaDomains,
     /// `information_schema.columns`.
     InformationSchemaColumns,
     /// `information_schema.table_constraints`, where a `NOT NULL` appears as a `CHECK`.
@@ -260,6 +264,7 @@ impl CatalogView {
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
         CatalogView::InformationSchemaViews,
+        CatalogView::InformationSchemaDomains,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
         CatalogView::InformationSchemaKeyColumnUsage,
@@ -298,6 +303,7 @@ impl CatalogView {
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
             CatalogView::InformationSchemaViews => "information_schema.views",
+            CatalogView::InformationSchemaDomains => "information_schema.domains",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
             CatalogView::InformationSchemaTableConstraints => {
                 "information_schema.table_constraints"
@@ -322,6 +328,7 @@ impl CatalogView {
         match self {
             CatalogView::InformationSchemaTables
             | CatalogView::InformationSchemaViews
+            | CatalogView::InformationSchemaDomains
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -355,6 +362,7 @@ impl CatalogView {
             | CatalogView::PgAvailableExtensions
             | CatalogView::InformationSchemaTables
             | CatalogView::InformationSchemaViews
+            | CatalogView::InformationSchemaDomains
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -405,6 +413,8 @@ impl CatalogView {
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
                 CatalogView::InformationSchemaViews => 33,
+                // 30: free, and its own the way every reserved id here is.
+                CatalogView::InformationSchemaDomains => 30,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
                 CatalogView::InformationSchemaKeyColumnUsage => 12,
@@ -465,6 +475,12 @@ impl CatalogView {
                 // `pg_class` row a **composite** owns and every other type reports as `0`.
                 ("typarray", ColumnType::Int8),
                 ("typrelid", ColumnType::Int8),
+                // **Last for the fifth time.** A **domain**'s two: whether it refuses a NULL and
+                // the `DEFAULT` expression it prints back (ADR 0065). Every other type answers
+                // `f` and NULL, which is what a real server reports for one — these describe a
+                // constraint a domain carries and nothing else can.
+                ("typnotnull", ColumnType::Bool),
+                ("typdefault", ColumnType::Text),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
@@ -711,6 +727,7 @@ impl CatalogView {
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
             CatalogView::InformationSchemaViews => super::information_schema::VIEWS_COLUMNS,
+            CatalogView::InformationSchemaDomains => super::information_schema::DOMAINS_COLUMNS,
             CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
             CatalogView::InformationSchemaTableConstraints => {
                 super::information_schema::TABLE_CONSTRAINTS_COLUMNS
@@ -730,6 +747,33 @@ impl CatalogView {
     /// order; this one is deterministic, which is a superset of that promise and is the order
     /// `ORDER BY oid` would have given anyway. The same choice `crate::exec::aggregate` made for
     /// group order, and for the same reason.
+    /// The rows of one `information_schema` view, split out of [`CatalogView::rows_of`].
+    fn information_schema_rows(
+        view: CatalogView,
+        txn: &dyn crate::backend::Txn,
+        tenant: u64,
+    ) -> Result<Vec<Vec<Datum>>> {
+        match view {
+            CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
+            CatalogView::InformationSchemaViews => super::information_schema::views(txn, tenant),
+            CatalogView::InformationSchemaDomains => {
+                super::information_schema::domains(txn, tenant)
+            }
+            CatalogView::InformationSchemaColumns => {
+                super::information_schema::columns(txn, tenant)
+            }
+            CatalogView::InformationSchemaTableConstraints => {
+                super::information_schema::table_constraints(txn, tenant)
+            }
+            CatalogView::InformationSchemaKeyColumnUsage => {
+                super::information_schema::key_column_usage(txn, tenant)
+            }
+            // `referential_constraints` has no rows and no function; it falls through with every
+            // `pg_catalog` view, which never reaches here.
+            other => Ok(other.rows()),
+        }
+    }
+
     /// Every row, in OID order — reading the catalog for the views whose rows are not constants.
     ///
     /// `txn` and `tenant` are what make `pg_class` a **view over the records** rather than a
@@ -757,16 +801,11 @@ impl CatalogView {
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgLocks => Ok(locks_rows(txn, tenant)),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
-            CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
-            CatalogView::InformationSchemaViews => super::information_schema::views(txn, tenant),
-            CatalogView::InformationSchemaColumns => {
-                super::information_schema::columns(txn, tenant)
-            }
-            CatalogView::InformationSchemaTableConstraints => {
-                super::information_schema::table_constraints(txn, tenant)
-            }
-            CatalogView::InformationSchemaKeyColumnUsage => {
-                super::information_schema::key_column_usage(txn, tenant)
+            // **The standard's views delegate as a group**, in their own function: they are six
+            // arms that all call one module, and keeping them here is what pushed `rows_of` past
+            // the size lint when the sixth arrived (ADR 0065's `information_schema.domains`).
+            view if view.schema() == super::INFORMATION_SCHEMA => {
+                Self::information_schema_rows(view, txn, tenant)
             }
             // **Trusted**, which is what `lanpltrusted` says of `plpgsql` on a real server: a
             // non-superuser may write a function in it. Nothing here acts on the flag; it is
@@ -886,6 +925,7 @@ impl CatalogView {
             // included.
             CatalogView::PgAvailableExtensions
             | CatalogView::PgMatviews
+            | CatalogView::InformationSchemaDomains
             | CatalogView::PgRange
             | CatalogView::PgCollation
             | CatalogView::PgExtension
@@ -1675,7 +1715,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 Datum::Int8(
                     ArrayValue::element_of(*ty).map_or(0, |element| i64::from(element.oid())),
                 ),
-                Datum::Text(",".to_owned()),
+                Datum::Text(typdelim(*ty).to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
                 Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
@@ -1693,6 +1733,9 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 Datum::Int8(i64::from(crate::value::array_oid(*ty))),
                 // No built-in type owns a `pg_class` row: only a composite does.
                 Datum::Int8(0),
+                // Only a domain can constrain its own values.
+                Datum::Bool(false),
+                Datum::Null,
             ]
         })
         .collect();
@@ -1710,20 +1753,35 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
 /// is `floatrange[]`, measured — so it is derived here rather than stored: its oid is the type's
 /// plus one, taken from the same sequence at creation.
 fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let schemas = super::schemas(txn, tenant)?;
     let mut rows = Vec::new();
     for def in super::user_types(txn, tenant)? {
         let oid = super::pg_relations::as_oid(def.oid);
+        // **The bare name**, the way a relation's `relname` is bare: the schema is `typnamespace`
+        // and repeating it here would make `typname = 'text'` fail to find a domain called `text`.
+        let (_, bare) = super::split_qualified(&def.name);
         rows.push(vec![
             Datum::Int8(oid),
-            Datum::Text(def.name.clone()),
+            Datum::Text(bare.to_owned()),
             // Not an array, so no element type — the array row below is the one with one.
             Datum::Int8(0),
             Datum::Text(",".to_owned()),
-            Datum::Text(format!("{}_in", def.name)),
+            Datum::Text(format!("{bare}_in")),
             Datum::Text(def.kind.typtype().to_owned()),
+            // **`typbasetype` is the domain's base type and zero for everything else** — measured,
+            // `typbasetype::regtype` over `custom_money` prints `numeric`. It is the column a
+            // client reads to learn what a domain is a domain *over*, and the one that told the
+            // corpus the answer was `-`: an oid of zero has no `regtype` to print.
+            Datum::Int8(match &def.kind {
+                super::TypeKind::Domain { base, .. } => i64::from(base.oid()),
+                _ => 0,
+            }),
             Datum::Int8(0),
-            Datum::Int8(0),
-            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            // **The schema the type is actually in**, not a constant. It was `public` while a type
+            // could only be there; a domain takes a schema like a relation does (ADR 0065), and
+            // `schema_test.rb` creates `schema_1.text` — a domain reported in `public` would be a
+            // *wrong* row rather than a missing one.
+            Datum::Int8(namespace_oid(&schemas, super::split_qualified(&def.name).0)),
             Datum::Int2(-1),
             Datum::Text(def.kind.typcategory().to_owned()),
             Datum::Int8(oid + 1),
@@ -1734,10 +1792,21 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
                 super::TypeKind::Composite { .. } => oid + 2,
                 _ => 0,
             }),
+            Datum::Bool(matches!(
+                def.kind,
+                super::TypeKind::Domain { not_null: true, .. }
+            )),
+            match &def.kind {
+                super::TypeKind::Domain {
+                    default: Some(text),
+                    ..
+                } => Datum::Text(text.clone()),
+                _ => Datum::Null,
+            },
         ]);
         rows.push(vec![
             Datum::Int8(oid + 1),
-            Datum::Text(format!("_{}", def.name)),
+            Datum::Text(format!("_{bare}")),
             Datum::Int8(oid),
             Datum::Text(",".to_owned()),
             Datum::Text("array_in".to_owned()),
@@ -1751,6 +1820,9 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
             Datum::Text("A".to_owned()),
             Datum::Int8(0),
             Datum::Int8(0),
+            // An array of a domain is not itself a domain: it constrains nothing.
+            Datum::Bool(false),
+            Datum::Null,
         ]);
     }
     Ok(rows)
@@ -1934,6 +2006,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpchar",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
+        ColumnType::Xml => "xml",
+        ColumnType::XmlArray => "_xml",
         ColumnType::Hstore => "hstore",
         ColumnType::Citext => "citext",
         ColumnType::TsRange => "tsrange",
@@ -2037,7 +2111,7 @@ fn typtype(ty: ColumnType) -> &'static str {
 /// what a reader would guess: `bytea` is `U` (user-defined) and not `S` (string), a `uuid` is `U`
 /// too, and all three datetime types are `D` while an `interval` is `T`. An exhaustive match, so
 /// a type added here has to answer instead of inheriting somebody else's letter.
-fn typcategory(ty: ColumnType) -> &'static str {
+pub(super) fn typcategory(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Int8
         | ColumnType::Int4
@@ -2068,6 +2142,9 @@ fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Bytea
         | ColumnType::Json
         | ColumnType::Jsonb
+        // **And an `xml`**, which is `U` and not `S`: it is a string to a reader and a
+        // user-defined type to `pg_type`. Measured.
+        | ColumnType::Xml
         | ColumnType::Hstore
         | ColumnType::Uuid
         // **And a `macaddr`**, which a real server groups with them rather than with the two
@@ -2083,7 +2160,7 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`, all seven.
@@ -2108,6 +2185,24 @@ fn typcategory(ty: ColumnType) -> &'static str {
 /// `ActiveRecord` reads it, and reads it by comparison — `row["typinput"] == "array_in"` is how it
 /// tells an array type from everything else — so the value is load-bearing and the spelling is the
 /// capture's, underscore and all: `timestamptz_in` has one and `int8in` does not.
+/// `pg_type.typdelim`: the character that separates two elements inside an array literal.
+///
+/// **A comma for every type but one.** `box` uses a **semicolon**, because a box's own text
+/// already contains commas — `(1,1),(0,0)` — so `{(1,1),(0,0);(3,3),(2,2)}` is a two-element
+/// `box[]` and the same string with commas would be four points. Measured the only way that
+/// settles it, by asking a real server which types disagree with the default:
+/// `SELECT typname, typdelim FROM pg_type WHERE typdelim <> ','` answers `box` and `_box`, and
+/// nothing else.
+///
+/// The `,` was a constant here before, which is a right answer for 77 types and a wrong one for
+/// the seventy-eighth.
+fn typdelim(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Box => ";",
+        _ => ",",
+    }
+}
+
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
@@ -2148,7 +2243,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
-        | ColumnType::VarBitArray => "array_in",
+        | ColumnType::VarBitArray
+        | ColumnType::XmlArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -2157,6 +2253,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpcharin",
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",
+        ColumnType::Xml => "xml_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
         ColumnType::TsRange => "tsrange_in",

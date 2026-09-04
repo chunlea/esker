@@ -208,7 +208,12 @@ impl Aggregation {
                 // seventh member of the list ADR 0031 turned into a rule — the aggregate set is
                 // per type and cannot be derived from whether the type is ordered.
                 | ColumnType::Bit
-                | ColumnType::VarBit => undefined(),
+                | ColumnType::VarBit
+                // **And an `xml`**, measured: `min(xml)` is `42883 function min(xml) does not
+                // exist` — the eighth member of that list, and the one that could not have been
+                // guessed from `json` being in it, since `json` has no ordering at all and this
+                // refusal is about the aggregate rather than the order.
+                | ColumnType::Xml => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`
@@ -272,7 +277,17 @@ impl Aggregation {
             if keys.contains(&resolved) {
                 continue;
             }
-            key_types.push(super::query::expr_type(&resolved, scope)?);
+            let ty = super::query::expr_type(&resolved, scope)?;
+            // **A grouping key needs an equality operator class**, and it is the same list
+            // `count(DISTINCT x)` reads three functions down: `GROUP BY j` over a `json` column is
+            // `42883 could not identify an equality operator for type json` on a real server,
+            // measured, and grouping it here from `pg_cmp`'s text comparison answered where a real
+            // server raises. A `jsonb` is deliberately not on the list — it has a btree opclass
+            // and groups fine there.
+            if !crate::value::has_equality_operator(ty) {
+                return Err(SqlError::NoEqualityOperator(ty.name()));
+            }
+            key_types.push(ty);
             keys.push(resolved);
         }
 
@@ -935,19 +950,12 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
     // `42883 could not identify an equality operator for type lseg` on a real server while
     // `'…'::lseg = '…'::lseg` is `t` — and without this the count was answered from `pg_cmp`'s
     // text comparison, a number where PostgreSQL raises, which ADR 0031 ranks worst.
+    // **The array gets its *own* name in the message**: `count(DISTINCT x)` over an `xml[]` is
+    // `could not identify an equality operator for type xml[]`, not for `xml`. Measured, and the
+    // same for `json[]` and `point[]`, which is why `ty.name()` and not the element's.
     if call.distinct
         && let Some(ty) = arg_type
-        && !esker_keys::row::is_index_key(ty)
-        && matches!(
-            ty,
-            ColumnType::Lseg
-                | ColumnType::Box
-                | ColumnType::Path
-                | ColumnType::Polygon
-                | ColumnType::Circle
-                | ColumnType::Line
-                | ColumnType::Point
-        )
+        && !crate::value::has_equality_operator(ty)
     {
         return Err(SqlError::NoEqualityOperator(ty.name()));
     }

@@ -80,6 +80,46 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         .collect())
 }
 
+/// The columns of `information_schema.domains`, in the standard's order.
+///
+/// **No `domain_catalog`**, for the reason [`TABLES_COLUMNS`] gives about `table_catalog`: this
+/// node has no database name to report and a constant would be a value nobody measured. What is
+/// left is what the capture reads — a domain described the way a column of its base type would be.
+pub const DOMAINS_COLUMNS: &[(&str, ColumnType)] = &[
+    ("domain_schema", ColumnType::Text),
+    ("domain_name", ColumnType::Text),
+    ("data_type", ColumnType::Text),
+    ("numeric_precision", ColumnType::Int4),
+    ("numeric_scale", ColumnType::Int4),
+];
+
+/// Every `information_schema.domains` row: one per domain, and nothing else.
+///
+/// `data_type` is the **base** type's standard name and not the domain's — measured, a
+/// `custom_money` over `numeric(8,2)` reports `numeric`, with the precision and scale beside it.
+/// The domain's own name is `domain_name`, which is the column that tells them apart (ADR 0065).
+pub fn domains(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let mut rows = Vec::new();
+    for def in super::user_types(txn, tenant)? {
+        let super::TypeKind::Domain { base, typmod, .. } = def.kind else {
+            continue;
+        };
+        let (schema, name) = super::split_qualified(&def.name);
+        let (precision, scale) = match value::numeric::precision_and_scale(typmod) {
+            Some((precision, scale)) => (Datum::Int4(precision), Datum::Int4(scale)),
+            None => (Datum::Null, Datum::Null),
+        };
+        rows.push(vec![
+            Datum::Text(schema.to_owned()),
+            Datum::Text(name.to_owned()),
+            Datum::Text(value::PgType::name(base).to_owned()),
+            precision,
+            scale,
+        ]);
+    }
+    Ok(rows)
+}
+
 /// The columns of `information_schema.views`, in the standard's order.
 pub const VIEWS_COLUMNS: &[(&str, ColumnType)] = &[
     ("table_schema", ColumnType::Text),
@@ -156,6 +196,16 @@ pub fn views(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 /// Every `information_schema.columns` row: one per column of a table, in declaration order.
 pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
+    // One read for the whole view rather than a lookup per column, the trade `Relations` already
+    // makes for user types: a schema dump asks this of every column of every table.
+    let domains: std::collections::BTreeMap<u64, String> = super::user_types(txn, tenant)?
+        .into_iter()
+        .filter(|def| matches!(def.kind, super::TypeKind::Domain { .. }))
+        .map(|def| {
+            let (_, bare) = super::split_qualified(&def.name);
+            (def.oid, bare.to_owned())
+        })
+        .collect();
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
         let Some(table) = relations.table(relation) else {
@@ -184,10 +234,17 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 // user-defined type is the literal string `USER-DEFINED`, whatever the type is and
                 // whatever it is stored as: measured, and it is what `timestamp_test.rb:202`
                 // asserts by name, beside a `udt_name` of the type itself.
-                Datum::Text(match column.user_type {
-                    Some(_) => USER_DEFINED.to_owned(),
-                    None => data_type(column.ty),
-                }),
+                // **A domain is the exception**: it reports its *base* type here, not
+                // `USER-DEFINED` — measured, a `custom_money` column over `numeric(8,2)` says
+                // `numeric`, and `domain_name` is the only column that names the domain. That is
+                // what makes `ActiveRecord` read the column as a `:decimal` while its `sql_type`
+                // stays `custom_money` (ADR 0065).
+                Datum::Text(
+                    match column.user_type.filter(|oid| !domains.contains_key(oid)) {
+                        Some(_) => USER_DEFINED.to_owned(),
+                        None => data_type(column.ty),
+                    },
+                ),
                 length_of(column),
                 numeric_precision(column.ty),
                 numeric_scale(column.ty),
@@ -198,6 +255,9 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 Datum::Text(
                     column
                         .user_type
+                        // A domain's `udt_name` is its base type's too, for the same reason
+                        // `data_type` above is: the domain's own name lives in `domain_name`.
+                        .filter(|oid| !domains.contains_key(oid))
                         .and_then(|oid| table.enums.get(&oid))
                         .map_or_else(
                             || super::pg_catalog::typname(column.ty).to_owned(),
@@ -234,6 +294,13 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 // column: one `pg_attrdef` row, and the two views disagree about what it is.
                 match &column.generated {
                     Some(expr) => Datum::Text(expr.clone()),
+                    None => Datum::Null,
+                },
+                // The domain the column was declared as. A column of an **enum** or a **range**
+                // also carries a `user_type`, and neither is a domain — so the kind is checked
+                // rather than the presence of an oid.
+                match column.user_type.and_then(|oid| domains.get(&oid)) {
+                    Some(name) => Datum::Text(name.clone()),
                     None => Datum::Null,
                 },
             ]);
@@ -453,6 +520,11 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     // **Last**, the rule `pg_type`'s columns follow: `SELECT *` expands in declared order, so a
     // column added anywhere else moves every one after it.
     ("generation_expression", ColumnType::Text),
+    // **Last again**, same rule. The **domain** a column was declared as, and NULL for a column
+    // declared as an ordinary type (ADR 0065). This is the one column that tells the two apart
+    // here: `data_type` and `udt_name` both report the *base* type — measured, a `custom_money`
+    // column over `numeric(8,2)` says `numeric` for both and `dm_money` only here.
+    ("domain_name", ColumnType::Text),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.

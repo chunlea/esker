@@ -841,6 +841,27 @@ pub enum TypeKind {
         /// because of the alphabet.
         labels: Vec<String>,
     },
+    /// `CREATE DOMAIN d AS <type> [DEFAULT e] [NOT NULL] [CHECK (VALUE …)]`.
+    ///
+    /// **A domain is a name over a base type, not a representation of its own**: a column declared
+    /// as one stores exactly what the base type stores, and what the domain adds is a name the
+    /// catalog reports and the constraints every value is checked against. Measured — a
+    /// `custom_money` column over `numeric(8,2)` overflows with `numeric field overflow` naming
+    /// precision 8 scale 2, which is the base type's error and not the domain's.
+    Domain {
+        /// What the values physically are.
+        base: ColumnType,
+        /// The base type's `atttypmod`, so `numeric(8,2)` keeps its precision and scale.
+        typmod: i32,
+        /// `NOT NULL` on the **domain**, which every column of it inherits. A NULL is `23502`
+        /// naming the domain rather than the column.
+        not_null: bool,
+        /// `DEFAULT`, as text — the expression `pg_type.typdefault` prints back.
+        default: Option<String>,
+        /// `CHECK (VALUE …)`, as text. `VALUE` is the value being stored, and the constraint's
+        /// name in the `23514` is `<domain>_check` where none was given.
+        check: Option<String>,
+    },
 }
 
 impl TypeKind {
@@ -851,6 +872,7 @@ impl TypeKind {
             TypeKind::Range { .. } => "r",
             TypeKind::Composite { .. } => "c",
             TypeKind::Enum { .. } => "e",
+            TypeKind::Domain { .. } => "d",
         }
     }
 
@@ -863,6 +885,10 @@ impl TypeKind {
             TypeKind::Range { .. } => "R",
             TypeKind::Composite { .. } => "C",
             TypeKind::Enum { .. } => "E",
+            // **A domain's category is its base type's**, not one of its own: PostgreSQL puts a
+            // domain in the category of what it is a domain over, which is what makes a client's
+            // `typcategory` filter find it beside the type it stands for.
+            TypeKind::Domain { base, .. } => pg_catalog::typcategory(*base),
         }
     }
 }
@@ -3923,7 +3949,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1f",               // catalog format version
+                "20",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -4016,7 +4042,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1f",       // catalog format version
+                "20",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4098,7 +4124,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1f",                 // catalog format version
+                "20",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5415,7 +5441,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1f",               // catalog format version
+                "20",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

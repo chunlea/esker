@@ -263,10 +263,18 @@ fn declared_columns(
             return Err(SqlError::DuplicateColumn(column.name.clone()));
         }
         let (ty, user_type) = resolve_user_type(txn, executor, column)?;
+        // **A domain carries its base type's modifier**, and the column takes it: `custom_money`
+        // is `numeric(8,2)`, so a column of it overflows at precision 8 scale 2 — measured, and
+        // the error names those numbers, which is the base type's error and not the domain's.
+        let domain = domain_of(txn, executor, user_type)?;
+        let typmod = match &domain {
+            Some(catalog::TypeKind::Domain { typmod, .. }) => *typmod,
+            _ => column.typmod,
+        };
         let mut kept = ColumnDef {
             name: column.name.clone(),
             ty,
-            typmod: column.typmod,
+            typmod,
             default_expr: column.default_expr.clone(),
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
             // rule and also ours by necessity: a NULL cannot be part of a row key.
@@ -282,6 +290,20 @@ fn declared_columns(
             dropped: false,
             user_type,
         };
+        // **A domain's `DEFAULT` fills a column that declares none**, and a column's own default
+        // wins where it has one — measured, `INSERT … DEFAULT VALUES` into a column of
+        // `dm_pos DEFAULT 1` stores 1 (ADR 0065). It is set as an *expression* rather than a
+        // value, so it goes through the same folding a written `DEFAULT` does and cannot be a
+        // second reading of the same text.
+        if let Some(catalog::TypeKind::Domain {
+            default: Some(text),
+            ..
+        }) = &domain
+            && kept.default_expr.is_none()
+            && kept.default.is_none()
+        {
+            kept.default_expr = Some(text.clone());
+        }
         // **The default is folded again once the type is known**, which is the only moment it
         // can be: lowering read it against `crate::plan::Column::ty`, a placeholder for a column
         // declared as a user-defined type.
@@ -293,6 +315,20 @@ fn declared_columns(
         columns.push(kept);
     }
     Ok(columns)
+}
+
+/// The `TypeKind` of a column's user type when it is a **domain**, and `None` otherwise.
+fn domain_of(
+    txn: &dyn Txn,
+    executor: &Executor,
+    user_type: Option<u64>,
+) -> Result<Option<catalog::TypeKind>> {
+    let Some(oid) = user_type else {
+        return Ok(None);
+    };
+    Ok(type_by_oid(txn, executor, oid)?
+        .map(|def| def.kind)
+        .filter(|kind| matches!(kind, catalog::TypeKind::Domain { .. })))
 }
 
 /// One user-defined type by oid, for the places that hold an oid rather than a name.
@@ -351,6 +387,13 @@ fn resolve_user_type(
                 subtype.name()
             ))),
         },
+        // **A domain's value is its base type's**, which is the whole of what a domain is
+        // ([ADR 0065](../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)):
+        // nothing below this line can tell a `custom_money` column from the `numeric(8,2)` it
+        // stands for, and the catalog is where the name comes back. Measured — a value too wide
+        // for one reports `numeric field overflow` naming precision 8 scale 2, the **base type's**
+        // error and not the domain's.
+        catalog::TypeKind::Domain { base, .. } => Ok((base, Some(def.oid))),
         catalog::TypeKind::Composite { .. } => Err(SqlError::unsupported(format!(
             "a column of the composite type {name}"
         ))),
@@ -447,6 +490,9 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef) -> Result<()> {
             | ColumnType::Polygon
             | ColumnType::Circle
             | ColumnType::Line
+            // **And `xml`**, measured: `data type xml has no default operator class for access
+            // method "btree"`, the same `42704` with the same HINT.
+            | ColumnType::Xml
     ) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
     }
