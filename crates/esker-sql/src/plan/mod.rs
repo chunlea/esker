@@ -31,13 +31,14 @@ mod time_machine;
 pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
-    AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, Column, ColumnDefault,
-    Comment, CommentObject, CreateDatabase, CreateExtension, CreateFunction, CreateIndex,
-    CreateMaterializedView, CreateSchema, CreateSequence, CreateTable, CreateTrigger, CreateType,
-    CreateView, DropDatabase, DropExtension, DropFunction, DropIndex, DropMaterializedView,
-    DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
-    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
-    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
+    AddValuePosition, AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, AlterType,
+    AlterTypeAction, Column, ColumnDefault, Comment, CommentObject, CreateDatabase,
+    CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateSchema,
+    CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
+    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropSchema, DropSequence,
+    DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName,
+    PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint, foreign_key_name,
+    index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
@@ -134,6 +135,8 @@ pub enum Statement {
     Comment(Comment),
     /// `CREATE TYPE`.
     CreateType(CreateType),
+    /// `ALTER TYPE` — rename the type, add a label, or rename a label.
+    AlterType(AlterType),
     /// `DROP TYPE`.
     DropType(DropType),
     /// `ALTER TABLE`, of which only `ADD COLUMN` is executed.
@@ -240,6 +243,9 @@ impl Statement {
             // A catalog write like the rest: it rewrites the table record the comment lives in.
             Statement::Comment(_) => Some("COMMENT"),
             Statement::CreateType(_) => Some("CREATE TYPE"),
+            // **`ADD VALUE` may rewrite rows** — a label inserted mid-list moves the ordinal every
+            // later one is stored as — so this is a write, not only a catalog change.
+            Statement::AlterType(_) => Some("ALTER TYPE"),
             Statement::DropType(_) => Some("DROP TYPE"),
             Statement::DropSequence(_) => Some("DROP SEQUENCE"),
             Statement::CreateSequence(_) => Some("CREATE SEQUENCE"),
@@ -303,6 +309,7 @@ impl Statement {
             // `psql` prints back and a script may branch on.
             Statement::Comment(_) => "COMMENT",
             Statement::CreateType(_) => "CREATE TYPE",
+            Statement::AlterType(_) => "ALTER TYPE",
             Statement::DropType(_) => "DROP TYPE",
             Statement::DropSequence(_) => "DROP SEQUENCE",
             Statement::CreateSequence(_) => "CREATE SEQUENCE",
