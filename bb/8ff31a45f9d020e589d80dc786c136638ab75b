@@ -1,0 +1,14 @@
+crates/esker-engine/src/memtable.rs
+  h_44076b318daf9c 611-619,625,640,663-667
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bb8ff31a45f9d020e589d80dc786c136638ab75b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
