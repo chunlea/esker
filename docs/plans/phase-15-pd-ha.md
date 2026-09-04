@@ -341,7 +341,49 @@ check can fill in because only `Pd` holds the member list; and a new test drives
 service's check had no coverage at all. The same mutation now turns three tests red, each naming
 what it lost.
 
-### 9.2 Changes against §3 and §5, and why
+### 9.2 What the generator found
+
+`tests/tso_window.rs` drives the oracle under `proptest`: an adversary picks the counts, picks the
+clock — including a thousand years behind — decides when a mark **commits** and when it does not,
+and fails the member over at will. A failover is modelled as what it is, a fresh `Oracle` loaded
+from the *committed* mark.
+
+Its first run failed, and on a claim this plan had made rather than on the code. The test asserted
+that a failed commit leaves the oracle untouched — which is the **allocator's** guarantee, copied
+onto the oracle by hand. The oracle does not make it: it moves its physical part before it asks,
+so a commit that fails leaves a run of skipped timestamps behind. That is harmless and
+`crate::tso` already says so — skipping costs nothing, and a timestamp is only ever required to be
+ordered. What would be fatal is the **mark** moving without a commit, because a new leader resumes
+at the committed mark and a member believing in an uncommitted one would hand out timestamps its
+successor hands out again. So the assertion is now that, and the difference is written beside it.
+
+The second test in that file is there because a green generator proves nothing if it never reaches
+the case: it drives a resume with the clock *behind* the mark by hand, which is the only situation
+in which `Oracle::load`'s `max` does any work at all.
+
+### 9.3 Owed, and what each is worth
+
+Named rather than quietly dropped. None of them is load-bearing for the units above; all of them
+would add coverage the current tests do not.
+
+- **A three-process kill test.** `tests/crash_kill.rs` now drives PD through the Raft log and
+  still passes, so the *ordering* is tested against a real signal — but against a group of one.
+  Killing the **leader of three** means three processes and a parent that can tell which of them
+  was leading; it is the largest of these and the one with the most to find.
+- **A deterministic `esker-sim` scenario.** `tests/failover.rs` drops messages by cutting a member
+  off, which is a partition rather than a lossy link. A sim scenario would reorder and duplicate as
+  well, over seeds.
+- **A `stateright` model of leader change crossed with the window.** The state space is the
+  product of Raft's and a 64-bit counter's, so it needs the counter abstracted to "before, inside,
+  after the mark" before it is finite enough to check. Worth doing, and it is a design exercise
+  rather than a transcription.
+- **The heartbeat round trip, measured.** §8.3 prices it as ~100 round trips a second at a thousand
+  regions and says the fix is batching if the number says so. `docs/bench/phase-4-pd.md` has the
+  4a baseline for `tso` and `allocid` to compare against; nothing has been re-measured.
+- **The real transport, end to end.** `PdRaft` has goldens and `transport.rs` has unit tests for
+  its dropping rules, but no test sends a batch over a socket between two placement drivers.
+
+### 9.4 Changes against §3 and §5, and why
 
 - **The wire addition moved from unit 2 into unit 1** (above).
 - **Snapshot and compaction were built in unit 1, not left for unit 2.** `Ready`'s snapshot arm

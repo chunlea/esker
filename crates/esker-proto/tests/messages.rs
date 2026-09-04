@@ -108,17 +108,14 @@ fn columnar_wishes() -> Vec<ColumnarWish> {
     ]
 }
 
-fn golden_pd_requests() -> Vec<(&'static str, Request)> {
+/// The two `Pd::Raft` goldens, apart from the rest.
+///
+/// Not to satisfy a line count: these are the only PD requests sent **between two placement
+/// drivers** rather than by a client to one, they carry no cluster id that means anything, and
+/// their payload is `esker-raft`'s codec rather than this crate's. Reading them beside a
+/// heartbeat would suggest they are the same kind of thing.
+fn golden_pd_raft_requests() -> Vec<(&'static str, Request)> {
     vec![
-        (
-            "pd-report-columnar",
-            Request::Pd {
-                cluster_id: PD_CLUSTER,
-                request: PdReq::ReportColumnar {
-                    wishes: columnar_wishes(),
-                },
-            },
-        ),
         (
             "pd-raft",
             Request::Pd {
@@ -143,24 +140,16 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 request: PdReq::Raft(PdRaftBatch::new(PD_GROUP, 2, Vec::new())),
             },
         ),
-        (
-            "pd-members",
-            Request::Pd {
-                cluster_id: PD_CLUSTER,
-                request: PdReq::Members,
-            },
-        ),
-        (
-            "pd-bootstrap",
-            Request::Pd {
-                // Zero: the caller does not know the cluster id yet, which is the whole
-                // reason it is asking.
-                cluster_id: 0,
-                request: PdReq::Bootstrap {
-                    store: StoreInfo::new(1, "127.0.0.1:20160"),
-                },
-            },
-        ),
+    ]
+}
+
+/// The two heartbeats, apart from the rest.
+///
+/// Their field sets are a **cross-lane contract** — exactly the ones `docs/plans/phase-4.md` §3.2
+/// pins for the store's `PdClient` (ADR 0011) — so they are worth reading as a pair rather than
+/// scattered among the methods a client calls.
+fn golden_pd_heartbeat_requests() -> Vec<(&'static str, Request)> {
+    vec![
         (
             "pd-store-heartbeat",
             Request::Pd {
@@ -185,6 +174,40 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                     term: 4,
                     approximate_size: 1 << 20,
                     applied_index: 77,
+                },
+            },
+        ),
+    ]
+}
+
+fn golden_pd_requests() -> Vec<(&'static str, Request)> {
+    let mut requests = golden_pd_raft_requests();
+    requests.extend(golden_pd_heartbeat_requests());
+    requests.extend(vec![
+        (
+            "pd-report-columnar",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::ReportColumnar {
+                    wishes: columnar_wishes(),
+                },
+            },
+        ),
+        (
+            "pd-members",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Members,
+            },
+        ),
+        (
+            "pd-bootstrap",
+            Request::Pd {
+                // Zero: the caller does not know the cluster id yet, which is the whole
+                // reason it is asking.
+                cluster_id: 0,
+                request: PdReq::Bootstrap {
+                    store: StoreInfo::new(1, "127.0.0.1:20160"),
                 },
             },
         ),
@@ -235,7 +258,8 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 },
             },
         ),
-    ]
+    ]);
+    requests
 }
 
 #[allow(clippy::too_many_lines)]

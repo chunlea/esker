@@ -34,6 +34,8 @@
 //! the driver threads rather than driving them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// One `as usize` on a compile-time constant that is 20, in a test.
+#![allow(clippy::cast_possible_truncation)]
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -43,6 +45,10 @@ use esker_pd::member::{MemberList, PdMember};
 use esker_pd::{Clock, Pd, PdError, PdOptions};
 use esker_proto::pd::PdRaftBatch;
 use esker_raft::{Message, NodeId};
+
+/// One election timeout, in rounds of this harness. `esker-raft` counts in `u64`; everything here
+/// counts loop iterations.
+const ELECTION_TIMEOUT: usize = esker_raft::ELECTION_TIMEOUT_MAX_TICKS as usize;
 
 /// Ticks the group is driven for before an election is called failed.
 ///
@@ -176,7 +182,7 @@ impl Group {
     }
 
     fn at(&self, id: NodeId) -> &Arc<Pd> {
-        &self.pds[(id - 1) as usize]
+        &self.pds[slot(id)]
     }
 
     /// Waits until every member has driven everything it has been given.
@@ -264,7 +270,7 @@ impl Group {
     /// inside a reservation, its oracle's logical counter, its in-flight operators — and keeps only
     /// what it had applied.
     fn restart(&mut self, id: NodeId) {
-        let at = (id - 1) as usize;
+        let at = slot(id);
         // Dropped first, so its driver thread is joined and its database closed before the
         // replacement opens the same files.
         self.pds[at] = open(
@@ -276,6 +282,11 @@ impl Group {
         );
         self.wire.join(id, &self.pds[at]);
     }
+}
+
+/// Where member `id` sits in the group's parallel arrays. Ids run from one and there are three.
+fn slot(id: NodeId) -> usize {
+    usize::try_from(id).expect("a member id fits a usize") - 1
 }
 
 fn open(
@@ -634,7 +645,7 @@ fn a_deposed_leader_cannot_cross_its_own_mark() {
     // makes this a test rather than a hang — in a running placement driver the request sits on a
     // blocking thread while the ticks that end it arrive on the reactor.
     let deposed = Arc::clone(group.at(leader));
-    let clock = Arc::clone(&group.clocks[(leader - 1) as usize]);
+    let clock = Arc::clone(&group.clocks[slot(leader)]);
     let asking = std::thread::spawn(move || {
         clock.set(1_700_000_000_000 + esker_pd::TSO_SAVE_INTERVAL_MS + 1);
         deposed.tso(1)
@@ -720,7 +731,7 @@ fn the_survivors_serve_within_one_election_timeout() {
     // rather than impossible. Past four the group is churning, not electing, which is a different
     // failure and worth catching.
     assert!(
-        rounds <= 4 * esker_raft::ELECTION_TIMEOUT_MAX_TICKS as usize,
+        rounds <= 4 * ELECTION_TIMEOUT,
         "the survivors took {rounds} ticks, more than four election timeouts"
     );
     // And they serve the cluster the dead leader created, not a new one.
@@ -789,7 +800,7 @@ fn a_returning_leader_hands_out_nothing_its_successor_already_did() {
 
     // And back it comes.
     group.wire.restore(first);
-    for _ in 0..(2 * esker_raft::ELECTION_TIMEOUT_MAX_TICKS as usize) {
+    for _ in 0..(2 * ELECTION_TIMEOUT) {
         group.round();
     }
     assert!(

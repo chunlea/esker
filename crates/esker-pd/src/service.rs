@@ -164,27 +164,38 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
         return Err(pd.not_leading().into());
     }
 
-    // The cluster check, in one place. `Bootstrap` may carry zero — asking is how a caller
-    // learns the id — but a caller that *does* name a cluster is checked even there, so a store
-    // that already belongs to one cannot bootstrap a second cluster on a wiped PD by accident.
+    // The cluster check, in one place, and three methods are exempt for three different reasons.
     //
-    // `Status` is exempt for a different reason: it is a question about **this process**, not
-    // about a cluster. A PD that has not been bootstrapped is exactly when an operator most wants
-    // to ask, and refusing with "the cluster is not bootstrapped" would answer a question nobody
-    // asked. It reads no cluster-scoped state, so there is nothing for the check to protect.
-    match request {
-        PdReq::Bootstrap { .. } if cluster_id == 0 => {}
-        PdReq::Status => {}
-        // Configuration and this member's own belief, neither of which is cluster-scoped — and a
-        // group that has not bootstrapped is exactly when an operator wants to see it.
-        PdReq::Members => {}
-        // Not cluster-checked, because a placement-driver group elects a leader *before*
-        // `Bootstrap` has minted a cluster id at all. The group id it carries is the guard, and it
-        // rules out the same mistake one layer down ([`crate::member`]).
-        PdReq::Raft(_) => {}
-        _ => pd.check_cluster(cluster_id)?,
+    // `Bootstrap` may carry **zero** — asking is how a caller learns the id — but a caller that
+    // *does* name a cluster is checked even there, so a store that already belongs to one cannot
+    // bootstrap a second on a wiped placement driver by accident.
+    //
+    // `Status` and `Members` are questions about **this process** rather than about a cluster: what
+    // it is doing right now, and who is in its group. A placement driver nothing has bootstrapped
+    // is exactly when an operator most wants to ask either, and neither reads cluster-scoped state,
+    // so there is nothing for the check to protect.
+    //
+    // `Raft` cannot be checked at all: a group elects a leader *before* `Bootstrap` — itself a log
+    // entry — has minted a cluster id. Its guard is the group id it carries, checked inside
+    // `Pd::step_raft`, which rules out the same misconfiguration one layer down
+    // ([`crate::member`]).
+    let exempt = match request {
+        PdReq::Bootstrap { .. } => cluster_id == 0,
+        PdReq::Status | PdReq::Members | PdReq::Raft(_) => true,
+        _ => false,
+    };
+    if !exempt {
+        pd.check_cluster(cluster_id)?;
     }
 
+    dispatch(pd, request)
+}
+
+/// The method itself, once the two checks above have let it through.
+///
+/// Split from them so that the checks are the whole of what `serve` does: a method added to this
+/// match cannot skip a check it never sees.
+fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
     Ok(match request {
         PdReq::Bootstrap { store } => {
             let done = pd.bootstrap(store.store_id, &store.address)?;

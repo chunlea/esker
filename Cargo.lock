@@ -412,6 +412,7 @@ dependencies = [
  "esker-proto",
  "esker-raft",
  "esker-sim",
+ "proptest",
  "tempfile",
  "thiserror",
  "tokio",

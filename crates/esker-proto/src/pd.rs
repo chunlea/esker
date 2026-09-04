@@ -944,7 +944,7 @@ impl PdResp {
                 out.put_varint(*cluster_id);
                 encode_opt_region(region.as_ref(), out);
             }
-            Self::StoreHeartbeat | Self::ReportColumnar => {}
+            Self::StoreHeartbeat | Self::ReportColumnar | Self::Raft => {}
             Self::RegionHeartbeat { operator } => match operator {
                 Some(operator) => {
                     out.put_bool(true);
@@ -988,7 +988,6 @@ impl PdResp {
                     status.encode(out);
                 }
             }
-            Self::Raft => {}
             Self::Members(membership) => {
                 out.put_u64(membership.group_id);
                 out.put_varint(membership.this_id);

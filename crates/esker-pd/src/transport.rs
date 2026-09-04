@@ -8,7 +8,7 @@
 //!
 //! # Fire and forget, and why that is not a compromise
 //!
-//! [`PdTransport::send`](crate::driver::PdTransport::send) is infallible by design. Raft already
+//! [`crate::driver::PdTransport::send`] is infallible by design. Raft already
 //! retries everything it sends, so a lost message is indistinguishable from a slow one, and a
 //! transport that reported failures would hand the driver a decision it has no better answer to
 //! than "send it again next tick". Every failure here is therefore a dropped message and a log

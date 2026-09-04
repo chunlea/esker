@@ -392,6 +392,45 @@ async fn shutdown_signal() {
     }
 }
 
+/// Prints the durable half of consensus, and only that.
+///
+/// Who leads *now* is a live fact that dies with the process, and `esker pd members` is what asks
+/// a running group for it. What a stopped member left behind is what it would resume from: the
+/// term it reached, the vote it cast in it, and how far it committed and applied.
+fn print_raft(pd: &PdInspector, out: &mut impl std::io::Write) -> Result<(), String> {
+    let write = |error: std::io::Error| format!("writing: {error}");
+    let Some(raft) = pd.raft() else {
+        return writeln!(out, "raft           (no consensus state on disk)").map_err(write);
+    };
+    writeln!(
+        out,
+        "raft           term {}  voted {}  commit {}  applied {}  log begins after {}",
+        raft.hard_state.term,
+        raft.hard_state
+            .voted_for
+            .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+        raft.hard_state.commit,
+        raft.applied_index,
+        raft.truncated_index,
+    )
+    .map_err(write)?;
+    writeln!(
+        out,
+        "members        {}",
+        if raft.conf_state.voters.is_empty() {
+            "(none recorded)".to_owned()
+        } else {
+            raft.conf_state
+                .voters
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )
+    .map_err(write)
+}
+
 /// Prints what PD has asked the cluster to do.
 ///
 /// The in-flight set is memory and is gone with the process
@@ -455,40 +494,7 @@ pub(crate) fn inspect(
         pd.allocated_end().map_err(|error| error.to_string())?
     )
     .map_err(write)?;
-    // The durable half of consensus, and only that. Who leads *now* is a live fact that dies with
-    // the process, and `esker pd members` is what asks a running group for it.
-    match pd.raft() {
-        Some(raft) => {
-            writeln!(
-                out,
-                "raft           term {}  voted {}  commit {}  applied {}  log begins after {}",
-                raft.hard_state.term,
-                raft.hard_state
-                    .voted_for
-                    .map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                raft.hard_state.commit,
-                raft.applied_index,
-                raft.truncated_index,
-            )
-            .map_err(write)?;
-            writeln!(
-                out,
-                "members        {}",
-                if raft.conf_state.voters.is_empty() {
-                    "(none recorded)".to_owned()
-                } else {
-                    raft.conf_state
-                        .voters
-                        .iter()
-                        .map(u64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            )
-            .map_err(write)?;
-        }
-        None => writeln!(out, "raft           (no consensus state on disk)").map_err(write)?,
-    }
+    print_raft(&pd, out)?;
 
     let stores = pd.stores().map_err(|error| error.to_string())?;
     writeln!(out, "\nstores ({})", stores.len()).map_err(write)?;
