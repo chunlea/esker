@@ -375,3 +375,156 @@ Six of the seven sightings were found by running the test at four loads and read
 one was found by reading a sample — and it is the case where the curve would have said least,
 because the failure is not slower under load, it is *silent* under load. The discriminator was that
 the runtime was **idle**: a test that is waiting on a cluster has a runtime with something to do.
+
+## 10. What the seven were, and the rule that found six of them
+
+Seven tests were handed to this lane as one family — "fails only under load". They were not one
+family. Two were product defects a quiet machine hid, five were test defects, one record was stale
+before it was written, and one is still unreproduced.
+
+| # | sighting | what it turned out to be | where |
+|---|---|---|---|
+| 1 | `cli::cluster_start` a driver that cannot listen | **two product defects**: a readiness check that could not tell the driver from a squatter, and an announcement gated on `sleep(250 ms)` + "has anybody died yet" | `58ed28af`, `2a82232e` |
+| 2 | `store::sim_sweep` the sweep reclaims on evidence | **three test defects**; the store was obeying ADR 0034 and the test blamed it | `ea1135fb` |
+| 3 | `store::promotion` a learner becomes a voter under load | **one test defect** — success was gated on the *load generator* finishing — and **one race still open** | `3e436086` |
+| 4 | `client::crash_through_the_client` | **not a sighting**: fixed at HEAD three hours before the register that listed it as open (`46166886`) | — |
+| 5 | `store::snapshot` a snapshot replacing a held region | a race, and **h1's**, not this lane's | h1 |
+| 6 | `sql::real_backend` a scan reads every row | **unreproduced** in 44 runs across four load models; blocked on a capture, not on a reproduction | — |
+| 7 | `cli::cluster_chaos` a SIGKILLed leader | **a test defect**: a panic inside `thread::scope`, which joins while unwinding | `d3698dca` |
+
+Two product defects, five test defects, one stale record, one unreproduced. Beside them, debt #7
+`sql::join_cost` was diagnosed and left to its owner (§7), debt #3 turned out to owe an ADR rather
+than code (§4, ADR 0068), and debt #8's Miri gate was three lines (§3).
+
+**The thing worth carrying out of the wave is that "load-sensitive" was the wrong category.** Not one
+of the seven was fixed by changing a budget, and only one — promotion's remaining arm — is even
+plausibly about speed. What load did was expose a wrong assumption that a quiet machine kept true.
+
+### The standing rule: run it at four loads and read the curve
+
+Before touching a test that fails only under load, run it at **idle / 14 / 40 / 80 busy threads**
+and read the shape. The shape names the fault, and it named six of these seven:
+
+| curve | what it means | seen in |
+|---|---|---|
+| rises monotonically | genuinely slower; the budget may be the honest fix | none of the seven |
+| flat, then a **cliff** | a state change, not a slowdown — something stops happening | 1, `0.38 / 0.31 / 0.32 / 60.05 FAILED` |
+| **fails faster than it passes** | a wrong verdict, not a slow test | 2, `12.0 s FAILED` against `15.7 s` passing |
+| **up, then down** | a race; more load is not more failure | 3, `3.9 / 188.5 / 75.8 / 202.6`; and #7's `join_cost`, green at 0, red at 14, green at 40 and 80 |
+| rises steeply, never fails | not reproduced; stop and fix the capture instead | 6, `0.88 / 3.71 / 5.25 / 36.2 s`, 44 runs, 0 failures |
+| no curve at all — it hangs | the curve says least here; look at whether the runtime is **idle** | 7 |
+
+Sighting 7 is the exception that sharpens the rule. It is not slower under load, it is *silent*
+under load, and a curve would only have recorded a timeout. What found it was a sample: every
+thread in `futex_wait` with the tokio runtime **idle in `epoll_pwait`** — a test genuinely waiting
+on a cluster has a runtime with something to do. So the rule has a second half: **when a test hangs
+rather than fails, sample it before running it again**, and read whether anything is waiting on I/O.
+
+### Three habits this wave paid for, and one it corrected
+
+* **Verify the record.** Two of the four register rows this lane owned were closed before the
+  register was written, though it opens by claiming every row was verified against the tree. A debt
+  record is a hypothesis (§4).
+* **Show it red.** Every fix here has a red arm, and three of them were made deterministic rather
+  than load-dependent — a degenerate case table at base 0, a convergence budget of 1 ms, a range
+  mapping that ignores its end bound. A red that needs eighty busy threads is a red that will not be
+  re-run.
+* **Watch the test that passes too easily.** `the_wait_ends_when_the_port_answers` *asserted* the
+  defect in sighting 1; `an older membership than this store's` had never once put an older record
+  in front of the sweep in sighting 2. Both were green for years.
+* **And read the exit code from the checker.** Three handovers in this wave reported `fmt ✅`
+  through `cargo fmt --all --check | tail -3 && echo OK`, which reports `tail`'s status. The gate's
+  first step was red and every lane was calling it green.
+
+## 11. `TxnKv::ReclaimRange`, written out so the commit is mechanical
+
+ADR 0069's one wire message, sketched against the tree at `1228cf11` so that whoever applies it
+after the ruling is transcribing rather than designing. `esker-proto` is the coordinator's to
+sequence; **nothing below is applied.**
+
+### The shape
+
+```rust
+// crates/esker-proto/src/txn.rs — TxnKvReq
+/// Reclaim the storage under a user-key range whose owner has been dropped
+/// ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+///
+/// **Not a delete.** Nothing routes into a dropped tenant's key space, so this does not resolve
+/// versions or take locks — it clears the range physically, which is only sound below the
+/// safepoint. A store refuses until its own safepoint has reached `below_ts`.
+ReclaimRange {
+    /// Inclusive lower bound, a **user** key.
+    start: Bytes,
+    /// Exclusive upper bound. Empty means the end of the key space.
+    end: Bytes,
+    /// The commit timestamp of the drop this reclaim belongs to.
+    below_ts: u64,
+},
+
+// TxnKvResp
+ReclaimRange {
+    /// How far the store got: the caller resumes from here rather than restarting.
+    /// Equal to the request's `start` when the safepoint was too low and nothing was done.
+    cursor: Bytes,
+    /// Whether this store has nothing left of the range.
+    finished: bool,
+    /// The safepoint in force, so a blocked caller can say *why* rather than retry blindly —
+    /// the same courtesy `GcSafepoint` already extends by answering with the safepoint now in
+    /// effect rather than the one that was asked for.
+    safepoint: u64,
+},
+```
+
+### Every place it touches
+
+| file | what | note |
+|---|---|---|
+| `messages.rs` | `TxnReclaimRange = 0x020A` | **`0x0209` is `TxnLatestCommit`** (ADR 0067), so `0x020A` is the next free code. Claim it out loud when taken |
+| `messages.rs` | `Method::is_mutation` | **true.** It deletes data. The test `reads_are_not_mutations_and_everything_else_is` enumerates the mutating methods and must gain it |
+| `txn.rs` header | the `0x02NN` table at the top | it currently stops at `0x0208` and is already missing `0x0209`; add both rows while there |
+| `txn.rs` | `TxnKvReq::routing_key` | **`start`**, like `Scan` — a reclaim is addressed to the range's first region and the store clamps to its own end, exactly as `Command::DeleteRange` already does |
+| `txn.rs` | request `encode`/`decode` | `put_bytes(start)`, `put_bytes(end)`, `put_varint(below_ts)` — length-prefixed, in that order |
+| `txn.rs` | response `encode`/`decode` | `put_bytes(cursor)`, `put_u8(finished as u8)`, `put_varint(safepoint)` |
+| `txn.rs` tests | `every_request_routes_by_a_key`, the method-order test | the order test asserts `0x0201 + index`, so the new variant goes **last** in that list |
+| `server.rs` | the `TxnKvReq` match arms at `:2852` and `:2922` | where `GcSafepoint` is answered; this is where `reclaim::advance` is called |
+| every crate matching on `TxnKvReq`/`TxnKvResp` | — | a new variant breaks matches in crates nobody edited; build the workspace, not the crate |
+
+### Golden rows
+
+`docs/DESIGN.md` §9's framing is unchanged — this is a body, not a frame. The bytes to pin, with
+`start = "d"`, `end = "" `(the end of the key space), `below_ts = 300`:
+
+```text
+request  body   01 64            start:  len 1, 'd'
+                00               end:    len 0  (the end of the key space, not an absent field)
+                AC 02            below_ts: varint 300
+response body   01 66            cursor: len 1, 'f'
+                00               finished: 0
+                AC 02            safepoint: varint 300
+```
+
+The empty `end` is the row worth having: it is a **length-prefixed empty string**, not an omitted
+field, for the same reason `meta.rs` gives about a region's `end_key` — absence and emptiness would
+be the same bytes and one of them means "to the end of the key space".
+
+### What the store side already is
+
+`crate::reclaim::advance` (`564dcc77`) takes the record, the hosted regions and the safepoint and
+returns `Blocked`/`Advanced`/`Finished`. The handler is a translation:
+
+* `Blocked { safepoint, .. }` → `cursor` unchanged, `finished: false`, that `safepoint`;
+* `Advanced { cursor }` → that cursor, `finished: false`;
+* `Finished` → `cursor: end`, `finished: true`.
+
+The record is created on the first request for a range and removed by `advance` when it finishes,
+so the message carries no id and the store needs no session state. A repeated request for a range
+already reclaimed finds no record, creates one, finds no hosted region overlapping it, and answers
+`finished: true` — which is the idempotence the caller needs and costs one pass with no writes.
+
+### The one thing still to decide, which is why this waits on a ruling
+
+Whether a reclaim is **addressed to one region** (routed like any other `TxnKv` request, the caller
+walking the range region by region) or **broadcast to every store** (one call per store, each
+clearing what it hosts). The sketch above is the first: it needs no new routing, reuses the epoch
+check, and makes the caller's loop the same shape as a scan. The second is fewer round trips and
+needs a way to address a store rather than a region, which `TxnKv` does not have today.
