@@ -1,0 +1,14 @@
+docs/bench/skiplist.md
+  h_44076b318daf9c 162,172-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2295f6c291673f1ca26234498fbe1fbc20a4105c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
