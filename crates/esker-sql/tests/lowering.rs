@@ -21,6 +21,9 @@ use esker_sql::plan::{IndexKeyPart, KeyPartName, Statement};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
 
+#[path = "parity_harness/mod.rs"]
+mod parity;
+
 /// Parse and lower. A construct can be refused at either step — some are already named by the
 /// parser's own recognizer (`docs/plans/phase-6a.md` §9) — and contract C2 does not care which,
 /// only that the answer is `0A000` naming the construct.
@@ -140,13 +143,25 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "an aggregate FILTER clause",
         ),
         ("SELECT sum(*) FROM t", "sum(*)"),
-        // `lower`, `upper`, `length`, `octet_length`, `reverse` and `ascii` all run now — the
-        // generated columns the suite declares use four of them. `soundex` is the example that is
-        // still absent, and the property under test is the *naming*, not which one it is.
-        ("SELECT soundex(b) FROM t", "the function soundex"),
     ];
 
     refuses_by_name(&cases);
+}
+
+/// A function name nobody declared is still `0A000` naming it — **one pass later**.
+///
+/// `soundex` used to be refused where the statement was lowered. It is now carried out as a call
+/// the catalog might hold, because lowering cannot tell a name its vocabulary lacks from a user's
+/// `CREATE FUNCTION` — so the refusal moved to `Executor`'s resolve pass, which still runs before
+/// any row is touched, and the sentence is unchanged. This test moved with it rather than being
+/// deleted: what contract C2 promises is the named refusal, not the pass that raises it.
+#[test]
+fn a_function_nobody_declared_is_still_refused_by_name() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE t (a int8, b text)").unwrap();
+    let error = node.run("SELECT soundex(b) FROM t").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(error.to_string(), "the function soundex is not supported");
 }
 
 /// Contract C2 for one statement: it must not lower, the answer must be `0A000`, and the message

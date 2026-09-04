@@ -432,6 +432,32 @@ fn count(error: &Error, tally: &mut Tally) {
 }
 
 /// Kills the leader `kills` times under load, and checks what came out.
+/// Releases the load generators when it is dropped, however the scope is left.
+///
+/// # A panic inside `thread::scope` hangs it instead of failing it
+///
+/// `std::thread::scope` joins every thread it spawned before it returns — **including while a
+/// panic is unwinding through it** — and the drivers below run `while !stop.load(..)`. Setting
+/// that flag only on the way out of a successful kill loop means any failure inside the scope
+/// waits for four threads that will never stop.
+///
+/// That is not hypothetical and it is not cheap. Seen in a gate as a **29-minute hang** with no
+/// message: `time_to_serve` had returned `None`, the panic that says so could not finish
+/// unwinding, `cluster.restart` never ran — which is why the sample showed the killed node gone
+/// and not restarted — and the supervising `cluster start` sat idle beside it. The test exists to
+/// catch a cluster that does not converge after a kill, and that is exactly the case where it
+/// stopped saying so.
+///
+/// Dropped before the scope's own join, because the closure's locals unwind first, so the drivers
+/// are already leaving by the time anything waits for them.
+struct ReleaseDrivers<'a>(&'a AtomicBool);
+
+impl Drop for ReleaseDrivers<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn battery(kills: u32) {
     let mut cluster = Cluster::start();
     let addrs = cluster.addrs();
@@ -451,6 +477,9 @@ fn battery(kills: u32) {
                 scope.spawn(move || drive(at as u64 + 1, addrs, recorder, stop, acked))
             })
             .collect();
+        // Every exit from this scope releases them, not just the successful one. See
+        // `ReleaseDrivers` — without it a failing assertion here is a hang and not a failure.
+        let _release = ReleaseDrivers(&stop);
 
         let mut worst = Duration::ZERO;
         let mut killed = 0;

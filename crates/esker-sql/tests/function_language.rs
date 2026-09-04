@@ -51,27 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              a body an evaluator — a parameter list is only worth reading by something that can \
              use it.",
         ),
-        (
-            "INSERT INTO fl_t (name) VALUES ('a')",
-            "**The default calls a function this node stores and cannot run**, so the row cannot \
-             be written: `0A000` naming the function, at the point of use, which is where a real \
-             server evaluates it.\n\nIt answered `XX000 internal error` until this unit — the \
-             stored-default path treats a text it cannot parse as a broken catalog, which is right \
-             for every other cause and wrong for this one. `XX000` says *this server has a bug* \
-             about a statement a user can write.",
-        ),
-        (
-            "SELECT 'r', fl_gen()::text AS called",
-            "**A stored function is not a callable one.** The body is kept and never run — this \
-             node has no evaluator for a `LANGUAGE SQL` body and none for `plpgsql` either, and \
-             `CREATE TRIGGER` has registered functions it never fires since the trigger unit. So \
-             a call is `0A000` naming the function, which is the same answer it gets for any name \
-             the vocabulary lacks.\n\nMeasured before it was declared: `uuid_test.rb`'s eight \
-             tests define a function and **never call it** — seven of the eight read the schema — \
-             so what the file needs is that the name survive into a column default and out through \
-             the dumper, which it now does. An interpreter for function bodies is its own unit and \
-             this one deliberately is not it.",
-        ),
     ],
 };
 

@@ -2594,6 +2594,11 @@ fn catalog_function(
                     .to_owned(),
             ));
         }
+        CatalogFunc::UserFunc => {
+            return Err(SqlError::Internal(
+                "a call to a user-defined function reached the row evaluator unresolved".to_owned(),
+            ));
+        }
     })
 }
 

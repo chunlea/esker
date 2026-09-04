@@ -321,3 +321,57 @@ caller's timing. Until it exists, `clear_user_range` is reachable in-process onl
 deletes across many transactions, re-driven by the schema-job machinery that already exists. It is
 still `O(keys)` and still leaves the space to GC, but it is bounded, idempotent and crash-safe
 today. If the wire message is not sequenced, that is the answer.
+
+## 9. The seventh sighting: a panic inside `thread::scope`, and why it hung
+
+`esker-cli::cluster_chaos::a_sigkilled_leader_process_never_costs_an_acknowledged_write` hung for
+**29 minutes** in b4's gate with three lanes' containers up, having passed the four gates before it
+and the two after. It is the only one of the seven that needed no reproduction at four loads: b4
+sampled the wedged process, and every observation in that sample follows from one line of the test.
+
+```rust
+let took = converged.unwrap_or_else(|| panic!("… did not serve a write within …"));
+worst = worst.max(took);
+cluster.restart(leader);
+…
+stop.store(true, Ordering::Relaxed);          // after the kill loop, so: never
+```
+
+`std::thread::scope` joins every thread it spawned before it returns — **including while a panic is
+unwinding through it** — and the four load generators run `while !stop.load(..)`. When
+`time_to_serve` returns `None`, the main thread panics, the scope waits for four threads nothing
+will ever stop, and the panic never finishes unwinding.
+
+| what the sample showed | why |
+|---|---|
+| the test and its four threads in `futex_wait` | the scope's join, and the drivers still looping |
+| the runtime idle in `epoll_pwait` | nothing is waiting on a socket; this was never a network stall |
+| **the killed node gone and not restarted** | `cluster.restart` is two lines below the panic |
+| `cluster start` alive and idle | nobody reached `cluster.stop` |
+
+The supervisor was never at fault, and the brief's first reading — *a supervisor that does not
+restart a killed node* — is not what `cluster start` does: it is documented to name a dead child and
+keep going, and the **test** is what restarts nodes.
+
+What it cost is worse than a slow gate. The test exists to catch a cluster that does not converge
+after a `SIGKILL`, and a convergence failure is precisely the case where it stopped saying so — the
+message naming the node and the budget is written, and never printed.
+
+`ReleaseDrivers` is a guard whose `Drop` sets the flag, so every exit from the scope releases the
+drivers rather than only the successful one. Red first, with a budget nothing can meet so the
+failure is deterministic rather than load-dependent:
+
+| | `CONVERGE_WITHIN` = 1 ms |
+|---|---|
+| without the guard | killed by `timeout` at 150 s, **no message** — the recorded symptom |
+| with the guard | FAILED in 9 s: *after killing node 1, the cluster did not serve a write within 1ms* |
+
+`CONVERGE_WITHIN` stays 5 s. No budget was widened; what changed is that expiring one is a failure
+instead of a hang.
+
+### The shape, for the next one
+
+Six of the seven sightings were found by running the test at four loads and reading the curve. This
+one was found by reading a sample — and it is the case where the curve would have said least,
+because the failure is not slower under load, it is *silent* under load. The discriminator was that
+the runtime was **idle**: a test that is waiting on a cluster has a runtime with something to do.
