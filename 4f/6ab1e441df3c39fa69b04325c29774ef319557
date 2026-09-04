@@ -1,0 +1,55 @@
+crates/esker-cli/src/args.rs
+  s_555c5659f0909b::t_e6dd454e6b2ba8 277
+crates/esker-cli/src/server.rs
+  s_555c5659f0909b::t_fa9497e0b9efac 151
+crates/esker-pd/src/command.rs
+  s_555c5659f0909b::t_85d4542c991cbe 6,70
+crates/esker-pd/src/driver.rs
+  s_555c5659f0909b::t_92daf6e1620631 112,648,887
+crates/esker-pd/src/error.rs
+  s_555c5659f0909b::t_80f4181bd4cb42 45
+crates/esker-pd/src/lib.rs
+  s_555c5659f0909b::t_207aea6c461382 38
+crates/esker-pd/src/member.rs
+  s_555c5659f0909b::t_6c84966e9051fa 4
+crates/esker-pd/src/pd/mod.rs
+  s_555c5659f0909b::t_3fa262ea1305eb 323,422,558,669,731,878,1018,1119
+crates/esker-pd/src/pd/repair.rs
+  s_555c5659f0909b::t_b6783bf9204227 404
+crates/esker-pd/src/raft_log.rs
+  s_555c5659f0909b::t_018ea81b4f79b4 4,155
+crates/esker-pd/src/service.rs
+  s_555c5659f0909b::t_62060f71001663 142
+crates/esker-pd/src/transport.rs
+  s_555c5659f0909b::t_9428b94fde13e5 192
+crates/esker-proto/src/error.rs
+  s_555c5659f0909b::t_a34c0da9a7bc98 127
+crates/esker-proto/src/messages.rs
+  s_555c5659f0909b::t_0aaa427c260854 89,98
+crates/esker-proto/src/pd.rs
+  s_555c5659f0909b::t_4dd8e2414d80a1 463
+crates/esker-store/src/pd_remote.rs
+  s_555c5659f0909b::t_9ffac670df0367 37
+docs/DESIGN.md
+  s_555c5659f0909b::t_01410f354afd4f 494,972,977
+docs/adr/0059-pd-is-a-raft-group.md
+  s_555c5659f0909b::t_ae23d563b00a41 1
+docs/plans/phase-15-pd-ha.md
+  s_555c5659f0909b::t_2aebb89765b76d 193,220,289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4f6ab1e441df3c39fa69b04325c29774ef319557",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
