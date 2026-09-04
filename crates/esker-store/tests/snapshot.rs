@@ -545,8 +545,22 @@ async fn an_operator_against_a_stale_epoch_is_dropped() {
         store_id: 9,
         peer_id: 90,
     });
-    // Long enough for several heartbeat rounds to have carried it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // **Waited for by evidence, not by clock.** `FakePd` hands an operator out once, removing it
+    // as it answers the heartbeat, so `operator_pending` going false is proof the store has
+    // *taken* it; and one further region heartbeat proves the loop iteration that ran it has
+    // finished, because `run_operator` is called in the same iteration as the beat that returned
+    // it. Before this the test slept 200 ms — a **negative** assertion behind a wall clock, which
+    // under load does not go red, it goes vacuously green: the store may not have fetched the
+    // operator at all, and "nothing was applied" is then true of a store that never looked.
+    wait_for("the stale operator to be taken by the store", || {
+        !pd.operator_pending(1)
+    })
+    .await;
+    let carried = pd.region_beats().len();
+    wait_for("the round that ran it to finish", || {
+        pd.region_beats().len() > carried
+    })
+    .await;
     assert_eq!(
         node.store.regions().regions()[0].peers.len(),
         1,
