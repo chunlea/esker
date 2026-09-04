@@ -903,6 +903,8 @@ pub(super) fn returning_columns_over(
         }
     }
     let select = Select {
+        // A synthetic `SELECT` for a `RETURNING` list: nothing asked to lock anything.
+        locking: Vec::new(),
         from,
         ctes: Vec::new(),
         joins: joins.to_vec(),

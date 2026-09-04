@@ -140,6 +140,45 @@ pub struct Join {
     pub using: Vec<String>,
 }
 
+/// How strongly `FOR UPDATE` / `FOR SHARE` asks a row to be held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStrength {
+    /// `FOR UPDATE`.
+    Update,
+    /// `FOR SHARE`.
+    Share,
+}
+
+impl LockStrength {
+    /// The clause as PostgreSQL spells it in its own errors — **the one the user wrote**, which is
+    /// what makes `SELECT DISTINCT … FOR SHARE` say `FOR SHARE` and not `FOR UPDATE`.
+    #[must_use]
+    pub fn clause(self) -> &'static str {
+        match self {
+            LockStrength::Update => "FOR UPDATE",
+            LockStrength::Share => "FOR SHARE",
+        }
+    }
+}
+
+/// One `FOR UPDATE` / `FOR SHARE` clause. A statement may carry more than one.
+///
+/// **What it does on this node is what the transaction was going to do anyway.** A Percolator
+/// transaction is snapshot-isolated: it does not block a conflicting writer, it loses to one at
+/// commit with `40001` — the caveat
+/// [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) records as permanent
+/// for as long as this node is snapshot-isolated. So the rows are answered and the ordering the
+/// clause asks for is the one the transaction already enforces, which is a difference no single
+/// session can observe. `NOWAIT` and `SKIP LOCKED` are refused in the lowering, because each of
+/// those *is* observable and this node would answer the wrong thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locking {
+    /// `FOR UPDATE` or `FOR SHARE`.
+    pub strength: LockStrength,
+    /// `OF x` — the relation to lock, **as the query refers to it**, or `None` for all of them.
+    pub of: Option<String>,
+}
+
 /// `SELECT`, as written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
@@ -180,6 +219,12 @@ pub struct Select {
     pub limit: Option<Expr>,
     /// `OFFSET`.
     pub offset: Option<Expr>,
+    /// `FOR UPDATE` / `FOR SHARE`, in the order written. Empty for a statement with none.
+    ///
+    /// Carried rather than dropped even though the executor reads nothing from it: a clause the
+    /// user wrote belongs in the plan whether or not this node's isolation makes it a no-op, and
+    /// it is what a pessimistic-lock implementation would take its rows from. See [`Locking`].
+    pub locking: Vec<Locking>,
 }
 
 /// One item in a target list.

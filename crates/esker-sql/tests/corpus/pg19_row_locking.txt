@@ -1,0 +1,90 @@
+# `SELECT … FOR UPDATE` / `FOR SHARE` — as a real PostgreSQL 19beta1 answers it.
+#
+# Run 53's ranking: **21 tests over 4 files**, `locking_test.rb` chief among them, every one of
+# them stopped by `0A000 a row-level locking clause is not supported`. `ActiveRecord`'s
+# `Model.lock` is `FOR UPDATE`, `lock("FOR SHARE")` and `lock("FOR SHARE NOWAIT")` are the two
+# custom strings the suite passes, and `with_lock` wraps them in a transaction.
+#
+# Captured in one session against the `esker-pg19` container, inside `BEGIN … ROLLBACK`, error
+# probes in `SAVEPOINT` / `ROLLBACK TO`. The `SELECT count(*)` after the `ROLLBACK` proves it left
+# nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The clause names itself in its own errors.** `SELECT DISTINCT … FOR SHARE` is
+#     `FOR SHARE is not allowed with DISTINCT clause`, not `FOR UPDATE …` — the message carries the
+#     lock the user wrote, so a single hard-coded sentence is wrong half the time.
+#   * **`OF` names the relation as the query refers to it**, which is the alias where there is one:
+#     `SELECT id FROM lk l FOR SHARE OF lk` is `42P01 relation "lk" in FOR SHARE clause not found
+#     in FROM clause` even though `lk` is the table. Same rule as every other qualifier, and its
+#     own sentence — `42P01` with the clause named, not `missing FROM-clause entry`.
+#   * **Locking the nullable side of an outer join is refused; locking the other side is not.**
+#     `FROM lk l LEFT JOIN lk r … FOR UPDATE` is `0A000`, and the same query with `FOR UPDATE OF l`
+#     answers rows — so the rule is about which relation is locked, not about the join.
+#   * **Two locking clauses in one statement are legal.** `FOR UPDATE FOR SHARE` is accepted and
+#     answers the rows; PostgreSQL merges them per relation.
+#   * **`SELECT 1 FOR UPDATE` is legal and returns 1.** There is no `FROM`, so there is nothing to
+#     lock and nothing to complain about.
+#   * `LIMIT` composes with it, and the limit is applied to the rows the lock is taken on.
+#
+# WHAT TWO SESSIONS DO, MEASURED AND NOT REPLAYABLE HERE
+#
+# A corpus is one session, so the half of this feature that only exists between two of them is
+# recorded rather than replayed. With session A holding `SELECT … WHERE id = 1 FOR UPDATE` in an
+# open transaction, session B answered:
+#
+#     SELECT id FROM lk WHERE id = 1 FOR UPDATE NOWAIT
+#       -> 55P03 could not obtain lock on row in relation "lk"
+#     SELECT id FROM lk WHERE id = 1 FOR SHARE NOWAIT
+#       -> 55P03 could not obtain lock on row in relation "lk"
+#     SELECT id FROM lk ORDER BY id FOR UPDATE SKIP LOCKED   -> 2, 3   (1 is skipped)
+#     SELECT id FROM lk WHERE id = 2 FOR UPDATE NOWAIT       -> 2      (a row nobody holds)
+#     SELECT count(*) FROM lk                                -> 3      (a plain read never blocks)
+#
+# And with A holding `FOR SHARE` instead, the compatibility matrix shows through: B's
+# `FOR SHARE NOWAIT` and `FOR KEY SHARE NOWAIT` both answer, and B's `FOR UPDATE NOWAIT` is the
+# same `55P03`.
+BEGIN		-
+CREATE TABLE lk (id bigint primary key, n text)		-
+INSERT INTO lk VALUES (1,'a'), (2,'b'), (3,'c')		-
+SELECT 'r', id FROM lk ORDER BY id FOR UPDATE		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id FOR SHARE		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id FOR UPDATE OF lk		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk l ORDER BY l.id FOR UPDATE OF l		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk ORDER BY id LIMIT 2 FOR UPDATE		r|1 ; r|2
+SELECT 'r', id FROM lk ORDER BY id FOR UPDATE FOR SHARE		r|1 ; r|2 ; r|3
+SELECT 'r', l.id FROM lk l LEFT JOIN lk r ON r.id = l.id ORDER BY l.id FOR UPDATE OF l		r|1 ; r|2 ; r|3
+SELECT 'r', 1 FOR UPDATE		r|1
+SELECT 'r', id FROM lk WHERE id = 1 FOR UPDATE NOWAIT		r|1
+SELECT 'r', id FROM lk ORDER BY id FOR UPDATE SKIP LOCKED		r|1 ; r|2 ; r|3
+SELECT 'r', id FROM lk WHERE n = 'b' FOR UPDATE		r|2
+SAVEPOINT s1		-
+SELECT DISTINCT id FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with DISTINCT clause
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT DISTINCT id FROM lk FOR SHARE	!0A000 FOR SHARE is not allowed with DISTINCT clause
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT count(*) FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with aggregate functions
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT id FROM lk GROUP BY id FOR UPDATE	!0A000 FOR UPDATE is not allowed with GROUP BY clause
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SELECT l.id FROM lk l LEFT JOIN lk r ON r.id = l.id FOR UPDATE	!0A000 FOR UPDATE cannot be applied to the nullable side of an outer join
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+SELECT id FROM lk UNION SELECT id FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+SELECT id FROM lk WHERE id = 1 FOR UPDATE OF nosuch	!42P01 relation "nosuch" in FOR UPDATE clause not found in FROM clause
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+SELECT id FROM lk l FOR SHARE OF lk	!42P01 relation "lk" in FOR SHARE clause not found in FROM clause
+ROLLBACK TO s8		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'lk'	bigint	0

@@ -1067,6 +1067,39 @@ pub enum SqlError {
     #[error("cannot drop a template database")]
     CannotDropTemplateDatabase,
 
+    /// `SELECT DISTINCT … FOR UPDATE` and its kin — a locking clause on a statement whose shape
+    /// PostgreSQL will not lock.
+    ///
+    /// **The clause names itself**, so `FOR SHARE` says `FOR SHARE`: one hard-coded sentence would
+    /// be wrong half the time. Measured, every one of them.
+    #[error("{lock} is not allowed with {clause}")]
+    LockingNotAllowedWith {
+        /// `FOR UPDATE` or `FOR SHARE`, as the user wrote it.
+        lock: &'static str,
+        /// `DISTINCT clause`, `GROUP BY clause`, `aggregate functions`,
+        /// `UNION/INTERSECT/EXCEPT` — PostgreSQL's own words, plural and all.
+        clause: &'static str,
+    },
+
+    /// `FROM a LEFT JOIN b … FOR UPDATE`, where the lock would fall on `b`.
+    ///
+    /// **The other side is fine**: the same query with `FOR UPDATE OF a` answers rows, so the rule
+    /// is about which relation is locked rather than about the join. Measured, both.
+    #[error("{0} cannot be applied to the nullable side of an outer join")]
+    LockingNullableSide(&'static str),
+
+    /// `FOR UPDATE OF x` where `x` is not a relation the query has — **under the name the query
+    /// refers to it by**, so an alias takes the table's own name away here as everywhere else.
+    ///
+    /// Its own sentence rather than `missing FROM-clause entry`, and the same `42P01`.
+    #[error("relation \"{relation}\" in {lock} clause not found in FROM clause")]
+    LockingRelationNotInFrom {
+        /// The name written after `OF`.
+        relation: String,
+        /// `FOR UPDATE` or `FOR SHARE`.
+        lock: &'static str,
+    },
+
     /// `DROP DATABASE` naming the one the session is connected to.
     ///
     /// PostgreSQL's own sentence and its own class: a database in use is not a missing one and not
@@ -1856,7 +1889,12 @@ impl SqlError {
             | SqlError::PartitionKeyNotCovered { .. }
             | SqlError::AccessMethodWithoutInclude(_)
             | SqlError::SetFunctionNotAllowed(_)
-            | SqlError::OnConflictMovesPartition => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::OnConflictMovesPartition
+            // A locking clause on a shape that cannot be locked: the one place PostgreSQL spends
+            // `0A000` on something it will never implement rather than on something it has not
+            // implemented yet.
+            | SqlError::LockingNotAllowedWith { .. }
+            | SqlError::LockingNullableSide(_) => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
@@ -1880,8 +1918,14 @@ impl SqlError {
             // is a syntax error there and not a feature refusal. Measured.
             | SqlError::HstoreSyntax(_)
             | SqlError::UnrecognizedDatabaseOption(_) => sqlstate::SYNTAX_ERROR,
+            // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
+            // the one place PostgreSQL spends that class on something it will never implement
+            // rather than on something it has not implemented yet.
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
-            SqlError::UndefinedTable(_)
+            // `FOR UPDATE OF x` naming a relation the `FROM` does not have: `42P01` like any
+            // other missing relation, with a sentence that says which clause looked for it.
+            SqlError::LockingRelationNotInFrom { .. }
+            | SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
             | SqlError::UndefinedSequenceForDrop(_)
             | SqlError::MissingFromEntry(_)
