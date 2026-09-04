@@ -1,0 +1,37 @@
+crates/esker-cli/tests/tier_acceptance.rs
+  s_0ae9006f3dc5a2::t_a344e7a327e57f 780-833,842,853-859
+crates/esker-s3/src/tls.rs
+  s_0ae9006f3dc5a2::t_ff6c701622693c 358-367
+crates/esker-s3/tests/fixtures/README.md
+  s_0ae9006f3dc5a2::t_7309b66fb4a0fd 1-55
+crates/esker-s3/tests/fixtures/ca-cert.pem
+  s_0ae9006f3dc5a2::t_4842d6e9b10632 1-11
+crates/esker-s3/tests/fixtures/localhost-cert.pem
+  s_0ae9006f3dc5a2::t_e3d8b375269bc9 1-12
+crates/esker-s3/tests/fixtures/localhost-key.pem
+  s_0ae9006f3dc5a2::t_ffb87813dd3629 1-5
+crates/esker-s3/tests/fixtures/other-ca-cert.pem
+  s_0ae9006f3dc5a2::t_1a584a7b96ea4f 1-11
+crates/esker-s3/tests/fixtures/wrong-name-cert.pem
+  s_0ae9006f3dc5a2::t_7d125ef0fedbf6 1-12
+crates/esker-s3/tests/fixtures/wrong-name-key.pem
+  s_0ae9006f3dc5a2::t_7d8daf2593bf34 1-5
+crates/esker-s3/tests/https.rs
+  s_0ae9006f3dc5a2::t_878c3fbbd12493 1-607
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7e1b2c92952df918af889aa0eee8e6a7f1ecba67",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9006f3dc5a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dda7865a-6020-489a-b184-a2d3ff7a56d7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
