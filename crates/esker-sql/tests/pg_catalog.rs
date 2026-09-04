@@ -732,17 +732,22 @@ fn a_star_expands_to_every_column_of_the_view() {
     // every type reports it, as every relation's `relnamespace` does. The `8` and `N` are `typlen`
     // and `typcategory`, appended last again for the uuid unit. `1016` and `0` are `typarray` and
     // `typrelid`, appended last for the **fourth** time by `CREATE TYPE`: `_int8` really is 1016
-    // on a real server, and nothing but a composite owns a `pg_class` row.
+    // on a real server, and nothing but a composite owns a `pg_class` row. The `f` and the NULL
+    // are `typnotnull` and `typdefault`, appended last for the **fifth** time by `CREATE DOMAIN`
+    // (ADR 0065): only a domain can constrain its own values, so every other type answers exactly
+    // this pair.
     assert_eq!(
         node.rows("SELECT * FROM pg_type WHERE typname = 'int8'"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0", "f",
+            "\\N"
         ]]
     );
     assert_eq!(
         node.rows("SELECT t.* FROM pg_type AS t WHERE t.oid = 20"),
         vec![vec![
-            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0"
+            "20", "int8", "0", ",", "int8in", "b", "0", "0", "11", "8", "N", "1016", "0", "f",
+            "\\N"
         ]]
     );
     assert_eq!(

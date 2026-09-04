@@ -915,6 +915,20 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A NULL into a column of a `NOT NULL` **domain**: `23502`, and it names the domain rather
+    /// than the column or the table — measured, `domain dm_pos does not allow null values`.
+    #[error("domain {0} does not allow null values")]
+    DomainNotNull(String),
+    /// A value a **domain**'s `CHECK` refuses: `23514`, naming the domain and the constraint.
+    ///
+    /// A different sentence from a table's `CHECK`, which names the relation and prints the row.
+    #[error("value for domain {domain} violates check constraint \"{constraint}\"")]
+    DomainCheckViolation {
+        /// The domain, bare.
+        domain: String,
+        /// Its constraint's name — `<domain>_check` where the statement gave none.
+        constraint: String,
+    },
     /// A write to a materialized view: `42809`.
     ///
     /// **A materialized view is a table underneath** ([ADR 0064]), so this refusal is the only
@@ -2369,9 +2383,11 @@ impl SqlError {
             SqlError::NotPartitioned(_) | SqlError::PartitionOverlap { .. } => {
                 sqlstate::INVALID_OBJECT_DEFINITION
             }
-            SqlError::NoPartitionForRow { .. } | SqlError::PartitionConstraintViolation(_) => {
-                sqlstate::CHECK_VIOLATION
-            }
+            SqlError::NoPartitionForRow { .. }
+            | SqlError::PartitionConstraintViolation(_)
+            | SqlError::CheckViolation { .. }
+            // A domain's `CHECK` is a check constraint like any other; only its sentence differs.
+            | SqlError::DomainCheckViolation { .. } => sqlstate::CHECK_VIOLATION,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
@@ -2382,6 +2398,7 @@ impl SqlError {
             | SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
             SqlError::ColumnContainsNulls { .. }
             | SqlError::NotNullViolation(_)
+            | SqlError::DomainNotNull(_)
             | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
@@ -2486,7 +2503,7 @@ impl SqlError {
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-            SqlError::CheckViolation { .. } => sqlstate::CHECK_VIOLATION,
+
             SqlError::ExclusionViolation { .. } => sqlstate::EXCLUSION_VIOLATION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
