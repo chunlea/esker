@@ -51,17 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              was an error where PostgreSQL has a value, which aborted the block and hid every \
              statement after it. Two of those are now measured and one was a real gap.",
         ),
-        // **Also un-swallowed**, and also pre-existing: `pg_attribute` has no rows for a view.
-        // The columns a view has are worked out where it is *read*, from the shape its definition
-        // produces, and nothing writes them into the attribute catalog — so a client asking the
-        // catalog what columns a view has gets an empty answer where PostgreSQL lists them.
-        (
-            r#"SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"ebooks''"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"#,
-            "No rows: a view's columns are derived at read time and never written to \
-             `pg_attribute`. Its own unit — the fix is to publish the shape a view's definition \
-             produces into the attribute catalog when the view is created, which is the same \
-             resolution step a rename-following view body needs.",
-        ),
         // **Un-swallowed by the line above.** `information_schema.views` did not exist, so the
         // statement before this one aborted the transaction and this was never compared. It is a
         // pre-existing gap and not a view-formatting one: an `INSERT` through an automatically
@@ -72,14 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`42P01`: writing **through** a view is its own feature. `is_updatable` now answers \
              `YES` for this view, which is the right answer about the *query* — PostgreSQL would \
              accept the insert and this node does not. Its own unit; the read side is complete.",
-        ),
-        (
-            "REFRESH MATERIALIZED VIEW ebooks_mat",
-            "**A materialized view is a different feature.** It holds its own rows — storage \
-             rather than a rewrite — and `REFRESH` is the statement that rewrites them; this \
-             node's views are stored `SELECT`s expanded where they are read, so there is nothing \
-             to refresh. `CREATE`/`DROP MATERIALIZED VIEW` and `pg_matviews` are refused by name \
-             beside it, and `view_test.rb:218-222` is the part of the file that needs them.",
         ),
     ],
 };

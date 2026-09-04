@@ -170,6 +170,14 @@ pub enum SqlError {
     #[error("sequence \"{0}\" does not exist")]
     UndefinedSequenceForDrop(String),
 
+    /// `DROP MATERIALIZED VIEW` naming nothing: `42P01`, saying **`materialized view`**.
+    ///
+    /// **`REFRESH` of the same missing name says `relation`**, not this — measured, both in one
+    /// session. The noun follows the statement and not the object, which is why the two cannot
+    /// share a variant.
+    #[error("materialized view \"{}\" does not exist", crate::catalog::display_name(.0))]
+    UndefinedMatviewForDrop(String),
+
     /// `DROP SEQUENCE` on a sequence a column's default depends on: `2BP01`.
     ///
     /// The `DETAIL` names the **column** and not just the table, which is what tells a reader
@@ -902,6 +910,26 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A write to a materialized view: `42809`.
+    ///
+    /// **A materialized view is a table underneath** ([ADR 0064]), so this refusal is the only
+    /// thing between a client and a writable one. Measured on 19beta1 — `INSERT`, `UPDATE` and
+    /// `DELETE` all give this same sentence, and `TRUNCATE` gives `"m" is not a table` instead.
+    ///
+    /// [ADR 0064]: ../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md
+    #[error("cannot change materialized view \"{0}\"")]
+    CannotChangeMatview(String),
+    /// Reading a materialized view created `WITH NO DATA` and never refreshed: `55000`.
+    ///
+    /// **Not zero rows**, which is a different claim: zero rows says the query produced none.
+    #[error("materialized view \"{0}\" has not been populated")]
+    MatviewNotPopulated(String),
+    /// `REFRESH … CONCURRENTLY` without a unique index on the materialized view: `55000`.
+    ///
+    /// The name is **schema-qualified** here where almost nothing else is — measured, PostgreSQL
+    /// says `"public.mv_ebooks"` — so it is stored qualified rather than reassembled.
+    #[error("cannot refresh materialized view \"{0}\" concurrently")]
+    CannotRefreshConcurrently(String),
     /// `TRUNCATE` of a table another table's foreign key points at: `0A000`, unless `CASCADE`.
     ///
     /// **`0A000`, not `2BP01`** — measured, and it is the one refusal in this family PostgreSQL
@@ -2260,6 +2288,7 @@ impl SqlError {
             SqlError::LockingRelationNotInFrom { .. }
             | SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
+            | SqlError::UndefinedMatviewForDrop(_)
             | SqlError::UndefinedViewForDrop(_)
             | SqlError::UndefinedSequenceForDrop(_)
             | SqlError::MissingFromEntry(_)
@@ -2296,6 +2325,7 @@ impl SqlError {
             SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
+            | SqlError::CannotChangeMatview(_)
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
             // statement, which is the same `42809` an `ALTER` on the wrong kind gets.
@@ -2415,7 +2445,11 @@ impl SqlError {
             SqlError::GeneratedAlways { .. }
             | SqlError::GeneratedColumnInsert { .. }
             | SqlError::GeneratedColumnUpdate { .. } => sqlstate::GENERATED_ALWAYS,
-            SqlError::SequenceNotYetDefined(_) => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            SqlError::SequenceNotYetDefined(_)
+            | SqlError::MatviewNotPopulated(_)
+            | SqlError::CannotRefreshConcurrently(_) => {
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            }
             SqlError::NoSuchSavepoint(_) => sqlstate::NO_SUCH_SAVEPOINT,
             SqlError::GroupingError(_) | SqlError::AggregateNotAllowed(_) => {
                 sqlstate::GROUPING_ERROR
@@ -2782,6 +2816,14 @@ impl SqlError {
                 "Truncate table \"{child}\" at the same time, or use TRUNCATE ... CASCADE."
             )),
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),
+            SqlError::MatviewNotPopulated(_) => {
+                Some("Use the REFRESH MATERIALIZED VIEW command.".to_owned())
+            }
+            SqlError::CannotRefreshConcurrently(_) => Some(
+                "Create a unique index with no WHERE clause on one or more columns of the \
+                 materialized view."
+                    .to_owned(),
+            ),
             // PostgreSQL's own, and it names the **constraint** — measured for both the primary
             // key and a `UNIQUE` constraint, which give the identical sentence. The hint here used
             // to say "drop the table", which was advice a user could follow and not the advice a
@@ -2899,6 +2941,7 @@ fn drop_verb_hint(found: &str) -> Option<String> {
         "DROP TABLE" => "Use DROP TABLE to remove a table.",
         "DROP SEQUENCE" => "Use DROP SEQUENCE to remove a sequence.",
         "DROP VIEW" => "Use DROP VIEW to remove a view.",
+        "DROP MATERIALIZED VIEW" => "Use DROP MATERIALIZED VIEW to remove a materialized view.",
         _ => return None,
     };
     Some(sentence.to_owned())

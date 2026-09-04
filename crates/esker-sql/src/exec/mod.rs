@@ -795,6 +795,13 @@ impl Executor {
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
             Statement::CreateView(create) => ddl::create_view(self, txn, create),
             Statement::DropView(drop) => ddl::drop_view(self, txn, drop),
+            Statement::CreateMaterializedView(create) => {
+                ddl::create_materialized_view(self, txn, create)
+            }
+            Statement::RefreshMaterializedView(refresh) => {
+                ddl::refresh_materialized_view(self, txn, refresh)
+            }
+            Statement::DropMaterializedView(drop) => ddl::drop_materialized_view(self, txn, drop),
             Statement::CreateDatabase(create) => ddl::create_database(self, txn, create),
             Statement::DropDatabase(drop) => ddl::drop_database(self, txn, drop),
             Statement::DropSchema(drop) => ddl::drop_schema(self, txn, drop),
@@ -1215,11 +1222,19 @@ impl Executor {
     }
 
     /// `SELECT`: plan it, then pull every row through.
-    fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
-        // A sequence function is a **write**, not a value of a row, so it runs here — once, in the
-        // order the target list names it — and what the planner sees is the number it produced.
-        // Running it inside the plan would run it once per row, which is what PostgreSQL does over
-        // a `FROM` and is why that shape is refused rather than approximated.
+    /// Plans a `SELECT`, runs it, and hands back the plan and the rows **as stored** — before any
+    /// of the presentation [`Executor::select`] does.
+    ///
+    /// Extracted so that `CREATE MATERIALIZED VIEW` and `REFRESH` run a definition through exactly
+    /// the machinery an ordinary `SELECT` goes through — the fragments, the subqueries, the
+    /// sequence reads and the lock pass, in that order and for the reasons given below. A second
+    /// copy of this sequence is the way a materialized view would come to disagree with the query
+    /// it claims to be.
+    fn planned_rows(
+        &mut self,
+        txn: &mut dyn Txn,
+        select: &crate::plan::Select,
+    ) -> Result<(query::Planned, Vec<Vec<Datum>>)> {
         let resolved = self.resolve_sequence_calls(&*txn, select)?;
         let select = resolved.as_ref();
         let mut planned = self.plan_select(txn, select)?;
@@ -1248,6 +1263,15 @@ impl Executor {
         // `&dyn Txn` and a lock needs `&mut`, and a `SELECT` materialises its rows anyway, so the
         // second pass costs nothing that was not already spent (ADR 0057 §5).
         let raw = self.lock_rows(txn, &planned, raw)?;
+        Ok((planned, raw))
+    }
+
+    fn select(&mut self, txn: &mut dyn Txn, select: &crate::plan::Select) -> Result<Outcome> {
+        // A sequence function is a **write**, not a value of a row, so it runs there — once, in
+        // the order the target list names it — and what the planner sees is the number it
+        // produced. Running it inside the plan would run it once per row, which is what
+        // PostgreSQL does over a `FROM` and is why that shape is refused rather than approximated.
+        let (planned, raw) = self.planned_rows(txn, select)?;
         let mut rows = Vec::new();
         for row in raw {
             let row = &row[..row.len() - planned.junk];
@@ -2815,6 +2839,18 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
         Statement::CreateView(create) => vec![format!("Create View on {}", create.name)],
         Statement::DropView(drop) => vec![format!("Drop View on {}", drop.names.join(", "))],
+        Statement::CreateMaterializedView(create) => {
+            vec![format!("Create Materialized View on {}", create.name)]
+        }
+        Statement::RefreshMaterializedView(refresh) => {
+            vec![format!("Refresh Materialized View on {}", refresh.name)]
+        }
+        Statement::DropMaterializedView(drop) => {
+            vec![format!(
+                "Drop Materialized View on {}",
+                drop.names.join(", ")
+            )]
+        }
         Statement::CreateDatabase(create) => vec![format!("Create Database on {}", create.name)],
         Statement::DropDatabase(drop) => {
             vec![format!("Drop Database on {}", drop.names.join(", "))]
@@ -3209,10 +3245,26 @@ impl Executor {
             // leaves a `FROM (SELECT …)` in and `plan_subqueries` fills the rest.
             entry.derived = Some(Box::new(crate::plan::Derived::new(
                 Box::new(body),
-                view.columns.clone(),
+                view.columns.iter().map(|c| c.name.clone()).collect(),
             )));
         }
-        Ok(())
+        // **And every `FROM` inside an expression subquery**, which is a relation list of its own:
+        // `WHERE id IN (SELECT id FROM v)` names a view where no `FROM` walk reaches it. Recursive
+        // rather than one level down, because a subquery may hold another one — and it runs after
+        // the `FROM` entries above so that a view *and* a subquery in one statement both expand.
+        let mut nested = Ok(());
+        subquery::for_each_written_expr_mut(select, &mut |expr| {
+            if nested.is_err() {
+                return;
+            }
+            nested = subquery::walk_mut(expr, &mut |expr| {
+                if let crate::plan::Expr::Subquery(sub) = expr {
+                    self.expand_views(txn, &mut sub.select)?;
+                }
+                Ok(())
+            });
+        });
+        nested
     }
 
     /// A view's stored `SELECT`, parsed and lowered.
@@ -3249,19 +3301,49 @@ impl Executor {
                 each(&entry.name)?;
             }
         }
-        Ok(())
+        // **And the ones named only inside an expression**: `WHERE id IN (SELECT id FROM v)` puts
+        // a relation name nowhere near the `FROM`, and a walk that stopped at the `FROM` reported
+        // no view for a statement that names one — so `expand_views` was never called and the
+        // name reached the planner as a table that does not exist.
+        let mut nested = Ok(());
+        subquery::for_each_written_expr(select, &mut |expr| {
+            subquery::walk(expr, &mut |expr| {
+                if nested.is_err() {
+                    return;
+                }
+                if let crate::plan::Expr::Subquery(sub) = expr {
+                    nested = Self::each_relation_name(&sub.select, each);
+                }
+            });
+        });
+        nested
     }
 
     /// What a `Describe` answers, read through one transaction.
     fn described_in(&self, txn: &dyn Txn, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
-        let statement = parsed.lower()?;
+        let mut statement = parsed.lower()?;
+        // **A view becomes the derived table it stands for here too**, exactly as
+        // [`Executor::plan_select`] does it and for the same reason: after the rewrite nothing
+        // below can tell a view from a sub-select somebody typed. Skipping it left `FROM v`
+        // reaching `relation_of` as a table name, which is `42P01` for a relation that is right
+        // there — and since `ActiveRecord` prepares by default, that was **every** read of a view
+        // it makes. `SELECT * FROM v` through the simple protocol answered all along, which is
+        // what made it look like a catalog gap rather than a describe one.
+        //
+        // Before the parameters are typed, so a `$1` compared against a view's column is typed
+        // against the column and not against nothing, and before the subqueries are planned,
+        // because a view may be named inside one.
+        if let Statement::Select(select) = &mut statement
+            && self.names_a_view(txn, select)?
+        {
+            self.expand_views(txn, select)?;
+        }
         let tables = self.tables_for(txn, &statement)?;
         let types = bind::infer(&statement, &tables, declared);
         let parameters = types.iter().copied().map(ColumnType::oid).collect();
 
         // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
         // is run, so a placeholder of the right type is all the planner needs to answer the shape.
-        let mut statement = statement;
         bind::substitute_placeholders(&mut statement, &types);
         // **A derived table has no shape until its sub-select is planned**, and the shape is the
         // whole of what a `Describe` answers. `Executor::plan_select` does this before it plans;

@@ -443,7 +443,9 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
         // **A view has no index and no primary key**, which `view_test.rb` asserts directly:
         // `test_does_not_assume_id_column_as_primary_key` finds none even though the view selects
         // `id`. Measured — `pg_index` and `pg_constraint` are both empty for one.
-        RelKind::Table | RelKind::Sequence | RelKind::View => None,
+        // A materialized view is not an index; the indexes **on** one are their own relations and
+        // reach this function as `RelKind::Index`, exactly as a table's do.
+        RelKind::Table | RelKind::Sequence | RelKind::View | RelKind::MaterializedView => None,
     }
 }
 

@@ -201,6 +201,7 @@ pub(super) fn table_function_def(
         _ => ColumnType::Int4,
     };
     std::sync::Arc::new(crate::catalog::TableDef {
+        matview: None,
         on_commit: crate::catalog::OnCommit::default(),
         // Synthetic and never stored, so its persistence is the default.
         persistence: crate::catalog::Persistence::Permanent,
@@ -339,6 +340,7 @@ fn plan_derived(
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
+        matview: None,
         on_commit: crate::catalog::OnCommit::default(),
         // Synthetic and never stored, so its persistence is the default.
         persistence: crate::catalog::Persistence::Permanent,
@@ -457,7 +459,7 @@ pub(super) fn relation_of(
             {
                 return Err(SqlError::UndefinedTable(written.clone()));
             }
-            tables.get(&entry.name).map_err(|error| match error {
+            let table = tables.get(&entry.name).map_err(|error| match error {
                 SqlError::UndefinedTable(name) if entry.hidden_cte => {
                     SqlError::ForwardCteReference(name)
                 }
@@ -468,7 +470,21 @@ pub(super) fn relation_of(
                     SqlError::UndefinedTable(entry.written.clone().unwrap_or(name))
                 }
                 other => other,
-            })
+            })?;
+            // **A materialized view created `WITH NO DATA` refuses to be read**, and this is the
+            // one place every read path passes through. Answering zero rows instead would be a
+            // different claim — that the query produced none — and it is the claim a client would
+            // act on. Measured: `55000`, with PostgreSQL's own hint (ADR 0064).
+            if table
+                .matview
+                .as_ref()
+                .is_some_and(|matview| !matview.populated)
+            {
+                return Err(SqlError::MatviewNotPopulated(crate::catalog::display_name(
+                    &table.name,
+                )));
+            }
+            Ok(table)
         }
         Some(derived) => derived.def.clone().ok_or_else(|| {
             SqlError::Internal("a derived table reached the planner without a shape".to_owned())
@@ -943,7 +959,7 @@ fn compare(op: BinaryOp, left: &Datum, right: &Datum) -> bool {
 /// Its own walk rather than a method on `Select`, for the reason
 /// `crate::exec::fragment::collect_columns` gives for its own: the statement type is shared with
 /// another lane, and a walk this module owns is one hunk fewer to resolve when `main` is merged.
-fn for_each_written_expr(select: &Select, visit: &mut impl FnMut(&Expr)) {
+pub(super) fn for_each_written_expr(select: &Select, visit: &mut impl FnMut(&Expr)) {
     for item in &select.projection {
         if let SelectItem::Expr { expr, .. } = item {
             visit(expr);
@@ -972,7 +988,7 @@ fn for_each_written_expr(select: &Select, visit: &mut impl FnMut(&Expr)) {
 /// The same walk, mutably. Written twice rather than made generic over the borrow: the two
 /// callers want different things (one asks a question, one rewrites), and a macro or a trait to
 /// share nine lines would be harder to read than the nine lines.
-fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Expr)) {
+pub(super) fn for_each_written_expr_mut(select: &mut Select, visit: &mut impl FnMut(&mut Expr)) {
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, .. } = item {
             visit(expr);
@@ -1255,7 +1271,10 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
 /// The same walk, mutably, and **innermost first** — which is the half that matters. A subquery
 /// nested inside another one has to be planned and run before the one holding it, because the
 /// outer one's rows are what the inner one is asked about.
-fn walk_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> Result<()>) -> Result<()> {
+pub(super) fn walk_mut(
+    expr: &mut Expr,
+    visit: &mut impl FnMut(&mut Expr) -> Result<()>,
+) -> Result<()> {
     match expr {
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk_mut(left, visit)?;

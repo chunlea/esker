@@ -261,6 +261,34 @@ pub fn fit_to_typmod(value: Numeric, typmod: i32) -> Result<Numeric> {
 }
 
 /// The value at exactly `scale` fractional digits, **rounding half away from zero**.
+/// One `numeric` as the whole number PostgreSQL casts it to, rounded **half away from zero**.
+///
+/// The other rounding rule in this crate is the float one, and they genuinely differ: measured in
+/// a single session, `12.5::numeric` casts to **13** and `12.5::float8` to **12**, with the
+/// negatives mirroring each. `round_to_scale` already carries at five, which is this rule; what
+/// this adds is reading the result back as an integer.
+///
+/// A `NaN` or an infinity has no integer to give and answers `0`, which never reaches a column:
+/// both are refused before a value is stored.
+#[must_use]
+pub fn round_half_away_to_integer(value: &Numeric) -> i64 {
+    let Numeric::Finite(decimal) = value else {
+        return 0;
+    };
+    let rounded = round_to_scale(decimal, 0);
+    let mut magnitude: i64 = 0;
+    for digit in &rounded.digits {
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add(i64::from(*digit));
+    }
+    if rounded.negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 fn round_to_scale(decimal: &Decimal, scale: i32) -> Decimal {
     if decimal.scale == scale {
         return decimal.clone();

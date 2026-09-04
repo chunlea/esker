@@ -155,6 +155,12 @@ pub enum CatalogView {
     PgIndexes,
     /// `pg_views`: one row per view, with the `SELECT` it stands for.
     PgViews,
+    /// `pg_matviews`: one row per **materialized** view.
+    ///
+    /// A separate view from `pg_views` on a real server, and the split is the point: a
+    /// materialized view is in this one and in neither `pg_views` nor
+    /// `information_schema.tables` — measured, all three (ADR 0064).
+    PgMatviews,
     /// The sessions this server is running, which is **the asking one and no other**.
     ///
     /// `migration_test.rb:1108` reads it to ask whether the connection that held an advisory lock
@@ -210,7 +216,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 30] = [
+    pub const ALL: [CatalogView; 31] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -229,6 +235,7 @@ impl CatalogView {
         CatalogView::PgPartitionedTable,
         CatalogView::PgIndexes,
         CatalogView::PgViews,
+        CatalogView::PgMatviews,
         CatalogView::PgStatActivity,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
@@ -266,6 +273,7 @@ impl CatalogView {
             CatalogView::PgPartitionedTable => "pg_partitioned_table",
             CatalogView::PgIndexes => "pg_indexes",
             CatalogView::PgViews => "pg_views",
+            CatalogView::PgMatviews => "pg_matviews",
             CatalogView::PgStatActivity => "pg_stat_activity",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
@@ -364,6 +372,10 @@ impl CatalogView {
                 // `'…'::regclass` over a sequence find this view instead, and eight tests that had
                 // nothing to do with views went red at once.
                 CatalogView::PgViews => 27,
+                // 29: the next free reserved relation id — 33 is `InformationSchemaViews`'s and
+                // two views sharing one resolve to each other, which is the mistake the note
+                // above records.
+                CatalogView::PgMatviews => 29,
                 CatalogView::PgStatActivity => 28,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
@@ -462,6 +474,11 @@ impl CatalogView {
                 // ordinary one — `information_schema.tables` calls both `BASE TABLE`, so a client
                 // that reads the standard view cannot see persistence at all.
                 ("relpersistence", ColumnType::Text),
+                // **Last again**, for the same reason. `t` for every relation that is not a
+                // materialized view — measured, a real server reports `relispopulated = t` for an
+                // ordinary table — and `f` only for one created `WITH NO DATA` and not yet
+                // refreshed (ADR 0064).
+                ("relispopulated", ColumnType::Bool),
             ],
             // Exactly the three a client reads. `amname` is a `name` on a real server and `amtype`
             // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
@@ -547,6 +564,19 @@ impl CatalogView {
                 ("schemaname", ColumnType::Text),
                 ("viewname", ColumnType::Text),
                 ("viewowner", ColumnType::Text),
+                ("definition", ColumnType::Text),
+            ],
+            // A real server's order, so `SELECT *` expands the way a client expects.
+            // `matviewowner` and `tablespace` are empty here for the same reason `viewowner` is:
+            // this node has neither roles nor tablespaces, and a name invented for one would be an
+            // object nobody created.
+            CatalogView::PgMatviews => &[
+                ("schemaname", ColumnType::Text),
+                ("matviewname", ColumnType::Text),
+                ("matviewowner", ColumnType::Text),
+                ("tablespace", ColumnType::Text),
+                ("hasindexes", ColumnType::Bool),
+                ("ispopulated", ColumnType::Bool),
                 ("definition", ColumnType::Text),
             ],
             // **All twenty-two, in a real server's order**, because `SELECT *` on this view is
@@ -680,6 +710,7 @@ impl CatalogView {
             CatalogView::PgPartitionedTable => partitioned_table_rows(txn, tenant),
             CatalogView::PgIndexes => indexes_rows(txn, tenant),
             CatalogView::PgViews => views_rows(txn, tenant),
+            CatalogView::PgMatviews => matviews_rows(txn, tenant),
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
@@ -810,6 +841,7 @@ impl CatalogView {
             // here — `rows_of` answers for those before it delegates, the two extension views
             // included.
             CatalogView::PgAvailableExtensions
+            | CatalogView::PgMatviews
             | CatalogView::PgRange
             | CatalogView::PgCollation
             | CatalogView::PgExtension
@@ -857,6 +889,7 @@ impl CatalogView {
                 .iter()
                 .map(|view| {
                     Arc::new(TableDef {
+                        matview: None,
                         // Synthetic and never stored, so its persistence is the default.
                         persistence: crate::catalog::Persistence::Permanent,
                         on_commit: super::OnCommit::default(),
@@ -1216,6 +1249,36 @@ fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<
         Datum::Null,
         Datum::Text("client backend".to_owned()),
     ]])
+}
+
+/// Every `pg_matviews` row: one per materialized view, and no ordinary table.
+///
+/// **Read off the relations rather than out of a view record**, because a materialized view *is* a
+/// table record — which is also why `pg_views`, whose source is the view records, excludes them
+/// without being told to (ADR 0064).
+fn matviews_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let mut rows = Vec::new();
+    for relation in relations.of_kind(super::pg_relations::RelKind::MaterializedView) {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        let Some(matview) = table.matview.as_ref() else {
+            continue;
+        };
+        rows.push(vec![
+            Datum::Text(relation.schema.clone()),
+            Datum::Text(relation.name.clone()),
+            Datum::Text(String::new()),
+            Datum::Text(String::new()),
+            // **The indexes a user made on it**, which a materialized view can have and a view
+            // cannot — measured, `CREATE UNIQUE INDEX` over one succeeds and flips this to `t`.
+            Datum::Bool(!table.indexes.is_empty()),
+            Datum::Bool(matview.populated),
+            Datum::Text(matview.definition.clone()),
+        ]);
+    }
+    Ok(rows)
 }
 
 fn views_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
@@ -1596,6 +1659,9 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Int8(0),
             // A catalog view is not stored at all, and a real server reports `p` for one.
             Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
+            // `relispopulated`: `t`. Only a materialized view can be false, and a catalog
+            // relation is never one.
+            Datum::Bool(true),
         ]
     });
     Ok(relations
@@ -1662,6 +1728,15 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                         .relpersistence()
                         .to_owned(),
                 ),
+                // `relispopulated`: **only a materialized view can be false**, and it is false
+                // only between `WITH NO DATA` and the first `REFRESH`. Everything else — an
+                // ordinary table, an index, a view — is `t` on a real server.
+                Datum::Bool(
+                    relations
+                        .table(relation)
+                        .and_then(|table| table.matview.as_ref())
+                        .is_none_or(|matview| matview.populated),
+                ),
             ]
         })
         .chain(views)
@@ -1682,7 +1757,7 @@ fn access_method_oid(kind: super::pg_relations::RelKind) -> i64 {
         RelKind::Index | RelKind::PrimaryKey => BTREE_AM_OID,
         RelKind::Exclusion => GIST_AM_OID,
         // A view is not built with an access method either, so a join to `pg_am` drops it.
-        RelKind::Table | RelKind::Sequence | RelKind::View => 0,
+        RelKind::Table | RelKind::Sequence | RelKind::View | RelKind::MaterializedView => 0,
     }
 }
 

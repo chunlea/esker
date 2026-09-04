@@ -81,6 +81,19 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
     let mut rows = catalog_rows();
     for relation in relations.rows() {
+        // **A view answers here too, out of the shape it published when it was created.** It has
+        // no `TableDef` to describe, and until the shape was stored there was nothing to say — so
+        // `pg_attribute` was empty for a view, which is the one answer a client cannot tell from
+        // "no such relation".
+        if relation.kind == RelKind::View {
+            let Some(columns) = relations.view_columns(relation.table_id) else {
+                continue;
+            };
+            for (attnum, column) in (1..).zip(columns) {
+                rows.push(view_attribute(relation, column, attnum));
+            }
+            continue;
+        }
         let Some(table) = relations.table(relation) else {
             continue;
         };
@@ -89,6 +102,31 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         }
     }
     Ok(rows)
+}
+
+/// One `pg_attribute` row for one column of a view.
+///
+/// **Every flag is a constant, and `attnotnull` is the one worth saying out loud.** Measured on
+/// 19beta1: a view over a column declared `NOT NULL` reports `attnotnull` **`f`**. A view's column
+/// is the value of an expression, and an expression is nullable whatever it reads — an outer join
+/// alone makes a `NOT NULL` column produce NULLs — so the constraint belongs to the table and is
+/// not inherited by the relation that selects from it. Nothing here can carry a default, an
+/// identity or a generated expression either, and a view has no tombstoned columns because
+/// replacing a view rewrites its shape outright.
+fn view_attribute(relation: &RelationRow, column: &super::ViewColumn, attnum: i16) -> Vec<Datum> {
+    vec![
+        Datum::Int8(relation.oid),
+        Datum::Text(column.name.clone()),
+        Datum::Int8(i64::from(column.ty.oid())),
+        Datum::Int2(attnum),
+        Datum::Int4(column.typmod),
+        Datum::Bool(false),
+        Datum::Bool(false),
+        Datum::Text(NOT_IDENTITY.to_owned()),
+        Datum::Text(NOT_IDENTITY.to_owned()),
+        Datum::Bool(false),
+        Datum::Int8(NO_COLLATION),
+    ]
 }
 
 /// **The catalog describes itself here too.** One row per column of every catalog relation.
@@ -176,7 +214,11 @@ fn columns_of<'a>(
         // row on a real server, and the adapter's own query is the one that filters it out
         // (`AND NOT a.attisdropped`). Hiding it here would answer that query correctly and still
         // be wrong — `attnum` would close over the gap, where PostgreSQL leaves it (ADR 0051).
-        RelKind::Table => table
+        // **A materialized view describes its own columns exactly as a table does**, because it
+        // is one (ADR 0064) — measured: `pg_attribute` over one lists the query's columns with
+        // their types, and `attnotnull` is `f` for every one of them, which is what a keyless
+        // table with no `NOT NULL` column reports anyway.
+        RelKind::Table | RelKind::MaterializedView => table
             .all_user_columns()
             .map(|(at, column)| (Cow::Borrowed(column), Some(at)))
             .collect(),

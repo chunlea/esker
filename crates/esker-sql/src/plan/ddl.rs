@@ -311,6 +311,51 @@ pub struct CreateView {
     pub or_replace: bool,
 }
 
+/// `CREATE MATERIALIZED VIEW name [(cols)] AS SELECT … [WITH [NO] DATA]`.
+///
+/// [ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md):
+/// this creates a **table** that carries its definition, so the `SELECT` is planned once here the
+/// way a view's is and then run to fill the rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMaterializedView {
+    /// The relation's name, folded.
+    pub name: String,
+    /// `CREATE MATERIALIZED VIEW m (a, b) AS …` — the names it gives its columns, or empty when it
+    /// takes them from the query.
+    pub columns: Vec<String>,
+    /// The `SELECT`, as text.
+    pub definition: String,
+    /// `WITH DATA` (the default) computes the rows now; `WITH NO DATA` leaves the relation
+    /// unpopulated, and reading it before a `REFRESH` is `55000`.
+    pub with_data: bool,
+    /// `IF NOT EXISTS`.
+    pub if_not_exists: bool,
+}
+
+/// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshMaterializedView {
+    /// The relation named, folded.
+    pub name: String,
+    /// `CONCURRENTLY`. PostgreSQL requires a unique index for it and refuses without one; the
+    /// difference from the plain form is **locking**, and this node declares that divergence
+    /// rather than hiding it (ADR 0064).
+    pub concurrently: bool,
+    /// `WITH NO DATA` on a refresh **empties** the relation and marks it unpopulated again.
+    pub with_data: bool,
+}
+
+/// `DROP MATERIALIZED VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropMaterializedView {
+    /// The relations named, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`.
+    pub if_exists: bool,
+    /// `CASCADE`: also drop what depends on it.
+    pub cascade: bool,
+}
+
 /// `TRUNCATE [TABLE] t [, …] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
 ///
 /// **Not a `DELETE` without a `WHERE`**, and the difference that matters here is what it does

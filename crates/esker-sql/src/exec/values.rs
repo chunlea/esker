@@ -55,6 +55,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         })
         .collect();
     Ok(Arc::new(TableDef {
+        matview: None,
         on_commit: crate::catalog::OnCommit::default(),
         // Synthetic and never stored, so its persistence is the default.
         persistence: crate::catalog::Persistence::Permanent,

@@ -49,6 +49,18 @@ const NO: &str = "NO";
 /// Every `information_schema.tables` row: one per **table**, and nothing else.
 pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
+    // **A view is here and a materialized view is not**, measured: `information_schema.tables` has
+    // a `VIEW` row for the first and no row at all for the second — the standard has no table type
+    // for something PostgreSQL invented, so a real server leaves it out rather than calling it a
+    // table (ADR 0064). `of_kind` gives the exclusion for free now that the two have different
+    // kinds; the views have to be added.
+    let views = relations.of_kind(RelKind::View).map(|relation| {
+        vec![
+            Datum::Text(relation.schema.clone()),
+            Datum::Text(relation.name.clone()),
+            Datum::Text("VIEW".to_owned()),
+        ]
+    });
     Ok(relations
         .of_kind(RelKind::Table)
         .map(|relation| {
@@ -64,6 +76,7 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                 Datum::Text("BASE TABLE".to_owned()),
             ]
         })
+        .chain(views)
         .collect())
 }
 

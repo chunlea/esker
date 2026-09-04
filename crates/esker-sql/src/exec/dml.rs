@@ -209,7 +209,7 @@ pub(super) fn column_default_value(
     clippy::cast_possible_truncation,
     reason = "`in_range` checks the bound first, which is what makes each cast exact"
 )]
-fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
+pub(super) fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
     if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
         return Ok(value);
     }
@@ -256,6 +256,26 @@ fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
             .ok_or_else(out_of_range),
         };
     }
+    // **A `numeric` into an integer rounds the other way**, half *away from zero* — the comment
+    // above says so and nothing implemented it, so this fell to the text path and refused the row:
+    // `22P02 invalid input syntax for type integer: "10.50"` for a value PostgreSQL stores as 11.
+    // Measured in one session against the float rule beside it: `12.5::numeric` is **13** and
+    // `-12.5::numeric` is **-13**, where `12.5::float8` is **12**.
+    if let Datum::Numeric(number) = &value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        let rounded = crate::value::numeric::round_half_away_to_integer(number);
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        return match ty {
+            ColumnType::Int2 => i16::try_from(rounded)
+                .map(Datum::Int2)
+                .map_err(|_| out_of_range()),
+            ColumnType::Int4 => i32::try_from(rounded)
+                .map(Datum::Int4)
+                .map_err(|_| out_of_range()),
+            _ => Ok(Datum::Int8(rounded)),
+        };
+    }
     match value.to_text() {
         Some(text) => Datum::from_text(ty, &text),
         None => Ok(Datum::Null),
@@ -279,6 +299,23 @@ fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
     })
 }
 
+/// **A materialized view is not writable**, and this is the only thing that says so.
+///
+/// The relation is a table underneath
+/// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)),
+/// so without this every row-writing path would happily write to one — and the next `REFRESH`
+/// would silently throw the writes away, which is worse than refusing. Measured: `INSERT`, `UPDATE`
+/// and `DELETE` all give the identical sentence, and it is not the `is not a table` message
+/// `TRUNCATE` gives for the same relation.
+fn refuse_matview_write(table: &TableDef, named: &str) -> Result<()> {
+    if table.matview.is_some() {
+        return Err(SqlError::CannotChangeMatview(crate::catalog::display_name(
+            named,
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn insert(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -287,6 +324,7 @@ pub(super) fn insert(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&insert.table)?;
     let table = executor.require_table(txn, &insert.table)?;
+    refuse_matview_write(&table, &insert.table)?;
     let targets = target_columns(&table, insert)?;
     let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
     // The row keys this statement has written, for the `21000` above. Only `ON CONFLICT` fills it:
@@ -725,6 +763,7 @@ pub(super) fn update(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
     let named = executor.require_table(txn, &update.table)?;
+    refuse_matview_write(&named, &update.table)?;
     let chain = update.chain();
     // Resolved once and **before the first row is read**, so a `FROM` naming nothing is `42P01`
     // with nothing written. The same lookup a `SELECT`'s `FROM` entry gets, which is what makes a
@@ -855,6 +894,7 @@ pub(super) fn delete(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
     let named = executor.require_table(txn, &delete.table)?;
+    refuse_matview_write(&named, &delete.table)?;
     let mut returned = Returned::open(delete.returning.as_ref(), &named)?;
     let mut count = 0;
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,

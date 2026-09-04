@@ -83,6 +83,15 @@ pub enum RelKind {
     /// reported as a table makes `table_exists?` true where a real server says false — measured in
     /// `tests/corpus/pg19_view.txt`, which asserts both counts.
     View,
+    /// A materialized view: `relkind` `m`.
+    ///
+    /// **A table underneath**
+    /// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)),
+    /// so it answers `pg_attribute` and `pg_index` as a table does — which is what PostgreSQL does
+    /// too. The letter is what separates it: `ActiveRecord`'s `table_exists?` asks for
+    /// `relkind IN ('r','p')` and its `views` for `('v','m')`, so one reported as `r` is a table
+    /// to the adapter and `view_test.rb`'s `test_table_exists` asserts it is not.
+    MaterializedView,
     /// The index behind an `EXCLUDE` constraint: `relkind` `i`, and `pg_am` says `gist`.
     ///
     /// **Synthesised, not stored.** Every other relation here comes from a name record; this one
@@ -106,6 +115,7 @@ impl RelKind {
             RelKind::Index | RelKind::PrimaryKey | RelKind::Exclusion => "i",
             RelKind::Sequence => "S",
             RelKind::View => "v",
+            RelKind::MaterializedView => "m",
         }
     }
 }
@@ -151,6 +161,12 @@ pub struct Relations {
     /// anyway, so `pg_get_viewdef(oid)` costs no lookup per row. The same trade `user_types`
     /// makes, and for the same reason.
     view_definitions: BTreeMap<u64, String>,
+    /// Every view's published columns, by oid — resolved when the view was created and read out of
+    /// the same record `view_definitions` comes from, so `pg_attribute` can answer for a view
+    /// without planning its body per query.
+    ///
+    /// Empty for a view stored before record version 30, which held no types.
+    view_columns: BTreeMap<u64, Vec<super::ViewColumn>>,
 }
 
 impl Relations {
@@ -192,15 +208,18 @@ impl Relations {
             .into_iter()
             .map(|def| (def.oid, def))
             .collect();
-        let view_definitions = super::views(txn, tenant)?
-            .into_iter()
-            .map(|view| (view.id, view.definition))
-            .collect();
+        let mut view_definitions = BTreeMap::new();
+        let mut view_columns = BTreeMap::new();
+        for view in super::views(txn, tenant)? {
+            view_definitions.insert(view.id, view.definition);
+            view_columns.insert(view.id, view.columns);
+        }
         Ok(Relations {
             rows,
             tables,
             user_types,
             view_definitions,
+            view_columns,
         })
     }
 
@@ -212,6 +231,16 @@ impl Relations {
     #[must_use]
     pub fn view_definition(&self, oid: u64) -> Option<&str> {
         self.view_definitions.get(&oid).map(String::as_str)
+    }
+
+    /// The columns a view publishes, by oid, or `None` when the oid is not a view's.
+    ///
+    /// **`Some(&[])` and `None` are different answers.** An empty slice is a view stored before
+    /// record version 30 knew types — it publishes nothing to `pg_attribute` — and `None` is a
+    /// relation that is not a view at all.
+    #[must_use]
+    pub fn view_columns(&self, oid: u64) -> Option<&[super::ViewColumn]> {
+        self.view_columns.get(&oid).map(Vec::as_slice)
     }
 
     /// The name of the user-defined type with this oid, or `None`.
@@ -279,7 +308,10 @@ impl Relations {
         let row = self.by_oid(oid)?;
         let table = self.table(row)?;
         match row.kind {
-            RelKind::Table => table.comment.as_deref(),
+            // A materialized view's record **is** a table's, comment field included — so it
+            // answers here the way the table it is does, and `COMMENT ON` reaching one would need
+            // no second place to store it.
+            RelKind::Table | RelKind::MaterializedView => table.comment.as_deref(),
             RelKind::PrimaryKey => table.primary_key_comment.as_deref(),
             RelKind::Index => table.indexes.get(row.index_at?)?.comment.as_deref(),
             // An `EXCLUDE` constraint's index is synthesised from the constraint and has no record
@@ -338,12 +370,19 @@ fn row_of(
     let (schema, name) = (schema.to_owned(), name.to_owned());
     Ok(match relation {
         Relation::Table { table_id } => {
-            load_table(txn, tenant, table_id, tables)?;
+            // **A materialized view is a table record**, and this is where the two part company:
+            // the letter, and everything downstream that branches on it (ADR 0064).
+            let table = load_table(txn, tenant, table_id, tables)?;
+            let kind = if table.matview.is_some() {
+                RelKind::MaterializedView
+            } else {
+                RelKind::Table
+            };
             RelationRow {
                 oid: as_oid(table_id),
                 name: name.clone(),
                 schema: schema.clone(),
-                kind: RelKind::Table,
+                kind,
                 table_id,
                 index_at: None,
                 exclude_at: None,
