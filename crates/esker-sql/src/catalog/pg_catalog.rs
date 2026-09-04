@@ -853,6 +853,21 @@ const AVAILABLE_EXTENSIONS: [(&str, &str); 5] = [
     ("uuid-ossp", "1.1"),
 ];
 
+/// The column types an extension provides, which is what a `DROP EXTENSION` has to account for.
+///
+/// **Only the two that reach a column.** `pgcrypto` and `uuid-ossp` bring functions, and `plpgsql`
+/// a language; none of them can be the type of a stored column, so dropping one takes nothing with
+/// it. If a third type-bearing extension arrives, this is the list that has to learn it — and the
+/// symptom of forgetting would be a column whose type nothing declares.
+#[must_use]
+pub fn extension_types(extension: &str) -> &'static [ColumnType] {
+    match extension {
+        "citext" => &[ColumnType::Citext],
+        "hstore" => &[ColumnType::Hstore, ColumnType::HstoreArray],
+        _ => &[],
+    }
+}
+
 /// The extension every database has installed before anything runs.
 const PRE_INSTALLED: (&str, &str) = ("plpgsql", "1.0");
 

@@ -206,13 +206,12 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
             "ALTER TABLE ... ALTER COLUMN",
         ),
         ("ALTER TABLE t RENAME TO u", "ALTER TABLE ... RENAME TO"),
+        // Still refused, and this is the one that keeps the `ADD CONSTRAINT` arm honest now that
+        // `UNIQUE` and `FOREIGN KEY` and `CHECK` are through it: a kind it cannot build must still
+        // name itself rather than fall through.
         (
-            "ALTER TABLE t ADD CONSTRAINT c UNIQUE (a)",
+            "ALTER TABLE t ADD CONSTRAINT c PRIMARY KEY (a)",
             "ALTER TABLE ... ADD CONSTRAINT",
-        ),
-        (
-            "ALTER TABLE t DROP CONSTRAINT c",
-            "ALTER TABLE ... DROP CONSTRAINT",
         ),
         ("ALTER TABLE ONLY t ADD COLUMN c int8", "ALTER TABLE ONLY"),
         ("ALTER TABLE t OWNER TO someone", "ALTER TABLE ..."),
