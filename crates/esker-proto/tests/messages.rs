@@ -13,7 +13,9 @@ use esker_proto::fragment::{
     Value, ValueType,
 };
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
-use esker_proto::pd::{ColumnarWish, Operator, PdReq, PdResp, StoreInfo};
+use esker_proto::pd::{
+    ColumnarWish, Operator, PdMemberInfo, PdMembership, PdRaftBatch, PdReq, PdResp, StoreInfo,
+};
 use esker_proto::schema::{SchemaReq, SchemaResp};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 use esker_proto::{
@@ -80,6 +82,13 @@ fn pd_region() -> Region {
 /// The cluster id every `Pd` golden but `Bootstrap` carries.
 const PD_CLUSTER: u64 = 0xABCD;
 
+/// The placement-driver group id the `Pd::Raft` goldens carry.
+///
+/// Every byte distinct, because the field is a **fixed** eight little-endian bytes rather than a
+/// varint — a group id is a hash, so it is large in the ordinary case — and a value with repeated
+/// bytes would not catch a byte order that had been reversed.
+const PD_GROUP: u64 = 0x0123_4567_89AB_CDEF;
+
 /// The `Pd` goldens, in their own function: `docs/DESIGN.md` §9 gives the service six methods,
 /// and a corpus function holding every message of every service is one nobody reads.
 /// The columnar report's two wishes: one bounded range and one running to the end of the key
@@ -99,28 +108,48 @@ fn columnar_wishes() -> Vec<ColumnarWish> {
     ]
 }
 
-fn golden_pd_requests() -> Vec<(&'static str, Request)> {
+/// The two `Pd::Raft` goldens, apart from the rest.
+///
+/// Not to satisfy a line count: these are the only PD requests sent **between two placement
+/// drivers** rather than by a client to one, they carry no cluster id that means anything, and
+/// their payload is `esker-raft`'s codec rather than this crate's. Reading them beside a
+/// heartbeat would suggest they are the same kind of thing.
+fn golden_pd_raft_requests() -> Vec<(&'static str, Request)> {
     vec![
         (
-            "pd-report-columnar",
+            "pd-raft",
             Request::Pd {
                 cluster_id: PD_CLUSTER,
-                request: PdReq::ReportColumnar {
-                    wishes: columnar_wishes(),
-                },
+                request: PdReq::Raft(PdRaftBatch::new(
+                    PD_GROUP,
+                    2,
+                    vec![Message::TimeoutNow {
+                        from: 2,
+                        to: 3,
+                        term: 9,
+                    }],
+                )),
             },
         ),
+        // An empty batch is legal — "nothing to say" — and it is a different shape on the wire
+        // from a batch of one, so it gets a golden rather than an assumption.
         (
-            "pd-bootstrap",
+            "pd-raft-empty",
             Request::Pd {
-                // Zero: the caller does not know the cluster id yet, which is the whole
-                // reason it is asking.
-                cluster_id: 0,
-                request: PdReq::Bootstrap {
-                    store: StoreInfo::new(1, "127.0.0.1:20160"),
-                },
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Raft(PdRaftBatch::new(PD_GROUP, 2, Vec::new())),
             },
         ),
+    ]
+}
+
+/// The two heartbeats, apart from the rest.
+///
+/// Their field sets are a **cross-lane contract** — exactly the ones `docs/plans/phase-4.md` §3.2
+/// pins for the store's `PdClient` (ADR 0011) — so they are worth reading as a pair rather than
+/// scattered among the methods a client calls.
+fn golden_pd_heartbeat_requests() -> Vec<(&'static str, Request)> {
+    vec![
         (
             "pd-store-heartbeat",
             Request::Pd {
@@ -145,6 +174,40 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                     term: 4,
                     approximate_size: 1 << 20,
                     applied_index: 77,
+                },
+            },
+        ),
+    ]
+}
+
+fn golden_pd_requests() -> Vec<(&'static str, Request)> {
+    let mut requests = golden_pd_raft_requests();
+    requests.extend(golden_pd_heartbeat_requests());
+    requests.extend(vec![
+        (
+            "pd-report-columnar",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::ReportColumnar {
+                    wishes: columnar_wishes(),
+                },
+            },
+        ),
+        (
+            "pd-members",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Members,
+            },
+        ),
+        (
+            "pd-bootstrap",
+            Request::Pd {
+                // Zero: the caller does not know the cluster id yet, which is the whole
+                // reason it is asking.
+                cluster_id: 0,
+                request: PdReq::Bootstrap {
+                    store: StoreInfo::new(1, "127.0.0.1:20160"),
                 },
             },
         ),
@@ -195,7 +258,8 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 },
             },
         ),
-    ]
+    ]);
+    requests
 }
 
 #[allow(clippy::too_many_lines)]
@@ -664,6 +728,47 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
             }),
         ),
         ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
+        // Empty on purpose: Raft answers Raft, so a follower's reply is a message in a later
+        // batch and not a value here.
+        ("pd-raft", Response::Pd(PdResp::Raft)),
+        (
+            "pd-members",
+            Response::Pd(PdResp::Members(PdMembership {
+                group_id: PD_GROUP,
+                this_id: 2,
+                leader_id: 2,
+                term: 7,
+                members: vec![
+                    PdMemberInfo {
+                        id: 1,
+                        address: "127.0.0.1:2379".to_owned(),
+                    },
+                    PdMemberInfo {
+                        id: 2,
+                        address: "127.0.0.1:2380".to_owned(),
+                    },
+                    PdMemberInfo {
+                        id: 3,
+                        address: "127.0.0.1:2381".to_owned(),
+                    },
+                ],
+            })),
+        ),
+        // "Nobody leads yet" is a different answer from "the leader is member zero", and only a
+        // golden for both pins the difference — the same reason `not-leader-blind` has one.
+        (
+            "pd-members-electing",
+            Response::Pd(PdResp::Members(PdMembership {
+                group_id: PD_GROUP,
+                this_id: 3,
+                leader_id: 0,
+                term: 0,
+                members: vec![PdMemberInfo {
+                    id: 3,
+                    address: "127.0.0.1:2381".to_owned(),
+                }],
+            })),
+        ),
         (
             "pd-get-region",
             Response::Pd(PdResp::GetRegion {
@@ -872,8 +977,9 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
     responses
 }
 
-// A list of sixteen literals, one per error code. Splitting it to satisfy a line count would
-// make it harder to check against the golden file, which is the whole job of this function.
+// One literal per error code, and two apiece for the two that carry an optional hint. Splitting
+// it to satisfy a line count would make it harder to check against the golden file, which is the
+// whole job of this function.
 #[allow(clippy::too_many_lines)]
 fn golden_errors() -> Vec<(&'static str, ProtoError)> {
     vec![
@@ -1002,6 +1108,23 @@ fn golden_errors() -> Vec<(&'static str, ProtoError)> {
             ProtoError::ClusterMismatch {
                 expected: 0xDEAD_BEEF,
                 actual: 1,
+            },
+        ),
+        (
+            "pd-not-leader",
+            ProtoError::PdNotLeader {
+                leader_id: 2,
+                leader_address: "127.0.0.1:2380".to_owned(),
+            },
+        ),
+        // The blind case is its own golden for the reason `not-leader-blind` is: "I do not know
+        // who leads" is a different answer from "the leader is at the empty address", and only a
+        // golden for both pins the difference.
+        (
+            "pd-not-leader-blind",
+            ProtoError::PdNotLeader {
+                leader_id: 0,
+                leader_address: String::new(),
             },
         ),
     ]
