@@ -224,3 +224,55 @@ fn write_skew_is_caught_with_a_savepoint_open() {
         .expect_err("a savepoint must not turn validation off");
     assert_eq!(refused.sqlstate(), "40001", "{refused}");
 }
+
+/// **A write to a row committed since this transaction's snapshot fails at the statement, not at
+/// the commit** — under REPEATABLE READ and SERIALIZABLE, which keep one snapshot for their whole
+/// life.
+///
+/// PostgreSQL raises `40001` from the `UPDATE` itself: the row it would write is newer than the
+/// snapshot it can see, and there is no re-read available to a level that may not take one. This
+/// node deferred it to the commit, where the per-key check found it — the same code, from a
+/// statement the client had already been told succeeded.
+///
+/// Measured against the suite rather than reasoned:
+/// `transaction_nested_test.rb`'s *"`SerializationFailure` inside nested `SavepointTransaction` is
+/// recoverable"* asserts the raise around the **inner** block, so a `40001` at `COMMIT` arrives
+/// after the assertion has already failed. That test is why this exists, and it is the shape the
+/// savepoint-forward fix did **not** close.
+#[test]
+fn a_repeatable_read_write_over_a_newer_commit_fails_at_the_statement() {
+    let pair = Pair::new(&[
+        "CREATE TABLE snap (id bigint primary key, n bigint)",
+        "INSERT INTO snap VALUES (1, 1)",
+    ]);
+
+    let mut held = pair.session();
+    held.run("BEGIN").unwrap();
+    held.run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    // The snapshot is taken here, and this level keeps it.
+    assert_eq!(held.rows("SELECT n FROM snap WHERE id = 1"), [["1"]]);
+
+    // Another session commits the row, and finishes: nothing is held by the time we write.
+    let mut other = pair.session();
+    other.run("UPDATE snap SET n = 2 WHERE id = 1").unwrap();
+
+    let refused = held
+        .run("UPDATE snap SET n = 4 WHERE id = 1")
+        .expect_err("the row is newer than this transaction's snapshot");
+    assert_eq!(refused.sqlstate(), "40001", "{refused}");
+    held.run("ROLLBACK").unwrap();
+
+    // And READ COMMITTED, which may re-read, still proceeds: it waits for nobody, re-runs on the
+    // committed value and writes 4 over 2.
+    let mut fresh = pair.session();
+    fresh.run("BEGIN").unwrap();
+    fresh.rows("SELECT n FROM snap WHERE id = 1");
+    let mut third = pair.session();
+    third.run("UPDATE snap SET n = 3 WHERE id = 1").unwrap();
+    fresh
+        .run("UPDATE snap SET n = 4 WHERE id = 1")
+        .expect("READ COMMITTED re-reads rather than refusing");
+    fresh.run("COMMIT").unwrap();
+    assert_eq!(fresh.rows("SELECT n FROM snap WHERE id = 1"), [["4"]]);
+}

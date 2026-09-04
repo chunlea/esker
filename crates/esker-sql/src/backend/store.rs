@@ -340,6 +340,16 @@ impl Txn for StoreTxn {
         self.held.clear();
     }
 
+    fn locks(&self) -> crate::backend::LockView {
+        // A poisoned table answers "nothing held" rather than panicking: `pg_locks` is a
+        // diagnostic, and a diagnostic that takes the node down when the node is already in
+        // trouble is worse than one that says less.
+        self.locks
+            .lock()
+            .map(|locks| locks.view())
+            .unwrap_or_default()
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.open()?.get(key).map_err(translate)
     }

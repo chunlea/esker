@@ -100,6 +100,25 @@ pub fn table_row_prefix(tenant: u64, table_id: u64) -> Vec<u8> {
     out
 }
 
+/// The tenant and table a row key belongs to, or `None` when it is not a row key.
+///
+/// The inverse of [`table_row_prefix`], and it lives here because that is where the layout is
+/// written: a reader that took the two `u64`s apart itself would be a second place to update when
+/// the prefix changes (`CLAUDE.md` invariant 7 — key semantics live in `esker-keys`).
+///
+/// **Total, and refuses rather than guesses**: an index entry, a metadata key, a key too short to
+/// hold the header, all answer `None`. `pg_locks` reads it over keys it did not build.
+#[must_use]
+pub fn row_key_table(key: &[u8]) -> Option<(u64, u64)> {
+    const HEADER: usize = 1 + 8 + 8 + 1;
+    if key.len() < HEADER || key[0] != SQL || key[HEADER - 1] != SQL_ROW {
+        return None;
+    }
+    let tenant = u64::from_be_bytes(key[1..9].try_into().ok()?);
+    let table_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
+    Some((tenant, table_id))
+}
+
 /// `'t' ++ tenant ++ table_id ++ 'i' ++ index_id` — the prefix one index shares.
 ///
 /// TODO(phase-6): the indexed columns and row id are appended by `esker-sql`.
@@ -278,5 +297,30 @@ mod tests {
         assert!(split_ts(b"short").is_err());
         assert!(split_ts(b"").is_err());
         assert!(split_ts(&[0u8; 8]).is_ok());
+    }
+
+    /// The inverse really is the inverse, and it refuses what it did not build.
+    #[test]
+    fn a_row_key_names_its_tenant_and_table() {
+        let key = table_row_prefix(7, 42);
+        assert_eq!(row_key_table(&key), Some((7, 42)));
+        let mut longer = key.clone();
+        longer.extend_from_slice(b"whatever the primary key encodes to");
+        assert_eq!(row_key_table(&longer), Some((7, 42)));
+
+        assert_eq!(
+            row_key_table(&table_index_prefix(7, 42, 1)),
+            None,
+            "an index entry is not a row"
+        );
+        assert_eq!(row_key_table(&[SQL]), None, "too short to hold the header");
+        assert_eq!(row_key_table(b""), None);
+        let mut wrong = key.clone();
+        wrong[0] = META;
+        assert_eq!(
+            row_key_table(&wrong),
+            None,
+            "another namespace is not a row key"
+        );
     }
 }
