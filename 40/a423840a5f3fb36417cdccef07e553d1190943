@@ -1,0 +1,16 @@
+crates/esker-engine/src/db/ingest.rs
+  h_44076b318daf9c 287-313
+docs/plans/debt-c6.md
+  h_44076b318daf9c 304-321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "40a423840a5f3fb36417cdccef07e553d1190943",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
