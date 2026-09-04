@@ -81,7 +81,20 @@ impl Cluster {
                 )
             })
             .collect();
-        Cluster { sessions }
+        let mut cluster = Cluster { sessions };
+        // **A ceiling the *harness* imposes, not the server.** `lock_timeout` boots at `0` here as
+        // it does on a real server — wait forever — and a single-threaded replay cannot wait for a
+        // session that has no thread to run on: the corpus's deadlock rows would block this
+        // process rather than fail it. So every session of this replay is given a bound, which the
+        // corpus's own `SET LOCAL lock_timeout` lines then override where they mean to. A test
+        // harness bounding itself is not a divergence; a server default would have been.
+        for name in names {
+            cluster
+                .session(*name)
+                .run("SET lock_timeout = '250ms'")
+                .expect("the harness's own ceiling");
+        }
+        cluster
     }
 
     fn session(&mut self, name: char) -> &mut Session {
@@ -441,21 +454,25 @@ fn corpus() -> Vec<(usize, char, String, String)> {
 
 /// **`0` is the truth and it is accepted; anything else is refused by name.**
 ///
-/// `statement_timeout` boots at `0` as a real server does. **`lock_timeout` does not**, and that
-/// is a declared divergence in a parameter's *value* rather than a lie about a condition: a wait
-/// with no ceiling on a node whose deadlock detection is node-local is a wait that can hang a
-/// client with nothing to tell it, so the default is a real ceiling that `SHOW` reports honestly
+/// **Both boot at `0`, as a real server does**, and one of them is now honoured for a real value.
+///
+/// A non-zero `lock_timeout` default was tried and reverted: a long-held lock in another worker is
+/// normal in a Rails application and PostgreSQL waits for it, so a node that gives up after some
+/// seconds fails a workload a real server serves — and `SHOW` reporting the ceiling honestly makes
+/// the incompatibility documented rather than absent
 /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
-/// `SET lock_timeout = 0` gives a caller PostgreSQL's behaviour and its risk.
 #[test]
 fn a_timeout_of_zero_is_accepted_and_a_real_one_is_refused_by_name() {
     let mut cluster = Cluster::new(&['A']);
     let session = cluster.session('A');
 
+    // The harness gives its own sessions a ceiling so a single-threaded replay cannot hang
+    // (`Cluster::new`); this test is about the *server's* boot value, so it undoes that first.
+    session.run("RESET lock_timeout").unwrap();
     assert_eq!(
         session.rows("SHOW lock_timeout"),
-        [[esker_sql::parameter::DEFAULT_LOCK_TIMEOUT]],
-        "lock_timeout boots at a real ceiling here, declared"
+        [["0"]],
+        "lock_timeout boots at PostgreSQL's own default: wait forever"
     );
     // **`lock_timeout` is honoured for a real value now**, which is the first timeout this node
     // can keep: a waiter is a loop the SQL layer drives, so it is cancellable in a way a statement

@@ -121,3 +121,150 @@ fn a_waiter_whose_locker_commits_commits_too_and_sees_the_new_row() {
         "the arithmetic is on A's committed version, not on the one B first read"
     );
 }
+
+/// **The locker aborts, and the waiter works from the row as it was.** Measured on PostgreSQL 19:
+/// `n + 100` over a row A had moved to 11 and then rolled back gives **110**.
+///
+/// The pair to the test above, and the reason the re-run reads rather than replays: what the
+/// waiter must use is whatever is *committed* when the wait ends, which is the original row here
+/// and A's new one there. A design that remembered A's value and applied it would answer 111 to
+/// both.
+#[test]
+fn a_waiter_whose_locker_aborts_works_from_the_row_as_it_was() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A's write is buffered");
+        b.run("BEGIN").unwrap();
+        reached(&b_says, "B is about to write");
+        let update = b.run("UPDATE rc SET n = n + 100 WHERE id = 1");
+        let commit = b.run("COMMIT");
+        (update, commit)
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE rc SET n = n + 1 WHERE id = 1").unwrap();
+    reached(&a_says, "A's write is buffered");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("ROLLBACK").unwrap();
+
+    let (update, commit) = waiter.join().unwrap();
+    update.expect("B waits for A and then proceeds");
+    commit.expect("a rolled-back locker leaves nothing to conflict with");
+
+    let mut reader = pair.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM rc WHERE id = 1"),
+        [["110"]],
+        "A's write never happened, so B's input is the row it first read"
+    );
+}
+
+/// **`EvalPlanQual`: a row whose `WHERE` stops matching is skipped, not failed.**
+///
+/// A changes the column B's predicate tests. B waits, re-runs, and its `WHERE` no longer selects
+/// the row — so B updates *nothing* and says so. Measured: `n` stayed 10 and the `UPDATE` reported
+/// no rows.
+///
+/// This is the row that says the re-run is a re-**evaluation** and not a retry of a decision already
+/// already made. An implementation that waited and then applied the update it had planned would write a
+/// row its own `WHERE` no longer matches.
+#[test]
+fn a_row_that_stops_matching_is_skipped_by_the_waiter() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint, tag text)",
+        "INSERT INTO rc (id, n, tag) VALUES (1, 10, 'a')",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A's write is buffered");
+        b.run("BEGIN").unwrap();
+        reached(&b_says, "B is about to write");
+        let update = b.run("UPDATE rc SET n = n + 100 WHERE tag = 'a'");
+        let commit = b.run("COMMIT");
+        (update, commit)
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE rc SET tag = 'moved' WHERE id = 1").unwrap();
+    reached(&a_says, "A's write is buffered");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("COMMIT").unwrap();
+
+    let (update, commit) = waiter.join().unwrap();
+    update.expect("a row that no longer qualifies is skipped, not an error");
+    commit.expect("B wrote nothing, so it has nothing to conflict over");
+
+    let mut reader = pair.session();
+    assert_eq!(
+        reader.rows("SELECT n, tag FROM rc WHERE id = 1"),
+        [["10", "moved"]],
+        "B's WHERE stopped matching, so B left the row alone"
+    );
+}
+
+/// **What protects the keys an earlier statement wrote is the lock, not the timestamp** — which
+/// is a stronger answer than ADR 0057 §4 asked for, and worth writing down because the ADR's own
+/// test list asked for the weaker one.
+///
+/// §4 worried that a fresh read timestamp might become a licence to lose an update: a transaction
+/// writes row 1, then waits on row 2 and re-runs, and a third transaction commits row 1 while it
+/// waited. The per-key rule answers that — row 1 keeps its own, older stamp — but with row locks
+/// taken at the statement (unit 1) the situation **cannot arise at all**: row 1 is locked from the
+/// moment it is written until the transaction ends, so nobody else can commit it in the middle.
+///
+/// So the assertion is the lock's: a third session that tries waits, and says so.
+#[test]
+fn a_key_an_earlier_statement_wrote_is_held_until_the_transaction_ends() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10), (2, 20)",
+    ]);
+    let (b_says, hears_b) = channel();
+    let (c_says, hears_c) = channel();
+
+    let mut b = pair.session();
+    let holder = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        b.run("UPDATE rc SET n = n + 100 WHERE id = 1").unwrap();
+        reached(&b_says, "B has written row 1");
+        edge(&hears_c, "C has tried and failed to take row 1");
+        b.run("COMMIT").unwrap();
+    });
+
+    edge(&hears_b, "B has written row 1");
+    let mut c = pair.session();
+    // Bounded, because the point is that this *waits*: with `lock_timeout` at PostgreSQL's own
+    // default it would wait until B ended, which is exactly the guarantee under test.
+    c.run("SET lock_timeout = '150ms'").unwrap();
+    let blocked = c
+        .run("UPDATE rc SET n = 999 WHERE id = 1")
+        .expect_err("row 1 is B's until B ends");
+    assert_eq!(
+        blocked.sqlstate(),
+        "55P03",
+        "a third session waits for a row an open transaction wrote: {blocked}"
+    );
+    reached(&c_says, "C has tried and failed to take row 1");
+    holder.join().unwrap();
+
+    let mut reader = pair.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM rc WHERE id = 1"),
+        [["110"]],
+        "B's value stands: C never got the row"
+    );
+}

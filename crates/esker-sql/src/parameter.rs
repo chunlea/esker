@@ -171,17 +171,18 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Duration,
         read_only: false,
     },
-    // **A non-zero default, where a real server's is `0`.** PostgreSQL waits for a row lock
-    // forever unless told otherwise, and relies on its deadlock detector to end the waits that
-    // will never end. This node detects a cycle between two sessions of one process (ADR 0057)
-    // and cannot see one that runs across nodes, so a wait with no ceiling is a wait that can
-    // hang a client with nothing to tell it. A default ceiling is a **declared divergence in a
-    // parameter's value**, which `SHOW lock_timeout` reports honestly, rather than a lie about a
-    // condition — and `SET lock_timeout = 0` gives a caller PostgreSQL's behaviour and its risk.
+    // **`0`, which is PostgreSQL's: wait forever.** A ceiling was tried here and reverted, and the
+    // reason is worth keeping: a long-held lock in another worker is *normal* in a Rails
+    // application and a real server waits for it, so a node that gives up after some seconds fails
+    // a production workload that PostgreSQL serves — and `SHOW` reporting the ceiling honestly
+    // does not make the node compatible, it only makes the incompatibility documented. If this
+    // node ever needs self-protection from an unbounded wait it belongs in a setting of its own,
+    // named as esker's and off by default, never in the default of a parameter a client already
+    // knows the meaning of.
     Parameter {
         name: "lock_timeout",
         reported: "lock_timeout",
-        boot: DEFAULT_LOCK_TIMEOUT,
+        boot: "0",
         values: Values::Duration,
         read_only: false,
     },
@@ -514,12 +515,6 @@ fn is_utc(value: &str) -> bool {
         "utc" | "etc/utc" | "universal" | "zulu" | "z" | "+00:00" | "utc+0" | "utc-0"
     )
 }
-
-/// How long a writer waits for a row before giving up, when nobody has said.
-///
-/// PostgreSQL's default is `0` — wait forever — because its deadlock detector ends the waits that
-/// would not end. See the parameter's own note for why this node's is not zero.
-pub const DEFAULT_LOCK_TIMEOUT: &str = "5s";
 
 /// `lock_timeout`, which bounds how long a writer waits for the row in front of it (ADR 0057).
 #[must_use]
