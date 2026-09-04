@@ -35,7 +35,7 @@
 //! or its signatures would put `sqlparser` types in this crate's public API, which is the one thing
 //! ADR 0014 exists to prevent.
 
-mod lower;
+pub(crate) mod lower;
 pub(crate) use lower::DATABASE_NAME;
 
 use sqlparser::ast::{ObjectType, Statement};
