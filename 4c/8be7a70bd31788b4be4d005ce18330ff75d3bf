@@ -1,0 +1,19 @@
+docs/plans/phase-15-pd-ha.md
+  s_555c5659f0909b::t_9dcf4db802bd0c 574-596,646-650
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4c8be7a70bd31788b4be4d005ce18330ff75d3bf",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
