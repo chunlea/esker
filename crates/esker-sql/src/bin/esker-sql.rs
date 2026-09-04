@@ -21,8 +21,8 @@ use esker_sql::exec::redrive::ReDriver;
 use esker_sql::fragment::{ClientFragments, FragmentSource};
 use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
-use esker_sql::pgwire::tls::TlsConfig;
 use esker_sql::pgwire::session::Execute;
+use esker_sql::pgwire::tls::TlsConfig;
 
 /// The tenant every connection is served as, until there is a way to say otherwise.
 const TENANT: u64 = 1;

@@ -84,7 +84,10 @@ fn startup_packet() -> Vec<u8> {
         body.push(0);
     }
     body.push(0);
-    let mut packet = u32::try_from(body.len() + 4).unwrap().to_be_bytes().to_vec();
+    let mut packet = u32::try_from(body.len() + 4)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     packet.extend_from_slice(&body);
     packet
 }
@@ -221,7 +224,9 @@ mod encrypted {
         let mut roots = rustls::RootCertStore::empty();
         let certificate = std::fs::read_to_string(fixture("ca-cert.pem")).unwrap();
         let der = pem_certificate(&certificate);
-        roots.add(rustls::pki_types::CertificateDer::from(der)).unwrap();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .unwrap();
         let provider = Arc::new(rustls_graviola::default_provider());
         Arc::new(
             rustls::ClientConfig::builder_with_provider(provider)
@@ -250,8 +255,7 @@ mod encrypted {
         let mut quantum = 0u32;
         let mut bits = 0;
         for byte in text.bytes().filter(|byte| *byte != b'=') {
-            let value = u32::try_from(ALPHABET.iter().position(|c| *c == byte).unwrap())
-                .unwrap();
+            let value = u32::try_from(ALPHABET.iter().position(|c| *c == byte).unwrap()).unwrap();
             quantum = (quantum << 6) | value;
             bits += 6;
             if bits >= 8 {
@@ -383,8 +387,11 @@ mod encrypted {
         let directory = std::env::temp_dir().join(format!("esker-tls-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let bad = directory.join("not-a-cert.pem");
-        std::fs::write(&bad, "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let Err(error) = TlsConfig::from_pem_files(&bad, &fixture("localhost-test-key.pem")) else {
             panic!("a certificate that is not base64 must be refused");
@@ -403,12 +410,9 @@ mod encrypted {
     }
 
     /// Drives the client half of the handshake and hands back the plaintext stream.
-    async fn handshake(
-        socket: tokio::net::TcpStream,
-    ) -> tokio::io::DuplexStream {
+    async fn handshake(socket: tokio::net::TcpStream) -> tokio::io::DuplexStream {
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let mut session =
-            rustls::ClientConnection::new(client_config(), server_name).unwrap();
+        let mut session = rustls::ClientConnection::new(client_config(), server_name).unwrap();
         let (mut socket_rx, mut socket_tx) = tokio::io::split(socket);
         let mut buffer = vec![0u8; 8 * 1024];
 

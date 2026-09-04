@@ -128,7 +128,10 @@ impl TlsConfig {
     /// [`TlsError::NotCompiledIn`] when the `tls` feature is off — never a silently disabled
     /// configuration. Otherwise: the file could not be read, held no PEM block of the right kind,
     /// was not valid base64, or `rustls` rejected the pair.
-    #[cfg_attr(not(feature = "tls"), expect(unused_variables, reason = "no TLS to configure"))]
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(unused_variables, reason = "no TLS to configure")
+    )]
     pub fn from_pem_files(certificate: &Path, key: &Path) -> Result<Self, TlsError> {
         #[cfg(not(feature = "tls"))]
         {
@@ -188,7 +191,6 @@ impl TlsConfig {
             })
         }
     }
-
 }
 
 /// A client connection, before or after it became a TLS one.
@@ -311,8 +313,10 @@ where
 {
     use tokio::io::AsyncReadExt;
 
-    let mut session = rustls::ServerConnection::new(std::sync::Arc::clone(config))
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut session =
+        rustls::ServerConnection::new(std::sync::Arc::clone(config)).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
 
     let mut buffer = vec![0u8; 8 * 1024];
     while session.is_handshaking() {
@@ -604,7 +608,10 @@ mod tests {
     /// PEM wraps at 64 columns, so the decoder has to ignore newlines wherever they fall.
     #[test]
     fn ignores_the_whitespace_pem_wraps_with() {
-        assert_eq!(base64_decode("Zm9v\nYmFy\r\n").as_deref(), Ok(&b"foobar"[..]));
+        assert_eq!(
+            base64_decode("Zm9v\nYmFy\r\n").as_deref(),
+            Ok(&b"foobar"[..])
+        );
         assert_eq!(base64_decode(" Z m 9 v ").as_deref(), Ok(&b"foo"[..]));
     }
 
@@ -655,7 +662,8 @@ Zm8=
     #[cfg(not(feature = "tls"))]
     #[test]
     fn configuring_tls_without_the_feature_is_an_error() {
-        let Err(error) = TlsConfig::from_pem_files(Path::new("/nonexistent.pem"), Path::new("/k.pem"))
+        let Err(error) =
+            TlsConfig::from_pem_files(Path::new("/nonexistent.pem"), Path::new("/k.pem"))
         else {
             panic!("a build without the feature must refuse to configure TLS");
         };
