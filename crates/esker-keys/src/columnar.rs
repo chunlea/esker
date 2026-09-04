@@ -134,6 +134,12 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::VarBit => 71,
         ColumnType::BitArray => 72,
         ColumnType::VarBitArray => 73,
+        ColumnType::Lseg => 74,
+        ColumnType::Box => 75,
+        ColumnType::Path => 76,
+        ColumnType::Polygon => 77,
+        ColumnType::Circle => 78,
+        ColumnType::Line => 79,
     }
 }
 
@@ -211,6 +217,12 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         71 => ColumnType::VarBit,
         72 => ColumnType::BitArray,
         73 => ColumnType::VarBitArray,
+        74 => ColumnType::Lseg,
+        75 => ColumnType::Box,
+        76 => ColumnType::Path,
+        77 => ColumnType::Polygon,
+        78 => ColumnType::Circle,
+        79 => ColumnType::Line,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

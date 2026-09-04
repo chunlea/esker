@@ -107,6 +107,18 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // an array key is built out of its element's key encoding and a point has none.
                 | ColumnType::Point
                 | ColumnType::PointArray
+                // **The other six geometric shapes, for `point`'s reason and with a real
+                // server's agreement**: `CREATE INDEX` on an `lseg` column is
+                // `42704 data type lseg has no default operator class for access method "btree"`,
+                // and `count(DISTINCT)` over one is
+                // `42883 could not identify an equality operator` — both measured, and both true
+                // even though the `=` operator itself answers.
+                | ColumnType::Lseg
+                | ColumnType::Box
+                | ColumnType::Path
+                | ColumnType::Polygon
+                | ColumnType::Circle
+                | ColumnType::Line
         ) {
             assert!(
                 !types_seen.contains(&ty),

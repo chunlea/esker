@@ -930,6 +930,27 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
         .as_ref()
         .map(|arg| super::query::expr_type(arg, scope))
         .transpose()?;
+    // **`DISTINCT` needs an equality *operator class*, which is not the same as an `=` that
+    // answers.** `count(DISTINCT a_line_segment)` is
+    // `42883 could not identify an equality operator for type lseg` on a real server while
+    // `'…'::lseg = '…'::lseg` is `t` — and without this the count was answered from `pg_cmp`'s
+    // text comparison, a number where PostgreSQL raises, which ADR 0031 ranks worst.
+    if call.distinct
+        && let Some(ty) = arg_type
+        && !esker_keys::row::is_index_key(ty)
+        && matches!(
+            ty,
+            ColumnType::Lseg
+                | ColumnType::Box
+                | ColumnType::Path
+                | ColumnType::Polygon
+                | ColumnType::Circle
+                | ColumnType::Line
+                | ColumnType::Point
+        )
+    {
+        return Err(SqlError::NoEqualityOperator(ty.name()));
+    }
     Ok(AggregateSpec {
         func: call.func,
         arg,

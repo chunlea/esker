@@ -1189,6 +1189,11 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
     });
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stand-in per type, in one match; splitting it would put a type's placeholder \
+              somewhere other than beside every other type's"
+)]
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
         // The origin, which is a point like any other: what stands in is never read, only its
@@ -1204,6 +1209,27 @@ fn placeholder(ty: ColumnType) -> Datum {
             addr: [0; 16],
         },
         ColumnType::MacAddr => Datum::MacAddr([0; 6]),
+        // The shape's own zero, which is never read — only its type is.
+        ColumnType::Lseg => Datum::Geometry {
+            kind: Box::new(ty),
+            text: "[(0,0),(0,0)]".to_owned(),
+        },
+        ColumnType::Box => Datum::Geometry {
+            kind: Box::new(ty),
+            text: "(0,0),(0,0)".to_owned(),
+        },
+        ColumnType::Path | ColumnType::Polygon => Datum::Geometry {
+            kind: Box::new(ty),
+            text: "((0,0))".to_owned(),
+        },
+        ColumnType::Circle => Datum::Geometry {
+            kind: Box::new(ty),
+            text: "<(0,0),0>".to_owned(),
+        },
+        ColumnType::Line => Datum::Geometry {
+            kind: Box::new(ty),
+            text: "{0,1,0}".to_owned(),
+        },
         ColumnType::Bit | ColumnType::VarBit => Datum::Bit {
             varying: ty == ColumnType::VarBit,
             bits: String::new(),

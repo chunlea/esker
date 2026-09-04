@@ -1820,6 +1820,12 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::MacAddrArray => "_macaddr",
         // **`varbit`, not `bit varying`** — `typname` is the internal name and the two differ for
         // this type as they do for `int8`/`bigint`.
+        ColumnType::Lseg => "lseg",
+        ColumnType::Box => "box",
+        ColumnType::Path => "path",
+        ColumnType::Polygon => "polygon",
+        ColumnType::Circle => "circle",
+        ColumnType::Line => "line",
         ColumnType::Bit => "bit",
         ColumnType::VarBit => "varbit",
         ColumnType::BitArray => "_bit",
@@ -1946,8 +1952,14 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
-        // `S` a string does. Measured off `pg_type.typcategory`.
-        ColumnType::Point => "G",
+        // `S` a string does. Measured off `pg_type.typcategory`, all seven.
+        ColumnType::Point
+        | ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line => "G",
         ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
         | ColumnType::FloatRange | ColumnType::VarcharRange => "R",
         // **`N`, with the numbers**, which is where a real server puts it — not `U`, where the
@@ -2025,6 +2037,14 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Inet => "inet_in",
         ColumnType::Cidr => "cidr_in",
         ColumnType::MacAddr => "macaddr_in",
+        ColumnType::Lseg => "lseg_in",
+        ColumnType::Box => "box_in",
+        ColumnType::Path => "path_in",
+        // **`poly_in`, not `polygon_in`** — the input function is named for the C type, the way
+        // `money`'s is `cash_in`. Measured.
+        ColumnType::Polygon => "poly_in",
+        ColumnType::Circle => "circle_in",
+        ColumnType::Line => "line_in",
         ColumnType::Bit => "bit_in",
         ColumnType::VarBit => "varbit_in",
         // **`range_in` for a user-defined range**, measured: a real server's `floatrange` has
