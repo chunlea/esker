@@ -176,10 +176,9 @@ fn refuses_by_name(cases: &[(&str, &str)]) {
 #[test]
 fn every_unimplemented_alter_table_action_is_refused_by_name() {
     let cases = [
-        (
-            "ALTER TABLE t ADD COLUMN c int8 NOT NULL",
-            "ADD COLUMN ... NOT NULL",
-        ),
+        // `ADD COLUMN … NOT NULL` was here. It is not a lowering question at all: whether it can
+        // be done depends on whether the table has a row, which only the executor can see
+        // (`tests/schema_change.rs`, `tests/add_column_not_null.rs`).
         // Still refused, and for the rewrite rather than for volatility: PostgreSQL gives every
         // row already stored its own value, and this `ALTER` is defined not to touch them.
         (

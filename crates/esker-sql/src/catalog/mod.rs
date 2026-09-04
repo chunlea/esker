@@ -3608,6 +3608,16 @@ pub fn drop_sequence(txn: &mut dyn Txn, tenant: u64, table_id: u64, sequence: &S
     txn.delete(&record::sequence_value_key(tenant, sequence.id));
 }
 
+/// Sets one sequence back to its start, keeping the sequence itself.
+///
+/// **The counter is a key, and deleting it is the restart**: the next `nextval` finds nothing and
+/// begins from the record's start value, which is what `TRUNCATE … RESTART IDENTITY` asks for.
+/// Without the clause the key stays and the next id carries on past the rows that are gone —
+/// measured, and the opposite of what "empty" suggests.
+pub fn restart_sequence(txn: &mut dyn Txn, tenant: u64, sequence_id: u64) {
+    txn.delete(&record::sequence_value_key(tenant, sequence_id));
+}
+
 /// Removes one table's sequences: their records, their names and their counters.
 fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
     for sequence in &table.sequences {

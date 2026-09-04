@@ -1,0 +1,88 @@
+# `ALTER TABLE … ADD COLUMN … NOT NULL` with **no** `DEFAULT`, and `TRUNCATE`.
+#
+# **Run 66: `ALTER TABLE … ADD COLUMN … NOT NULL without a DEFAULT is not supported`, 5 tests over
+# 4 files** (`change_schema_test.rb`, `columns_test.rb`, `compatibility_test.rb`,
+# `migration_test.rb`) and **`TRUNCATE TABLE is not supported`, 4 tests** (`adapter_test.rb`,
+# `database_tasks_test.rb`).
+#
+# The refusal this node gives names the pair rather than the keyword, and its reason is written
+# down: "`NOT NULL` needs a value for every row already stored, and a constant default is exactly
+# that value. Without one there is nothing to pad with, and the alternative is a rewrite this
+# `ALTER` is defined not to do."
+#
+# **That reason is only half the rule, and this capture is what says which half.** The question is
+# what PostgreSQL does when the table is *empty*, which is what every one of those five tests has.
+#
+# Things reasoning would get wrong:
+#
+#   * **An empty table takes the column.** There is no row to hold a NULL, so there is nothing to
+#     refuse — the scan finds nothing and the column is added. Five tests, one rule.
+#   * **A populated table is `23502`**, and the message names the column and the relation the way
+#     `SET NOT NULL` does rather than the way an offending `INSERT` does.
+#   * `TRUNCATE` is not `DELETE`: it takes no `WHERE`, and it **resets nothing by default** —
+#     `RESTART IDENTITY` is the clause that moves the sequence, and without it the next `nextval`
+#     carries on from where it was.
+#   * `TRUNCATE` of a table another table's foreign key points at is refused (`0A000` there is
+#     `55006`-adjacent; measured below) unless `CASCADE`.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`.
+
+BEGIN;		-
+
+-- ------------------------------------------------- ADD COLUMN NOT NULL, empty table		-
+CREATE TABLE acnn_a (id bigserial primary key, a integer);		-
+ALTER TABLE acnn_a ADD COLUMN b integer NOT NULL;		-
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'acnn_a'::regclass AND attname = 'b';		b|t
+INSERT INTO acnn_a (a, b) VALUES (1, 10);		-
+SAVEPOINT s1;		-
+INSERT INTO acnn_a (a) VALUES (2);	!23502 null value in column "b" of relation "acnn_a" violates not-null constraint DETAIL: Failing row contains (2, 2, null).
+ROLLBACK TO s1;		-
+
+-- ------------------------------------------------- and now the table is not empty		-
+SAVEPOINT s2;		-
+ALTER TABLE acnn_a ADD COLUMN c integer NOT NULL;	!23502 column "c" of relation "acnn_a" contains null values
+ROLLBACK TO s2;		-
+-- with a default it goes through, and the rows already there hold the default		-
+ALTER TABLE acnn_a ADD COLUMN d integer NOT NULL DEFAULT 7;		-
+SELECT id, d FROM acnn_a ORDER BY id;		1|7
+-- a nullable column needs no default either way		-
+ALTER TABLE acnn_a ADD COLUMN e integer;		-
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'acnn_a'::regclass AND attname IN ('d','e') ORDER BY attname;		d|t ; e|f
+
+-- ------------------------------------------------- TRUNCATE		-
+CREATE TABLE acnn_t (id bigserial primary key, v integer);		-
+INSERT INTO acnn_t (v) VALUES (1), (2), (3);		-
+SELECT count(*) FROM acnn_t;		3
+SELECT last_value FROM acnn_t_id_seq;		3
+TRUNCATE acnn_t;		-
+SELECT count(*) FROM acnn_t;		0
+-- the sequence is untouched: the next id carries on		-
+SELECT last_value FROM acnn_t_id_seq;		3
+INSERT INTO acnn_t (v) VALUES (4);		-
+SELECT id, v FROM acnn_t;		4|4
+-- RESTART IDENTITY is the clause that moves it		-
+TRUNCATE acnn_t RESTART IDENTITY;		-
+INSERT INTO acnn_t (v) VALUES (5);		-
+SELECT id, v FROM acnn_t;		1|5
+-- the spellings AR sends		-
+TRUNCATE TABLE acnn_t;		-
+SELECT count(*) FROM acnn_t;		0
+TRUNCATE TABLE acnn_t RESTART IDENTITY CASCADE;		-
+SELECT count(*) FROM acnn_t;		0
+-- two tables in one statement		-
+CREATE TABLE acnn_t2 (id bigserial primary key);		-
+INSERT INTO acnn_t2 DEFAULT VALUES;		-
+TRUNCATE acnn_t, acnn_t2;		-
+SELECT (SELECT count(*) FROM acnn_t) + (SELECT count(*) FROM acnn_t2);		0
+-- a table a foreign key points at		-
+CREATE TABLE acnn_p (id bigint PRIMARY KEY);		-
+CREATE TABLE acnn_c (id bigint PRIMARY KEY, p bigint REFERENCES acnn_p (id));		-
+INSERT INTO acnn_p VALUES (1);		-
+SAVEPOINT s3;		-
+TRUNCATE acnn_p;	!0A000 cannot truncate a table referenced in a foreign key constraint DETAIL: Table "acnn_c" references "acnn_p". HINT: Truncate table "acnn_c" at the same time, or use TRUNCATE ... CASCADE.
+ROLLBACK TO s3;		-
+TRUNCATE acnn_p CASCADE;		-
+SELECT count(*) FROM acnn_p;		0
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname IN ('acnn_a','acnn_t','acnn_t2','acnn_p','acnn_c');	bigint	0
