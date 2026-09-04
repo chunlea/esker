@@ -1,0 +1,47 @@
+crates/esker-cli/src/pd.rs
+  s_555c5659f0909b::t_fded7dfab93e6c 115,231,525
+crates/esker-pd/src/driver.rs
+  s_555c5659f0909b::t_eb74a596380409 227
+crates/esker-pd/src/member.rs
+  s_555c5659f0909b::t_aab1fb66e8b7b8 36,79,249
+crates/esker-pd/src/pd/mod.rs
+  s_555c5659f0909b::t_51da1b0e5f46a0 330,451,665
+crates/esker-pd/src/raft_log.rs
+  s_555c5659f0909b::t_1c10a7dbc78ee5 54,178,433,795
+crates/esker-pd/src/service.rs
+  s_555c5659f0909b::t_224b0e5e9ff037 289
+crates/esker-pd/src/wiring.rs
+  s_555c5659f0909b::t_aae9069e48f9f3 7,24
+crates/esker-pd/tests/failover.rs
+  s_555c5659f0909b::t_3912b76f117470 272,1001
+crates/esker-pd/tests/membership.rs
+  s_555c5659f0909b::t_3c9219dfd5b75c 4,42
+crates/esker-proto/src/messages.rs
+  s_555c5659f0909b::t_ee189d3c03f8d3 106
+crates/esker-proto/src/pd.rs
+  s_555c5659f0909b::t_efb79b6cc33625 1461
+crates/esker-store/src/pd_remote.rs
+  s_555c5659f0909b::t_a54f54adf7b3e8 48,236
+docs/DESIGN.md
+  s_555c5659f0909b::t_794976a1e0576e 540,1004
+docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md
+  s_555c5659f0909b::t_0798cd2f0df2e7 1
+docs/plans/phase-15-pd-ha.md
+  s_555c5659f0909b::t_533aa2e62bb1be 590
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a4972545e2b95059a1afea858063b6908d270fb7",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
