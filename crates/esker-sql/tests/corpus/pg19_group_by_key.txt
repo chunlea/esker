@@ -1,0 +1,62 @@
+# `must appear in the GROUP BY clause` — run 57's third row, 6 tests over 2 files.
+#
+# **The coordinator's hypothesis, and the capture says yes**: PostgreSQL accepts a bare column when
+# the `GROUP BY` contains that table's **primary key**. It is a *functional dependency* — grouping
+# by a key means one row per group of that table, so every other column of it has exactly one value
+# and needs no aggregate. `ActiveRecord` writes it constantly, because `group(:id)` on a relation
+# selecting `*` is the shape every one of these tests has.
+#
+# Things reasoning would get wrong:
+#
+# * **It is per table, not per query.** `GROUP BY f.id` frees every column of `f` and none of `a`,
+#   even in the same select list — measured, and an implementation that treated "some key is
+#   grouped" as a licence would accept a genuinely ambiguous query.
+# * **`HAVING` sees the same rule**: `GROUP BY f.id HAVING f.name = 'one'` runs, where
+#   `GROUP BY f.name HAVING f.name = 'one'` runs for the ordinary reason. Only the first needs the
+#   dependency.
+# * **The message names the column the way the query did** — `"a.credit_limit"` when the table has
+#   an alias and `"gb_firms.rating"` when it does not — and the class is `42803`.
+#
+# The capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`, and
+# the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE gb_firms (id bigint primary key, name character varying(255), rating integer)		-
+CREATE TABLE gb_accounts (id bigint primary key, firm_id bigint, credit_limit integer)		-
+INSERT INTO gb_firms (id, name, rating) VALUES (1, 'one', 5), (2, 'two', 7)		-
+INSERT INTO gb_accounts (id, firm_id, credit_limit) VALUES (1, 1, 50), (2, 1, 60), (3, 2, 70)		-
+# ---- the functional dependency: grouping by a primary key frees every column of that table ----
+SELECT 'r', f.id, f.name, f.rating, count(a.id) FROM gb_firms f LEFT JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id ORDER BY f.id		r|1|one|5|2 ; r|2|two|7|1
+SELECT 'r', id, name, rating FROM gb_firms GROUP BY id ORDER BY id		r|1|one|5 ; r|2|two|7
+SELECT 'r', id, name FROM gb_firms GROUP BY gb_firms.id ORDER BY id		r|1|one ; r|2|two
+# ---- ...and grouping by a non-key column does not ----
+SAVEPOINT g1		-
+SELECT 'r', name, rating FROM gb_firms GROUP BY name	!42803 column "gb_firms.rating" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO g1		-
+SAVEPOINT g2		-
+SELECT 'r', a.firm_id, a.credit_limit FROM gb_accounts a GROUP BY a.firm_id	!42803 column "a.credit_limit" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO g2		-
+# ---- the dependency is per table: the other table's columns are still bare ----
+SAVEPOINT g3		-
+SELECT 'r', f.name, a.credit_limit FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id	!42803 column "a.credit_limit" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO g3		-
+SELECT 'r', f.name, count(a.id) FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id ORDER BY f.name		r|one|2 ; r|two|1
+# ---- grouping by both keys frees both tables ----
+SELECT 'r', f.name, a.credit_limit FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id, a.id ORDER BY a.id		r|one|50 ; r|one|60 ; r|two|70
+# ---- HAVING sees the same rule ----
+SELECT 'r', f.id, f.name FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id HAVING count(a.id) > 1 ORDER BY f.id		r|1|one
+SAVEPOINT g4		-
+SELECT 'r', count(*) FROM gb_firms f GROUP BY f.id HAVING f.name = 'one'		r|1
+ROLLBACK TO g4		-
+SELECT 'r', count(*) FROM gb_firms f GROUP BY f.name HAVING f.name = 'one'		r|1
+# ---- what the message says when it does refuse ----
+SAVEPOINT g5		-
+SELECT 'r', rating FROM gb_firms GROUP BY name	!42803 column "gb_firms.rating" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO g5		-
+# ---- multiple group values, which is `test_find_keeps_multiple_group_values` ----
+SELECT 'r', f.id, f.name, f.rating FROM gb_firms f GROUP BY f.id, f.name, f.rating ORDER BY f.id		r|1|one|5 ; r|2|two|7
+DROP TABLE gb_accounts		-
+DROP TABLE gb_firms		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('gb_firms','gb_accounts')	bigint	0

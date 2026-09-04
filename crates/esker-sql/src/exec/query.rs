@@ -173,6 +173,31 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The **primary key of the table a resolved position belongs to**, as positions in this
+    /// scope, or `None` when that table has no declared key.
+    ///
+    /// What it is for is PostgreSQL's functional dependency: a `GROUP BY` that contains a table's
+    /// primary key leaves one row per group *of that table*, so every other column of it has
+    /// exactly one value and needs no aggregate. `ActiveRecord` writes that constantly —
+    /// `group(:id)` on a relation selecting `*`.
+    ///
+    /// **Per table, which is what the offset is here for.** `GROUP BY f.id` frees every column of
+    /// `f` and none of `a`, and a rule that asked only "is some key grouped" would accept a query
+    /// that really is ambiguous. Measured, in a join and in one select list.
+    pub(super) fn key_of(&self, at: usize) -> Option<Vec<usize>> {
+        let mut start = 0;
+        for table in &self.tables {
+            if at < start + table.columns.len() {
+                if table.primary_key.is_empty() {
+                    return None;
+                }
+                return Some(table.primary_key.iter().map(|key| start + key).collect());
+            }
+            start += table.columns.len();
+        }
+        None
+    }
+
     /// The name a `42803` prints for a resolved position: `t.c`, qualified.
     ///
     /// PostgreSQL qualifies it even when the query has one table, and in a join it is the only
