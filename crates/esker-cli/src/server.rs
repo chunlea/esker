@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::rpc_tls::RpcTlsFlags;
 use esker_proto::{Server, TransportConfig};
 use esker_store::server::RaftOptions;
 use esker_store::{PdClient, PeerAddress, RemotePd, Store, StoreOptions, StoreService};
@@ -29,6 +30,8 @@ pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:20160";
 pub(crate) struct ServerOptions {
     /// The directory holding the database. Created if it is not there.
     pub(crate) data_dir: PathBuf,
+    /// The RPC TLS this store speaks, to its clients and to its peers.
+    pub(crate) tls: RpcTlsFlags,
     /// The address to listen on.
     pub(crate) listen: String,
     /// This store's id, reported in the handshake.
@@ -96,6 +99,7 @@ pub(crate) struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
+            tls: RpcTlsFlags::default(),
             data_dir: PathBuf::from("esker-data"),
             listen: DEFAULT_LISTEN.to_owned(),
             store_id: 1,
@@ -143,6 +147,26 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         .listen
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
+
+    // **Before the database is opened.** A store told to speak TLS that came up without it would
+    // serve in the clear on a port an operator believes is protected (ADR 0055).
+    let tls = options.tls.build()?;
+    // **And a store that cannot encrypt *all* of its links refuses rather than encrypting some.**
+    // The inbound side is wired here; a replicated store's outbound peer dialling is reached
+    // through `RaftOptions` in `esker-store`, which this lane does not own — one field and one
+    // line at the `StoreTransport::spawn` call. Until that lands, a replicated store with these
+    // flags would encrypt what its clients see and leave Raft between stores in the clear, which
+    // is precisely the half-configured state every refusal in this project exists to prevent.
+    if tls.is_enabled() && !options.peers.is_empty() {
+        return Err(
+            "RPC TLS on a replicated store is not wired yet: the inbound side is, and the \
+             outbound peer links are reached through `RaftOptions` in \
+             crates/esker-store/src/server.rs, which needs one `tls` field passed to \
+             `StoreTransport::spawn_with_tls`. Refusing rather than encrypting one direction and \
+             not the other — run without --peers, or without the RPC TLS flags"
+                .to_owned(),
+        );
+    }
 
     // A replicated store's transport tasks and ticker live in a runtime, so the runtime is
     // built before the store rather than after it.
@@ -267,8 +291,12 @@ async fn serve(
     options: &ServerOptions,
 ) -> Result<(), String> {
     let service = StoreService::new(Arc::clone(&store));
+    // `run` already validated and reported these; building them again here is cheaper than
+    // threading the value through and cannot disagree, because the flags are the same flags.
+    let tls = options.tls.build()?;
     let server = Server::bind(address, service, TransportConfig::new())
         .await
+        .map(|server| server.with_tls(tls))
         .map_err(|error| format!("listening on {address}: {error}"))?;
     let bound = server
         .local_addr()
