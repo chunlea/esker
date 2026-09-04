@@ -4260,6 +4260,40 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
 ///
 /// So the pair is recognised together. That is not a shortcut around a missing type — it is the
 /// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
+/// `'x'::regclass::text` — **the relation's name**, not the digits its oid prints as.
+///
+/// A `regclass` on a real server is an oid whose *output function* is the name, so the text of one
+/// is `pg_class` and never `16xxx`. Both halves of that were already here: the forward cast
+/// resolves a name to an oid once per statement, and [`plan::CatalogFunc::RegClassName`] is the
+/// inverse per row. Composing them is the whole of it, and it keeps the `42P01` — a name nothing
+/// answers to fails in the forward half, before anything prints.
+///
+/// **The forward form only.** `t.oid::regclass::text` is already the inverse, since the inner cast
+/// lowers to `RegClassName` on its own; wrapping that again would ask the name-of-an-oid function
+/// for the name of a name, which is `42804`.
+fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Expr>> {
+    if !matches!(data_type, DataType::Text) {
+        return Ok(None);
+    }
+    let Expr::Cast {
+        expr: inner,
+        data_type: inner_type,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if cast_target(inner_type) != Some(CastTarget::RegClass) || !is_string_literal(inner) {
+        return Ok(None);
+    }
+    Ok(Some(plan::Expr::CatalogFunc(Box::new(
+        plan::CatalogFuncCall {
+            func: plan::CatalogFunc::RegClassName,
+            args: vec![lower_cast(inner, inner_type)?],
+        },
+    ))))
+}
+
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
     // what the cast carries is the type, and everything downstream resolves against it — a
@@ -4277,6 +4311,9 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     }
     if let Some(array) = lower_array_cast(expr, data_type)? {
         return Ok(array);
+    }
+    if let Some(printed) = lower_regclass_text(expr, data_type)? {
+        return Ok(printed);
     }
     let Some(target) = cast_target(data_type) else {
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it
@@ -6293,29 +6330,6 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
     }
 }
 
-/// A relation **anywhere a relation is named** — a `FROM` clause, a `DROP`, an `INSERT INTO`, a
-/// `CREATE INDEX ... ON` — which is where a schema may be written.
-///
-/// Two schemas and no others, and they behave differently on purpose:
-///
-/// * **`pg_catalog.x` is `x`.** `pg_class` is a relation on its own here, and `pg_catalog` is the
-///   schema it is in, so the qualifier names the thing that is already there. Measured:
-///   `SELECT relname FROM pg_catalog.pg_class` and `FROM pg_class` are the same query on a real
-///   server, and `ActiveRecord` writes the qualified form in three of its boot statements.
-/// * **`information_schema.tables` keeps its qualifier**, because a bare `tables` is **not** a
-///   relation on a real server — `42P01` — and answering it here would invent one. So the schema
-///   is part of the view's name (`catalog::information_schema`).
-///
-/// Everything else stays refused by name. `public.t` is the interesting one: a real server takes
-/// it, this node has one schema, and answering it would be right *when the qualifier is `public`*
-/// and a wrong answer when it is not — so it waits for a unit that has schemas rather than being
-/// guessed at here.
-///
-/// **This is what a write reaches too**, and it has to be: `DROP TABLE pg_catalog.pg_class` is
-/// `42501 permission denied` on a real server, and a lowering that refused the *qualifier* first
-/// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
-/// (`catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
-/// is `42P07` there for the same reason.
 /// The name as written, when [`relation_name`] threw a qualifier away.
 ///
 /// **Only `public.`**, because it is the only schema this node spells *out* of a stored name: a
@@ -6323,9 +6337,8 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
 /// time anything can fail to find it. Every other schema is part of the stored name and quotes
 /// itself back for free — `relation "nosuchschema.sometable" does not exist` was already right.
 ///
-/// `pg_catalog.` is left alone deliberately: nothing measured says what a `42P01` naming it looks
-/// like, and a rule invented for it would be a message nobody captured
-/// ([ADR 0031](../../docs/adr/0031-rails-compatibility-is-measured.md)).
+/// `pg_catalog.` is **not** one of these any more: it is a stored qualifier now, so it quotes
+/// itself back through [`catalog::display_name`] the way any other schema does.
 fn dropped_qualifier(name: &ObjectName) -> Option<String> {
     let parts: Option<Vec<&str>> = name
         .0
@@ -6340,6 +6353,34 @@ fn dropped_qualifier(name: &ObjectName) -> Option<String> {
         .then(|| format!("{PUBLIC_SCHEMA}.{}", fold_identifier(relation, false).0))
 }
 
+/// A relation **anywhere a relation is named** — a `FROM` clause, a `DROP`, an `INSERT INTO`, a
+/// `CREATE INDEX ... ON` — which is where a schema may be written.
+///
+/// **A qualifier is where to look, not decoration on a name**, and each of the three this node
+/// knows keeps that in a different way:
+///
+/// * **`pg_catalog.x` keeps its qualifier**, in the stored form a user schema uses. `pg_class` is
+///   a relation on its own here too, because `pg_catalog` is in the implicit search path — but
+///   `pg_catalog.books` must be `42P01` however many `books` there are in `public`, and a lowering
+///   that dropped the qualifier could not tell the two apart. Nothing is ever *written* under this
+///   prefix (creating in it is `42501`), so it is a lookup key and never a record's name.
+/// * **`information_schema.tables` keeps its qualifier as part of the name**, because a bare
+///   `tables` is **not** a relation on a real server — `42P01` — and answering it here would
+///   invent one. That schema is not in the search path, which is the same fact from the other
+///   side (`catalog::information_schema`).
+/// * **`public.x` is `x`.** A relation in `public` is stored with no qualifier at all, which is
+///   what keeps every key written before schemas existed readable — so this is the one qualifier
+///   that cannot survive to resolution. What it wrote is carried beside the name instead
+///   ([`plan::TableRef::written`]), which is what makes `public.pg_class` the `42P01` a real
+///   server gives rather than the catalog's `pg_class`.
+///
+/// Every other schema is part of the stored name, separated by a NUL rather than a dot.
+///
+/// **This is what a write reaches too**, and it has to be: `DROP TABLE pg_catalog.pg_class` is
+/// `42501 permission denied` on a real server, and a lowering that refused the *qualifier* first
+/// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
+/// (`catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
+/// is `42P07` there for the same reason.
 fn relation_name(name: &ObjectName) -> Result<String> {
     let parts: Option<Vec<&str>> = name
         .0
@@ -6347,8 +6388,17 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
         .collect();
     if let Some([schema, relation]) = parts.as_deref() {
-        if schema.eq_ignore_ascii_case("pg_catalog") {
-            return Ok(fold_identifier(relation, false).0);
+        // **The qualifier stays**, in the stored form a user schema uses: `pg_catalog` is a real
+        // namespace here now (`catalog::RESERVED_SCHEMAS`), and dropping it made
+        // `pg_catalog.books` find the *user's* `books` and `pg_catalog.nosuch` say
+        // `relation "nosuch" does not exist` where PostgreSQL quotes the qualifier back.
+        // Nothing is ever *written* under this prefix — creating in it is `42501` — so it is a
+        // lookup key and never a record's name.
+        if schema.eq_ignore_ascii_case(catalog::PG_CATALOG_SCHEMA) {
+            return Ok(catalog::qualify(
+                catalog::PG_CATALOG_SCHEMA,
+                &fold_identifier(relation, false).0,
+            ));
         }
         // **`public` is this node's only schema**, which is what `current_schema()` answers two
         // screens up — so `public.t` and `t` are the same relation and the qualifier is dropped

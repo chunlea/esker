@@ -2103,10 +2103,18 @@ fn catalog_function(
         // has no match.
         CatalogFunc::RegClassName => match oid_argument(args.first())? {
             None => Datum::Null,
-            Some(oid) => match env.relations()?.by_oid(oid) {
-                Some(relation) => Datum::Text(relation.name.clone()),
-                None if oid == 0 => Datum::Text("-".to_owned()),
-                None => Datum::Text(oid.to_string()),
+            // **The catalog's own oids print as names too**, and they are asked for first: a
+            // catalog relation is not in `Relations`, which reads the name records, so an oid of
+            // one used to print its digits back. `CatalogView::name` is the printed form and
+            // already carries the rule — `pg_class` bare because `pg_catalog` is in the search
+            // path, `information_schema.tables` qualified because that schema is not.
+            Some(oid) => match crate::catalog::pg_catalog::view_by_oid(oid) {
+                Some(view) => Datum::Text(view.name().to_owned()),
+                None => match env.relations()?.by_oid(oid) {
+                    Some(relation) => Datum::Text(crate::catalog::display_name(&relation.name)),
+                    None if oid == 0 => Datum::Text("-".to_owned()),
+                    None => Datum::Text(oid.to_string()),
+                },
             },
         },
         // The one encoding this node speaks. Anything else is the empty string, which is what a

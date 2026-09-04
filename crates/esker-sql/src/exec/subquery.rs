@@ -425,18 +425,31 @@ pub(super) fn relation_of(
         // A name that is a `WITH` item this part of the query cannot see becomes PostgreSQL's
         // three-part answer -- **only when the catalog has no such relation**, because a later CTE
         // does not hide a real table of the same name from an earlier body (measured).
-        None => tables.get(&entry.name).map_err(|error| match error {
-            SqlError::UndefinedTable(name) if entry.hidden_cte => {
-                SqlError::ForwardCteReference(name)
+        None => {
+            // **A qualifier that is not the catalog's cannot name a catalog relation.** `public`
+            // is the one schema whose qualifier the stored name drops, so `public.pg_class`
+            // arrives here as the bare `pg_class` and would find the catalog's — where a real
+            // server answers `42P01`, because the catalog is in `pg_catalog` and nowhere else.
+            // Read from what the user *wrote*, which is the only place the qualifier survives.
+            if let Some(written) = &entry.written
+                && !crate::catalog::reach_of(written).catalog()
+                && crate::catalog::pg_catalog::view(&entry.name).is_some()
+            {
+                return Err(SqlError::UndefinedTable(written.clone()));
             }
-            // **The qualifier the user wrote, back inside the quotes.** `public.` is dropped on
-            // the way to the catalog because a relation there is stored bare, so the stored name
-            // this error carries has already forgotten it; PostgreSQL has not.
-            SqlError::UndefinedTable(name) => {
-                SqlError::UndefinedTable(entry.written.clone().unwrap_or(name))
-            }
-            other => other,
-        }),
+            tables.get(&entry.name).map_err(|error| match error {
+                SqlError::UndefinedTable(name) if entry.hidden_cte => {
+                    SqlError::ForwardCteReference(name)
+                }
+                // **The qualifier the user wrote, back inside the quotes.** `public.` is dropped on
+                // the way to the catalog because a relation there is stored bare, so the stored name
+                // this error carries has already forgotten it; PostgreSQL has not.
+                SqlError::UndefinedTable(name) => {
+                    SqlError::UndefinedTable(entry.written.clone().unwrap_or(name))
+                }
+                other => other,
+            })
+        }
         Some(derived) => derived.def.clone().ok_or_else(|| {
             SqlError::Internal("a derived table reached the planner without a shape".to_owned())
         }),
