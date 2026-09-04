@@ -46,7 +46,8 @@ mod tests {
             | ColumnType::Int4Array
         | ColumnType::Int2Array
             | ColumnType::NumericArray
-            | ColumnType::TextArray => {
+            | ColumnType::TextArray
+            | ColumnType::HstoreArray => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
                 (
@@ -125,6 +126,9 @@ mod tests {
             }
             // Documents, because that is what these columns hold — the row codec is only ever
             // handed a value the SQL layer has already validated or canonicalised.
+            // An hstore is a `Datum::Text` holding the canonical form; the ordering property
+            // these tests state is the text's, which is exactly the claim.
+            ColumnType::Hstore => ".*".prop_map(Datum::Text).boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",

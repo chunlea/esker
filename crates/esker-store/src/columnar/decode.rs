@@ -196,7 +196,13 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::Int4Array
         | StoredType::Int2Array
         | StoredType::NumericArray
-        | StoredType::TextArray => return None,
+        | StoredType::TextArray
+        // **An hstore column is not columnar**, the same deliberate gap an array column is: it is
+        // text-shaped and `esker-columnar` could hold one, but its own `ColumnType` is a separate
+        // enum and teaching it a type is that crate's unit. A table with one routes to the row
+        // engine, which is correct and slower — and the `Option` here is what says so out loud.
+        | StoredType::Hstore
+        | StoredType::HstoreArray => return None,
     })
 }
 

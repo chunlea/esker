@@ -25,28 +25,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          = 'plpgsql'",
     ],
     answers: &[
-        // **Three, and all three are `hstore`**, which this build no longer offers. The
-        // `CREATE EXTENSION` unit set the available list to exactly what
-        // `postgresql_specific_schema.rb` needs in order to load — `uuid-ossp` and `pgcrypto` —
-        // and took `hstore` off it: an entry there tells a client this server has something, and
-        // `hstore` brings a type this node does not have. A real server has it available and
-        // uninstalled, so these three answer where this node answers nothing.
-        //
-        // The shape they were here to prove — available-and-not-installed — is unchanged and is
-        // now carried by `pgcrypto`, in the test below.
-        (
-            "SELECT true FROM pg_available_extensions WHERE name = 'hstore'",
-            "`hstore` is available on a real server and is not on this build's allowlist.",
-        ),
-        (
-            "SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE name = \
-             'hstore'",
-            "The same, through `extension_enabled?`'s own expression: `f` there, no row here.",
-        ),
+        // **`hstore` was three entries here and is now one.** The `CREATE EXTENSION` unit had
+        // taken it off the available list on the rule that an entry tells a client this server
+        // has something, and hstore brings a type — so it went back on in the commit that built
+        // the type, and two of the three started agreeing. The one left is the *version*: a real
+        // server's hstore is 1.8 and so is this build's, but `default_version` and
+        // `installed_version` are read together and the second is NULL here until an install.
         (
             "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE \
              name = 'hstore'",
-            "The same again, read directly.",
+            "read directly, `installed_version` differs from the two probes above it",
         ),
         (
             "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = \

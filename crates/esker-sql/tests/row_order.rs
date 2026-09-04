@@ -59,7 +59,16 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
         // exactly why ADR 0042 keeps it out of a key. Exempting them here rather than inventing a
         // fixture is the honest form of this assertion — and it is narrow, so the next type that
         // forgets its fixture still fails.
-        if matches!(ty, ColumnType::Json | ColumnType::Jsonb) {
+        // **`hstore` joins them, and its reason is its own.** A `jsonb` cannot be a key because
+        // its equality is not its bytes'; an hstore's *is*, and it is its **order** that is not —
+        // measured, `'a=>NULL'` sorts first among hstores sharing a key where its canonical text
+        // sorts it after `"a"=>"2"`. Half of `text`'s comparison is shared and half is not, which
+        // ADR 0042's rule already forbids: a fixture here would have to claim an order the key
+        // encoding cannot produce.
+        if matches!(
+            ty,
+            ColumnType::Json | ColumnType::Jsonb | ColumnType::Hstore | ColumnType::HstoreArray
+        ) {
             assert!(
                 !types_seen.contains(&ty),
                 "{ty:?} has an ordering fixture and cannot be an index column"

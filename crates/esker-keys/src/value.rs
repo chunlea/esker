@@ -134,6 +134,25 @@ pub enum ColumnType {
     /// equal, because a jsonb number is a `numeric`. That is why a `jsonb` column cannot be a key
     /// here, and it is the one thing ADR 0042 turns on.
     Jsonb,
+    /// The `hstore` extension's type: a map of text to nullable text, stored as the **canonical
+    /// text** it prints as — every key and value quoted, pairs joined with `, `, a NULL value the
+    /// bare word `NULL`, and the pairs ordered by the key's **length first and its bytes second**.
+    ///
+    /// The same road `jsonb` takes, and for the same reason: the canonical form is a function of
+    /// the content, so two hstores are equal exactly when their texts are, and equality, ordering,
+    /// grouping and an index over the column are the text machinery's. `crate::value`'s codecs
+    /// treat it as a `Text` throughout; `esker_sql::value::hstore` is what canonicalises one.
+    ///
+    /// **Unlike `jsonb` it is a key**: its equality *is* its byte equality, because there is no
+    /// number inside it to print two ways.
+    ///
+    /// Its oid is a real oid here. On a real server the extension is allocated one at install
+    /// time and it differs per database, which is why `ActiveRecord` looks it up by `typname` and
+    /// why nothing may hard-code it — a fixed one on this side is invisible to a client that
+    /// reads it the way the adapter does.
+    Hstore,
+    /// `hstore[]`, which `hstore_test.rb` declares as `t.hstore "payload", array: true`.
+    HstoreArray,
     /// Two-valued, with no third state but NULL.
     Bool,
     /// Variable-length byte string.
@@ -214,7 +233,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 25] = [
+    pub const ALL: [ColumnType; 27] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -223,6 +242,8 @@ impl ColumnType {
         ColumnType::Bpchar,
         ColumnType::Json,
         ColumnType::Jsonb,
+        ColumnType::Hstore,
+        ColumnType::HstoreArray,
         ColumnType::Bool,
         ColumnType::Bytea,
         ColumnType::TimestampTz,
@@ -408,7 +429,8 @@ impl Datum {
                 | ColumnType::Varchar
                 | ColumnType::Bpchar
                 | ColumnType::Json
-                | ColumnType::Jsonb,
+                | ColumnType::Jsonb
+                | ColumnType::Hstore,
             ) => true,
             (Some(actual), wanted) => actual == wanted,
         }
