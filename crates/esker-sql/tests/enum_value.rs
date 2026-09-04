@@ -137,16 +137,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', id FROM postgresql_enums WHERE current_mood = 1",
             "a bare integer constant is int8 here and int4 there",
         ),
-        // **`DO $$ … $$` is what `create_enum` actually sends**, and it is the reason
-        // `enum_test.rb`'s 19 tests stay where they are whatever this unit does: the block is a
-        // PL/pgSQL body with an `IF NOT EXISTS` in it, and this node refuses `DO` by name. The
-        // tests a bare `CREATE TYPE` reaches are `timestamp_test.rb`'s, which uses raw `execute`.
-        // Its own unit, and a large one — it is a language, not a statement.
-        (
-            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON \
-             t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = 'public') THEN CREATE TYPE \"mood\" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$",
-            "DO is not supported: create_enum sends a PL/pgSQL block, not a CREATE TYPE",
-        ),
+        // `DO $$ … $$` was here, refused by name. This entry predicted its own unit would be
+        // "a large one — it is a language, not a statement"; the measurement said otherwise.
+        // All 36 `DO` statements the suite sends are `create_enum`'s one template, so the block
+        // runs and the entry is deleted (ADR 0031 rule 2) — `do_block.rs` is where it lives.
+        // Note the spacing: this line writes `EXISTS (SELECT`, the suite writes `EXISTS ( SELECT`,
+        // and the recogniser tokenises rather than matching text, so both are the same template.
     ],
 };
 

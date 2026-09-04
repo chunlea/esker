@@ -15,16 +15,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT i.relname, x.indisunique, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'nd'::regclass ORDER BY i.relname",
     ],
-    // One, and it is not about this clause: `ALTER TABLE … ADD CONSTRAINT … UNIQUE` is an action
-    // this node does not have at all, so it stops one step before the grammar that carries the
-    // clause. Twenty of the twenty-one statements are byte-identical.
-    answers: &[(
-        "ALTER TABLE nd ADD CONSTRAINT nd_u UNIQUE NULLS NOT DISTINCT (a)",
-        "PostgreSQL accepts the clause on a UNIQUE constraint and fails on the data — two NULLs \
-         in `a` under NULLS NOT DISTINCT. This node refuses the whole action (0A000), which is \
-         older than this unit: `ADD CONSTRAINT ... UNIQUE` has never been built. Both refuse; the \
-         constraint form is what is missing, not the clause",
-    )],
+    // The one entry here recorded that `ALTER TABLE … ADD CONSTRAINT … UNIQUE` did not exist and
+    // so "both refuse" — which stopped being true twice over. The action was built, and then it
+    // learned to scan the rows already there, so the line now fails on the *data* the way
+    // PostgreSQL does: two NULLs in `a` under `NULLS NOT DISTINCT`. Deleted (ADR 0031 rule 2);
+    // `unique_over_existing_rows.rs` is where that scan is measured.
+    answers: &[],
 };
 
 #[test]

@@ -316,6 +316,21 @@ pub enum SqlError {
         table: String,
     },
 
+    /// `DROP TABLE`/`DROP VIEW` of something a view is built on: `2BP01`, unless `CASCADE`.
+    ///
+    /// **A view is a dependency of its base relation, not a copy of it.** Without this edge the
+    /// base could be dropped and the view left naming a relation that is gone — the same shape as
+    /// a name record outliving its object, reached from an ordinary `DROP TABLE`.
+    #[error("cannot drop {kind} {name} because other objects depend on it")]
+    ViewDependsOnRelation {
+        /// `table` or `view` — what is being dropped.
+        kind: &'static str,
+        /// Its name, unquoted the way PostgreSQL writes it in this sentence.
+        name: String,
+        /// `view v_plain depends on table vb` — the `DETAIL`, naming the first dependent found.
+        detail: String,
+    },
+
     /// No such column.
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
@@ -719,6 +734,60 @@ pub enum SqlError {
     /// dropping it would leave a key that could hold a NULL.
     #[error("column \"{0}\" is in a primary key")]
     ColumnIsInPrimaryKey(String),
+
+    /// `RAISE NOTICE | WARNING | INFO '<text>'` inside a `DO` block: the raised text, verbatim.
+    ///
+    /// Its severity is the level that was written, which is the whole of what a client sees —
+    /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
+    /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
+    #[error("{message}")]
+    Raised {
+        /// The text between the quotes.
+        message: String,
+        /// `NOTICE`, `WARNING` or `INFO`, already read into a severity.
+        severity: Severity,
+    },
+
+    /// `ALTER COLUMN … TYPE` for a pair PostgreSQL will not convert on its own: `42804`.
+    ///
+    /// The HINT is the whole value of this message — it tells the caller the `USING` to write, and
+    /// `change_column` is built to read exactly that.
+    #[error("column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastColumnAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type, spelled the way `format_type` spells it.
+        target: String,
+        /// The `USING` the caller should have written, for the HINT.
+        using: String,
+    },
+
+    /// The same statement, failing on the **default** rather than on the rows: `42804`.
+    ///
+    /// `USING` governs the rows and says nothing about the default, so a column whose default will
+    /// not convert stops the statement even when every row would — and a `SET DEFAULT` later in
+    /// the same statement does not rescue it. Measured on two independent pairs.
+    #[error("default for column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastDefaultAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type.
+        target: String,
+    },
+
+    /// A `UNIQUE` index that cannot be **built**, because the rows already there break it: `23505`.
+    ///
+    /// **A different sentence from the one an `INSERT` gets**, and deliberately: nothing was
+    /// inserted. PostgreSQL says `could not create unique index "…"` here and `duplicate key value
+    /// violates unique constraint "…"` there, both `23505`, and `ALTER TABLE … ADD CONSTRAINT …
+    /// UNIQUE` uses *this* one because what it does is build an index.
+    #[error("could not create unique index \"{index}\"")]
+    CouldNotCreateUniqueIndex {
+        /// The index or constraint being built.
+        index: String,
+        /// `Key (a)=(5) is duplicated.` — the first duplicate found, for the `DETAIL` field.
+        detail: String,
+    },
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
@@ -1778,6 +1847,10 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// What a `CASCADE` took: a **notice**, one per view, in PostgreSQL's own wording.
+    #[error("drop cascades to view {0}")]
+    CascadeDropsView(String),
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -2066,6 +2139,7 @@ impl SqlError {
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
@@ -2081,6 +2155,11 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
+            // Measured: `RAISE NOTICE` carries `00000` and `RAISE WARNING` carries `01000`.
+            SqlError::Raised { severity, .. } => match severity {
+                Severity::Warning => sqlstate::WARNING,
+                _ => sqlstate::SUCCESSFUL_COMPLETION,
+            },
             SqlError::PermanentReferencesUnlogged
             | SqlError::OnCommitNotTemporary
             | SqlError::ColumnIsInPrimaryKey(_) => {
@@ -2094,7 +2173,9 @@ impl SqlError {
             | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. }
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
-            SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
+            SqlError::ColumnTypeConflict { .. }
+            | SqlError::CannotCastColumnAutomatically { .. }
+            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
 
@@ -2112,7 +2193,8 @@ impl SqlError {
             SqlError::DuplicateColumn(_)
             | SqlError::DuplicateColumnInRelation { .. }
             | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
-            SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
+            SqlError::CouldNotCreateUniqueIndex { .. }
+            | SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
             SqlError::ColumnContainsNulls { .. }
             | SqlError::NotNullViolation(_)
             | SqlError::NotNullViolationInRelation { .. } => {
@@ -2209,7 +2291,8 @@ impl SqlError {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
-            SqlError::DependentObjectsStillExist { .. }
+            SqlError::ViewDependsOnRelation { .. }
+            | SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
@@ -2284,7 +2367,9 @@ impl SqlError {
             | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
+            SqlError::Raised { severity, .. } => *severity,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
@@ -2340,7 +2425,9 @@ impl SqlError {
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
-            SqlError::DependentType { detail, .. }
+            SqlError::CouldNotCreateUniqueIndex { detail, .. }
+            | SqlError::ViewDependsOnRelation { detail, .. }
+            | SqlError::DependentType { detail, .. }
             | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
@@ -2439,6 +2526,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, and the reason this error is worth more than a refusal:
+            // `change_column` reads the sentence and re-sends the statement with that `USING`.
+            SqlError::CannotCastColumnAutomatically { using, .. } => {
+                Some(format!("You might need to specify \"USING {using}\"."))
+            }
             // PostgreSQL's own, verbatim: the extension is missing from the *system*, not from the
             // statement, so the fix is outside SQL.
             SqlError::ExtensionNotAvailable(_) => Some(
@@ -2477,7 +2569,8 @@ impl SqlError {
             | SqlError::DependentConstraint { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentType { .. }
-            | SqlError::DependentFunction { .. } => {
+            | SqlError::DependentFunction { .. }
+            | SqlError::ViewDependsOnRelation { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),

@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::rpc_tls::RpcTlsFlags;
 use esker_proto::{Server, TransportConfig};
 use esker_store::server::RaftOptions;
 use esker_store::{PdClient, PeerAddress, RemotePd, Store, StoreOptions, StoreService};
@@ -29,6 +30,8 @@ pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:20160";
 pub(crate) struct ServerOptions {
     /// The directory holding the database. Created if it is not there.
     pub(crate) data_dir: PathBuf,
+    /// The RPC TLS this store speaks, to its clients and to its peers.
+    pub(crate) tls: RpcTlsFlags,
     /// The address to listen on.
     pub(crate) listen: String,
     /// This store's id, reported in the handshake.
@@ -96,6 +99,7 @@ pub(crate) struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
+            tls: RpcTlsFlags::default(),
             data_dir: PathBuf::from("esker-data"),
             listen: DEFAULT_LISTEN.to_owned(),
             store_id: 1,
@@ -114,12 +118,49 @@ impl Default for ServerOptions {
     }
 }
 
+/// Reads a `--pd` value: one `HOST:PORT`, or several separated by commas.
+///
+/// **A list**, because a placement driver is a Raft group and only its leader answers
+/// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). One address is still one address, so
+/// every invocation written before there were groups means exactly what it did.
+pub(crate) fn pd_endpoints(listed: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut endpoints = Vec::new();
+    for part in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        endpoints
+            .push(part.parse::<SocketAddr>().map_err(|error| {
+                format!("`--pd {listed}`: `{part}` is not an address: {error}")
+            })?);
+    }
+    if endpoints.is_empty() {
+        return Err(format!("`--pd {listed}` names no placement driver"));
+    }
+    Ok(endpoints)
+}
+
 /// Opens the store, serves it, and returns when it has stopped cleanly.
 pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     let address: SocketAddr = options
         .listen
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
+
+    // **Before the database is opened.** A store told to speak TLS that came up without it would
+    // serve in the clear on a port an operator believes is protected (ADR 0055).
+    let tls = options.tls.build()?;
+    if tls.is_enabled() {
+        println!(
+            "esker server: the RPC links speak TLS{}",
+            if tls.is_mutual() {
+                " with client certificates"
+            } else {
+                ""
+            }
+        );
+    }
 
     // A replicated store's transport tasks and ticker live in a runtime, so the runtime is
     // built before the store rather than after it.
@@ -139,7 +180,13 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
                 .map_err(|error| format!("`--peer {id}@{address}` is not an address: {error}"))?;
             peers.push(PeerAddress::new(*id, *id, addr));
         }
-        Some(RaftOptions::new(peers, options.seed))
+        // The same configuration the listener uses, so a store cannot end up encrypting what its
+        // clients see while speaking to its peers in the clear — the half-configured state this
+        // whole surface refuses (ADR 0055).
+        Some(RaftOptions {
+            tls: tls.clone(),
+            ..RaftOptions::new(peers, options.seed)
+        })
     };
 
     // Connecting is lazy, so a placement driver that is not up yet fails the *bootstrap* with
@@ -147,10 +194,8 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     let pd = match &options.pd {
         None => None,
         Some(listed) => {
-            let addr: SocketAddr = listed
-                .parse()
-                .map_err(|error| format!("`--pd {listed}` is not an address: {error}"))?;
-            let client = RemotePd::connect(addr)
+            let endpoints = pd_endpoints(listed)?;
+            let client = RemotePd::connect_to(&endpoints, TransportConfig::new())
                 .map_err(|error| format!("starting the placement-driver client: {error}"))?;
             Some(Arc::new(client) as Arc<dyn PdClient>)
         }
@@ -246,8 +291,12 @@ async fn serve(
     options: &ServerOptions,
 ) -> Result<(), String> {
     let service = StoreService::new(Arc::clone(&store));
+    // `run` already validated and reported these; building them again here is cheaper than
+    // threading the value through and cannot disagree, because the flags are the same flags.
+    let tls = options.tls.build()?;
     let server = Server::bind(address, service, TransportConfig::new())
         .await
+        .map(|server| server.with_tls(tls))
         .map_err(|error| format!("listening on {address}: {error}"))?;
     let bound = server
         .local_addr()
@@ -261,9 +310,8 @@ async fn serve(
     if let Some(pd) = &options.pd {
         println!("esker server: registered with the placement driver at {pd}");
     }
-    // Every region this store hosts, in key order. In phase 4a that is one, bootstrapped to
-    // cover everything; `TODO(phase-4b)` a split makes the list grow while the server runs, and
-    // this line only says what it found at open.
+    // Every region this store hosts, in key order — what it found **at open**, and no more than
+    // that: a split makes the list grow while the server runs, and nothing reprints it.
     for region in store.regions().regions() {
         println!(
             "esker server: region {} covers [{}, {})",

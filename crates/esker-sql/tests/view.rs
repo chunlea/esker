@@ -24,6 +24,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // types, which compare identically and are the standing choice every catalog view in this
     // crate makes (`tests/coalesce.rs` declares the same fact about the same columns).
     types: &[
+        // `is_updatable` and `is_insertable_into` are `character varying(3)` in the standard and
+        // `text` here — the standing `information_schema` trade, with `YES`/`NO` identical.
+        "SELECT 'r', table_name, is_updatable FROM information_schema.views WHERE table_name = 'ebooks'''",
+        "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_plain'",
         r"SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks'''",
         r"SELECT 'r', viewname, definition FROM pg_views WHERE viewname = 'ebooks'''",
     ],
@@ -39,10 +43,35 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             r#"SELECT 'r', pg_get_viewdef('"ebooks''"'::regclass, true)"#,
-            "The same renderer as a function, refused by name until there is one. The schema \
-             dumper is what reads it, and a dumper fed a differently-formatted body would emit a \
-             file that round-trips and still does not compare equal — so answering with this \
-             node's own text would be worse than not answering.",
+            "The same renderer as a function. It **answers** now, with the stored text — the same \
+             text `pg_views.definition` gives, and the same formatting divergence. The earlier \
+             argument here was that answering would be worse than not answering, because a schema \
+             dumper fed a differently-formatted body emits a file that round-trips and still does \
+             not compare equal. That is true of the *formatting* either way; what refusing added \
+             was an error where PostgreSQL has a value, which aborted the block and hid every \
+             statement after it. Two of those are now measured and one was a real gap.",
+        ),
+        // **Also un-swallowed**, and also pre-existing: `pg_attribute` has no rows for a view.
+        // The columns a view has are worked out where it is *read*, from the shape its definition
+        // produces, and nothing writes them into the attribute catalog — so a client asking the
+        // catalog what columns a view has gets an empty answer where PostgreSQL lists them.
+        (
+            r#"SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"ebooks''"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"#,
+            "No rows: a view's columns are derived at read time and never written to \
+             `pg_attribute`. Its own unit — the fix is to publish the shape a view's definition \
+             produces into the attribute catalog when the view is created, which is the same \
+             resolution step a rename-following view body needs.",
+        ),
+        // **Un-swallowed by the line above.** `information_schema.views` did not exist, so the
+        // statement before this one aborted the transaction and this was never compared. It is a
+        // pre-existing gap and not a view-formatting one: an `INSERT` through an automatically
+        // updatable view is not implemented, so the insert path does not know the name.
+        (
+            "INSERT INTO ebooks_plain (name, cover, status, format) VALUES ('Written Through', \
+             'hard', 0, 'ebook')",
+            "`42P01`: writing **through** a view is its own feature. `is_updatable` now answers \
+             `YES` for this view, which is the right answer about the *query* — PostgreSQL would \
+             accept the insert and this node does not. Its own unit; the read side is complete.",
         ),
         (
             "REFRESH MATERIALIZED VIEW ebooks_mat",

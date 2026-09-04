@@ -88,6 +88,11 @@ pub enum CatalogView {
     /// schema because a bare `tables` is `42P01` on a real server
     /// ([`crate::catalog::information_schema`]).
     InformationSchemaTables,
+    /// `information_schema.views`: one row per view, with the standard's `is_updatable`.
+    ///
+    /// **`YES`/`NO` text, not a boolean** — the standard spells these `character varying(3)`, and
+    /// a client comparing against the string would read a boolean as neither.
+    InformationSchemaViews,
     /// `information_schema.columns`.
     InformationSchemaColumns,
     /// `information_schema.table_constraints`, where a `NOT NULL` appears as a `CHECK`.
@@ -202,7 +207,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 29] = [
+    pub const ALL: [CatalogView; 30] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -228,6 +233,7 @@ impl CatalogView {
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
+        CatalogView::InformationSchemaViews,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
         CatalogView::InformationSchemaKeyColumnUsage,
@@ -263,6 +269,7 @@ impl CatalogView {
             CatalogView::PgSequence => "pg_sequence",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
+            CatalogView::InformationSchemaViews => "information_schema.views",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
             CatalogView::InformationSchemaTableConstraints => {
                 "information_schema.table_constraints"
@@ -286,6 +293,7 @@ impl CatalogView {
     pub fn schema(self) -> &'static str {
         match self {
             CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -317,6 +325,7 @@ impl CatalogView {
             | CatalogView::PgStatActivity
             | CatalogView::PgAvailableExtensions
             | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -359,6 +368,7 @@ impl CatalogView {
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
+                CatalogView::InformationSchemaViews => 33,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
                 CatalogView::InformationSchemaKeyColumnUsage => 12,
@@ -624,6 +634,7 @@ impl CatalogView {
                 ("enumsortorder", ColumnType::Real),
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
+            CatalogView::InformationSchemaViews => super::information_schema::VIEWS_COLUMNS,
             CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
             CatalogView::InformationSchemaTableConstraints => {
                 super::information_schema::TABLE_CONSTRAINTS_COLUMNS
@@ -668,6 +679,7 @@ impl CatalogView {
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
+            CatalogView::InformationSchemaViews => super::information_schema::views(txn, tenant),
             CatalogView::InformationSchemaColumns => {
                 super::information_schema::columns(txn, tenant)
             }
@@ -819,6 +831,7 @@ impl CatalogView {
             | CatalogView::PgIndex
             | CatalogView::PgConstraint
             | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -1667,6 +1680,14 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::TsRange => "tsrange",
         ColumnType::TstzRange => "tstzrange",
         ColumnType::Int4Range => "int4range",
+        ColumnType::DateRange => "daterange",
+        ColumnType::NumRange => "numrange",
+        ColumnType::Int8Range => "int8range",
+        ColumnType::TstzRangeArray => "_tstzrange",
+        ColumnType::Int4RangeArray => "_int4range",
+        ColumnType::DateRangeArray => "_daterange",
+        ColumnType::NumRangeArray => "_numrange",
+        ColumnType::Int8RangeArray => "_int8range",
         ColumnType::TsRangeArray => "_tsrange",
         ColumnType::BoolArray => "_bool",
         ColumnType::ByteaArray => "_bytea",
@@ -1707,7 +1728,12 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
 /// (ADR 0050); this is only the types the column vocabulary has.
 fn typtype(ty: ColumnType) -> &'static str {
     match ty {
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "r",
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => "r",
         _ => "b",
     }
 }
@@ -1752,9 +1778,9 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "R",
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => "R",
     }
 }
 
@@ -1777,6 +1803,11 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::TextArray
         | ColumnType::HstoreArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1806,6 +1837,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::TsRange => "tsrange_in",
         ColumnType::TstzRange => "tstzrange_in",
         ColumnType::Int4Range => "int4range_in",
+        ColumnType::DateRange => "daterange_in",
+        ColumnType::NumRange => "numrange_in",
+        ColumnType::Int8Range => "int8range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

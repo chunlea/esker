@@ -16,9 +16,10 @@
 //! # Addressing
 //!
 //! A call names a **store id**, not an address. The client routes by region and peer, and
-//! `Peer` carries a store id; turning that into a socket address is the placement driver's
-//! job. Until PD exists the mapping is a one-entry table inside the transport
-//! (`// TODO(phase-4)`).
+//! `Peer` carries a store id; turning that into a socket address is the placement driver's job.
+//! `TODO(debt-c6 #4)`: it is still not PD that does it — [`crate::tcp::TcpStores`] is handed a
+//! fixed list of addresses at construction and learns no store it was not given, so a store added
+//! to the cluster is unreachable until the client is rebuilt (`docs/plans/debt-c6.md` §4).
 
 //! # Not `esker_proto::transport::Transport`
 //!

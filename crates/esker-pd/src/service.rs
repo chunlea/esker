@@ -5,11 +5,12 @@
 //! edge": the engine's `fsync` runs on a blocking thread, never on the reactor that every
 //! other connection is served on.
 //!
-//! The one piece of policy here is the cluster check. It runs **once**, at the top of the
-//! dispatch, for every method but `Bootstrap` — in one place, so that adding a method cannot
-//! quietly add one that skips it.
+//! The two pieces of policy here are the cluster check and the leader check. Both run **once**, at
+//! the top of the dispatch — in one place, so that adding a method cannot quietly add one that
+//! skips them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use esker_proto::pd::{PdReq, PdResp};
 use esker_proto::{BoxFuture, ProtoError, Reply, Request, Response, Service};
@@ -36,7 +37,47 @@ impl PdService {
     pub fn pd(&self) -> &Arc<Pd> {
         &self.pd
     }
+
+    /// Starts the interval that feeds the group's Raft core its ticks.
+    ///
+    /// **Time enters the placement driver here and nowhere else.** `esker-raft` counts ticks and
+    /// never reads a clock (`CLAUDE.md` invariant 4), and this is the one wall-clock timer that
+    /// turns into them — election timeouts are therefore ticks, not instants, whatever the
+    /// machine's clock does.
+    ///
+    /// `None` for a **group of one**, which has nothing to time out against: it won with a quorum
+    /// of itself inside `Pd::open`, has no peer to miss a heartbeat from, and would spend a
+    /// wake-up every hundred milliseconds proving it. Every test that opens a single durable PD
+    /// gets that saving, which is most of them.
+    ///
+    /// Must be called from inside a `tokio` runtime.
+    pub fn spawn_ticker(pd: &Arc<Pd>, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+        if pd.members().is_alone() {
+            return None;
+        }
+        let pd = Arc::clone(pd);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Delay rather than Burst: a process that was descheduled must not deliver the ticks
+            // it missed all at once, because a burst of them is an election timeout that fires
+            // early on every member together.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if pd.tick().is_err() {
+                    return;
+                }
+            }
+        }))
+    }
 }
+
+/// What one tick of the placement driver's Raft core is worth.
+///
+/// `esker_raft::TICK_MS`, and not a number of its own: the election-timeout constants are counted
+/// in ticks, so a placement driver that ticked at a different rate would have a different election
+/// timeout than the one `esker-raft`'s own tests reason about.
+pub const TICK: Duration = Duration::from_millis(esker_raft::TICK_MS);
 
 impl Service for PdService {
     fn call(&self, request: Request) -> BoxFuture<'_, Result<Reply, ProtoError>> {
@@ -65,6 +106,23 @@ impl Service for PdService {
                 }
             };
 
+            // **Two methods are answered on the reactor, and the first one has to be.**
+            //
+            // Everything else goes to a blocking thread because it may reach the engine or wait on
+            // a Raft commit. `Raft` must *not*: it validates a group id and posts to a channel,
+            // and it is what unblocks the proposals that are occupying those threads. On a busy
+            // group the blocking pool can fill with commands waiting to commit, and a step that
+            // had to queue behind them would be waiting for the message it is itself carrying.
+            //
+            // `Members` joins it because it costs the same nothing — a lock-free read of this
+            // member's own belief and a clone of its configuration — and because it is the one
+            // question an operator asks a placement driver that has stopped answering. `Status` is
+            // deliberately *not* here: it reads `Pd`'s state lock, which a proposer holds.
+            if matches!(request, PdReq::Raft(_) | PdReq::Members) {
+                return Ok(Reply::Unary(Response::Pd(serve(
+                    &pd, cluster_id, &request,
+                )?)));
+            }
             let response = blocking(move || serve(&pd, cluster_id, &request)).await?;
             Ok(Reply::Unary(Response::Pd(response)))
         })
@@ -81,20 +139,63 @@ impl Service for PdService {
 
 /// One request, synchronously.
 fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError> {
-    // The cluster check, in one place. `Bootstrap` may carry zero — asking is how a caller
-    // learns the id — but a caller that *does* name a cluster is checked even there, so a store
-    // that already belongs to one cannot bootstrap a second cluster on a wiped PD by accident.
+    // **Only the leader answers** ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). A
+    // follower that answered a `Tso` would hand out a timestamp the leader may also hand out, and
+    // a duplicate commit timestamp corrupts MVCC ordering silently — so the refusal is here, at
+    // the top, rather than method by method where the next method could miss it.
     //
-    // `Status` is exempt for a different reason: it is a question about **this process**, not
-    // about a cluster. A PD that has not been bootstrapped is exactly when an operator most wants
-    // to ask, and refusing with "the cluster is not bootstrapped" would answer a question nobody
-    // asked. It reads no cluster-scoped state, so there is nothing for the check to protect.
-    match request {
-        PdReq::Bootstrap { .. } if cluster_id == 0 => {}
-        PdReq::Status => {}
-        _ => pd.check_cluster(cluster_id)?,
+    // The writes refuse themselves as well, inside `Pd`, and that is not redundancy: this covers
+    // the *reads*, which take no proposal and would otherwise be answered by any member out of
+    // whatever it happens to have applied.
+    //
+    // `Status` is exempt, for the reason it is exempt from the cluster check: it is a question
+    // about **this process**. "Which member am I, and do I lead" is exactly what an operator asks
+    // a placement driver that is not answering, and refusing it with "ask the leader" would answer
+    // a question nobody asked.
+    //
+    // `Raft` is exempt too, and for the sharpest reason of all: consensus is *how* a member
+    // becomes the leader, so refusing it on a follower would refuse the only traffic that can end
+    // an election. Its guard is the group id, checked inside `Pd::step_raft`.
+    //
+    // `Members` is exempt for `Status`'s reason, sharpened: it is *the* question an operator asks
+    // a group that is not answering, so a version only the leader could answer would be useless
+    // at the moment it was wanted.
+    if !matches!(request, PdReq::Status | PdReq::Members | PdReq::Raft(_)) && !pd.is_serving() {
+        return Err(pd.not_leading().into());
     }
 
+    // The cluster check, in one place, and three methods are exempt for three different reasons.
+    //
+    // `Bootstrap` may carry **zero** — asking is how a caller learns the id — but a caller that
+    // *does* name a cluster is checked even there, so a store that already belongs to one cannot
+    // bootstrap a second on a wiped placement driver by accident.
+    //
+    // `Status` and `Members` are questions about **this process** rather than about a cluster: what
+    // it is doing right now, and who is in its group. A placement driver nothing has bootstrapped
+    // is exactly when an operator most wants to ask either, and neither reads cluster-scoped state,
+    // so there is nothing for the check to protect.
+    //
+    // `Raft` cannot be checked at all: a group elects a leader *before* `Bootstrap` — itself a log
+    // entry — has minted a cluster id. Its guard is the group id it carries, checked inside
+    // `Pd::step_raft`, which rules out the same misconfiguration one layer down
+    // ([`crate::member`]).
+    let exempt = match request {
+        PdReq::Bootstrap { .. } => cluster_id == 0,
+        PdReq::Status | PdReq::Members | PdReq::Raft(_) => true,
+        _ => false,
+    };
+    if !exempt {
+        pd.check_cluster(cluster_id)?;
+    }
+
+    dispatch(pd, request)
+}
+
+/// The method itself, once the two checks above have let it through.
+///
+/// Split from them so that the checks are the whole of what `serve` does: a method added to this
+/// match cannot skip a check it never sees.
+fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
     Ok(match request {
         PdReq::Bootstrap { store } => {
             let done = pd.bootstrap(store.store_id, &store.address)?;
@@ -177,6 +278,11 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             let (regions, stores) = pd.scan_regions(start_key, *limit)?;
             PdResp::ScanRegions { regions, stores }
         }
+        PdReq::Raft(batch) => {
+            pd.step_raft(batch)?;
+            PdResp::Raft
+        }
+        PdReq::Members | PdReq::MemberChange { .. } => operator(pd, request)?,
         PdReq::Status => {
             let (now_ms, operators) = pd.status()?;
             PdResp::Status { now_ms, operators }
@@ -188,6 +294,41 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
                 step_interval_ms: lease.step_interval_ms,
                 removal_extra_ms: lease.removal_extra_ms,
             }
+        }
+    })
+}
+
+/// The two methods an **operator** calls, as opposed to a store or a client.
+///
+/// Split from the dispatch above because they are a different audience asking a different kind of
+/// question — who is in this group, and change it — and because a placement driver's own membership
+/// has nothing to do with the routing table the other methods are all about.
+fn operator(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
+    Ok(match request {
+        PdReq::Members => PdResp::Members(pd.membership()),
+        // **One step.** Adding a member is three things with a catch-up between them, and a call
+        // that did all three would hold a request open across a snapshot transfer, past any
+        // sensible deadline. Each call does what is missing; `done` says whether to call again
+        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        PdReq::MemberChange {
+            change,
+            id,
+            address,
+        } => {
+            let done = match change {
+                esker_proto::pd::MemberChange::Add => pd.add_member(*id, address)?,
+                esker_proto::pd::MemberChange::Remove => pd.remove_member(*id)?,
+            };
+            PdResp::MemberChange {
+                membership: pd.membership(),
+                done,
+            }
+        }
+        other => {
+            return Err(ProtoError::internal(format!(
+                "{} is not an operator method",
+                other.method().name()
+            )));
         }
     })
 }

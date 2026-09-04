@@ -104,8 +104,25 @@ pub mod raft_cf {
     /// a change to it would need an ADR and a version bump.
     pub const PENDING_SNAPSHOT: u8 = b'p';
 
+    /// `'R' ++ region_id:u64` → this region's range is being reclaimed and is not finished.
+    ///
+    /// The mirror image of [`PENDING_SNAPSHOT`]: that one says *data is arriving into this range
+    /// and must not be served*, this one says *data is leaving it and nothing owns it*. Both exist
+    /// because the operation they name is two writes, and a crash lands between them.
+    ///
+    /// Written in the same batch that deletes the `'m'` record, which is what makes it necessary:
+    /// the `'m'` record is the only thing on disk that says which **range** the region was, so
+    /// once it is gone a restart cannot find the keys to reclaim, and they are orphaned for ever
+    /// with nothing to serve them and nothing to sweep them. Removed once the range is provably
+    /// empty (`crate::server::Store::retire_region`).
+    ///
+    /// Upper case, alone among the five, because it is not a record of something this store
+    /// **has**. A `sst-dump` of the `raft` family reads as three live records, one half-built one
+    /// and one grave.
+    pub const RETIRING: u8 = b'R';
+
     /// Every prefix this column family uses.
-    pub const ALL: [u8; 4] = [LOG_ENTRY, STATE, METADATA, PENDING_SNAPSHOT];
+    pub const ALL: [u8; 5] = [LOG_ENTRY, STATE, METADATA, PENDING_SNAPSHOT, RETIRING];
 }
 
 /// A region is split once it grows past this many bytes (`docs/DESIGN.md` §14).

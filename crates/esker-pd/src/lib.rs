@@ -21,41 +21,66 @@
 //! | [`error`] | what PD refuses, and the wire error each refusal becomes |
 //! | [`clock`] | the one wall clock in the system, injected so tests can break it |
 //! | [`keys`] | PD's private key space, and how a key lookup becomes one seek |
+//! | [`inspect`] | a read-only view of a **stopped** placement driver's files |
+//! | [`command`] | what PD writes into its Raft log, one per durable write |
+//! | [`machine`] | `apply`: the only writer of the records, identical on every member |
+//! | [`member`] | who the placement drivers are, and what tells one group from another |
+//! | [`driver`] | the thread that turns a `Ready` into durable bytes, and answers a propose |
 //! | [`record`] | the bytes of every record PD stores, and their strict decoders |
 //! | [`alloc`] | ids that are never reused, because the batch end is persisted first |
 //! | [`tso`] | timestamps that never repeat, because the mark is persisted ahead |
 //! | [`routing`] | the region table: epoch-guarded upserts, and where a key lives |
+//! | [`raft_log`] | PD's Raft log, on the engine's `raft` column family |
 //! | [`pd`] | the six operations, synchronous, over one database |
-//! | [`service`] | the async edge: PD behind `esker-proto`'s server |
+//! | [`transport`] | one connection per member pair, a batch per tick |
+//! | [`wiring`] | the connections this member holds, rebuilt when the group changes |
+//! | [`service`] | the async edge: PD behind `esker-proto`'s server, and the tick |
 //!
-//! Phase 4a builds a **single** durable PD. High availability — three PDs replicated with
-//! `esker-raft`, the oracle's mark going through the log — is 4e, and scheduling is 4b–4d
-//! (`prompts/04-multiraft-pd.md`, `docs/plans/phase-4-pd.md`).
+//! PD is a **Raft group of up to three members** ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md),
+//! `docs/plans/phase-15-pd-ha.md`). Every durable write is a [`command`] proposed by the leader,
+//! applied by [`machine`] on every member, and acknowledged only once *this* member has applied
+//! it. A group of one behaves exactly as the single durable PD of phase 4a did, and is what every
+//! test that does not care about failover builds.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod alloc;
 pub mod balance;
 pub mod clock;
+pub mod command;
+pub mod driver;
 pub mod error;
+pub mod inspect;
 pub mod keys;
+pub mod machine;
+pub mod member;
 pub mod operator;
 pub mod pd;
+pub mod raft_log;
 pub mod record;
 pub mod routing;
 pub mod schedule;
 pub mod service;
+pub mod transport;
 pub mod tso;
+pub mod wiring;
 
 pub use balance::Balance;
 pub use clock::{Clock, SystemClock};
+pub use command::Command;
+pub use driver::{Leadership, PdTransport};
 pub use error::{PdError, Result};
+pub use inspect::PdInspector;
+pub use machine::Machine;
+pub use member::{MemberList, PdMember};
 pub use operator::{Cancelled, InFlight, Observed, Progress};
 pub use pd::{Bootstrapped, Pd, PdOptions, RegionRoute};
 pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 pub use routing::{RegionBeat, StoreBeat, Upsert};
 pub use schedule::{Cluster, LoadDelta, Repair};
 pub use service::PdService;
+pub use transport::PdTcpTransport;
+pub use wiring::PdWiring;
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
 /// (`docs/DESIGN.md` §7). Part of the wire format — every timestamp on disk uses it.

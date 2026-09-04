@@ -277,6 +277,16 @@ const TAG_JSON_ARRAY: u8 = 45;
 const TAG_JSONB_ARRAY: u8 = 46;
 const TAG_OID_ARRAY: u8 = 47;
 const TAG_CITEXT_ARRAY: u8 = 48;
+/// The three range types and five range arrays run 58's `tstzrange[]` row needed. **49-56,
+/// read off the constants above rather than counted**, which is this list's standing rule.
+const TAG_DATE_RANGE: u8 = 49;
+const TAG_NUM_RANGE: u8 = 50;
+const TAG_INT8_RANGE: u8 = 51;
+const TAG_TSTZ_RANGE_ARRAY: u8 = 52;
+const TAG_INT4_RANGE_ARRAY: u8 = 53;
+const TAG_DATE_RANGE_ARRAY: u8 = 54;
+const TAG_NUM_RANGE_ARRAY: u8 = 55;
+const TAG_INT8_RANGE_ARRAY: u8 = 56;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -349,6 +359,14 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::JsonbArray => TAG_JSONB_ARRAY,
         ColumnType::OidArray => TAG_OID_ARRAY,
         ColumnType::CitextArray => TAG_CITEXT_ARRAY,
+        ColumnType::DateRange => TAG_DATE_RANGE,
+        ColumnType::NumRange => TAG_NUM_RANGE,
+        ColumnType::Int8Range => TAG_INT8_RANGE,
+        ColumnType::TstzRangeArray => TAG_TSTZ_RANGE_ARRAY,
+        ColumnType::Int4RangeArray => TAG_INT4_RANGE_ARRAY,
+        ColumnType::DateRangeArray => TAG_DATE_RANGE_ARRAY,
+        ColumnType::NumRangeArray => TAG_NUM_RANGE_ARRAY,
+        ColumnType::Int8RangeArray => TAG_INT8_RANGE_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -445,6 +463,14 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_JSONB_ARRAY => ColumnType::JsonbArray,
         TAG_OID_ARRAY => ColumnType::OidArray,
         TAG_CITEXT_ARRAY => ColumnType::CitextArray,
+        TAG_DATE_RANGE => ColumnType::DateRange,
+        TAG_NUM_RANGE => ColumnType::NumRange,
+        TAG_INT8_RANGE => ColumnType::Int8Range,
+        TAG_TSTZ_RANGE_ARRAY => ColumnType::TstzRangeArray,
+        TAG_INT4_RANGE_ARRAY => ColumnType::Int4RangeArray,
+        TAG_DATE_RANGE_ARRAY => ColumnType::DateRangeArray,
+        TAG_NUM_RANGE_ARRAY => ColumnType::NumRangeArray,
+        TAG_INT8_RANGE_ARRAY => ColumnType::Int8RangeArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,

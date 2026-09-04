@@ -85,6 +85,32 @@ pub enum Method {
     /// `Pd::ScanRegions` — a page of the routing table in **key** order, so a tool that wants
     /// every region does not ask `GetRegion` once per region ([`crate::pd`]).
     PdScanRegions = 0x030a,
+    /// `Pd::Raft` — a tick's worth of Raft messages between two placement drivers
+    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md), [`crate::pd::PdRaftBatch`]).
+    ///
+    /// On the `Pd` service rather than on `RaftTransport`, because the two are addressed
+    /// differently and a store must not be able to receive one: `RaftTransport` carries a
+    /// **region's** messages, with a region id and an epoch, and a placement driver's group is not
+    /// a region. Anything routing or metering on the service byte can therefore tell a cluster's
+    /// consensus traffic from its placement driver's without decoding a body.
+    PdRaft = 0x030b,
+    /// `Pd::Members` — who is in this placement driver's group and which member leads
+    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)).
+    ///
+    /// Answered by **any** member, leader or not, which is the whole point: an operator reaches
+    /// for it exactly when the leader is the thing that is missing. Its own method rather than a
+    /// field added to `Pd::Status`, because that message's bytes are frozen by a golden and this
+    /// is an addition rather than a change to what is already on the wire.
+    PdMembers = 0x030c,
+    /// `Pd::MemberChange` — add or remove a placement driver, one step at a time
+    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    ///
+    /// **One step**, and the caller loops. Adding a member is three things — propose a learner,
+    /// wait for it to catch up, promote it — and a single call that did all three would hold a
+    /// request open across a catch-up that a snapshot may be part of, well past any sensible
+    /// deadline. So each call does what is missing and says whether more is needed, which is also
+    /// what makes an operator's retry after a `kill -9` a reconciliation rather than a mistake.
+    PdMemberChange = 0x030d,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
@@ -166,7 +192,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 37] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -186,6 +212,9 @@ impl Method {
         Self::PdReportColumnar,
         Self::PdStatus,
         Self::PdScanRegions,
+        Self::PdRaft,
+        Self::PdMembers,
+        Self::PdMemberChange,
         Self::RaftBatch,
         Self::RaftSnapshot,
         Self::TxnGet,
@@ -232,6 +261,9 @@ impl Method {
             0x0308 => Some(Self::PdReportColumnar),
             0x0309 => Some(Self::PdStatus),
             0x030a => Some(Self::PdScanRegions),
+            0x030b => Some(Self::PdRaft),
+            0x030c => Some(Self::PdMembers),
+            0x030d => Some(Self::PdMemberChange),
             0x0601 => Some(Self::FragmentEvaluate),
             0x0701 => Some(Self::SchemaFetch),
             0x0401 => Some(Self::RaftBatch),
@@ -289,6 +321,9 @@ impl Method {
             Self::PdReportColumnar => "Pd::ReportColumnar",
             Self::PdStatus => "Pd::Status",
             Self::PdScanRegions => "Pd::ScanRegions",
+            Self::PdRaft => "Pd::Raft",
+            Self::PdMembers => "Pd::Members",
+            Self::PdMemberChange => "Pd::MemberChange",
             Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::SchemaFetch => "Schema::Fetch",
             Self::PdSchemaLease => "Pd::SchemaLease",
@@ -1536,7 +1571,10 @@ mod tests {
                 | Method::PdSchemaLease
                 | Method::PdReportColumnar
                 | Method::PdStatus
-                | Method::PdScanRegions => crate::messages::SERVICE_PD,
+                | Method::PdScanRegions
+                | Method::PdRaft
+                | Method::PdMembers
+                | Method::PdMemberChange => crate::messages::SERVICE_PD,
                 Method::TxnGet
                 | Method::TxnScan
                 | Method::TxnPrewrite

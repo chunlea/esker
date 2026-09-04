@@ -18,6 +18,7 @@ mod pd;
 mod raw;
 mod reconcile;
 mod region;
+mod rpc_tls;
 mod server;
 mod sst_dump;
 mod sst_store;

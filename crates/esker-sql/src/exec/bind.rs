@@ -188,21 +188,22 @@ fn walk(
                         // expression, so the arm above never saw the parameter and it kept the
                         // fallback. Walking it types the parameter from what it is *added to*,
                         // which is how PostgreSQL resolves it.
-                        (_, value) => walk_predicate(value, tables, seen),
+                        (_, value) => walk_predicate(value, &under_own_names(tables), tables, seen),
                     }
                 }
             }
+            let named = under_own_names(tables);
             for predicate in update
                 .filter
                 .iter()
                 .chain(update.joins.iter().filter_map(|join| join.on.as_ref()))
             {
-                walk_predicate(predicate, tables, seen);
+                walk_predicate(predicate, &named, tables, seen);
             }
         }
         Statement::Delete(delete) => {
             if let Some(filter) = &delete.filter {
-                walk_predicate(filter, tables, seen);
+                walk_predicate(filter, &under_own_names(tables), tables, seen);
             }
         }
         Statement::Explain(inner, _) => walk(inner, tables, seen),
@@ -230,6 +231,7 @@ fn walk(
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
+        | Statement::Raise { .. }
         | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
@@ -239,6 +241,62 @@ fn walk(
 
 /// The `SELECT` half of [`walk`], which is most of it: a `SELECT` has five places a parameter
 /// can be typed from and the other statements have one each.
+/// One relation a statement's predicates can name, under the name the statement calls it by.
+///
+/// **An alias *is* that name.** `INNER JOIN "categories" "group" ON "group"."id" = $1` calls the
+/// relation `group`, and looking that qualifier up among the relations' *own* names finds nothing:
+/// the parameter stayed untyped, fell back to `text`, and the statement was
+/// `42883 operator does not exist: bigint = text` where a real server resolves `$1` to `bigint`.
+///
+/// Every statement r1 traced for that row is aliased and every one of them raised; the shapes that
+/// worked in a probe were the ones written without an alias, which is why the bug survived a probe
+/// that looked like the real thing.
+type Named<'a> = (String, &'a TableDef);
+
+/// The relations a `SELECT` names, each paired with the qualifier a column reference must use.
+///
+/// A derived table, a `VALUES` list and a set-returning function have no `TableDef` and are
+/// skipped: their columns are not a catalog relation's and nothing here can type a parameter from
+/// them. An entry whose relation is not among `tables` is skipped for the same reason.
+fn named_relations<'a>(
+    select: &crate::plan::Select,
+    tables: &'a [std::sync::Arc<TableDef>],
+) -> Vec<Named<'a>> {
+    let mut named = Vec::new();
+    for entry in select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+    {
+        if entry.derived.is_some() || entry.values.is_some() || entry.function.is_some() {
+            continue;
+        }
+        // The relation as the catalog knows it, which may be written `schema.relation`.
+        let relation = entry.name.rsplit('.').next().unwrap_or(&entry.name);
+        let Some(def) = tables
+            .iter()
+            .find(|candidate| candidate.name == relation)
+            .map(AsRef::as_ref)
+        else {
+            continue;
+        };
+        named.push((
+            entry.alias.clone().unwrap_or_else(|| relation.to_owned()),
+            def,
+        ));
+    }
+    named
+}
+
+/// Every relation under its own name, for the statements that have no `FROM` list to read aliases
+/// from — an `UPDATE`'s or a `DELETE`'s predicates.
+fn under_own_names(tables: &[std::sync::Arc<TableDef>]) -> Vec<Named<'_>> {
+    tables
+        .iter()
+        .map(|def| (def.name.clone(), def.as_ref()))
+        .collect()
+}
+
 fn walk_select(
     select: &crate::plan::Select,
     tables: &[std::sync::Arc<TableDef>],
@@ -247,6 +305,7 @@ fn walk_select(
     // **Every predicate, not only the `WHERE`.** A `HAVING` and a join's `ON` are
     // predicates over the same columns, and a parameter in one is typed by the column it
     // is compared against exactly as in a `WHERE`.
+    let named = named_relations(select, tables);
     for predicate in select
         .filter
         .iter()
@@ -256,7 +315,7 @@ fn walk_select(
         // column against a parameter exactly as a `WHERE` does.
         .chain(select.group_by.iter())
     {
-        walk_predicate(predicate, tables, seen);
+        walk_predicate(predicate, &named, tables, seen);
     }
     // **And the target list**, which holds no predicate of its own but may hold a
     // *subquery* that does: `SELECT (SELECT count(*) FROM t WHERE n > $1)` types `$1`
@@ -264,7 +323,7 @@ fn walk_select(
     // there matches no arm and costs one call.
     for item in &select.projection {
         if let crate::plan::SelectItem::Expr { expr, .. } = item {
-            walk_predicate(expr, tables, seen);
+            walk_predicate(expr, &named, tables, seen);
         }
     }
     // **A derived table's predicates too.** Its parameters are numbered in the same
@@ -298,36 +357,19 @@ fn walk_select(
 /// else**, and it is what leaves `$1 + $2` unresolved so that a real server's
 /// `42725 operator is not unique: unknown + unknown` is what comes out, rather than a type this
 /// function invented.
-fn static_type(expr: &Expr, tables: &[std::sync::Arc<TableDef>]) -> Option<ColumnType> {
+fn static_type(expr: &Expr, named: &[Named<'_>]) -> Option<ColumnType> {
     match expr {
-        Expr::Column { table, name } => {
-            let mut found = None;
-            for candidate in tables {
-                if table
-                    .as_deref()
-                    .is_some_and(|qualifier| qualifier != candidate.name)
-                {
-                    continue;
-                }
-                if let Some(at) = candidate.column(name) {
-                    // An ambiguous bare name names nothing, exactly as in `walk_predicate`.
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(candidate.columns[at].ty);
-                }
-            }
-            found
-        }
+        // The same lookup `column_type` does, aliases and all.
+        Expr::Column { table, name } => column_type(named, table.as_deref(), name),
         // A bare integer constant is an `int8` here and an `integer` there — the standing
         // constant-width divergence, and it is the *resolution* that matters: `1 + $1` makes the
         // parameter a number either way, and reading `"4"` as an `int8` gives the same answer.
         Expr::Literal(literal) => super::query::literal_type(literal),
         // `COALESCE`'s type is its first argument that has one, which is what makes
         // `COALESCE(c, 0) + $1` an integer.
-        Expr::Coalesce(items) => items.iter().find_map(|item| static_type(item, tables)),
+        Expr::Coalesce(items) => items.iter().find_map(|item| static_type(item, named)),
         Expr::Arithmetic { left, right, .. } => {
-            static_type(left, tables).or_else(|| static_type(right, tables))
+            static_type(left, named).or_else(|| static_type(right, named))
         }
         _ => None,
     }
@@ -335,8 +377,17 @@ fn static_type(expr: &Expr, tables: &[std::sync::Arc<TableDef>]) -> Option<Colum
 
 /// A parameter compared against a column takes that column's type. That is the whole of the
 /// inference in a `WHERE`, and it is what `WHERE id = $1` needs.
+/// `named` is what the statement calls its relations — aliases included — and `tables` is every
+/// relation it resolved. Both are needed: a qualifier is matched against the first, and a subquery
+/// builds its own `named` list out of the second.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per expression a parameter can sit in, and a clause missing from it is a \
+              parameter that keeps the text fallback — which is the bug this function exists for"
+)]
 fn walk_predicate(
     expr: &Expr,
+    named: &[Named<'_>],
     tables: &[std::sync::Arc<TableDef>],
     seen: &mut impl FnMut(u32, ColumnType),
 ) {
@@ -359,6 +410,21 @@ fn walk_predicate(
                     }
                     _ => {}
                 }
+                // **A literal beside a parameter types it too**, and there is no column in
+                // sight: `(1 = $3)` is what `eager_test.rb` sends, and PostgreSQL resolves `$3`
+                // to `integer` from the constant on the other side. Without it the parameter kept
+                // the `text` fallback and five characters of a long statement refused the whole
+                // of it. A quoted string types nothing, which is right: `'a' = $1` leaves both
+                // `unknown` on a real server too.
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Literal(literal), Expr::Parameter(number))
+                    | (Expr::Parameter(number), Expr::Literal(literal)) => {
+                        if let Some(ty) = crate::exec::query::literal_type(literal) {
+                            seen(*number, ty);
+                        }
+                    }
+                    _ => {}
+                }
                 let pair = match (left.as_ref(), right.as_ref()) {
                     (Expr::Column { table, name }, Expr::Parameter(number))
                     | (Expr::Parameter(number), Expr::Column { table, name }) => {
@@ -372,8 +438,8 @@ fn walk_predicate(
                 // `ParameterDescription` on the wire for a query that is about to fail.
                 if let Some((qualifier, name, number)) = pair {
                     let mut found = None;
-                    for candidate in tables {
-                        if qualifier.is_some_and(|qualifier| qualifier != candidate.name) {
+                    for (called, candidate) in named {
+                        if qualifier.is_some_and(|qualifier| qualifier != called) {
                             continue;
                         }
                         if let Some(at) = candidate.column(name) {
@@ -389,12 +455,12 @@ fn walk_predicate(
                     }
                 }
             }
-            walk_predicate(left, tables, seen);
-            walk_predicate(right, tables, seen);
+            walk_predicate(left, named, tables, seen);
+            walk_predicate(right, named, tables, seen);
         }
         Expr::Binary { left, right, .. } => {
-            walk_predicate(left, tables, seen);
-            walk_predicate(right, tables, seen);
+            walk_predicate(left, named, tables, seen);
+            walk_predicate(right, named, tables, seen);
         }
         // **A parameter in an arithmetic expression takes the *other operand's* type.** This is
         // the shape run 51 reported as `operator does not exist: integer + text` and it is not an
@@ -410,32 +476,34 @@ fn walk_predicate(
         Expr::Arithmetic { left, right, .. } => {
             match (left.as_ref(), right.as_ref()) {
                 (other, Expr::Parameter(number)) | (Expr::Parameter(number), other) => {
-                    if let Some(ty) = static_type(other, tables) {
+                    if let Some(ty) = static_type(other, named) {
                         seen(*number, ty);
                     }
                 }
                 _ => {}
             }
-            walk_predicate(left, tables, seen);
-            walk_predicate(right, tables, seen);
+            walk_predicate(left, named, tables, seen);
+            walk_predicate(right, named, tables, seen);
         }
         // `COALESCE(c, 0)` is where the counter-cache update's type comes from, so its arguments
         // are walked like any other expression — a parameter *inside* one is typed by whatever it
         // sits beside further out.
         Expr::Coalesce(items) => {
             for item in items {
-                walk_predicate(item, tables, seen);
+                walk_predicate(item, named, tables, seen);
             }
         }
-        Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, tables, seen),
+        Expr::Not(operand) | Expr::IsNull { operand, .. } => {
+            walk_predicate(operand, named, tables, seen);
+        }
         // **`n IN ($1, $2, $3)` types every one of them from `n`.** Walking the list as
         // independent predicates types none — a bare `$1` matches no arm — and the statement then
         // compares an `integer` against `text`: `42883 operator does not exist: integer = text`,
         // which is what `ActiveRecord`'s `where(id: [1,2,3])` sends on every association load.
         Expr::InList { operand, list, .. } => {
-            walk_predicate(operand, tables, seen);
+            walk_predicate(operand, named, tables, seen);
             if let Expr::Column { table, name } = operand.as_ref()
-                && let Some(ty) = column_type(tables, table.as_deref(), name)
+                && let Some(ty) = column_type(named, table.as_deref(), name)
             {
                 for item in list {
                     if let Expr::Parameter(number) = item {
@@ -444,7 +512,7 @@ fn walk_predicate(
                 }
             }
             for item in list {
-                walk_predicate(item, tables, seen);
+                walk_predicate(item, named, tables, seen);
             }
         }
         // **The subquery's own clauses type their own parameters.** `IN (SELECT id FROM t LIMIT
@@ -454,7 +522,7 @@ fn walk_predicate(
         // `SELECT` it is, so every rule above applies inside it without being restated.
         Expr::Subquery(sub) => {
             if let Some(operand) = &sub.operand {
-                walk_predicate(operand, tables, seen);
+                walk_predicate(operand, named, tables, seen);
                 // `$1 IN (SELECT n FROM t)` is the operand taking the **subquery's** column
                 // type, which is the one rule here that reads across the boundary rather than
                 // within it. `SubqueryExpr::column` cannot answer: it is filled by the planner and
@@ -491,7 +559,7 @@ fn single_column_type(
     let Expr::Column { table, name } = expr else {
         return None;
     };
-    column_type(tables, table.as_deref(), name)
+    column_type(&named_relations(select, tables), table.as_deref(), name)
 }
 
 /// One column's type, by name and an optional qualifier.
@@ -499,14 +567,10 @@ fn single_column_type(
 /// **An ambiguous bare name types nothing** rather than the first match: the planner will refuse
 /// the statement anyway, and guessing here would put a `ParameterDescription` on the wire for a
 /// query that is about to fail.
-fn column_type(
-    tables: &[std::sync::Arc<TableDef>],
-    qualifier: Option<&str>,
-    name: &str,
-) -> Option<ColumnType> {
+fn column_type(named: &[Named<'_>], qualifier: Option<&str>, name: &str) -> Option<ColumnType> {
     let mut found = None;
-    for candidate in tables {
-        if qualifier.is_some_and(|qualifier| qualifier != candidate.name) {
+    for (called, candidate) in named {
+        if qualifier.is_some_and(|qualifier| qualifier != called) {
             continue;
         }
         if let Some(at) = candidate.column(name) {
@@ -701,6 +765,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
+        | Statement::Raise { .. }
         | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
@@ -914,6 +979,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
+        | Statement::Raise { .. }
         | Statement::DropType(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
@@ -927,7 +993,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
 }
 
 /// Whether a statement mentions a parameter at all, so the common case costs no walk of its own.
-pub(super) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool {
+pub(crate) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool {
     let mut found = false;
     for_each_expr(statement, &mut |expr| {
         found = found || wanted(expr);
@@ -999,6 +1065,7 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
+        | Statement::Raise { .. }
         | Statement::DropType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
@@ -1117,6 +1184,11 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::TextArray
         | ColumnType::HstoreArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1153,7 +1225,12 @@ fn placeholder(ty: ColumnType) -> Datum {
         }
         ColumnType::Citext => Datum::Citext(String::new()),
         // The empty range, which is a real value and not a NULL.
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => Datum::Range {
             subtype: Box::new(match ty {
                 ColumnType::TstzRange => ColumnType::TimestampTz,
                 ColumnType::Int4Range => ColumnType::Int8,

@@ -88,6 +88,14 @@ impl Parsed {
                 actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
             }));
         }
+        // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
+        // statement it is a disguised form of, so the whole lowering is this.
+        if let Some((message, severity)) = self.raised() {
+            return Ok(plan::Statement::Raise {
+                message: message.clone(),
+                severity: *severity,
+            });
+        }
         let mut lowered = lower_statement(&self.statement)?;
         // The one thing the parser could not carry (`crate::parse::Parsed::concurrently`).
         if let plan::Statement::DropIndex(drop) = &mut lowered {
@@ -105,6 +113,11 @@ impl Parsed {
                     &create.name,
                 )?);
             }
+        }
+        // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
+        // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
+        if let plan::Statement::CreateType(create) = &mut lowered {
+            create.if_not_exists = self.is_do_guarded();
         }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
@@ -531,16 +544,15 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
-                // **`CASCADE` on a `DROP VIEW` is refused rather than ignored**: nothing here
-                // depends on a view yet, but a clause that silently did nothing would be a
-                // promise broken the day something does.
-                ObjectType::View => {
-                    refuse_if(*cascade, "DROP VIEW ... CASCADE")?;
-                    plan::Statement::DropView(plan::DropView {
-                        names,
-                        if_exists: *if_exists,
-                    })
-                }
+                // `CASCADE` was refused here rather than ignored, on the argument that "nothing
+                // depends on a view yet, but a clause that silently did nothing would be a promise
+                // broken the day something does". A view can now depend on a view, so the day
+                // came and the clause does what it says.
+                ObjectType::View => plan::Statement::DropView(plan::DropView {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,
@@ -2044,6 +2056,38 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 actions.push(plan::AlterTableAction::SetNotNull {
                     column: ident(column_name),
                     not_null: matches!(op, AlterColumnOperation::SetNotNull),
+                });
+                continue;
+            }
+            // `ALTER COLUMN c TYPE t [USING e]`. The `USING` is read only far enough to tell
+            // "cast this column to this type" — which is all `change_column` ever writes — from
+            // anything else, which is refused by name because there is no per-row evaluator.
+            if let AlterColumnOperation::SetDataType {
+                data_type, using, ..
+            } = op
+            {
+                let (ty, typmod, user_type) = lower_column_type(data_type)?;
+                if let Some(name) = user_type {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER TABLE ... ALTER COLUMN ... TYPE {name}"
+                    )));
+                }
+                let using = match using {
+                    None => None,
+                    Some(expr) => match using_cast_target(expr, &ident(column_name)) {
+                        Some(cast_to) => Some(lower_column_type(cast_to)?.0),
+                        None => {
+                            return Err(SqlError::unsupported(format!(
+                                "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING {expr}"
+                            )));
+                        }
+                    },
+                };
+                actions.push(plan::AlterTableAction::SetColumnType {
+                    column: ident(column_name),
+                    ty,
+                    typmod,
+                    using,
                 });
                 continue;
             }
@@ -6144,6 +6188,28 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// takes a typmod here — and `test_schema.mood` is a type in a schema, which is
 /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
 /// the namespace lane's. Both keep the refusal `lower_type` gives them.
+/// The type a `USING` casts this column to, or `None` if it is anything but such a cast.
+///
+/// `change_column` writes `USING CAST("c" AS timestamp)` and `USING c::integer`; both spell the
+/// conversion the statement already names, so they license it without asking for any computation
+/// this node cannot do. **Anything else is refused by name** — `USING string_to_array(c, ',')`
+/// included — because evaluating it would need a per-row expression evaluator that does not exist,
+/// and ignoring it would silently answer a different question than the one asked.
+fn using_cast_target<'a>(expr: &'a Expr, column: &str) -> Option<&'a DataType> {
+    let Expr::Cast {
+        expr: inner,
+        data_type,
+        ..
+    } = unwrap_nested(expr)
+    else {
+        return None;
+    };
+    let names_the_column = matches!(unwrap_nested(inner), Expr::Identifier(name) if ident(name) == column)
+        || matches!(unwrap_nested(inner), Expr::CompoundIdentifier(parts)
+            if parts.last().is_some_and(|part| ident(part) == column));
+    names_the_column.then_some(data_type)
+}
+
 fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<String>)> {
     match lower_type(data_type) {
         Ok((ty, typmod)) => Ok((ty, typmod, None)),
@@ -6173,6 +6239,9 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "tsrange" => Some(ColumnType::TsRange),
         "tstzrange" => Some(ColumnType::TstzRange),
         "int4range" => Some(ColumnType::Int4Range),
+        "daterange" => Some(ColumnType::DateRange),
+        "numrange" => Some(ColumnType::NumRange),
+        "int8range" => Some(ColumnType::Int8Range),
         _ => None,
     }
 }
@@ -6240,6 +6309,17 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
             ColumnType::Timestamp,
             value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
         )),
+        // The same for the zoned spelling, which `change_column` sends as `timestamptz(6)`. The
+        // bound and the fall-through are the arm above's, because the difference between the two
+        // types is the label and not the precision.
+        DataType::Timestamp(Some(precision), TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
+            if *precision <= 6 =>
+        {
+            Ok((
+                ColumnType::TimestampTz,
+                value::typmod_of_precision(u32::try_from(*precision).unwrap_or(6)),
+            ))
+        }
         // **`time(7)` is `time(6)`, not an error.** A precision past the maximum is reduced to it
         // — a `WARNING` on a real server and no complaint at all in the answer — where a
         // `varchar` length past *its* bound is `22023`. The asymmetry is PostgreSQL's, measured:
@@ -6812,7 +6892,12 @@ fn lower_create_type(
         // C function. There is nothing this node could put in one.
         None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
     };
-    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
+    Ok(plan::Statement::CreateType(plan::CreateType {
+        name,
+        kind,
+        // Set by the caller that can see the `DO` block this came out of, if it came out of one.
+        if_not_exists: false,
+    }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

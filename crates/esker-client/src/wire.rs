@@ -144,8 +144,10 @@ pub fn routing_key(request: &RawKvReq) -> &[u8] {
         | RawKvReq::CompareAndSwap { key, .. } => key,
         RawKvReq::BatchGet { keys } => keys.first().map_or(&[][..], |key| &key[..]),
         RawKvReq::BatchPut { pairs, .. } => pairs.first().map_or(&[][..], |(key, _)| &key[..]),
-        // TODO(phase-4): a reverse scan walks down from `start`, so once there is more than
-        // one region the first region to ask is the one holding the *high* end.
+        // `TODO(debt-c6 #2)`: for a reverse scan `start` is the **exclusive** upper bound, so a
+        // `start` sitting exactly on a region boundary routes to the region above the one holding
+        // every key the scan should return, and the answer is an empty page that reads like the
+        // end of the range (`docs/plans/debt-c6.md` §4).
         RawKvReq::DeleteRange { start, .. } | RawKvReq::Scan { start, .. } => start,
     }
 }

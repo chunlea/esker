@@ -39,9 +39,10 @@ use crate::region::RegionMeta;
 /// One region as this store hosts it: its metadata, and its Raft peer when it replicates.
 ///
 /// Held behind an `Arc` so the request path can take one out of the map and drop the map's lock
-/// before doing any engine work. In 4a a state is immutable once inserted — the epoch only moves
-/// on a split or a membership change, and neither exists yet. `TODO(phase-4b)`: a split replaces
-/// two entries under one lock, and the replacement is what the epoch bump *is*.
+/// before doing any engine work. A state is immutable once inserted; the epoch moves by
+/// **replacement**, which is what makes the bump observable — a split replaces two entries under
+/// one write lock ([`RegionMap::apply_split`], from `Store::adopt_split`), and a membership change
+/// replaces one ([`RegionMap::replace`]).
 #[derive(Debug)]
 pub struct RegionState {
     meta: RegionMeta,
@@ -275,9 +276,12 @@ impl RegionMap {
 
     /// Drops a region this store no longer hosts, returning what it held.
     ///
-    /// Nothing in 4a calls it; `TODO(phase-4c)` is the `RemovePeer` operator, and its hazard is
-    /// already named in `docs/plans/phase-4.md` §6 race 3 — a store that crashes between the
-    /// removal and the deletion of the data must not restart into serving the region again.
+    /// Called by `Store::retire_region`, on the `RemovePeer` path, and its hazard is named in
+    /// `docs/plans/phase-4.md` §6 race 3 — a store that crashes between the removal and the
+    /// deletion of the data must not restart into serving the region again. That is now closed at
+    /// both ends: the record goes before the data, so a restart serves nothing, and the retirement
+    /// is announced in the same batch so the data is still reclaimed
+    /// ([ADR 0056](../../../docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md)).
     pub fn remove(&self, region_id: u64) -> Option<Arc<RegionState>> {
         let mut inner = self.write();
         let state = inner.by_id.remove(&region_id)?;

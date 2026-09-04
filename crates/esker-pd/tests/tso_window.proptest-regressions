@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 192ed0204bf91885ceae9489f43bf2e877bd8cf5d35b493479bb5d3503f5d7fc # shrinks to script = [NoQuorum { count: 1, now_ms: 1700001000000 }], save_interval_ms = 1

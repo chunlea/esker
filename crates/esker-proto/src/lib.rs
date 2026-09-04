@@ -57,7 +57,8 @@ pub use messages::{
     RequestHeader, Response, SnapshotRequest,
 };
 pub use pd::{
-    Operator, OperatorProgress, OperatorStatus, PdChannel, PdReq, PdResp, ScannedRegion, StoreInfo,
+    MemberChange, Operator, OperatorProgress, OperatorStatus, PdChannel, PdMemberInfo,
+    PdMembership, PdRaftBatch, PdReq, PdResp, ScannedRegion, StoreInfo,
 };
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};

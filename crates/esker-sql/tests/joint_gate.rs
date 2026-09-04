@@ -74,9 +74,19 @@ struct Node {
     dir: tempfile::TempDir,
 }
 
-fn reserve() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A free port, **held** until the server that wants it is about to bind.
+///
+/// Returning only the address and dropping the listener is a time-of-check race: between the
+/// kernel picking the port and `Server::bind` asking for it, a sibling test in the same binary is
+/// handed the same number. It failed roughly one run in three, on a different test each time,
+/// with `Io { detail: "Address already in use (os error 98)" }` — and it reddens every lane's
+/// gate, not only this file's.
+///
+/// `esker-store`'s eight cluster tests already do it this way: reserve every port up front, keep
+/// the listeners, and drop each one as its own server binds. The window is then one call wide and
+/// every *other* port stays occupied while it is open.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
@@ -265,8 +275,14 @@ impl Gate {
     }
 
     async fn start_with(balance: bool) -> Self {
-        let pd_address = reserve();
-        let addresses: Vec<SocketAddr> = (0..STORES).map(|_| reserve()).collect();
+        let pd_listener = reserve();
+        let pd_address = pd_listener.local_addr().unwrap();
+        let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();
+        let addresses: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
+        let mut listeners = listeners.into_iter();
         let peers: Vec<PeerAddress> = addresses
             .iter()
             .enumerate()
@@ -293,6 +309,7 @@ impl Gate {
             },
         )
         .unwrap();
+        drop(pd_listener);
         let pd_handle = Server::bind(
             pd_address,
             PdService::new(Arc::clone(&pd)) as Arc<dyn Service>,
@@ -306,6 +323,7 @@ impl Gate {
         // The first store bootstraps the cluster; PD's repair grows the region to `VOTERS`.
         let mut nodes = Vec::new();
         for (at, address) in addresses.iter().enumerate() {
+            drop(listeners.next());
             nodes.push(
                 open_store(
                     tempfile::tempdir().unwrap(),

@@ -328,8 +328,14 @@ struct Node {
 
 impl Gate {
     async fn start() -> Self {
-        let pd_address = reserve();
-        let addresses: Vec<SocketAddr> = (0..STORES).map(|_| reserve()).collect();
+        let pd_listener = reserve();
+        let pd_address = pd_listener.local_addr().unwrap();
+        let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();
+        let addresses: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
+        let mut listeners = listeners.into_iter();
         let peers: Vec<PeerAddress> = addresses
             .iter()
             .enumerate()
@@ -354,6 +360,7 @@ impl Gate {
             },
         )
         .unwrap();
+        drop(pd_listener);
         let pd_handle = Server::bind(
             pd_address,
             PdService::new(Arc::clone(&pd)) as Arc<dyn Service>,
@@ -366,6 +373,7 @@ impl Gate {
 
         let mut nodes = Vec::new();
         for (at, address) in addresses.iter().enumerate() {
+            drop(listeners.next());
             nodes.push(open_store(*address, at as u64 + 1, pd_address, &peers).await);
         }
         wait_for("the region to reach three voters", 60, || {
@@ -597,9 +605,10 @@ async fn open_store(
     }
 }
 
-fn reserve() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A free port, **held** until the server that wants it is about to bind — see
+/// `tests/joint_gate.rs`'s copy for the race this closes and the numbers behind it.
+fn reserve() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {

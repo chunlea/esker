@@ -643,6 +643,203 @@ fn sequence_start(start: i64) -> Result<u64> {
 /// that one droppable without `CASCADE` on the very next line. A node that added the new sequence
 /// beside the old one would leave the column drawing from two counters and would answer `2BP01`
 /// to the drop, which is PostgreSQL's own correct answer to a state it should not be in.
+/// Whether PostgreSQL converts this pair **without** a `USING` — an assignment cast.
+///
+/// Measured, not derived: `timestamp -> timestamptz` needs no help and `varchar -> timestamp` does,
+/// though both are casts that exist. "Needs `USING`" is a property of the *pair*, and the relation
+/// is narrower than "a cast is possible".
+fn converts_implicitly(from: ColumnType, to: ColumnType) -> bool {
+    use ColumnType::{
+        Bpchar, Citext, CitextArray, Int2, Int4, Int8, Text, TextArray, Timestamp, TimestampArray,
+        TimestampTz, TimestampTzArray, Varchar, VarcharArray,
+    };
+    if from == to {
+        return true;
+    }
+    // The string family is one representation with three names; only the typmod differs, and a
+    // length that no longer fits is caught per row rather than here.
+    let string = |ty| matches!(ty, Text | Varchar | Bpchar | Citext);
+    if string(from) && string(to) {
+        return true;
+    }
+    // The two timestamps are one representation under two labels, and the integers convert **both
+    // directions** — measured: a narrowing is implicit too, and a value that no longer fits is
+    // that row's error rather than the statement's. Assuming "widening only" refused
+    // `bigint -> integer`, which PostgreSQL takes.
+    matches!(
+        (from, to),
+        (Timestamp | TimestampTz, Timestamp | TimestampTz)
+            | (Int2 | Int4 | Int8, Int2 | Int4 | Int8 | Text | Varchar)
+    ) || matches!(
+        (from, to),
+        // The array pairs whose element pair is itself implicit. Written out rather than derived:
+        // `ColumnType` has one variant per array type and no element accessor, so a rule over
+        // elements would have to invent the mapping this list *is*.
+        (TextArray, VarcharArray)
+            | (VarcharArray, TextArray)
+            | (TextArray | VarcharArray, CitextArray)
+            | (CitextArray, TextArray | VarcharArray)
+            | (TimestampArray, TimestampTzArray)
+            | (TimestampTzArray, TimestampArray)
+    )
+}
+
+/// Whether a conversion is possible **at all**, with a `USING` to license it.
+///
+/// Everything an assignment cast covers, plus the pairs that go through the type's own text
+/// representation — which is what `CAST(c AS t)` does for every type this node stores.
+fn converts_with_using(from: ColumnType, to: ColumnType) -> bool {
+    use ColumnType::{Bpchar, Citext, Text, Varchar};
+    if converts_implicitly(from, to) {
+        return true;
+    }
+    // **Text is the hub, in both directions.** Every type renders itself into a string and every
+    // type reads itself back out of one, so with a `USING` to license it a conversion goes to a
+    // string type or comes from one — and the parse is per row, so a value that does not parse is
+    // that row's error rather than the statement's.
+    //
+    // This is the whole of what `USING` buys here, and it is why `USING string_to_array(c, ',')`
+    // stays refused: that asks for a computation, not a conversion.
+    matches!(from, Text | Varchar | Bpchar | Citext)
+        || matches!(to, Text | Varchar | Bpchar | Citext)
+}
+
+/// One value, moved from `from` to `to`.
+///
+/// **Through the type's own text representation**, which is what `CAST` does for these pairs and
+/// what keeps this narrow enough to be honest: there is no per-row expression evaluator here, and
+/// this is not one — it is the same `to_text`/`from_text` pair the wire protocol uses, so a value
+/// converts exactly as it would if the client had sent it to a column of the new type.
+///
+/// **The string family is relabelled rather than round-tripped.** `text`, `varchar` and `bpchar`
+/// share `Datum::Text`, and going through text would be the identity anyway; `citext` and the two
+/// timestamps have *distinct* `Datum` variants for the same bytes, so those are re-tagged here —
+/// which is a fact about this crate's representation, not about SQL.
+fn convert_datum(from: ColumnType, to: ColumnType, value: &Datum) -> Result<Datum> {
+    use crate::value::PgDatum as _;
+    if matches!(value, Datum::Null) || from == to {
+        return Ok(value.clone());
+    }
+    // Same bytes, different tag. Written as a match on the *value* so a type pair that shares no
+    // representation still falls through to the text path below.
+    let retagged = match (value, to) {
+        (Datum::Text(text) | Datum::Citext(text), ColumnType::Citext) => {
+            Some(Datum::Citext(text.clone()))
+        }
+        (
+            Datum::Text(text) | Datum::Citext(text),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar,
+        ) => Some(Datum::Text(text.clone())),
+        // No zone conversion in either direction, which is what this node's `timestamptz` means
+        // (`ColumnType::TimestampTz`): the micros are the value and only the label moves.
+        (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::TimestampTz) => {
+            Some(Datum::TimestampTz(*micros))
+        }
+        (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::Timestamp) => {
+            Some(Datum::Timestamp(*micros))
+        }
+        _ => None,
+    };
+    if let Some(datum) = retagged {
+        return Ok(datum);
+    }
+    let Some(text) = value.to_text() else {
+        return Ok(Datum::Null);
+    };
+    Datum::from_text(to, &text)
+}
+
+/// `ALTER TABLE … ALTER COLUMN … TYPE <type> [USING …]` — and it rewrites every row.
+///
+/// A row is stored positionally and decoded against the table's *current* schema (ADR 0030), so a
+/// column that changes type and leaves its rows alone makes every row already written decode as
+/// the wrong value. The whole table is read and written back in the statement's own transaction,
+/// which is the same trade [`backfill`] makes and for the same reason.
+///
+/// The order of the checks is PostgreSQL's, and it is observable: the **pair** is rejected before
+/// any row is read (`42804` with the `USING` to write), the **default** before that (`42804`
+/// naming the default), and only then can a row fail on its own value.
+fn set_column_type(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    column: &str,
+    ty: ColumnType,
+    typmod: i32,
+    using: Option<ColumnType>,
+) -> Result<()> {
+    let at = updated
+        .column(column)
+        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+            column: column.to_owned(),
+            relation: updated.name.clone(),
+        })?;
+    let from = updated.columns[at].ty;
+    let target = crate::value::format_type(ty, typmod);
+    // **Two hops when a `USING` names its own type**: the column has to reach the `USING`'s type,
+    // and that type has to reach the column's new one on its own — which is why
+    // `TYPE character varying USING s::text` works and is not the same statement as
+    // `TYPE character varying` alone.
+    let allowed = match using {
+        None => converts_implicitly(from, ty),
+        Some(cast_to) => converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty),
+    };
+    if !allowed {
+        return Err(SqlError::CannotCastColumnAutomatically {
+            column: column.to_owned(),
+            target: target.clone(),
+            using: format!("{column}::{target}"),
+        });
+    }
+    // **The default converts or the statement stops**, before any row is touched — and it is held
+    // to the *assignment* cast, not to whether its particular value happens to parse. A `varchar`
+    // column defaulted to `'0'` going to `integer` is refused even though `'0'` is a fine integer,
+    // because `USING` governs the rows and says nothing about the default. Measured on two
+    // independent pairs, and the `SET DEFAULT` later in the same statement does not rescue it.
+    if updated.columns[at].default.is_some() && !converts_implicitly(from, ty) {
+        return Err(SqlError::CannotCastDefaultAutomatically {
+            column: column.to_owned(),
+            target,
+        });
+    }
+
+    // Every row, a page at a time, decoded against the old schema and written back under the new
+    // one. Collected before anything is written: the walk holds the transaction.
+    let (start, end) = crate::row::table_row_range(executor.tenant, updated.id);
+    let schema = updated.row_schema();
+    let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+        }
+        Ok(())
+    })?;
+
+    // The column's own values move with it: a default and a missing value are stored as data and
+    // would otherwise be read back under the new type without ever having been converted.
+    let default = match &updated.columns[at].default {
+        Some(value) => Some(convert_datum(from, ty, value)?),
+        None => None,
+    };
+    let missing = match &updated.columns[at].missing {
+        Some(value) => Some(convert_datum(from, ty, value)?),
+        None => None,
+    };
+    updated.columns[at].ty = ty;
+    updated.columns[at].typmod = typmod;
+    updated.columns[at].default = default;
+    updated.columns[at].missing = missing;
+    let types = updated.column_types();
+    for (key, mut row) in rows {
+        // The typmod is applied per row and not compared once: `varchar(5)` over a nineteen
+        // character value is `22001`, and which row raises it depends on the data. `fit_to_typmod`
+        // is the same function an `INSERT` uses, so a rounded `timestamp(6)` rounds identically.
+        row[at] = crate::value::fit_to_typmod(convert_datum(from, ty, &row[at])?, ty, typmod)?;
+        txn.put(&key, &crate::row::encode_row(&types, &row)?);
+    }
+    Ok(())
+}
+
 /// `ALTER TABLE … VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
 ///
 /// It runs the scan the `ADD` skipped and, when every row satisfies the constraint, records it as
@@ -1778,6 +1975,30 @@ fn drop_column(
     // **Before anything is changed**, so a refusal leaves the definition as it was.
     refuse_referencing_keys(txn, executor, updated, name, at, cascade)?;
 
+    // A view that reads this column is a dependent too, and the message names the column rather
+    // than the table. This was the recorded debt on the other side of `tests/drop_column.rs`'s two
+    // divergence entries: the column went and the view was left reading one that is gone.
+    let dependents = views_depending_on_column(executor, txn, relation, name)?;
+    if let Some(view) = dependents.first()
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind: "column",
+            name: format!(
+                "{} of table {}",
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+            detail: format!(
+                "view {} depends on column {} of table {}",
+                catalog::display_name(view),
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+    drop_views_cascading(executor, txn, dependents)?;
+
     // The tombstone. `ty`, `typmod` and `missing` survive because the row codec reads them;
     // everything else was a promise to a user who can no longer see the column.
     let column = &mut updated.columns[at];
@@ -1902,7 +2123,18 @@ fn add_unique_constraint(
         predicate: None,
         comment: None,
     });
-    Ok(())
+    // **The index has to be filled, not merely declared.** Without this the constraint was a
+    // catalog entry over an empty index: the rows already in the table were not in it, so a later
+    // duplicate of one of them was accepted *and* a `SELECT … WHERE a = <that value>` answered
+    // with only the new row. A wrong answer to an ordinary query, reached through a statement that
+    // succeeded — and the scan that fixes it is the same one that refuses a constraint the
+    // existing rows already break (ADR 0020's recorded gap).
+    let index = updated
+        .indexes
+        .last()
+        .ok_or_else(|| SqlError::Internal("the index just pushed is not there".to_owned()))?
+        .clone();
+    backfill(executor, txn, updated, &index)
 }
 
 /// The derived name, or the first `<name><n>` that nothing answers to.
@@ -2601,6 +2833,9 @@ pub(super) fn drop_view(
         let stored = executor.resolve_unqualified(txn, name)?;
         match existing_relation(executor, txn, &stored)? {
             Some(catalog::Relation::View { .. }) => {
+                // A view built on this one is a dependency exactly as a view on a table is —
+                // same `2BP01`, with `view` on both sides of the `DETAIL`.
+                refuse_or_drop_dependent_views(executor, txn, &stored, "view", drop.cascade)?;
                 catalog::drop_view(txn, executor.tenant, &stored)?;
                 executor.catalog_written = true;
             }
@@ -2708,6 +2943,120 @@ pub(super) fn alter_schema_rename(
     Ok(Outcome::done("ALTER SCHEMA"))
 }
 
+/// The view half of a `DROP`: refuse if anything is built on `relation`, or take it with `CASCADE`.
+///
+/// Checked **before** the foreign keys, because PostgreSQL reports the first dependent it finds and
+/// views come first in its own order. Without this the base could go and the view be left naming a
+/// relation that is gone — a name outliving its object, reached from an ordinary `DROP TABLE`.
+fn refuse_or_drop_dependent_views(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    relation: &str,
+    kind: &'static str,
+    cascade: bool,
+) -> Result<()> {
+    let dependents = dependent_views(executor, txn, relation)?;
+    if let Some(view) = dependents.first()
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind,
+            name: catalog::display_name(relation),
+            detail: format!(
+                "view {} depends on {kind} {}",
+                catalog::display_name(view),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+    drop_views_cascading(executor, txn, dependents)
+}
+
+/// Drops each view and everything built on it, depth first.
+///
+/// **A view over a view is a dependency too**, so a cascade that dropped only the direct
+/// dependents would leave the outer one naming a relation that is gone — the very thing the edge
+/// exists to prevent, reintroduced by the `CASCADE` that was meant to clean up. Depth first so a
+/// view is dropped after everything that reads it.
+fn drop_views_cascading(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    views: Vec<String>,
+) -> Result<()> {
+    for view in views {
+        let outer = dependent_views(executor, txn, &view)?;
+        drop_views_cascading(executor, txn, outer)?;
+        // Already gone with an earlier branch: two views over one table can share a dependent.
+        if catalog::view(txn, executor.tenant, &view)?.is_none() {
+            continue;
+        }
+        executor.notice(SqlError::CascadeDropsView(catalog::display_name(&view)));
+        catalog::drop_view(txn, executor.tenant, &view)?;
+    }
+    Ok(())
+}
+
+/// Every view whose query names `column` of `relation`, by stored name.
+///
+/// **Column-precise, because PostgreSQL's message is.** `DROP COLUMN` says `view v depends on
+/// column c of table t`, so a view that reads the table but not the column does not stop the
+/// statement. A bare column reference counts wherever it appears — target list, `WHERE`, `ORDER
+/// BY` — and a qualified one counts only when the qualifier is the table or its alias.
+///
+/// `SELECT *` is the case worth naming: it lowers to the columns the table had **when the view was
+/// created**, so it names the column explicitly and is caught like any other.
+fn views_depending_on_column(
+    executor: &Executor,
+    txn: &dyn Txn,
+    relation: &str,
+    column: &str,
+) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for view in dependent_views(executor, txn, relation)? {
+        let Some(def) = catalog::view(txn, executor.tenant, &view)? else {
+            continue;
+        };
+        let Ok(parsed) = crate::parse::parse_statements(&def.definition) else {
+            continue;
+        };
+        let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
+            continue;
+        };
+        if super::bind::any(&lowered, |expr| {
+            matches!(expr, plan::Expr::Column { name, table }
+                if name == column
+                    && table.as_deref().is_none_or(|qualifier| qualifier == relation))
+        }) {
+            found.push(view);
+        }
+    }
+    Ok(found)
+}
+
+/// Every view whose query names `relation`, by stored name.
+///
+/// **Read out of the definitions rather than out of an edge.** A `ViewDef` stores the `SELECT`
+/// text and nothing else, so the dependency is recovered by parsing each view — which is
+/// affordable because `DROP` is rare and a tenant has few views, and which needs no format change.
+/// A definition that no longer parses is skipped rather than fatal: it cannot be a dependency this
+/// statement understands, and refusing every `DROP TABLE` in the database because one view is
+/// unreadable would be the worse answer.
+fn dependent_views(executor: &Executor, txn: &dyn Txn, relation: &str) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for view in catalog::views(txn, executor.tenant)? {
+        let Ok(parsed) = crate::parse::parse_statements(&view.definition) else {
+            continue;
+        };
+        let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
+            continue;
+        };
+        if super::bind::table_names(&lowered).contains(&relation) {
+            found.push(view.name.clone());
+        }
+    }
+    Ok(found)
+}
+
 pub(super) fn drop_table(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -2754,6 +3103,7 @@ pub(super) fn drop_table(
                 return Err(SqlError::UndefinedTableForDrop(name.clone()));
             }
         };
+        refuse_or_drop_dependent_views(executor, txn, &table.name, "table", drop.cascade)?;
         // **A table something references cannot be dropped**, and `2BP01` names the constraint
         // that stops it — unless `CASCADE`, which takes the constraint with the table instead.
         // `RESTRICT` is the default and the same thing as writing nothing; measured, both.
@@ -3520,9 +3870,11 @@ fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
             | AlterTableAction::AddUnique(_),
         ) => "ADD CONSTRAINT",
         Some(AlterTableAction::DropConstraint { .. }) => "DROP CONSTRAINT",
-        Some(AlterTableAction::SetDefault { .. } | AlterTableAction::SetNotNull { .. }) => {
-            "ALTER COLUMN"
-        }
+        Some(
+            AlterTableAction::SetDefault { .. }
+            | AlterTableAction::SetNotNull { .. }
+            | AlterTableAction::SetColumnType { .. },
+        ) => "ALTER COLUMN",
         Some(AlterTableAction::ValidateConstraint(_)) => "VALIDATE CONSTRAINT",
         Some(_) => "ALTER",
     }
@@ -3626,6 +3978,17 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+            continue;
+        }
+        if let AlterTableAction::SetColumnType {
+            column,
+            ty,
+            typmod,
+            using,
+        } = action
+        {
+            set_column_type(txn, executor, &mut updated, column, *ty, *typmod, *using)?;
+            changed = true;
             continue;
         }
         if let AlterTableAction::ValidateConstraint(name) = action {
@@ -3863,9 +4226,17 @@ fn backfill(
             if entry.by_value && entries.iter().any(|(existing, _)| existing == &entry.key) {
                 // Out of the walk as well as out of the page: the index cannot be built and
                 // reading the rest of the table would learn nothing.
-                return Err(SqlError::UniqueViolation {
-                    constraint: index.name.clone(),
-                    key: None,
+                //
+                // **The build's sentence, not the insert's.** Nothing was inserted here, and
+                // PostgreSQL says so — `could not create unique index "…"`, with the `DETAIL`
+                // naming the first duplicate found.
+                return Err(SqlError::CouldNotCreateUniqueIndex {
+                    index: index.name.clone(),
+                    // `render_key` already writes the leading `Key `.
+                    detail: format!(
+                        "{} is duplicated.",
+                        super::index::render_key(table, &index.keys, &entry.values)
+                    ),
                 });
             }
             entries.push((

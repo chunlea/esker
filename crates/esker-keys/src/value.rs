@@ -163,6 +163,27 @@ pub enum ColumnType {
     /// PostgreSQL's `int4range`. **Canonicalised**, because an integer has a successor:
     /// `'[1,10]'` is stored and printed `[1,11)`.
     Int4Range,
+    /// `daterange`. **Discrete, so it canonicalises**: `[2012-01-02,2012-01-04]` comes back
+    /// `[2012-01-02,2012-01-05)`, measured. A date has a successor and a timestamp does not,
+    /// which is the whole of why one of these normalises and the next does not.
+    DateRange,
+    /// `numrange`. **Continuous, so it does not canonicalise**: `[0.1,0.2]` comes back exactly
+    /// `[0.1,0.2]`. `rngcanonical` is `-` for it on a real server, beside `tsrange`'s.
+    NumRange,
+    /// `int8range`. Discrete like `int4range`: `[10,100]` comes back `[10,101)`.
+    Int8Range,
+    /// `tstzrange[]`. **`range_test.rb` declares two range arrays, not one** — `ts_ranges` and
+    /// `tstz_ranges` — and an array type is built per element type, so three of the four left the
+    /// file's 46 tests exactly where they were.
+    TstzRangeArray,
+    /// `int4range[]`.
+    Int4RangeArray,
+    /// `daterange[]`.
+    DateRangeArray,
+    /// `numrange[]`.
+    NumRangeArray,
+    /// `int8range[]`.
+    Int8RangeArray,
     /// `tsrange[]`, which `range_test.rb` declares as `t.tsrange :ts_ranges, array: true`.
     TsRangeArray,
     /// The `citext` extension's type: text whose **comparison folds case**.
@@ -293,7 +314,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 48] = [
+    pub const ALL: [ColumnType; 56] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -342,6 +363,14 @@ impl ColumnType {
         ColumnType::JsonbArray,
         ColumnType::OidArray,
         ColumnType::CitextArray,
+        ColumnType::DateRange,
+        ColumnType::NumRange,
+        ColumnType::Int8Range,
+        ColumnType::TstzRangeArray,
+        ColumnType::Int4RangeArray,
+        ColumnType::DateRangeArray,
+        ColumnType::NumRangeArray,
+        ColumnType::Int8RangeArray,
     ];
 }
 
@@ -532,9 +561,17 @@ impl Datum {
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Citext(_) => ColumnType::Citext,
             Datum::Hstore(_) => ColumnType::Hstore,
+            // **The inverse of `crate::row::range_subtype`, and it is not total.** `int4range`
+            // and `int8range` are both ranges *of* an `int8` here — an `int4` is read as one
+            // everywhere in this crate — so a value carrying that subtype could be either, and
+            // this answers the first as a representative. Which of the two a value **fits** is a
+            // different question and [`Datum::fits`] asks it properly, against the column's own
+            // subtype; nothing needs a single answer except a value with no column beside it.
             Datum::Range { subtype, .. } => match **subtype {
                 ColumnType::TimestampTz => ColumnType::TstzRange,
                 ColumnType::Int4 | ColumnType::Int8 => ColumnType::Int4Range,
+                ColumnType::Date => ColumnType::DateRange,
+                ColumnType::Numeric => ColumnType::NumRange,
                 _ => ColumnType::TsRange,
             },
             Datum::Int4(_) => ColumnType::Int4,
@@ -564,6 +601,14 @@ impl Datum {
     #[must_use]
     pub fn fits(&self, ty: ColumnType) -> bool {
         // NULL fits every column.
+        // **A range fits the column whose subtype it carries**, which `column_type` alone cannot
+        // decide: `int4range` and `int8range` are both ranges of an `int8` here, so a value's
+        // subtype names a *set* of column types and not one. Asked from the column's side, where
+        // the answer is single-valued.
+        if let Datum::Range { subtype, .. } = self {
+            return crate::row::range_subtype(ty) == **subtype
+                && crate::array::ArrayValue::element_of(ty).is_none();
+        }
         let Some(actual) = self.column_type() else {
             return true;
         };

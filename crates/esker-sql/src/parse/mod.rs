@@ -257,6 +257,17 @@ pub struct Parsed {
     /// `sqlparser` 0.62.0 reads `TEMP`/`TEMPORARY` before `TABLE` and not `UNLOGGED`, so the word
     /// is cut out of the source and travels here ([`strip_unlogged`]).
     unlogged: bool,
+    /// Whether this `CREATE TYPE` is the one inside `create_enum`'s `DO` block, and so must do
+    /// nothing when the type is already there ([`strip_do_create_enum`]).
+    do_guarded: bool,
+    /// The message and severity of a `DO $$ BEGIN RAISE … END $$`, if that is what this was.
+    ///
+    /// **The parsed tree is a placeholder.** `sqlparser` has no `DO`, and a `RAISE` is not any
+    /// other statement in disguise the way `create_enum`'s block is a `CREATE TYPE` — so the
+    /// source is replaced by one that parses and the lowering throws that tree away for this
+    /// ([`Parsed::lower`]). Every other rewrite in this module keeps the tree and adds to it;
+    /// this one is the exception, and it is why the field carries the whole statement.
+    raise: Option<(String, crate::error::Severity)>,
 }
 
 impl Parsed {
@@ -274,6 +285,23 @@ impl Parsed {
     #[must_use]
     pub fn is_unlogged(&self) -> bool {
         self.unlogged
+    }
+
+    /// Whether this statement was `create_enum`'s `DO` block rather than a bare `CREATE TYPE`.
+    ///
+    /// The block is a guard around the `CREATE`, and the guard is all it does — so what travels
+    /// here is "make this creation a no-op if the type exists", which is the `IF NOT EXISTS`
+    /// PostgreSQL's `CREATE TYPE` grammar does not have and the reason the adapter writes a block.
+    #[must_use]
+    pub fn is_do_guarded(&self) -> bool {
+        self.do_guarded
+    }
+
+    /// The `RAISE` this `DO` block was, if it was one — recognised by `strip_do_raise`, which
+    /// is private, so this names it rather than linking to it.
+    #[must_use]
+    pub fn raised(&self) -> Option<&(String, crate::error::Severity)> {
+        self.raise.as_ref()
     }
 
     /// Whether this `BEGIN` asked for a **read-only** transaction.
@@ -343,6 +371,17 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let database_options = strip_create_database_options(sql, &scanned)
         .map(|(_, options)| options)
         .unwrap_or_default();
+    // `create_enum`'s block becomes the `CREATE TYPE` it guards, and a `RAISE` block becomes a
+    // placeholder the lowering discards. Every other `DO` body is left alone, fails to parse, and
+    // is named by the refusal table.
+    let guarded = strip_do_create_enum(sql, &scanned);
+    let raise = strip_do_raise(sql, &scanned);
+    let sql = match (&guarded, &raise) {
+        (Some(rewritten), _) => rewritten.as_str(),
+        // Parsed and thrown away: what this statement *is* travels in `Parsed::raise`.
+        (None, Some(_)) => "SELECT 1",
+        (None, None) => sql,
+    };
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
@@ -355,9 +394,390 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
                 unlogged,
+                do_guarded: guarded.is_some(),
+                raise: raise.clone(),
             }
         })
         .collect())
+}
+
+/// The text between a `DO` statement's dollar quotes, or `None` when this is not a plain `DO`.
+///
+/// **`DO LANGUAGE plpgsql $$ … $$` and a trailing `LANGUAGE` are not recognised.** They are
+/// perfectly good PostgreSQL and they reach the refusal table, which names `DO` — a body that says
+/// which language it is in is one this recogniser has no business guessing at.
+fn do_body(sql: &str) -> Option<&str> {
+    let open = sql.find('$')?;
+    // Everything before the quote must be the bare word `DO`.
+    if !sql.get(..open)?.trim().eq_ignore_ascii_case("DO") {
+        return None;
+    }
+    let tag_end = sql.get(open + 1..)?.find('$')? + open + 1;
+    let tag = sql.get(open..=tag_end)?;
+    let body_start = tag_end + 1;
+    let body_end = sql.get(body_start..)?.rfind(tag)? + body_start;
+    if body_end < body_start {
+        return None;
+    }
+    // Only whitespace and an optional `;` may follow the closing tag.
+    let tail = sql.get(body_end + tag.len()..)?.trim();
+    if !tail.is_empty() && tail != ";" {
+        return None;
+    }
+    sql.get(body_start..body_end)
+}
+
+/// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's other `DO` body.
+///
+/// `postgresql_adapter_test.rb` raises one in seven tests to exercise `db_warnings_action`, and
+/// what those tests read is the severity word and the message `libpq` prints. So this is one
+/// `RAISE` of one literal and nothing else: no format arguments, no `USING`, no second statement.
+///
+/// **`EXCEPTION` is deliberately not here.** It is an error — `P0001` with the raised text as the
+/// whole message — and routing it through the notice path would turn a failed statement into a
+/// successful one. It stays refused by name until something needs it.
+fn strip_do_raise(sql: &str, scanned: &Scan<'_>) -> Option<(String, crate::error::Severity)> {
+    let [first, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("DO") {
+        return None;
+    }
+    let tokens = tokenize_do_body(do_body(sql)?)?;
+    if !do_words_match(&tokens, 0, &["BEGIN", "RAISE"]) {
+        return None;
+    }
+    let severity = match tokens.get(2) {
+        Some((DoToken::Word(level), _, _)) if level.eq_ignore_ascii_case("NOTICE") => {
+            crate::error::Severity::Notice
+        }
+        Some((DoToken::Word(level), _, _)) if level.eq_ignore_ascii_case("WARNING") => {
+            crate::error::Severity::Warning
+        }
+        // `INFO`, `LOG` and `DEBUG` have no severity token on this wire, and `EXCEPTION` is an
+        // error rather than a notice. Both reach the refusal table.
+        _ => return None,
+    };
+    let Some((DoToken::Text(message), _, _)) = tokens.get(3) else {
+        return None;
+    };
+    let mut at = 4;
+    // `; END` or `; END;` — the trailing semicolon inside the body is optional.
+    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct(';')) {
+        return None;
+    }
+    at += 1;
+    if !do_words_match(&tokens, at, &["END"]) {
+        return None;
+    }
+    at += 1;
+    if tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct(';')) {
+        at += 1;
+    }
+    if at != tokens.len() {
+        return None;
+    }
+    // `''` inside a literal is one quote, which is the only escape this recogniser reads.
+    Some((message.replace("''", "'"), severity))
+}
+
+/// One token of a `DO` body: a word, a quoted string, a quoted identifier, or a punctuation mark.
+///
+/// Enough to recognise one statement template and no more. It is deliberately not a plpgsql
+/// lexer — it does not know comments, dollar-quoting inside the body, or `E''` escapes — because
+/// the only bodies it ever has to accept are machine-generated by one method of one adapter, and
+/// anything it fails to recognise is refused by name rather than guessed at.
+#[derive(Debug, PartialEq, Eq)]
+enum DoToken<'a> {
+    /// A bare word: a keyword or an unquoted identifier. Compared case-insensitively.
+    Word(&'a str),
+    /// `'…'` — the text between the quotes, with `''` left as written.
+    Text(&'a str),
+    /// `"…"` — the text between the quotes.
+    Quoted(&'a str),
+    /// One of `( ) , ; . =`.
+    Punct(char),
+}
+
+/// Splits a `DO` body into [`DoToken`]s, each with the byte range it came from.
+///
+/// `None` if the body holds something this recogniser will not reason about — an unterminated
+/// quote, or a character that is not part of the one template. Refusing to tokenise is how an
+/// unfamiliar body reaches the refusal table instead of being partly understood.
+fn tokenize_do_body(body: &str) -> Option<Vec<(DoToken<'_>, usize, usize)>> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte.is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        match byte {
+            b'\'' | b'"' => {
+                let quote = byte;
+                at += 1;
+                let from = at;
+                loop {
+                    // An unterminated quote is not a body this recogniser will judge.
+                    let end = body.get(at..)?.find(quote as char)? + at;
+                    // `''` and `""` are one escaped quote, not the end of the literal.
+                    if bytes.get(end + 1) == Some(&quote) {
+                        at = end + 2;
+                        continue;
+                    }
+                    let text = body.get(from..end)?;
+                    out.push((
+                        if quote == b'\'' {
+                            DoToken::Text(text)
+                        } else {
+                            DoToken::Quoted(text)
+                        },
+                        start,
+                        end + 1,
+                    ));
+                    at = end + 1;
+                    break;
+                }
+            }
+            b'(' | b')' | b',' | b';' | b'.' | b'=' => {
+                out.push((DoToken::Punct(byte as char), start, at + 1));
+                at += 1;
+            }
+            _ if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                    at += 1;
+                }
+                out.push((DoToken::Word(body.get(start..at)?), start, at));
+            }
+            // Anything else -- an operator, a `$`, a `:` -- is outside the template.
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Whether the tokens from `at` are these bare words, in order and case-insensitively.
+fn do_words_match(tokens: &[(DoToken<'_>, usize, usize)], at: usize, words: &[&str]) -> bool {
+    words.iter().enumerate().all(|(offset, want)| {
+        matches!(tokens.get(at + offset), Some((DoToken::Word(seen), _, _))
+            if seen.eq_ignore_ascii_case(want))
+    })
+}
+
+/// The `create_enum` block, rewritten into the `CREATE TYPE` it guards — or `None` for any other
+/// body, which then reaches the refusal table and is named there.
+///
+/// **This is the only `DO` body the suite sends.** Thirty-six `DO` statements were logged running
+/// the five files that need one against PostgreSQL 19 and every one is this template:
+///
+/// ```text
+/// DO $$ BEGIN IF NOT EXISTS (
+///          SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+///          WHERE t.typname = '<name>' AND n.nspname = <ANY (current_schemas(false)) | '<schema>'>
+///        ) THEN CREATE TYPE <name> AS ENUM (<labels>); END IF; END $$
+/// ```
+///
+/// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, which is why `create_enum` writes a block at
+/// all; the guard is the whole of what the block does, so running the template is running the
+/// `CREATE TYPE` **only when the type is not already there** ([`Parsed::is_do_guarded`]).
+///
+/// **The guard's type name must be the created one's.** A block that tested one name and created
+/// another would be idempotent in the wrong direction, and nothing generated writes one — so it is
+/// refused rather than run. The *schema* is not compared: `create_enum` guards on the search path
+/// when the caller named no schema and on the literal when it did, and in both cases the guard and
+/// the `CREATE` agree by construction; what decides where the type lands is the `CREATE`, and the
+/// executor's own "does this name exist here" is the same question the guard asks.
+/// Whether the token at `at` is exactly `want`, comparing words case-insensitively.
+fn do_token_is(tokens: &[(DoToken<'_>, usize, usize)], at: usize, want: &DoToken<'_>) -> bool {
+    match (tokens.get(at).map(|(token, _, _)| token), want) {
+        (Some(DoToken::Word(seen)), DoToken::Word(expected)) => seen.eq_ignore_ascii_case(expected),
+        (Some(seen), expected) => seen == expected,
+        (None, _) => false,
+    }
+}
+
+/// Walks `wants` from `at`, returning the index after them or `None` at the first mismatch.
+fn do_expect(
+    tokens: &[(DoToken<'_>, usize, usize)],
+    mut at: usize,
+    wants: &[DoToken<'_>],
+) -> Option<usize> {
+    for want in wants {
+        if !do_token_is(tokens, at, want) {
+            return None;
+        }
+        at += 1;
+    }
+    Some(at)
+}
+
+/// The guard half of `create_enum`'s block: `BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type … )`.
+///
+/// Returns the type name it tests for and the index just past the closing parenthesis. The
+/// **schema** predicate is accepted in either of the two forms `create_enum` writes and is not
+/// otherwise read: it guards on the search path when the caller named no schema and on the literal
+/// when it did, so in both cases it asks the same question the `CREATE` half answers.
+fn match_do_enum_guard<'a>(tokens: &'a [(DoToken<'a>, usize, usize)]) -> Option<(&'a str, usize)> {
+    use DoToken::{Punct, Text, Word};
+    let at = do_expect(
+        tokens,
+        0,
+        &[
+            Word("BEGIN"),
+            Word("IF"),
+            Word("NOT"),
+            Word("EXISTS"),
+            Punct('('),
+            Word("SELECT"),
+            Word("1"),
+            Word("FROM"),
+            Word("pg_type"),
+            Word("t"),
+            Word("JOIN"),
+            Word("pg_namespace"),
+            Word("n"),
+            Word("ON"),
+            Word("t"),
+            Punct('.'),
+            Word("typnamespace"),
+            Punct('='),
+            Word("n"),
+            Punct('.'),
+            Word("oid"),
+            Word("WHERE"),
+            Word("t"),
+            Punct('.'),
+            Word("typname"),
+            Punct('='),
+        ],
+    )?;
+    let Some((Text(guarded), _, _)) = tokens.get(at) else {
+        return None;
+    };
+    let at = do_expect(
+        tokens,
+        at + 1,
+        &[
+            Word("AND"),
+            Word("n"),
+            Punct('.'),
+            Word("nspname"),
+            Punct('='),
+        ],
+    )?;
+    let at = match tokens.get(at) {
+        // `n.nspname = 'test_schema'` — the caller named a schema.
+        Some((Text(_), _, _)) => at + 1,
+        // `n.nspname = ANY (current_schemas(false))` — the search path.
+        Some((Word(word), _, _)) if word.eq_ignore_ascii_case("ANY") => do_expect(
+            tokens,
+            at,
+            &[
+                Word("ANY"),
+                Punct('('),
+                Word("current_schemas"),
+                Punct('('),
+                Word("false"),
+                Punct(')'),
+                Punct(')'),
+            ],
+        )?,
+        _ => return None,
+    };
+    Some((guarded, do_expect(tokens, at, &[Punct(')')])?))
+}
+
+/// The guarded half: `THEN CREATE TYPE <name> AS ENUM (…); END IF; END`.
+///
+/// Returns the byte range of the `CREATE TYPE …` itself, which is what replaces the whole
+/// statement. The created name must be the one the guard tested — a block that tested one name and
+/// created another would be idempotent in the wrong direction, and nothing generated writes one.
+fn match_do_enum_create(
+    tokens: &[(DoToken<'_>, usize, usize)],
+    at: usize,
+    guarded: &str,
+) -> Option<(usize, usize)> {
+    use DoToken::{Punct, Quoted, Text, Word};
+    let from = tokens.get(at + 1)?.1;
+    let mut at = do_expect(tokens, at, &[Word("THEN"), Word("CREATE"), Word("TYPE")])?;
+
+    // `<name>` or `<schema> . <name>`; the bare name is the one that has to match the guard.
+    let (Quoted(name) | Word(name), _, _) = tokens.get(at)? else {
+        return None;
+    };
+    at += 1;
+    let created = if do_token_is(tokens, at, &Punct('.')) {
+        let (Quoted(inner) | Word(inner), _, _) = tokens.get(at + 1)? else {
+            return None;
+        };
+        at += 2;
+        *inner
+    } else {
+        *name
+    };
+    if created != guarded {
+        return None;
+    }
+
+    // `AS ENUM ('<label>', …)` — the list may be empty, which `schema_test.rb` sends.
+    at = do_expect(tokens, at, &[Word("AS"), Word("ENUM"), Punct('(')])?;
+    while matches!(tokens.get(at), Some((Text(_), _, _))) {
+        at += 1;
+        if do_token_is(tokens, at, &Punct(',')) {
+            at += 1;
+        }
+    }
+    let to = tokens.get(at)?.2;
+    at = do_expect(
+        tokens,
+        at,
+        &[
+            Punct(')'),
+            Punct(';'),
+            Word("END"),
+            Word("IF"),
+            Punct(';'),
+            Word("END"),
+        ],
+    )?;
+    // A trailing `;` inside the body is optional; anything after it is not this template.
+    if do_token_is(tokens, at, &Punct(';')) {
+        at += 1;
+    }
+    (at == tokens.len()).then_some((from, to))
+}
+
+/// The `create_enum` block, rewritten into the `CREATE TYPE` it guards — or `None` for any other
+/// body, which then reaches the refusal table and is named there.
+///
+/// **This is the only `DO` body the suite sends for a type.** Thirty-six `DO` statements were
+/// logged running the five files that need one against PostgreSQL 19, and every one is:
+///
+/// ```text
+/// DO $$ BEGIN IF NOT EXISTS (
+///          SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+///          WHERE t.typname = '<name>' AND n.nspname = <ANY (current_schemas(false)) | '<schema>'>
+///        ) THEN CREATE TYPE <name> AS ENUM (<labels>); END IF; END $$
+/// ```
+///
+/// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, which is why `create_enum` writes a block at
+/// all; the guard is the whole of what the block does, so running the template is running the
+/// `CREATE TYPE` **only when the type is not already there** ([`Parsed::is_do_guarded`]).
+fn strip_do_create_enum(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("DO") {
+        return None;
+    }
+    let body = do_body(sql)?;
+    let tokens = tokenize_do_body(body)?;
+    let (guarded, at) = match_do_enum_guard(&tokens)?;
+    let (from, to) = match_do_enum_create(&tokens, at, guarded)?;
+    Some(body.get(from..to)?.to_owned())
 }
 
 /// `CREATE UNLOGGED TABLE …` with the keyword removed, or `None` for anything else.
@@ -1317,7 +1737,22 @@ const UNSUPPORTED: &[Unsupported] = &[
     // SEQUENCE` and its relatives, which is why the name stayed general.
     u("ALTER TABLE ... SET LOGGED", &[], &["SET", "LOGGED"]),
     u("ALTER TABLE ... SET UNLOGGED", &[], &["SET", "UNLOGGED"]),
-    u("CREATE UNLOGGED", &["CREATE", "UNLOGGED"], &[]),
+    // **Not `CREATE UNLOGGED TABLE`**, whose keyword is cut out of the source and parses
+    // (`strip_unlogged`). This entry matched it anyway, so a `CREATE UNLOGGED TABLE` that failed
+    // to parse for a reason of its own — a virtual generated column, in the suite — was reported
+    // as `CREATE UNLOGGED is not supported`, sending the reader to a feature that works. Ten tests
+    // over two files were ranked under that name while `relpersistence` had answered `u` all
+    // along. The `SEQUENCE` and `MATERIALIZED VIEW` spellings are what is left.
+    u(
+        "CREATE UNLOGGED SEQUENCE",
+        &["CREATE", "UNLOGGED", "SEQUENCE"],
+        &[],
+    ),
+    u(
+        "CREATE UNLOGGED",
+        &["CREATE", "UNLOGGED"],
+        &["MATERIALIZED"],
+    ),
     // **`CREATE TABLE` is not here**: an `EXCLUDE` constraint is cut out of the source and read on
     // its own (`strip_exclude_constraints`). What stays a refusal is `ALTER TABLE ... ADD
     // CONSTRAINT ... EXCLUDE`, which has no such path.
@@ -1459,6 +1894,30 @@ fn recognize_unsupported(sql: &str, words: &[&str]) -> Option<&'static str> {
         .eq_ignore_ascii_case("SELECT")
     {
         return Some("SELECT with an empty target list");
+    }
+    // **A generated column that is not `STORED`** — PostgreSQL 18's virtual generated column,
+    // which this parser has no grammar for: it reports `Expected: STORED`, a syntax error about
+    // valid SQL. Written with `VIRTUAL` or with no keyword at all, and `ActiveRecord` sends both —
+    // it tries the bare form first and re-sends with the keyword.
+    //
+    // **Counted rather than searched**, because one `CREATE TABLE` can declare both kinds: the
+    // suite's `virtual_columns` has three `STORED` columns and two virtual ones, so "contains
+    // `GENERATED` and does not contain `STORED`" is false there and misses it. More `GENERATED`
+    // clauses than `STORED` keywords means at least one is virtual.
+    let generated = words
+        .windows(3)
+        .filter(|window| {
+            window[0].eq_ignore_ascii_case("GENERATED")
+                && window[1].eq_ignore_ascii_case("ALWAYS")
+                && window[2].eq_ignore_ascii_case("AS")
+        })
+        .count();
+    let stored = words
+        .iter()
+        .filter(|word| word.eq_ignore_ascii_case("STORED"))
+        .count();
+    if generated > stored {
+        return Some("a virtual generated column, which is not STORED");
     }
     UNSUPPORTED
         .iter()
