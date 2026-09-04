@@ -979,6 +979,152 @@ impl Env<'_> {
 }
 
 /// Evaluates an expression over a row, with no way to run a subquery of its own.
+/// The hstore operators and functions, over the canonical text a column holds.
+///
+/// **Every one is strict**: a NULL operand is a NULL answer, never an error and never a default,
+/// which is what a real server does for all of them. Parsing the operand rather than keeping a map
+/// beside the value is deliberate — an hstore *is* its canonical text here
+/// (`crate::value::hstore`), so there is nothing else to keep, and a parse that fails is bytes this
+/// node did not write.
+///
+/// Split out of [`catalog_function`] for the reason [`range_function`] is: one family, and that
+/// function is long enough already.
+fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+    use crate::value::hstore;
+
+    // **Strict, and only strict.** A NULL operand is a NULL answer; an operand that is *not* NULL
+    // and not an hstore is the refusal the operator already had, **not** a NULL — these operators
+    // are spelled the same as several others (`@>` over arrays, `||` over text), so answering NULL
+    // for a shape this function does not handle would turn another type's declared gap into a
+    // silent wrong answer. `tests/array.rs` caught exactly that.
+    let wrong_type = |value: Option<&Datum>| {
+        SqlError::unsupported(format!(
+            "{} over {}",
+            func.name(),
+            value
+                .and_then(Datum::column_type)
+                .map_or("unknown", crate::value::PgType::name)
+        ))
+    };
+    let map = |value: Option<&Datum>| match value {
+        Some(Datum::Text(text)) => hstore::from_text(text).map(Some),
+        Some(Datum::Null) | None => Ok(None),
+        other => Err(wrong_type(other)),
+    };
+    let text = |value: Option<&Datum>| match value {
+        Some(Datum::Text(text)) => Ok(Some(text.clone())),
+        Some(Datum::Null) | None => Ok(None),
+        other => Err(wrong_type(other)),
+    };
+    Ok(match func {
+        // `h -> k`: the value, or NULL for a key the hstore does not hold **and** for one whose
+        // value is NULL — the two are indistinguishable through this operator, which is why `?`
+        // exists.
+        CatalogFunc::HstoreFetch => match (map(args.first())?, text(args.get(1))?) {
+            (Some(map), Some(key)) => map
+                .get(&hstore::Key(key))
+                .cloned()
+                .flatten()
+                .map_or(Datum::Null, Datum::Text),
+            _ => Datum::Null,
+        },
+        // `h ? k`: **true for a key whose value is NULL**, which is the whole difference from
+        // `(h -> k) IS NOT NULL`.
+        CatalogFunc::HstoreHasKey => match (map(args.first())?, text(args.get(1))?) {
+            (Some(map), Some(key)) => Datum::Bool(map.contains_key(&hstore::Key(key))),
+            _ => Datum::Null,
+        },
+        // `a @> b`: every pair of `b` is in `a`, values compared as they are — a NULL value in `b`
+        // is contained only by a NULL value in `a`.
+        CatalogFunc::HstoreContains => match (map(args.first())?, map(args.get(1))?) {
+            (Some(left), Some(right)) => Datum::Bool(
+                right
+                    .iter()
+                    .all(|(key, value)| left.get(key) == Some(value)),
+            ),
+            _ => Datum::Null,
+        },
+        // `a || b`: **the right wins a shared key**, which is the opposite of the first-wins rule
+        // a repeated key inside one literal follows. Both measured.
+        CatalogFunc::HstoreConcat => match (map(args.first())?, map(args.get(1))?) {
+            (Some(mut left), Some(right)) => {
+                left.extend(right);
+                Datum::Text(hstore::to_text(&left))
+            }
+            _ => Datum::Null,
+        },
+        CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => match map(args.first())? {
+            None => Datum::Null,
+            Some(map) => {
+                let wants_keys = func == CatalogFunc::HstoreAkeys;
+                // **A NULL value is a NULL element**, and `akeys` never has one because a key is
+                // never NULL. In canonical order, which is the map's own.
+                let values: Vec<Option<Datum>> = map
+                    .iter()
+                    .map(|(key, value)| {
+                        if wants_keys {
+                            Some(Datum::Text(key.0.clone()))
+                        } else {
+                            value.clone().map(Datum::Text)
+                        }
+                    })
+                    .collect();
+                Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                    ColumnType::Text,
+                    1,
+                    values,
+                ))
+            }
+        },
+        // `hstore(k, v)` — one pair — and `hstore(keys[], vals[])`, which pairs them by position.
+        CatalogFunc::HstoreBuild => build_hstore(args.first(), args.get(1)),
+        other => {
+            return Err(SqlError::Internal(format!(
+                "{} reached the hstore evaluator",
+                other.name()
+            )));
+        }
+    })
+}
+
+/// `hstore(k, v)` and `hstore(keys[], vals[])`.
+///
+/// Two shapes of one name, told apart by whether the arguments are arrays — which is how a real
+/// server tells them apart too, by overload rather than by a different name.
+fn build_hstore(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
+    use crate::value::hstore;
+
+    let mut out = hstore::Hstore::new();
+    match (left, right) {
+        (Some(Datum::Array(keys)), Some(Datum::Array(values))) => {
+            for (at, key) in keys.values.iter().enumerate() {
+                let Some(Datum::Text(key)) = key else {
+                    continue;
+                };
+                out.insert(
+                    hstore::Key(key.clone()),
+                    match values.values.get(at) {
+                        Some(Some(Datum::Text(value))) => Some(value.clone()),
+                        _ => None,
+                    },
+                );
+            }
+        }
+        (Some(Datum::Text(key)), value) => {
+            out.insert(
+                hstore::Key(key.clone()),
+                match value {
+                    Some(Datum::Text(value)) => Some(value.clone()),
+                    _ => None,
+                },
+            );
+        }
+        _ => return Datum::Null,
+    }
+    Datum::Text(hstore::to_text(&out))
+}
+
 /// The three functions `crate::value::range` answers: `daterange`, `isempty` and `&&`.
 ///
 /// Split out of [`catalog_function`] because they are one family and it is long enough already.
@@ -1877,6 +2023,13 @@ fn catalog_function(
                 _ => Datum::Null,
             }
         }
+        CatalogFunc::HstoreFetch
+        | CatalogFunc::HstoreHasKey
+        | CatalogFunc::HstoreContains
+        | CatalogFunc::HstoreConcat
+        | CatalogFunc::HstoreAkeys
+        | CatalogFunc::HstoreAvals
+        | CatalogFunc::HstoreBuild => hstore_function(call.func, &args)?,
         CatalogFunc::DateRange | CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => {
             range_function(call.func, &args)?
         }

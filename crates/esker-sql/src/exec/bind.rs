@@ -991,7 +991,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::TextArray
+        | ColumnType::HstoreArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1005,7 +1006,11 @@ fn placeholder(ty: ColumnType) -> Datum {
         },
         ColumnType::Int4 => Datum::Int4(0),
         ColumnType::Int2 => Datum::Int2(0),
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => Datum::Text(String::new()),
+        // The empty hstore is the empty string too, and it is a real value rather than a NULL —
+        // see `crate::value::hstore`.
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Hstore => {
+            Datum::Text(String::new())
+        }
         // The empty string is not a document, so a `json` placeholder is the smallest one that
         // is. It only ever stands in for a type while a `Describe` is answered.
         ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),

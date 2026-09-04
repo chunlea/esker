@@ -836,7 +836,17 @@ fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
 /// schema load, and a function this node does not have is a gap of its own with its own capture.
 /// The list is deliberately short for the reason `pg_type` is: an entry here tells a client this
 /// server has something, so a type-bearing extension does not go on it until the type does.
-const AVAILABLE_EXTENSIONS: [(&str, &str); 3] = [
+/// **`hstore` is the first entry that carries a type**, and it went on in the commit that made
+/// `ColumnType::Hstore` — not before.
+///
+/// **The type is here whether or not the extension is installed**, which is one place this differs
+/// from a real server: there, `CREATE TABLE t (c hstore)` without the extension is
+/// `42704 type "hstore" does not exist`, and here it is accepted. The type name resolves in the
+/// lowering, which has no catalog to ask (`crate::parse::lower`), and every statement the suite
+/// sends installs the extension first — so it is a gap nothing measured reaches, recorded here
+/// rather than in a divergence nothing would exercise.
+const AVAILABLE_EXTENSIONS: [(&str, &str); 4] = [
+    ("hstore", "1.8"),
     ("pgcrypto", "1.4"),
     ("plpgsql", "1.0"),
     ("uuid-ossp", "1.1"),
@@ -1374,6 +1384,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpchar",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
+        ColumnType::Hstore => "hstore",
+        ColumnType::HstoreArray => "_hstore",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
         ColumnType::TimestampTz => "timestamptz",
@@ -1410,7 +1422,13 @@ fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
             "D"
         }
-        ColumnType::Bytea | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => "U",
+        // **`U` for hstore**, measured: the adapter's boot type-map query reads this column
+        // and an extension type is "user" rather than "string".
+        ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Hstore
+        | ColumnType::Uuid => "U",
         // `T` for timespan, which is its own category and not the datetimes' `D`.
         ColumnType::Interval => "T",
         // `A` for array, whatever the elements are — the category is the constructor's, not the
@@ -1419,7 +1437,8 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => "A",
+        | ColumnType::TextArray
+        | ColumnType::HstoreArray => "A",
     }
 }
 
@@ -1439,7 +1458,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => "array_in",
+        | ColumnType::TextArray
+        | ColumnType::HstoreArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -1448,6 +1468,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Bpchar => "bpcharin",
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",
+        // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
+        ColumnType::Hstore => "hstore_in",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
         ColumnType::TimestampTz => "timestamptz_in",

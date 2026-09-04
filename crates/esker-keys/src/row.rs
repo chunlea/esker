@@ -364,7 +364,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => return decode_array(ty, bytes),
+        | ColumnType::TextArray
+        | ColumnType::HstoreArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -388,6 +389,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Jsonb
+        | ColumnType::Hstore
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -403,6 +405,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                     | ColumnType::Bpchar
                     | ColumnType::Json
                     | ColumnType::Jsonb
+                    | ColumnType::Hstore
             ) {
                 Datum::Text(text_from_utf8(body)?)
             } else {
@@ -876,8 +879,16 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // rows a scan does not, and `json` has no equality operator at all on a real server. The
         // SQL layer refuses both at `CREATE TABLE`; reaching here means the bytes claim a key this
         // crate never wrote, which is corruption rather than something to decode.
-        ColumnType::Json | ColumnType::Jsonb => {
-            return Err(corrupt("an index key column of type json or jsonb"));
+        // **Not a key column**, and hstore is here for a reason worth reading rather than
+        // guessing. Its *equality* is its byte equality — the canonical form is a function of the
+        // content — so sharing `text`'s representation is safe for `=`. Its **order is not**:
+        // measured on 19beta1, `'a=>NULL'` sorts **first** among hstores sharing a key, where its
+        // canonical text `"a"=>NULL` sorts after `"a"=>"2"` because `N` is above `"`. A byte
+        // ordered key would return an index scan in an order a real server does not, which is
+        // ADR 0042's rule one type later: a type may share another's representation only if it
+        // shares its comparison, and hstore shares half of one.
+        ColumnType::Json | ColumnType::Jsonb | ColumnType::Hstore | ColumnType::HstoreArray => {
+            return Err(corrupt("an index key column of type json, jsonb or hstore"));
         }
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
             let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
@@ -1512,7 +1523,8 @@ mod tests {
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
-            | ColumnType::TextArray => {
+            | ColumnType::TextArray
+            | ColumnType::HstoreArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 (
                     proptest::collection::vec(
@@ -1551,6 +1563,10 @@ mod tests {
             }
             // Valid documents, because that is what a `json` column holds — an arbitrary string
             // is not one, and the row codec is only ever handed a value the SQL layer validated.
+            // An hstore is a `Datum::Text` here like every other text-shaped type: this crate
+            // stores the canonical form and `esker_sql::value::hstore` is what makes one, so the
+            // strategy is text and the round trip is the text's.
+            ColumnType::Hstore => ".*".prop_map(|text: String| Datum::Text(text)).boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",

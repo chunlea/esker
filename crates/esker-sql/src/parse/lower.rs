@@ -2845,6 +2845,35 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 // — `pg_cmp` says nothing about them — so it cannot be a `BinaryOp`, and every
                 // walker already descends into a call's arguments
                 // (`crate::plan::expr::CatalogFunc::RangeOverlaps`).
+                // **The hstore operators are calls, not comparisons**, for the reason `&&` is:
+                // none of them is an ordering, and every walker already descends into a call's
+                // arguments. Which type they are *for* is decided when they are evaluated, so
+                // `||` over anything but two hstores still gets the refusal it has today rather
+                // than a wrong answer.
+                BinaryOperator::Arrow => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::HstoreFetch,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                BinaryOperator::Question => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::HstoreHasKey,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                BinaryOperator::AtArrow => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::HstoreContains,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                BinaryOperator::StringConcat => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::HstoreConcat,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 BinaryOperator::PGOverlap => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::RangeOverlaps,
@@ -3663,6 +3692,24 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
     let mut texts: Vec<Option<String>> = Vec::with_capacity(elements.len());
     let mut element = None;
     for expr in elements {
+        // **An `'…'::hstore` element is a constant too.** `hstore_test.rb` writes
+        // `t.hstore "payload", array: true` and then `ARRAY['"AA"=>"BB"'::hstore, …]`, which is a
+        // cast of a string constant and folds here exactly as the string would — narrowed to
+        // hstore rather than to every type, because a cast to any other one is a declared
+        // divergence and widening it would move answers this unit did not measure.
+        if let Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } = strip_nesting(expr)
+            && matches!(lower_type(data_type), Ok((ColumnType::Hstore, _)))
+            && let Expr::Value(value) = strip_nesting(inner)
+            && let Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) = &value.value
+        {
+            element = Some(ColumnType::Hstore);
+            texts.push(Some(text.clone()));
+            continue;
+        }
         let Expr::Value(value) = strip_nesting(expr) else {
             return Err(SqlError::unsupported(
                 "an ARRAY constructor over anything but constants",
@@ -5697,6 +5744,15 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("oid") =>
         {
             ColumnType::Oid
+        }
+        // **`hstore` is a real type here and a `CREATE EXTENSION` type there**, and it reaches
+        // `sqlparser` as a custom name for the same reason `oid` does. Resolving it before the
+        // catalog is asked is what makes `'a=>b'::hstore` an ordinary constant cast rather than
+        // the cast-to-a-named-type this crate does not have yet.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("hstore") =>
+        {
+            ColumnType::Hstore
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

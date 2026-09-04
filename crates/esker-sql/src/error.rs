@@ -363,6 +363,16 @@ pub enum SqlError {
         value: String,
     },
 
+    /// An `hstore` literal the extension's own input function refuses.
+    ///
+    /// **`42601`, a syntax error**, and not the `22P02` every other bad literal in this crate
+    /// gives: measured, `'a'::hstore` is `syntax error in hstore: unexpected end of string`. The
+    /// sentence is `hstore_in`'s own and the prefix is part of it, which is why this is a variant
+    /// rather than a [`SqlError::Syntax`] with a message — that one prints its own
+    /// `syntax error: ` in front.
+    #[error("syntax error in hstore: {0}")]
+    HstoreSyntax(String),
+
     /// A string that is not one of an enum's labels.
     ///
     /// **`22P02`, the input-syntax class**, and the sentence is a different one from
@@ -1795,6 +1805,7 @@ impl SqlError {
             | SqlError::UnloggedView
             // **PostgreSQL's own class for this**: an option its `CREATE DATABASE` does not have
             // is a syntax error there and not a feature refusal. Measured.
+            | SqlError::HstoreSyntax(_)
             | SqlError::UnrecognizedDatabaseOption(_) => sqlstate::SYNTAX_ERROR,
             SqlError::StatementTooComplex => sqlstate::STATEMENT_TOO_COMPLEX,
             SqlError::UndefinedTable(_)
