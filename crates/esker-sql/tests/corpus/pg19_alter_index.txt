@@ -1,0 +1,58 @@
+# `ALTER INDEX` — 18 tests over 7 files, and one shape.
+#
+# `ActiveRecord` sends **only `RENAME TO`**, from two places: `rename_index` renames any index
+# (`postgresql/schema_statements.rb:590`), and `rename_table` follows a table rename with the
+# primary key's index (`:467`) because PostgreSQL does not rename it for you. The MySQL adapter's
+# `ALTER INDEX … VISIBLE` is a different adapter's statement and is not sent here.
+#
+# Captured against `esker-pg19` on 127.0.0.1:55432.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Renaming an index renames its constraint.** `ALTER INDEX ai_pkey RENAME TO ai2_pkey` moves
+#     `pg_constraint.conname` too, and so does renaming the index a `UNIQUE` constraint owns. They
+#     are one name in two catalogs, not two names — which is the same fact `DROP CONSTRAINT` uses
+#     from the other side.
+#   * **A name already taken is `42P07`, not `42P01` or `42710`** — `relation "…" already exists`,
+#     because an index shares its namespace with tables and sequences.
+#   * **A missing index is `42P01 relation "…" does not exist`**, the *relation* message rather than
+#     an index-specific one, and `IF EXISTS` turns it into a `NOTICE … skipping` that succeeds.
+#   * **`ALTER INDEX` accepts a table.** `ALTER INDEX ai RENAME TO ai_renamed` renames the *table*
+#     `ai` without complaint: the statement is the generic rename wearing another keyword. Nothing
+#     the suite sends does this, and a node that refuses it is diverging on a shape no client uses.
+#   * **`SET (fillfactor = …)` and `SET TABLESPACE` both succeed and change nothing observable
+#     here**, while `ALTER COLUMN n SET STATISTICS` on an ordinary column is `0A000` with a HINT
+#     pointing at the table's column. None of the three is sent by the suite.
+#   * `pg_indexes.indexname` is a `name` and `pg_constraint.contype` a `"char"`.
+BEGIN		-
+CREATE TABLE ai (id serial primary key, name character varying(255), qty integer)		-
+CREATE INDEX index_ai_on_name ON ai (name)		-
+CREATE UNIQUE INDEX index_ai_on_qty ON ai (qty)		-
+ALTER TABLE ai ADD CONSTRAINT ai_qty_uq UNIQUE (qty, name)		-
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'ai' ORDER BY indexname	text,name	r|ai_pkey ; r|ai_qty_uq ; r|index_ai_on_name ; r|index_ai_on_qty
+ALTER INDEX "index_ai_on_name" RENAME TO "index_ai_on_title"		-
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'ai' ORDER BY indexname	text,name	r|ai_pkey ; r|ai_qty_uq ; r|index_ai_on_qty ; r|index_ai_on_title
+SELECT 'r', indexdef FROM pg_indexes WHERE indexname = 'index_ai_on_title'	text,text	r|CREATE INDEX index_ai_on_title ON public.ai USING btree (name)
+ALTER INDEX "ai_pkey" RENAME TO "ai2_pkey"		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'ai'::regclass AND contype = 'p'	text,name,"char"	r|ai2_pkey|p
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'ai' ORDER BY indexname	text,name	r|ai2_pkey ; r|ai_qty_uq ; r|index_ai_on_qty ; r|index_ai_on_title
+ALTER INDEX "ai_qty_uq" RENAME TO "ai_qty_uq2"		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'ai'::regclass AND contype = 'u'	text,name	r|ai_qty_uq2
+ALTER INDEX "public"."index_ai_on_title" RENAME TO "index_ai_on_name"		-
+SELECT 'r', count(*) FROM pg_indexes WHERE indexname = 'index_ai_on_name'	text,bigint	r|1
+SAVEPOINT a1		-
+ALTER INDEX "nosuchindex" RENAME TO "x"		!42P01 relation "nosuchindex" does not exist
+ROLLBACK TO a1		-
+ALTER INDEX IF EXISTS "nosuchindex" RENAME TO "x"		-
+SAVEPOINT a2		-
+ALTER INDEX "index_ai_on_name" RENAME TO "index_ai_on_qty"		!42P07 relation "index_ai_on_qty" already exists
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+ALTER INDEX "index_ai_on_name" ALTER COLUMN 1 SET STATISTICS 100		!0A000 cannot alter statistics on non-expression column "name" of index "index_ai_on_name" HINT: Alter statistics on table column instead.
+ROLLBACK TO a3		-
+ALTER INDEX "index_ai_on_name" SET (fillfactor = 70)		-
+ALTER INDEX "index_ai_on_name" SET TABLESPACE pg_default		-
+ALTER INDEX "ai" RENAME TO "ai_renamed"		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'ai_renamed'	text,bigint	r|1
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'ai%'	bigint	0

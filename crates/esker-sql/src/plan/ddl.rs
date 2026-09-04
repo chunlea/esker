@@ -111,6 +111,21 @@ pub struct Column {
     pub sequence: Option<Identity>,
 }
 
+/// `ALTER INDEX [IF EXISTS] <name> RENAME TO <name>`.
+///
+/// **The one `ALTER INDEX` form `ActiveRecord` sends**, from two places: `rename_index` renames any
+/// index, and `rename_table` follows a table rename with the primary key's index because
+/// PostgreSQL does not rename it for you (`postgresql/schema_statements.rb:590,467`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterIndexRename {
+    /// The index as it is now, schema qualification already resolved away.
+    pub name: String,
+    /// What it becomes.
+    pub to: String,
+    /// `IF EXISTS`: a name nothing answers to is a notice rather than `42P01`.
+    pub if_exists: bool,
+}
+
 /// A `UNIQUE` constraint, which becomes a unique index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniqueConstraint {

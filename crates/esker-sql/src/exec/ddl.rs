@@ -1805,6 +1805,69 @@ fn free_derived_name(txn: &dyn Txn, executor: &Executor, derived: &str) -> Resul
     Err(SqlError::DuplicateTable(derived.to_owned()))
 }
 
+/// `ALTER INDEX <name> RENAME TO <name>`.
+///
+/// **Renaming an index renames its constraint**, and here that is not two writes but one: a
+/// `UNIQUE` constraint and the index it owns are one `IndexDef::name`, and a primary key's index is
+/// `TableDef::primary_key_name`. A real server keeps two catalog rows that share a name and moves
+/// both; this node keeps one field, so the `pg_constraint` row follows by construction.
+///
+/// A name already taken is **`42P07`** — `relation "…" already exists`, because an index shares a
+/// namespace with tables and sequences — and a name nothing answers to is `42P01`, the *relation*
+/// message rather than an index-specific one. Both measured.
+pub(super) fn alter_index_rename(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    rename: &plan::AlterIndexRename,
+) -> Result<Outcome> {
+    let done = Ok(Outcome::done("ALTER INDEX"));
+    if catalog::name_exists(&*txn, executor.tenant, &rename.to)? {
+        return Err(SqlError::DuplicateTable(rename.to.clone()));
+    }
+    let Some(relation) = existing_relation(executor, txn, &rename.name)? else {
+        if rename.if_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "relation",
+                name: rename.name.clone(),
+            });
+            return done;
+        }
+        return Err(SqlError::UndefinedTable(rename.name.clone()));
+    };
+    // **A real server renames a *table* through this statement** — `ALTER INDEX` is the generic
+    // rename wearing another keyword, measured. Nothing the suite sends does it, and accepting it
+    // here would mean this arm quietly doing `ALTER TABLE`'s job; it is named instead, and the
+    // corpus records the divergence.
+    let (catalog::Relation::Index { table_id, .. } | catalog::Relation::PrimaryKey { table_id }) =
+        relation
+    else {
+        return Err(SqlError::unsupported(format!(
+            "ALTER INDEX naming {}, which is not an index",
+            rename.name
+        )));
+    };
+    let table = executor.table_by_id(txn, table_id)?;
+    let mut updated = (*table).clone();
+    if updated.primary_key_name == rename.name {
+        updated.primary_key_name.clear();
+        updated.primary_key_name.push_str(&rename.to);
+    } else if let Some(index) = updated
+        .indexes
+        .iter_mut()
+        .find(|index| index.name == rename.name)
+    {
+        index.name.clear();
+        index.name.push_str(&rename.to);
+    } else {
+        return Err(SqlError::UndefinedTable(rename.name.clone()));
+    }
+    updated.schema_version += 1;
+    // The old name record goes and the new one is written here, because `replace_table` reconciles
+    // an index's name and the primary key's — the rule three separate leaks taught it.
+    catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    done
+}
+
 /// `ALTER TABLE … RENAME COLUMN <from> TO <to>`.
 ///
 /// **Only `attname` changes.** The column keeps its ordinal, so every index, constraint, default
@@ -3086,6 +3149,27 @@ pub(super) fn drop_index(
 /// is what makes `ALTER TABLE t ADD COLUMN a text, ADD COLUMN b text` atomic the way PostgreSQL's
 /// is. A statement whose actions all skip writes nothing at all: it has changed no shape, and
 /// bumping the catalog version for it would make every node discard its cache and every concurrent
+/// The action's own name, for the `42809` a relation that cannot take it answers with.
+///
+/// It used to be the constant `"ADD COLUMN"`, which named the wrong statement for every action but
+/// one — a message that sends a reader looking for a clause they did not write.
+fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
+    match action {
+        Some(AlterTableAction::AddColumn { .. }) | None => "ADD COLUMN",
+        Some(AlterTableAction::DropColumn { .. }) => "DROP COLUMN",
+        Some(AlterTableAction::RenameColumn { .. }) => "RENAME COLUMN",
+        Some(AlterTableAction::RenameTo(_)) => "RENAME",
+        Some(
+            AlterTableAction::AddCheck(_)
+            | AlterTableAction::AddForeignKey(_)
+            | AlterTableAction::AddUnique(_),
+        ) => "ADD CONSTRAINT",
+        Some(AlterTableAction::DropConstraint { .. }) => "DROP CONSTRAINT",
+        Some(AlterTableAction::SetDefault { .. }) => "ALTER COLUMN",
+        Some(_) => "ALTER",
+    }
+}
+
 /// DDL conflict, for nothing.
 #[allow(
     clippy::too_many_lines,
@@ -3109,12 +3193,33 @@ pub(super) fn alter_table(
                 kind: "indexes",
             });
         }
-        Some(catalog::Relation::Sequence { .. }) => {
-            return Err(SqlError::AlterActionOnWrongObject {
-                action: "ADD COLUMN",
-                name: alter.name.clone(),
-                kind: "sequences",
-            });
+        // **A sequence takes `RENAME TO` and nothing else**, and getting that wrong cost run 55
+        // a hundred files. `rename_table` renames a table and then renames the sequence its
+        // `serial` column owns with `ALTER TABLE <seq> RENAME TO …` — a sequence named where the
+        // grammar says table, which a real server runs. Refusing it left the table moved and the
+        // sequence under its old name, so the suite's `force: true` cycle could not clean up: the
+        // `DROP TABLE IF EXISTS` found nothing under the old table name, and the `CREATE TABLE`
+        // after it collided with a sequence that was still there. Every later schema load hit the
+        // same wall while the node answered every health check perfectly.
+        Some(catalog::Relation::Sequence {
+            table_id,
+            sequence_id,
+        }) => {
+            let [AlterTableAction::RenameTo(to)] = alter.actions.as_slice() else {
+                return Err(SqlError::AlterActionOnWrongObject {
+                    action: alter_action_name(alter.actions.first()),
+                    name: alter.name.clone(),
+                    kind: "sequences",
+                });
+            };
+            let owner = executor.table_by_id(txn, table_id)?;
+            let sequence = owner
+                .sequences
+                .iter()
+                .find(|sequence| sequence.id == sequence_id)
+                .ok_or_else(|| SqlError::UndefinedTable(alter.name.clone()))?;
+            catalog::rename_sequence(txn, executor.tenant, sequence, to)?;
+            return done;
         }
         None => {
             if alter.if_exists {
