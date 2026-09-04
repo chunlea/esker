@@ -47,16 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              before the `CASCADE`, agrees at one on both — which is what says the view itself is \
              right and only the dependency is missing.",
         ),
-        (
-            "SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_id_seq'",
-            "**Not a view divergence at all, and it was never being compared.** `DROP COLUMN` does \
-             not drop the sequence the column owned — reproduced on its own, with no view in the \
-             statement — and PostgreSQL does. It is visible now only because `CREATE VIEW` used to \
-             fail twelve lines above it: the transaction aborted there and every line after was \
-             swallowed by the harness rather than checked. A gap in one feature was hiding a bug \
-             in a different one, which is the argument for the harness counting swallowed lines \
-             out loud.",
-        ),
     ],
 };
 
