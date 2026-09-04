@@ -3426,8 +3426,46 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
 
 /// The name and type of every output column.
 ///
-/// A bare column keeps its name; anything else is `?column?`, which is PostgreSQL's own answer and
-/// what `psql` prints as a header.
+/// What a target-list entry with no `AS` is called — PostgreSQL's `FigureColname`, measured.
+///
+/// **A function is named after itself**, unqualified: `area(box '…')` is `area` and
+/// `pg_catalog.length('x')` is `length`. Run 75 stopped a Rails test on exactly that, because the
+/// test reads its value back **by the column's name**. The outermost call wins, so `upper(lower(…))`
+/// is `upper`. A column keeps its own name, an alias beats everything, and everything else — a
+/// literal, an operator, a comparison, a subscript, a negation — is `?column?`.
+///
+/// **What is not recoverable here, and is declared rather than guessed**: a cast over a *literal*.
+/// PostgreSQL names `1::text` after the type — `text`, and `1::numeric(5,2)` is `numeric` without
+/// the modifier — but this crate folds such a cast at plan time, so by now there is no cast left to
+/// read, only the folded literal. A cast that survives to run time is [`Expr::ToText`] and is named
+/// the way a real server names it: the operand's name when it has one (`a::text` is `a`), and the
+/// target type when it does not (`(a + 1)::text` is `text`).
+fn figure_column_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Aggregate(call) => call.func.name().to_owned(),
+        Expr::Scalar { func, .. } => func.name().to_owned(),
+        Expr::Uuid(func) => func.name().to_owned(),
+        Expr::CatalogFunc(call) => call.func.name().to_owned(),
+        Expr::Sequence(call) => call.func.name().to_owned(),
+        Expr::SetFunc(call) => call.name.clone(),
+        // The keyword-shaped calls, named after the keyword and lower-cased — measured, all of
+        // them: `coalesce`, `case`.
+        Expr::Coalesce(_) => "coalesce".to_owned(),
+        Expr::Case { .. } => "case".to_owned(),
+        // A cast that reaches run time: the operand's name, or the type it casts to.
+        Expr::ToText { operand, .. } => match figure_column_name(operand) {
+            unnamed if unnamed == "?column?" => "text".to_owned(),
+            named => named,
+        },
+        // A scalar subquery takes the **subquery's own** column name and `EXISTS` is called
+        // `exists`; everything else about a subquery is `?column?`. Measured with `psql`, which a
+        // corpus of types and rows cannot record.
+        Expr::Subquery(sub) => sub.output_name().unwrap_or("?column?").to_owned(),
+        _ => "?column?".to_owned(),
+    }
+}
+
 /// The table a `*` is qualified with, if any.
 fn qualifier_of(item: &SelectItem) -> Option<&str> {
     match item {
@@ -3477,15 +3515,7 @@ fn output_columns(
                 };
                 // PostgreSQL names an aggregate's column after the function -- `count`, `sum` --
                 // and not `?column?`. Measured; ActiveRecord reads results by name.
-                let name = alias.clone().unwrap_or_else(|| match expr {
-                    Expr::Column { name, .. } => name.clone(),
-                    Expr::Aggregate(call) => call.func.name().to_owned(),
-                    // A scalar subquery takes the **subquery's own** column name and `EXISTS` is
-                    // called `exists`; everything else about a subquery is `?column?`. Measured
-                    // with `psql`, which a corpus of types and rows cannot record.
-                    Expr::Subquery(sub) => sub.output_name().unwrap_or("?column?").to_owned(),
-                    _ => "?column?".to_owned(),
-                });
+                let name = alias.clone().unwrap_or_else(|| figure_column_name(expr));
                 // A typmod travels only with a **plain column reference**, which is
                 // PostgreSQL's rule and the corpus's: `c || '|'` is `text` with none and
                 // `min(c)` is `bpchar` with none, where a bare `c` is `character(3)`.
