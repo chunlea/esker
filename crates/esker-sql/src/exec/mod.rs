@@ -24,7 +24,7 @@
 //! the first of those names the constraint. A key that is absent means nobody took it and the
 //! conflict really was an ordinary row-level race, which stays `40001` and stays retryable.
 
-mod aggregate;
+pub(crate) mod aggregate;
 mod assign;
 mod bind;
 mod comment;
@@ -2226,94 +2226,26 @@ impl Execute for Executor {
     }
 
     fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
-        let statement = parsed.lower()?;
-        // Describing takes a transaction of its own, because typing the parameters needs the
-        // catalog and the catalog is data like any other. It writes nothing, so it costs a
-        // snapshot and no conflict — and it takes the *session's* snapshot, so that a statement
-        // prepared under `esker.read_as_of` is described against the schema it will run on.
-        let txn = self.open_txn()?;
-        let tables = self.tables_for(&*txn, &statement)?;
-        let types = bind::infer(&statement, &tables, declared);
-        let parameters = types.iter().copied().map(ColumnType::oid).collect();
-
-        // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
-        // is run, so a placeholder of the right type is all the planner needs to answer the shape.
-        let mut statement = statement;
-        bind::substitute_placeholders(&mut statement, &types);
-        // **A derived table has no shape until its sub-select is planned**, and the shape is the
-        // whole of what a `Describe` answers. `Executor::plan_select` does this before it plans;
-        // here it was skipped, so `FROM (SELECT …) AS x` reached the planner as a relation with
-        // nothing behind it and came back `XX000 a derived table reached the planner without a
-        // shape` — a code that says *this server has a bug* about a statement it runs perfectly
-        // well through the simple protocol.
-        if let Statement::Select(select) = &mut statement
-            && subquery::present(select)
-        {
-            let catalogued = Catalogued {
-                exec: self,
-                txn: &*txn,
-            };
-            subquery::plan_subqueries(select, self.tenant, &*txn, &catalogued, None)?;
+        // **The session's own transaction when it has one.** Describing reads the catalog, and a
+        // transaction's uncommitted DDL is visible only inside it — so a snapshot taken beside the
+        // session cannot see a table the session has just created, which is what
+        // `@connection.transaction { create_table … }` does in every `ActiveRecord` test case.
+        //
+        // Two failures came of that and the second is the worse: a `SELECT` over such a table was
+        // `42P01` for a table that was there, and an `INSERT … RETURNING` was described as
+        // `NoData` and then executed — in the session's transaction, which *could* see it — into
+        // `DataRow`s the client had no `RowDescription` for. That is a protocol violation, and a
+        // client drops the connection on it rather than reporting a statement error.
+        if let Some(open) = &self.open {
+            return self.described_in(&**open, parsed, declared);
         }
-        let fields = match &statement {
-            // **The relations are resolved here, not read out of `tables` by position.**
-            // `tables` comes from `bind::table_names`, which is built for parameter *typing*: a
-            // name appearing twice is one name to type against and a name the catalog does not
-            // have is nothing to type against, so that list de-duplicates and it drops. Both are
-            // right for typing and wrong for a position — a **self-join**'s two entries collapsed
-            // into one and left this planning a one-join `SELECT` with nothing to join to, which
-            // is `42P01` for a table that is right there. Seventeen of run 51's forty-seven
-            // `relation "…" does not exist` were `topics` alone, because `Reply < Topic` makes
-            // `Topic.joins(:replies)` a self-join.
-            //
-            // So it resolves the way `Executor::plan_select` does, off the statement's own `FROM`
-            // and joins, which is also the only reading that a derived table cannot shift.
-            Statement::Select(select) => {
-                let catalogued = Catalogued {
-                    exec: self,
-                    txn: &*txn,
-                };
-                let from = match &select.from {
-                    Some(table) => Some(subquery::relation_of(table, &catalogued)?),
-                    None => None,
-                };
-                let inners = select
-                    .joins
-                    .iter()
-                    .map(|join| subquery::relation_of(&join.table, &catalogued))
-                    .collect::<Result<Vec<_>>>()?;
-                let inner_refs: Vec<&crate::catalog::TableDef> =
-                    inners.iter().map(AsRef::as_ref).collect();
-                Some(
-                    query::plan(select, self.tenant, from.as_deref(), &inner_refs)?
-                        .columns
-                        .into_iter()
-                        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
-                        .collect(),
-                )
-            }
-            Statement::Explain(..) => Some(vec![FieldDescription::computed(
-                "QUERY PLAN",
-                ColumnType::Text,
-            )]),
-            // A `RETURNING` makes a write statement row-returning, and a client that prepares one
-            // asks for its shape before it binds. Answering `None` here would tell the client
-            // there are no columns and then send it some, which is the one thing a `Describe` is
-            // for.
-            Statement::Insert(insert) => returning_fields(insert.returning.as_ref(), &tables)?,
-            Statement::Update(update) => update_returning_fields(
-                update,
-                &tables,
-                &Catalogued {
-                    exec: self,
-                    txn: &*txn,
-                },
-            )?,
-            Statement::Delete(delete) => returning_fields(delete.returning.as_ref(), &tables)?,
-            _ => None,
-        };
+        // With no transaction open, one of its own: it writes nothing, so it costs a snapshot and
+        // no conflict — and it takes the *session's* snapshot, so that a statement prepared under
+        // `esker.read_as_of` is described against the schema it will run on.
+        let txn = self.open_txn()?;
+        let described = self.described_in(&*txn, parsed, declared);
         let _ = txn.rollback();
-        Ok(Described { parameters, fields })
+        described
     }
 
     fn take_notices(&mut self) -> Vec<SqlError> {
@@ -2428,5 +2360,82 @@ pub(super) struct Catalogued<'a> {
 impl subquery::Tables for Catalogued<'_> {
     fn get(&self, name: &str) -> Result<Arc<crate::catalog::TableDef>> {
         self.exec.require_table(self.txn, name)
+    }
+}
+
+impl Executor {
+    /// What a `Describe` answers, read through one transaction.
+    fn described_in(&self, txn: &dyn Txn, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
+        let statement = parsed.lower()?;
+        let tables = self.tables_for(txn, &statement)?;
+        let types = bind::infer(&statement, &tables, declared);
+        let parameters = types.iter().copied().map(ColumnType::oid).collect();
+
+        // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
+        // is run, so a placeholder of the right type is all the planner needs to answer the shape.
+        let mut statement = statement;
+        bind::substitute_placeholders(&mut statement, &types);
+        // **A derived table has no shape until its sub-select is planned**, and the shape is the
+        // whole of what a `Describe` answers. `Executor::plan_select` does this before it plans;
+        // here it was skipped, so `FROM (SELECT …) AS x` reached the planner as a relation with
+        // nothing behind it and came back `XX000 a derived table reached the planner without a
+        // shape` — a code that says *this server has a bug* about a statement it runs perfectly
+        // well through the simple protocol.
+        if let Statement::Select(select) = &mut statement
+            && subquery::present(select)
+        {
+            let catalogued = Catalogued { exec: self, txn };
+            subquery::plan_subqueries(select, self.tenant, txn, &catalogued, None)?;
+        }
+        let fields = match &statement {
+            // **The relations are resolved here, not read out of `tables` by position.**
+            // `tables` comes from `bind::table_names`, which is built for parameter *typing*: a
+            // name appearing twice is one name to type against and a name the catalog does not
+            // have is nothing to type against, so that list de-duplicates and it drops. Both are
+            // right for typing and wrong for a position — a **self-join**'s two entries collapsed
+            // into one and left this planning a one-join `SELECT` with nothing to join to, which
+            // is `42P01` for a table that is right there. Seventeen of run 51's forty-seven
+            // `relation "…" does not exist` were `topics` alone, because `Reply < Topic` makes
+            // `Topic.joins(:replies)` a self-join.
+            //
+            // So it resolves the way `Executor::plan_select` does, off the statement's own `FROM`
+            // and joins, which is also the only reading that a derived table cannot shift.
+            Statement::Select(select) => {
+                let catalogued = Catalogued { exec: self, txn };
+                let from = match &select.from {
+                    Some(table) => Some(subquery::relation_of(table, &catalogued)?),
+                    None => None,
+                };
+                let inners = select
+                    .joins
+                    .iter()
+                    .map(|join| subquery::relation_of(&join.table, &catalogued))
+                    .collect::<Result<Vec<_>>>()?;
+                let inner_refs: Vec<&crate::catalog::TableDef> =
+                    inners.iter().map(AsRef::as_ref).collect();
+                Some(
+                    query::plan(select, self.tenant, from.as_deref(), &inner_refs)?
+                        .columns
+                        .into_iter()
+                        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
+                        .collect(),
+                )
+            }
+            Statement::Explain(..) => Some(vec![FieldDescription::computed(
+                "QUERY PLAN",
+                ColumnType::Text,
+            )]),
+            // A `RETURNING` makes a write statement row-returning, and a client that prepares one
+            // asks for its shape before it binds. Answering `None` here would tell the client
+            // there are no columns and then send it some, which is the one thing a `Describe` is
+            // for.
+            Statement::Insert(insert) => returning_fields(insert.returning.as_ref(), &tables)?,
+            Statement::Update(update) => {
+                update_returning_fields(update, &tables, &Catalogued { exec: self, txn })?
+            }
+            Statement::Delete(delete) => returning_fields(delete.returning.as_ref(), &tables)?,
+            _ => None,
+        };
+        Ok(Described { parameters, fields })
     }
 }

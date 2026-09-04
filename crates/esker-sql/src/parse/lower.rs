@@ -4909,12 +4909,126 @@ fn lower_limit_offset(query: &Query) -> Result<(Option<plan::Expr>, Option<plan:
     }
 }
 
+/// `FOR UPDATE` / `FOR SHARE`, and the two modifiers this node will not pretend to.
+///
+/// **`NOWAIT` and `SKIP LOCKED` are refused by name and the bare clause is not**, and the line
+/// between them is whether a client can tell that nothing was locked. A Percolator transaction is
+/// snapshot-isolated: it does not block a conflicting writer, it loses to one at commit with
+/// `40001` (ADR 0031). So `FOR UPDATE` buys ordering the transaction already enforces — no session
+/// can observe the difference — while `NOWAIT` must raise `55P03` when another session holds the
+/// row and `SKIP LOCKED` must leave that row out of the answer. Answering rows for those two is a
+/// wrong answer rather than a missing feature, and a queue built on `SKIP LOCKED` would hand one
+/// job to every worker.
+///
+/// `FOR NO KEY UPDATE` and `FOR KEY SHARE` never arrive here: `sqlparser` 0.62.0's `LockType` has
+/// only the two, so both are refused by name in `crate::parse`'s table before this runs.
+fn lower_locking(locks: &[sqlparser::ast::LockClause]) -> Result<Vec<plan::Locking>> {
+    use sqlparser::ast::{LockType, NonBlock};
+
+    locks
+        .iter()
+        .map(|lock| {
+            let strength = match lock.lock_type {
+                LockType::Update => plan::LockStrength::Update,
+                LockType::Share => plan::LockStrength::Share,
+            };
+            match lock.nonblock {
+                None => {}
+                Some(NonBlock::Nowait) => {
+                    return Err(SqlError::unsupported(format!(
+                        "{} NOWAIT, on a node whose transactions do not block",
+                        strength.clause()
+                    )));
+                }
+                Some(NonBlock::SkipLocked) => {
+                    return Err(SqlError::unsupported(format!(
+                        "{} SKIP LOCKED, on a node with no row locks to skip",
+                        strength.clause()
+                    )));
+                }
+            }
+            Ok(plan::Locking {
+                strength,
+                of: lock.of.as_ref().map(relation_name).transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// The shapes PostgreSQL will not lock, in its own words.
+///
+/// Every one measured (`tests/corpus/pg19_row_locking.txt`), and the message carries **the clause
+/// the user wrote** rather than a fixed `FOR UPDATE` — which is the half a single hard-coded
+/// sentence gets wrong.
+fn refuse_unlockable_shape(select: &plan::Select) -> Result<()> {
+    let Some(lock) = select.locking.first() else {
+        return Ok(());
+    };
+    let clause = lock.strength.clause();
+    if select.distinct {
+        return Err(SqlError::LockingNotAllowedWith {
+            lock: clause,
+            clause: "DISTINCT clause",
+        });
+    }
+    if !select.group_by.is_empty() {
+        return Err(SqlError::LockingNotAllowedWith {
+            lock: clause,
+            clause: "GROUP BY clause",
+        });
+    }
+    // Only the target list, which is where PostgreSQL looks: an aggregate anywhere in it makes the
+    // statement one row per group, and a group is not a row anything can hold.
+    if select.projection.iter().any(|item| {
+        matches!(item, plan::SelectItem::Expr { expr, .. } if crate::exec::aggregate::contains_aggregate(expr))
+    }) {
+        return Err(SqlError::LockingNotAllowedWith {
+            lock: clause,
+            clause: "aggregate functions",
+        });
+    }
+    // **The nullable side is the one a `LEFT JOIN` may fill with NULLs**, which is the inner side
+    // of every join this node builds. Locking the other side is legal, so what decides it is which
+    // relation the clause names rather than the join itself.
+    let nullable: Vec<&str> = select
+        .joins
+        .iter()
+        .filter(|join| join.kind == plan::JoinKind::Left)
+        .map(|join| join.table.referred_as())
+        .collect();
+    for lock in &select.locking {
+        // A clause with no `OF` locks every relation, so any nullable one is enough to refuse it;
+        // with an `OF` it is that relation alone that has to be lockable.
+        let locks_a_nullable_side = match &lock.of {
+            None => !nullable.is_empty(),
+            Some(of) => nullable.contains(&of.as_str()),
+        };
+        if locks_a_nullable_side {
+            return Err(SqlError::LockingNullableSide(lock.strength.clause()));
+        }
+        // `OF x` names a relation **as the query refers to it**, so an alias has taken the table's
+        // own name away — the same rule every other qualifier follows.
+        if let Some(of) = &lock.of
+            && !select
+                .from
+                .iter()
+                .chain(select.joins.iter().map(|join| &join.table))
+                .any(|table| table.referred_as() == of)
+        {
+            return Err(SqlError::LockingRelationNotInFrom {
+                relation: of.clone(),
+                lock: lock.strength.clause(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
 )]
 fn lower_query(query: &Query) -> Result<plan::Select> {
-    refuse_if(!query.locks.is_empty(), "a row-level locking clause")?;
     refuse_if(query.fetch.is_some(), "FETCH FIRST")?;
     refuse_if(query.for_clause.is_some(), "FOR XML/JSON")?;
     refuse_if(query.settings.is_some(), "SETTINGS")?;
@@ -4928,6 +5042,9 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         if let SetExpr::Values(values) = query.body.as_ref() {
             let (limit, offset) = lower_limit_offset(query)?;
             return Ok(plan::Select {
+                // `VALUES` names no relation, so there is nothing a locking clause could hold —
+                // and PostgreSQL agrees: `VALUES (1) FOR UPDATE` is a syntax error there.
+                locking: Vec::new(),
                 projection: vec![plan::SelectItem::Wildcard],
                 from: Some(plan::TableRef {
                     values: Some(Box::new(lower_values(values, &[], "")?)),
@@ -5135,7 +5252,12 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         order_by,
         limit,
         offset,
+        locking: lower_locking(&query.locks)?,
     };
+    // **After the statement is lowered, because the rules are about the lowered shape**: whether
+    // there is a `DISTINCT`, a `GROUP BY`, an aggregate in the target list, a nullable join side,
+    // or a relation the `OF` names and the `FROM` does not.
+    refuse_unlockable_shape(&lowered)?;
     lower_with(query.with.as_ref(), &mut lowered)?;
     Ok(lowered)
 }

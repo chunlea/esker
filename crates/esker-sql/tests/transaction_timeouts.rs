@@ -537,33 +537,46 @@ fn two_writers_to_one_row_both_proceed_and_the_loser_fails_at_commit() {
     );
 }
 
-/// **A row-level locking clause is refused by name in all three spellings**, and the plain
-/// `FOR UPDATE` with them.
+/// **The bare locking clause answers and the two non-blocking ones are refused by name**, which is
+/// the line drawn where this node's isolation can and cannot keep the promise.
 ///
-/// The capture only carries `NOWAIT` and `SKIP LOCKED`; the bare clause is here because it is the
-/// one `ActiveRecord`'s `lock!` sends, and a refusal that covered only the two decorated forms
-/// would be a gap nobody had looked at.
+/// This test asserted a blanket refusal until `FOR UPDATE`/`FOR SHARE` landed
+/// (`tests/row_locking.rs`), and what replaced it is the distinction rather than the refusal: a
+/// Percolator transaction does not block a conflicting writer, it loses to one at commit with
+/// `40001` (ADR 0031), so the bare clause buys ordering the transaction already enforces and no
+/// session can see the difference. `NOWAIT` must raise `55P03` against a held row and
+/// `SKIP LOCKED` must leave that row out — promises a client checks, and ones this node would
+/// answer wrongly rather than not at all.
 #[test]
-fn every_row_locking_clause_is_refused_by_name() {
+fn a_locking_clause_answers_unless_it_promises_something_this_node_cannot_keep() {
     let mut cluster = Cluster::new(&['A']);
     let session = cluster.session('A');
     session
         .run("CREATE TABLE tt_rows (id bigint primary key, n integer)")
         .unwrap();
+    session.run("INSERT INTO tt_rows VALUES (1, 10)").unwrap();
 
     for written in [
         "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE",
-        "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE NOWAIT",
-        "SELECT id FROM tt_rows ORDER BY id FOR UPDATE SKIP LOCKED",
         "SELECT id FROM tt_rows FOR SHARE",
+        "SELECT id FROM tt_rows FOR UPDATE OF tt_rows",
+    ] {
+        assert_eq!(session.rows(written), [["1"]], "for {written}");
+    }
+
+    for (written, named) in [
+        (
+            "SELECT id FROM tt_rows WHERE id = 1 FOR UPDATE NOWAIT",
+            "FOR UPDATE NOWAIT, on a node whose transactions do not block is not supported",
+        ),
+        (
+            "SELECT id FROM tt_rows ORDER BY id FOR UPDATE SKIP LOCKED",
+            "FOR UPDATE SKIP LOCKED, on a node with no row locks to skip is not supported",
+        ),
     ] {
         let error = session.run(written).unwrap_err();
         assert_eq!(error.sqlstate(), "0A000", "for {written}");
-        assert_eq!(
-            error.to_string(),
-            "a row-level locking clause is not supported",
-            "for {written}"
-        );
+        assert_eq!(error.to_string(), named, "for {written}");
     }
 }
 
