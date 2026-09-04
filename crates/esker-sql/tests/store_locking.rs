@@ -37,10 +37,16 @@ fn a_writer_waits_for_the_writer_in_front_of_it_against_real_stores() {
         .unwrap();
     setup.run("INSERT INTO lk (id, n) VALUES (1, 10)").unwrap();
 
+    let (a_says, hears_a) = channel();
     let (b_says, hears_b) = channel();
     let (done_says, hears_done) = channel();
     let mut b = cluster.session();
     let waiter = std::thread::spawn(move || {
+        // **Both edges, and the A→B one is the one that matters.** Without it B may reach the row
+        // *first*, take the lock legitimately and finish — which is not a bug and reads exactly
+        // like one. This test failed that way under a full workspace run and passed alone, which
+        // is the signature of a barrier that gates one side only.
+        hears_a.recv_timeout(Duration::from_secs(10)).unwrap();
         b_says.send("B is about to write").unwrap();
         // No `BEGIN`: one statement, its own transaction, and it must wait exactly as a block does.
         let update = b.run("UPDATE lk SET n = n + 100 WHERE id = 1");
@@ -51,6 +57,7 @@ fn a_writer_waits_for_the_writer_in_front_of_it_against_real_stores() {
     let mut a = cluster.session();
     a.run("BEGIN").unwrap();
     a.run("UPDATE lk SET n = n + 1 WHERE id = 1").unwrap();
+    a_says.send("A holds the row").unwrap();
     hears_b.recv_timeout(Duration::from_secs(10)).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     // **Recorded, not asserted here.** B reports "done" whether it wrote or failed, so asserting on
