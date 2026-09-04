@@ -1446,18 +1446,29 @@ pub struct ForeignKeyDef {
     pub on_update: ReferentialAction,
     /// `ON DELETE …`: `confdeltype`.
     pub on_delete: ReferentialAction,
-    /// `DEFERRABLE`, which is recorded and **changes nothing**: every check here is immediate,
-    /// and `DEFERRABLE INITIALLY IMMEDIATE` — the only deferrable form `ActiveRecord` writes — is
-    /// immediate on a real server too. `INITIALLY DEFERRED` is `0A000` naming itself, because
-    /// accepting it and checking immediately would refuse a transaction PostgreSQL commits.
+    /// `convalidated`: whether the rows already in the table were checked.
+    ///
+    /// **`NOT VALID` does not mean "unchecked from now on".** New rows are checked from the moment
+    /// the constraint exists; what the clause skips is the scan of the rows already there. So this
+    /// flag governs one scan and one catalog column, and never the writes.
+    pub validated: bool,
+    /// `DEFERRABLE`: whether the check **may** be moved to `COMMIT`, by declaration or by
+    /// `SET CONSTRAINTS`. `condeferrable`.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: whether it **starts** deferred. `condeferred`.
+    ///
+    /// Never true without [`Self::deferrable`] — `INITIALLY DEFERRED` implies `DEFERRABLE` in the
+    /// grammar. The pair says when the check runs, and `SET CONSTRAINTS` moves it either way
+    /// (`crate::exec::deferred`).
+    pub initially_deferred: bool,
 }
 
 /// What a `FOREIGN KEY` does when the row it points at is deleted or its key is changed.
 ///
-/// `SET NULL` and `SET DEFAULT` are PostgreSQL's other two and are `0A000` naming themselves:
-/// nothing `ActiveRecord` writes uses them, and each would need a rule about which columns it
-/// touches that this crate has nowhere to put yet.
+/// All five of PostgreSQL's, and the two that write rather than refuse are the reason this is an
+/// enum rather than a flag: `SET NULL` and `SET DEFAULT` put a value into the **child's**
+/// referencing columns when the parent goes, so they need the child's rows rewritten where
+/// `NO ACTION` and `RESTRICT` only need a question answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferentialAction {
     /// `NO ACTION`, the default — refuse. On a real server this one is deferrable to the end of
@@ -1469,6 +1480,16 @@ pub enum ReferentialAction {
     Restrict,
     /// `CASCADE` — delete the referencing rows, or rewrite their key to follow the parent's.
     Cascade,
+    /// `SET NULL` — write NULL into the child's referencing columns and keep the row.
+    ///
+    /// It needs the columns to be nullable, and PostgreSQL does **not** check that at DDL time:
+    /// the constraint is accepted and the `DELETE` that fires it is what fails, `23502`.
+    SetNull,
+    /// `SET DEFAULT` — write each referencing column's default, and keep the row.
+    ///
+    /// The default has to name a row that exists, or the same `DELETE` fails `23503` on the way
+    /// back out: the rewritten row is checked against the constraint like any other.
+    SetDefault,
 }
 
 impl ReferentialAction {
@@ -1479,6 +1500,8 @@ impl ReferentialAction {
             ReferentialAction::NoAction => "a",
             ReferentialAction::Restrict => "r",
             ReferentialAction::Cascade => "c",
+            ReferentialAction::SetNull => "n",
+            ReferentialAction::SetDefault => "d",
         }
     }
 
@@ -1490,6 +1513,8 @@ impl ReferentialAction {
             ReferentialAction::NoAction => "",
             ReferentialAction::Restrict => "RESTRICT",
             ReferentialAction::Cascade => "CASCADE",
+            ReferentialAction::SetNull => "SET NULL",
+            ReferentialAction::SetDefault => "SET DEFAULT",
         }
     }
 
@@ -3825,7 +3850,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",               // catalog format version
+                "1c",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3918,7 +3943,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",       // catalog format version
+                "1c",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4000,7 +4025,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",                 // catalog format version
+                "1c",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5304,7 +5329,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1a",               // catalog format version
+                "1c",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
