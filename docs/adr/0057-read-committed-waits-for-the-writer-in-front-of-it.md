@@ -320,19 +320,52 @@ user gave no key still has one, the hidden row id, and locks like any other.
   UPDATE is not allowed with UNION/INTERSECT/EXCEPT`: this node has no `UNION` at all, so the more
   specific sentence names a rule it cannot reach. It becomes reachable the day `UNION` lands.
 
-### Where this is implemented, and where it is not yet
+### Where this is implemented — unit 7
 
-**`MemoryBackend` only.** `StoreTxn` takes the trait's defaults — `lock` answers `Taken`,
-`begin_statement` and `restart_statement` do nothing — so against a **real cluster** the wait, the
-statement snapshot and the row lock are all inert. That is the honest default the trait was written
-with rather than an oversight ("it keeps a backend that has not been taught this honest rather than
-silently blocking"), and it is why nothing here changes a cluster's behaviour before the store
-learns `Op::Lock` on the wire.
+Units 1–5 landed on `MemoryBackend` alone. `StoreTxn` took the trait's defaults, so against a **real
+cluster** the wait, the statement snapshot and the row lock were all inert — the honest default the
+trait was written with, and a wide gap between what the tests proved and what a cluster did. Unit 7
+closes it, with `tests/store_locking.rs` running against three real stores over real sockets.
 
-It is also why the measure is unaffected: the Rails scoreboard runs `esker-sql --release` on the
-**in-process backend** (`docs/bench/rails-scoreboard.md`), which is the one this unit implements.
-Teaching `StoreTxn` to lock is a wire operation of its own and belongs with the store's `Op::Lock`
-apply path, not here.
+**The row lock is node-local, and that is a declared scope rather than an approximation.**
+`StoreBackend` holds the same `RowLocks` table `MemoryBackend` uses — one mechanism, not a second
+wait-for graph — so two sessions of one `esker-sql` process block on each other exactly as they do
+in-process. Two sessions of *different* nodes do not see each other's locks, and their conflict
+resolves where it always did, at prewrite, with the loser told `40001`. Nothing is weakened: what a
+cross-node pair gets is what **every** pair got before this, and the per-key read timestamp is what
+keeps it honest. A lock every node can see is a store-side operation with a wire and a log change
+behind it, and it belongs in its own unit with its own ruling.
+
+**The statement snapshot is a timestamp per statement from the oracle.** Without it every read of a
+transaction went out at `start_ts`, which is REPEATABLE READ wearing another name; the cost is one
+TSO call per statement, which is what a real server pays for a snapshot per statement too. A
+read-only transaction is left alone — it was opened at a timestamp the caller chose, and moving its
+snapshot forward would answer a different past.
+
+**A re-run is not a second statement, and the client needed a statement window to say so.** This is
+what the cluster test found that no in-process test could: the client's buffer had no undo, so a
+statement that waited kept the writes of the attempt that waited — computed from the snapshot
+*before* the wait — and its prewrite died with `40001` naming the very commit it had waited for
+(`a commit at 1007 beat this transaction at 1004`, measured). `Transaction::begin_statement` and
+`restart_statement` mirror the memory backend's pair: the first discards the previous statement's
+undo, the second gives the current statement's writes **back**, so their stamps move forward with
+the values that replace them. The second reason the undo is not optional: a re-run may decide not to
+write a key it wrote the first time — the row it matched no longer matches — and a stale write left
+behind would be committed as if it had.
+
+**And the same "earliest stamp wins" rule had to be fixed one layer down.** `Transaction::stamp`
+overwrote a key's read timestamp on every write, exactly as the SQL buffer did before run 66. It was
+dormant only because nothing called `reading_at` per statement; unit 7 is what would have woken it,
+at cluster scale.
+
+### What unit 7 does **not** do, declared
+
+* **`changed_since_statement` is the trait default on the store path**, so the read-to-lock window
+  there still answers `40001` where the in-process backend re-runs the statement. Closing it needs
+  the store to answer "has this key a commit newer than `ts`", which is an RPC that does not exist.
+  Strictly no worse than before ADR 0057, and visible rather than silent.
+* **A deadlock across two nodes is not detected.** The wait-for graph is one node's. A cycle spanning
+  nodes waits until `lock_timeout`, and PD is where a cluster-wide graph would live.
 
 ### The gap unit 5 found in units 1–4
 
