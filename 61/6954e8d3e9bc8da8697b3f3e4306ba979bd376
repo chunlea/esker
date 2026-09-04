@@ -1,0 +1,24 @@
+crates/esker-engine/src/db/ingest.rs
+  h_44076b318daf9c 8,10-11,13-20,22,24-60,66,69-71,74-116,121-126,128-129,143,146-154,191,215-221,223-227,230-242,244,248-313,315-330,342
+crates/esker-engine/src/db/iter.rs
+  h_44076b318daf9c 38,374-387,389-415,419,437-438,444,458,460,463-481,484,489,496
+crates/esker-engine/tests/checkpoint.rs
+  h_44076b318daf9c 310-311
+crates/esker-engine/tests/ingest_overlap.proptest-regressions
+  h_44076b318daf9c 1-8
+crates/esker-engine/tests/ingest_overlap.rs
+  h_44076b318daf9c 1-210
+docs/plans/debt-c6.md
+  h_44076b318daf9c 217-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "616954e8d3e9bc8da8697b3f3e4306ba979bd376",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
