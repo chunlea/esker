@@ -3825,7 +3825,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",               // catalog format version
+                "1a",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3918,7 +3918,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",       // catalog format version
+                "1a",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4000,7 +4000,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",                 // catalog format version
+                "1a",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4090,6 +4090,10 @@ mod tests {
                 // own types" without a flag byte in front of it (ADR 0050).
                 "00", // `id` is an `int8`
                 "00", // `email` is a `text`
+                // Version 26. One byte: `ON COMMIT PRESERVE ROWS`, which is what a table with no
+                // clause is and what every table that is not temporary is (ADR 0054). So a table
+                // written before 26 decodes to exactly this and means what it always meant.
+                "00",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -5300,7 +5304,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",               // catalog format version
+                "1a",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

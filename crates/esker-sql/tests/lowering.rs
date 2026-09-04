@@ -5,10 +5,13 @@
 //! the rule is that an unhonoured clause is contract C2's `0A000` **naming the clause** — never a
 //! statement executed without it.
 //!
-//! That is the whole point of this file: `CREATE TEMPORARY TABLE t (a int8)` executed as a
+//! That is the whole point of this file. `CREATE TEMPORARY TABLE t (a int8)` executed as a
 //! permanent table is a failure nothing reports, and the next session finds a table it did not
-//! expect. Each case below is a clause phase 6a does not honour, put through the lowering, with
-//! the assertion that its own name comes back.
+//! expect — which is why it was refused by name for eight phases and why it is *built* now
+//! ([ADR 0054]), in a schema the next session cannot see. Each case below is a clause phase 6a
+//! does not honour, put through the lowering, with the assertion that its own name comes back.
+//!
+//! [ADR 0054]: ../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -30,10 +33,6 @@ fn lower(sql: &str) -> esker_sql::Result<Statement> {
 #[test]
 fn a_clause_we_do_not_honour_is_refused_by_name() {
     let cases = [
-        (
-            "CREATE TEMPORARY TABLE t (a int8)",
-            "CREATE TEMPORARY TABLE",
-        ),
         ("CREATE TABLE t AS SELECT 1", "CREATE TABLE ... AS"),
         // **`OR REPLACE` is a modifier, not the name of anything.** These were refused as
         // "CREATE OR is not supported" — a truncated token pair that names no feature and tells a
@@ -414,8 +413,12 @@ fn explain_wraps_a_lowered_statement() {
         panic!("not an EXPLAIN")
     };
     assert!(matches!(*inner, Statement::CreateTable(_)));
+    // **The refusal inside is still the answer**, which is what this half asserts: `EXPLAIN` does
+    // not excuse a clause the lowering will not honour. `CREATE TEMPORARY TABLE` used to be the
+    // case here and now lowers (ADR 0054), so the statement that carries the refusal is one that
+    // still has one.
     assert_eq!(
-        lower("EXPLAIN CREATE TEMPORARY TABLE t (a int8)")
+        lower("EXPLAIN CREATE TABLE t AS SELECT 1")
             .unwrap_err()
             .sqlstate(),
         sqlstate::FEATURE_NOT_SUPPORTED

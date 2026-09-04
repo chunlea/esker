@@ -228,7 +228,7 @@ impl Drop for Executor {
         let Ok(mut txn) = self.backend.begin() else {
             return;
         };
-        if crate::exec::ddl::drop_temp_schema(self, &mut *txn, &schema).is_ok() {
+        if ddl::drop_temp_schema(self, &mut *txn, &schema).is_ok() {
             let _ = txn.commit();
         }
     }
@@ -737,10 +737,28 @@ impl Executor {
                     self.currval_defined.clear();
                     self.last_sequence = None;
                 }
-                // `PLANS` caches nothing here and `TEMP` has nothing to drop
-                // (`CREATE TEMPORARY TABLE` is a named refusal), so both are honest no-ops for as
-                // long as those two facts hold. Each is declared in the corpus rather than left to
-                // be assumed.
+                // **`TEMP` drops this session's temporary relations**, which is what the target
+                // names — `ALL` includes it, and `PLANS` and `SEQUENCES` leave them alone
+                // (measured, one target at a time). It is the same walk a session end does; the
+                // session simply carries on afterwards with no temp schema, so the next
+                // `CREATE TEMP TABLE` allocates a fresh one.
+                if matches!(
+                    target,
+                    crate::plan::DiscardTarget::All | crate::plan::DiscardTarget::Temp
+                ) && let Some(schema) = self.temp_schema.take()
+                {
+                    let mut txn = self.backend.begin()?;
+                    match ddl::drop_temp_schema(self, &mut *txn, &schema) {
+                        Ok(()) => {
+                            txn.commit()?;
+                        }
+                        Err(error) => {
+                            let _ = txn.rollback();
+                            return Err(error);
+                        }
+                    }
+                }
+                // `PLANS` caches nothing here, so it is an honest no-op for as long as that holds.
                 Ok(Outcome::done(statement.tag()))
             }
             SessionStatement::SetParameter { name, value } => {

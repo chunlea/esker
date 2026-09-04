@@ -23,26 +23,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // has and this node does not, so there is nothing for the statement to reset — the
         // refusals are all older than this unit and each names its own missing feature.
         //
-        // `CREATE TEMPORARY TABLE` is a named refusal, so `DISCARD TEMP` has nothing to drop. That
-        // is an honest no-op exactly as long as that stays true, which is why it is written down
-        // here rather than assumed in the code.
-        (
-            "CREATE TEMP TABLE dsc_tmp (id int)",
-            "`0A000 CREATE TEMPORARY TABLE is not supported`, older than this unit. Every line \
-             that reads `dsc_tmp` follows from it.",
-        ),
-        ("CREATE TEMP TABLE dsc_tmp2 (id int)", "The same."),
-        (
-            "INSERT INTO dsc_tmp VALUES (1)",
-            "The temp table was never created.",
-        ),
-        (
-            "SELECT 'r', count(*) FROM dsc_tmp",
-            "The same. A real server answers `1` before `DISCARD TEMP` and `42P01` after, and \
-             this node answers `42P01` throughout — so the *end* state agrees and the start does \
-             not. `dsc_tmp2` is only ever read *after* its `DISCARD ALL`, so that line agrees \
-             outright and is listed nowhere.",
-        ),
+        // The temp-table entries that used to stand here are **gone**: `CREATE TEMPORARY TABLE`
+        // was a named refusal, so `DISCARD TEMP` had nothing to drop and this file said so out
+        // loud rather than assuming it in the code. ADR 0054 built the tables, and the harness
+        // failed this test on three entries that had started agreeing — which is the whole point
+        // of writing an absence down. `DISCARD TEMP` now drops what it names.
         // SQL-level `PREPARE` is a named refusal — the extended protocol's named statements are a
         // different thing and *are* cleared by `DISCARD ALL`, which `discarding_all_clears_the_\
         // session` asserts directly because no corpus statement can reach them.

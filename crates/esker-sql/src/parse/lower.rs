@@ -1917,9 +1917,10 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     } else {
         catalog::Persistence::Permanent
     };
+    // **No clause is `PRESERVE ROWS`**, which is why the two share an arm: PostgreSQL's default is
+    // the clause spelled out, not a fourth state.
     let on_commit = match create.on_commit {
-        None => catalog::OnCommit::PreserveRows,
-        Some(sqlparser::ast::OnCommit::PreserveRows) => catalog::OnCommit::PreserveRows,
+        None | Some(sqlparser::ast::OnCommit::PreserveRows) => catalog::OnCommit::PreserveRows,
         Some(sqlparser::ast::OnCommit::DeleteRows) => catalog::OnCommit::DeleteRows,
         Some(sqlparser::ast::OnCommit::Drop) => catalog::OnCommit::Drop,
     };
