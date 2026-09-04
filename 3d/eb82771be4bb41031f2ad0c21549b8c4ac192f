@@ -1,0 +1,57 @@
+crates/esker-cli/src/args.rs
+  s_2bed4ac2b1c944::t_119e763de097fa 34,135,273-277,287-292,300-304,306,850,873-888,890-892,905,1343-1425
+crates/esker-cli/src/pd.rs
+  s_2bed4ac2b1c944::t_f7882cf143172d 16,37-54,79-90,98-99,104-128,156-220,222-225,303-315,322-340,342-343,355-363,400,429-434,452-491
+crates/esker-cli/src/server.rs
+  s_2bed4ac2b1c944::t_4259d3233a8525 150-162
+crates/esker-pd/src/driver.rs
+  s_2bed4ac2b1c944::t_270eccbd7fbe4c 148-149,158-165,233-256,275-285,294,297-307,325,330-339,342,661-666,668-683,691-705,725-726,770-780
+crates/esker-pd/src/inspect.rs
+  s_2bed4ac2b1c944::t_ce7fc66a9e5f04 1-268
+crates/esker-pd/src/lib.rs
+  s_2bed4ac2b1c944::t_150b2b88f7a66a 24,35-36,52,63,71,80
+crates/esker-pd/src/pd/mod.rs
+  s_2bed4ac2b1c944::t_4fffee7da4ba12 39,553-630,915-925,1042-1050
+crates/esker-pd/src/service.rs
+  s_2bed4ac2b1c944::t_cf4e04e9ebaf3e 13,40-72,75-81,109-125,155-163,178-184,270-274
+crates/esker-pd/src/transport.rs
+  s_2bed4ac2b1c944::t_c5c109fd304f5e 1-284
+crates/esker-pd/tests/failover.rs
+  s_2bed4ac2b1c944::t_3d9e76f3c3f9c6 1-890
+crates/esker-proto/src/lib.rs
+  s_2bed4ac2b1c944::t_4e0f1f704d88f3 60-61
+crates/esker-proto/src/messages.rs
+  s_2bed4ac2b1c944::t_4cdfc94a5a1bb3 88-104,186,206-207,254-255,313-314,1562-1564
+crates/esker-proto/src/pd.rs
+  s_2bed4ac2b1c944::t_1cc2b12f9161fe 34-35,429-533,576-584,684-685,724-725,772-773,803-814,936-937,991-1002,1052-1073
+crates/esker-proto/src/raft.rs
+  s_2bed4ac2b1c944::t_1fc8363f1897da 154-159,264-265
+crates/esker-proto/tests/golden/messages.hex
+  s_2bed4ac2b1c944::t_d512e5a2e075f9 39-41,60-62
+crates/esker-proto/tests/messages.rs
+  s_2bed4ac2b1c944::t_8bf65c3274233d 16-18,85-91,122-152,705-745
+crates/esker-store/src/pd_remote.rs
+  s_2bed4ac2b1c944::t_b1a18c76eb0d8e 33-51,55,57,76-93,97-101,117,120,122-139,141-152,154-155,161,164-192,195-209,211-248,273,294-302,313-316,348-360,370-375,395,398-403,408,412,414-416,422,425
+crates/esker-store/tests/pd_client.rs
+  s_2bed4ac2b1c944::t_68e08dd9520564 114-127
+docs/DESIGN.md
+  s_2bed4ac2b1c944::t_6d86d11e4749fb 478-525,651-657,924-930
+docs/plans/phase-15-pd-ha.md
+  s_2bed4ac2b1c944::t_3a171d5e886524 301-344,367-385,391-403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3deb82771be4bb41031f2ad0c21549b8c4ac192f",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
