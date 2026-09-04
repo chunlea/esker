@@ -129,7 +129,7 @@ Two of the rows this lane owns were not.
 | 5 | "`crash_through_the_client` starves under load … the child is killed on a **wall clock**" | **Closed before the record was written.** `46166886`, *the crash loop kills after acknowledged writes, not after milliseconds*, landed 2026-09-04 06:45; the register was written at 09:48. The test kills after `1..8` acknowledged writes and has done since. Green at eighty busy threads in 3.5 s. |
 | 3 | "`Db::ingest` refuses any overlap, tombstones included … c6 verified this as the one item of eight that HEAD still owes" | **The widening landed nine hours before the record.** `616954e8`, *an ingest is refused for a shared key, not for a shared range*, 2026-09-04 00:41. The module header states the key rule and argues it against range-disjointness explicitly, and `tests/ingest_overlap.rs` property-tests it — including point tombstones and range deletes — against a rule computed from the inputs rather than from the code under test. The site the record cites, `DbInner::place`, is documented as *"placement, not permission"* and returns a level. |
 
-**ADR 0066** now records the rule, which is what #3 actually still owed. Refusing an ingest whose
+**ADR 0068** now records the rule, which is what #3 actually still owed. Refusing an ingest whose
 keys collide, tombstones included, is **correct and should not be widened**:
 a point tombstone is an entry under its key, so a sequence number would still have to decide between
 the delete and the ingested value, and the two numberings are unrelated. What #3 still owes is the

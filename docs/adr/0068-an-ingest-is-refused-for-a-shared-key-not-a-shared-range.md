@@ -1,4 +1,4 @@
-# 0066 — An ingest is refused for a shared key, not a shared range
+# 0068 — An ingest is refused for a shared key, not a shared range
 
 * Status: accepted
 * Date: 2026-09-04
