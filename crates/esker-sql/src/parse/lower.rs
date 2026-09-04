@@ -678,6 +678,40 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
         // Everything downstream — the record, `pg_type`, the drop, the dependency check — is the
         // one path all four already take.
+        // `ALTER TYPE` — the three shapes `rename_enum`, `add_enum_value` and
+        // `rename_enum_value` send, and no others.
+        Statement::AlterType(alter) => {
+            use sqlparser::ast::{AlterTypeAddValuePosition, AlterTypeOperation};
+            let action = match &alter.operation {
+                AlterTypeOperation::Rename(rename) => {
+                    plan::AlterTypeAction::RenameTo(ident(&rename.new_name))
+                }
+                AlterTypeOperation::AddValue(add) => plan::AlterTypeAction::AddValue {
+                    // **A label, not an identifier**: it is written in single quotes and its case
+                    // is its own, so it is taken verbatim the way an enum's labels are at
+                    // `CREATE TYPE`.
+                    label: add.value.value.clone(),
+                    if_not_exists: add.if_not_exists,
+                    position: match &add.position {
+                        Some(AlterTypeAddValuePosition::Before(other)) => {
+                            Some(plan::AddValuePosition::Before(other.value.clone()))
+                        }
+                        Some(AlterTypeAddValuePosition::After(other)) => {
+                            Some(plan::AddValuePosition::After(other.value.clone()))
+                        }
+                        None => None,
+                    },
+                },
+                AlterTypeOperation::RenameValue(rename) => plan::AlterTypeAction::RenameValue {
+                    from: rename.from.value.clone(),
+                    to: rename.to.value.clone(),
+                },
+            };
+            Ok(plan::Statement::AlterType(plan::AlterType {
+                name: relation_name(&alter.name)?,
+                action,
+            }))
+        }
         Statement::CreateDomain(create) => {
             refuse_if(create.collation.is_some(), "CREATE DOMAIN ... COLLATE")?;
             let (base, typmod) = lower_type(&create.data_type)?;
@@ -1381,6 +1415,23 @@ pub(super) fn column_default(
         _ => (None, None),
     };
     if let Some(literal) = literal {
+        // **A bit-string literal is its bits, and its stored expression names its *own* type.**
+        // `bit_string_test.rb` never writes one — it declares a *string* default and
+        // `ActiveRecord` renders it back out as `B'00000011'`, which is how the file meets this
+        // path. Two things go wrong without this arm and the `other.to_string()` below is both:
+        // the text handed to `bit`'s input function was `B'00000011'`, envelope and all, which is
+        // what `"B" is not a valid binary digit` was; and the expression a real server stores is
+        // `'0011'::"bit"` even on a `bit varying(4)` column, because a `B'…'` literal is a `bit`
+        // and the cast to the column's type is not part of what `pg_get_expr` prints.
+        let bits = match literal {
+            Value::SingleQuotedByteStringLiteral(digits) => Some(value::bit::from_text(digits)?),
+            Value::HexStringLiteral(digits) => Some(value::bit::from_hex(digits)?),
+            _ => None,
+        };
+        if let Some(bits) = bits {
+            let value = Datum::from_text(ty, &bits)?;
+            return Ok((Some(value), Some(format!("'{bits}'::\"bit\""))));
+        }
         let text = match literal {
             // The same thing as no default at all, and the value a column with no default takes.
             Value::Null => return Ok((None, None)),
@@ -5431,6 +5482,11 @@ fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
             // input function, exactly as `'1.5'::numeric` does — and it is the spelling the
             // corpus uses everywhere, because it is the one a person writes.
             Value::Number(digits, _) => Some(digits.clone()),
+            // **And a bit-string literal is one**, as the *bits* it stands for rather than as
+            // what was typed: `X'F'::bit(4)` is `1111` and the cast reads four characters, not
+            // one. `B'1010'::bit(2)` truncating to `10` is then the ordinary cast rule.
+            Value::SingleQuotedByteStringLiteral(bits) => Some(value::bit::from_text(bits)?),
+            Value::HexStringLiteral(digits) => Some(value::bit::from_hex(digits)?),
             _ => None,
         }),
         // `(-1.5)::numeric`: a signed number is a unary minus over a literal, and the sign is
@@ -5527,6 +5583,28 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
         | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
             refuse_if(negated, "a negated string literal")?;
             plan::Literal::String(text.clone())
+        }
+        // **`B'1010'` and `X'ff'` are one type through two alphabets.** Both are a `bit` with no
+        // typmod — `pg_typeof(B'1010')` and `pg_typeof(X'ff')` are both `bit` — so the length is
+        // the value's and nothing here carries an `n`. `sqlparser` gives them as two `Value`
+        // variants and case does not matter to it: `b'1010'` and `x'ff'` arrive the same way.
+        //
+        // Reaching a `Literal::Typed` rather than a `Literal::String` is the point of the unit:
+        // as a string the `B` went to `bit`'s input function with the rest, and
+        // `"B" is not a valid binary digit` is that envelope arriving at the value parser.
+        Value::SingleQuotedByteStringLiteral(bits) => {
+            refuse_if(negated, "a negated bit-string literal")?;
+            plan::Literal::Typed(Box::new(Datum::Bit {
+                varying: false,
+                bits: value::bit::from_text(bits)?,
+            }))
+        }
+        Value::HexStringLiteral(digits) => {
+            refuse_if(negated, "a negated bit-string literal")?;
+            plan::Literal::Typed(Box::new(Datum::Bit {
+                varying: false,
+                bits: value::bit::from_hex(digits)?,
+            }))
         }
         Value::Placeholder(name) => {
             refuse_if(negated, "a negated parameter")?;
@@ -6621,6 +6699,20 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         // **And `xml`**, which `sqlparser` has no variant for either. `xml_test.rb` writes
         // `t.xml "payload"`, which the adapter sends as the bare word.
         "xml" => Some(ColumnType::Xml),
+        // **And `ltree`**, the third extension type to reach a column, by the road `hstore` and
+        // `citext` take: `sqlparser` has no variant, so it is a `Custom` name here.
+        "ltree" => Some(ColumnType::Ltree),
+        // **A pattern, not a path** — see [`crate::value::ltree`]'s `matches`.
+        "lquery" => Some(ColumnType::LQuery),
+        // **`"bit"` quoted is not `bit` bare, and the difference is a typmod.** The keyword in a
+        // cast is the grammar's `bit(1)` — `'101'::bit` is `1`, truncated — while the *quoted*
+        // name is the type with no length, so `'101'::"bit"` is `101`. Measured, and it is why a
+        // real server prints a bit default as `'00000011'::"bit"`: the bare spelling would throw
+        // away every bit but the first when the default is re-read. `sqlparser` gives a keyword
+        // as `DataType::Bit` and only ever reaches this table with the quoted form, which the
+        // guard above has already unquoted.
+        "bit" => Some(ColumnType::Bit),
+        "varbit" | "bit varying" => Some(ColumnType::VarBit),
         _ => None,
     }
 }
@@ -6631,6 +6723,23 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
 
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
+    // **A quoted type name is a type name.** `'101'::"bit"`, `'101'::"varchar"` and `'1'::"int4"`
+    // are all ordinary casts on a real server — the quotes say "this is an identifier", not "this
+    // is a different type". `sqlparser` keeps them in `ObjectName::to_string`, so every `Custom`
+    // guard below compared `"bit"` with `bit` and missed. This node writes the spelling itself:
+    // a `B'…'` default is stored as `'00000011'::"bit"`, because `bit` is reserved, and that text
+    // is re-parsed for every row the default fills.
+    if let DataType::Custom(name, modifiers) = data_type
+        && modifiers.is_empty()
+        && let [only] = name.0.as_slice()
+        && let Some(part) = only.as_ident()
+        && part.quote_style.is_some()
+    {
+        return lower_type(&DataType::Custom(
+            ObjectName::from(vec![Ident::new(part.value.clone())]),
+            Vec::new(),
+        ));
+    }
     // **The typmod is the length**, not the length plus a header: `character_maximum_length` for
     // `bit(8)` is 8 and `format_type(1560, 8)` is `bit(8)`, both measured. A bare `bit` keeps
     // `NO_TYPMOD` and reads back as `bit(1)`, which is where that rule lives.
@@ -6640,9 +6749,19 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
         } else {
             ColumnType::VarBit
         };
+        // **A bare `bit` is `bit(1)`, everywhere a type is written.** `'101'::bit` is `1` on a
+        // real server — truncated, not kept — and a bare `bit` column reports
+        // `character_maximum_length` 1 with `atttypmod` 1 behind it. Only a `B'…'` *literal* has
+        // no length at all, and `crate::value::format_type` is where that case answers `"bit"`.
+        // A bare `bit varying` really is unbounded, so the two do not share this rule.
+        let bare = if matches!(data_type, DataType::Bit(_)) {
+            1
+        } else {
+            NO_TYPMOD
+        };
         return Ok((
             ty,
-            length.map_or(NO_TYPMOD, |n| i32::try_from(n).unwrap_or(i32::MAX)),
+            length.map_or(bare, |n| i32::try_from(n).unwrap_or(i32::MAX)),
         ));
     }
     match data_type {
@@ -6865,6 +6984,20 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             Some(ty) => ty,
             None => return Err(SqlError::unsupported(format!("the type {other}"))),
         },
+        // **A type's *internal* name is a type name.** `bpchar` is what PostgreSQL calls
+        // `character(n)` in `pg_type`, and `'a'::bpchar`, `c bpchar` and `CREATE DOMAIN d AS
+        // bpchar` are all ordinary on a real server — the name is not a second-class spelling, it
+        // is the one the catalog itself reports. Anything not in the grammar arrives here as a
+        // custom name, so this is the one place the three paths meet; without it `bpchar` was a
+        // *user* type nobody had declared and the answer was `0A000 the type bpchar is not
+        // supported` about a type this node has.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.0.len() == 1
+                && let Ok(Some(ty)) = value::type_by_name(&name.to_string()) =>
+        {
+            ty
+        }
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
 }

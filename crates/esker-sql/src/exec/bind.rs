@@ -237,6 +237,7 @@ fn walk(
         | Statement::Raise { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
+        | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -775,6 +776,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::Raise { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
+        | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -993,6 +995,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::Raise { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
+        | Statement::AlterType(_)
         // DDL over a table, but nothing here needs its column types: a parameter cannot appear
         // in an `ALTER TABLE`, so there is nothing to infer against.
         | Statement::AlterTable(_)
@@ -1083,6 +1086,7 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::Raise { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
+        | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
@@ -1273,7 +1277,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::CitextArray
-        | ColumnType::XmlArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::XmlArray
+        | ColumnType::LtreeArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1312,6 +1317,10 @@ fn placeholder(ty: ColumnType) -> Datum {
         // smallest thing there is. It only ever stands in for a type while a `Describe` is
         // answered.
         ColumnType::Xml => Datum::Text(String::new()),
+        // The empty path, which is a value: zero labels, and never read — only its type is.
+        ColumnType::Ltree => Datum::Ltree(String::new()),
+        // `*`, which matches every path — never read, only its type is.
+        ColumnType::LQuery => Datum::Text("*".to_owned()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),
         ColumnType::TimestampTz => Datum::TimestampTz(0),

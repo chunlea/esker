@@ -1,5 +1,14 @@
 //! `bit(n)` and `bit varying(n)`: a string of ones and zeros, and the two length rules over it.
 //!
+//! # The literal is `B'…'`, and `X'…'` is the same type through a different alphabet
+//!
+//! `B'1010'` and `X'ff'` are both `bit` — `pg_typeof` says so for each — and neither carries a
+//! typmod: `format_type(1560, -1)` is `"bit"`, quoted because the word is reserved, where a bare
+//! `bit` *column* is `bit(1)` because its `atttypmod` is 1 and not -1. Both spellings are
+//! case-insensitive (`b'1010'`, `x'ff'`), `B''` is a zero-length `bit`, and each refuses by
+//! naming the offending character: `"2" is not a valid binary digit`,
+//! `"G" is not a valid hexadecimal digit`.
+//!
 //! # One representation, two types, and they compare equal
 //!
 //! `B'101'::bit varying = B'101'::bit(3)` is `t` on a real server, so under
@@ -43,6 +52,25 @@ pub fn from_text(text: &str) -> Result<String> {
         }
     }
     Ok(text.to_owned())
+}
+
+/// Reads the digits of an `X'…'` literal: **four bits a digit**, most significant first.
+///
+/// `X'F'` is `1111` and `X'0'` is `0000` — measured, and the width is what a reader would get
+/// wrong: the literal's length in bits is four times its length in characters, so `X'ff'` is eight
+/// bits and not two. Its refusal names the character the way the binary one does, with its own
+/// word: `X'FG'` is `22P02 "G" is not a valid hexadecimal digit`.
+pub fn from_hex(digits: &str) -> Result<String> {
+    let mut bits = String::with_capacity(digits.len() * 4);
+    for ch in digits.chars() {
+        let value = ch
+            .to_digit(16)
+            .ok_or_else(|| SqlError::InvalidHexadecimalDigit(ch.to_string()))?;
+        for shift in (0..4).rev() {
+            bits.push(if value >> shift & 1 == 1 { '1' } else { '0' });
+        }
+    }
+    Ok(bits)
 }
 
 /// A **cast** to `bit(n)` or `bit varying(n)`: padded on the right, or truncated.
@@ -91,7 +119,23 @@ pub fn fit_to_column(bits: &str, length: Option<usize>, varying: bool) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{fit, fit_to_column, from_text};
+    use super::{fit, fit_to_column, from_hex, from_text};
+
+    /// **Four bits a digit**, which is the whole of what `X'…'` adds.
+    #[test]
+    fn a_hexadecimal_literal_is_four_bits_a_digit() {
+        assert_eq!(from_hex("F").unwrap(), "1111");
+        assert_eq!(from_hex("f").unwrap(), "1111");
+        assert_eq!(from_hex("0").unwrap(), "0000");
+        assert_eq!(from_hex("ff").unwrap(), "11111111");
+        assert_eq!(from_hex("").unwrap(), "");
+        let refused = from_hex("FG").unwrap_err();
+        assert_eq!(refused.sqlstate(), "22P02");
+        assert_eq!(
+            refused.to_string(),
+            "\"G\" is not a valid hexadecimal digit"
+        );
+    }
 
     /// Every row of the module's own table.
     #[test]

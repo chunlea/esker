@@ -125,6 +125,13 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // identify an ordering operator for type xml` and there is no order to fix.
                 | ColumnType::Xml
                 | ColumnType::XmlArray
+                // `ltree[]` and not `ltree`: an array key is built from its element's encoding,
+                // and the element's here is the separator rewrite, which has nowhere to put the
+                // array's own delimiters. The scalar has a fixture two screens up.
+                | ColumnType::LtreeArray
+                // **A pattern has no comparison at all**, which is `json`'s reason: `lquery`
+                // exists to be matched with `~` and never to be stored, ordered or indexed.
+                | ColumnType::LQuery
         ) {
             assert!(
                 !types_seen.contains(&ty),
@@ -160,6 +167,11 @@ fn column_type(name: &str) -> ColumnType {
         "macaddr[]" => ColumnType::MacAddrArray,
         "money[]" => ColumnType::MoneyArray,
         "citext" => ColumnType::Citext,
+        // **The fixture that says the order is not the text's.** `a.b` sits *before* `a-b` here
+        // and after it under `COLLATE "C"`, because a real server compares label by label — and
+        // the key `esker_keys::row` builds for an ltree lowers the separator below every byte a
+        // label can hold, which is what makes plain byte order reproduce this row.
+        "ltree" => ColumnType::Ltree,
         "int4" => ColumnType::Int4,
         "int2" => ColumnType::Int2,
         "text" => ColumnType::Text,

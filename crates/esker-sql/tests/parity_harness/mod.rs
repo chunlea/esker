@@ -146,7 +146,10 @@ const SWALLOWING_DEBT: &[&str] = &[
     // `tests/do_block.rs`
     "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;",
     // `tests/drop_extension.rs`
-    "CREATE EXTENSION IF NOT EXISTS \"ltree\"",
+    // **This was `"ltree"` and is one statement later now**: the ltree unit closed that refusal,
+    // and the file reaches `postgres_fdw` before it aborts. One fewer statement swallowed, and
+    // the entry stays until a foreign-data wrapper is a thing this node has.
+    "CREATE EXTENSION IF NOT EXISTS \"postgres_fdw\"",
     "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\" SCHEMA extschema",
     // `tests/include_index.rs`
     "SELECT 'r', pg_get_indexdef('companies_u_include'::regclass)",
