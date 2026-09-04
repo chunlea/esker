@@ -141,5 +141,19 @@ SELECT 'r', c, count(*) FROM e2 GROUP BY c		r|\N|1
 SAVEPOINT s6		-
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = 'public') THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$		-
 ROLLBACK TO SAVEPOINT s6		-
+# **`pg_enum` is a view over the type records**, added with the unit that projected it. Three
+# things are asked here that one enum cannot answer: that the rows of two types do not run
+# together, that a type declared with **no labels** contributes none rather than one empty row,
+# and that `enumsortorder` is a `real` starting at **1** — not the label's index, and a float
+# because `ALTER TYPE … ADD VALUE … BEFORE` puts a new label *between* two numbers on a real
+# server. This node appends only, so its numbers are 1, 2, 3.
+CREATE TYPE tense AS ENUM ('past', 'present', 'future')		-
+SELECT 'r', t.typname, e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') ORDER BY t.typname, e.enumsortorder	text,name,name,real	r|mood|sad|1 ; r|mood|ok|2 ; r|mood|happy|3 ; r|tense|past|1 ; r|tense|present|2 ; r|tense|future|3
+SELECT 'r', t.typname, count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') GROUP BY t.typname ORDER BY t.typname	text,name,bigint	r|mood|3 ; r|tense|3
+SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder	text,real,regtype	r|1|real ; r|2|real ; r|3|real
+SELECT 'r', t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense') GROUP BY t.typname ORDER BY t.typname	text,name,name[]	r|mood|{sad,ok,happy} ; r|tense|{past,present,future}
+SELECT 'r', count(*) AS labels_of_an_empty_enum FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'emptymood'	text,bigint	r|0
+SELECT 'r', count(*) FROM pg_type t WHERE t.typname IN ('mood','tense','emptymood') AND t.typtype = 'e'	text,bigint	r|3
+DROP TYPE tense		-
 ROLLBACK		-
-SELECT count(*) FROM pg_type WHERE typname IN ('mood','emptymood')	bigint	0
+SELECT count(*) FROM pg_type WHERE typname IN ('mood','emptymood','tense')	bigint	0

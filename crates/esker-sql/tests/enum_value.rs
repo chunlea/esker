@@ -29,6 +29,31 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          table_name = 'postgresql_enums' ORDER BY ordinal_position",
         "SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name \
          = 'postgresql_enums' AND column_name = 'good_mood'",
+        // **`ActiveRecord`'s own `enum_types()` query, and the rows agree now**: `pg_enum` is a
+        // view over the type records, so the labels come back in declaration order with
+        // `enumsortorder` 1, 2, 3. What is left is the same trade one line up — `typname` and
+        // `nspname` are `name` on a real server and `text` here, so `array_agg` of the labels is
+        // `name[]` there and `text[]` here, with the same three strings in it.
+        "SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY \
+         enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = \
+         enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY \
+         (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
+        // **The four `pg_enum` probes, and every row of every one of them agrees.** `typname`
+        // and `enumlabel` are `name` on a real server and `text` here — so `array_agg` of the
+        // labels is `name[]` there and `text[]` here — and `pg_typeof` answers a `regtype` there
+        // and `text` here, which is the trade `'x'::regtype` already makes. `enumsortorder` is a
+        // `real` on **both**, which is the one column of this view that had to be got right
+        // rather than traded: it is not the label's index.
+        "SELECT 'r', t.typname, e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON \
+         t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') ORDER BY t.typname, \
+         e.enumsortorder",
+        "SELECT 'r', t.typname, count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+         WHERE t.typname IN ('mood','tense','emptymood') GROUP BY t.typname ORDER BY t.typname",
+        "SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON \
+         t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder",
+        "SELECT 'r', t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e \
+         JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense') GROUP BY \
+         t.typname ORDER BY t.typname",
     ],
     answers: &[
         // **`pg_type` holds this node's own types and the tenant's, and PostgreSQL's built-in
@@ -74,18 +99,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = \
              'mood'::regtype ORDER BY enumsortorder",
             "'x'::regtype does not resolve a user-defined type's name to its oid",
-        ),
-        // **`pg_enum` is a relation with no rows**, which is what it has been since `CREATE TYPE`
-        // landed: the labels live on the type record and nothing projects them as rows yet. This
-        // is `ActiveRecord`'s own `enum_types` query, and until it answers the schema dumper
-        // writes no `create_enum` line — the half of `test_schema_dump` that this unit does not
-        // reach. A row per label, keyed by the type's oid, and it needs no new storage.
-        (
-            "SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel \
-             ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON \
-             (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE \
-             n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
-            "pg_enum has no rows: a type's labels are on its record and are not projected yet",
         ),
         // **The standing constant-width divergence, in three sentences that are otherwise
         // identical**: a bare integer constant is `int8` here and `int4` there, so the type this

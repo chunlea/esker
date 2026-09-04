@@ -161,8 +161,13 @@ pub enum CatalogView {
     /// **Not `last_value`**, which is state and lives in the sequence relation itself. Two
     /// different reads, and `reset_pk_sequence!` uses both.
     PgSequence,
-    /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
-    /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
+    /// One row per label of every enum type this tenant has declared.
+    ///
+    /// A **view over the type records**, the way `pg_class` is a view over the name records: the
+    /// labels live on the `TypeDef` that `CREATE TYPE` wrote, in declaration order, and this
+    /// projects them. There is no second copy and no way for the two to disagree — which matters
+    /// more here than elsewhere, because that order *is* the sort order of the type
+    /// (`enumsortorder`, and ADR 0050's never-reuse rule).
     PgEnum,
     /// What *could* be installed, which is not what is — and **not** [`CatalogView::PgExtension`].
     ///
@@ -534,6 +539,7 @@ impl CatalogView {
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
+            CatalogView::PgEnum => pg_enum_rows(txn, tenant),
             CatalogView::PgDepend => pg_depend_rows(txn, tenant),
             CatalogView::PgSequence => pg_sequence_rows(txn, tenant),
             CatalogView::PgClass => pg_class_rows(txn, tenant),
@@ -1127,6 +1133,40 @@ fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Ve
     rows.sort_by_key(|row| match row.first() {
         Some(Datum::Int8(oid)) => *oid,
         _ => 0,
+    });
+    Ok(rows)
+}
+
+/// One `pg_enum` row per label of every enum type this tenant has declared.
+///
+/// **`enumsortorder` is a `real` and it is not the label's index** — it is what PostgreSQL wrote
+/// when the label was declared, and `ALTER TYPE … ADD VALUE … BEFORE` puts a new one *between* two
+/// existing numbers, which is why the column is a float and not an integer. This node appends only,
+/// so the numbers are 1, 2, 3 …, and the rule that matters is the one they encode: the order is the
+/// declaration order, never the alphabet, and a label's number is never reused (ADR 0050).
+///
+/// Rows are ordered by type oid and then by that number, which is the order a client reading them
+/// without an `ORDER BY` would find least surprising — and `ActiveRecord`'s own `enum_types` query
+/// sorts inside `array_agg` anyway, so it does not depend on this.
+fn pg_enum_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let mut rows = Vec::new();
+    for def in super::user_types(txn, tenant)? {
+        let super::TypeKind::Enum { labels } = &def.kind else {
+            continue;
+        };
+        let oid = super::pg_relations::as_oid(def.oid);
+        for (at, label) in labels.iter().enumerate() {
+            rows.push(vec![
+                Datum::Int8(oid),
+                Datum::Text(label.clone()),
+                // `at + 1`: a real server's first label is `1`, not `0`.
+                Datum::Real(f32::from(u16::try_from(at + 1).unwrap_or(u16::MAX))),
+            ]);
+        }
+    }
+    rows.sort_by_key(|row| match (row.first(), row.get(2)) {
+        (Some(Datum::Int8(oid)), Some(Datum::Real(order))) => (*oid, order.to_bits()),
+        _ => (0, 0),
     });
     Ok(rows)
 }
