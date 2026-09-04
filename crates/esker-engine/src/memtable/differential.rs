@@ -312,8 +312,29 @@ fn differential<S: Store>(ops: &[Op]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// This module's property-test configuration, and the reason it is a function.
+///
+/// The case count is scaled for Miri, which interprets every instruction; the second field is
+/// what makes the documented Miri command true. proptest's default `FileFailurePersistence`
+/// writes a `.proptest-regressions` file beside the source, so it calls `std::env::current_dir`,
+/// and Miri refuses `getcwd` under isolation — the harness aborts there with the rest of the
+/// module's tests **unrun**. That reads like the gate failing rather than the gate not running,
+/// which is the whole reason it was worth fixing rather than documenting
+/// (`docs/plans/debts-v1.md` #8).
+///
+/// Dropping the regressions file under Miri costs nothing. A Miri run is a gate, not where a
+/// counterexample is first found: the native run of this same property has 256 cases to Miri's
+/// two and still records what it finds.
+fn config() -> ProptestConfig {
+    let mut config = ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 256 });
+    if cfg!(miri) {
+        config.failure_persistence = None;
+    }
+    config
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 256 }))]
+    #![proptest_config(config())]
 
     /// Insert, seek, seek-for-prev, step forward, step backward and the MVCC point read, all
     /// against a `BTreeMap` under a restated order.
