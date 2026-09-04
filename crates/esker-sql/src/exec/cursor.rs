@@ -133,7 +133,125 @@ enum Kind<'a> {
         matched: bool,
         /// The inner table, read once, for [`Probe::Materialize`] only.
         materialized: Vec<Vec<Datum>>,
+        /// `materialized` grouped by its half of an equality in the `ON`, when the `ON` has one.
+        ///
+        /// **This is what keeps a materialised join off the cross product.** Without it every
+        /// outer row is paired with every inner row and the `ON` decides — which is correct and is
+        /// `O(outer × inner)`. `ActiveRecord`'s `eager_load` over the suite's generated
+        /// `citations` fixture is 65,536 rows joined to itself, so that is 4.3 **billion** pairs
+        /// for a statement whose answer is 65,536 rows: the node held a core for the whole of run
+        /// 53's 120 s watchdog and was still going when the client was killed.
+        ///
+        /// It changes no answer and no order. The rows a bucket holds are in the order they were
+        /// materialised, so the pairs come out in the order a full pass produces them, and the
+        /// **whole `ON` is still evaluated on every pair** — the bucket only skips pairs whose
+        /// equality conjunct is false, and a false conjunct makes the conjunction false.
+        buckets: Option<EquiBuckets>,
+        /// Whether [`Kind::NestedLoop::buckets`] has been decided; see why it cannot be at open.
+        buckets_built: bool,
+        /// The positions in `materialized` this outer row may pair with, or `None` for all of them.
+        candidates: Option<Vec<usize>>,
     },
+}
+
+/// One equality out of a join's `ON`, and the inner rows grouped by its inner half.
+///
+/// The key is a [`Datum`] ordered by `pg_cmp`, which is this crate's SQL comparison — the one the
+/// `=` in the `ON` is decided by, and the one a unique index groups equal values with. Keying on
+/// anything else (the bytes, the text) would be a second opinion about equality, and `citext` and
+/// `float8` are where two opinions differ.
+struct EquiBuckets {
+    /// Where the outer half of the equality sits in an outer row.
+    outer_at: usize,
+    /// Inner-row positions by key, each in the order they were materialised.
+    by_key: BTreeMap<PgKey, Vec<usize>>,
+}
+
+/// A [`Datum`] ordered by `pg_cmp` so it can key a map.
+#[derive(PartialEq, Eq)]
+struct PgKey(Datum);
+
+impl Ord for PgKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        PgDatum::pg_cmp(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for PgKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl EquiBuckets {
+    /// The buckets an `ON` allows, or `None` when it has no `outer = inner` conjunct to group by.
+    ///
+    /// Only an equality **between the two sides** counts: one whose halves are both on the inner
+    /// side is a filter, and one with an expression on either side is not a key this can group by.
+    /// Anything it declines leaves the join exactly as it was.
+    fn build(residual: Option<&Expr>, rows: &[Vec<Datum>], boundary: usize) -> Option<Self> {
+        let (outer_at, inner_at) = equi_positions(residual?, boundary)?;
+        let mut by_key: BTreeMap<PgKey, Vec<usize>> = BTreeMap::new();
+        for (at, row) in rows.iter().enumerate() {
+            // A row too short for the position is a plan that does not match its rows; the full
+            // pass is always correct, so this declines rather than guessing.
+            let key = row.get(inner_at)?;
+            // **A NULL key pairs with nothing**, because `NULL = anything` is unknown and unknown
+            // keeps no pair — the same rule the indexed probes apply before their read. Leaving it
+            // out of the map is what makes the lookup below exact rather than approximate.
+            if matches!(key, Datum::Null) {
+                continue;
+            }
+            by_key.entry(PgKey(key.clone())).or_default().push(at);
+        }
+        Some(EquiBuckets { outer_at, by_key })
+    }
+
+    /// The inner positions an outer row may pair with.
+    fn candidates(&self, row: &[Datum]) -> Vec<usize> {
+        match row.get(self.outer_at) {
+            // A NULL on the outer half matches nothing, for the reason above.
+            None | Some(Datum::Null) => Vec::new(),
+            Some(value) => self
+                .by_key
+                .get(&PgKey(value.clone()))
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The `(outer, inner)` positions of an equality between the two sides of a join, out of the
+/// `AND` spine of an `ON`.
+fn equi_positions(on: &Expr, boundary: usize) -> Option<(usize, usize)> {
+    match on {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => equi_positions(left, boundary).or_else(|| equi_positions(right, boundary)),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            // **The inner half is relative to the inner row**, which is what `materialized` holds:
+            // the `ON`'s ordinals are positions in the *joined* row, so the inner one is past the
+            // boundary and has to come back to it. `exec::query::probe_for` subtracts the same
+            // amount for the same reason.
+            (Expr::Ordinal { at: a, .. }, Expr::Ordinal { at: b, .. }) => {
+                match (*a < boundary, *b < boundary) {
+                    (true, false) => Some((*a, *b - boundary)),
+                    (false, true) => Some((*b, *a - boundary)),
+                    // Both halves on one side joins nothing: it is a filter, and the full pass
+                    // applies it correctly.
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The inner side of a nested loop, read once, or nothing when the probe reads it per outer row.
@@ -296,6 +414,13 @@ impl<'a> Cursor<'a> {
                     residual: residual.clone(),
                     current: None,
                     matched: false,
+                    // **Built from the first outer row, not here**, because the boundary between
+                    // the two halves of the `ON`'s ordinals is the outer row's width and nothing
+                    // at open knows it. A join whose outer side is empty never builds them, which
+                    // is the right answer for the work as well as for the rows.
+                    buckets: None,
+                    buckets_built: false,
+                    candidates: None,
                     materialized,
                 }
             }
@@ -458,11 +583,21 @@ impl<'a> Cursor<'a> {
                 current,
                 matched,
                 materialized,
+                buckets,
+                buckets_built,
+                candidates,
             } => loop {
                 let Some((row, position)) = current else {
                     let Some(next) = outer.next()? else {
                         return Ok(None);
                     };
+                    // The `ON`'s ordinals split at the outer row's width, which this is the first
+                    // point that knows.
+                    if !*buckets_built {
+                        *buckets_built = true;
+                        *buckets = EquiBuckets::build(residual.as_ref(), materialized, next.len());
+                    }
+                    *candidates = buckets.as_ref().map(|buckets| buckets.candidates(&next));
                     *current = Some((next, 0));
                     *matched = false;
                     continue;
@@ -519,7 +654,13 @@ impl<'a> Cursor<'a> {
                         {
                             *materialized = super::table_function::rows(call, row)?;
                         }
-                        let Some(inner) = materialized.get(*position) else {
+                        // The bucket's positions when the `ON` gave one to group by, and every
+                        // row otherwise — the same rows in the same order either way.
+                        let at = match candidates {
+                            Some(candidates) => candidates.get(*position).copied(),
+                            None => Some(*position),
+                        };
+                        let Some(inner) = at.and_then(|at| materialized.get(at)) else {
                             // The inner side is exhausted. A left join whose outer row kept no
                             // pair is emitted now, with every inner column NULL — and it is
                             // decided **here**, after the `ON` has been applied to every pair and
