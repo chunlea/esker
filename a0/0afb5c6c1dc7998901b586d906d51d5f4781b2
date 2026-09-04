@@ -1,0 +1,29 @@
+crates/esker-sql/src/backend/mod.rs
+  s_6f7019c05b578b::t_4c175f410b98b0 189-202,366-379,479-481,504-506,559-569,614-636,677-679,686,696-698,778-783,862-886
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_dd8ff11f052494 223-237,2336-2338,2603-2607
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_b9d9c6b24b1a65 654-660,691
+crates/esker-sql/tests/serializable.rs
+  s_6f7019c05b578b::t_75a6b906a84e56 1-176
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_6f7019c05b578b::t_9babaed4554cf6 305-312,634-640,642-644,646,658-659,662,679,682-688,690,693-694
+docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md
+  s_6f7019c05b578b::t_06ce967667eebc 3,152-179,182-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a00afb5c6c1dc7998901b586d906d51d5f4781b2",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
