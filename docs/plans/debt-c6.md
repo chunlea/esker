@@ -733,3 +733,52 @@ applied"* is a **negative** assertion behind a wall clock: under load it does no
 green without the store having considered the operator at all. It fails only on the day the
 rejection breaks — and it will still pass. Not fixed here; it wants a wait on evidence that the
 operator was seen and refused, and that is its own unit.
+
+## 10. The retry-helper audit: seven files carry the shape, none of them is exposed
+
+`docs/plans/debt-c6.md` §8 ended by noting that seven of nine `esker-store` test files carry a
+retry helper of their own and only `cluster.rs` looks at a leader hint. That is a count of the
+*shape*. It is not a count of the *exposure*, and the difference is the whole of this section.
+
+### The audit
+
+A helper is exposed only if a write can run while the region has **more than one voter** — a sole
+voter cannot lose an election, so there is no office for the write to be aimed at wrongly.
+
+| file | multi-voter anywhere? | writes after its `AddPeer`? | exposed |
+|---|---|---|---|
+| `snapshot.rs` | yes | **yes**, three batches | **was — fixed in §8** |
+| `promotion.rs` | yes | yes | **no — already correct** |
+| `balance.rs` | yes, in `regions_reach_a_store_that_joins…` | no: its writes are in `a_dozen_regions_on_two_workers_all_make_progress`, which is single-node | no |
+| `retire.rs` | yes | no, every write precedes it | no |
+| `sim_sweep.rs` | yes | no, `seed_all_three_families` runs before the second store opens | no |
+| `server.rs` | no | — | no |
+| `sim_snapshot_ask.rs` | no | — | no |
+| `split.rs` | no | — | no |
+
+`balance.rs` is the one that looks exposed and is not: its `AddPeer` and its writes are in
+different tests, and the writing one builds `peers = vec![PeerAddress::new(1, 1, address)]` with
+`bootstrap_voters: Some(vec![1])` — one store, one voter, twelve regions after the splits.
+Leadership has nowhere to move to.
+
+`promotion.rs` had solved this independently, by scanning the group for whichever store's peer
+reports `is_leader()` rather than by following the hint, and its comment says why: *"a load
+generator that only knows one store measures the bug rather than the fix."*
+
+### Why no shared helper was extracted
+
+The instruction was to fix it once, in one place, if the files share it. **They do not share it** —
+there is no `tests/common/` module, and each integration test is its own binary — so "once, in one
+place" would mean creating a module and importing it into six binaries in order to change nothing
+about any of them.
+
+Worse than nothing: giving a single-voter test a group parameter states that its writes might be
+refused by the store they are aimed at, which is exactly false and is the fact that keeps those
+tests simple. The distinction is load-bearing, so it is now written down where a future sweep will
+hit it — `retire.rs` and `sim_sweep.rs`'s helpers each say in one paragraph why they take one store
+and what would have to change for that to stop being true.
+
+### The rule this leaves
+
+Count the shape to find candidates; count the *exposure* before changing any of them. Seven files
+matched a grep and one had the bug.

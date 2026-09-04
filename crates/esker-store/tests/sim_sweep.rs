@@ -180,6 +180,11 @@ const PROBE_ROUNDS: usize = 50;
 /// by [`open`]. This is what turns the beats PD received into a count of the rounds that ran.
 const ROUNDS_PER_BEAT: usize = 4;
 
+/// Writes one key, retrying while the answer is one the caller is told to retry.
+///
+/// **One store, deliberately.** See `retire.rs`'s note: a hint-ignoring retry livelocks against a
+/// two-voter region, and `seed_all_three_families` runs before the second store is opened, so
+/// every write here happens under a sole voter that cannot lose office.
 async fn put(store: &Arc<Store>, region: &Region, k: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
