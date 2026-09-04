@@ -1,0 +1,16 @@
+crates/esker-store/tests/snapshot.rs
+  h_44076b318daf9c 204,206-208,210-211,235-239,241-262,269-380,617,649-651,654,749,898,901,1105,1193,1306,1391
+docs/plans/debt-c6.md
+  h_44076b318daf9c 572-641
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3ecc3f55fc316eb8c2f4cec5ac0a39a3c79c7e2a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
