@@ -1,0 +1,53 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_6f7019c05b578b::t_e9f3c1feaa4112 55-58,60
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_2a71ce936396cd 740,869-873,1025-1052,1062,2331-2338,3332-3342,3742
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_b72d924d91ba35 839
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_420d1f7d55d2e7 68-70,106,1647,1677-1686,1690-1706,1738-1741,2291,2295
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_071ecb1cb0d41d 223-228,2017-2019
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_b115b516873878 56-90,92,95,176,2761-2833
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_3362e6379996c2 167-175,207-236,328-334,440,1701-1774,1782-1784,1789,1823,1840-1843,1972,2010,2526-2536
+crates/esker-sql/src/exec/subquery.rs
+  s_6f7019c05b578b::t_653e4d03267555 204,340
+crates/esker-sql/src/exec/values.rs
+  s_6f7019c05b578b::t_57dc6c05826236 57
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_b128eb09eb0d36 1910-1932,1934-1937,6420-6429
+crates/esker-sql/src/plan/ddl.rs
+  s_6f7019c05b578b::t_4e61a1dbae9aee 37-39
+crates/esker-sql/tests/corpus/pg19_temp_on_commit.txt
+  s_6f7019c05b578b::t_f25d91ba155f4c 1-48
+crates/esker-sql/tests/corpus/pg19_temp_table.txt
+  s_6f7019c05b578b::t_d316dd48c59cc7 1-113
+crates/esker-sql/tests/relation_resolution.rs
+  s_6f7019c05b578b::t_9f285878129749 37-39,95-100,102-103
+crates/esker-sql/tests/slt/unsupported.slt
+  s_6f7019c05b578b::t_de8dfe42cfffb4 48-50
+crates/esker-sql/tests/temp_table.rs
+  s_6f7019c05b578b::t_250e646ed8cebe 1-127
+docs/adr/0053-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
+  s_6f7019c05b578b::t_97d01ca4b10528 1-113
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_d97058a4bd03fe 1319-1322,1578
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "925eeb6c8605f9360d76c9c9de87bb88fe0228a1",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
