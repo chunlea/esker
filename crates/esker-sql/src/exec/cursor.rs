@@ -29,7 +29,7 @@ use crate::value::{ColumnType, Datum};
 /// Rows read from the store in one round trip. Shared with everything else that walks a range
 /// ([`crate::exec::for_each_page`]).
 use crate::exec::SCAN_CHUNK;
-use crate::value::PgDatum;
+use crate::value::{PgDatum, PgType, range};
 
 /// The most rows a `Sort` will hold. Past it, `53400` rather than an unbounded allocation.
 pub(super) const SORT_LIMIT: usize = 1_000_000;
@@ -1145,7 +1145,7 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
             func.name(),
             value
                 .and_then(Datum::column_type)
-                .map_or("unknown", crate::value::PgType::name)
+                .map_or("unknown", PgType::name)
         ))
     };
     // **At least one operand has to be a real hstore.** A `Datum::Text` is accepted only as the
@@ -1291,15 +1291,10 @@ fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
                 Some(Datum::Text(text)) => Ok(Some(crate::value::date::from_text(text, 0)?)),
                 Some(other) => Err(SqlError::UndefinedFunctionTypes(format!(
                     "daterange({})",
-                    other
-                        .column_type()
-                        .map_or("unknown", crate::value::PgType::name)
+                    other.column_type().map_or("unknown", PgType::name)
                 ))),
             };
-            Datum::Text(
-                crate::value::range::DateRange::new(day(args.first())?, day(args.get(1))?)
-                    .to_text(),
-            )
+            Datum::Text(range::DateRange::new(day(args.first())?, day(args.get(1))?).to_text())
         }
         CatalogFunc::IsEmpty => match range_argument(args.first())? {
             None => Datum::Null,
@@ -1314,11 +1309,178 @@ fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
     })
 }
 
+/// The range functions over a **stored** range column, which `range::Range` models
+/// with its bounds' inclusivity as data.
+///
+/// Separate from [`range_function`], which answers the `daterange(a, b)` *expression* the suite's
+/// `EXCLUDE` key is built from — that one has a half-open `DateRange` and no brackets to report.
+/// The two will merge when the expression form is rebuilt on this type; until then each is right
+/// about its own shape and neither is guessing about the other's.
+fn range_value_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+
+    let stored = |value: Option<&Datum>| match value {
+        Some(Datum::Range { subtype, text }) => range::from_text(**subtype, text).map(Some),
+        Some(Datum::Null) | None => Ok(None),
+        other => Err(SqlError::UndefinedFunctionTypes(format!(
+            "{}({})",
+            func.name(),
+            other
+                .and_then(Datum::column_type)
+                .map_or("unknown", PgType::name)
+        ))),
+    };
+    Ok(match func {
+        // **`lower_inf` is true for an *absent* bound and false for `-infinity`**, which is the
+        // distinction the whole type turns on: an infinite timestamp is a value, and unbounded is
+        // the lack of one.
+        CatalogFunc::IsEmpty => match stored(args.first())? {
+            None => Datum::Null,
+            Some(range) => Datum::Bool(range.empty),
+        },
+        // Two ranges share a point. An empty range overlaps nothing, itself included.
+        CatalogFunc::RangeOverlaps => match (stored(args.first())?, stored(args.get(1))?) {
+            (Some(left), Some(right)) => Datum::Bool(overlaps(&left, &right)),
+            _ => Datum::Null,
+        },
+        CatalogFunc::RangeLowerInc
+        | CatalogFunc::RangeUpperInc
+        | CatalogFunc::RangeLowerInf
+        | CatalogFunc::RangeUpperInf => match stored(args.first())? {
+            None => Datum::Null,
+            Some(range) => Datum::Bool(match func {
+                CatalogFunc::RangeLowerInc => range.lower_inc,
+                CatalogFunc::RangeUpperInc => range.upper_inc,
+                CatalogFunc::RangeLowerInf => !range.empty && range.lower.is_none(),
+                _ => !range.empty && range.upper.is_none(),
+            }),
+        },
+        // `a @> b`, and `b <@ a` is the same question with the arguments the other way round —
+        // the lowering swaps them so there is one rule here. The right side may be a bare value
+        // rather than a range, which is what `ts_range @> '…'::timestamp` sends.
+        CatalogFunc::RangeContains => match (stored(args.first())?, args.get(1)) {
+            (Some(outer), Some(inner)) => match inner {
+                Datum::Null => Datum::Null,
+                Datum::Range { subtype, text } => {
+                    let inner = range::from_text(**subtype, text)?;
+                    Datum::Bool(contains_range(&outer, &inner))
+                }
+                point => Datum::Bool(contains_point(&outer, point)),
+            },
+            _ => Datum::Null,
+        },
+        // `tsrange(a, b)` is `[a,b)` and the third argument names the brackets.
+        CatalogFunc::RangeBuild => {
+            let bounds = match args.get(2) {
+                Some(Datum::Text(text)) => text.clone(),
+                _ => "[)".to_owned(),
+            };
+            let mut chars = bounds.chars();
+            let range = range::Range {
+                empty: false,
+                lower: args.first().filter(|v| **v != Datum::Null).cloned(),
+                upper: args.get(1).filter(|v| **v != Datum::Null).cloned(),
+                lower_inc: chars.next() == Some('['),
+                upper_inc: chars.next() == Some(']'),
+            };
+            Datum::Range {
+                subtype: Box::new(
+                    args.first()
+                        .and_then(Datum::column_type)
+                        .unwrap_or(ColumnType::Timestamp),
+                ),
+                text: range.to_text(),
+            }
+        }
+        other => {
+            return Err(SqlError::Internal(format!(
+                "{} reached the range evaluator",
+                other.name()
+            )));
+        }
+    })
+}
+
+/// Whether two ranges share a point. An empty range overlaps nothing, itself included.
+fn overlaps(left: &range::Range, right: &range::Range) -> bool {
+    if left.empty || right.empty {
+        return false;
+    }
+    // `left` starts before `right` ends, and `right` starts before `left` ends — with each
+    // bound's inclusivity deciding the touching case.
+    starts_before_end(left, right) && starts_before_end(right, left)
+}
+
+/// Whether `a`'s lower bound is below `b`'s upper, honouring both inclusivities.
+fn starts_before_end(a: &range::Range, b: &range::Range) -> bool {
+    let (Some(lower), Some(upper)) = (&a.lower, &b.upper) else {
+        return true;
+    };
+    match lower.pg_cmp(upper) {
+        Ordering::Less => true,
+        Ordering::Equal => a.lower_inc && b.upper_inc,
+        Ordering::Greater => false,
+    }
+}
+
+/// Whether every point of `inner` is in `outer`. An empty range is contained by everything.
+fn contains_range(outer: &range::Range, inner: &range::Range) -> bool {
+    if inner.empty {
+        return true;
+    }
+    if outer.empty {
+        return false;
+    }
+    let lower_ok = match (&outer.lower, &inner.lower) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => match a.pg_cmp(b) {
+            Ordering::Less => true,
+            Ordering::Equal => outer.lower_inc || !inner.lower_inc,
+            Ordering::Greater => false,
+        },
+    };
+    let upper_ok = match (&outer.upper, &inner.upper) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => match a.pg_cmp(b) {
+            Ordering::Greater => true,
+            Ordering::Equal => outer.upper_inc || !inner.upper_inc,
+            Ordering::Less => false,
+        },
+    };
+    lower_ok && upper_ok
+}
+
+/// Whether a bare value falls inside a range, honouring each bound's inclusivity.
+fn contains_point(outer: &range::Range, point: &Datum) -> bool {
+    if outer.empty {
+        return false;
+    }
+    let above_lower = match &outer.lower {
+        None => true,
+        Some(lower) => match lower.pg_cmp(point) {
+            Ordering::Less => true,
+            Ordering::Equal => outer.lower_inc,
+            Ordering::Greater => false,
+        },
+    };
+    let below_upper = match &outer.upper {
+        None => true,
+        Some(upper) => match upper.pg_cmp(point) {
+            Ordering::Greater => true,
+            Ordering::Equal => outer.upper_inc,
+            Ordering::Less => false,
+        },
+    };
+    above_lower && below_upper
+}
+
 /// A range argument, or `None` for NULL — and `42883` for a value that is not one.
-fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::DateRange>> {
+fn range_argument(value: Option<&Datum>) -> Result<Option<range::DateRange>> {
     match value {
         Some(Datum::Null) | None => Ok(None),
-        Some(Datum::Text(text)) => match crate::value::range::DateRange::from_text(text) {
+        Some(Datum::Text(text)) => match range::DateRange::from_text(text) {
             Some(range) => Ok(Some(range)),
             None => Err(SqlError::UndefinedOperator {
                 op: "&&",
@@ -1328,10 +1490,9 @@ fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::D
         },
         Some(other) => Err(SqlError::UndefinedOperator {
             op: "&&",
-            left: other.column_type().map_or_else(
-                || "unknown".to_owned(),
-                |ty| crate::value::PgType::name(ty).to_owned(),
-            ),
+            left: other
+                .column_type()
+                .map_or_else(|| "unknown".to_owned(), |ty| PgType::name(ty).to_owned()),
             right: "unknown".to_owned(),
         }),
     }
@@ -1348,10 +1509,9 @@ fn like_text(value: &Datum) -> Result<Option<String>> {
         Datum::Text(text) | Datum::Citext(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: "~~",
-            left: other.column_type().map_or_else(
-                || "unknown".to_owned(),
-                |ty| crate::value::PgType::name(ty).to_owned(),
-            ),
+            left: other
+                .column_type()
+                .map_or_else(|| "unknown".to_owned(), |ty| PgType::name(ty).to_owned()),
             right: "unknown".to_owned(),
         }),
     }
@@ -1368,10 +1528,9 @@ fn regex_text(value: &Datum, operator: &'static str) -> Result<Option<String>> {
         Datum::Text(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: operator,
-            left: other.column_type().map_or_else(
-                || "unknown".to_owned(),
-                |ty| crate::value::PgType::name(ty).to_owned(),
-            ),
+            left: other
+                .column_type()
+                .map_or_else(|| "unknown".to_owned(), |ty| PgType::name(ty).to_owned()),
             right: "unknown".to_owned(),
         }),
     }
@@ -1556,6 +1715,17 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         }
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
+            // **`lower` and `upper` are overloaded on a range**, which is how a real server spells
+            // them too: over a string they fold case, over a range they are the bounds. The
+            // subtype's value comes back, so `lower(ts_range)` is a `timestamp` — measured — and
+            // an absent bound and an empty range are both NULL.
+            Datum::Range { subtype, text } if !matches!(func, crate::plan::ScalarFunc::Abs) => {
+                let range = range::from_text(*subtype, &text)?;
+                match func {
+                    crate::plan::ScalarFunc::Lower => range.lower.unwrap_or(Datum::Null),
+                    _ => range.upper.unwrap_or(Datum::Null),
+                }
+            }
             // **A citext is binary-coercible to `text`**, so every text function takes one — and
             // the *result* is a `text`, not a citext: measured, `pg_typeof(lower('X'::citext))` is
             // `text`. The type survives a column, a cast and a comparison, and nothing else.
@@ -1571,9 +1741,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 return Err(SqlError::UndefinedFunctionTypes(format!(
                     "{}({})",
                     func.name(),
-                    other
-                        .column_type()
-                        .map_or("unknown", crate::value::PgType::name)
+                    other.column_type().map_or("unknown", PgType::name)
                 )));
             }
         },
@@ -1653,9 +1821,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                         // type nothing gives it.
                         return Err(SqlError::DatatypeMismatch(format!(
                             "argument of CASE/WHEN must be type boolean, not type {}",
-                            other
-                                .column_type()
-                                .map_or("unknown", crate::value::PgType::name)
+                            other.column_type().map_or("unknown", PgType::name)
                         )));
                     }
                 }
@@ -2039,7 +2205,7 @@ fn catalog_function(
         CatalogFunc::PgTypeof => Datum::Text(
             args.first()
                 .and_then(Datum::column_type)
-                .map_or("text", crate::value::PgType::name)
+                .map_or("text", PgType::name)
                 .to_owned(),
         ),
         // **Per call, and the corpus pins the consequence rather than a value**: two calls in one
@@ -2117,6 +2283,18 @@ fn catalog_function(
                 },
             },
         },
+        // **The inverse of `'x'::regtype`, and per row**, with the three answers `RegClassName`
+        // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
+        // every non-array row of `pg_type` holds in `typelem` — and the number back for an oid
+        // this node has no type for.
+        CatalogFunc::RegTypeName => match oid_argument(args.first())? {
+            None => Datum::Null,
+            Some(oid) => match u32::try_from(oid).ok().and_then(crate::value::type_by_oid) {
+                Some(ty) => Datum::Text(crate::value::Named::Scalar(ty).printed()),
+                None if oid == 0 => Datum::Text("-".to_owned()),
+                None => Datum::Text(oid.to_string()),
+            },
+        },
         // The one encoding this node speaks. Anything else is the empty string, which is what a
         // real server answers for a number that names no encoding.
         CatalogFunc::PgEncodingToChar => match oid_argument(args.first())? {
@@ -2187,6 +2365,11 @@ fn catalog_function(
                 _ => Datum::Null,
             }
         }
+        // `@>` again: an hstore's containment and a range's are one operator, told apart by what
+        // is on the left.
+        CatalogFunc::HstoreContains if matches!(args.first(), Some(Datum::Range { .. })) => {
+            range_value_function(CatalogFunc::RangeContains, &args)?
+        }
         CatalogFunc::HstoreFetch
         | CatalogFunc::HstoreHasKey
         | CatalogFunc::HstoreContains
@@ -2194,6 +2377,20 @@ fn catalog_function(
         | CatalogFunc::HstoreAkeys
         | CatalogFunc::HstoreAvals
         | CatalogFunc::HstoreBuild => hstore_function(call.func, &args)?,
+        CatalogFunc::RangeLowerInc
+        | CatalogFunc::RangeUpperInc
+        | CatalogFunc::RangeLowerInf
+        | CatalogFunc::RangeUpperInf
+        | CatalogFunc::RangeContains
+        | CatalogFunc::RangeBuild => range_value_function(call.func, &args)?,
+        // **`isempty` and `&&` are spelled the same for both range shapes**, so the operand
+        // decides: a stored range column is a `Datum::Range` and the `daterange(a, b)` expression
+        // is a `Datum::Text`. Dispatching on the value is the same rule `@>` follows.
+        CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps
+            if args.iter().any(|arg| matches!(arg, Datum::Range { .. })) =>
+        {
+            range_value_function(call.func, &args)?
+        }
         CatalogFunc::DateRange | CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => {
             range_function(call.func, &args)?
         }
@@ -2214,6 +2411,12 @@ fn catalog_function(
                 "{}() reached the row evaluator unresolved",
                 call.func.name()
             )));
+        }
+        // The same, one cast over: resolved in the same pass and for the same reason.
+        CatalogFunc::UserCast => {
+            return Err(SqlError::Internal(
+                "a cast to a user-defined type reached the row evaluator unresolved".to_owned(),
+            ));
         }
     })
 }
@@ -2253,6 +2456,8 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int8(oid)) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
+        // An `oid` is what a catalog column really holds; `23::oid::regtype` sends one.
+        Some(Datum::Oid(oid)) => Some(i64::from(*oid)),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "an oid is an integer, not {other:?}"
@@ -2373,9 +2578,7 @@ fn read_array(value: &Datum) -> Result<Option<crate::value::vector::Array>> {
             }),
         other => Err(SqlError::UndefinedFunctionTypes(format!(
             "array operator on {}",
-            other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name)
+            other.column_type().map_or("unknown", PgType::name)
         ))),
     }
 }

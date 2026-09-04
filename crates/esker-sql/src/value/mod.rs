@@ -74,6 +74,17 @@ const VARHDRSZ: i32 = 4;
 /// No typmod: the number a column declared without one carries.
 pub const NO_TYPMOD: i32 = -1;
 
+/// A range's binary wire form, which is its canonical text.
+fn binary_range(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| SqlError::ProtocolViolation("a binary range is not UTF-8".into()))?;
+    let subtype = range_subtype(ty);
+    Ok(Datum::Range {
+        subtype: Box::new(subtype),
+        text: range::from_text(subtype, text)?.to_text(),
+    })
+}
+
 /// The text-shaped types' binary wire form, which is the text itself.
 ///
 /// A citext keeps its spelling and answers a [`Datum::Citext`], because the folding is the
@@ -103,6 +114,21 @@ pub const HSTORE_ARRAY_OID: u32 = 16401;
 pub const CITEXT_OID: u32 = 16402;
 /// See [`CITEXT_OID`].
 pub const CITEXT_ARRAY_OID: u32 = 16403;
+/// The subtype a range column's bounds are, which the column type names.
+///
+/// `int4range`'s is `Int8` and not `Int4`, because a bare integer constant is an `int8` here — the
+/// standing constant-width trade, and the bound has to read as the type the literal makes.
+#[must_use]
+pub fn range_subtype(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::TstzRange => ColumnType::TimestampTz,
+        ColumnType::Int4Range => ColumnType::Int8,
+        _ => ColumnType::Timestamp,
+    }
+}
+
+/// `tsrange[]`'s oid — PostgreSQL's own `_tsrange`, which is built in and therefore fixed.
+pub const TSRANGE_ARRAY_OID: u32 = 3909;
 
 /// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
 ///
@@ -165,6 +191,22 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
         return Ok(value);
     }
     Ok(match (&value, ty) {
+        // **An array's typmod is its element's, applied element by element.** Every rule below
+        // is a rule about one value, and an array is a container: `'{1.245}'::numeric(10,2)[]`
+        // rounds the number inside it and a `character varying(3)[]` refuses the element that is
+        // too long, naming the *element's* type in the `22001` the way a real server does.
+        (Datum::Array(array), _) => {
+            let Some(element_type) = esker_keys::array::ArrayValue::element_of(ty) else {
+                return Ok(value);
+            };
+            let mut fitted = array.clone();
+            for element in &mut fitted.values {
+                if let Some(datum) = element.take() {
+                    *element = Some(fit_to_typmod(datum, element_type, typmod)?);
+                }
+            }
+            Datum::Array(fitted)
+        }
         // The declared scale is applied here rather than at the parse, which is what makes one
         // rule serve the cast, the assignment and the `INSERT`: `1.245::numeric(10,2)` and a
         // `1.245` written into a `numeric(10,2)` column are the same rounding.
@@ -232,6 +274,16 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         // aggregate carries no typmod.
         (ColumnType::Bpchar, NO_TYPMOD) => "bpchar".to_owned(),
         (_, NO_TYPMOD) => ty.name().to_owned(),
+        // **`character varying(255)[]`, not `character varying[](255)`.** The typmod is the
+        // element's and prints inside the element's name, with the brackets after the whole of
+        // it — which is what `ActiveRecord`'s schema dumper reads back to write
+        // `t.string "tags", limit: 255, array: true`.
+        _ if esker_keys::array::ArrayValue::element_of(ty).is_some() => {
+            match esker_keys::array::ArrayValue::element_of(ty) {
+                Some(element) => format!("{}[]", format_type(element, typmod)),
+                None => ty.name().to_owned(),
+            }
+        }
         (ColumnType::Varchar | ColumnType::Bpchar, _) => match length_of_typmod(typmod) {
             Some(length) => format!("{}({length})", ty.name()),
             None => ty.name().to_owned(),
@@ -363,13 +415,23 @@ pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
 /// `CREATE TABLE t (v varchar(0))` does.
 pub const MAX_TYPE_LENGTH: u32 = 10_485_760;
 
+/// The type an OID names: the inverse of `'x'::regtype`, for an oid read per row.
+///
+/// A scan of `ColumnType::ALL` rather than a table beside it, for the same reason `pg_type`'s rows
+/// are derived from that list — a type added to this node cannot be left out of the answer.
+#[must_use]
+pub fn type_by_oid(oid: u32) -> Option<ColumnType> {
+    ColumnType::ALL.into_iter().find(|ty| ty.oid() == oid)
+}
+
 /// A type name, which may name an **array** of a type this node has.
 ///
-/// Arrays are not storable here — there is no `ColumnType` for one — but their *names* resolve,
-/// because `ActiveRecord` asks `pg_type` for them and statement 766 of `schema.rb` stops on
-/// `'decimal[]'::regtype`. Resolving the name is not claiming the type: nothing can create a
-/// column of one, and `Named::Array` exists only so that the two things a `regtype` answers —
-/// the OID and the printed name — can be produced for it.
+/// **Every array is storable now** — each of them is a `ColumnType`, because a `typarray` naming a
+/// `pg_type` row that is not there is what left `ActiveRecord` unable to quote an array at all. So
+/// `Named::Array(ty)` and `Named::Scalar(array_of(ty))` are two spellings of one type, and the
+/// variant is kept because a *name* can be written either way: `'decimal[]'::regtype` and
+/// `'_numeric'::regtype` reach it from opposite directions, and `numeric[][]` and `numeric[3]` are
+/// both `numeric[]` — the dimensions in a name are not part of the type on a real server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Named {
     /// The type itself.
@@ -433,7 +495,12 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => 0,
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+        // No array of a `tstzrange` or an `int4range` here: `range_test.rb` declares only
+        // `tsrange[]`, and a `typarray` of 0 is what a real server holds for a type with none.
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range => 0,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -462,6 +529,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // `0` would be a wrong answer there. `CITEXT_ARRAY_OID` is reserved and reported, and the
         // array type itself is not built.
         ColumnType::Citext => CITEXT_ARRAY_OID,
+        ColumnType::TsRange => TSRANGE_ARRAY_OID,
         ColumnType::Jsonb => 3807,
     }
 }
@@ -516,6 +584,11 @@ fn resolve_type_name(name: &str) -> Option<ColumnType> {
 /// An exhaustive match rather than a `matches!` list, so that a type added to `ColumnType` has to
 /// answer this question instead of silently inheriting "no".
 fn takes_typmod(ty: ColumnType) -> bool {
+    // **An array takes exactly its element's typmod**, because that is whose it is:
+    // `character varying(255)[]` bounds each string and `numeric(10,2)[]` rounds each number.
+    if let Some(element) = esker_keys::array::ArrayValue::element_of(ty) {
+        return takes_typmod(element);
+    }
     match ty {
         ColumnType::Varchar
         | ColumnType::Bpchar
@@ -541,9 +614,8 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Uuid
         | ColumnType::Oid
         | ColumnType::Date
-        // `numeric(10,2)[]` is a real declaration on a real server and this node does not read
-        // one; the array types take no typmod here, and a declaration that carries one is
-        // refused where it is parsed rather than silently dropped.
+        // Unreachable: every array type is answered above, from its element's answer. Kept as
+        // arms rather than a `_` so that the next type added here has to answer the question.
         | ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -552,7 +624,11 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
         | ColumnType::Hstore
         | ColumnType::HstoreArray
-        | ColumnType::Citext => false,
+        | ColumnType::Citext
+        | ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
 }
 
@@ -655,6 +731,11 @@ impl PgType for ColumnType {
             ColumnType::Jsonb => 3802,
             ColumnType::Hstore => HSTORE_OID,
             ColumnType::Citext => CITEXT_OID,
+            // PostgreSQL's own, and fixed: unlike an extension's, a range type is built in.
+            ColumnType::TsRange => 3908,
+            ColumnType::TstzRange => 3910,
+            ColumnType::Int4Range => 3904,
+            ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
@@ -671,7 +752,23 @@ impl PgType for ColumnType {
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
-            | ColumnType::TextArray => 0,
+            | ColumnType::TextArray
+            | ColumnType::BoolArray
+            | ColumnType::ByteaArray
+            | ColumnType::BpcharArray
+            | ColumnType::VarcharArray
+            | ColumnType::DateArray
+            | ColumnType::TimeArray
+            | ColumnType::TimestampArray
+            | ColumnType::TimestampTzArray
+            | ColumnType::IntervalArray
+            | ColumnType::RealArray
+            | ColumnType::DoubleArray
+            | ColumnType::UuidArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::OidArray
+            | ColumnType::CitextArray => 0,
         }
     }
 
@@ -687,6 +784,26 @@ impl PgType for ColumnType {
             ColumnType::TextArray => "text[]",
             ColumnType::Hstore => "hstore",
             ColumnType::Citext => "citext",
+            ColumnType::TsRange => "tsrange",
+            ColumnType::TstzRange => "tstzrange",
+            ColumnType::Int4Range => "int4range",
+            ColumnType::TsRangeArray => "tsrange[]",
+            ColumnType::BoolArray => "boolean[]",
+            ColumnType::ByteaArray => "bytea[]",
+            ColumnType::BpcharArray => "character[]",
+            ColumnType::VarcharArray => "character varying[]",
+            ColumnType::DateArray => "date[]",
+            ColumnType::TimeArray => "time without time zone[]",
+            ColumnType::TimestampArray => "timestamp without time zone[]",
+            ColumnType::TimestampTzArray => "timestamp with time zone[]",
+            ColumnType::IntervalArray => "interval[]",
+            ColumnType::RealArray => "real[]",
+            ColumnType::DoubleArray => "double precision[]",
+            ColumnType::UuidArray => "uuid[]",
+            ColumnType::JsonArray => "json[]",
+            ColumnType::JsonbArray => "jsonb[]",
+            ColumnType::OidArray => "oid[]",
+            ColumnType::CitextArray => "citext[]",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
@@ -730,6 +847,10 @@ impl PgType for ColumnType {
             ColumnType::Hstore
             | ColumnType::HstoreArray
             | ColumnType::Citext
+            | ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -813,7 +934,9 @@ impl PgDatum for Datum {
             Datum::Int2(v) => v.to_string(),
             // **As written**: what a client is sent is the spelling that was stored, never the
             // folded form the key holds.
-            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => v.clone(),
+            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+                v.clone()
+            }
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
             Datum::Bool(v) => (if *v { "t" } else { "f" }).to_string(),
@@ -858,7 +981,24 @@ impl PgDatum for Datum {
             | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray
-            | ColumnType::HstoreArray => {
+            | ColumnType::HstoreArray
+            | ColumnType::TsRangeArray
+            | ColumnType::BoolArray
+            | ColumnType::ByteaArray
+            | ColumnType::BpcharArray
+            | ColumnType::VarcharArray
+            | ColumnType::DateArray
+            | ColumnType::TimeArray
+            | ColumnType::TimestampArray
+            | ColumnType::TimestampTzArray
+            | ColumnType::IntervalArray
+            | ColumnType::RealArray
+            | ColumnType::DoubleArray
+            | ColumnType::UuidArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::OidArray
+            | ColumnType::CitextArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -882,6 +1022,15 @@ impl PgDatum for Datum {
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
             // **As written.** The folding is the comparison's, so nothing here touches the case.
             ColumnType::Citext => Datum::Citext(text.to_owned()),
+            // Parsed and rendered back **canonical**, which is what makes equality and grouping the
+            // text's — the same road `hstore` and `jsonb` take.
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+                let subtype = range_subtype(ty);
+                Datum::Range {
+                    subtype: Box::new(subtype),
+                    text: range::from_text(subtype, text)?.to_text(),
+                }
+            }
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
@@ -947,11 +1096,19 @@ impl PgDatum for Datum {
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
             Datum::Real(v) => v.to_be_bytes().to_vec(),
-            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => v.as_bytes().to_vec(),
+            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+                v.as_bytes().to_vec()
+            }
             Datum::Bytea(v) => v.clone(),
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per type in the wire vocabulary, and the array half is a list of names \
+                  rather than of rules: every one of them refuses, because `array_recv`'s shape \
+                  has never been read here"
+    )]
     fn from_binary(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
         let fixed = |width: usize| {
             (bytes.len() == width).then_some(bytes).ok_or_else(|| {
@@ -970,7 +1127,24 @@ impl PgDatum for Datum {
             | ColumnType::Int2Array
             | ColumnType::NumericArray
             | ColumnType::TextArray
-            | ColumnType::HstoreArray => {
+            | ColumnType::HstoreArray
+            | ColumnType::TsRangeArray
+            | ColumnType::BoolArray
+            | ColumnType::ByteaArray
+            | ColumnType::BpcharArray
+            | ColumnType::VarcharArray
+            | ColumnType::DateArray
+            | ColumnType::TimeArray
+            | ColumnType::TimestampArray
+            | ColumnType::TimestampTzArray
+            | ColumnType::IntervalArray
+            | ColumnType::RealArray
+            | ColumnType::DoubleArray
+            | ColumnType::UuidArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::OidArray
+            | ColumnType::CitextArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -1044,11 +1218,16 @@ impl PgDatum for Datum {
             // it is refused rather than guessed. The text path is what a client actually uses.
             // An hstore arrives as its own text and is canonicalised on the way in, exactly as
             // it is from the text format — the wire carries the printed form either way.
-            ColumnType::Hstore => Datum::Text(hstore::to_text(&hstore::from_text(
+            ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(
                 std::str::from_utf8(bytes).map_err(|_| {
                     SqlError::ProtocolViolation("a binary hstore is not UTF-8".into())
                 })?,
             )?)),
+            // The wire carries the printed form either way, so this is `from_text`'s road with the
+            // bytes read first.
+            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+                binary_range(ty, bytes)?
+            }
             ColumnType::Json | ColumnType::Jsonb => {
                 return Err(SqlError::unsupported(
                     "a json or jsonb parameter in the binary format",
@@ -1202,6 +1381,19 @@ impl PgDatum for Datum {
             (Datum::Text(a), Datum::Text(b)) | (Datum::Hstore(a), Datum::Hstore(b)) => {
                 a.as_bytes().cmp(b.as_bytes())
             }
+            // **A range compares by its canonical text**, which is right because the text *is*
+            // canonical: two ranges print the same exactly when they are the same range. Without
+            // this arm the match falls through to the cross-type rank below, which says every
+            // range equals every other — `count(DISTINCT ts_range)` answered 1 where a real
+            // server says 5, and only a corpus row could see it. The same trap citext's
+            // `PartialEq` fell into; a pair-exhaustive match has no compiler to remind it.
+            //
+            // It is **not** PostgreSQL's range ordering, which compares the lower bound, then its
+            // inclusivity, then the upper — declared, and the reason a range is not an index key.
+            (
+                Datum::Range { text: a, .. },
+                Datum::Range { text: b, .. },
+            ) => a.as_bytes().cmp(b.as_bytes()),
             // **A citext compares folded**, which is the whole type: `'ABC' = 'abc'` is true, two
             // rows differing only in case are one group and one `DISTINCT`, and a unique index
             // over the column refuses the second. It is the *comparison* that folds and never the
@@ -1281,6 +1473,8 @@ fn variant_rank(value: &Datum) -> u8 {
         // than to describe an operator a real server has.
         Datum::Time(_) => 8,
         Datum::Text(_) | Datum::Citext(_) | Datum::Hstore(_) => 4,
+        // Its own rank in the cross-type total order, above every scalar's text.
+        Datum::Range { .. } => 21,
         Datum::Bytea(_) => 5,
         Datum::Null => 6,
     }
@@ -1520,6 +1714,10 @@ mod tests {
         assert_eq!(ColumnType::Hstore.oid(), 16400);
         assert_eq!(ColumnType::HstoreArray.oid(), 16401);
         assert_eq!(ColumnType::Citext.oid(), 16402);
+        // The range types are PostgreSQL's own and fixed, unlike an extension's.
+        assert_eq!(ColumnType::TsRange.oid(), 3908);
+        assert_eq!(ColumnType::TstzRange.oid(), 3910);
+        assert_eq!(ColumnType::Int4Range.oid(), 3904);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
@@ -1533,6 +1731,10 @@ mod tests {
                         | ColumnType::Hstore
                         | ColumnType::HstoreArray
                         | ColumnType::Citext
+                        | ColumnType::TsRange
+                        | ColumnType::TstzRange
+                        | ColumnType::Int4Range
+                        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

@@ -392,6 +392,22 @@ pub enum SqlError {
         value: String,
     },
 
+    /// A range literal the range input function refuses: `22P02`, with the DETAIL naming what it
+    /// found. Measured — `'nonsense'::tsrange` is
+    /// `malformed range literal: "nonsense" DETAIL: Missing left parenthesis or bracket.`
+    #[error("malformed range literal: \"{value}\"")]
+    MalformedRangeLiteral {
+        /// The literal, quoted back.
+        value: String,
+        /// `Missing left parenthesis or bracket.` and the two others.
+        detail: &'static str,
+    },
+
+    /// A range whose lower bound is above its upper: **`22000`**, a data exception, not the
+    /// `22P02` a malformed literal gets — the text parsed and the value is impossible.
+    #[error("range lower bound must be less than or equal to range upper bound")]
+    RangeBoundsOutOfOrder,
+
     /// An `hstore` literal the extension's own input function refuses.
     ///
     /// **`42601`, a syntax error**, and not the `22P02` every other bad literal in this crate
@@ -2047,7 +2063,9 @@ impl SqlError {
             SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
-            SqlError::InvalidTextRepresentation { .. }
+            SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
+            SqlError::MalformedRangeLiteral { .. }
+            | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {
                 sqlstate::INVALID_TEXT_REPRESENTATION
@@ -2222,6 +2240,9 @@ impl SqlError {
     /// It is the part of a `23505` a user actually reads — the constraint name says *which* rule
     /// was broken and the detail says *what broke it*.
     #[must_use]
+    // One arm per condition that has a detail, the same table `sqlstate` is and for the same
+    // reason: the sentence a client reads sits beside the variant it belongs to.
+    #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
             SqlError::CreateInSystemSchema(_) => {
@@ -2257,6 +2278,7 @@ impl SqlError {
             } => Some(format!(
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
+            SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
             SqlError::DependentType { detail, .. }
             | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }

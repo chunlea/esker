@@ -15,7 +15,15 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    // **`pg_typeof` answers a `regtype` on a real server and `text` here** — the same trade
+    // `'x'::regtype` makes, and the values are the four type names either way. These two lines are
+    // the *evidence* for the rule the statements around them test: each constructor over
+    // `unknown`s is `text`, and the `ARRAY[]` one is `text[]`.
+    types: &[
+        "SELECT 'r', pg_typeof((SELECT '1')), pg_typeof(CASE WHEN true THEN '1' ELSE '2' END)",
+        "SELECT 'r', pg_typeof(COALESCE('1','2')), pg_typeof(ARRAY['1','2']), \
+         pg_typeof(COALESCE(NULL, NULL))",
+    ],
     answers: &[],
 };
 

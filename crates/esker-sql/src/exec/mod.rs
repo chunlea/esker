@@ -1546,6 +1546,7 @@ impl Executor {
         self.resolve_current_setting(&mut statement)?;
         self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
+        self.resolve_user_cast(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
     }
@@ -1900,6 +1901,149 @@ impl Executor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// `'happy'::mood` — the label in a projection, the ordinal everywhere else.
+    ///
+    /// Resolved here rather than per row for the reason `::regclass` is: the catalog answer is the
+    /// same for every row, and reading it per row is the cost trap `08ff6a2` paid for once. What
+    /// it is replaced *with* depends on where it sits, which is not a special case but what an
+    /// enum is — a number that prints as a label
+    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    ///
+    /// **The projection is walked first**, because the general walk below rewrites every cast it
+    /// finds and would leave nothing to tell the two positions apart.
+    fn resolve_user_cast(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::Expr;
+
+        let mut failure = None;
+        // One catalog read for the whole statement, whatever it names.
+        let mut types = None;
+        if let Statement::Select(select) = statement {
+            for item in &mut select.projection {
+                let crate::plan::SelectItem::Expr { expr, .. } = item else {
+                    continue;
+                };
+                match self.user_cast(&mut types, txn, expr, true) {
+                    Ok(Some(resolved)) => *expr = resolved,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        let mut resolve = |expr: &mut Expr| match self.user_cast(&mut types, txn, expr, false) {
+            Ok(Some(resolved)) => *expr = resolved,
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
+    fn user_cast(
+        &self,
+        types: &mut Option<Vec<crate::catalog::TypeDef>>,
+        txn: &dyn Txn,
+        expr: &crate::plan::Expr,
+        printed: bool,
+    ) -> Result<Option<crate::plan::Expr>> {
+        use crate::plan::{Expr, Literal};
+
+        // **`'happy'::mood::text` is `happy`, not `3`.** A cast to `text` is the operand's output
+        // function, and an enum's output function is its label — the same rule
+        // `Expr::ToText::enum_labels` follows for a column. Answered here because the operand is
+        // already known to be a cast whose printed form is the label.
+        if let Expr::ToText { operand, .. } = expr
+            && matches!(&**operand, Expr::CatalogFunc(inner)
+                if inner.func == crate::plan::CatalogFunc::UserCast)
+        {
+            return self.user_cast(types, txn, operand, true);
+        }
+        let Expr::CatalogFunc(call) = expr else {
+            return Ok(None);
+        };
+        // **`pg_typeof('happy'::mood)` is `mood`**, and it is answered here because here is where
+        // the name is: the value below is an `int2` and `smallint` is the one thing a client must
+        // not be told about an enum (ADR 0031's worst class). The cast under it is still resolved
+        // first, so `pg_typeof('angry'::mood)` is the `22P02` the argument would have raised.
+        if call.func == crate::plan::CatalogFunc::PgTypeof
+            && let Some(inner) = call.args.first()
+            && matches!(inner, Expr::CatalogFunc(inner) if inner.func == crate::plan::CatalogFunc::UserCast)
+        {
+            let Expr::CatalogFunc(inner) = inner else {
+                return Ok(None);
+            };
+            let Some(Expr::Literal(Literal::String(name))) = inner.args.first().cloned() else {
+                return Ok(None);
+            };
+            self.user_cast(types, txn, &call.args[0].clone(), true)?;
+            return Ok(Some(Expr::Literal(Literal::String(name))));
+        }
+        if call.func != crate::plan::CatalogFunc::UserCast {
+            return Ok(None);
+        }
+        let (Some(Expr::Literal(Literal::String(name))), Some(operand)) =
+            (call.args.first(), call.args.get(1))
+        else {
+            return Err(SqlError::Internal(
+                "a cast to a user-defined type without its name".to_owned(),
+            ));
+        };
+        let known = match types {
+            Some(known) => known,
+            None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
+        };
+        let Some(def) = known.iter().find(|def| &def.name == name) else {
+            // **Not a type anybody declared**, which is where lowering's own refusal has been
+            // waiting for a catalog to confirm it: the same `0A000` naming the type that
+            // `lower_type` gave before this pass existed, and the same one a column of it gets.
+            return Err(SqlError::unsupported(format!("the type {name}")));
+        };
+        let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+            return Err(SqlError::unsupported(format!(
+                "a cast to the {} type {name}",
+                match def.kind {
+                    crate::catalog::TypeKind::Range { .. } => "range",
+                    _ => "composite",
+                }
+            )));
+        };
+        // **Only a literal.** A cast of a *column* to an enum happens per row and would need the
+        // labels in the row evaluator; nothing the suite sends writes one, and a `0A000` naming
+        // the type is the honest answer rather than a value read some other way.
+        let text = match operand {
+            Expr::Literal(Literal::String(text)) => text.clone(),
+            Expr::Literal(Literal::Typed(value)) => match &**value {
+                Datum::Text(text) => text.clone(),
+                _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+            },
+            // Nothing is still nothing, whatever type it is cast to.
+            Expr::Literal(Literal::Null | Literal::TypedNull(_)) => {
+                return Ok(Some(Expr::Literal(Literal::Null)));
+            }
+            _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+        };
+        let Some(ordinal) = crate::catalog::enum_ordinal(labels, &text) else {
+            return Err(SqlError::InvalidEnumValue {
+                ty: name.clone(),
+                value: text,
+            });
+        };
+        Ok(Some(if printed {
+            // Its output function, which is the label — and the label is what the text already
+            // is, now that the ordinal above has proved the type has it.
+            Expr::Literal(Literal::String(text))
+        } else {
+            Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal))))
+        }))
     }
 
     fn resolve_regclass(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {

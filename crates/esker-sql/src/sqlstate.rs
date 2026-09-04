@@ -70,6 +70,13 @@ pub const DIVISION_BY_ZERO: &str = "22012";
 /// this is *not* `22P02`: the datetime types have their own condition, and a client that branches
 /// on the code would see the difference.
 pub const INVALID_DATETIME_FORMAT: &str = "22007";
+
+/// A value that is impossible rather than unreadable — the class's own catch-all.
+///
+/// **A range whose lower bound is above its upper is this and not `22P02`**: the literal parsed
+/// perfectly and what it describes cannot exist. Measured; a client branching on the code learns
+/// the difference between a typo and an impossible interval.
+pub const DATA_EXCEPTION: &str = "22000";
 /// A cast between two types that have none. Not a *failed* cast — that is the value's own error —
 /// but a pair for which no cast exists at all, which PostgreSQL decides before it reads a value.
 pub const CANNOT_COERCE: &str = "42846";

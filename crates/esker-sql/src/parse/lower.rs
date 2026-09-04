@@ -3040,10 +3040,22 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                         args: vec![lower_expr(left)?, lower_expr(right)?],
                     })));
                 }
+                // **`@>` is spelled the same for an hstore and a range**, so it lowers to one
+                // call and the evaluator dispatches on the operands — the rule the `||` regression
+                // taught: an operator this crate carries for one type must not answer for
+                // another's, and the only place that can be decided is where the values are.
                 BinaryOperator::AtArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreContains,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                // `b <@ a` is `a @> b` with the arguments the other way round, so there is one
+                // containment rule and not two.
+                BinaryOperator::ArrowAt => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::RangeContains,
+                        args: vec![lower_expr(right)?, lower_expr(left)?],
                     })));
                 }
                 BinaryOperator::StringConcat => {
@@ -3870,21 +3882,22 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
     let mut texts: Vec<Option<String>> = Vec::with_capacity(elements.len());
     let mut element = None;
     for expr in elements {
-        // **An `'…'::hstore` element is a constant too.** `hstore_test.rb` writes
-        // `t.hstore "payload", array: true` and then `ARRAY['"AA"=>"BB"'::hstore, …]`, which is a
-        // cast of a string constant and folds here exactly as the string would — narrowed to
-        // hstore rather than to every type, because a cast to any other one is a declared
-        // divergence and widening it would move answers this unit did not measure.
+        // **A cast of a string constant is a constant too, whatever it casts to.** A cast is how
+        // an element type is written down at all — `ARRAY['2010-01-01'::date]` is a `date[]` and
+        // `ARRAY['2010-01-01']` is a `text[]` — and the type the cast names *is* the array's, so
+        // this arm both folds the value and settles the element type. It was two named types
+        // while only `hstore` and `tsrange` had been measured this way; every one of them is
+        // measured now, from `ARRAY['{"a":1}'::jsonb]` to `ARRAY['ABC'::citext]`.
         if let Expr::Cast {
             expr: inner,
             data_type,
             ..
         } = strip_nesting(expr)
-            && matches!(lower_type(data_type), Ok((ColumnType::Hstore, _)))
+            && let Ok((cast_to, NO_TYPMOD)) = lower_type(data_type)
             && let Expr::Value(value) = strip_nesting(inner)
             && let Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) = &value.value
         {
-            element = Some(ColumnType::Hstore);
+            element = Some(cast_to);
             texts.push(Some(text.clone()));
             continue;
         }
@@ -3904,6 +3917,13 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
                 (Some(text.clone()), Some(ColumnType::Text))
             }
+            // **`ARRAY[true,false]` is a `boolean[]`**, and the keyword is the value: a boolean
+            // literal is not an `unknown` string that happens to read as one, which is why it
+            // does not widen to `text` beside a string the way a number does not either.
+            Value::Boolean(value) => (
+                Some(if *value { "true" } else { "false" }.to_owned()),
+                Some(ColumnType::Bool),
+            ),
             other => {
                 return Err(SqlError::unsupported(format!(
                     "an ARRAY constructor holding {other}"
@@ -3951,13 +3971,57 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
 /// `IN` list before the planner sees it, and a `Datum` is never an array. That is the split ADR
 /// 0033's roadmap describes — expression-level arrays now, stored arrays with the tier-2 unit that
 /// needs a column of them.
+/// An `ARRAY[…]` on the right of `= ANY`, as a list of elements **typed by the constructor**.
+///
+/// `lower_array_constructor` folds the whole thing to one array value; this takes that value apart
+/// again, which is what the `IN`-list shape needs. Going through it rather than lowering each
+/// element on its own is the point: the constructor is where the common type is chosen, and a list
+/// of `unknown`s would take the column's type instead and answer where a real server raises.
+fn lower_array_constructor_elements(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
+    let Expr::Array(array) = expr else {
+        return Ok(None);
+    };
+    // **`ARRAY[]` has no elements to take a type from**, and on this side of `= ANY` it needs
+    // none: an empty list matches nothing, which is what `'x' = ANY(ARRAY[]::text[])` is `f` for.
+    // Asking the constructor would be `42P18 cannot determine type of empty array`, which is the
+    // right answer where the array is a *value* and the wrong one here.
+    if array.elem.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let plan::Expr::Literal(plan::Literal::Typed(value)) = lower_array_constructor(&array.elem)?
+    else {
+        return Ok(None);
+    };
+    let Datum::Array(array) = *value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        array
+            .values
+            .into_iter()
+            .map(|element| {
+                plan::Expr::Literal(match element {
+                    Some(value) => plan::Literal::Typed(Box::new(value)),
+                    None => plan::Literal::Null,
+                })
+            })
+            .collect(),
+    ))
+}
+
 fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
     Ok(Some(match expr {
-        Expr::Array(array) => array
-            .elem
-            .iter()
-            .map(lower_expr)
-            .collect::<Result<Vec<_>>>()?,
+        // **A constructor settles its elements' type, and a bare list does not.** `id IN ('1','2')`
+        // works on a real server because each literal is `unknown` and takes the column's type;
+        // `id = ANY(ARRAY['1','2'])` is `42883 operator does not exist: bigint = text`, because
+        // `ARRAY['1','2']` is a `text[]` **value** — `pg_typeof` says so — and the coercion does
+        // not reach into one. Lowering the constructor is what settles them: it reads each element
+        // at the array's own element type, so what comes out is typed rather than `unknown`, and
+        // the comparison then refuses exactly where a real server does.
+        Expr::Array(_) => match lower_array_constructor_elements(expr)? {
+            Some(elements) => elements,
+            None => return Ok(None),
+        },
         Expr::Nested(inner) => return lower_array(inner),
         // **`current_schemas(…)` is no longer a list this lowering can see.** Its value is the
         // session's `search_path`, which arrives at `crate::exec::Executor::bound`, so it stays an
@@ -4265,24 +4329,6 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     Ok(None)
 }
 
-/// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
-///
-/// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
-/// at rung 2 for three scoreboard runs: `Quoting#lookup_cast_type` sends
-/// `SELECT 'integer'::regtype::oid` once per column type, and `pg_type` here already held the
-/// answer — what was missing was only the cast that asks it.
-///
-/// # Why the nested shape is matched rather than composed
-///
-/// A `regtype` is a real type on a real server, four bytes holding an OID that *print* as the
-/// type's name; `::oid` from one is then a free coercion. This node has no `regtype`, so
-/// `'x'::regtype` lowers to the **name**, as text — which makes `SELECT 'int4'::regtype` answer
-/// `integer`, exactly right, and leaves only `RowDescription`'s OID differing (`text` where a real
-/// server says `regtype`). It also means a composed `::oid` would be a text-to-oid cast, which a
-/// real server refuses: `'integer'::oid` is `22P02`, and this node answers that too.
-///
-/// So the pair is recognised together. That is not a shortcut around a missing type — it is the
-/// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
 /// `'x'::regclass::text` — **the relation's name**, not the digits its oid prints as.
 ///
 /// A `regclass` on a real server is an oid whose *output function* is the name, so the text of one
@@ -4317,6 +4363,29 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
     ))))
 }
 
+/// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
+///
+/// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
+/// at rung 2 for three scoreboard runs: `Quoting#lookup_cast_type` sends
+/// `SELECT 'integer'::regtype::oid` once per column type, and `pg_type` here already held the
+/// answer — what was missing was only the cast that asks it.
+///
+/// # Why the nested shape is matched rather than composed
+///
+/// A `regtype` is a real type on a real server, four bytes holding an OID that *print* as the
+/// type's name; `::oid` from one is then a free coercion. This node has no `regtype`, so
+/// `'x'::regtype` lowers to the **name**, as text — which makes `SELECT 'int4'::regtype` answer
+/// `integer`, exactly right, and leaves only `RowDescription`'s OID differing (`text` where a real
+/// server says `regtype`). It also means a composed `::oid` would be a text-to-oid cast, which a
+/// real server refuses: `'integer'::oid` is `22P02`, and this node answers that too.
+///
+/// So the pair is recognised together. That is not a shortcut around a missing type — it is the
+/// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per cast shape, and each arm is a measured answer; splitting it would \
+              hide which shapes are folded at plan time and which are not"
+)]
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
     // what the cast carries is the type, and everything downstream resolves against it — a
@@ -4339,6 +4408,29 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         return Ok(printed);
     }
     let Some(target) = cast_target(data_type) else {
+        // **A cast to a name the catalog might know**, and it is asked *after* `cast_target`,
+        // because `regclass`, `regtype` and `oid` are `DataType::Custom` too — every one of them
+        // is a name `sqlparser` has no type for. `lower_type` refuses what is left because this
+        // node's own type table does not have it, which is the right answer for a typo and the
+        // wrong one for a type somebody declared: the same place `CREATE TABLE t (c mood)` was
+        // before `lower_column_type` learned to carry the name. Carried here too and resolved once
+        // per statement (ADR 0053); the operand goes with it, because the label is what is looked
+        // up.
+        if lower_type(data_type).is_err()
+            && let DataType::Custom(name, modifiers) = data_type
+            && modifiers.is_empty()
+            && name.0.len() == 1
+            && !is_serial_spelling(data_type)
+            && let Some(part) = name.0.first().and_then(|part| part.as_ident())
+        {
+            return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::UserCast,
+                args: vec![
+                    plan::Expr::Literal(plan::Literal::String(ident(part))),
+                    lower_expr(expr)?,
+                ],
+            })));
+        }
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it
         // reads the operand with that type's input function, exactly as assigning it to a column
         // of that type would. Only a literal, and only a chain of them — `'{"a":1}'::json::jsonb`
@@ -4444,6 +4536,15 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             func: plan::CatalogFunc::RegClassName,
             args: vec![lower_expr(expr)?],
         }))),
+        // **The inverse, and per row**: an oid rather than a name. `t.typelem::regtype` is how
+        // `ActiveRecord` reads what an array type is over, and its operand is a catalog column.
+        // `23::regtype` is `integer` on a real server too, so a number goes this way as well.
+        (CastTarget::RegType, _) if !is_string_literal(expr) => {
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegTypeName,
+                args: vec![lower_expr(expr)?],
+            })))
+        }
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
@@ -5906,6 +6007,16 @@ fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<St
 /// Whether a custom type name is one of the `serial` spellings, which are integers plus a sequence
 /// and never a user-defined type — a table with a column called `serial` would otherwise resolve
 /// against the catalog and get a worse error than the one [`lower_type`] already gives it.
+/// The range column type one of PostgreSQL's built-in range names spells, or `None`.
+fn range_type_name(name: &str) -> Option<ColumnType> {
+    match name.to_ascii_lowercase().as_str() {
+        "tsrange" => Some(ColumnType::TsRange),
+        "tstzrange" => Some(ColumnType::TstzRange),
+        "int4range" => Some(ColumnType::Int4Range),
+        _ => None,
+    }
+}
+
 fn is_serial_spelling(data_type: &DataType) -> bool {
     serial_identity(data_type).is_some()
 }
@@ -5913,21 +6024,19 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     match data_type {
-        // **`int8[]` is a column type**, over one of the four element types this node has an
-        // array of. The element's own declaration is read first, so `numeric(10,2)[]` is refused
-        // by naming the typmod rather than by silently dropping it — an array takes none here.
+        // **`int8[]` is a column type**, over every element type this node has. The element's own
+        // declaration is read first and **its typmod is the array's**: `character varying(255)[]`
+        // and `numeric(10,2)[]` are real declarations that `ActiveRecord` writes, the length
+        // belongs to the element, and `format_type` prints it back inside the element's name.
         DataType::Array(inner) => {
             let Some(element) = array_element(inner) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
-            if typmod != NO_TYPMOD {
-                return Err(SqlError::unsupported(format!("the type {data_type}")));
-            }
             let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
-            plain(array)
+            Ok((array, typmod))
         }
         // The three that take a number. Each is checked against PostgreSQL's own limit, because a
         // length this node accepted and a real server refused would be a table that exists here
@@ -6103,6 +6212,17 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("citext") =>
         {
             ColumnType::Citext
+        }
+        // The range types, which `sqlparser` also has no variant for. Built in on a real server
+        // rather than an extension's, so they need no `CREATE EXTENSION` in front of them.
+        //
+        // **Matched by name and not by a guard on `Custom` alone**: a catch-all here swallows
+        // `serial`, whose arm is below, and turns every `id serial primary key` into
+        // `0A000 the type serial is not supported`.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty() && range_type_name(&name.to_string()).is_some() =>
+        {
+            range_type_name(&name.to_string()).unwrap_or(ColumnType::TsRange)
         }
         // `bigserial` and `serial` are `bigint`/`integer` plus a sequence, and `sqlparser` 0.62
         // has no variant for either -- both arrive as a custom type name. `smallserial` arrives

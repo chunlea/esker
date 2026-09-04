@@ -2142,10 +2142,33 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // have no type of their own here — they are text in the catalog — so what gives them one
         // is the operand, at evaluation, exactly as the plan-time form types its list against the
         // operand it is compared with.
-        Expr::AnyArray { operand, array } => Expr::AnyArray {
-            operand: Box::new(resolve(operand, scope)?),
-            array: Box::new(resolve(array, scope)?),
-        },
+        Expr::AnyArray { operand, array } => {
+            let operand = resolve(operand, scope)?;
+            let array = resolve(array, scope)?;
+            // **An array that knows its element type is not `unknown`.** `'{1,2}'` is an unknown
+            // literal and takes the operand's type at evaluation, which is the arm below; an
+            // `ARRAY['1','2']` is a `text[]` **value** — `pg_typeof` says so on a real server —
+            // and `id = ANY(...)` of one is `42883 operator does not exist: bigint = text`,
+            // naming the *element* type. Without this the evaluator read each element at the
+            // operand's type and answered a row, which is a wrong row set rather than a wrong
+            // error.
+            if let Some(element) = expr_type(&array, scope)
+                .ok()
+                .and_then(esker_keys::array::ArrayValue::element_of)
+                && let Ok(left) = expr_type(&operand, scope)
+                && !same_family(left, element)
+            {
+                return Err(SqlError::UndefinedOperator {
+                    left: left.name().to_owned(),
+                    op: "=",
+                    right: element.name().to_owned(),
+                });
+            }
+            Expr::AnyArray {
+                operand: Box::new(operand),
+                array: Box::new(array),
+            }
+        }
         // **The element type comes from the array where the array knows it.** An array is text
         // here and its elements normally take their type from what they are compared against
         // (`retype_subscript`) — but that rule needs the comparison to be *in the same statement*,
@@ -2545,6 +2568,32 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Hstore => 27,
             // Its own family: a citext compares only with a citext and with an `unknown`.
             ColumnType::Citext => 28,
+            // A family each: a range compares only with a range of the same subtype.
+            ColumnType::TsRange => 29,
+            ColumnType::TstzRange => 30,
+            ColumnType::Int4Range => 31,
+            ColumnType::TsRangeArray => 32,
+            // **Measured, one pairing at a time**: `text[] = varchar[]`, `date[] =
+            // timestamp[]`, `int4[] = int8[]` and `bpchar[] = text[]` are every one of them
+            // `42883` on a real server — even where the *element* types compare. So the rule
+            // above holds for all sixteen: an array's comparison is its element type's, and
+            // two element types are two operators.
+            ColumnType::BoolArray => 33,
+            ColumnType::ByteaArray => 34,
+            ColumnType::BpcharArray => 35,
+            ColumnType::VarcharArray => 36,
+            ColumnType::DateArray => 37,
+            ColumnType::TimeArray => 38,
+            ColumnType::TimestampArray => 39,
+            ColumnType::TimestampTzArray => 40,
+            ColumnType::IntervalArray => 41,
+            ColumnType::RealArray => 42,
+            ColumnType::DoubleArray => 43,
+            ColumnType::UuidArray => 44,
+            ColumnType::JsonArray => 45,
+            ColumnType::JsonbArray => 46,
+            ColumnType::OidArray => 47,
+            ColumnType::CitextArray => 48,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
@@ -2562,7 +2611,13 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Json => 9,
         }
     }
-    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
+    // **And `json[]` with it.** `ARRAY['{"a":1}'::json] = ARRAY['{"a":1}'::json]` is
+    // `42883 could not identify an equality operator for type json` — a different sentence
+    // from the one above and the same reason: an array's equality is its element's, and
+    // `json` has none to lend.
+    if matches!(left, ColumnType::Json | ColumnType::JsonArray)
+        || matches!(right, ColumnType::Json | ColumnType::JsonArray)
+    {
         return false;
     }
     family(left) == family(right)
@@ -2788,8 +2843,50 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
         Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => Some(*ty),
         Expr::Arithmetic { ty, .. } => *ty,
         Expr::ToText { .. } => Some(ColumnType::Text),
+        // **An `unknown` stops being one the moment it passes through a constructor.** Measured,
+        // one constructor at a time: `pg_typeof((SELECT '1'))`, `pg_typeof(CASE WHEN true THEN
+        // '1' ELSE '2' END)` and `pg_typeof(COALESCE('1','2'))` are each **`text`** on a real
+        // server, and `id = ` any of them is `42883 operator does not exist: bigint = text`. The
+        // coercion that makes `id = '1'` work does *not* reach through them: it applies to the
+        // literal itself, and a constructor over literals is a value of a settled type.
+        //
+        // Without this each of the three compared a `Datum` to a `Datum`, found none equal and
+        // answered **no rows** — a query that silently finds nothing, which a suite reports as a
+        // wrong count rather than as an error and which is the worst class ADR 0031 ranks. It is
+        // the same failure `tests/operator_types.rs` was written for, one shape further out.
+        Expr::Subquery(sub) => Some(sub.value_type()),
+        // The branches' common type, and `text` when no branch has one — PostgreSQL's own
+        // `select_common_type` fallback, and the reason `COALESCE(NULL, '1')` is `text` too: a
+        // NULL carries no type either, so a `COALESCE` of a NULL and an `unknown` is all-unknown.
+        Expr::Coalesce(args) => Some(branch_common_type(args.iter())),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => Some(branch_common_type(
+            otherwise
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(branches.iter().map(|branch| &branch.then)),
+        )),
         _ => None,
     }
+}
+
+/// The type a `CASE` or a `COALESCE` settles on: the first branch that carries one, else `text`.
+///
+/// **`text` is the answer and not `None`**, which is the whole point of asking: an all-`unknown`
+/// constructor is a `text` value on a real server, so a comparison against a number is `42883`
+/// rather than a silent no-match.
+fn branch_common_type<'a>(branches: impl Iterator<Item = &'a Expr>) -> ColumnType {
+    for branch in branches {
+        if let Some(ty) = carried_type(branch).or_else(|| match branch {
+            Expr::Literal(literal) => literal_type(literal),
+            _ => None,
+        }) {
+            return ty;
+        }
+    }
+    ColumnType::Text
 }
 
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {

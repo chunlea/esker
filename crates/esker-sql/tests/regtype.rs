@@ -45,11 +45,12 @@ const NAME_SYNTAX: &str = "**A type name is parsed, not compared.** PostgreSQL r
      rather than matched.";
 
 /// The other direction: an OID back to a name.
-const REVERSE: &str = "**The reverse direction is not implemented**: `23::regtype` is `integer` \
-     on a real server and an unknown number prints as itself (`999999::regtype` is `999999`, not \
-     an error). This node has no cast from a number to a `regtype` at all, so it is `0A000` \
-     naming the cast. The forward direction is what the scoreboard needed and what ADR 0033 \
-     scoped; this half has had no caller.";
+const REVERSE: &str = "**The reverse direction answers now** — `t.typelem::regtype` is how \
+     `ActiveRecord` reads what an array type is over, which is the caller this half never had — \
+     and every value below is byte-identical: `23` is `integer`, `1007` is `integer[]`, oid 0 is \
+     `-` and an unknown number prints as itself. What is left is the standing trade: a `regtype` \
+     is a type of its own on a real server, four bytes holding an oid that print as a name, and \
+     `text` here, so `RowDescription` differs and the characters do not.";
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
@@ -172,7 +173,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ("SELECT 23::regtype, 1043::regtype", REVERSE),
         ("SELECT 1007::regtype, 1009::regtype", REVERSE),
         ("SELECT 999999::regtype", REVERSE),
-        ("SELECT 999999::regtype::text", REVERSE),
         (
             "SELECT '1'::regtype",
             "PostgreSQL reads a bare number in a type name as an **OID**, so `'1'::regtype` is \

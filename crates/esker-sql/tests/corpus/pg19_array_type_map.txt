@@ -1,0 +1,99 @@
+# The `pg_type` rows an array column needs before `ActiveRecord` can quote one.
+#
+# **Run 52 ranking: `TypeError` 43 tests over 2 files, 42 of them `array_test.rb`.** It is a *Ruby*
+# error, `can't quote Array` at `postgresql/quoting.rb:122`, and it is not a bug in the adapter: it
+# is what the adapter does when it was never told the column is an array. AR registers array types
+# from its boot type-map query — the one `boot36` counts — and it looks the array type up **by the
+# element type's `typarray` oid**. If that oid has no row, no `OID::Array` is registered, the column
+# is an ordinary one as far as the adapter knows, and quoting a Ruby `Array` for it falls through to
+# the generic `quote` and raises.
+#
+# On the node at run 52 that is exactly the state: **6 array types in `pg_type`, and 16 base types
+# whose `typarray` points at a row that is not there** — `varchar`, `bool`, `bpchar`, `bytea`,
+# `citext`, `date`, `float4`, `float8`, `interval`, `json`, `jsonb`, `oid`, `time`, `timestamp`,
+# `timestamptz`, `uuid`. `_int4` and `_text` exist, which is why `t.integer "ratings", array: true`
+# works in that file and `t.string "tags", array: true` raises. `array_test.rb` declares
+# `string`, `integer`, `datetime`, `hstore`, `decimal` and `timestamp` arrays (`:21-26`).
+#
+# Things reasoning would get wrong:
+#
+# * **`typarray` and `typelem` are a two-way link and both halves are load-bearing.** The base row
+#   points *up* to its array type; the array row points *down* through `typelem`. A client walks it
+#   in both directions — AR from the base type, `format_type` from the array — so filling in one and
+#   not the other is worse than filling in neither: it advertises a type that cannot be fetched.
+# * **The check is one statement**, and it is the last one below: on this oracle it answers **0**.
+#   Any number above zero is a dangling reference.
+# * **An array type is not identified by its name.** `_int4` is a convention, not a rule: the test is
+#   `typelem <> 0 AND typinput = 'array_in'`. A name-based rule breaks on a user type whose array is
+#   named by truncation, and on `citext`, whose array oid is allocated at `CREATE EXTENSION` time and
+#   is not a fixed number at all.
+# * **`typinput = 'array_in'` does NOT imply `typcategory = 'A'`**, and the row below that asks the
+#   question answers `f`. There is exactly one exception on this oracle and it is the pseudo-type
+#   `_record`, `typcategory = 'P'`. So a check written as "every array_in type is category A" fails
+#   on a real PostgreSQL, and the two columns have to be populated from what each one means.
+# * **The delimiter is not always `,`** — `box` uses `;`. Both the element row and the array row
+#   carry `typdelim` and on this oracle they **agree**, so these rows do not discriminate which of
+#   the two a parser must read; they only settle that a hard-coded comma is wrong.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK` and touches nothing: every statement reads
+# `pg_catalog`. The `CREATE EXTENSION`s at the end are the citext/hstore half of the question and
+# roll back with everything else; the `SELECT count(*)` lines prove it.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+#
+# **Re-captured from r1's `captures/pg19_array_type_map.txt`, statement for statement**, with the
+# probes this node may refuse in `SAVEPOINT`s: one `42704` run bare aborts the replay and takes
+# every statement after it, and the statements after these are the whole unit. Every answer is
+# byte-identical to r1's.
+#
+BEGIN		-
+SELECT 'r', t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON t.oid = r.rngtypid WHERE t.typname IN ('_int4','_text','_varchar','_timestamp','_timestamptz','_date','_numeric','_uuid','_bool','_jsonb') ORDER BY t.typname	text,oid,name,oid,"char",regproc,"char",oid	r|1000|_bool|16|,|array_in|b|0 ; r|1182|_date|1082|,|array_in|b|0 ; r|1007|_int4|23|,|array_in|b|0 ; r|3807|_jsonb|3802|,|array_in|b|0 ; r|1231|_numeric|1700|,|array_in|b|0 ; r|1009|_text|25|,|array_in|b|0 ; r|1115|_timestamp|1114|,|array_in|b|0 ; r|1185|_timestamptz|1184|,|array_in|b|0 ; r|2951|_uuid|2950|,|array_in|b|0 ; r|1015|_varchar|1043|,|array_in|b|0
+SELECT 'r', b.typname AS base, b.typarray, a.typname AS array_name, a.typelem, a.typelem = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN ('varchar','int4','timestamp','timestamptz','numeric','text','uuid','bool','date') ORDER BY b.typname	text,name,oid,name,oid,boolean	r|bool|1000|_bool|16|t ; r|date|1182|_date|1082|t ; r|int4|1007|_int4|23|t ; r|numeric|1231|_numeric|1700|t ; r|text|1009|_text|25|t ; r|timestamp|1115|_timestamp|1114|t ; r|timestamptz|1185|_timestamptz|1184|t ; r|uuid|2951|_uuid|2950|t ; r|varchar|1015|_varchar|1043|t
+SELECT 'r', typname, typcategory, typelem <> 0 AS has_element, typinput FROM pg_type WHERE typname IN ('_int4','_varchar','int4','varchar') ORDER BY typname	text,name,"char",boolean,regproc	r|_int4|A|t|array_in ; r|_varchar|A|t|array_in ; r|int4|N|f|int4in ; r|varchar|S|f|varcharin
+SAVEPOINT cp1		-
+SELECT 'r', count(*) FROM pg_type WHERE typinput = 'array_in'::regproc	text,bigint	r|369
+ROLLBACK TO SAVEPOINT cp1		-
+SELECT 'r', count(*) FROM pg_type WHERE typcategory = 'A'	text,bigint	r|370
+SAVEPOINT cp2		-
+SELECT 'r', count(*) = count(*) FILTER (WHERE typcategory = 'A') AS array_in_implies_category_A FROM pg_type WHERE typinput = 'array_in'::regproc	text,boolean	r|f
+ROLLBACK TO SAVEPOINT cp2		-
+SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN ('int4','text','varchar','box','_box') ORDER BY typname	text,name,"char"	r|_box|; ; r|box|; ; r|int4|, ; r|text|, ; r|varchar|,
+SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'box'	text,name,"char",name,"char"	r|box|;|_box|;
+SAVEPOINT cp3		-
+SELECT 'r', '{(1,1),(0,0);(3,3),(2,2)}'::box[], array_length('{(1,1),(0,0);(3,3),(2,2)}'::box[], 1)		r|{(1,1),(0,0);(3,3),(2,2)}|2
+ROLLBACK TO SAVEPOINT cp3		-
+DROP TABLE IF EXISTS atm		-
+CREATE TABLE atm (id serial primary key, tags character varying(255)[], ratings integer[], stamps timestamp[], amounts numeric(10,2)[])		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), t.typname, t.typelem::regtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = '"atm"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|int4|- ; r|tags|character varying(255)[]|_varchar|character varying ; r|ratings|integer[]|_int4|integer ; r|stamps|timestamp without time zone[]|_timestamp|timestamp without time zone ; r|amounts|numeric(10,2)[]|_numeric|numeric
+INSERT INTO atm (tags, ratings, amounts) VALUES (ARRAY['one','two'], ARRAY[1,2,3], ARRAY[1.50,2.25])		-
+SELECT 'r', tags, ratings, amounts FROM atm		r|{one,two}|{1,2,3}|{1.50,2.25}
+SELECT 'r', pg_typeof(tags), pg_typeof(tags[1]), array_length(tags, 1) FROM atm		r|character varying[]|character varying|2
+SELECT 'r', ARRAY['a','b']::varchar[], ARRAY[1,2]::int4[], ARRAY['2010-01-01 14:30'::timestamp], ARRAY['2010-01-01'::date]	text,character varying[],integer[],timestamp without time zone[],date[]	r|{a,b}|{1,2}|{"2010-01-01 14:30:00"}|{2010-01-01}
+SELECT 'r', ARRAY[1.5,2.5]::numeric[], ARRAY[true,false], ARRAY['{"a":1}'::jsonb], ARRAY['11111111-1111-1111-1111-111111111111'::uuid]	text,numeric[],boolean[],jsonb[],uuid[]	r|{1.5,2.5}|{t,f}|{"{\"a\": 1}"}|{11111111-1111-1111-1111-111111111111}
+SELECT 'r', pg_typeof(ARRAY['a','b']::varchar[]), pg_typeof(ARRAY[1.5]::numeric[]), pg_typeof(ARRAY[true])	text,regtype,regtype,regtype	r|character varying[]|numeric[]|boolean[]
+CREATE EXTENSION IF NOT EXISTS hstore		-
+CREATE EXTENSION IF NOT EXISTS citext		-
+SELECT 'r', b.typname, b.typarray <> 0 AS has_array, a.typname AS array_name, a.typelem = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN ('hstore','citext') ORDER BY b.typname	text,name,boolean,name,boolean	r|citext|t|_citext|t ; r|hstore|t|_hstore|t
+SELECT 'r', b.typname, b.oid < 10000 AS oid_is_builtin, a.oid < 10000 AS array_oid_is_builtin FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN ('hstore','citext','varchar') ORDER BY b.typname	text,name,boolean,boolean	r|citext|f|f ; r|hstore|f|f ; r|varchar|t|t
+SELECT 'r', ARRAY['a=>1'::hstore], ARRAY['ABC'::citext]		r|{"\"a\"=>\"1\""}|{ABC}
+SELECT 'r', count(*) AS dangling_typarray FROM pg_type t WHERE t.typarray <> 0 AND NOT EXISTS (SELECT 1 FROM pg_type a WHERE a.oid = t.typarray)	text,bigint	r|0
+SAVEPOINT cp4		-
+SELECT 'r', count(*) AS dangling_typelem FROM pg_type t WHERE t.typinput = 'array_in'::regproc AND NOT EXISTS (SELECT 1 FROM pg_type e WHERE e.oid = t.typelem)	text,bigint	r|0
+ROLLBACK TO SAVEPOINT cp4		-
+SELECT 'r', count(*) AS asymmetric FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE a.typelem <> b.oid	text,bigint	r|0
+DROP TABLE atm		-
+DROP EXTENSION IF EXISTS hstore CASCADE		-
+DROP EXTENSION IF EXISTS citext CASCADE		-
+# `typinput = 'array_in'` **without a cast does not work on PostgreSQL either**: the unknown
+# literal resolves to `oid`, not to `regproc`, and the answer is `22P02 invalid input syntax for
+# type oid: "array_in"` -- measured, not assumed. `typinput::text` is the spelling both servers
+# read, and it is what makes the three checks above askable here at all.
+SELECT 'r', count(*) AS dangling_typelem FROM pg_type t WHERE t.typinput::text = 'array_in' AND NOT EXISTS (SELECT 1 FROM pg_type e WHERE e.oid = t.typelem)	text,bigint	r|0
+SELECT 'r', count(*) AS array_in_but_not_category_a FROM pg_type WHERE typinput::text = 'array_in' AND typcategory <> 'A'	text,bigint	r|1
+SELECT 'r', typname, typcategory FROM pg_type WHERE typinput::text = 'array_in' AND typcategory <> 'A' ORDER BY typname	text,name,"char"	r|_record|P
+SELECT 'r', count(*) AS suite_array_types FROM pg_type WHERE typinput::text = 'array_in' AND typname IN ('_int2','_int4','_int8','_text','_varchar','_bpchar','_bool','_bytea','_date','_time','_timestamp','_timestamptz','_interval','_numeric','_float4','_float8','_uuid','_json','_jsonb','_oid')	text,bigint	r|20
+SELECT 'r', t.typname, t.typelem::regtype::text AS element, t.typlen FROM pg_type t WHERE t.typname IN ('_varchar','_timestamp','_bool','_date','_uuid','_jsonb','_float8','_bytea') ORDER BY t.typname	text,name,text,smallint	r|_bool|boolean|-1 ; r|_bytea|bytea|-1 ; r|_date|date|-1 ; r|_float8|double precision|-1 ; r|_jsonb|jsonb|-1 ; r|_timestamp|timestamp without time zone|-1 ; r|_uuid|uuid|-1 ; r|_varchar|character varying|-1
+SELECT 'r', b.typname, b.typarray, a.typname AS array_name FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN ('bytea','bpchar','float4','float8','interval','json','oid','time') ORDER BY b.typname	text,name,oid,name	r|bpchar|1014|_bpchar ; r|bytea|1001|_bytea ; r|float4|1021|_float4 ; r|float8|1022|_float8 ; r|interval|1187|_interval ; r|json|199|_json ; r|oid|1028|_oid ; r|time|1183|_time
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'atm'	bigint	0
+SELECT count(*) FROM pg_extension WHERE extname IN ('hstore','citext')	bigint	0

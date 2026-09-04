@@ -251,6 +251,32 @@ const TAG_HSTORE: u8 = 26;
 const TAG_HSTORE_ARRAY: u8 = 27;
 /// The `citext` extension's type. 28, checked against the constants above rather than counted.
 const TAG_CITEXT: u8 = 28;
+/// The range types. 29-32, checked against the constants above rather than counted — 25 was
+/// already `smallint[]` when `hstore` reached for "the next one".
+const TAG_TSRANGE: u8 = 29;
+const TAG_TSTZRANGE: u8 = 30;
+const TAG_INT4RANGE: u8 = 31;
+const TAG_TSRANGE_ARRAY: u8 = 32;
+/// The sixteen array types the rest of `pg_type` needed: every base type on a real server has
+/// an array, and a `typarray` naming a row that is not there is what left `ActiveRecord` unable
+/// to quote one. **33-48, read off the constants above rather than counted** — the list is not
+/// in numeric order and never has been.
+const TAG_BOOL_ARRAY: u8 = 33;
+const TAG_BYTEA_ARRAY: u8 = 34;
+const TAG_BPCHAR_ARRAY: u8 = 35;
+const TAG_VARCHAR_ARRAY: u8 = 36;
+const TAG_DATE_ARRAY: u8 = 37;
+const TAG_TIME_ARRAY: u8 = 38;
+const TAG_TIMESTAMP_ARRAY: u8 = 39;
+const TAG_TIMESTAMP_TZ_ARRAY: u8 = 40;
+const TAG_INTERVAL_ARRAY: u8 = 41;
+const TAG_REAL_ARRAY: u8 = 42;
+const TAG_DOUBLE_ARRAY: u8 = 43;
+const TAG_UUID_ARRAY: u8 = 44;
+const TAG_JSON_ARRAY: u8 = 45;
+const TAG_JSONB_ARRAY: u8 = 46;
+const TAG_OID_ARRAY: u8 = 47;
+const TAG_CITEXT_ARRAY: u8 = 48;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -303,6 +329,26 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Hstore => TAG_HSTORE,
         ColumnType::HstoreArray => TAG_HSTORE_ARRAY,
         ColumnType::Citext => TAG_CITEXT,
+        ColumnType::TsRange => TAG_TSRANGE,
+        ColumnType::TstzRange => TAG_TSTZRANGE,
+        ColumnType::Int4Range => TAG_INT4RANGE,
+        ColumnType::TsRangeArray => TAG_TSRANGE_ARRAY,
+        ColumnType::BoolArray => TAG_BOOL_ARRAY,
+        ColumnType::ByteaArray => TAG_BYTEA_ARRAY,
+        ColumnType::BpcharArray => TAG_BPCHAR_ARRAY,
+        ColumnType::VarcharArray => TAG_VARCHAR_ARRAY,
+        ColumnType::DateArray => TAG_DATE_ARRAY,
+        ColumnType::TimeArray => TAG_TIME_ARRAY,
+        ColumnType::TimestampArray => TAG_TIMESTAMP_ARRAY,
+        ColumnType::TimestampTzArray => TAG_TIMESTAMP_TZ_ARRAY,
+        ColumnType::IntervalArray => TAG_INTERVAL_ARRAY,
+        ColumnType::RealArray => TAG_REAL_ARRAY,
+        ColumnType::DoubleArray => TAG_DOUBLE_ARRAY,
+        ColumnType::UuidArray => TAG_UUID_ARRAY,
+        ColumnType::JsonArray => TAG_JSON_ARRAY,
+        ColumnType::JsonbArray => TAG_JSONB_ARRAY,
+        ColumnType::OidArray => TAG_OID_ARRAY,
+        ColumnType::CitextArray => TAG_CITEXT_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -379,6 +425,26 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_HSTORE => ColumnType::Hstore,
         TAG_HSTORE_ARRAY => ColumnType::HstoreArray,
         TAG_CITEXT => ColumnType::Citext,
+        TAG_TSRANGE => ColumnType::TsRange,
+        TAG_TSTZRANGE => ColumnType::TstzRange,
+        TAG_INT4RANGE => ColumnType::Int4Range,
+        TAG_TSRANGE_ARRAY => ColumnType::TsRangeArray,
+        TAG_BOOL_ARRAY => ColumnType::BoolArray,
+        TAG_BYTEA_ARRAY => ColumnType::ByteaArray,
+        TAG_BPCHAR_ARRAY => ColumnType::BpcharArray,
+        TAG_VARCHAR_ARRAY => ColumnType::VarcharArray,
+        TAG_DATE_ARRAY => ColumnType::DateArray,
+        TAG_TIME_ARRAY => ColumnType::TimeArray,
+        TAG_TIMESTAMP_ARRAY => ColumnType::TimestampArray,
+        TAG_TIMESTAMP_TZ_ARRAY => ColumnType::TimestampTzArray,
+        TAG_INTERVAL_ARRAY => ColumnType::IntervalArray,
+        TAG_REAL_ARRAY => ColumnType::RealArray,
+        TAG_DOUBLE_ARRAY => ColumnType::DoubleArray,
+        TAG_UUID_ARRAY => ColumnType::UuidArray,
+        TAG_JSON_ARRAY => ColumnType::JsonArray,
+        TAG_JSONB_ARRAY => ColumnType::JsonbArray,
+        TAG_OID_ARRAY => ColumnType::OidArray,
+        TAG_CITEXT_ARRAY => ColumnType::CitextArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,
