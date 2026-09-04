@@ -1,6 +1,12 @@
 # 0055 — The TLS options across three surfaces, measured
 
-Status: **proposed — the choice below is for the maintainer.** [ADR 0025](0025-s3-transport-and-tls.md)
+Status: **accepted 2026-09-04, and built for the PostgreSQL port.** The maintainer took option 4
+and named `rustls-graviola` as the exception: refusal discipline everywhere now, `rustls` +
+`rustls-graviola` behind `esker-sql`'s `tls` feature, off by default, PG port first. What that
+turned into is at the end of this file, under "What was built, and what is still owed"; the option
+list below is unchanged from the measurement that produced it.
+
+[ADR 0025](0025-s3-transport-and-tls.md)
 settled S3's transport for phase 6b (plain HTTP now, `https://` refused at parse time) and wrote down
 four things that have to be true before TLS lands there. This ADR does the first of those four —
 measure the dependency cost of a pure-Rust `rustls` provider against `deny.toml` — and widens the
@@ -286,3 +292,59 @@ the PostgreSQL port, or the RPC layer — gets it first.
 - **Option 4:** the same `ADR 0003`/`deny.toml` additions as option 2, latent behind the feature, plus
   the `[graph] all-features = true` decision named above — a real edit either way, decided once rather
   than discovered when `cargo deny check` turns red on a branch that thought the feature was invisible.
+
+## What was built, and what is still owed
+
+Written after the fact, because two of the numbers above moved once the crates were in a real
+workspace rather than a probe, and because building it found things the measurement could not.
+
+### The PostgreSQL port, built
+
+`SSLRequest` is answered `S` when the node holds a certificate, and the whole session — the
+client's real startup packet included — runs inside TLS records. `--tls-cert` and `--tls-key` take
+PEM. The provider is passed explicitly rather than installed with `install_default`, which is
+process-global and would decide for anything else linking rustls in the same binary.
+
+`esker-sql`'s `tls` feature is off by default, and the default build's runtime graph is unchanged —
+36 crates by `dep_budget.rs`'s method, name for name, before and after. **With the feature on it is
+nine crates, not the twelve measured standalone**, because `once_cell`, `cfg-if` and `libc` are
+already in this workspace. `cargo deny check`, which always evaluates with `all-features = true`,
+is green with them in the graph.
+
+Three things the measurement did not predict, all now written down where someone will hit them:
+
+* **`ring` and `cc` are in `Cargo.lock` and nothing builds them.** Cargo locks a version for every
+  optional dependency edge, and `rustls-webpki` declares an unused optional `ring`. `deny.toml` and
+  ADR 0003 carry the three checks that prove it is not in the graph.
+* **`dep_budget.rs` would report that unused `ring` as a banned crate** the moment anything measured
+  the feature-on graph, because it walks `resolve.nodes[].deps` without consulting the activated
+  feature list. That is a false positive in the one test that must not have them, and it is owed to
+  whoever owns `crates/esker-cli/`. The same flaw inflates the default count by two.
+* **The budget has four crates of headroom, not twenty.** ADR 0025 said "the teens"; the real number
+  today is 36 of 40, `sqlparser` and tokio's chain having landed since. Nothing here needs the
+  budget raised, and the next thing that wants a crate should re-measure rather than trust either
+  number.
+
+### What S3 and RPC still need
+
+Neither surface is touched by this work. Both terminate outside the process today, which is
+option 1 and remains correct until someone does for them what this did for the PG port.
+
+* **S3** (`esker-s3`, ADR 0025): the transport is already a trait with one blocking `std::net`
+  implementor, so this is a second implementor and a config field, not a refactor. It needs the one
+  thing the PG port did not: **a root store**, because a client verifies a certificate where a
+  server only presents one. `webpki-roots` is one crate and one `CDLA-Permissive-2.0` line in
+  `deny.toml`'s `[licenses] allow` — that licence is not on the list today and the check fails on
+  it, measured. An explicit `--ca-file` is the other half, per ADR 0025 decision 4 item 3.
+  `Endpoint::parse` should stop refusing `https://` in the same change that makes it work, and not
+  before.
+* **RPC** (`esker-proto`, DESIGN.md §9): the harder one, and not because of TLS. It is the surface
+  where both ends are ours, so it is the one that wants **mutual** authentication — and mTLS gives
+  a verified peer identity, not an authorization decision. Nothing in `esker-pd` today maps an
+  identity to "may register as this store id" or "may vote in this region": a store's
+  `StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the
+  socket. Encrypting that link without also deciding who is allowed on it moves the problem rather
+  than solving it, and the deciding is application logic no option in this ADR provides. Whoever
+  takes this surface should expect the certificate-issuance story (a private CA, most likely) and
+  the identity check to be the bulk of the work, with the TLS itself the small part — `TlsConfig`
+  and the session driver in `pgwire::tls` are the shape it can reuse.

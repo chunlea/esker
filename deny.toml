@@ -8,9 +8,36 @@
 #
 # The transitive runtime crate budget. The test reads this line, so keep the format exact.
 # Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md). It came down
-# from 40 when `crossbeam-skiplist` left with `crossbeam-epoch` and `crossbeam-utils` behind it
-# (docs/adr/0041-the-in-house-arena-skiplist.md).
+# from 40 when `crossbeam-skiplist` left, taking `crossbeam-epoch` and `crossbeam-utils` with it
+# (docs/adr/0041-the-in-house-arena-skiplist.md) -- three crates removed, three off the budget, so
+# the headroom below is the same as it was.
 # esker-dep-budget = 37
+#
+# **This number is about the default feature set, which is the only one the test measures.**
+# `esker-sql`'s `tls` feature (ADR 0055, off by default) adds nine crates when it is on — rustls,
+# rustls-graviola, graviola, rustls-pki-types, rustls-webpki, getrandom, subtle, untrusted,
+# zeroize — taking the compiled graph from 34 to 43. Nothing enforces a budget in that state, and
+# two things would have to be fixed before anything could:
+#
+#   * `dep_budget.rs` walks `resolve.nodes[].deps` without cross-referencing
+#     `resolve.nodes[].features`, so it counts optional dependencies that are never compiled. It
+#     reports 36 for the default set that `cargo tree -e normal` puts at 34.
+#   * Worse, `rustls-webpki` *declares* an optional `ring` — unused, never built, and not in
+#     `cargo tree` or in cargo-deny's graph — which that same walk would report as a banned crate
+#     the moment the feature was measured. A false positive, in the one test whose job is to have
+#     no false negatives.
+#
+# Both live in `crates/esker-cli/`, which ADR 0055's lane does not own; they are written down in
+# that ADR as owed work rather than fixed here.
+#
+# **`ring` and `cc` are named in `Cargo.lock`, and nothing builds them.** Cargo's lock file records
+# a version for every optional dependency edge that *could* be selected, activated or not, so
+# `rustls-webpki`'s unused optional `ring` — and `ring`'s own `cc` and `windows-*` — appear there
+# the moment rustls is in the manifest. Three independent checks say they are not in the graph:
+# `cargo tree --features esker-sql/tls --target all -e normal,build,dev -i ring` prints nothing,
+# `rustls-webpki`'s activated features are `["alloc", "std"]`, and `cargo deny check` (whose graph
+# is built by `krates`, not by this file) reports `bans ok`. A grep of `Cargo.lock` is not a
+# measurement of the dependency graph; these three are.
 
 [graph]
 # The two platforms CI builds. Without this, cargo-deny would also consider the Windows

@@ -21,6 +21,19 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # `psm`, which compiles assembly through `cc`, and both are banned. esker-sql/src/parse/ owns
 # the stack-depth guard that feature would otherwise have provided.
 sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
+# --- the TLS exception, behind a default-off feature (docs/adr/0055-*.md, accepted 2026-09-04) ---
+# Reached only through `esker-sql`'s `tls` feature, which is **off by default**, so the default
+# build's runtime graph is unchanged — `crates/esker-cli/tests/dep_budget.rs` is the proof and it
+# measures the default feature set.
+#
+# `default-features = false` is load-bearing twice over: rustls's defaults enable `aws_lc_rs`,
+# which pulls `aws-lc-sys` (C, banned), and the `ring` feature is banned for the same reason. With
+# neither, the crypto provider is supplied at runtime — `rustls_graviola::default_provider()`.
+# graviola was chosen over `rustls-rustcrypto` on measurement, not reputation: the latter fails
+# `cargo deny check` today on a banned `rand`, a duplicate stale `rustls-webpki` carrying four live
+# RUSTSEC advisories, an unmaintained `paste` and an unpatched RSA timing CVE (ADR 0055).
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-graviola = { version = "0.4", default-features = false }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
