@@ -1,4 +1,4 @@
-# 0055 — a retirement is announced before the record that names it goes
+# 0056 — a retirement is announced before the record that names it goes
 
 Status: accepted. Debt wave c6, unit 1, from `docs/plans/debt-c6.md` §2 — the residual left by
 [ADR 0034](0034-a-removed-peer-is-swept-and-its-range-reclaimed.md), found while verifying that

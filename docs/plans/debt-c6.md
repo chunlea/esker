@@ -124,8 +124,10 @@ the fix for it — one whole region's data, permanently, on a path **every rebal
 
 ### The fix
 
-[ADR 0055](../adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md). A fifth
-prefix in the `raft` column family, `'R' ++ region_id` → the region being reclaimed, whole, written
+[ADR 0056](../adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md) — the
+commit that landed it says 0055, which is the number it was written under and which `main` took
+first for the TLS options ADR; renumbered on the merge, per the rule that the later committer
+moves. A fifth prefix in the `raft` column family, `'R' ++ region_id` → the region being reclaimed, whole, written
 **in the same synced batch that deletes the record it describes**. It is the mirror of `'p'`, the
 pending-snapshot record, whose own documentation had already made the argument: data arriving into
 an unowned range was given a durable name in phase 4, and data leaving one was not.
@@ -314,3 +316,106 @@ header, rather than fixed inside a unit about overlap.
 
 - **Site:** `crates/esker-engine/src/db/ingest.rs`, `Db::ingest`'s `raise_seqno_above`.
 - **Size:** medium; a format change, so it needs the human (`CLAUDE.md` §"Ask before doing").
+
+## 4. The `TODO(phase-N)` markers: eight had outlived their phase, four had not
+
+A marker naming a phase that shipped is worse than no marker: it tells a reader the code is
+unfinished when the finishing is three phases behind them, and it hides the ones that are real. All
+of them in this lane's crates were checked against the code they point at. Two `TODO(post-v1)`
+markers are left alone — they name a version rather than a phase that has passed
+(`esker-store/src/server.rs` on read-only replicas, `esker-store/src/snapshot.rs` on
+sequence-number rewriting, which is §3's debt seen from the other side).
+
+### Outlived their phase — the marker is gone and the doc says what is there instead
+
+| Site | The marker said | What is actually there |
+|---|---|---|
+| `esker-store/src/regions.rs`, `RegionState` | `TODO(phase-4b)`: a split replaces two entries under one lock | `RegionMap::split`, from `Store::adopt_split`; a membership change goes through `RegionMap::replace` |
+| `esker-store/src/regions.rs`, `RegionMap::remove` | "Nothing in 4a calls it; `TODO(phase-4c)` is the `RemovePeer` operator" | `Store::retire_region` calls it, and race 3's hazard is closed at both ends ([ADR 0056](../adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md)) |
+| `esker-store/src/meta.rs`, `stage_region` | `TODO(phase-4b)`: a split writes both halves' records in one batch | `crate::peer`'s `stage_split` does exactly that |
+| `esker-store/src/raft_log.rs`, `PersistedState::conf_state` | "Nothing writes this after `open` … see the `TODO(phase-4)` on `RaftLogStorage::snapshot`" | Both halves stale: `stage_compact` writes it at every truncation, and the `TODO` it points at is gone — a dangling cross-reference |
+| `esker-store/src/peer.rs`, `applied_conf` | `TODO(phase-4c unit 5)`: moved by applying a `ConfChange` | `apply_conf_change` moves it, and nowhere else |
+| `esker-cli/src/server.rs` | `TODO(phase-4b)`: a split makes the list grow while the server runs | Splits exist; the line still only prints what was found at open, which is what the comment now says |
+| `esker-sim/tests/raft_snapshot.rs` | `TODO(phase-3d)`: the harness has no action that adds or removes a voter | `crates/esker-sim/tests/raft_membership.rs` is that harness, with the membership in the observation and a quorum per configuration |
+
+One of these was not merely stale but **wrong**, and it is worth its own line.
+`esker-store/src/meta.rs`'s `stage_removal` said "the `RemovePeer` operator is what calls this".
+`RemovePeer` reaches `raft_log::destroy`, which deletes the metadata key alongside the region's
+log, state and pending-snapshot records in one synced batch — and it has to, because a record
+removed without them leaves a log for a region nothing hosts. A reader following that comment to
+find the retirement path would have found the wrong function. Its doc now says what it is for and
+who uses it.
+
+### Still open — a debt entry each, and the marker re-tagged `TODO(debt-c6 #n)`
+
+**#1 — one timer per region is one task per region.** At fifty regions that is fifty timers where
+one wheel would do; it is the same sharding decision the apply workers already made and belongs
+with it.
+*Site:* `crates/esker-store/src/server.rs`, `Store::tickers`. *Size:* medium.
+
+**#2 — a reverse scan is routed by its exclusive upper bound.** `routing_key` answers `start` for
+every `Scan`, and for a reverse scan `start` is the **exclusive** upper bound to walk down from. A
+`start` sitting exactly on a region boundary therefore routes to the region *above* the one holding
+every key the scan should return, and the answer is an empty page — which a caller cannot tell from
+the end of the range. Reverse scans are reachable: `RawClient::scan_reverse` and the `reverse` flag
+on `RawKvReq::Scan` and the txn scan.
+*Site:* `crates/esker-client/src/wire.rs`, `routing_key`. *Size:* small; a test needs two regions
+and a boundary-aligned bound.
+
+**#3 — the peer a request is aimed at ignores which peer just failed.** `RegionCache::target`
+answers the cached leader or the first peer in the list, so a down store is asked twice inside one
+retry budget. The budget itself was fixed in wave c3 — it counts failures rather than attempts —
+which makes this the remaining half: the retries are now the right *number*, aimed the same way
+each time.
+*Site:* `crates/esker-client/src/region_cache.rs`, `RegionCache::target`. *Size:* small-medium.
+
+**#4 — the client's store book is a fixed list, not PD's.** `TcpStores` is handed addresses at
+construction and learns no store it was not given, so a store added to the cluster is unreachable
+until the client is rebuilt. The marker predates PD existing at all; PD exists, and this is still
+not wired to it.
+*Sites:* `crates/esker-client/src/transport.rs` (module header) and
+`crates/esker-client/src/tcp.rs`, `TcpStores::connect_with`. *Size:* medium. **Owner:** this is the
+`pdha` lane's territory — the markers are re-tagged and nothing else in `tcp.rs` was touched.
+
+## 5. `docs/DESIGN.md` against the code, for the engine, the store and the client
+
+`CLAUDE.md`: *"If code and DESIGN.md disagree, fix one of them in the same change — they must never
+drift."* Four disagreements, and in all four the code was right and the document was describing a
+version of the system that two waves had already replaced. Each is one that would mislead a reader
+into writing wrong code, not a wording preference.
+
+**§4.1 — `WriteOptions { sync: bool }`, "defaults to `true`".** Replaced in wave c3 by a
+`Durability` with three states ([ADR 0036](../adr/0036-a-write-may-have-no-opinion-about-durability.md)),
+and the whole point of that change was the state a `bool` cannot express: **no opinion**. A reader
+following §4.1 would have written `WriteOptions { sync: true }` against an API that has no such
+field, and, worse, would have taken from it the belief the ADR exists to correct — that a write
+either demands durability or forbids it, so a database-wide policy has nothing to decide. §4.2's
+`sync = false` sentences move to `Buffered` with them, and its `wal_sync_mode` line now says that
+`Interval` is a real background thread and what `Never` still syncs.
+
+**§6, the snapshot receive — "`Db::ingest` refuses any overlap including tombstones (§4.1)".** True
+until §3 of this wave; the rule is now about a shared *key*. The sentence is load-bearing where it
+sits — it is half the argument for why a snapshot ships key-value pairs instead of linking files —
+so it is corrected rather than deleted, and the argument survives intact: a receive retried after a
+partial one collides with exactly the keys the partial one left. The same paragraph in
+`esker-store/src/snapshot.rs`'s module header says the same thing and was corrected with it.
+
+**§6, the snapshot receive — "Only into a range this store holds nothing in… A peer that already
+has data is refused and stays behind."** This is the one that was not merely out of date but
+inverted. `receive_raft` **replaces** a region this store already hosts: it retires the old peer so
+nothing is driving the region, then empties and refills the range. The comment in the code says
+why, and names what the document still describes as the design: *"Refusing it was 4c's limitation
+and phase-4 acceptance showed it is not an edge case: a peer that falls behind its leader's
+compaction boundary can only be repaired this way, and until now it could not be repaired at all."*
+A reader of §6 would have concluded that the repair path this system depends on does not exist.
+
+**§10, the client's retries — the budget's unit.** §10 said retries are bounded by a budget of 8
+and a deadline, which is still true and is no longer the whole rule. Wave c3 made the budget count
+**failures rather than attempts**: a refusal that moved the region's epoch resets it, and only an
+epoch change does. Both halves matter to anyone reading the section to predict client behaviour —
+without the first, nine redirects through a splitting region look like a client bug; without the
+second, "it resets on a redirect" reads as a budget that cannot expire.
+
+No disagreement was found in §4.3–§4.9, §6's other bullets, or §10's remaining rules; the §14
+defaults table was checked against the constants it names and matches, including the two rows this
+wave brushed against (`store WAL sync mode` and `SST data block … 4 KiB local, 16 KiB tiered`).

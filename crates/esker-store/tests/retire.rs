@@ -20,7 +20,7 @@
 //!
 //! Retiring a region is **two** durable steps — the batch that destroys its Raft state and its
 //! `'m'` record, and the clear of its range — so a crash lands between them, and until
-//! [ADR 0055](../../../docs/adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md)
+//! [ADR 0056](../../../docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md)
 //! that was permanent: the `'m'` record is the only thing on disk that says which *range* the
 //! region was, and destroying it first left the keys with nothing that could name them again. The
 //! last three tests here are the same rule at a restart — reclaim what is orphaned, and never
