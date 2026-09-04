@@ -1,0 +1,57 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_2d916f5f540186::t_26ede1b3f6c81c 1795-1804,1982-1985,1987-1990,2977-3045
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_2d916f5f540186::t_e629e76d34ed8f 227-230
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2d916f5f540186::t_ed4f85afe15974 148-149,189,207,242,281-285,460-468,566,705-706,1010-1029,1401-1402
+crates/esker-sql/src/catalog/pg_index.rs
+  s_2d916f5f540186::t_aa97c4a9b8f17d 443-446
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_2d916f5f540186::t_e68b34156776c1 79-85,108,268-269,334-346
+crates/esker-sql/src/catalog/record.rs
+  s_2d916f5f540186::t_f532dfbb960994 16,184-186,729-791,2307-2310,2336-2338
+crates/esker-sql/src/error.rs
+  s_2d916f5f540186::t_fe047761dcca9a 1103-1119,1909,1948,2359,2466-2481
+crates/esker-sql/src/exec/bind.rs
+  s_2d916f5f540186::t_5703fab25ec5b8 262-263,661-662,873-874,957-958
+crates/esker-sql/src/exec/comment.rs
+  s_2d916f5f540186::t_c03719fd6e07b8 47-52
+crates/esker-sql/src/exec/ddl.rs
+  s_2d916f5f540186::t_3e7f69ab66ccaa 1418-1424,2313-2439,2535-2542,3123-3129,3261-3269
+crates/esker-sql/src/exec/mod.rs
+  s_2d916f5f540186::t_5828b5d8c2ea3e 592-593,1230-1245,2087-2088,2387-2495
+crates/esker-sql/src/parse/lower.rs
+  s_2d916f5f540186::t_a7561b82174aa8 434-461,521-530
+crates/esker-sql/src/plan/ddl.rs
+  s_2d916f5f540186::t_88eb762a2f3f2d 269-302
+crates/esker-sql/src/plan/mod.rs
+  s_2d916f5f540186::t_5c4bced36fd358 36-39,92-95,201-202,254-255
+crates/esker-sql/tests/corpus/pg19_view.txt
+  s_2d916f5f540186::t_1dae33c5788c8d 1-118
+crates/esker-sql/tests/drop_column.rs
+  s_2d916f5f540186::t_f348cc0e90c4b0 29-31,34-41,45-58
+crates/esker-sql/tests/lowering.rs
+  s_2d916f5f540186::t_1e836d23a69c0a 40-45
+crates/esker-sql/tests/rename_column.rs
+  s_2d916f5f540186::t_7b629e4398bb35 19-23,25-27,29-33,35-37,39-45
+crates/esker-sql/tests/slt/unsupported.slt
+  s_2d916f5f540186::t_63b04dcb0988e8 111-112,114
+crates/esker-sql/tests/view.rs
+  s_2d916f5f540186::t_55db1fe580db30 1-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1518cffeb985a900b6a17fcc16e34b21a94cf378",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
