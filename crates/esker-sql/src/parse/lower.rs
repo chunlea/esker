@@ -2002,8 +2002,21 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_storage_parameters(options)?);
             continue;
         }
-        if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
-            actions.push(lower_added_constraint(&table_name, constraint)?);
+        if let AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } = operation
+        {
+            let mut lowered = lower_added_constraint(&table_name, constraint)?;
+            // **`NOT VALID` is only a foreign key's here.** PostgreSQL takes it on `CHECK` too,
+            // and refusing it there by name is the honest answer while nothing skips that scan.
+            if *not_valid {
+                match &mut lowered {
+                    plan::AlterTableAction::AddForeignKey(key) => key.validated = false,
+                    _ => return Err(SqlError::unsupported("ADD CONSTRAINT ... NOT VALID")),
+                }
+            }
+            actions.push(lowered);
             continue;
         }
         if let AlterTableOperation::DisableTrigger { name }
@@ -2013,11 +2026,27 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_trigger_state(&table_name, name, disabled)?);
             continue;
         }
+        if let AlterTableOperation::ValidateConstraint { name } = operation {
+            actions.push(plan::AlterTableAction::ValidateConstraint(ident(name)));
+            continue;
+        }
         // `ALTER COLUMN c SET DEFAULT <expr>` and `DROP DEFAULT`. The **type is not known here** —
         // a plan is lowered without the catalog — so a literal is not folded until the executor
         // has the column, which is also where `22P02` for one the type will not take comes from.
         if let AlterTableOperation::AlterColumn { column_name, op } = operation {
             use sqlparser::ast::AlterColumnOperation;
+            // `SET NOT NULL` / `DROP NOT NULL` are their own action: they change a column's
+            // nullability rather than its default, and the executor has to scan for the first.
+            if matches!(
+                op,
+                AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull
+            ) {
+                actions.push(plan::AlterTableAction::SetNotNull {
+                    column: ident(column_name),
+                    not_null: matches!(op, AlterColumnOperation::SetNotNull),
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
@@ -2434,23 +2463,23 @@ fn lower_foreign_key(
             format!("FOREIGN KEY ... MATCH {kind}"),
         )?;
     }
-    let deferrable = match &key.characteristics {
-        None => false,
+    // **`INITIALLY DEFERRED` really waits**, the way a deferrable `UNIQUE` already does
+    // (`crate::exec::deferred`): the check is registered against the transaction and re-examined
+    // at `COMMIT`. It was refused by name until the transaction could owe one — accepting the
+    // clause while checking at the statement would refuse a transaction PostgreSQL commits, which
+    // is a wrong answer rather than a gap.
+    let (deferrable, initially_deferred) = match &key.characteristics {
+        None => (false, false),
         Some(characteristics) => {
-            // `INITIALLY DEFERRED` is the one form that would **change an answer**: a transaction
-            // that violates the constraint in the middle and repairs it before `COMMIT` succeeds
-            // on a real server and would be refused here, because every check in this crate is
-            // immediate. Refused by name rather than accepted, which is contract C2's whole rule.
-            // `ActiveRecord` writes `DEFERRABLE INITIALLY IMMEDIATE` and never this one.
-            refuse_if(
-                characteristics.initially == Some(DeferrableInitial::Deferred),
-                "FOREIGN KEY ... INITIALLY DEFERRED",
-            )?;
             refuse_if(
                 characteristics.enforced.is_some(),
                 "FOREIGN KEY ... ENFORCED, which is MySQL's",
             )?;
-            characteristics.deferrable.unwrap_or(false)
+            let deferred = characteristics.initially == Some(DeferrableInitial::Deferred);
+            (
+                characteristics.deferrable.unwrap_or(false) || deferred,
+                deferred,
+            )
         }
     };
     let columns: Vec<String> = key.columns.iter().map(ident).collect();
@@ -2462,28 +2491,34 @@ fn lower_foreign_key(
         columns,
         parent: relation_name(&key.foreign_table)?,
         parent_columns: key.referred_columns.iter().map(ident).collect(),
-        on_update: referential_action(key.on_update.as_ref())?,
-        on_delete: referential_action(key.on_delete.as_ref())?,
+        on_update: referential_action(key.on_update.as_ref()),
+        on_delete: referential_action(key.on_delete.as_ref()),
+        // The `NOT VALID` that may follow belongs to the `ALTER TABLE ... ADD CONSTRAINT` and not
+        // to the constraint's own grammar, so it is applied by the caller that can see it.
+        validated: true,
         deferrable,
+        initially_deferred,
     })
 }
 
 /// `ON UPDATE`/`ON DELETE`, defaulting to `NO ACTION` the way a real server does.
 ///
-/// `SET NULL` and `SET DEFAULT` are refused by name: each writes a value into the child's columns
-/// rather than refusing or removing, and neither appears in anything `ActiveRecord` emits.
+/// All five, including the two that **write** into the child rather than refusing or removing.
+///
+/// PostgreSQL 15 added a column list — `SET NULL (a, b)` — narrowing which columns are cleared.
+/// The parser this crate uses has no variant for it, so it does not reach here; nothing
+/// `ActiveRecord` writes uses it, and the whole clause is one `Option` away when something does.
 fn referential_action(
     action: Option<&sqlparser::ast::ReferentialAction>,
-) -> Result<catalog::ReferentialAction> {
+) -> catalog::ReferentialAction {
     use sqlparser::ast::ReferentialAction as Written;
-    Ok(match action {
+    match action {
         None | Some(Written::NoAction) => catalog::ReferentialAction::NoAction,
         Some(Written::Restrict) => catalog::ReferentialAction::Restrict,
         Some(Written::Cascade) => catalog::ReferentialAction::Cascade,
-        Some(other) => {
-            return Err(SqlError::unsupported(format!("ON DELETE/UPDATE {other}")));
-        }
-    })
+        Some(Written::SetNull) => catalog::ReferentialAction::SetNull,
+        Some(Written::SetDefault) => catalog::ReferentialAction::SetDefault,
+    }
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {

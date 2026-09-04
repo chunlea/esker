@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 26;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 28;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1532,6 +1532,11 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.push(action_tag(key.on_update));
         out.push(action_tag(key.on_delete));
         out.push(u8::from(key.deferrable));
+        // Version 27: `NOT VALID`. It sits **beside** the key rather than at the end of the record
+        // because a foreign key's fields are already a group and the reader walks them in one
+        // loop; the version guard in `read_foreign_keys` is what keeps an older record readable.
+        out.push(u8::from(key.validated));
+        out.push(u8::from(key.initially_deferred));
     }
 
     // Version 11. One flag per index, at the **very end** — after the foreign keys, not beside
@@ -1911,12 +1916,16 @@ fn unique_kind_of(tag: u8) -> Result<Option<UniqueKind>> {
 const ACTION_NO_ACTION: u8 = 1;
 const ACTION_RESTRICT: u8 = 2;
 const ACTION_CASCADE: u8 = 3;
+const ACTION_SET_NULL: u8 = 4;
+const ACTION_SET_DEFAULT: u8 = 5;
 
 fn action_tag(action: ReferentialAction) -> u8 {
     match action {
         ReferentialAction::NoAction => ACTION_NO_ACTION,
         ReferentialAction::Restrict => ACTION_RESTRICT,
         ReferentialAction::Cascade => ACTION_CASCADE,
+        ReferentialAction::SetNull => ACTION_SET_NULL,
+        ReferentialAction::SetDefault => ACTION_SET_DEFAULT,
     }
 }
 
@@ -1925,6 +1934,10 @@ fn action_of(tag: u8) -> Result<ReferentialAction> {
         ACTION_NO_ACTION => ReferentialAction::NoAction,
         ACTION_RESTRICT => ReferentialAction::Restrict,
         ACTION_CASCADE => ReferentialAction::Cascade,
+        // Version 27. An older record cannot hold either — both were `0A000` until then — so no
+        // version guard is needed here: the tag simply never appears in one.
+        ACTION_SET_NULL => ReferentialAction::SetNull,
+        ACTION_SET_DEFAULT => ReferentialAction::SetDefault,
         other => return Err(corrupt(format!("referential action tag {other}"))),
     })
 }
@@ -2019,6 +2032,15 @@ fn read_foreign_keys(reader: &mut Reader<'_>, columns: usize) -> Result<Vec<Fore
             on_update: action_of(reader.byte()?)?,
             on_delete: action_of(reader.byte()?)?,
             deferrable: reader.flag()?,
+            // **Version 27 added `NOT VALID`.** Every foreign key written before it was checked
+            // against the rows already there when it was made, because there was no clause that
+            // could skip that scan — so an older record's keys are validated, and reading them as
+            // anything else would report a schema the node never had.
+            validated: reader.version < 27 || reader.flag()?,
+            // **Version 28 added deferred foreign keys.** Before it, `INITIALLY DEFERRED` was
+            // `0A000`, so nothing an older record holds can start deferred — and `deferrable`
+            // alone meant `INITIALLY IMMEDIATE`, which is what reading `false` here gives.
+            initially_deferred: reader.version >= 28 && reader.flag()?,
         });
     }
     Ok(keys)

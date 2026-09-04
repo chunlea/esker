@@ -25,16 +25,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dcp' ORDER BY indexname",
     ],
     answers: &[
-        // **`ALTER COLUMN … SET NOT NULL` is a named refusal older than this unit**, and it is the
-        // *other* spelling — the one `ActiveRecord` sends. What this unit adds is that `NOT NULL`
-        // can be dropped **by constraint name**, which PostgreSQL 19 allows and the two lines
-        // above this one prove: `DROP CONSTRAINT "dcp_code_not_null"` clears `attnotnull`.
-        (
-            "ALTER TABLE \"dcp\" ALTER COLUMN \"code\" SET NOT NULL",
-            "`0A000`: adding a `NOT NULL` to a populated column has to check every row, which is \
-             the rewrite this node's `ALTER TABLE` is defined not to do. Removing one needs no \
-             scan, which is why the `DROP` half of this pair works and the `SET` half does not.",
-        ),
+        // `ALTER COLUMN … SET NOT NULL` was here, refused because it has to check every row.
+        // It now runs the scan and is gone from this list (ADR 0031 rule 2) —
+        // `pg19_foreign_key_options.txt` is where the whole family is measured.
         (
             "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '\"dcp\"'::regclass \
              AND contype = 'n' ORDER BY conname",
