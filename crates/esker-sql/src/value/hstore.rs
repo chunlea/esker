@@ -2,9 +2,9 @@
 //!
 //! # One representation, two types
 //!
-//! An hstore is stored as its **canonical text** in a [`Datum::Text`], the way `json` and `jsonb`
-//! already are (`Datum::fits`): there is nothing in an hstore-shaped datum that a `Text` does not
-//! already hold, and what differs is the column's declared type. That is what makes equality,
+//! An hstore is stored as its **canonical text** in a [`crate::value::Datum::Text`], the way
+//! `json` and `jsonb` already are (`Datum::fits`): there is nothing in an hstore-shaped datum that
+//! a `Text` does not already hold, and what differs is the column's declared type. That is what makes equality,
 //! ordering, grouping and an index over an hstore column fall out of the text machinery already
 //! here — and it is *correct* rather than convenient, because the canonical form is a function of
 //! the content: two hstores are equal exactly when their canonical forms are.
