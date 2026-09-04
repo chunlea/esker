@@ -186,6 +186,72 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     );
 }
 
+/// A **node** that cannot listen fails the command too, which is the same rule reached from the
+/// other side of the start.
+///
+/// The driver's port is left free here and node 1's is taken, so the driver comes up, every store
+/// is spawned, and one of them can never bind. Before the announcement waited for the stores to
+/// *answer*, what decided this was a 250 ms sleep and a "has anybody died yet" — so the outcome
+/// depended on whether node 1's `Address already in use` landed inside that window. Measured at
+/// the base of this change: 0.36 s and a correct refusal on a quiet box, and at eighty busy
+/// threads `4 nodes started`, a state file naming a dead pid, and a command that never returned.
+///
+/// The state-file assertion is the one that matters most: `stop` reads those pids and signals
+/// them, and a pid the operating system has since reused belongs to something else entirely.
+#[test]
+fn a_node_that_cannot_listen_is_a_failure_and_not_a_cluster() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let data_dir = TempDir::new().unwrap();
+    let base_port = free_port_run();
+
+    // Held for the whole test: node 1's port belongs to somebody else. The driver's, one above
+    // the last node, is free — this test is about the stores.
+    let _squatter = TcpListener::bind(("127.0.0.1", base_port)).expect("node 1's port is free");
+
+    warm_the_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_esker-cli"));
+    command
+        .arg("cluster")
+        .arg("start")
+        .arg("--nodes")
+        .arg(NODES.to_string())
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--base-port")
+        .arg(base_port.to_string())
+        .arg("--pd")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = Supervisor(command.spawn().expect("the cluster command starts"));
+    // Sixty seconds is this file's wedge-detector, not the assertion: the command settles in
+    // about a second at every load measured, and the four points are in the doc above.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.0.try_wait().expect("waiting on the cluster command") {
+            Some(status) => break status,
+            None => assert!(
+                Instant::now() < deadline,
+                "`cluster start` is still running with a node that can never listen: it \
+                 announced a cluster and is supervising less than one"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    assert!(
+        !status.success(),
+        "`cluster start` reported success with a node that never listened"
+    );
+    assert!(
+        !data_dir.path().join("cluster.state").exists(),
+        "a cluster that never started left a state file, so `cluster stop` would signal pids that \
+         belong to whatever the OS has reused them for"
+    );
+}
+
 /// A driver that **cannot** listen fails the command, rather than leaving an announcement and four
 /// stores that quietly die behind it.
 ///

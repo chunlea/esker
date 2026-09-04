@@ -315,12 +315,13 @@ fn start(
         return Err(error);
     }
 
-    // Every child is alive **before** the cluster is announced. A store that failed to open exits
-    // in milliseconds, and the announcement's list of four pids is otherwise the only thing anyone
-    // sees: the children inherit this process's stdio, and this process then blocks in
-    // `wait_for_interrupt`, so their own error lines are not flushed until the whole thing is
-    // stopped. A cluster that is a quarter of one must not be reported as started.
-    if let Some(error) = first_child_that_died(&mut children) {
+    // Every store is **serving** before the cluster is announced. The announcement's list of pids
+    // is otherwise the only thing anyone sees: the children inherit this process's stdio, and this
+    // process then blocks in `wait_for_interrupt`, so their own error lines are not flushed until
+    // the whole thing is stopped. A cluster that is a quarter of one must not be reported as
+    // started — and "no child has died yet" was not enough to know that it is not.
+    if let Err(error) = wait_until_the_stores_answer(&mut children, &launched, STORE_START_TIMEOUT)
+    {
         for (_, mut child) in children {
             let _ = child.kill();
         }
@@ -391,15 +392,22 @@ fn signal(pid: u32, name: &str) {
 /// a port already taken, a directory it cannot write — is an error rather than a hang.
 const PD_START_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long one readiness probe waits for the driver to answer before it is retried.
+/// How long one readiness probe waits for an answer before it is retried.
 ///
 /// It bounds a probe against a socket that accepts and then says nothing, which is the case the
-/// probe exists for; the budget that decides whether the driver started is [`PD_START_TIMEOUT`],
-/// and it is unchanged.
-const PD_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// probe exists for; the budgets that decide whether a process started are [`PD_START_TIMEOUT`]
+/// and [`STORE_START_TIMEOUT`].
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Between two readiness probes. A round trip is the cost, so this polls rather than spins.
-const PD_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long the stores have to answer before this gives up on them.
+///
+/// Generous, because a store opens a database and — with `--pd` — registers with the driver
+/// before it binds, and both are slower on a cold cache under load. Bounded, because a start
+/// that never returns and never says why is worse than one that gives up with a name in it.
+const STORE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the supervisor looks at its children while waiting for ctrl-C.
 const SUPERVISE_TICK: Duration = Duration::from_millis(250);
@@ -456,7 +464,7 @@ fn wait_until_the_driver_answers(
                 "the placement driver did not answer on {address} within {within:?}: {refusal}"
             ));
         }
-        std::thread::sleep(PD_PROBE_INTERVAL);
+        std::thread::sleep(PROBE_INTERVAL);
     }
 }
 
@@ -468,7 +476,7 @@ fn ask_the_driver(address: &str) -> Result<(), String> {
     // `request_timeout` bounds the handshake as well as the call, so a socket that accepts and
     // then says nothing costs one probe rather than the transport's default thirty seconds.
     let config = TransportConfig {
-        request_timeout: PD_PROBE_TIMEOUT,
+        request_timeout: PROBE_TIMEOUT,
         ..TransportConfig::new()
     };
     let pd = crate::region::PdConn::connect_with(socket, config)?;
@@ -481,11 +489,87 @@ fn ask_the_driver(address: &str) -> Result<(), String> {
     }
 }
 
+/// Waits until every launched store answers on its own port, or names the first that will not.
+///
+/// # "Nothing has failed yet" is not "everything started"
+///
+/// This replaces a `sleep(250ms)` followed by [`first_child_that_died`], which is a **negative**
+/// assertion behind a wall clock — the shape `docs/plans/debt-c6.md` §9 names three times in this
+/// tree. What it proves is that nothing had failed *by then*, and that is equally true of a store
+/// which has not finished opening.
+///
+/// Measured, with node 1's port already taken and the driver's left free: at no extra load the
+/// bind failure lands inside the 250 ms and `cluster start` correctly refuses in 0.36 s; at eighty
+/// busy threads it does not, and the command prints *4 nodes started*, writes a state file naming
+/// a pid that is already dead, and supervises three nodes it calls four. `stop` then signals
+/// whatever the operating system has since given that pid to — which is the second assertion in
+/// [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`], reached from the other side.
+///
+/// A store that answers `Admin::Regions` has opened its engine, registered with the driver if
+/// there is one, and is serving. That is the event "started" was always meant to name, and it is
+/// waited for here rather than timed.
+fn wait_until_the_stores_answer(
+    children: &mut [(u64, Child)],
+    launched: &[Node],
+    within: Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + within;
+    let mut waiting: Vec<(u64, String)> = launched
+        .iter()
+        .filter(|node| node.id != 0)
+        .map(|node| (node.id, node.address.clone()))
+        .collect();
+    loop {
+        // A child that has exited is the precise answer and it is available at once. Without this
+        // arm a store that cannot open would spend the whole budget failing to connect, and the
+        // message at the end would say "did not answer" where "exited with status 1" is the truth.
+        if let Some(died) = first_child_that_died(children) {
+            return Err(died);
+        }
+        waiting.retain(|(_, address)| ask_a_store(address).is_err());
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let (id, address) = &waiting[0];
+            return Err(format!(
+                "{} did not answer on {address} within {within:?}",
+                what(*id)
+            ));
+        }
+        std::thread::sleep(PROBE_INTERVAL);
+    }
+}
+
+/// One round trip that only a store answers, or why it did not.
+///
+/// `Admin::Regions` for the same reason the driver is asked for its status: it is read-only, it
+/// carries no epoch to be checked against a region the caller has not routed to, and nothing but
+/// a store answers it.
+fn ask_a_store(address: &str) -> Result<(), String> {
+    let socket: SocketAddr = address
+        .parse()
+        .map_err(|error| format!("`{address}` is not an address: {error}"))?;
+    let config = TransportConfig {
+        request_timeout: PROBE_TIMEOUT,
+        ..TransportConfig::new()
+    };
+    let store = esker_proto::BlockingTransport::connect_with(socket, config)
+        .map_err(|error| format!("connecting to {address}: {error}"))?;
+    match store.call(
+        esker_proto::Request::Admin(esker_proto::AdminReq::Regions),
+        std::time::Instant::now() + PROBE_TIMEOUT,
+    ) {
+        Ok(esker_proto::Response::Admin(_)) => Ok(()),
+        Ok(other) => Err(format!(
+            "{address} answered a store's question with {other:?}"
+        )),
+        Err(error) => Err(format!("asking {address} for its regions: {error}")),
+    }
+}
+
 /// The first child that has already exited, described the way an operator needs it.
 fn first_child_that_died(children: &mut [(u64, Child)]) -> Option<String> {
-    // A store that cannot open exits in milliseconds, but not instantly; without this the check
-    // races the thing it is checking and passes because nothing has failed *yet*.
-    std::thread::sleep(Duration::from_millis(250));
     children
         .iter_mut()
         .find_map(|(id, child)| match child.try_wait() {
@@ -616,7 +700,7 @@ mod tests {
 
     use super::{
         DEFAULT_BASE_PORT, Node, address_of, dir_of, first_child_that_died, read_state,
-        wait_until_the_driver_answers, write_state,
+        wait_until_the_driver_answers, wait_until_the_stores_answer, write_state,
     };
     use crate::testserver::{TestPd, TestServer};
 
@@ -750,11 +834,93 @@ mod tests {
         assert!(error.contains("did not answer"), "{error}");
     }
 
+    /// **A node that is alive and not serving is not a node that started**, and the check this
+    /// replaced could not tell the two apart.
+    ///
+    /// The first assertion is the point: `first_child_that_died` — all the announcement gate used
+    /// to consult — answers `None` for a child that is merely alive, which is what let
+    /// `cluster start` print *4 nodes started* over a store still opening (or already doomed and
+    /// not yet reaped). `sleep` stands in for exactly that store: nothing has died, and nothing
+    /// answers either.
+    ///
+    /// It pins this function, not the wiring, and would pass against a gate that still slept and
+    /// counted corpses. The regression for the **gate** is `cluster_start.rs`'s
+    /// `a_node_that_cannot_listen_is_a_failure_and_not_a_cluster`, which is red against that gate
+    /// at forty busy threads and above.
+    #[test]
+    fn a_node_that_is_alive_and_not_serving_is_not_a_started_cluster() {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = free.local_addr().unwrap().to_string();
+        drop(free);
+        let mut children = vec![(1, sleeper())];
+        let launched = vec![Node {
+            id: 1,
+            address: address.clone(),
+            pid: 0,
+        }];
+
+        assert!(
+            first_child_that_died(&mut children).is_none(),
+            "the old gate saw a problem here; this test no longer shows what it could not see"
+        );
+        let error =
+            wait_until_the_stores_answer(&mut children, &launched, Duration::from_millis(300))
+                .expect_err("a node that never answered was reported as started");
+        for (_, mut child) in children {
+            let _ = child.kill();
+        }
+        assert!(error.contains("node 1"), "{error}");
+        assert!(error.contains("did not answer"), "{error}");
+    }
+
+    /// And a store that **is** serving ends the wait, so the check cannot pass by never being
+    /// satisfiable.
+    #[test]
+    fn the_wait_ends_when_every_store_answers() {
+        let store = TestServer::start();
+        let mut children = vec![(1, sleeper())];
+        let launched = vec![Node {
+            id: 1,
+            address: store.addr(),
+            pid: 0,
+        }];
+        let answer = wait_until_the_stores_answer(&mut children, &launched, Duration::from_secs(5));
+        for (_, mut child) in children {
+            let _ = child.kill();
+        }
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
+    /// A store that died is reported **as having died**, not as one that did not answer: the
+    /// exit status is the diagnosis and the silence is only its symptom.
+    #[test]
+    fn a_store_that_exited_is_reported_as_that_rather_than_as_silence() {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = free.local_addr().unwrap().to_string();
+        drop(free);
+        let mut dead = Process::new("false").spawn().unwrap();
+        dead.wait().unwrap();
+        let mut children = vec![(1, dead)];
+        let launched = vec![Node {
+            id: 1,
+            address,
+            pid: 0,
+        }];
+        let error = wait_until_the_stores_answer(&mut children, &launched, Duration::from_secs(5))
+            .expect_err("a store that had exited was reported as started");
+        assert!(error.contains("node 1 exited with"), "{error}");
+    }
+
     /// The check that stands between a store that failed to open and an announcement claiming it
     /// started. `id` zero is the driver, and it is named as such.
     #[test]
     fn a_child_that_has_already_died_is_found_and_named() {
-        let mut children = vec![(0, Process::new("true").spawn().unwrap()), (1, sleeper())];
+        let mut dead = Process::new("true").spawn().unwrap();
+        // Waited for rather than slept past: `first_child_that_died` no longer sleeps 250 ms of
+        // its own, so "it has exited" has to be a fact here and not a hope. `wait` caches the
+        // status, which is what the `try_wait` inside then reads.
+        dead.wait().unwrap();
+        let mut children = vec![(0, dead), (1, sleeper())];
         let gone = first_child_that_died(&mut children).expect("the exited child was not noticed");
         assert!(
             gone.starts_with("the placement driver exited with"),
