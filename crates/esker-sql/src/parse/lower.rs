@@ -544,16 +544,15 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
-                // **`CASCADE` on a `DROP VIEW` is refused rather than ignored**: nothing here
-                // depends on a view yet, but a clause that silently did nothing would be a
-                // promise broken the day something does.
-                ObjectType::View => {
-                    refuse_if(*cascade, "DROP VIEW ... CASCADE")?;
-                    plan::Statement::DropView(plan::DropView {
-                        names,
-                        if_exists: *if_exists,
-                    })
-                }
+                // `CASCADE` was refused here rather than ignored, on the argument that "nothing
+                // depends on a view yet, but a clause that silently did nothing would be a promise
+                // broken the day something does". A view can now depend on a view, so the day
+                // came and the clause does what it says.
+                ObjectType::View => plan::Statement::DropView(plan::DropView {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,

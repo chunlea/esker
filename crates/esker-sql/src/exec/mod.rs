@@ -26,7 +26,7 @@
 
 pub(crate) mod aggregate;
 mod assign;
-mod bind;
+pub(crate) mod bind;
 mod comment;
 mod cursor;
 mod ddl;
