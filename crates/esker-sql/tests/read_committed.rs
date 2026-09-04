@@ -20,59 +20,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::channel;
 use std::time::Duration;
-
-use esker_sql::backend::{Backend, MemoryBackend};
-use esker_sql::catalog::Catalog;
 
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// How long a test waits for the other session to reach its edge before calling it wedged. Long
-/// enough that a loaded container is not a failure, short enough that a genuine hang is one.
-const EDGE: Duration = Duration::from_secs(10);
-
-/// Two sessions on one store, and a channel each way to gate on their transactions' edges.
-struct Pair {
-    store: Arc<dyn Backend>,
-    catalog: Arc<Catalog>,
-}
-
-impl Pair {
-    fn new(fixture: &[&str]) -> Self {
-        let store: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let catalog = Arc::new(Catalog::new());
-        let mut setup = parity::Node::on(Arc::clone(&store), Arc::clone(&catalog), 1, "esker", &[]);
-        for statement in fixture {
-            setup.run(statement).unwrap();
-        }
-        Pair { store, catalog }
-    }
-
-    fn session(&self) -> parity::Node {
-        parity::Node::on(
-            Arc::clone(&self.store),
-            Arc::clone(&self.catalog),
-            1,
-            "esker",
-            &[],
-        )
-    }
-}
-
-/// Waits for the other session to say it has reached an edge, and fails rather than hanging.
-fn edge(from: &Receiver<&'static str>, what: &str) {
-    match from.recv_timeout(EDGE) {
-        Ok(_) => {}
-        Err(error) => panic!("the other session never reached `{what}`: {error}"),
-    }
-}
-
-fn reached(to: &Sender<&'static str>, what: &'static str) {
-    to.send(what).unwrap();
-}
+use parity::{Pair, edge, reached};
 
 /// **The red test for the whole unit.** A holds the row, B blocks, A commits, B proceeds on A's
 /// version — and B's own `COMMIT` succeeds.
@@ -391,4 +345,86 @@ fn the_isolation_level_is_a_session_setting() {
         "read uncommitted" | "read committed"
     ));
     node.run("COMMIT").unwrap();
+}
+
+/// **A statement with no transaction block of its own waits too — and its wait must not reach the
+/// client.**
+///
+/// The restart loop ADR 0057 built lives in the *open-block* branch, so every test above sends a
+/// `BEGIN` before the statement that waits. `ActiveRecord` does not: `update_attribute`,
+/// `increment!` and `touch` are single statements in autocommit, and two workers touching one row
+/// is the ordinary case rather than the exotic one.
+///
+/// What a client saw is the signal itself. `SqlError::StatementMustRestart`'s own comment says it
+/// "reaches a client only if something forgot to catch it, which is exactly an internal error" —
+/// and `XX000` is what an autocommit writer got the moment the transaction in front of it
+/// committed. PostgreSQL answers `UPDATE 1`.
+#[test]
+fn a_waiter_with_no_block_of_its_own_waits_and_then_writes() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A's write is buffered");
+        reached(&b_says, "B is about to write");
+        // No `BEGIN`: one statement, its own transaction, and it blocks on A's lock exactly as a
+        // statement inside a block does.
+        b.run("UPDATE rc SET n = n + 100 WHERE id = 1")
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE rc SET n = n + 1 WHERE id = 1").unwrap();
+    reached(&a_says, "A's write is buffered");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("COMMIT").unwrap();
+
+    waiter
+        .join()
+        .unwrap()
+        .expect("an autocommit UPDATE must wait for A and then write, not report a signal");
+
+    let mut reader = pair.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM rc WHERE id = 1"),
+        [["111"]],
+        "the arithmetic is on A's committed version"
+    );
+}
+
+/// **A session that disappears mid-transaction must not hold its rows forever.**
+///
+/// `Executor::drop` rolls the open transaction back only for a session that made a *temporary
+/// schema*; every other session's transaction is dropped without a `rollback`, so the lock it took
+/// was never given back and the row stayed held for the life of the process. With `lock_timeout`
+/// at PostgreSQL's default of 0 — wait forever — the next writer to that row waits forever, which
+/// is what an abandoned `psql` did to this project once already.
+///
+/// The second session sets a `lock_timeout` on purpose: without one, a regression here **hangs the
+/// test suite** instead of failing it.
+#[test]
+fn a_transaction_dropped_without_rollback_gives_its_locks_back() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    {
+        let mut gone = pair.session();
+        gone.run("BEGIN").unwrap();
+        gone.run("SELECT n FROM rc WHERE id = 1 FOR UPDATE")
+            .unwrap();
+        // No COMMIT and no ROLLBACK: the session ends here, as an abrupt disconnect ends one.
+    }
+
+    let mut next = pair.session();
+    next.run("SET lock_timeout = '2s'").unwrap();
+    next.run("UPDATE rc SET n = 99 WHERE id = 1")
+        .expect("the lock died with the session that took it");
+    assert_eq!(next.rows("SELECT n FROM rc WHERE id = 1"), [["99"]]);
 }

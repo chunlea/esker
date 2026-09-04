@@ -173,22 +173,42 @@ impl LockStrength {
     }
 }
 
+/// What a locking clause does when the row is already held by somebody else.
+///
+/// The three are one decision made three ways, and the difference between them is the whole
+/// content of the modifiers: **wait** for the holder, **refuse** at once, or **leave the row out
+/// of the answer**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    /// The bare clause: block until the holder's transaction ends
+    /// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    Wait,
+    /// `NOWAIT`: `55P03 could not obtain lock on row in relation "x"`, immediately.
+    NoWait,
+    /// `SKIP LOCKED`: the row is not in the answer, and nothing is said about it.
+    SkipLocked,
+}
+
 /// One `FOR UPDATE` / `FOR SHARE` clause. A statement may carry more than one.
 ///
-/// **What it does on this node is what the transaction was going to do anyway.** A Percolator
-/// transaction is snapshot-isolated: it does not block a conflicting writer, it loses to one at
-/// commit with `40001` — the caveat
-/// [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) records as permanent
-/// for as long as this node is snapshot-isolated. So the rows are answered and the ordering the
-/// clause asks for is the one the transaction already enforces, which is a difference no single
-/// session can observe. `NOWAIT` and `SKIP LOCKED` are refused in the lowering, because each of
-/// those *is* observable and this node would answer the wrong thing.
+/// **The rows it names are locked as the statement returns them**
+/// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+/// §5): a `SELECT … FOR UPDATE` takes the same row lock a write takes, so a writer behind it waits
+/// rather than racing it to the commit. Without that, `lock!`-then-`UPDATE` — the whole of
+/// `ActiveRecord`'s pessimistic API — is two sessions proceeding in parallel and one of them
+/// losing at commit with `40001`.
+///
+/// `FOR SHARE` is served as `FOR UPDATE`: stricter than the standard asks for, which costs
+/// concurrency and never correctness, and declared as a divergence rather than approximated in
+/// silence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Locking {
     /// `FOR UPDATE` or `FOR SHARE`.
     pub strength: LockStrength,
     /// `OF x` — the relation to lock, **as the query refers to it**, or `None` for all of them.
     pub of: Option<String>,
+    /// `NOWAIT`, `SKIP LOCKED`, or neither.
+    pub wait: LockWait,
 }
 
 /// `SELECT`, as written.
@@ -233,9 +253,10 @@ pub struct Select {
     pub offset: Option<Expr>,
     /// `FOR UPDATE` / `FOR SHARE`, in the order written. Empty for a statement with none.
     ///
-    /// Carried rather than dropped even though the executor reads nothing from it: a clause the
-    /// user wrote belongs in the plan whether or not this node's isolation makes it a no-op, and
-    /// it is what a pessimistic-lock implementation would take its rows from. See [`Locking`].
+    /// **What the executor locks.** `crate::exec::query::finish_plan` turns each entry into the
+    /// key columns of the relation it names — carried through the projection as junk columns the
+    /// client never sees — and the executor takes a row lock per row before it answers. See
+    /// [`Locking`].
     pub locking: Vec<Locking>,
 }
 

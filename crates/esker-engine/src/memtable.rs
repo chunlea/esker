@@ -1,72 +1,69 @@
 //! The in-memory half of the log-structured design: a sorted map of internal keys.
 //!
 //! Every write lands here after its bytes are in the log, and stays until the memtable is
-//! flushed to an SST. It is a `crossbeam-skiplist` map — the one piece of concurrent code the
-//! project buys rather than writes (`CLAUDE.md`, "Dependency policy") — because a lock-free
-//! ordered map that supports concurrent readers during a write is exactly the hard part, and
-//! an in-house arena skiplist is a post-v1 replacement behind this same surface.
+//! flushed to an SST. Since [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) it is
+//! an in-house arena skiplist — `skiplist::SkipList`. It was `crossbeam-skiplist`, the last
+//! piece of concurrent code the project bought rather than wrote; that dependency is gone, and
+//! with it three crates from the runtime budget.
 //!
 //! # Nothing is ever removed
 //!
 //! A delete is an *insert* of a tombstone, and a memtable's entries are never taken out of it.
-//! Two things depend on that. Older versions of a key may still exist in lower levels, so only
-//! a stored tombstone can hide them; and an iterator holds a position in the map, so removing
-//! an entry underneath it would break the snapshot it thinks it has. Memtables die whole,
-//! after a flush, and never piecemeal.
+//! Three things depend on that. Older versions of a key may still exist in lower levels, so only
+//! a stored tombstone can hide them; an iterator holds a position in the map, so removing an
+//! entry underneath it would break the snapshot it thinks it has; and the arena store frees
+//! nothing until the last `Arc<MemTable>` goes, which is what makes its cursor a borrow rather
+//! than a copy. Memtables die whole, after a flush, and never piecemeal.
 //!
 //! # Ordering
 //!
-//! `crossbeam-skiplist` orders by the key type's [`Ord`], but the order the engine needs is
-//! chosen at runtime — a column family carries its own comparator. So each key carries a
-//! handle to the comparator and delegates to it. That is one `Arc` clone per
-//! insert, which the in-house skiplist will remove by holding the comparator once per table.
+//! Internal keys, ordered by the column family's comparator: user key ascending, then the tag
+//! descending, so the newest version of a key sorts first and one seek answers a point read.
+//! The store holds the comparator once, on the table, rather than once per key.
+
+mod arena;
+mod skiplist;
+mod store;
+
+#[cfg(test)]
+mod differential;
 
 use std::cmp::Ordering;
-use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-use crossbeam_skiplist::SkipMap;
-use crossbeam_skiplist::map::Entry as SkipEntry;
+use store::Store;
 
+use crate::error::{Error, Result};
 use crate::range_del::{RangeTombstone, RangeTombstones};
 
 use crate::dbformat::{
-    Comparator, EntryKind, InternalKeyComparator, SeqNo, append_internal_key, extract_user_key,
-    lookup_key, split_internal_key,
+    EntryKind, InternalKeyComparator, SeqNo, extract_user_key, lookup_key, pack_tag,
+    split_internal_key,
 };
 
-/// Bytes charged per entry on top of its key and value, to account for the skiplist node, the
-/// two `Vec` headers and the comparator handle. Approximate on purpose: it decides when to
-/// flush, and being a little wrong there costs a slightly early or late flush and nothing else.
+/// Which store the engine uses.
+///
+/// The one line ADR 0041's decision lives on. It had two candidates while the benchmark was
+/// being taken and now has one, and the seam is kept rather than inlined because the number that
+/// came out was mixed: `docs/bench/skiplist.md` records an eighteen-fold cheaper scan against an
+/// insert between 1.2 and 1.8 times dearer. If someone takes that insert on — `LevelDB`'s layout,
+/// with the key bytes inside the node's own allocation, is the obvious next thing to try — this
+/// is what keeps the attempt to one file.
+type Selected = skiplist::SkipList;
+
+/// Where a cursor is, in whichever store [`Selected`] names.
+type Position = <Selected as Store>::Pos;
+
+/// Bytes charged per entry on top of its key and value, to account for the node and its
+/// forward pointers. Approximate on purpose: it decides when to flush, and being a little wrong
+/// there costs a slightly early or late flush and nothing else.
+///
+/// Deliberately unchanged across ADR 0041, although the arena node is much smaller than the
+/// `crossbeam-skiplist` one plus its two `Vec` headers and its comparator handle. The number
+/// decides when every flush in the engine fires, and changing the storage and the flush
+/// schedule in one commit would leave no way to tell which of them moved a benchmark.
 const ENTRY_OVERHEAD: usize = 64;
-
-/// An internal key ordered by its column family's comparator.
-#[derive(Debug, Clone)]
-struct MemKey {
-    bytes: Vec<u8>,
-    order: Arc<InternalKeyComparator>,
-}
-
-impl Ord for MemKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.order.cmp(&self.bytes, &other.bytes)
-    }
-}
-
-impl PartialOrd for MemKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for MemKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for MemKey {}
 
 /// What a memtable knows about a key.
 ///
@@ -101,43 +98,94 @@ pub enum Lookup {
 /// rather than seeking within them.
 #[derive(Debug)]
 pub struct MemTable {
-    map: SkipMap<MemKey, Vec<u8>>,
+    store: Selected,
     range_tombstones: Mutex<RangeTombstones>,
-    comparator: Arc<InternalKeyComparator>,
     approximate_size: AtomicUsize,
 }
 
 impl MemTable {
     /// An empty memtable ordered by `comparator`.
+    ///
+    /// Uses the default height seed. Deterministic, which is what a replay needs; a caller that
+    /// wants a stream of its own — the simulator, or a test replaying a failure — takes
+    /// [`MemTable::with_seed`].
     pub fn new(comparator: Arc<InternalKeyComparator>) -> Self {
+        Self::with_seed(comparator, skiplist::DEFAULT_SEED)
+    }
+
+    /// An empty memtable whose node heights are drawn from `seed`.
+    ///
+    /// A memtable's shape is a function of its seed, so a failing test replays from one.
+    /// `crossbeam-skiplist` drew from thread-local entropy and could not, which is the
+    /// difference ADR 0041 was after; this is the way in for `esker-sim` and for a proptest
+    /// that wants to pin a shape.
+    pub fn with_seed(comparator: Arc<InternalKeyComparator>, seed: u64) -> Self {
         Self {
-            map: SkipMap::new(),
+            // Through the trait, not the inherent `new`: this file must not compile against
+            // anything but [`Store`]. See [`MemTable::store`].
+            store: <Selected as Store>::new(comparator, seed),
             range_tombstones: Mutex::new(RangeTombstones::new()),
-            comparator,
             approximate_size: AtomicUsize::new(0),
         }
     }
 
-    /// The comparator this table is ordered by. Iterators and merge iterators need it.
-    pub fn comparator(&self) -> &Arc<InternalKeyComparator> {
-        &self.comparator
+    /// A memtable whose arena gives up after a few dozen bytes, so a test can reach the
+    /// exhaustion path without allocating four gigabytes to get there.
+    #[cfg(test)]
+    pub(crate) fn cramped(comparator: Arc<InternalKeyComparator>, seed: u64) -> Self {
+        Self {
+            store: skiplist::SkipList::cramped(comparator, seed),
+            range_tombstones: Mutex::new(RangeTombstones::new()),
+            approximate_size: AtomicUsize::new(0),
+        }
     }
 
-    /// Inserts one entry. Takes `&self`: writers hold no lock over the map, and readers keep
-    /// working while this runs.
-    pub fn add(&self, seqno: SeqNo, kind: EntryKind, key: &[u8], value: &[u8]) {
-        let mut bytes = Vec::with_capacity(key.len() + 8);
-        append_internal_key(key, seqno, kind, &mut bytes);
-        let charge = bytes.len() + value.len() + ENTRY_OVERHEAD;
-        self.map.insert(
-            MemKey {
-                bytes,
-                order: Arc::clone(&self.comparator),
-            },
-            value.to_vec(),
-        );
+    /// The store, seen only as a [`Store`].
+    ///
+    /// Opaque on purpose. Reaching `self.store` directly would resolve to whichever inherent
+    /// method [`Selected`]'s concrete type happens to have, and this file would quietly depend
+    /// on the implementation rather than on the surface — so changing that one line would stop
+    /// compiling instead of just switching stores. Through here, only [`Store`] is visible.
+    fn store(&self) -> &impl Store<Pos = Position> {
+        &self.store
+    }
+
+    /// The comparator this table is ordered by. Iterators and merge iterators need it.
+    pub fn comparator(&self) -> &Arc<InternalKeyComparator> {
+        self.store().comparator()
+    }
+
+    /// Inserts one entry. Takes `&self`: readers keep working while this runs.
+    ///
+    /// The key goes in as a user key and a tag rather than as one joined buffer, which is what
+    /// keeps the insert free of an allocation the arena would only copy out of again.
+    ///
+    /// The store refuses an insert only when its arena's four-gigabyte offset space is
+    /// exhausted, which needs a single memtable four gigabytes deep — sixty-four times the
+    /// default `write_buffer_size`, and past the point where the batch that carried it would
+    /// have exhausted memory first. It is reported rather than swallowed, and the size is still
+    /// charged so the flush that would relieve it still fires.
+    pub fn add(&self, seqno: SeqNo, kind: EntryKind, key: &[u8], value: &[u8]) -> Result<()> {
+        let tag = pack_tag(seqno, kind).to_le_bytes();
+        let charge = key.len() + tag.len() + value.len() + ENTRY_OVERHEAD;
+        if !self.store().insert(key, &tag, value) {
+            // **A refusal is an error value, not a log line.** The arena is full, the entry is
+            // not stored, and the caller is part-way through a write group whose bytes are
+            // already in the log — so a caller that carried on would acknowledge a write this
+            // table does not hold, which is `CLAUDE.md` invariant 1 broken silently. It used to
+            // log at `error!` and return, and it also charged `approximate_size` for the entry
+            // it had just failed to store, so the table over-reported its size on the way to
+            // losing data.
+            return Err(Error::Unsupported(format!(
+                "the memtable arena is full: seqno {seqno}, a {}-byte key and a {}-byte value \
+                 were not stored",
+                key.len(),
+                value.len()
+            )));
+        }
         self.approximate_size
             .fetch_add(charge, AtomicOrdering::Relaxed);
+        Ok(())
     }
 
     /// Records that `[begin, end)` was deleted at `seqno`.
@@ -152,7 +200,7 @@ impl MemTable {
         if let Ok(mut tombstones) = self.range_tombstones.lock() {
             tombstones.push(
                 RangeTombstone::new(begin.to_vec(), end.to_vec(), seqno),
-                self.comparator.user_comparator().as_ref(),
+                self.comparator().user_comparator().as_ref(),
             );
         }
         self.approximate_size
@@ -189,11 +237,13 @@ impl MemTable {
     /// One seek answers this, because internal keys sort newest-first within a user key: the
     /// first entry at or after `(user_key, snapshot)` is already the answer.
     pub fn get(&self, user_key: &[u8], snapshot: SeqNo) -> Option<Lookup> {
-        let target = self.key(lookup_key(user_key, snapshot));
-        let entry = self.map.lower_bound(Bound::Included(&target))?;
-        let internal = entry.key().bytes.as_slice();
+        let position = self.store().seek(&lookup_key(user_key, snapshot));
+        if !self.store().valid(&position) {
+            return None;
+        }
+        let internal = self.store().key(&position);
         if self
-            .comparator
+            .comparator()
             .user_comparator()
             .cmp(extract_user_key(internal), user_key)
             != Ordering::Equal
@@ -202,7 +252,7 @@ impl MemTable {
         }
         match split_internal_key(internal) {
             Some((_, seqno, EntryKind::Put)) => Some(Lookup::Found {
-                value: entry.value().clone(),
+                value: self.store().value(&position).to_vec(),
                 seqno,
             }),
             // `DeleteRange` never reaches the map — `add_range` puts it in the tombstone list
@@ -223,7 +273,7 @@ impl MemTable {
 
     /// How many entries the table holds, tombstones included.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.store().len()
     }
 
     /// Whether nothing has been written to this table — **range deletes included**.
@@ -233,24 +283,18 @@ impl MemTable {
     /// empty" would drop the deletes on the floor at the next memtable switch
     /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && !self.has_range_tombstones()
+        self.store().len() == 0 && !self.has_range_tombstones()
     }
 
     /// A cursor over the table, positioned nowhere until it is seeked.
     ///
     /// Takes an `Arc` and keeps it: a cursor outlives the memtable switch that retires the
-    /// table it is reading, which is what lets a scan carry on across a flush.
+    /// table it is reading, which is what lets a scan carry on across a flush — and, with the
+    /// arena store, it is also what keeps the bytes the cursor points at alive.
     pub fn iter(self: &Arc<Self>) -> MemTableIter {
         MemTableIter {
             table: Arc::clone(self),
-            current: None,
-        }
-    }
-
-    fn key(&self, bytes: Vec<u8>) -> MemKey {
-        MemKey {
-            bytes,
-            order: Arc::clone(&self.comparator),
+            position: Position::default(),
         }
     }
 }
@@ -260,34 +304,33 @@ impl MemTable {
 /// The shape every iterator in the engine shares (`docs/DESIGN.md` §4.1), so that the merge
 /// iterator can drive memtables and SSTs through the same calls.
 ///
-/// # Why it navigates by key
+/// # Why it holds a position and not an entry
 ///
-/// `crossbeam-skiplist` hands out entries that borrow the map, so a cursor built from one
-/// would have to hold both the `Arc<MemTable>` and a reference into it — a self-referential
-/// struct, which in safe Rust means either a lifetime the caller has to thread through
-/// everything above, or a crate we are not allowed to add. Instead the cursor remembers its
-/// position as a key and re-finds it, which makes each step `O(log n)` and copies the entry
-/// it lands on.
+/// It holds an `Arc<MemTable>` and a position in that table's store, and reads through both.
+/// With the arena store that position is a node offset and [`MemTableIter::key`] borrows
+/// straight out of the arena, so a step is a pointer hop with no allocation. The arena is owned
+/// by the `MemTable` the `Arc` keeps alive, which is the whole lifetime argument: the borrow
+/// cannot outlive the bytes because it cannot outlive the table.
 ///
-/// That is a real cost and it is taken deliberately: `CLAUDE.md` says to prefer safe code and
-/// to optimise after a profile. `TODO(post-v1)`: the in-house arena skiplist that replaces
-/// this one can hand out an owned cursor, and this goes back to `O(1)`.
+/// That is what [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) was for.
+/// `crossbeam-skiplist` handed out entries that borrow the map, so a cursor built from one would
+/// have been self-referential; its position was a copy of the entry and every step re-found the
+/// key, which is `O(log n)` and an allocation.
 #[derive(Debug)]
 pub struct MemTableIter {
     table: Arc<MemTable>,
-    /// The entry under the cursor: its internal key and its value.
-    current: Option<(Vec<u8>, Vec<u8>)>,
+    position: Position,
 }
 
 impl MemTableIter {
     /// Whether the cursor is on an entry.
     pub fn valid(&self) -> bool {
-        self.current.is_some()
+        self.table.store().valid(&self.position)
     }
 
     /// The internal key under the cursor, empty when the cursor is not valid.
     pub fn key(&self) -> &[u8] {
-        self.current.as_ref().map_or(&[], |(key, _)| key.as_slice())
+        self.table.store().key(&self.position)
     }
 
     /// The user key under the cursor, without its tag.
@@ -297,55 +340,38 @@ impl MemTableIter {
 
     /// The value under the cursor, empty for a tombstone or an invalid cursor.
     pub fn value(&self) -> &[u8] {
-        self.current
-            .as_ref()
-            .map_or(&[], |(_, value)| value.as_slice())
+        self.table.store().value(&self.position)
     }
 
     /// Positions the cursor on the first entry at or after `target` (an internal key).
     pub fn seek(&mut self, target: &[u8]) {
-        let key = self.table.key(target.to_vec());
-        self.current = take(self.table.map.lower_bound(Bound::Included(&key)));
+        self.position = self.table.store().seek(target);
     }
 
     /// Positions the cursor on the last entry at or before `target` (an internal key).
     pub fn seek_for_prev(&mut self, target: &[u8]) {
-        let key = self.table.key(target.to_vec());
-        self.current = take(self.table.map.upper_bound(Bound::Included(&key)));
+        self.position = self.table.store().seek_for_prev(target);
     }
 
     /// Positions the cursor on the first entry.
     pub fn seek_to_first(&mut self) {
-        self.current = take(self.table.map.front());
+        self.position = self.table.store().first();
     }
 
     /// Positions the cursor on the last entry.
     pub fn seek_to_last(&mut self) {
-        self.current = take(self.table.map.back());
+        self.position = self.table.store().last();
     }
 
     /// Advances forward. Becomes invalid past the end; a no-op when already invalid.
     pub fn next(&mut self) {
-        let Some((key, _)) = self.current.take() else {
-            return;
-        };
-        let key = self.table.key(key);
-        self.current = take(self.table.map.lower_bound(Bound::Excluded(&key)));
+        self.position = self.table.store().after(&self.position);
     }
 
     /// Steps backward. Becomes invalid before the start; a no-op when already invalid.
     pub fn prev(&mut self) {
-        let Some((key, _)) = self.current.take() else {
-            return;
-        };
-        let key = self.table.key(key);
-        self.current = take(self.table.map.upper_bound(Bound::Excluded(&key)));
+        self.position = self.table.store().before(&self.position);
     }
-}
-
-/// Copies an entry out of the skiplist, which is what makes the cursor owned.
-fn take(entry: Option<SkipEntry<'_, MemKey, Vec<u8>>>) -> Option<(Vec<u8>, Vec<u8>)> {
-    entry.map(|entry| (entry.key().bytes.clone(), entry.value().clone()))
 }
 
 impl crate::iterator::Cursor for MemTableIter {
@@ -386,13 +412,68 @@ impl crate::iterator::Cursor for MemTableIter {
     }
 
     /// A memtable lives in memory: there is nothing that can fail to be read.
-    fn status(&self) -> crate::error::Result<()> {
+    fn status(&self) -> Result<()> {
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// **An arena that refuses is an error the caller must see, not a log line.**
+    ///
+    /// `add` used to answer `()`. When the arena was full it logged at `error!`, charged
+    /// `approximate_size` for the entry it had just failed to store, and returned — so the write
+    /// group carried on and the write was acknowledged while the table did not hold it. The bytes
+    /// were already in the log by then, which is what makes it silent rather than merely wrong:
+    /// nothing on the read path could tell the entry from one that was never written.
+    ///
+    /// Unreachable in practice at four gigabytes in one memtable, and `Chunks::cramped` is how a
+    /// test reaches it without allocating them (`docs/plans/debt-c6.md` §15).
+    #[test]
+    fn a_full_arena_is_an_error_and_not_a_lost_entry() {
+        let table = Arc::new(MemTable::cramped(
+            Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator))),
+            7,
+        ));
+        let mut stored = 0u32;
+        let refusal = loop {
+            let key = format!("k{stored:04}");
+            match table.add(
+                u64::from(stored) + 1,
+                EntryKind::Put,
+                key.as_bytes(),
+                b"value",
+            ) {
+                Ok(()) => stored += 1,
+                Err(error) => break error,
+            }
+            assert!(
+                stored < 10_000,
+                "a cramped arena accepted {stored} entries without refusing"
+            );
+        };
+        assert!(
+            matches!(refusal, crate::error::Error::Unsupported(ref detail) if detail.contains("arena is full")),
+            "a refusal must say what happened: {refusal:?}"
+        );
+        assert!(stored > 0, "the arena refused before it stored anything");
+
+        // And the size it reports is what it actually holds: the refused entry is not charged.
+        // The old code added the charge and then dropped the entry, so a table that was losing
+        // data also over-reported how much of it there was.
+        let mut counted = 0usize;
+        let mut cursor = table.iter();
+        cursor.seek_to_first();
+        while cursor.valid() {
+            counted += 1;
+            cursor.next();
+        }
+        assert_eq!(
+            counted, stored as usize,
+            "the table holds every entry `add` accepted and no more"
+        );
+    }
     use super::{Lookup, MemTable};
     use crate::dbformat::{
         BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, internal_key,
@@ -431,7 +512,9 @@ mod tests {
     #[test]
     fn a_put_is_visible_at_and_above_its_sequence_number() {
         let table = table();
-        table.add(5, EntryKind::Put, b"key", b"value");
+        table
+            .add(5, EntryKind::Put, b"key", b"value")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"key", 5), Some(found(b"value", 5)));
         assert_eq!(table.get(b"key", 100), Some(found(b"value", 5)));
         assert_eq!(
@@ -446,9 +529,15 @@ mod tests {
     #[test]
     fn snapshots_see_the_version_that_was_current() {
         let table = table();
-        table.add(1, EntryKind::Put, b"k", b"one");
-        table.add(2, EntryKind::Put, b"k", b"two");
-        table.add(3, EntryKind::Put, b"k", b"three");
+        table
+            .add(1, EntryKind::Put, b"k", b"one")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Put, b"k", b"two")
+            .expect("a real arena does not refuse this");
+        table
+            .add(3, EntryKind::Put, b"k", b"three")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"k", 3), Some(found(b"three", 3)));
         assert_eq!(table.get(b"k", 2), Some(found(b"two", 2)));
         assert_eq!(table.get(b"k", 1), Some(found(b"one", 1)));
@@ -460,8 +549,12 @@ mod tests {
     #[test]
     fn a_tombstone_is_not_the_same_as_an_absence() {
         let table = table();
-        table.add(1, EntryKind::Put, b"k", b"value");
-        table.add(2, EntryKind::Delete, b"k", b"");
+        table
+            .add(1, EntryKind::Put, b"k", b"value")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Delete, b"k", b"")
+            .expect("a real arena does not refuse this");
         assert_eq!(table.get(b"k", 2), Some(Lookup::Deleted));
         assert_eq!(table.get(b"k", 1), Some(found(b"value", 1)));
         assert_eq!(table.get(b"gone", 2), None, "never written is not deleted");
@@ -471,10 +564,18 @@ mod tests {
     #[test]
     fn iteration_is_user_key_ascending_then_newest_first() {
         let table = table();
-        table.add(1, EntryKind::Put, b"b", b"");
-        table.add(2, EntryKind::Put, b"a", b"");
-        table.add(3, EntryKind::Put, b"a", b"");
-        table.add(4, EntryKind::Delete, b"c", b"");
+        table
+            .add(1, EntryKind::Put, b"b", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(2, EntryKind::Put, b"a", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(3, EntryKind::Put, b"a", b"")
+            .expect("a real arena does not refuse this");
+        table
+            .add(4, EntryKind::Delete, b"c", b"")
+            .expect("a real arena does not refuse this");
         assert_eq!(
             walk(&table),
             vec![
@@ -490,7 +591,9 @@ mod tests {
     fn seek_and_seek_for_prev_land_on_the_right_side() {
         let table = table();
         for (seqno, key) in [(1u64, "a"), (2, "c"), (3, "e")] {
-            table.add(seqno, EntryKind::Put, key.as_bytes(), b"");
+            table
+                .add(seqno, EntryKind::Put, key.as_bytes(), b"")
+                .expect("a real arena does not refuse this");
         }
         let mut iter = table.iter();
 
@@ -513,7 +616,9 @@ mod tests {
     fn the_cursor_walks_both_ways() {
         let table = table();
         for key in ["a", "b", "c"] {
-            table.add(1, EntryKind::Put, key.as_bytes(), key.as_bytes());
+            table
+                .add(1, EntryKind::Put, key.as_bytes(), key.as_bytes())
+                .expect("a real arena does not refuse this");
         }
         let mut iter = table.iter();
         iter.seek_to_last();
@@ -548,10 +653,14 @@ mod tests {
     fn approximate_size_grows_with_every_entry() {
         let table = table();
         assert_eq!(table.approximate_size(), 0);
-        table.add(1, EntryKind::Put, b"key", b"value");
+        table
+            .add(1, EntryKind::Put, b"key", b"value")
+            .expect("a real arena does not refuse this");
         let after_one = table.approximate_size();
         assert!(after_one >= 3 + 8 + 5, "key, tag and value are all charged");
-        table.add(2, EntryKind::Delete, b"key", b"");
+        table
+            .add(2, EntryKind::Delete, b"key", b"")
+            .expect("a real arena does not refuse this");
         assert!(
             table.approximate_size() > after_one,
             "a tombstone occupies memory too"
@@ -568,11 +677,15 @@ mod tests {
         for seqno in 1u64..40 {
             let key = keys[(seqno % 3) as usize];
             if seqno % 5 == 0 {
-                table.add(seqno, EntryKind::Delete, key, b"");
+                table
+                    .add(seqno, EntryKind::Delete, key, b"")
+                    .expect("a real arena does not refuse this");
                 model.insert((key.to_vec(), seqno), None);
             } else {
                 let value = format!("v{seqno}").into_bytes();
-                table.add(seqno, EntryKind::Put, key, &value);
+                table
+                    .add(seqno, EntryKind::Put, key, &value)
+                    .expect("a real arena does not refuse this");
                 model.insert((key.to_vec(), seqno), Some(value));
             }
         }
@@ -602,14 +715,25 @@ mod tests {
     /// rather than a locked map.
     #[test]
     fn readers_and_writers_run_concurrently() {
+        // Miri interprets every instruction, and four readers each walking a two-thousand-entry
+        // list five hundred times is millions of them. Small is still meaningful here: what Miri
+        // is looking for is a missing happens-before edge, and one insert either has it or does
+        // not. Without this, `cargo miri test -- memtable` never finishes.
+        #[cfg(miri)]
+        const ROUNDS: u64 = 20;
+        #[cfg(not(miri))]
+        const ROUNDS: u64 = 500;
+
         let table = table();
         let writers: Vec<_> = (0..4u64)
             .map(|worker| {
                 let table = Arc::clone(&table);
                 std::thread::spawn(move || {
-                    for i in 0..500u64 {
+                    for i in 0..ROUNDS {
                         let key = format!("key-{:04}", i % 100);
-                        table.add(worker * 1000 + i + 1, EntryKind::Put, key.as_bytes(), b"v");
+                        table
+                            .add(worker * 1000 + i + 1, EntryKind::Put, key.as_bytes(), b"v")
+                            .expect("a real arena does not refuse this");
                     }
                 })
             })
@@ -622,7 +746,7 @@ mod tests {
                     // is little-endian and sorts descending, so `previous < key` on the raw
                     // bytes is exactly the mistake this crate exists to avoid.
                     let order = Arc::clone(table.comparator());
-                    for _ in 0..500 {
+                    for _ in 0..ROUNDS {
                         let mut iter = table.iter();
                         iter.seek_to_first();
                         let mut previous: Option<Vec<u8>> = None;
@@ -645,6 +769,10 @@ mod tests {
         for handle in writers.into_iter().chain(readers) {
             handle.join().unwrap();
         }
-        assert_eq!(table.len(), 2000, "every insert is present");
+        assert_eq!(
+            table.len(),
+            4 * usize::try_from(ROUNDS).unwrap(),
+            "every insert is present"
+        );
     }
 }

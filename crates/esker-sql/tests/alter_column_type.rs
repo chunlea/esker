@@ -58,17 +58,15 @@ fn every_alter_column_type_answer_is_postgresql_19_s() {
 ///
 /// Run 59 ranked `CREATE UNLOGGED is not supported` at 10 tests over 2 files. The keyword is cut
 /// out of the source and the statement parses (`crate::parse::strip_unlogged`), `relpersistence`
-/// answers `u`, and none of that changed in this unit — what those ten tests actually hit is a
-/// **virtual generated column**, which this parser has no grammar for. The refusal table matched
-/// `CREATE UNLOGGED` on the original words and reported that instead, sending the reader to a
-/// feature that works.
+/// answers `u`, and none of that changed in that unit — what those ten tests actually hit was a
+/// **virtual generated column**, which the refusal table then mis-named.
 ///
-/// The rule counts rather than searches, because one `CREATE TABLE` declares both kinds: the
-/// suite's `virtual_columns` has three `STORED` columns and two virtual ones.
+/// The refusal it was renamed to has since been implemented
+/// (`tests/virtual_generated_column.rs`), so what this test guards now is the half that was true
+/// all along: unlogged tables work, and `relpersistence` tells them apart.
 #[test]
-fn an_unlogged_table_works_and_a_virtual_column_names_itself() {
+fn an_unlogged_table_works_and_reports_its_persistence() {
     let mut node = parity::Node::new(&[]);
-    // Unlogged, with a stored generated column: this has worked all along.
     node.run(
         "CREATE UNLOGGED TABLE vc (id bigint PRIMARY KEY, c1 integer, c2 integer GENERATED ALWAYS \
          AS (c1 + 1) STORED)",
@@ -85,21 +83,15 @@ fn an_unlogged_table_works_and_a_virtual_column_names_itself() {
         [["p"]]
     );
 
-    // A virtual generated column names **itself**, in both spellings and on both persistences —
-    // and in a table that also has a stored one, which is the case the first rule missed.
+    // And the mixed table that broke the first refusal rule now simply works, on both
+    // persistences — three stored columns and two virtual ones in one statement.
     for written in [
         "CREATE TABLE v1 (id bigint PRIMARY KEY, c1 integer, c3 integer GENERATED ALWAYS AS (c1 + \
          2))",
-        "CREATE TABLE v2 (id bigint PRIMARY KEY, c1 integer, c3 integer GENERATED ALWAYS AS (c1 + \
-         2) VIRTUAL)",
         "CREATE UNLOGGED TABLE v3 (id bigint PRIMARY KEY, c1 integer, c2 integer GENERATED ALWAYS \
          AS (c1 + 1) STORED, c3 integer GENERATED ALWAYS AS (c1 + 2) VIRTUAL)",
     ] {
-        let error = node.run(written).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "for {written}");
-        assert!(
-            error.to_string().contains("virtual generated column"),
-            "the refusal names the real gap rather than UNLOGGED: {error}"
-        );
+        node.run(written)
+            .unwrap_or_else(|error| panic!("{written}: {error}"));
     }
 }

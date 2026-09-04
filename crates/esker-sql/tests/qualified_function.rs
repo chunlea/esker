@@ -80,10 +80,13 @@ fn the_qualifier_matches_the_way_a_schema_name_does() {
 #[test]
 fn a_missing_function_is_refused_under_its_bare_name() {
     let mut node = parity::Node::new(&[]);
-    let error = node.run("SELECT pg_catalog.length('abc')").unwrap_err();
+    // `length` used to be the example here and is implemented now, so the test uses one that is
+    // still missing — the property under test is the *naming*, not which function is absent.
+    assert_eq!(node.rows("SELECT pg_catalog.length('abc')"), [["3"]]);
+    let error = node.run("SELECT pg_catalog.soundex('abc')").unwrap_err();
     assert_eq!(error.sqlstate(), "0A000");
     assert!(
-        error.to_string().contains("the function length"),
-        "the refusal names `length`, not the qualified spelling: {error}"
+        error.to_string().contains("the function soundex"),
+        "the refusal names `soundex`, not the qualified spelling: {error}"
     );
 }

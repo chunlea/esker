@@ -120,6 +120,12 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
         // Nothing is written for a NULL; the bitmap is what records it.
         Datum::Null => {}
+        // **Sixteen bytes and no length header**, which is exactly what `pg_type.typlen` reports
+        // for a `point`: the two coordinates, `x` first.
+        Datum::Point { x, y } => {
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
         Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -319,6 +325,18 @@ impl RowSchema {
 fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let truncated = || corrupt(format!("a {ty:?} is truncated"));
     Ok(match ty {
+        // The sixteen bytes `encode_column` wrote: `x` then `y`, little-endian.
+        ColumnType::Point => {
+            let (head, rest) = bytes.split_first_chunk::<16>().ok_or_else(truncated)?;
+            let (x, y) = head.split_at(8);
+            (
+                Datum::Point {
+                    x: f64::from_le_bytes(x.try_into().unwrap_or([0; 8])),
+                    y: f64::from_le_bytes(y.try_into().unwrap_or([0; 8])),
+                },
+                rest,
+            )
+        }
         ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Double => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
             let value = match ty {
@@ -379,6 +397,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
+        | ColumnType::PointArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -544,7 +563,11 @@ pub fn unique_index_key_is_unique_by_value(columns: &[Datum]) -> bool {
 
 fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
     match value {
-        Datum::Null => {}
+        // Nothing is written for a NULL — the bitmap records it — nor for a **point**, which is
+        // not an index key at all: `point = point` is `42883` on a real server and a key space
+        // needs an order the type does not have. The column type is refused in
+        // `decode_key_column`, which is where the error a caller sees comes from.
+        Datum::Null | Datum::Point { .. } => {}
         Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
             codec::encode_i64(*v, out);
         }
@@ -911,6 +934,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
+        | ColumnType::PointArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1030,6 +1054,11 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // deduplicates correctly without one.
         ColumnType::Json
         | ColumnType::Jsonb
+        // **A point joins them with the sharpest reason of the four**: `json` has no equality
+        // with another type, an hstore's *order* is not its text's, a range's order is not its
+        // canonical text's — and a point has no equality even with itself, so there is no order
+        // for a key to reproduce at all.
+        | ColumnType::Point
         | ColumnType::Hstore
         | ColumnType::HstoreArray
         | ColumnType::JsonArray
@@ -1632,6 +1661,12 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            // **Every `f64` including the ones that are not numbers**, because the round trip is
+            // over the bits: a point holding `NaN` is a row a client can write and has to read
+            // back unchanged.
+            ColumnType::Point => (any::<f64>(), any::<f64>())
+                .prop_map(|(x, y)| Datum::Point { x, y })
+                .boxed(),
             ColumnType::Int4 => any::<i32>().prop_map(Datum::Int4).boxed(),
             ColumnType::Date => any::<i32>().prop_map(Datum::Date).boxed(),
             // The whole closed range, both ends included, because `24:00:00` is a value.
@@ -1681,6 +1716,7 @@ mod tests {
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
+            | ColumnType::PointArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray

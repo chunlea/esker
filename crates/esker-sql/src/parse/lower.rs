@@ -114,6 +114,31 @@ impl Parsed {
                 )?);
             }
         }
+        // Which generated columns were `VIRTUAL`: the rewritten tree says `STORED` for all of
+        // them, so the flags are applied here, in the order the clauses appeared in the source.
+        // The lowering walks a table's columns in that same order, which is what makes an index
+        // into the flag list line up with a column.
+        let mut virtual_flags = self.virtual_generated().iter().copied();
+        let mut mark = |columns: &mut Vec<plan::Column>| {
+            for column in columns {
+                if column.generated.is_some() {
+                    column.generated_virtual = virtual_flags.next().unwrap_or(false);
+                }
+            }
+        };
+        match &mut lowered {
+            plan::Statement::CreateTable(create) => mark(&mut create.columns),
+            plan::Statement::AlterTable(alter) => {
+                for action in &mut alter.actions {
+                    if let plan::AlterTableAction::AddColumn { column, .. } = action
+                        && column.generated.is_some()
+                    {
+                        column.generated_virtual = virtual_flags.next().unwrap_or(false);
+                    }
+                }
+            }
+            _ => {}
+        }
         // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
         // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
         if let plan::Statement::CreateType(create) = &mut lowered {
@@ -1969,6 +1994,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             default,
             sequence,
             generated,
+            // Applied by `Parsed::lower`, which is the only place that can see which spelling the
+            // source used: the tree it lowers says `STORED` for every one of them.
+            generated_virtual: false,
         });
     }
 
@@ -2226,6 +2254,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         )?;
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
+        let mut generated: Option<String> = None;
         let mut default = None;
         for option in &column_def.options {
             let named = match &option.option {
@@ -2262,6 +2291,33 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 }
                 ColumnOption::NotNull => {
                     not_null = true;
+                    continue;
+                }
+                // A generated column added by `ALTER`, which is what `t.virtual` sends when a
+                // migration adds one. The expression is lowered the same way `CREATE TABLE`'s is;
+                // the executor computes it for the rows already there.
+                ColumnOption::Generated {
+                    generated_as,
+                    sequence_options,
+                    generation_expr,
+                    generation_expr_mode,
+                    ..
+                } => {
+                    match lower_generated(
+                        *generated_as,
+                        sequence_options.as_deref(),
+                        generation_expr.as_ref(),
+                        generation_expr_mode.as_ref(),
+                    )? {
+                        Ok(expr) => generated = Some(expr),
+                        // An identity column added by `ALTER` is its own feature: it needs a
+                        // sequence and a value for every row already there.
+                        Err(_) => {
+                            return Err(SqlError::unsupported(
+                                "ALTER TABLE ... ADD COLUMN ... GENERATED AS IDENTITY",
+                            ));
+                        }
+                    }
                     continue;
                 }
                 ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
@@ -2303,7 +2359,8 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // `ADD COLUMN … GENERATED ALWAYS AS (…) STORED` would have to compute the
                 // expression for every row already there, which is a backfill and not a catalog
                 // write — refused by name with every other option this action does not take.
-                generated: None,
+                generated,
+                generated_virtual: false,
             },
             if_not_exists: *if_not_exists,
         });
@@ -3825,18 +3882,14 @@ fn lower_generated(
     let Some(expr) = generation_expr else {
         return Ok(Err(identity_kind(generated_as, sequence_options, None)?));
     };
-    // `VIRTUAL` computes on read where `STORED` computes on write, so a node that took the word
-    // and stored anyway would answer the same value after the source changed under it. Named
-    // rather than approximated.
-    //
-    // **Currently unreachable, and kept anyway**: `sqlparser` 0.62.0 expects `STORED` and makes
-    // `VIRTUAL` a syntax error, which is a contract C1 gap in the plan's register — PostgreSQL 19
-    // takes the word and reports `attgenerated` `v`. This is what the day the parser learns it
-    // needs.
-    refuse_if(
-        matches!(mode, Some(sqlparser::ast::GeneratedExpressionMode::Virtual)),
-        "GENERATED ALWAYS AS (expression) VIRTUAL",
-    )?;
+    // **`VIRTUAL` is not refused, and the old argument for refusing it was wrong.** It read: a
+    // node that took the word and stored anyway "would answer the same value after the source
+    // changed under it". It would not — a generated expression reads only its own row, so any
+    // change to the source rewrites the row and recomputes. Measured: the two kinds agree on every
+    // query, on `UPDATE`, and on refusing a non-DEFAULT write, and differ only in
+    // `pg_attribute.attgenerated`. The word reaches here as `STORED` anyway
+    // (`crate::parse::strip_virtual_generated`); which one was written travels on `Parsed`.
+    let _ = mode;
     refuse_if(
         generated_as == GeneratedAs::ByDefault,
         "GENERATED BY DEFAULT AS (expression)",
@@ -5370,16 +5423,13 @@ fn lower_limit_offset(query: &Query) -> Result<(Option<plan::Expr>, Option<plan:
     }
 }
 
-/// `FOR UPDATE` / `FOR SHARE`, and the two modifiers this node will not pretend to.
+/// `FOR UPDATE` / `FOR SHARE`, and the two modifiers that say what to do about a row somebody
+/// else holds.
 ///
-/// **`NOWAIT` and `SKIP LOCKED` are refused by name and the bare clause is not**, and the line
-/// between them is whether a client can tell that nothing was locked. A Percolator transaction is
-/// snapshot-isolated: it does not block a conflicting writer, it loses to one at commit with
-/// `40001` (ADR 0031). So `FOR UPDATE` buys ordering the transaction already enforces — no session
-/// can observe the difference — while `NOWAIT` must raise `55P03` when another session holds the
-/// row and `SKIP LOCKED` must leave that row out of the answer. Answering rows for those two is a
-/// wrong answer rather than a missing feature, and a queue built on `SKIP LOCKED` would hand one
-/// job to every worker.
+/// All three run now (ADR 0057 §5). They were refused by name for as long as this node took no row
+/// locks at all, because each of `NOWAIT` and `SKIP LOCKED` promises something a client can check —
+/// a `55P03` and a missing row — and answering every row would have been a wrong answer rather than
+/// a missing feature. The lock is real now, so the promises can be kept.
 ///
 /// `FOR NO KEY UPDATE` and `FOR KEY SHARE` never arrive here: `sqlparser` 0.62.0's `LockType` has
 /// only the two, so both are refused by name in `crate::parse`'s table before this runs.
@@ -5389,28 +5439,17 @@ fn lower_locking(locks: &[sqlparser::ast::LockClause]) -> Result<Vec<plan::Locki
     locks
         .iter()
         .map(|lock| {
-            let strength = match lock.lock_type {
-                LockType::Update => plan::LockStrength::Update,
-                LockType::Share => plan::LockStrength::Share,
-            };
-            match lock.nonblock {
-                None => {}
-                Some(NonBlock::Nowait) => {
-                    return Err(SqlError::unsupported(format!(
-                        "{} NOWAIT, on a node whose transactions do not block",
-                        strength.clause()
-                    )));
-                }
-                Some(NonBlock::SkipLocked) => {
-                    return Err(SqlError::unsupported(format!(
-                        "{} SKIP LOCKED, on a node with no row locks to skip",
-                        strength.clause()
-                    )));
-                }
-            }
             Ok(plan::Locking {
-                strength,
+                strength: match lock.lock_type {
+                    LockType::Update => plan::LockStrength::Update,
+                    LockType::Share => plan::LockStrength::Share,
+                },
                 of: lock.of.as_ref().map(relation_name).transpose()?,
+                wait: match lock.nonblock {
+                    None => plan::LockWait::Wait,
+                    Some(NonBlock::Nowait) => plan::LockWait::NoWait,
+                    Some(NonBlock::SkipLocked) => plan::LockWait::SkipLocked,
+                },
             })
         })
         .collect()
@@ -6278,7 +6317,8 @@ fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<St
 /// Whether a custom type name is one of the `serial` spellings, which are integers plus a sequence
 /// and never a user-defined type — a table with a column called `serial` would otherwise resolve
 /// against the catalog and get a worse error than the one [`lower_type`] already gives it.
-/// The range column type one of PostgreSQL's built-in range names spells, or `None`.
+/// The column type one of PostgreSQL's built-in names spells, where `sqlparser` has no
+/// variant of its own for it — the six ranges and `point`.
 fn range_type_name(name: &str) -> Option<ColumnType> {
     match name.to_ascii_lowercase().as_str() {
         "tsrange" => Some(ColumnType::TsRange),
@@ -6287,6 +6327,10 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "daterange" => Some(ColumnType::DateRange),
         "numrange" => Some(ColumnType::NumRange),
         "int8range" => Some(ColumnType::Int8Range),
+        // **`point` arrives the same way**: `sqlparser` has no variant for it either, so a
+        // geometric name is a `Custom` one exactly as a range name is, and this is the
+        // table that says which `Custom` names are types this node has.
+        "point" => Some(ColumnType::Point),
         _ => None,
     }
 }

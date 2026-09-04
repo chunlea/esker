@@ -260,6 +260,12 @@ pub struct Parsed {
     /// Whether this `CREATE TYPE` is the one inside `create_enum`'s `DO` block, and so must do
     /// nothing when the type is already there ([`strip_do_create_enum`]).
     do_guarded: bool,
+    /// One flag per `GENERATED … AS (…)` clause, in source order: whether it was **virtual**.
+    ///
+    /// `sqlparser` 0.62.0 reads only the `STORED` spelling, so the other two are rewritten to it
+    /// and the fact travels here ([`strip_virtual_generated`]). Empty for a statement that was not
+    /// rewritten, which is every statement that already parsed.
+    virtual_generated: Vec<bool>,
     /// The message and severity of a `DO $$ BEGIN RAISE … END $$`, if that is what this was.
     ///
     /// **The parsed tree is a placeholder.** `sqlparser` has no `DO`, and a `RAISE` is not any
@@ -295,6 +301,15 @@ impl Parsed {
     #[must_use]
     pub fn is_do_guarded(&self) -> bool {
         self.do_guarded
+    }
+
+    /// Which of this statement's generated columns were declared **virtual**, in source order.
+    ///
+    /// Empty when nothing was rewritten — and an empty list is not "none are virtual", it is "the
+    /// statement said `STORED` everywhere", which is the same thing for every caller.
+    #[must_use]
+    pub fn virtual_generated(&self) -> &[bool] {
+        &self.virtual_generated
     }
 
     /// The `RAISE` this `DO` block was, if it was one — recognised by `strip_do_raise`, which
@@ -403,6 +418,12 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // is named by the refusal table.
     let guarded = strip_do_create_enum(sql, &scanned);
     let raise = strip_do_raise(sql, &scanned);
+    // `VIRTUAL` and the keyword-less form become `STORED` so the statement parses; which ones they
+    // were travels on `Parsed`.
+    let virtual_rewrite = strip_virtual_generated(sql, &scanned);
+    let sql = virtual_rewrite
+        .as_ref()
+        .map_or(sql, |(text, _)| text.as_str());
     let sql = match (&guarded, &raise) {
         (Some(rewritten), _) => rewritten.as_str(),
         // Parsed and thrown away: what this statement *is* travels in `Parsed::raise`.
@@ -423,6 +444,10 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 unlogged,
                 do_guarded: guarded.is_some(),
                 raise: raise.clone(),
+                virtual_generated: virtual_rewrite
+                    .as_ref()
+                    .map(|(_, flags)| flags.clone())
+                    .unwrap_or_default(),
             }
         })
         .collect())
@@ -805,6 +830,89 @@ fn strip_do_create_enum(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let (guarded, at) = match_do_enum_guard(&tokens)?;
     let (from, to) = match_do_enum_create(&tokens, at, guarded)?;
     Some(body.get(from..to)?.to_owned())
+}
+
+/// Rewrites every generated column to the `STORED` spelling `sqlparser` accepts, and says which
+/// ones were **virtual** — in source order, one flag per `GENERATED … AS (…)` clause.
+///
+/// `sqlparser` 0.62.0 requires the word `STORED` and makes both other spellings a syntax error,
+/// which is a contract C1 gap: PostgreSQL 19 takes `VIRTUAL` **and** takes neither word, where
+/// **the keyword-less form means virtual** — measured, and worth measuring, because it meant
+/// *stored* before PostgreSQL 18 and reading the old rule out of memory would have got it backwards.
+///
+/// The flags travel on [`Parsed::virtual_generated`] because the rewritten tree cannot carry them:
+/// every column in it says `STORED`.
+fn strip_virtual_generated(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec<bool>)> {
+    // Cheap reject: nothing to do for a statement with no generated column.
+    if !contains_words(&scanned.words, &["GENERATED", "ALWAYS", "AS"]) {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut flags = Vec::new();
+    let mut at = 0;
+    let mut rewrote = false;
+    while let Some(found) = upper.get(at..)?.find("GENERATED ALWAYS AS") {
+        let clause = at + found;
+        // **`GENERATED ALWAYS AS IDENTITY (START WITH 100)` is not a generated column**, and it
+        // has a parenthesised list right where the expression would be — so without this the
+        // sequence options got a `STORED` appended and the statement stopped parsing. Found by
+        // `lowering.rs`, which asserts that clause is refused by name.
+        let after = upper
+            .get(clause + "GENERATED ALWAYS AS".len()..)?
+            .trim_start();
+        if after.starts_with("IDENTITY") {
+            out.push_str(sql.get(at..clause + "GENERATED ALWAYS AS".len())?);
+            at = clause + "GENERATED ALWAYS AS".len();
+            continue;
+        }
+        // The `(` that opens the expression, and the `)` that matches it.
+        let Some(open) = upper.get(clause..)?.find('(').map(|to| clause + to) else {
+            break;
+        };
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, byte) in bytes.get(open..)?.iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        let rest = upper.get(close + 1..)?;
+        let spaces = rest.len() - rest.trim_start().len();
+        let word = rest.trim_start();
+        out.push_str(sql.get(at..=close)?);
+        if word.starts_with("STORED") {
+            flags.push(false);
+            out.push_str(sql.get(close + 1..close + 1 + spaces + "STORED".len())?);
+            at = close + 1 + spaces + "STORED".len();
+        } else if word.starts_with("VIRTUAL") {
+            // The word `sqlparser` will not read, replaced by the one it will.
+            flags.push(true);
+            out.push_str(" STORED");
+            at = close + 1 + spaces + "VIRTUAL".len();
+            rewrote = true;
+        } else {
+            // Neither word: virtual, and `STORED` is inserted so the statement parses.
+            flags.push(true);
+            out.push_str(" STORED");
+            at = close + 1;
+            rewrote = true;
+        }
+    }
+    out.push_str(sql.get(at..)?);
+    // A statement that already said `STORED` everywhere is left exactly as it was, so nothing that
+    // parses today takes a different path.
+    rewrote.then_some((out, flags))
 }
 
 /// `CREATE UNLOGGED TABLE …` with the keyword removed, or `None` for anything else.
@@ -1921,30 +2029,6 @@ fn recognize_unsupported(sql: &str, words: &[&str]) -> Option<&'static str> {
         .eq_ignore_ascii_case("SELECT")
     {
         return Some("SELECT with an empty target list");
-    }
-    // **A generated column that is not `STORED`** — PostgreSQL 18's virtual generated column,
-    // which this parser has no grammar for: it reports `Expected: STORED`, a syntax error about
-    // valid SQL. Written with `VIRTUAL` or with no keyword at all, and `ActiveRecord` sends both —
-    // it tries the bare form first and re-sends with the keyword.
-    //
-    // **Counted rather than searched**, because one `CREATE TABLE` can declare both kinds: the
-    // suite's `virtual_columns` has three `STORED` columns and two virtual ones, so "contains
-    // `GENERATED` and does not contain `STORED`" is false there and misses it. More `GENERATED`
-    // clauses than `STORED` keywords means at least one is virtual.
-    let generated = words
-        .windows(3)
-        .filter(|window| {
-            window[0].eq_ignore_ascii_case("GENERATED")
-                && window[1].eq_ignore_ascii_case("ALWAYS")
-                && window[2].eq_ignore_ascii_case("AS")
-        })
-        .count();
-    let stored = words
-        .iter()
-        .filter(|word| word.eq_ignore_ascii_case("STORED"))
-        .count();
-    if generated > stored {
-        return Some("a virtual generated column, which is not STORED");
     }
     UNSUPPORTED
         .iter()

@@ -7,8 +7,11 @@
 # crate we already know about, the test catches a shape we have not seen yet.
 #
 # The transitive runtime crate budget. The test reads this line, so keep the format exact.
-# Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md).
-# esker-dep-budget = 40
+# Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md). It came down
+# from 40 when `crossbeam-skiplist` left, taking `crossbeam-epoch` and `crossbeam-utils` with it
+# (docs/adr/0041-the-in-house-arena-skiplist.md) -- three crates removed, three off the budget, so
+# the headroom below is the same as it was.
+# esker-dep-budget = 37
 #
 # **This number is about the default feature set, which is the only one the test measures.**
 # `esker-sql`'s `tls` feature (ADR 0055, off by default) adds nine crates when it is on — rustls,
