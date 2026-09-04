@@ -1,0 +1,21 @@
+crates/esker-proto/src/txn.rs
+  s_2bed4ac2b1c944::t_d1e1bfb3d2adf6 286-292,295-298,305-309,312-320,336-344
+crates/esker-store/src/txn_command.rs
+  s_2bed4ac2b1c944::t_00d893fffea4a6 262-272,277,281-298,364-372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f6d15cd9d44fa1499cb4c8425005210c762e5a5b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
