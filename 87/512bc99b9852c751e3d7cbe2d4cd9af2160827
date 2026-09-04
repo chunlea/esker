@@ -1,0 +1,36 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 150-160,205,224,260,304,488-517,617,758,1067-1122
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 2401-2405
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 1931-1934,1936-1939,1942-1957,1972-2003
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 432-437
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 5164,5449,5569,5625,5646,5685,5698,6395-6418
+crates/esker-sql/src/plan/cte.rs
+  h_44076b318daf9c 68
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 789-802,939,1012,1070,1106
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 89-99,113
+crates/esker-sql/tests/corpus/pg19_relation_resolution.txt
+  h_44076b318daf9c 1-123
+crates/esker-sql/tests/parity_harness/mod.rs
+  h_44076b318daf9c 281-294,298-306,424-427
+crates/esker-sql/tests/relation_resolution.rs
+  h_44076b318daf9c 1-112
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1311-1314,1571
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "87512bc99b9852c751e3d7cbe2d4cd9af2160827",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
