@@ -355,11 +355,16 @@ fn handshake_error(host: &str, port: u16, error: &std::io::Error) -> Error {
 #[cfg(feature = "tls")]
 /// Whether an idle session is still at a message boundary and usable.
 ///
-/// **This is not the plain transport's TCP peek, and it must not be.** A TLS 1.3 server sends
-/// session tickets *after* the handshake, whenever it likes — so on a healthy, idle, perfectly
-/// reusable connection there are usually bytes waiting on the socket. A peek that treats "bytes
-/// are readable" as "not at a boundary" would condemn almost every pooled session, and the
-/// keep-alive ADR 0039 measured would quietly stop working while every response stayed correct.
+/// **This is not the plain transport's TCP peek, and it must not be.** TLS 1.3 lets a server talk
+/// after the handshake whenever it likes — session tickets, key updates — so bytes waiting on the
+/// socket of an idle connection mean nothing is wrong. A peek that reads "readable" as "not at a
+/// message boundary" throws such a connection away, and the keep-alive ADR 0039 measured quietly
+/// stops working: every response stays correct and every request pays for a fresh handshake.
+///
+/// How often that bites depends on timing — a message that arrives while the response is still
+/// being read is absorbed by the read either way, and only one that lands *between* requests is
+/// misread. `tests/https.rs` builds exactly that case with a server that sends a key update after
+/// every response, and the peek costs a connection every time (8 handshakes where 1 is right).
 ///
 /// So the pending bytes are *absorbed* instead: fed to the session, which consumes tickets and key
 /// updates itself. What disqualifies a connection is a session that produces **plaintext** — the
