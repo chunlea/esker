@@ -112,7 +112,7 @@ pub(crate) struct ServeOptions {
     /// Empty means a group of one. Every member founding a group must be given the *same* list,
     /// in any order: the group's id is derived from it **once** and then written down
     /// ([`esker_pd::MemberList`],
-    /// [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
+    /// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
     /// so two members given different lists found two groups and will not talk to each other —
     /// which is a loud failure rather than a quiet half-formed cluster.
     ///
@@ -228,7 +228,7 @@ pub(crate) fn members(
 ///
 /// **A loop, because the command is a reconciliation.** Adding is three things with a catch-up
 /// between them, so each call does what is missing and says whether more is needed
-/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 /// That is also what makes it safe to run again after any failure, including a `kill -9` in the
 /// middle: it looks at what is there rather than at what it expected.
 pub(crate) fn change_member(
@@ -522,7 +522,7 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
 ///
 /// A member added at run time **cannot derive the group's id**: the derivation is over the member
 /// list, and adding this member moved it
-/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 /// So it asks, with the one method every member answers whether or not it leads — which matters,
 /// because the operator running this has just been told a member is missing.
 ///

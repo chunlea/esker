@@ -45,7 +45,7 @@
 //!   spins, because the member's answer will not change until the election ends;
 //! * a hint naming an address **outside** the list is no longer a misconfiguration, because a
 //!   placement driver's membership moves
-//!   ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
+//!   ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
 //!   it may simply be a member added since this store started. So it triggers a **refresh** —
 //!   `Pd::Members` at the endpoint that gave the hint, which any member answers — and the list is
 //!   adopted only if its **group id** matches the one this client first learned. That check is
@@ -233,7 +233,7 @@ impl RemotePd {
 
     /// Asks the current endpoint who is in its group, and adopts the answer.
     ///
-    /// **The group id is the guard**, and it is the whole of what makes this safe. Before ADR 0060
+    /// **The group id is the guard**, and it is the whole of what makes this safe. Before ADR 0061
     /// a hint outside the configured list was refused outright, because following one would let
     /// another cluster's placement driver route this store. That refusal cannot stand once
     /// membership moves — the address may be a member added an hour ago — so the check moves with

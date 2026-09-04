@@ -537,7 +537,7 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
   member refuses a Raft batch that does not carry it, so two clusters' placement drivers pointed at
   each other by a stale flag cannot form one group and replicate one cluster's routing table over
   the other's. Deriving it *again* on every start is what ADR 0059 did and what
-  [ADR 0060](adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) had to change
+  [ADR 0061](adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) had to change
   before membership could move at all: the derivation changes when a member is added, so a group
   that recomputed it would partition itself at the moment it grew. A joining member is *told* the
   id; a member whose record and whose `--peers` disagree believes the record, which is
@@ -1001,7 +1001,7 @@ how much Postgres surface for the first SQL milestone.
 `esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above). **Dynamic PD
 membership** — added and removed at run time through single-server conf changes, with the group id
 minted once instead of derived
-([ADR 0060](adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+([ADR 0061](adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 
 ## 16. Columnar (`esker-columnar`)
 

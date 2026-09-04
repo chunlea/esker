@@ -587,7 +587,7 @@ unit lands, that method makes `wiring.rs` disappear.
 
 ### 11.8 Progress
 
-- **Unit 8 — plan and ADR.** `docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md`.
+- **Unit 8 — plan and ADR.** `docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md`.
 - **Unit 9 — the group is named once.** `PersistedState` v2 with the group id and the address book;
   `MemberList` carries the recorded id. A version-1 record reads as "not yet named", which is the
   signal to mint. The upgrade is invisible, asserted against the derivation rather than a constant.

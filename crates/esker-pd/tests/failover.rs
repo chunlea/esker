@@ -269,7 +269,7 @@ impl Group {
     /// Its database is empty and its configuration is empty: it is a member of nothing until the
     /// group tells it otherwise. What it is *told* is the group's id and its members, which is
     /// exactly what `Pd::Members` answers and what
-    /// [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
     /// says a joining member is given.
     fn admit(&mut self, id: NodeId, address: &str) -> Arc<Pd> {
         let group_id = self
@@ -998,7 +998,7 @@ fn a_new_leader_inherits_no_operator_and_re_derives_from_a_heartbeat() {
 /// entry is appended and the entry that made the quorum three would need three to commit. So:
 /// add a learner, let it catch up, promote it, and only then remove the dead one — the same
 /// add-before-remove ADR 0013 states for region replicas, for the same arithmetic
-/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) §11.4).
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) §11.4).
 #[test]
 fn a_group_of_three_with_one_gone_recovers_to_three_of_three() {
     let mut group = Group::of_three(1_700_000_000_000);

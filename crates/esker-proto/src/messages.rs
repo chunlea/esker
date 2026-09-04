@@ -103,7 +103,7 @@ pub enum Method {
     /// is an addition rather than a change to what is already on the wire.
     PdMembers = 0x030c,
     /// `Pd::MemberChange` — add or remove a placement driver, one step at a time
-    /// ([ADR 0060](../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     ///
     /// **One step**, and the caller loops. Adding a member is three things — propose a learner,
     /// wait for it to catch up, promote it — and a single call that did all three would hold a

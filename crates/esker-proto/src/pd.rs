@@ -1458,7 +1458,7 @@ impl PdChannel {
     ///
     /// Answered by **any** member, which is what a client refreshing a stale endpoint list needs:
     /// it is asking precisely because the one it reached was not the leader
-    /// ([ADR 0060](../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     pub async fn members(&self) -> Result<PdMembership, ProtoError> {
         match self.call(PdReq::Members).await? {
             PdResp::Members(membership) => Ok(membership),

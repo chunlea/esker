@@ -51,7 +51,7 @@ use crate::member::{MAX_MEMBERS, PdMember};
 /// Version byte on the state record.
 ///
 /// **Version 2** appends the group id and the address book
-/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 /// A version-1 record still reads: it decodes as group id **zero** and no members, which is exactly
 /// the state a member written before dynamic membership is in — and zero is the signal to mint an
 /// id from the configured list and write it down. Every field version 1 had is byte-identical, and
@@ -175,7 +175,7 @@ pub struct PersistedState {
     /// The term of the entry at `truncated_index`.
     pub truncated_term: Term,
     /// What identifies this group's traffic, minted once and never recomputed
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     ///
     /// **Zero means "not yet minted"**, which is both a fresh database and a record written before
     /// there was such a thing. Zero is not a group id anywhere in this codebase — `derived_group_id`
@@ -430,7 +430,7 @@ impl PdLogStorage {
     /// messages go out, because a configuration is in force from the moment its entry is on disk.
     ///
     /// The id is refused if it would **change**: it is minted once and never recomputed
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)),
     /// and a member that quietly adopted a different one would have rejoined a different group.
     pub fn stage_group(
         &mut self,
@@ -792,7 +792,7 @@ mod tests {
     /// **A record written before there were group ids still reads**, and reads as what it is: a
     /// member that has not minted one and knows nowhere to send. Everything version 1 wrote is
     /// byte-identical, which is what makes this an appended field rather than a migration
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     #[test]
     fn a_version_one_record_reads_as_a_group_that_has_not_been_named() {
         let state = PersistedState {

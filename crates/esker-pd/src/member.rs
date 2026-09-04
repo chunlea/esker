@@ -33,7 +33,7 @@ use crate::error::{PdError, Result};
 ///
 /// **Three is the shape this is built and tested for**, and five is what the arithmetic of a
 /// replacement needs: `add`-before-`remove` puts the group transiently at four
-/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+/// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
 /// §11.4), and refusing that would refuse the recovery path itself. A deployment that settles above
 /// three is outside what this phase measured.
 pub const MAX_MEMBERS: usize = 5;
@@ -76,7 +76,7 @@ pub struct MemberList {
     /// `None` on a group being founded, which derives its id from the list below and then writes
     /// the answer down. From then on this is what [`MemberList::group_id`] answers, and adding a
     /// member does not change it — which is the whole of what
-    /// [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
     /// had to change before membership could move at all.
     ///
     /// It is also what lets `crate::transport` stay untouched: that module stamps
@@ -246,7 +246,7 @@ impl MemberList {
     /// being founded derives one from its members. A group that has never changed membership
     /// cannot tell the difference — the recorded id *is* the derivation of the founding list — and
     /// that is what makes the upgrade to
-    /// [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
     /// invisible to every deployment that exists.
     #[must_use]
     pub fn group_id(&self) -> u64 {

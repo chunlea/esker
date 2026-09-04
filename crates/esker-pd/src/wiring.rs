@@ -4,7 +4,7 @@
 //!
 //! [`PdTcpTransport`](crate::transport::PdTcpTransport) builds one queue and one delivery task per
 //! peer **at `spawn`**, and dynamic membership is exactly the peer set changing
-//! ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+//! ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
 //! The right shape is a `reconfigure` on that type, adding and dropping one queue per changed
 //! member and leaving the rest connected — and `crates/esker-pd/src/transport.rs` belongs to the
 //! `tls` lane until its RPC unit lands, so this is the shape that needs no edit there:
@@ -21,7 +21,7 @@
 //!
 //! The replacement transport is built from a [`MemberList`] that carries the group's **recorded**
 //! id, so every batch it stamps says the same thing the old one did. That is the whole reason
-//! `transport.rs` needs no change: it reads `members.group_id()`, and under ADR 0060 that method
+//! `transport.rs` needs no change: it reads `members.group_id()`, and under ADR 0061 that method
 //! answers the recorded id rather than a derivation that would move as the membership did.
 
 use std::sync::{Arc, RwLock};

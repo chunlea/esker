@@ -1,7 +1,7 @@
 //! What a placement driver believes about its own group, across an open, a restart and an upgrade.
 //!
 //! The rules under test are
-//! [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)'s
+//! [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)'s
 //! first two: a group id is **derived once and then recorded**, and after that the record wins over
 //! the command line. Everything dynamic membership does rests on those, and the first of them has
 //! to be invisible to every deployment that already exists — which is what the first test is.
@@ -39,7 +39,7 @@ fn three() -> Vec<PdMember> {
 
 /// **The upgrade is a no-op, and this is the test that says so.**
 ///
-/// Every placement driver running before ADR 0060 computed its group id from its `--peers` list on
+/// Every placement driver running before ADR 0061 computed its group id from its `--peers` list on
 /// every start. If this build minted a fresh one, the first member upgraded would refuse the
 /// others' traffic and the group would stop. So the id it writes down is exactly the id the old
 /// build would have derived — asserted against the derivation itself rather than against a

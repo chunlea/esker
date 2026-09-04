@@ -327,7 +327,7 @@ pub struct Pd {
     /// The group this member believes it is in, and what that group is called.
     ///
     /// **It moves**, which is what dynamic membership means
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
     /// a conf change appended to the log rewrites it, at append, before the messages of that same
     /// `Ready` go out. The lock is its own, taken briefly and never across a propose — the same
     /// rule the applied state follows and for the same reason ([`crate::driver`]).
@@ -448,7 +448,7 @@ impl Pd {
         // **Who this member is with, and what the group is called.** The record wins over the
         // command line, which is `esker-raft`'s own rule for membership — after a membership change
         // `--peers` is exactly the stale thing that rule is about
-        // ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
         let members = settle_membership(&mut log, &options.members, &db)?;
         let applied = log.applied_index();
 
@@ -662,7 +662,7 @@ impl Pd {
     /// configuration is in force from then, not from when it commits — and the entry that made the
     /// quorum three needs three to commit, while two are live and the new one has an empty log. A
     /// learner is not counted in a quorum, so it commits, catches up, and *then* counts
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
     /// §11.4).
     pub fn add_member(&self, id: NodeId, address: &str) -> Result<bool> {
         if id == 0 {

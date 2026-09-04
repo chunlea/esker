@@ -224,7 +224,7 @@ struct PdCore {
     ///
     /// Written **here**, at append, and read everywhere. A conf change is in force from the moment
     /// its entry is on disk, so the address it carries has to be usable in the same `Ready`
-    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     members: Arc<RwLock<MemberList>>,
     id: NodeId,
     /// Proposals appended and not yet applied. Only ever populated on a leader.

@@ -1,4 +1,4 @@
-# ADR 0060 — a placement driver joins a group it is told the name of, as a learner, before it votes
+# ADR 0061 — a placement driver joins a group it is told the name of, as a learner, before it votes
 
 Status: accepted (phase 15) · Date: 2026-09-04
 Context: `CLAUDE.md` invariants 1, 4, 5 · `docs/DESIGN.md` §7, §15 ·
