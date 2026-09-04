@@ -789,12 +789,17 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   in the database's own directory rather than `(cluster_id, store_id)`, which two benchmarks do not have
   and two misconfigured stores share (ADR 0029). A prefix holding objects and no marker — every pre-6c
   prefix — is refused until `--adopt-sst-store` says otherwise; nothing is ever adopted silently.
-- **TLS — settled by ADR 0025, and deferred.** Option (a): plain HTTP to `MinIO` or to a TLS-terminating
-  sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at the ADR, rather than
-  accepting it and speaking plaintext — a configuration that looks encrypted and is not is the worst of
-  the three outcomes. `esker_s3::Transport` is a trait with a blocking `std::net` implementation, so
-  `rustls` arrives as a second implementor rather than a refactor; ADR 0025 lists the four things that
-  have to be true first.
+- **TLS — settled for S3 by ADR 0025, and measured for all three surfaces by
+  [ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md).** S3: plain HTTP to `MinIO`
+  or to a TLS-terminating sidecar. `Endpoint::parse` **refuses** `https://` with a message pointing at
+  ADR 0025, rather than accepting it and speaking plaintext — a configuration that looks encrypted and
+  is not is the worst of the three outcomes. The PostgreSQL port answers the same way: `SSLRequest`
+  gets a plain `N` (`pgwire::server`), and the RPC layer (§9) carries no TLS at all today. All
+  three are one dependency decision, not three: ADR 0055 measured the pure-Rust `rustls`
+  `CryptoProvider` options against `deny.toml` and found the crate cost is paid once, for whichever
+  surface adopts it first. `esker_s3::Transport` is a trait with a blocking `std::net` implementation
+  and `pgwire::server::Connection<S>` is already generic over its stream — both are a second
+  implementor away from TLS, not a refactor, once a provider is chosen.
 - **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
   extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
