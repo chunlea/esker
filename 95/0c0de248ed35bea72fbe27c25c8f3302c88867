@@ -1,0 +1,39 @@
+crates/esker-sql/src/exec/typedef.rs
+  s_e5c0c6e78b5662::t_7869d508af2f6b 22,84-298
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_b5da83fd92f6d3 1662-1668
+crates/esker-sql/src/error.rs
+  s_e5c0c6e78b5662::t_05ddebd547d03a 913-921,2395-2397,2559-2562
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_7646be8fbc3e68 240,779,998,1089
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_ce0fd0ecb62527 835,2904
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_c954ccb84d7f4d 681-714
+crates/esker-sql/src/plan/ddl.rs
+  s_e5c0c6e78b5662::t_9aae8eb4cba882 636-677
+crates/esker-sql/src/plan/mod.rs
+  s_e5c0c6e78b5662::t_4231a3271f0213 34-41,138-139,246-248,312
+crates/esker-sql/tests/alter_type.rs
+  s_e5c0c6e78b5662::t_b9e259edf2159a 1-65
+crates/esker-sql/tests/corpus/pg19_alter_type.txt
+  s_e5c0c6e78b5662::t_a549d2935abca5 1-40
+docs/plans/debts-v1.md
+  s_e5c0c6e78b5662::t_3fe28a38286118 4-6,25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "950c0de248ed35bea72fbe27c25c8f3302c88867",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
