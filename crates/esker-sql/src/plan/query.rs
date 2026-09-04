@@ -310,6 +310,24 @@ pub enum Node {
         /// How a row is shaped, so everything above it reads one like any other.
         columns: RowSchema,
     },
+    /// The one row a **sequence read as a relation** has: `SELECT last_value, is_called FROM s`.
+    ///
+    /// Computed when the cursor opens, like a catalog view and for the same reason — the values are
+    /// a counter in the catalog rather than a key range, and there is exactly one row.
+    SequenceRead {
+        /// Which sequence's counter to read.
+        sequence_id: u64,
+        /// `(last_value, is_called)`, filled by the executor **outside the statement's
+        /// transaction**.
+        ///
+        /// A sequence is not transactional: `nextval` and `setval` commit on their own, so a
+        /// session that read one through its own snapshot would see the value as of `BEGIN` and
+        /// report a sequence nobody has. Measured the hard way — a `setval(s, 3, true)` followed by
+        /// a read in the same block answered the sequence's starting state.
+        state: Option<(i64, bool)>,
+        /// The three columns PostgreSQL shows: `last_value`, `log_cnt`, `is_called`.
+        columns: RowSchema,
+    },
     /// The rows a set-returning function in `FROM` yields.
     ///
     /// Computed when the cursor opens, like a catalog view and for the same reason: there is no
@@ -583,6 +601,39 @@ impl Node {
         }
     }
 
+    /// Every node directly under this one, so a pass over the plan needs no match of its own.
+    ///
+    /// Written for the sequence read, whose value is taken **outside** the statement's transaction
+    /// and so has to be found before the cursor opens. Total by construction: a node with children
+    /// that forgot to list them here would silently hide them from every such pass.
+    #[must_use]
+    pub fn children_mut(&mut self) -> Vec<&mut Node> {
+        match self {
+            Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Distinct { input }
+            | Node::Aggregate { input, .. }
+            | Node::Derived { input, .. } => vec![input],
+            Node::NestedLoop {
+                outer, inner_plan, ..
+            } => match inner_plan {
+                Some(inner) => vec![outer, inner],
+                None => vec![outer],
+            },
+            Node::Columnar(columnar) => vec![&mut columnar.fallback],
+            Node::OneRow
+            | Node::Values { .. }
+            | Node::SequenceRead { .. }
+            | Node::TableFunction { .. }
+            | Node::CatalogView { .. }
+            | Node::SeqScan { .. }
+            | Node::PointGet { .. }
+            | Node::IndexLookup { .. } => Vec::new(),
+        }
+    }
+
     /// The names of the row this node *reads*, which is what every expression on it is written
     /// against — except an `Aggregate`'s `HAVING`, which is written against what it produces.
     fn input_names(&self, columns: &[String]) -> Vec<String> {
@@ -664,6 +715,8 @@ impl Node {
             // PostgreSQL's own name for it, `*VALUES*` included: the rows are a relation with no
             // relation behind them, and the quoted star is what it calls that relation.
             Node::Values { .. } => ("Values Scan on \"*VALUES*\"".to_owned(), None, None),
+            // PostgreSQL's own name for it: a sequence is a relation and the scan is its one row.
+            Node::SequenceRead { .. } => (format!("Seq Scan on {table}"), None, None),
             // Named for what it is: one access path, no costs, and a row count that is the length
             // of an array nobody has read yet.
             Node::TableFunction { call, .. } => {
@@ -1041,6 +1094,7 @@ fn render_aggregate(spec: &AggregateSpec, columns: &[String]) -> String {
 /// cannot be checked against the query.
 fn render_literal(literal: &Literal) -> String {
     match literal {
+        Literal::TypedNull(ty) => format!("NULL::{}", crate::value::PgType::name(*ty)),
         Literal::Null => "NULL".to_owned(),
         Literal::Integer(value) => value.to_string(),
         Literal::Decimal(digits) => digits.clone(),

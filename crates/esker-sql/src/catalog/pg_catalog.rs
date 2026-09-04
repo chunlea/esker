@@ -735,6 +735,7 @@ impl CatalogView {
                                 generated: None,
                                 comment: None,
                                 dropped: false,
+                                user_type: None,
                             })
                             .collect(),
                         primary_key: Vec::new(),
@@ -754,6 +755,7 @@ impl CatalogView {
                         partition_bound: None,
                         comment: None,
                         primary_key_comment: None,
+                        enums: std::collections::BTreeMap::new(),
                     })
                 })
                 .collect()

@@ -159,6 +159,20 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The same chain, told which order the user wrote the tables in.
+    ///
+    /// `entries` is the order the executor **joins** in, which for a reordered comma list is not
+    /// the order they were written (`comma_list_order`). Only [`Scope::written`] cares, and what it
+    /// decides is what `SELECT *` returns — so a reordering that forgot this would silently give
+    /// back the same columns in a different order, which no `ORDER BY` and no test of one table's
+    /// values would notice. `written[i]` is where the table the user wrote *i*-th ended up.
+    fn chain_written(entries: &[(&'a TableDef, String)], written: Vec<usize>) -> Self {
+        Scope {
+            written,
+            ..Scope::chain(entries)
+        }
+    }
+
     /// The name a `42803` prints for a resolved position: `t.c`, qualified.
     ///
     /// PostgreSQL qualifies it even when the query has one table, and in a join it is the only
@@ -262,6 +276,25 @@ impl<'a> Scope<'a> {
     fn resolve_column(&self, qualifier: Option<&str>, name: &str) -> Result<(usize, &ColumnDef)> {
         let (_, at, column) = self.lookup(qualifier, name)?;
         Ok((at, column))
+    }
+
+    /// The enum the column at a resolved position was declared as, or `None`.
+    ///
+    /// A position is an index into the **concatenated** row, so this walks the tables the way
+    /// [`Scope::offset`] builds it: the labels live on the table
+    /// (`crate::catalog::TableDef::enums`) and the oid on the column, so both halves have to be
+    /// found together (ADR 0050).
+    fn user_type_at(&self, at: usize) -> Option<&'a crate::catalog::TypeDef> {
+        let mut start = 0;
+        for table in &self.tables {
+            let end = start + table.columns.len();
+            if at < end {
+                let column = table.columns.get(at - start)?;
+                return super::assign::enum_of(table, column);
+            }
+            start = end;
+        }
+        None
     }
 
     /// The same lookup, saying **how many scopes out** the name was found.
@@ -372,13 +405,31 @@ impl<'a> Scope<'a> {
 
 /// A planned query, with everything the executor needs to describe its output before running it.
 #[derive(Debug)]
+pub(super) struct OutputColumn {
+    /// The name a client is told, which is the alias where there is one.
+    pub(super) name: String,
+    /// What the value physically is — the type the wire's `RowDescription` carries, unless
+    /// [`OutputColumn::user_type`] replaces it.
+    pub(super) ty: ColumnType,
+    /// PostgreSQL's `atttypmod` for the declaration, or `crate::value::NO_TYPMOD`.
+    pub(super) typmod: i32,
+    /// The **user-defined type** this column was declared as, or `None`.
+    ///
+    /// Carried beside the storage type rather than instead of it, because both are needed and they
+    /// answer different questions: `ty` is how the value in the row is read, and this is what the
+    /// client is told and what the value is rendered *as* — an enum's ordinal goes onto the wire
+    /// as its label (ADR 0050). Kept in the same struct as `ty` rather than in a list beside it, so
+    /// that a column can never have one and not the other.
+    pub(super) user_type: Option<crate::catalog::TypeDef>,
+}
+
 pub(super) struct Planned {
     /// The tree to pull rows through.
     pub(super) node: Node,
     /// One name and type per output column, for `RowDescription`.
     /// One name, type and **typmod** per output column, for `RowDescription`. The typmod is
     /// `NO_TYPMOD` for everything but a plain column reference, which is PostgreSQL's rule.
-    pub(super) columns: Vec<(String, ColumnType, i32)>,
+    pub(super) columns: Vec<OutputColumn>,
     /// The table's name, for `EXPLAIN`.
     pub(super) table: String,
     /// The table's column names, so `EXPLAIN` can print the names a user typed rather than the
@@ -748,7 +799,7 @@ fn order_keys(
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
     outputs: &[Expr],
-    columns: &[(String, ColumnType, i32)],
+    columns: &[OutputColumn],
     over_output: bool,
 ) -> Result<Vec<SortKey>> {
     let mut keys = Vec::new();
@@ -776,7 +827,7 @@ fn order_keys(
             // one, which this does not do. Every case the corpus holds is covered by the
             // ambiguity alone, and a preference nothing has measured would be invented.
             if let Expr::Column { table: None, name } = &item.expr
-                && columns.iter().filter(|(output, ..)| output == name).count() > 1
+                && columns.iter().filter(|output| &output.name == name).count() > 1
             {
                 return Err(SqlError::AmbiguousOrderBy(name.clone()));
             }
@@ -818,7 +869,7 @@ fn order_keys(
 }
 
 /// A resolved target list: one name and type per output column, and the expression that fills it.
-pub(super) type TargetList = (Vec<(String, ColumnType, i32)>, Vec<Expr>);
+pub(super) type TargetList = (Vec<OutputColumn>, Vec<Expr>);
 
 /// `RETURNING`, resolved against one table: the output columns and the expression per column.
 ///
@@ -893,13 +944,31 @@ pub(super) fn returning_columns_over(
 /// lets `ON n.oid = t.relnamespace` reach back past the table joined in between, as
 /// `ActiveRecord`'s `indexes()` does.
 ///
-/// # What this deliberately does not do
+/// # The `WHERE` is applied as the chain is built, not once on top of it
 ///
-/// **It does not reorder.** A two-table inner join is commutative and [`plan`] exploits that; a
-/// chain is not free to, because a `LEFT JOIN` anywhere in it fixes the order of everything after
-/// it — `A LEFT JOIN B ON … JOIN C ON …` keeps only the rows the inner join matches, and swapping
-/// the last two steps would keep the NULL-extended ones. Rather than reorder the prefix that
-/// happens to be all-inner and stop at the first outer join, it plans as written: a rule-based
+/// A **comma-separated `FROM` list** has no `ON` anywhere: every condition is in the `WHERE`. Left
+/// on top, that is a cross product of every relation in the list with one filter above it, and run
+/// 49 is what that costs — `ActiveRecord`'s `pk_and_sequence_for` is five catalog relations in one
+/// such list, and it answered in 0 s over 30 relations, 4 s over 90 and never over the suite's 870.
+/// Measured here at 6 tables against 12: **362 ms against 3.92 s**, for a control that went 325 µs
+/// to 472 µs.
+///
+/// So each conjunct of the `WHERE` is applied at the **first step whose tables can answer it**
+/// ([`pushdown`]), which is a filter on the intermediate result rather than on the product. What
+/// is left over — a conjunct naming a table joined later, or one this pass will not touch — stays
+/// on top exactly as before.
+///
+/// # It reorders a comma list, and nothing else
+///
+/// A two-table inner join is commutative and [`plan`] exploits that; a chain with a `LEFT JOIN`
+/// anywhere in it is not free to, because an outer join fixes the order of everything after it —
+/// `A LEFT JOIN B ON … JOIN C ON …` keeps only the rows the inner join matches, and swapping the
+/// last two steps would keep the NULL-extended ones.
+///
+/// A **plain comma list** — every entry a stored relation or a catalog view, every join inner,
+/// every `ON` absent — has none of that, and it is the shape that needs the ordering most, because
+/// with no `ON` at all *nothing* bounds it. [`comma_list_order`] puts the tables a constant can
+/// pin first and grows from there. Every other chain is planned exactly as written: a rule-based
 /// planner that is right everywhere beats one that is faster on the shapes nobody sends.
 ///
 /// The cost is that the inner side of each step is probed by key only when its `ON` allows it,
@@ -937,56 +1006,295 @@ fn plan_chain(
         }
     }
 
+    // **A plain comma list may be reordered**; every other chain is planned as written. The
+    // permutation is over `entries`, so everything below reads the tables through it and the row
+    // an ordinal names is the row the executor builds.
+    let order = comma_list_order(select, &entries);
+    let reordered = order.iter().enumerate().any(|(at, to)| at != *to);
+    let entries: Vec<(&TableDef, String)> = order
+        .iter()
+        .map(|at| (entries[*at].0, entries[*at].1.clone()))
+        .collect();
+    // The conjuncts of the `WHERE`, each waiting for the first step that can answer it. One that
+    // never becomes answerable — and one this pass will not touch — is still on top at the end.
+    let mut pending: Vec<&Expr> = select.filter.as_ref().map_or_else(Vec::new, conjuncts_of);
+
     // The `WHERE` cannot narrow the outer access path here: with more than one table it may
     // mention any of them, and a value from a table not yet read is not one a scan can seek on.
-    let mut node = match select.from.as_ref() {
-        // A set-returning function is a third kind of source, beside a relation and a derived
-        // table: no key range, no statistics, and rows that exist only once its arguments are
-        // evaluated.
-        Some(entry) if entry.function.is_some() => {
-            function_node(entry, outer, &Scope::empty().under(enclosing))?
-        }
-        // Rows written into the statement, which is a source with even less to it than a function:
-        // no arguments, no key range, and the row count is the length of the list.
-        Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
-        Some(entry) => match entry.derived_plan() {
-            Some(plan) => plan.clone(),
+    let mut node = if reordered {
+        // Only a plain relation or a catalog view can be reordered onto the front, which is what
+        // `comma_list_order` checked before returning anything but the identity.
+        access_path(None, tenant, entries[0].0)?
+    } else {
+        match select.from.as_ref() {
+            // A set-returning function is a third kind of source, beside a relation and a derived
+            // table: no key range, no statistics, and rows that exist only once its arguments are
+            // evaluated.
+            Some(entry) if entry.function.is_some() => {
+                function_node(entry, outer, &Scope::empty().under(enclosing))?
+            }
+            // Rows written into the statement, which is a source with even less to it than a function:
+            // no arguments, no key range, and the row count is the length of the list.
+            Some(entry) if entry.values.is_some() => super::values::node(entry, outer)?,
+            Some(entry) => match entry.derived_plan() {
+                Some(plan) => plan.clone(),
+                None => access_path(None, tenant, outer)?,
+            },
             None => access_path(None, tenant, outer)?,
-        },
-        None => access_path(None, tenant, outer)?,
+        }
     };
+    // The first table's own conjuncts, before a single pair has been built. This is the step that
+    // matters most in a comma list: `seq.relkind = 'S'` here is the difference between joining
+    // every relation and joining the sequences.
+    node = pushdown(node, &mut pending, &entries[..1], enclosing);
+
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
     // reference to one further right an "undefined column" rather than a silent NULL.
-    for (at, (join, inner)) in select.joins.iter().zip(inners).enumerate() {
+    for at in 0..entries.len() - 1 {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
-        let left_join = join.kind == crate::plan::JoinKind::Left;
-        // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
-        // everything up to and including the outer side of this join.
-        let left = Scope::chain(&entries[..=at]).under(enclosing);
-        let inner_function = source_function(Some(&join.table), inner, &left)?;
-        node = join_node(
-            node,
-            join.on.as_ref(),
-            left_join,
-            &scope,
-            inner,
-            inner_function
-                .as_ref()
-                .or_else(|| join.table.derived_plan()),
-        )?;
+        let inner = entries[at + 1].0;
+        // A reordered chain is a comma list: every join inner, every `ON` absent, and no entry a
+        // function or a derived table — so the step needs nothing from `select.joins`, whose order
+        // no longer matches.
+        node = if reordered {
+            join_node(node, None, false, &scope, inner, None)?
+        } else {
+            let join = &select.joins[at];
+            let left_join = join.kind == crate::plan::JoinKind::Left;
+            // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
+            // everything up to and including the outer side of this join.
+            let left = Scope::chain(&entries[..=at]).under(enclosing);
+            let inner_function = source_function(Some(&join.table), inner, &left)?;
+            join_node(
+                node,
+                join.on.as_ref(),
+                left_join,
+                &scope,
+                inner,
+                inner_function
+                    .as_ref()
+                    .or_else(|| join.table.derived_plan()),
+            )?
+        };
+        // **Not below an outer join.** A `WHERE` conjunct applied before the NULL extension would
+        // throw away the rows a `LEFT JOIN` exists to keep, which is the one rewrite of this kind
+        // that changes an answer rather than a cost. Once a chain has taken an outer join, nothing
+        // after it is pushed either: the rows above that step are the extended ones.
+        if !select.joins[..=at]
+            .iter()
+            .any(|join| join.kind == crate::plan::JoinKind::Left)
+        {
+            node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing);
+        }
     }
 
-    let scope = Scope::chain(&entries).under(enclosing);
-    if let Some(filter) = &select.filter {
-        let predicate = resolve(filter, &scope)?;
-        check_predicate(&predicate, "WHERE", &scope)?;
+    // The **written** order for the scope every output column is resolved against: `SELECT *`
+    // returns the tables in the order the user wrote them whatever order they were joined in.
+    let written: Vec<usize> = (0..entries.len())
+        .map(|user_at| {
+            order
+                .iter()
+                .position(|joined| *joined == user_at)
+                .unwrap_or(user_at)
+        })
+        .collect();
+    let scope = Scope::chain_written(&entries, written).under(enclosing);
+    // Whatever is left, and the whole `WHERE` for a statement nothing was pushed out of. It is
+    // resolved and checked here exactly as before, so an aggregate in a `WHERE` is still the
+    // `WHERE`'s error and a column nobody has is still resolved against every table.
+    if !pending.is_empty() {
+        let predicate = all_of(&pending);
+        let resolved = resolve(&predicate, &scope)?;
+        check_predicate(&resolved, "WHERE", &scope)?;
         node = Node::Filter {
             input: Box::new(node),
-            predicate,
+            predicate: resolved,
         };
     }
-    finish_plan(select, node, &scope, Some(outer))
+    finish_plan(select, node, &scope, Some(entries[0].0))
+}
+
+/// One `AND`-ed predicate as its conjuncts, in the order written.
+///
+/// `OR` is **not** split: `a OR b` is one condition and applying either half alone would keep rows
+/// the statement excludes. Only the `AND` spine comes apart, which is what makes every piece of it
+/// independently true of any row the statement returns — the whole licence pushdown runs on.
+fn conjuncts_of(predicate: &Expr) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    let mut stack = vec![predicate];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => out.push(other),
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// The conjuncts joined back into one predicate.
+fn all_of(conjuncts: &[&Expr]) -> Expr {
+    let mut out = conjuncts[0].clone();
+    for conjunct in &conjuncts[1..] {
+        out = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(out),
+            right: Box::new((*conjunct).clone()),
+        };
+    }
+    out
+}
+
+/// Whether a conjunct may be moved below the top of the plan.
+///
+/// **Three shapes stay where they are**, and none of them is about correctness of the filter: an
+/// aggregate belongs to a `WHERE`'s own error (`check_predicate` names the clause, and a pushed
+/// copy would name `JOIN/ON` for a statement the user wrote no join in), a set-returning call in a
+/// predicate is refused there too, and a subquery may be **correlated** — it is planned against the
+/// scope it was resolved in, and moving it under a different one is a question this pass does not
+/// answer. Leaving them on top is what the plan did for all of them before.
+fn is_pushable(expr: &Expr) -> bool {
+    let mut has_subquery = false;
+    super::bind::descend(expr, &mut |inner| {
+        has_subquery |= matches!(inner, Expr::Subquery(_));
+    });
+    !has_subquery && !contains_set_func(expr) && !aggregate::contains_aggregate(expr)
+}
+
+/// Applies every pending conjunct the tables built so far can answer, and keeps the rest.
+///
+/// The test is [`resolve`] itself: a conjunct resolves against a scope exactly when every column
+/// it names is in it. **A conjunct that fails to resolve here is not an error** — it is one naming
+/// a table further right, and it stays pending for a later step or for the filter on top, which is
+/// where a genuinely undefined column is reported against the whole scope with the message it
+/// always had. Nothing is pushed on a failure, so no error is swallowed and none is moved.
+fn pushdown(
+    node: Node,
+    pending: &mut Vec<&Expr>,
+    entries: &[(&TableDef, String)],
+    enclosing: Option<&Scope<'_>>,
+) -> Node {
+    if pending.is_empty() {
+        return node;
+    }
+    let scope = Scope::chain(entries).under(enclosing);
+    let mut ready = Vec::new();
+    pending.retain(|conjunct| {
+        if !is_pushable(conjunct) {
+            return true;
+        }
+        match resolve(conjunct, &scope) {
+            Ok(resolved) => {
+                ready.push(resolved);
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    let Some(first) = ready.first() else {
+        return node;
+    };
+    let mut predicate = first.clone();
+    for next in &ready[1..] {
+        predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(predicate),
+            right: Box::new(next.clone()),
+        };
+    }
+    Node::Filter {
+        input: Box::new(node),
+        predicate,
+    }
+}
+
+/// The order to join a **plain comma list** in, or the identity for every other chain.
+///
+/// A comma list is the shape with nothing to bound it: no `ON` anywhere, so every step is a cross
+/// product until the `WHERE` is reached. Ordering it is what turns `pk_and_sequence_for` from the
+/// product of five catalog relations into a walk down one row's dependencies.
+///
+/// **Greedy, and the rule is the one a reader can check by eye**: a table a conjunct pins on its
+/// own — `dep.refobjid = '"accounts"'::regclass` — goes first, because it is one row before
+/// anything is joined to it; then, repeatedly, whichever remaining table shares a conjunct with the
+/// tables already chosen, which is an equijoin rather than a product; and only then, whatever is
+/// left, in the order written. Ties keep the written order, so the permutation is deterministic and
+/// a statement with nothing to choose between is planned exactly as it was.
+///
+/// It reorders **only** when every entry is a stored relation or a catalog view and every join is
+/// an inner one with no `ON`. A derived table, a set-returning function or a `VALUES` list in the
+/// list means the identity, because the outer node for those is built from `select.from` and a
+/// different first table would not be it; an outer join means the identity because reordering
+/// across one changes the answer.
+fn comma_list_order(select: &Select, entries: &[(&TableDef, String)]) -> Vec<usize> {
+    let identity = || (0..entries.len()).collect::<Vec<_>>();
+    let plain = |entry: Option<&crate::plan::TableRef>| {
+        entry.is_none_or(|entry| {
+            entry.function.is_none() && entry.values.is_none() && entry.derived_plan().is_none()
+        })
+    };
+    if entries.len() < 3
+        || !plain(select.from.as_ref())
+        || !select.joins.iter().all(|join| {
+            join.on.is_none()
+                && join.kind != crate::plan::JoinKind::Left
+                && plain(Some(&join.table))
+        })
+    {
+        return identity();
+    }
+    let Some(filter) = select.filter.as_ref() else {
+        return identity();
+    };
+    let conjuncts = conjuncts_of(filter);
+    // Which entries a conjunct can be answered by: the smallest prefix-free set is what matters,
+    // so each conjunct is tested against every single table and against every pair with a chosen
+    // one. `resolve` against a one-table scope is the whole test.
+    let answered_by_one = |at: usize| {
+        let scope = Scope::chain(&entries[at..=at]);
+        conjuncts
+            .iter()
+            .any(|conjunct| is_pushable(conjunct) && resolve(conjunct, &scope).is_ok())
+    };
+    let mut chosen: Vec<usize> = Vec::with_capacity(entries.len());
+    let mut left: Vec<usize> = (0..entries.len()).collect();
+    // The seed: the first table a constant pins, or the first table written.
+    let seed = left
+        .iter()
+        .position(|at| answered_by_one(*at))
+        .unwrap_or_default();
+    chosen.push(left.remove(seed));
+    while !left.is_empty() {
+        let next = left
+            .iter()
+            .position(|at| {
+                let mut with: Vec<(&TableDef, String)> = chosen
+                    .iter()
+                    .map(|c| (entries[*c].0, entries[*c].1.clone()))
+                    .collect();
+                with.push((entries[*at].0, entries[*at].1.clone()));
+                let scope = Scope::chain(&with);
+                // A conjunct this table completes and the tables so far could not answer alone:
+                // that is an equality tying it to what is already in hand.
+                let smaller = Scope::chain(&with[..with.len() - 1]);
+                conjuncts.iter().any(|conjunct| {
+                    is_pushable(conjunct)
+                        && resolve(conjunct, &scope).is_ok()
+                        && resolve(conjunct, &smaller).is_err()
+                })
+            })
+            .unwrap_or_default();
+        chosen.push(left.remove(next));
+    }
+    chosen
 }
 
 /// The rows an `UPDATE … FROM` writes: the target's row, then whatever its `FROM` chain put
@@ -1406,6 +1714,14 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     if let Some(view) = pg_catalog::view_of(table) {
         return Ok(Node::CatalogView { view, columns });
     }
+    // A sequence's relation has no rows of its own: its one row is the counter, read at open.
+    if let Some(sequence_id) = crate::catalog::sequence_of_relation(table.id) {
+        return Ok(Node::SequenceRead {
+            sequence_id,
+            state: None,
+            columns,
+        });
+    }
     let Some(filter) = filter else {
         return Ok(seq_scan(tenant, table, &columns, false));
     };
@@ -1751,9 +2067,19 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         Expr::ToText { operand, .. } => {
             let operand = resolve(operand, scope)?;
             let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
+            // The operand's output function, where the operand is an enum column: the label, not
+            // the ordinal the row holds.
+            let enum_labels = match &operand {
+                Expr::Ordinal { at, .. } => match scope.user_type_at(*at).map(|def| &def.kind) {
+                    Some(crate::catalog::TypeKind::Enum { labels }) => Some(labels.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
             Expr::ToText {
                 operand: Box::new(operand),
                 strip_blanks,
+                enum_labels,
             }
         }
         Expr::Column { table, name } => {
@@ -1775,6 +2101,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         }
         Expr::Binary { op, left, right } => {
             let (left, right) = (resolve(left, scope)?, resolve(right, scope)?);
+            // **An enum is reconciled before the ordinary rule, and by a different one.** The
+            // column is an `int2` in the row, so the ordinary rule would read `'sad'` as a
+            // smallint and answer `22P02 invalid input syntax for type smallint`. See
+            // [`reconcile_enum`] for the three answers a real server gives here.
+            if let Some((left, right)) = reconcile_enum(*op, &left, &right, scope)? {
+                return Ok(Expr::Binary {
+                    op: *op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
             let (left, right) = if op.is_comparison() {
                 // A literal has no type until something gives it one, and here that something is
                 // the other operand. Without this the comparison would run between a `text` and an
@@ -1856,10 +2193,28 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             for arg in &call.args {
                 args.push(resolve(arg, scope)?);
             }
-            Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
-                func: call.func,
-                args,
-            }))
+            // **`pg_typeof` of an enum column is folded here, where the type has a name.** The
+            // evaluator reads a `Datum`'s own type and a `Datum` is an `int2`, so it would answer
+            // `smallint` — the storage, which is the one thing about an enum a client must not be
+            // told, and a *wrong value* rather than a refusal (ADR 0031's worst class). The name is
+            // known at plan time and nowhere else, so this is where it is answered.
+            match (call.func, args.first()) {
+                (crate::plan::CatalogFunc::PgTypeof, Some(Expr::Ordinal { at, .. }))
+                    if args.len() == 1 =>
+                {
+                    match scope.user_type_at(*at) {
+                        Some(def) => Expr::Literal(Literal::String(def.name.clone())),
+                        None => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                            func: call.func,
+                            args,
+                        })),
+                    }
+                }
+                _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                    func: call.func,
+                    args,
+                })),
+            }
         }
         // Only the **operand** is resolved here. Everything inside the sub-select was resolved
         // against the sub-select's own scope when `crate::exec::subquery::plan_subqueries` planned
@@ -1896,6 +2251,27 @@ fn resolve_in_list(
     let mut items = Vec::with_capacity(list.len());
     for item in list {
         items.push(resolve(item, scope)?);
+    }
+    // **An enum operand types the whole list before the common-type rule sees it**, for the reason
+    // `reconcile_enum` exists: the column is an `int2` in the row, so `select_common_type` would
+    // read `'sad'` as a smallint and answer `22P02 invalid input syntax for type smallint`. Each
+    // item is reconciled against the operand on its own, which is what `x IN (a, b)` means — a set
+    // of `=` — and each gives the same three answers a single `=` gives (ADR 0050).
+    if let Expr::Ordinal { at, .. } = &operand
+        && scope.user_type_at(*at).is_some()
+    {
+        let mut coerced = Vec::with_capacity(items.len());
+        for item in items {
+            match reconcile_enum(BinaryOp::Eq, &operand, &item, scope)? {
+                Some((_, right)) => coerced.push(right),
+                None => coerced.push(item),
+            }
+        }
+        return Ok(Expr::InList {
+            operand: Box::new(operand),
+            list: coerced,
+            negated,
+        });
     }
     // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
     // answers `1 IN (NULL, 'x')` with `22P02` even though the NULL alone could have
@@ -2092,9 +2468,9 @@ fn subquery_operand(
         && !same_family(*left, ty)
     {
         return Err(SqlError::UndefinedOperator {
-            left: left.name(),
+            left: left.name().to_owned(),
             op: op.symbol(),
-            right: ty.name(),
+            right: ty.name().to_owned(),
         });
     }
     Ok(operand)
@@ -2106,7 +2482,7 @@ fn subquery_operand(
 /// grouping [`crate::plan::Literal::comparable_with`] already uses for a literal against a column,
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
-fn same_family(left: ColumnType, right: ColumnType) -> bool {
+pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // **`json` compares with nothing, including another `json`.** Measured:
     // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
     // type has no equality operator at all, which is a property of it rather than a gap, and is
@@ -2168,6 +2544,88 @@ fn same_family(left: ColumnType, right: ColumnType) -> bool {
         return false;
     }
     family(left) == family(right)
+}
+
+/// A comparison with a column declared as an **enum**, or `None` when neither side is one.
+///
+/// Three answers, all measured on 19beta1 against `mood` = `('sad','ok','happy')`:
+///
+/// * `current_mood = 'sad'` — an **unquoted** literal is `unknown` and is coerced to the enum, so
+///   it becomes the label's ordinal and the comparison is between two `int2`s. That is what makes
+///   the ordering and the equality the ordinal's, which is the whole of ADR 0050;
+/// * `current_mood = 'sad'::text` is **`42883 operator does not exist: mood = text`** — a `text`
+///   is not an `unknown` and there is no operator between the two. The distinction is the one
+///   thing about this that reasoning gets backwards, because both spellings look like strings;
+/// * `current_mood = 1` is the same `42883` naming `integer`, and a label nobody declared is
+///   `22P02 invalid input value for enum mood: "angry"`.
+///
+/// A NULL on either side is left alone: a comparison with one is NULL whatever the types are.
+fn reconcile_enum(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    scope: &Scope<'_>,
+) -> Result<Option<(Expr, Expr)>> {
+    if !op.is_comparison() {
+        return Ok(None);
+    }
+    let enum_of = |expr: &Expr| match expr {
+        Expr::Ordinal { at, .. } => scope.user_type_at(*at),
+        _ => None,
+    };
+    let (def, other, flipped) = match (enum_of(left), enum_of(right)) {
+        (Some(def), None) => (def, right, false),
+        (None, Some(def)) => (def, left, true),
+        // Neither side is one, or **both are**: two ordinals compare as they stand, and the
+        // ordinary path is already right for them.
+        _ => return Ok(None),
+    };
+    let coerced = match other {
+        // Still nothing, whatever the type it was written with.
+        Expr::Literal(Literal::Null | Literal::TypedNull(_)) => return Ok(None),
+        // The `unknown` literal, and the only spelling that is coerced.
+        Expr::Literal(Literal::String(text)) => {
+            match crate::catalog::enum_ordinal(enum_labels(def)?, text) {
+                Some(ordinal) => Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal)))),
+                None => {
+                    return Err(SqlError::InvalidEnumValue {
+                        ty: def.name.clone(),
+                        value: text.clone(),
+                    });
+                }
+            }
+        }
+        // Anything with a type of its own, including a cast that folded to one.
+        other => {
+            let named = expr_type(other, scope)
+                .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned());
+            let (left, right) = if flipped {
+                (named, def.name.clone())
+            } else {
+                (def.name.clone(), named)
+            };
+            return Err(SqlError::UndefinedOperator {
+                left,
+                op: op.symbol(),
+                right,
+            });
+        }
+    };
+    Ok(Some(if flipped {
+        (coerced, right.clone())
+    } else {
+        (left.clone(), coerced)
+    }))
+}
+
+/// An enum type's labels, or the internal error of a column carrying a type that is not one.
+fn enum_labels(def: &crate::catalog::TypeDef) -> Result<&[String]> {
+    match &def.kind {
+        crate::catalog::TypeKind::Enum { labels } => Ok(labels),
+        _ => Err(SqlError::Internal(
+            "a column carrying a user type that is not an enum reached a comparison".to_owned(),
+        )),
+    }
 }
 
 /// Gives a literal the type of whatever it is being compared against, or says the comparison is
@@ -2232,9 +2690,9 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             match (literal_type(left_literal), literal_type(right_literal)) {
                 (Some(a), Some(b)) if !same_family(a, b) => {
                     return Err(SqlError::UndefinedOperator {
-                        left: a.name(),
+                        left: a.name().to_owned(),
                         op: op.symbol(),
-                        right: b.name(),
+                        right: b.name().to_owned(),
                     });
                 }
                 _ => (left, right),
@@ -2258,9 +2716,9 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
                 unreachable!("both types are Some in the guard above")
             };
             return Err(SqlError::UndefinedOperator {
-                left: a.name(),
+                left: a.name().to_owned(),
                 op: op.symbol(),
-                right: b.name(),
+                right: b.name().to_owned(),
             });
         }
         _ => (left, right),
@@ -2332,6 +2790,10 @@ fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
 /// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
 pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
     match literal {
+        // **The one NULL that has a type**, which is why the variant exists: everything that asks
+        // this question — a subquery's column type, an operator's two sides, a `COALESCE`'s
+        // unification — gets the cast's answer instead of `None`.
+        Literal::TypedNull(ty) => Some(*ty),
         Literal::Null | Literal::String(_) => None,
         Literal::Integer(_) => Some(ColumnType::Int8),
         Literal::Decimal(_) => Some(ColumnType::Double),
@@ -2494,9 +2956,9 @@ fn undefined_operator(
         (ty.name(), literal.type_name())
     };
     SqlError::UndefinedOperator {
-        left,
+        left: left.to_owned(),
         op: op.symbol(),
-        right,
+        right: right.to_owned(),
     }
 }
 
@@ -2572,7 +3034,7 @@ fn output_columns(
     select: &Select,
     scope: &Scope<'_>,
     aggregation: Option<&aggregate::Aggregation>,
-) -> Result<Vec<(String, ColumnType, i32)>> {
+) -> Result<Vec<OutputColumn>> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
@@ -2588,11 +3050,14 @@ fn output_columns(
                 // with no declared key returns what the user declared and nothing else. Across a
                 // join it is every table's, left to right, which is the order PostgreSQL gives,
                 // and `t.*` is one table's.
-                columns.extend(
-                    scope
-                        .expand(qualifier_of(item))?
-                        .map(|(_, column)| (column.name.clone(), column.ty, column.typmod)),
-                );
+                columns.extend(scope.expand(qualifier_of(item))?.map(|(at, column)| {
+                    OutputColumn {
+                        name: column.name.clone(),
+                        ty: column.ty,
+                        typmod: column.typmod,
+                        user_type: scope.user_type_at(at).cloned(),
+                    }
+                }));
             }
             SelectItem::Expr { expr, alias } => {
                 // With an aggregation the type comes from the rewritten expression, because an
@@ -2622,7 +3087,34 @@ fn output_columns(
                     Expr::Column { .. } if aggregation.is_none() => typmod_of(expr, scope),
                     _ => crate::value::NO_TYPMOD,
                 };
-                columns.push((name, ty, typmod));
+                // **The type a client is told, for a column declared as a user-defined one.**
+                // A plain column reference and an aggregate over one both keep it — `min(mood)` is
+                // `mood` on a real server — and everything else loses it, because an expression
+                // over an enum is an expression over its ordinal and has no name to give back.
+                let user_type = match expr {
+                    Expr::Column { table, name } => scope
+                        .resolve_column(table.as_deref(), name)
+                        .ok()
+                        .and_then(|(at, _)| scope.user_type_at(at))
+                        .cloned(),
+                    Expr::Aggregate(call) if call.func.keeps_its_argument_type() => {
+                        match call.arg() {
+                            Some(Expr::Column { table, name }) => scope
+                                .resolve_column(table.as_deref(), name)
+                                .ok()
+                                .and_then(|(at, _)| scope.user_type_at(at))
+                                .cloned(),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                columns.push(OutputColumn {
+                    name,
+                    ty,
+                    typmod,
+                    user_type,
+                });
             }
         }
     }
@@ -2765,6 +3257,13 @@ enum Operand {
 
 fn operand(expr: &Expr, scope: &Scope<'_>) -> Result<Operand> {
     Ok(match expr {
+        // **A typed NULL is not unknown**: the cast gave it a type, so `NULL::text + 1` should
+        // resolve the way `'x'::text + 1` does and not the way a bare `NULL + 1` does. It is the
+        // one NULL that lands in `Fixed`.
+        //
+        // **Not captured** — see `crate::plan::Literal::TypedNull`. The rule follows from operator
+        // resolution being by type, and the corpus that would pin it is owed.
+        Expr::Literal(Literal::TypedNull(ty)) => Operand::Fixed(*ty),
         Expr::Literal(Literal::Null | Literal::String(_)) => Operand::Unknown,
         Expr::Literal(Literal::Integer(value)) => Operand::Integer(*value),
         other => Operand::Fixed(expr_type(other, scope)?),
@@ -2793,7 +3292,12 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             op, left, right, ..
         } => arithmetic_type(*op, left, right, scope)?,
         Expr::Column { table, name } => scope.resolve_column(table.as_deref(), name)?.1.ty,
-        Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => *ty,
+        // **The type the cast named**, which is the whole reason a typed NULL is a variant: this
+        // is what a subquery's column reports, and reporting `text` for `NULL::bigint` made
+        // `IN (SELECT NULL::bigint)` a `42883` where a real server matches nothing.
+        Expr::Ordinal { ty, .. }
+        | Expr::Outer { ty, .. }
+        | Expr::Literal(Literal::TypedNull(ty)) => *ty,
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         // Every catalog function returns `text`, which is what makes them one variant.

@@ -102,7 +102,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 24;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 25;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1214,6 +1214,38 @@ pub(super) fn encode_counter(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+/// A **sequence's** counter: the next value, and whether one has been handed out.
+///
+/// Nine bytes where a row-id counter is eight, and the ninth is what `SELECT is_called FROM <seq>`
+/// answers. It cannot be derived from the counter alone: `setval(s, 5, false)` stores 5 with
+/// `is_called` false and `setval(s, 4, true)` stores 5 with it true, and those are two different
+/// sequences — the first hands out 5 next and reports `last_value 5`, the second hands out 5 next
+/// and reports `last_value 4`.
+///
+/// **Eight bytes is a record this format wrote before the flag existed**, and it reads back
+/// exactly right: every sequence here starts at 1, so a counter still at 1 has handed nothing out
+/// and any higher one has.
+#[must_use]
+pub(super) fn encode_sequence_counter(next: u64, is_called: bool) -> Vec<u8> {
+    let mut out = next.to_le_bytes().to_vec();
+    out.push(u8::from(is_called));
+    out
+}
+
+/// Reads one back, in either width.
+pub(super) fn decode_sequence_counter(bytes: &[u8]) -> Result<(u64, bool)> {
+    match bytes.len() {
+        8 => {
+            let next = decode_counter(bytes)?;
+            Ok((next, next > 1))
+        }
+        9 => Ok((decode_counter(&bytes[..8])?, bytes[8] != 0)),
+        other => Err(corrupt(format!(
+            "a sequence counter is 8 or 9 bytes, not {other}"
+        ))),
+    }
+}
+
 /// Reads a counter, or says the bytes are not one.
 pub(super) fn decode_counter(bytes: &[u8]) -> Result<u64> {
     bytes
@@ -1549,7 +1581,36 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         varint::put_u64(ordinal, &mut out);
     }
 
+    // Version 25. One varint per column: the oid of the user-defined type it was declared as, and
+    // **0 for none** — an oid comes from the tenant's relation-id sequence, which starts above
+    // zero, so no present-or-absent byte is needed and the section costs one byte for a column
+    // that has no user type. Thirteenth section, appended like every one before it (ADR 0050).
+    // **It was written as 24 and renumbered**: `ALTER TABLE … DROP COLUMN` took that number on
+    // `main` while this was in review, which is the rule about claiming a version at HEAD in the
+    // commit that uses it rather than reserving one in advance.
+    for column in &table.columns {
+        varint::put_u64(column.user_type.unwrap_or(0), &mut out);
+    }
+
     Ok(out)
+}
+
+/// The version 25 tail: each column's user-defined type oid, or 0 for a column declared as one of
+/// this node's own types.
+///
+/// A column written before 25 has none, which is what every column had while a user type could not
+/// be a column's type at all — `CREATE TABLE t (c mood)` was `0A000 the type mood is not
+/// supported` until ADR 0050's first unit. Read **after** version 24's dropped ordinals, because
+/// the sections come off in the order they went on.
+fn read_user_types(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 25 {
+        return Ok(());
+    }
+    for column in columns {
+        let oid = reader.varint()?;
+        column.user_type = (oid != 0).then_some(oid);
+    }
+    Ok(())
 }
 
 /// The version 23 section: whether the table is `UNLOGGED`.
@@ -2025,6 +2086,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
     }
 
@@ -2112,6 +2174,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let (comment, primary_key_comment) = read_comments(&mut reader, &mut columns, &mut indexes)?;
     let persistence = read_persistence(&mut reader)?;
     read_dropped(&mut reader, &mut columns)?;
+    read_user_types(&mut reader, &mut columns)?;
     reader.finish()?;
 
     Ok(TableDef {
@@ -2139,6 +2202,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         checks,
         foreign_keys,
         triggers_disabled,
+        enums: std::collections::BTreeMap::new(),
     })
 }
 

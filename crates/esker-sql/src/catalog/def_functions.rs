@@ -43,7 +43,11 @@
 use crate::value::{self, ColumnType, Datum, PgType};
 
 /// What a real server prints for an oid that has no `pg_type` row.
-const UNKNOWN_TYPE: &str = "???";
+///
+/// Public because the evaluator asks the catalog about a **user-defined** type only when this is
+/// the answer — see `crate::exec::cursor`'s `FormatType` arm, and ADR 0050 for why the order
+/// matters.
+pub const UNKNOWN_TYPE: &str = "???";
 
 /// What a real server prints for `InvalidOid`.
 const INVALID_OID: &str = "-";

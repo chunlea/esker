@@ -32,7 +32,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', pg_typeof(avg(i4)), pg_typeof(avg(id)), pg_typeof(avg(n)), pg_typeof(avg(d)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(i4)::text) FROM ag",
         "SELECT 'r', pg_typeof(array_agg('lit'::text)) FROM ag",
-        "SELECT 'r', array_agg(NULL::int4) FROM ag",
+        // Moved up from `answers` by `Literal::TypedNull`: the cast survives lowering, so the
+        // argument is an `int4` and the aggregate declares `integer[]` — the row PostgreSQL
+        // gives. Only the `regtype` trade above it is left, which is what this list is.
+        "SELECT 'r', pg_typeof(array_agg(NULL::int4)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag GROUP BY t",
     ],
     answers: &[
@@ -83,21 +86,20 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
             "a bare integer constant is int8 here and int4 there",
         ),
-        // **A cast on a NULL is dropped at lowering** (`Literal::Null` carries no type), so
-        // `NULL` and `NULL::int4` are the same expression here. That costs both directions at
-        // once: the bare one is answered where PostgreSQL raises `42725`, and the cast one is
-        // `text[]` where PostgreSQL says `integer[]`. Refusing both would refuse a statement a
-        // real server answers, which is the worse of the two, so the rule that raises `42725`
-        // takes only a quoted string. Giving `Literal::Null` a type is the unit that closes both.
+        // **A bare NULL is still resolved to `text` where PostgreSQL calls it `unknown`.** The
+        // entry beside this one — `array_agg(NULL::int4)` — has gone: `Literal::TypedNull` keeps
+        // the cast, so the two spellings are no longer one expression. What is left is the bare
+        // one: PostgreSQL raises `42725 function array_agg(unknown) is not unique` and this node
+        // answers `text[]`, because `exec::aggregate::is_unknown` takes only a quoted string.
+        // Its doc comment named the dropped cast as the reason it could not take a NULL as well,
+        // and that reason is now gone — the one-line widening is unblocked, and what it needs
+        // first is a capture of the bare-NULL argument across all six aggregates (`sum` and `avg`
+        // should raise with `array_agg`; `min`, `max` and `count` should not), because only
+        // `array_agg`'s half of that family has been put to the oracle.
         (
             "SELECT 'r', pg_typeof(array_agg(NULL)) FROM ag",
-            "a cast on a NULL is dropped at lowering, so an untyped NULL cannot be told from a \
-             typed one",
-        ),
-        (
-            "SELECT 'r', pg_typeof(array_agg(NULL::int4)) FROM ag",
-            "a cast on a NULL is dropped at lowering, so an untyped NULL cannot be told from a \
-             typed one",
+            "a bare NULL is text here and unknown there, so this answers where PostgreSQL raises \
+             42725; exec::aggregate::is_unknown takes only a quoted string",
         ),
     ],
 };

@@ -45,7 +45,7 @@ use crate::value::{PgDatum, PgType};
 /// would be nothing left to read; more importantly it would answer with what a *later* statement
 /// could see rather than with what this one did, which is not what `RETURNING` means.
 struct Returned {
-    columns: Vec<(String, ColumnType, i32)>,
+    columns: Vec<query::OutputColumn>,
     exprs: Vec<crate::plan::Expr>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
 }
@@ -115,7 +115,7 @@ fn finish(returned: Option<Returned>, tag: String) -> Outcome {
             fields: returned
                 .columns
                 .iter()
-                .map(|(name, ty, typmod)| FieldDescription::of(name.clone(), *ty, *typmod))
+                .map(|column| FieldDescription::of(column.name.clone(), column.ty, column.typmod))
                 .collect(),
             rows: returned.rows,
             tag,
@@ -346,7 +346,7 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
-            row[*target] = value_for_column(expr, column, &*txn)?;
+            row[*target] = value_for_column(expr, column, &table, &*txn)?;
         }
         // A sequence fills its column when the statement did not name it, or named it and wrote
         // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
@@ -452,8 +452,23 @@ pub(super) fn insert(
 fn value_for_column(
     expr: &crate::plan::Expr,
     column: &crate::catalog::ColumnDef,
+    table: &TableDef,
     txn: &dyn Txn,
 ) -> Result<Datum> {
+    // **An enum column takes a label, not an `int2`.** The value is read as *text* whatever the
+    // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
+    // `mood` is a label the same way `'2020-01-01'` in a `date` column is a date — one rule, one
+    // place, and the same one an `UPDATE` uses (ADR 0050).
+    if let Some(def) = super::assign::enum_of(table, column) {
+        let value = match expr {
+            crate::plan::Expr::Literal(literal) => super::assign::enum_literal(literal),
+            other => {
+                let resolved = query::resolve(other, &query::Scope::empty())?;
+                cursor::evaluate_in_txn(&resolved, &[], txn)?
+            }
+        };
+        return super::assign::into_enum(value, column, def);
+    }
     match expr {
         crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
         // A `$1` with nothing bound to it. The simple query protocol has no way to carry one, and
@@ -470,7 +485,64 @@ fn value_for_column(
         | crate::plan::Expr::Subquery(_) => expr.evaluate(column.ty, &column.name),
         other => {
             let resolved = query::resolve(other, &query::Scope::empty())?;
-            super::assign::into_column(cursor::evaluate_in_txn(&resolved, &[], txn)?, column)
+            super::assign::into_column(
+                cursor::evaluate_in_txn(&resolved, &[], txn)?,
+                column,
+                super::assign::enum_of(table, column),
+            )
+        }
+    }
+}
+
+/// Everything one `SET` assignment is evaluated against.
+///
+/// A struct rather than eight arguments because it is passed once and read once; the fields are
+/// the row as the statement found it and the catalog around it.
+struct AssignedIn<'a> {
+    executor: &'a mut Executor,
+    txn: &'a dyn Txn,
+    table: &'a TableDef,
+    column: &'a crate::catalog::ColumnDef,
+    ordinal: usize,
+    scope: &'a query::Scope<'a>,
+    joined: &'a [Datum],
+}
+
+/// One `SET` assignment's value, before it meets the column.
+///
+/// Split out of [`update`] because it is the same three cases the `INSERT` path has in
+/// [`value_for_column`], and keeping them side by side is what makes the enum rule visibly the
+/// same rule on both: a label stays a label here and becomes an ordinal in `into_column`.
+fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<Datum> {
+    match value {
+        // `SET a = DEFAULT` is the column's own default, which for a sequence column is the next
+        // value and for every other one is the constant the catalog holds. `sequence_for` answers
+        // only for a sequence that *fills* this column, so an owned-but-unused one cannot capture
+        // a `SET c = DEFAULT`.
+        crate::plan::Expr::Default => match at.table.sequence_for(at.ordinal) {
+            Some(sequence) => sequence_datum(
+                at.table.columns[at.ordinal].ty,
+                at.executor.next_sequence_value(sequence.id)?,
+            ),
+            None => column_default_value(at.table, at.column, at.txn),
+        },
+        // An enum column takes a label, so the literal keeps its own type here and `into_column`
+        // reads it against the enum rather than against the `int2` the row holds.
+        crate::plan::Expr::Literal(literal)
+            if super::assign::enum_of(at.table, at.column).is_some() =>
+        {
+            Ok(super::assign::enum_literal(literal))
+        }
+        crate::plan::Expr::Literal(literal) => literal.assign(at.column.ty, &at.column.name),
+        other => {
+            let resolved = query::resolve_against_scope(other, at.scope)?;
+            // Against the row as the statement found it, and **the whole joined row**:
+            // `SET body = c.body || '!'` over `FROM vl_comments c` appends to the pre-statement
+            // value of every row rather than letting one row's new value leak into the next.
+            //
+            // In the transaction, so `SET updated_at = CURRENT_TIMESTAMP` reads the instant
+            // rather than reporting a clock with nothing to read.
+            cursor::evaluate_in_txn(&resolved, at.joined, at.txn)
         }
     }
 }
@@ -709,34 +781,23 @@ pub(super) fn update(
                     });
                 }
                 // Evaluated against the row as it was, so `SET a = b, b = a` swaps them.
-                let evaluated = match value {
-                    // `SET a = DEFAULT` is the column's own default, which for a sequence column is
-                    // the next value and for every other one is the constant the catalog holds.
-                    // `sequence_for` answers only for a sequence that *fills* this column, so an
-                    // owned-but-unused one cannot capture a `SET c = DEFAULT`.
-                    crate::plan::Expr::Default => match table.sequence_for(*ordinal) {
-                        Some(sequence) => sequence_datum(
-                            table.columns[*ordinal].ty,
-                            executor.next_sequence_value(sequence.id)?,
-                        )?,
-                        None => column_default_value(&table, column, &*txn)?,
+                let evaluated = assigned_value(
+                    value,
+                    &mut AssignedIn {
+                        executor,
+                        txn: &*txn,
+                        table: &table,
+                        column,
+                        ordinal: *ordinal,
+                        scope: &scope,
+                        joined: &joined,
                     },
-                    crate::plan::Expr::Literal(literal) => {
-                        literal.assign(column.ty, &column.name)?
-                    }
-                    other => {
-                        let resolved = query::resolve_against_scope(other, &scope)?;
-                        // Against the row as the statement found it, and **the whole joined row**:
-                        // `SET body = c.body || '!'` over `FROM vl_comments c` appends to the
-                        // pre-statement value of every row rather than letting one row's new value
-                        // leak into the next.
-                        //
-                        // In the transaction, so `SET updated_at = CURRENT_TIMESTAMP` reads the
-                        // instant rather than reporting a clock with nothing to read.
-                        cursor::evaluate_in_txn(&resolved, &joined, &*txn)?
-                    }
-                };
-                new[*ordinal] = super::assign::into_column(evaluated, column)?;
+                )?;
+                new[*ordinal] = super::assign::into_column(
+                    evaluated,
+                    column,
+                    super::assign::enum_of(&table, column),
+                )?;
             }
             fit_typmods(&table, &mut new)?;
             // The column is a function of the row, so an `UPDATE` that moved its source moves it too
@@ -1051,7 +1112,8 @@ fn apply_conflict_update(
                 cursor::evaluate_in_txn(&resolved, &both, txn)?
             }
         };
-        updated[ordinal] = super::assign::into_column(evaluated, column)?;
+        updated[ordinal] =
+            super::assign::into_column(evaluated, column, super::assign::enum_of(table, column))?;
     }
     fit_typmods(table, &mut updated)?;
     fill_generated(table, &mut updated)?;

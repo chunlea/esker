@@ -28,13 +28,23 @@ use crate::value::{ColumnType, PgType};
 /// The message is PostgreSQL's own, down to the order — the column's type first, the
 /// expression's second — and it carries the rewrite-or-cast `HINT` that a real server sends with
 /// it (`crate::error`).
-pub(super) fn into_column(value: Datum, column: &ColumnDef) -> Result<Datum> {
+pub(super) fn into_column(
+    value: Datum,
+    column: &ColumnDef,
+    user_type: Option<&crate::catalog::TypeDef>,
+) -> Result<Datum> {
+    // **An enum first, and by its own rule.** The column is an `int2` in the row, so every test
+    // below would be about the storage: `'angry'` would be `22P02 invalid input syntax for type
+    // smallint` where a real server names the enum and the label it did not have.
+    if let Some(def) = user_type {
+        return into_enum(value, column, def);
+    }
     if value.fits(column.ty) {
         return Ok(value);
     }
     coerce(&value, column.ty).ok_or_else(|| SqlError::DatatypeMismatchInColumn {
         column: column.name.clone(),
-        column_type: column.ty.name(),
+        column_type: column.ty.name().to_owned(),
         // A NULL fits every column and never reaches here, so a value with no type cannot either.
         expression_type: value.column_type().map_or("unknown", PgType::name),
     })
@@ -61,4 +71,104 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
         }
         _ => return None,
     })
+}
+
+/// The enum a column was declared as, or `None` for a column that is not one.
+///
+/// The labels are on the `TableDef` rather than on the column, because the type is its own catalog
+/// record and the column stores only its oid — see `crate::catalog::TableDef::enums`, which is
+/// where the read happens and where the "only when a column has one" guard lives.
+pub(super) fn enum_of<'a>(
+    table: &'a crate::catalog::TableDef,
+    column: &ColumnDef,
+) -> Option<&'a crate::catalog::TypeDef> {
+    let oid = column.user_type?;
+    let def = table.enums.get(&oid)?;
+    matches!(def.kind, crate::catalog::TypeKind::Enum { .. }).then_some(def)
+}
+
+/// A **literal** meeting an enum column, as the value it stands for.
+///
+/// Only an `unknown` — a quoted string — is a label; everything else keeps its own type and lands
+/// on [`into_enum`]'s `42804`. Reading them all as text would turn `VALUES (1)` into the label
+/// `"1"` and answer `22P02` where a real server says
+/// `column "current_mood" is of type mood but expression is of type integer`, which is a different
+/// error about a different mistake.
+pub(super) fn enum_literal(literal: &crate::plan::Literal) -> Datum {
+    use crate::plan::Literal;
+    match literal {
+        Literal::Null | Literal::TypedNull(_) => Datum::Null,
+        Literal::String(text) => Datum::Text(text.clone()),
+        Literal::Typed(value) => (**value).clone(),
+        // A bare integer constant is an `int8` here and an `integer` there — the standing
+        // constant-width divergence — and either way it is not a label.
+        Literal::Integer(value) => Datum::Int8(*value),
+        Literal::Decimal(digits) => Datum::Double(digits.parse().unwrap_or(f64::NAN)),
+        Literal::Bool(flag) => Datum::Bool(*flag),
+    }
+}
+
+/// One value, ready to store in a column declared as an **enum**: the ordinal of the label it
+/// names.
+///
+/// Three answers, all measured against 19beta1:
+///
+/// * a label becomes its **ordinal** — an `int2`, the label's position, which is what makes the
+///   ordering `ORDER BY current_mood` gives declaration order rather than the alphabet;
+/// * a string that is not one of the labels is
+///   **`22P02 invalid input value for enum mood: "angry"`** — the input-syntax class, and the same
+///   error from an `INSERT`, an `UPDATE` and a bare cast, which is why all three arrive here;
+/// * anything that is not a string at all is
+///   **`42804 column "current_mood" is of type mood but expression is of type integer`**, the
+///   sentence every other type's mismatch already uses, with the type's own name in it.
+///
+/// A NULL is a NULL, as it is for every column.
+pub(super) fn into_enum(
+    value: Datum,
+    column: &ColumnDef,
+    def: &crate::catalog::TypeDef,
+) -> Result<Datum> {
+    let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+        return Err(SqlError::Internal(
+            "a column carrying a user type that is not an enum reached the write path".to_owned(),
+        ));
+    };
+    match value {
+        Datum::Null => Ok(Datum::Null),
+        // Text, and an `unknown` literal arrives as text too — which is what makes the *unquoted*
+        // `current_mood = 'sad'` work where `current_mood = 'sad'::text` is `42883` on a real
+        // server: one is a literal waiting for a type and the other is already a `text`.
+        Datum::Text(text) => match crate::catalog::enum_ordinal(labels, &text) {
+            Some(ordinal) => Ok(Datum::Int2(ordinal)),
+            None => Err(SqlError::InvalidEnumValue {
+                ty: def.name.clone(),
+                value: text,
+            }),
+        },
+        other => Err(SqlError::DatatypeMismatchInColumn {
+            column: column.name.clone(),
+            column_type: def.name.clone(),
+            expression_type: other.column_type().map_or("unknown", PgType::name),
+        }),
+    }
+}
+
+/// The label an enum column's stored ordinal names, for a value on its way **out**.
+///
+/// The inverse of [`into_enum`], and the reason a client never sees the `int2`: what is stored is
+/// the position, what is sent is the label. An ordinal no label has answers NULL rather than a
+/// neighbouring label — see `crate::catalog::enum_label`, and ADR 0050's never-reuse rule, which
+/// is what keeps that case unreachable for a value this node wrote.
+#[must_use]
+pub(super) fn from_enum(value: &Datum, def: &crate::catalog::TypeDef) -> Datum {
+    let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+        return value.clone();
+    };
+    match value {
+        Datum::Int2(ordinal) => match crate::catalog::enum_label(labels, *ordinal) {
+            Some(label) => Datum::Text(label.to_owned()),
+            None => Datum::Null,
+        },
+        other => other.clone(),
+    }
 }

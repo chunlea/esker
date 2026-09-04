@@ -216,6 +216,25 @@ impl<'a> Cursor<'a> {
             // catalog view's are — there is no key range to seek in and the row count is the
             // length of one array. Its arguments are evaluated against **no row**, which is what
             // makes an argument that reads a column the refusal below rather than a wrong answer.
+            // One row, read from the catalog at open exactly as a catalog view's rows are.
+            Node::SequenceRead { state, .. } => {
+                let Some((last, is_called)) = *state else {
+                    return Err(SqlError::Internal(
+                        "a sequence read reached the cursor before its value was taken".to_owned(),
+                    ));
+                };
+                Kind::Rows(
+                    vec![vec![
+                        Datum::Int8(last),
+                        // **`log_cnt` is 0**, which is what a freshly written sequence shows on a
+                        // real server too: it counts values left in a WAL-logged batch, and this
+                        // node reaches crash safety another way.
+                        Datum::Int8(0),
+                        Datum::Bool(is_called),
+                    ]]
+                    .into_iter(),
+                )
+            }
             Node::TableFunction { call, .. } => {
                 Kind::Rows(super::table_function::rows(call, &[])?.into_iter())
             }
@@ -1009,16 +1028,17 @@ fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::D
             Some(range) => Ok(Some(range)),
             None => Err(SqlError::UndefinedOperator {
                 op: "&&",
-                left: "text",
-                right: "text",
+                left: "text".to_owned(),
+                right: "text".to_owned(),
             }),
         },
         Some(other) => Err(SqlError::UndefinedOperator {
             op: "&&",
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1034,10 +1054,11 @@ fn like_text(value: &Datum) -> Result<Option<String>> {
         Datum::Text(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: "~~",
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1053,10 +1074,11 @@ fn regex_text(value: &Datum, operator: &'static str) -> Result<Option<String>> {
         Datum::Text(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: operator,
-            left: other
-                .column_type()
-                .map_or("unknown", crate::value::PgType::name),
-            right: "unknown",
+            left: other.column_type().map_or_else(
+                || "unknown".to_owned(),
+                |ty| crate::value::PgType::name(ty).to_owned(),
+            ),
+            right: "unknown".to_owned(),
         }),
     }
 }
@@ -1256,8 +1278,19 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         Expr::ToText {
             operand,
             strip_blanks,
+            enum_labels,
         } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
+            // An enum's output function is its label, which is a lookup and not a rendering.
+            Datum::Int2(ordinal) if enum_labels.is_some() => {
+                match enum_labels
+                    .as_deref()
+                    .and_then(|labels| crate::catalog::enum_label(labels, ordinal))
+                {
+                    Some(label) => Datum::Text(label.to_owned()),
+                    None => Datum::Null,
+                }
+            }
             // **A boolean is the one type whose cast is not its output function.** `SELECT true`
             // prints `t` and `SELECT true::text` is `true`; PostgreSQL has a separate `booltext`
             // for the cast. Measured — every other type here casts to exactly what it prints.
@@ -1333,7 +1366,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // **A fresh value per call**, which is what volatile means: two of these in one statement
         // are two different UUIDs, and neither is cached.
         Expr::Uuid(_) => Datum::Uuid(crate::value::random::uuid_v4()?),
-        Expr::Literal(Literal::Null) => Datum::Null,
+        Expr::Literal(Literal::Null | Literal::TypedNull(_)) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),
         Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Double, digits)?,
@@ -1708,10 +1741,27 @@ fn catalog_function(
         // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool
         // through the same file `gen_random_uuid` reads (`crate::value::random`).
         CatalogFunc::Random => Datum::Double(crate::value::random::random_f64()?),
-        CatalogFunc::FormatType => crate::catalog::def_functions::format_type(
-            type_oid_argument(args.first())?,
-            typmod_argument(args.get(1))?,
-        ),
+        // **A user-defined type is asked about only after the built-in ones**, so a tenant's id
+        // sequence can never shadow one of PostgreSQL's fixed oids: everything that already had a
+        // name keeps it, and this can only turn a `???` into an answer. `pg_attribute.atttypid`
+        // reports a column's user type rather than its storage, so this is the call that prints
+        // `mood` where the row holds an `int2` (ADR 0050).
+        CatalogFunc::FormatType => {
+            let oid = type_oid_argument(args.first())?;
+            let built_in =
+                crate::catalog::def_functions::format_type(oid, typmod_argument(args.get(1))?);
+            match (&built_in, oid.and_then(|oid| u64::try_from(oid).ok())) {
+                (Datum::Text(printed), Some(oid))
+                    if printed == crate::catalog::def_functions::UNKNOWN_TYPE =>
+                {
+                    match env.relations()?.user_type_name(oid) {
+                        Some(name) => Datum::Text(name.to_owned()),
+                        None => built_in,
+                    }
+                }
+                _ => built_in,
+            }
+        }
         // **The five array operators, over the text the catalog holds** — see
         // `crate::value::vector` for why an array is text here and not a `Datum`. Every one is
         // strict: a NULL array or a NULL argument is NULL, never an error and never 0.
