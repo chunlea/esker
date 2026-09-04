@@ -1,8 +1,8 @@
 # Debts still open at v1
 
 **Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
-list — three items that were reported as open turned out to be closed, and one that was not on the
-list is open. Each row names its site, a size, and who it belongs to.
+list — three items that were reported as open turned out to be closed, and two that were not on the
+list are open (#5 and #8). Each row names its site, a size, and who it belongs to.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -20,6 +20,7 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 | 5 | **`crash_through_the_client` starves under load.** Fails 6 runs in 10 under 24 spinning threads **in one container**, so it is not the network-namespace contention the harness fix addressed. It is **not a durability failure**: the round's own guard `acked > 0` fires, and the durability assertion at `:311` fired in none of the six. The child is killed on a **wall clock** while the writes it should interrupt are CPU-bound. | `crates/esker-client/tests/crash_through_the_client.rs:331` (c6's record says `:305`; the file has moved) | small — measure the kill point in acknowledged writes, or retry a round that acked none | client |
 | 6 | **`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`.** Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it as a standing flake with an owner and treats the exclusive pass as evidence it is the same contention rather than a defect of its own. | `crates/esker-cli/tests/cluster_start.rs` | small, and may be closed by the per-container network namespaces | cli |
 | 7 | **`esker-sql::join_cost::a_materialised_join_costs_what_it_pairs_and_not_the_cross_product`.** One failure in a full 3,281-test parallel run; 3/3 in isolation and green on the next two full runs. A timing-**ratio** test with a control, so load-sensitive by construction. Unexplained, not diagnosed. | `crates/esker-sql/tests/join_cost.rs` | small to diagnose; unknown to fix | h1 (join cost) |
+| 8 | **The Miri gate needs `-Zmiri-disable-isolation`, which the code could make unnecessary.** proptest's default `FileFailurePersistence` calls `std::env::current_dir` to place a `.proptest-regressions` file, and Miri refuses `getcwd` under isolation, so the run aborts with 22 tests unrun. Setting `failure_persistence: None` under `cfg(miri)` in the memtable's `ProptestConfig` would make the plain documented command true — and matters because the failure looks like the gate *failing* rather than the gate *not running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state the flag. | `crates/esker-engine/src/memtable/differential.rs:316` (`ProptestConfig::with_cases`) | ~3 lines | engine |
 
 ## 2. Reported as open, and closed on inspection
 
