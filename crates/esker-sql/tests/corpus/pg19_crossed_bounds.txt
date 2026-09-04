@@ -1,0 +1,42 @@
+# **Bounds a user supplied in the wrong order** — the sweep the `BETWEEN` panic asked for.
+#
+# `WHERE id BETWEEN 3 AND 2` bounded a primary-key scan below by 3 and above by 2, and
+# `BTreeMap::range` panics on such a pair rather than answering empty: a query anyone can type took
+# the node down. The fix was one guard, and the question it left was **where else** a range is
+# built from bounds nobody checked. This file is that sweep's oracle.
+#
+# Things reasoning would get wrong:
+#
+# * **Meeting is empty and crossing is an error**, and the two are one character apart:
+#   `'[3,3)'::int4range` is `empty` and `'[3,1)'::int4range` is
+#   `22000 range lower bound must be less than or equal to range upper bound`.
+# * **A constructor is not a second opinion.** `tsrange(hi, lo)` and `'[hi,lo)'::tsrange` are two
+#   spellings of one value and answer alike — which is exactly what this node got wrong: the
+#   literal raised and the constructor built an impossible range object, while `daterange(hi, lo)`
+#   quietly answered `empty`. That last one is the worse of the two: a query filters nothing and
+#   nothing reports a problem.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE inv (id bigint primary key, n integer)		-
+INSERT INTO inv (id, n) VALUES (1, 10), (2, 20), (3, 30)		-
+SELECT 'r', count(*) AS crossed_pk_range FROM inv WHERE id BETWEEN 3 AND 2		r|0
+SELECT 'r', count(*) AS crossed_pk_range_wide FROM inv WHERE id >= 3 AND id <= 2		r|0
+SELECT 'r', count(*) AS crossed_on_a_non_key FROM inv WHERE n >= 30 AND n <= 10		r|0
+SELECT 'r', count(*) AS meeting_is_one_row FROM inv WHERE id BETWEEN 2 AND 2		r|1
+SELECT 'r', '[3,3)'::int4range AS meeting_is_empty	text,int4range	r|empty
+SAVEPOINT i1		-
+SELECT 'r', '[3,1)'::int4range	!22000 range lower bound must be less than or equal to range upper bound
+ROLLBACK TO i1		-
+SAVEPOINT i2		-
+SELECT 'r', tsrange('2026-03-01', '2026-01-01')	!22000 range lower bound must be less than or equal to range upper bound
+ROLLBACK TO i2		-
+SAVEPOINT i3		-
+SELECT 'r', daterange('2026-03-01', '2026-01-01')	!22000 range lower bound must be less than or equal to range upper bound
+ROLLBACK TO i3		-
+SELECT 'r', tsrange('2026-01-01', '2026-03-01') AS in_order	text,tsrange	r|["2026-01-01 00:00:00","2026-03-01 00:00:00")
+SELECT 'r', daterange('2026-01-01', '2026-03-01') AS in_order	text,daterange	r|[2026-01-01,2026-03-01)
+SELECT 'r', tsrange('2026-01-01', '2026-01-01') AS meeting	text,tsrange	r|empty
+DROP TABLE inv		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'inv'	bigint	0
