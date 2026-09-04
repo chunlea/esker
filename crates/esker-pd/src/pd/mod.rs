@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, WriteBatch, cf};
-use esker_proto::pd::{ColumnarWish, PdMemberInfo, PdMembership, PdRaftBatch};
+use esker_proto::pd::{ColumnarWish, PdMemberInfo, PdMembership, PdRaftBatch, PdRole};
 use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
 use esker_raft::{ConfChange, ConfChangeKind, Config, NodeId, Term};
 
@@ -637,6 +637,17 @@ impl Pd {
                 .map(|member| PdMemberInfo {
                     id: member.id,
                     address: member.address.clone(),
+                    // **As this member sees it.** The configuration comes from its own log, so a
+                    // member that has not caught up answers `Unconfigured` for everyone — which is
+                    // what a joiner honestly is until the group's snapshot reaches it, and is the
+                    // one report an operator debugging a join actually needs.
+                    role: if office.conf.voters.contains(&member.id) {
+                        PdRole::Voter
+                    } else if office.conf.learners.contains(&member.id) {
+                        PdRole::Learner
+                    } else {
+                        PdRole::Unconfigured
+                    },
                 })
                 .collect(),
         }

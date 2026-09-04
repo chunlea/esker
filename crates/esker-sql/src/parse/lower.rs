@@ -5445,16 +5445,13 @@ fn lower_limit_offset(query: &Query) -> Result<(Option<plan::Expr>, Option<plan:
     }
 }
 
-/// `FOR UPDATE` / `FOR SHARE`, and the two modifiers this node will not pretend to.
+/// `FOR UPDATE` / `FOR SHARE`, and the two modifiers that say what to do about a row somebody
+/// else holds.
 ///
-/// **`NOWAIT` and `SKIP LOCKED` are refused by name and the bare clause is not**, and the line
-/// between them is whether a client can tell that nothing was locked. A Percolator transaction is
-/// snapshot-isolated: it does not block a conflicting writer, it loses to one at commit with
-/// `40001` (ADR 0031). So `FOR UPDATE` buys ordering the transaction already enforces — no session
-/// can observe the difference — while `NOWAIT` must raise `55P03` when another session holds the
-/// row and `SKIP LOCKED` must leave that row out of the answer. Answering rows for those two is a
-/// wrong answer rather than a missing feature, and a queue built on `SKIP LOCKED` would hand one
-/// job to every worker.
+/// All three run now (ADR 0057 §5). They were refused by name for as long as this node took no row
+/// locks at all, because each of `NOWAIT` and `SKIP LOCKED` promises something a client can check —
+/// a `55P03` and a missing row — and answering every row would have been a wrong answer rather than
+/// a missing feature. The lock is real now, so the promises can be kept.
 ///
 /// `FOR NO KEY UPDATE` and `FOR KEY SHARE` never arrive here: `sqlparser` 0.62.0's `LockType` has
 /// only the two, so both are refused by name in `crate::parse`'s table before this runs.
@@ -5464,28 +5461,17 @@ fn lower_locking(locks: &[sqlparser::ast::LockClause]) -> Result<Vec<plan::Locki
     locks
         .iter()
         .map(|lock| {
-            let strength = match lock.lock_type {
-                LockType::Update => plan::LockStrength::Update,
-                LockType::Share => plan::LockStrength::Share,
-            };
-            match lock.nonblock {
-                None => {}
-                Some(NonBlock::Nowait) => {
-                    return Err(SqlError::unsupported(format!(
-                        "{} NOWAIT, on a node whose transactions do not block",
-                        strength.clause()
-                    )));
-                }
-                Some(NonBlock::SkipLocked) => {
-                    return Err(SqlError::unsupported(format!(
-                        "{} SKIP LOCKED, on a node with no row locks to skip",
-                        strength.clause()
-                    )));
-                }
-            }
             Ok(plan::Locking {
-                strength,
+                strength: match lock.lock_type {
+                    LockType::Update => plan::LockStrength::Update,
+                    LockType::Share => plan::LockStrength::Share,
+                },
                 of: lock.of.as_ref().map(relation_name).transpose()?,
+                wait: match lock.nonblock {
+                    None => plan::LockWait::Wait,
+                    Some(NonBlock::Nowait) => plan::LockWait::NoWait,
+                    Some(NonBlock::SkipLocked) => plan::LockWait::SkipLocked,
+                },
             })
         })
         .collect()

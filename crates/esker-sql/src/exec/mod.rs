@@ -263,9 +263,18 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     let mut waited = 0_u64;
     loop {
         match txn.lock(key)? {
-            // **Only a wait costs a restart.** A lock taken at once means nothing changed under
-            // this statement, so what it read is still what is there.
-            crate::backend::Lock::Taken if waited == 0 => return Ok(()),
+            // **A lock taken at once is not proof that nothing moved.** The writer in front may
+            // have committed and released between this statement's read and this lock, in which
+            // case there was nothing to wait for and the value in hand is stale anyway. Asking is
+            // PostgreSQL's `EvalPlanQual`, and without it a single `UPDATE … SET n = n + 1` under
+            // three writers raised `40001` a hundred times in twelve hundred transactions.
+            crate::backend::Lock::Taken if waited == 0 => {
+                if waits && txn.changed_since_statement(key)? {
+                    txn.restart_statement()?;
+                    return Err(SqlError::StatementMustRestart);
+                }
+                return Ok(());
+            }
             crate::backend::Lock::Taken => {
                 txn.restart_statement()?;
                 return Err(SqlError::StatementMustRestart);
@@ -672,7 +681,6 @@ impl Executor {
 
         let mut txn = self.open_txn()?;
         self.catalog_written = false;
-        let mut written = Written::default();
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
             Err(error) => {
@@ -680,25 +688,53 @@ impl Executor {
                 return Err(error);
             }
         };
-        let outcome = match self.run_recording(&mut *txn, &bound, &mut written) {
-            // **A statement outside a block is its own transaction, so its commit is here** — and
-            // a deferred check runs at every commit, this one included. Measured: the second of
-            // two colliding inserts fails on its own, with the row not written, exactly as an
-            // immediate constraint would refuse it; deferral is a property of the *transaction*,
-            // and an implicit transaction is one statement long.
-            Ok(outcome) => match self.checked_and_committed(txn, &written) {
-                Ok(()) => {
-                    // After the commit, and only after it.
-                    self.report_columnar();
-                    Ok(outcome)
+        // **A statement outside a block waits for a row lock exactly as one inside a block does,
+        // so it needs the same restart** (ADR 0057). Without this loop the signal itself reached
+        // the client as an `XX000`, and the statements that meet it are the ordinary ones:
+        // `update_attribute`, `increment!` and `touch` are single statements in autocommit.
+        //
+        // The restart is a **whole new transaction** rather than the block path's undo-and-re-run,
+        // and that is not a shortcut — an implicit transaction is one statement long, so a fresh
+        // one *is* the re-run, at a fresh read timestamp, holding nothing from the attempt that
+        // waited.
+        let mut attempt = 0;
+        let outcome = loop {
+            let mut written = Written::default();
+            match self.run_recording(&mut *txn, &bound, &mut written) {
+                // **A statement outside a block is its own transaction, so its commit is here** —
+                // and a deferred check runs at every commit, this one included. Measured: the
+                // second of two colliding inserts fails on its own, with the row not written,
+                // exactly as an immediate constraint would refuse it; deferral is a property of
+                // the *transaction*, and an implicit transaction is one statement long.
+                Ok(outcome) => {
+                    break match self.checked_and_committed(txn, &written) {
+                        Ok(()) => {
+                            // After the commit, and only after it.
+                            self.report_columnar();
+                            Ok(outcome)
+                        }
+                        Err(error) => Err(error),
+                    };
                 }
-                Err(error) => Err(error),
-            },
-            Err(error) => {
-                // The rollback's own failure is not what the client asked about; the statement's
-                // error is. Reporting the second would hide the first.
-                let _ = txn.rollback();
-                Err(error)
+                Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                    attempt += 1;
+                    let _ = txn.rollback();
+                    txn = self.open_txn()?;
+                    self.catalog_written = false;
+                }
+                Err(error) => {
+                    // The rollback's own failure is not what the client asked about; the
+                    // statement's error is. Reporting the second would hide the first.
+                    let _ = txn.rollback();
+                    // A statement that restarted this many times is waiting behind a queue that
+                    // keeps refilling, which is a livelock rather than a wait — and the signal is
+                    // never what a client is told.
+                    break Err(if matches!(error, SqlError::StatementMustRestart) {
+                        SqlError::LockTimeout
+                    } else {
+                        error
+                    });
+                }
             }
         };
         self.catalog_written = false;
@@ -1193,9 +1229,20 @@ impl Executor {
         // come from **outside** this transaction, because a sequence is not transactional and a
         // read through the statement's own snapshot would report the sequence as of `BEGIN`.
         self.fill_sequence_reads(&mut planned.node)?;
-        let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
+        let mut raw = Vec::new();
+        {
+            let mut cursor = cursor::Cursor::open(&*txn, self.tenant, &planned.node)?;
+            while let Some(row) = cursor.next()? {
+                raw.push(row);
+            }
+        }
+        // **The lock pass, and it is here because it cannot be anywhere lower**: a `Cursor` holds
+        // `&dyn Txn` and a lock needs `&mut`, and a `SELECT` materialises its rows anyway, so the
+        // second pass costs nothing that was not already spent (ADR 0057 §5).
+        let raw = self.lock_rows(txn, &planned, raw)?;
         let mut rows = Vec::new();
-        while let Some(row) = cursor.next()? {
+        for row in raw {
+            let row = &row[..row.len() - planned.junk];
             rows.push(
                 row.iter()
                     .enumerate()
@@ -1225,6 +1272,67 @@ impl Executor {
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
+    }
+
+    /// Takes the row locks a `SELECT … FOR UPDATE` asked for, and answers the rows that survive.
+    ///
+    /// **PostgreSQL's `LockRows`, in the one place this node can put it.** Each row's key is read
+    /// from the junk columns the planner appended, and what happens to a row somebody else holds is
+    /// the whole content of the modifiers:
+    ///
+    /// * bare — wait for the holder, then re-run the statement, which is ADR 0057's mechanism and
+    ///   not a second one. The row this statement read may have changed while it waited, so
+    ///   answering the version it already has would be answering a row that no longer exists.
+    /// * `NOWAIT` — `55P03` at once, naming the relation.
+    /// * `SKIP LOCKED` — the row leaves the answer and nothing is said about it.
+    ///
+    /// Then `OFFSET` and `LIMIT`, **after** the skipping: `LIMIT 1 … SKIP LOCKED` over a held first
+    /// row answers the second row, measured, and a limit applied before the skip would answer
+    /// nothing at all.
+    fn lock_rows(
+        &self,
+        txn: &mut dyn Txn,
+        planned: &query::Planned,
+        rows: Vec<Vec<Datum>>,
+    ) -> Result<Vec<Vec<Datum>>> {
+        if planned.locks.is_empty() {
+            return Ok(rows);
+        }
+        let mut kept = Vec::with_capacity(rows.len());
+        'row: for row in rows {
+            for target in &planned.locks {
+                let key: Vec<Datum> = target.key_at.iter().map(|&at| row[at].clone()).collect();
+                // A key column that is NULL belongs to a row that is not there: the nullable side
+                // of an outer join, which the lowering already refuses to lock, or a row a
+                // `LEFT JOIN` did not match. There is nothing to hold.
+                if key.iter().any(|value| matches!(value, Datum::Null)) {
+                    continue;
+                }
+                let key = crate::row::row_key(self.tenant, target.table_id, &key)?;
+                match txn.lock(&key)? {
+                    crate::backend::Lock::Taken => {}
+                    crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
+                    crate::backend::Lock::Held { .. } => match target.wait {
+                        crate::plan::LockWait::SkipLocked => continue 'row,
+                        crate::plan::LockWait::NoWait => {
+                            return Err(SqlError::LockNotAvailable(target.relation.clone()));
+                        }
+                        // The wait, and then the whole statement again: the same loop an `UPDATE`
+                        // behind a lock goes through.
+                        crate::plan::LockWait::Wait => wait_for_row(self, txn, &key)?,
+                    },
+                }
+            }
+            kept.push(row);
+        }
+        let Some((offset, limit)) = planned.limit else {
+            return Ok(kept);
+        };
+        let kept = kept.into_iter().skip(offset);
+        Ok(match limit {
+            Some(limit) => kept.take(limit).collect(),
+            None => kept.collect(),
+        })
     }
 
     /// Runs every sequence function in a target list and puts its value back in its place.

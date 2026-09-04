@@ -46,7 +46,7 @@ pub use expr::{
     current_setting_text, like_matches, regex_operator,
 };
 pub use query::{
-    AggregateSpec, Join, JoinKind, LockStrength, Locking, Node, OrderItem, Probe, Select,
+    AggregateSpec, Join, JoinKind, LockStrength, LockWait, Locking, Node, OrderItem, Probe, Select,
     SelectItem, SortKey, TableFunction, TableRef, ValuesList,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};

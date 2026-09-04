@@ -220,6 +220,15 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `NOWAIT` over a row another transaction holds.
+    ///
+    /// **`55P03`, and PostgreSQL's own sentence**, measured with two sessions: the relation is the
+    /// table's **own** name and not the alias the query used — `SELECT … FROM lk l … FOR UPDATE OF
+    /// l NOWAIT` says `relation "lk"`. Same code as [`SqlError::LockTimeout`] and a different
+    /// sentence; one code, two conditions, two messages.
+    #[error("could not obtain lock on row in relation \"{0}\"")]
+    LockNotAvailable(String),
+
     /// A row wait that ran out of `lock_timeout`.
     ///
     /// **`55P03`, and PostgreSQL's own sentence** — the same code `FOR UPDATE NOWAIT` answers and
@@ -2201,7 +2210,7 @@ impl SqlError {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
-            SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
+            SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }

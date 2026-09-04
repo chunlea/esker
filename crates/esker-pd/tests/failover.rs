@@ -1164,6 +1164,66 @@ fn a_member_killed_mid_change_comes_back_knowing_who_joined() {
     }
 }
 
+/// **The role is what tells a half-finished add from a group that is the size it looks.**
+///
+/// Three members plus a learner is four rows either way; only the role says that one of them is
+/// still catching up, and only that says whether `pd members add` has finished. A joining member
+/// reports everyone as unconfigured, itself included, because its configuration comes from its own
+/// log and the group's snapshot has not reached it yet — which is an honest answer rather than a
+/// gap ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+#[test]
+fn a_membership_report_says_which_member_is_still_catching_up() {
+    use esker_proto::PdRole;
+
+    let mut group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    group
+        .run("bootstrapping", || {
+            group.at(leader).bootstrap(1, "127.0.0.1:20160")
+        })
+        .unwrap();
+
+    // Before it is in any configuration the joiner says so, about everyone including itself.
+    let joiner = group.admit(4, "127.0.0.1:32382");
+    let seen = joiner.membership();
+    assert!(
+        seen.members.iter().all(|m| m.role == PdRole::Unconfigured),
+        "a member that has not caught up claimed to be configured: {:?}",
+        seen.members
+    );
+
+    // One step, and the group can see which of the four is not a voter yet.
+    assert!(
+        !group
+            .run("adding member 4", || {
+                group.at(leader).add_member(4, "127.0.0.1:32382")
+            })
+            .unwrap()
+    );
+    group.settle();
+    let seen = group.at(leader).membership();
+    assert_eq!(seen.members.len(), 4);
+    let learners: Vec<u64> = seen
+        .members
+        .iter()
+        .filter(|m| m.role == PdRole::Learner)
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(learners, vec![4], "the half-finished add is invisible");
+
+    // And when it finishes, nothing is a learner any more.
+    group.until("finishing the add", || {
+        group.at(leader).add_member(4, "127.0.0.1:32382")
+    });
+    group.settle();
+    let seen = group.at(leader).membership();
+    assert!(
+        seen.members.iter().all(|m| m.role == PdRole::Voter),
+        "the promotion left something behind: {:?}",
+        seen.members
+    );
+}
+
 /// A placement driver may not remove its way out of a quorum, because undoing that needs the
 /// quorum it just lost.
 ///

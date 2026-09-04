@@ -961,3 +961,123 @@ Five hypotheses, measured rather than argued:
 
 Two fixes, one correction of my own overstatement, two hypotheses killed. The two that were killed
 cost one container run each and would have cost a wrong change apiece.
+
+## 14. The joint gate's `txn.scan(..).unwrap()`: a budget in tries against a lease in milliseconds
+
+`esker-sql::joint_gate a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines`, seen twice,
+3/3 alone. The panic is on a **cluster read** — `txn.scan(..).unwrap()` — so it read as a flake in
+the read path. It is not: it is arithmetic, and the fix is in `esker-client`, not in the test.
+
+### The cause
+
+`Transaction::call_resolving` bounded lock resolution by an **attempt count**, and spent each
+attempt on one step of an exponential backoff capped at 2 s. Eight of them:
+
+```
+10 + 20 + 40 + 80 + 160 + 320 + 640 + 1280 = 2550 ms      LOCK_TTL_MS = 3000 ms
+```
+
+So a reader meeting a lock **younger than 450 ms** ran out of budget 450 ms before that lock could
+possibly have expired, and reported `LockNotCleared` — "its owner is alive, give up" — about a
+lease it had not waited out. It bites only in the first 450 ms of a lease whose owner then dies
+rather than commits, which is exactly the shape of a twice-seen sighting.
+
+It is [inventory #6](debt-c3.md) again in a different budget: wave c3 found the router's retry
+budget spending nine attempts against an epoch that kept moving, and the correction there was the
+same one — count the thing you are actually waiting for.
+
+### The red test, and why it asserts about waiting
+
+`a_reader_waits_out_the_lease_before_it_reports_a_lock_uncleared`, deterministic, no load:
+
+```
+waited 2550 ms before reporting the lock uncleared, but 2900 ms of its lease were still to run:
+[10, 20, 40, 80, 160, 320, 640, 1280]
+```
+
+It asserts that the client *waited*, not that the read succeeded, and that is deliberate:
+`CountingOracle` advances only the logical half of a timestamp, so a live lock in that file is
+immortal and no amount of waiting settles it. The invariant that can be checked without a wall
+clock is the one that matters — the client did not stop short of the lease it was told about.
+
+### The fix, and the one I tried first that was worse
+
+**Rejected: dropping the attempt bound and looping until the lease is waited out.** It makes the
+red test pass and introduces a hang: a heartbeating owner extends its lease every round, so the
+deadline recedes for ever. Two existing tests caught it, which is the argument for running the
+whole file rather than the new test. The original bound was not wrong to exist — the doc beside it
+says exactly why: *"a lock whose owner keeps heartbeating never clears and a client that waited
+for ever would be indistinguishable from one that hung."*
+
+**Landed: the count bounds the *looks*, and the last look waits out the *lease*.** The looks stay
+bounded, so the loop terminates whatever the owner does; the total wait covers the lease by
+construction, whatever the backoff schedule adds up to and whatever `max_lock_resolutions` is set
+to. `LockNotCleared` is then only ever reported about a lease that has run out or an owner that
+extended it — never one that still had time. The same rule is applied on the prewrite path, which
+had the identical loop.
+
+### A test that encoded the defect, replaced in the open
+
+`a_lock_inside_its_lease_is_waited_for_rather_than_settled` asserted `sleeps == [10, 20, 40]`.
+That is the old behaviour written down as an expectation, and under the fix it reads
+`[10, 20, 2501]`. It now asserts the two properties separately — the looks before the last back
+off and grow, and the last one waits out what remains of the lease — with a note saying what it
+used to say and why that was the bug rather than the specification.
+
+## 15. `MemTable::add` could not report failure, so a full arena lost an acknowledged write
+
+Handed over by the `skip` lane with its arena skiplist ([ADR 0041](../adr/0041-the-in-house-arena-skiplist.md)),
+which is what made the failure *possible*: `crossbeam-skiplist` allocated from the global
+allocator and could not refuse, so before that landing there was nothing here to report.
+
+### What it was
+
+```rust
+pub fn add(&self, …) {
+    if !self.store().insert(key, &tag, value) {
+        tracing::error!(…, "the memtable arena is full and the entry was not stored");
+    }
+    self.approximate_size.fetch_add(charge, …);   // charged anyway
+}
+```
+
+`add` answered `()`. On a refusal it logged at `error!`, **charged `approximate_size` for the
+entry it had just failed to store**, and returned — so `commit_group` carried on and the write was
+acknowledged. Its bytes were already in the log by then, which is what makes it silent rather than
+merely wrong: nothing on the read path can tell an entry that was refused from one never written,
+and the table over-reported its size on the way to losing it. `CLAUDE.md` invariant 1, broken
+without a word.
+
+Unreachable in practice — four gigabytes in one memtable, against a 64 MiB default — which is why
+it is worth fixing rather than shrugging at: the cost of the fix is four lines and the cost of
+reaching it is a lost acknowledged write nobody can trace.
+
+### Both halves, and a third the compiler found
+
+* **`add` returns `Result<()>`**, with the refusal as an `Error::Unsupported` naming the seqno and
+  the sizes, and `approximate_size` charged only for what was stored.
+* **`db/write.rs` fails the group's commit** with `?`, the same treatment a log-write failure gets
+  a few lines above and for the same reason.
+* **`db/open.rs`, which clippy found and I had not** — WAL *recovery* replayed entries with the
+  same ignored result. An arena that refuses there means the database cannot hold its own log, and
+  an open that carried on would present one missing writes acknowledged before the crash. The same
+  silent loss reached from the other direction, and `-D warnings` on an unused `Result` is what
+  surfaced it.
+
+### The red, which is the mutation and not the absence of one
+
+`a_full_arena_is_an_error_and_not_a_lost_entry` builds a memtable on `Chunks::cramped` — the
+`#[cfg(test)]` arena that gives up after two small chunks, so the exhaustion path is reachable
+without allocating four gigabytes to get to it — fills it until it refuses, and asserts both the
+error *and* that the table holds exactly what `add` accepted.
+
+Restoring the old log-and-continue behaviour behind the new signature turns it red in the shape of
+the bug itself:
+
+```
+a cramped arena accepted 10000 entries without refusing
+```
+
+Ten thousand successes reported over a full arena. That is the defect stated as a number, and it
+is why the assertion is "the entry is not lost" rather than "an error is returned" — the second
+would have passed against a version that returned an error and dropped the entry anyway.

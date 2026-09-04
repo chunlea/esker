@@ -333,10 +333,12 @@ fn print_members(
         return Ok(());
     }
     for member in &members.members {
-        let role = if member.id == members.leader_id {
+        // **Two different facts, and an operator needs both.** `leader` is who is answering right
+        // now; the *role* is what the configuration says, and it is the one that tells a
+        // half-finished `add` from a group that is simply the size it looks
+        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        let office = if member.id == members.leader_id {
             "leader"
-        } else if member.id == members.this_id {
-            "follower (this one)"
         } else {
             "follower"
         };
@@ -347,8 +349,23 @@ fn print_members(
         };
         writeln!(
             out,
-            "  {:>3}  {:<24} {role}{here}",
-            member.id, member.address
+            "  {:>3}  {:<24} {:<12} {office}{here}",
+            member.id,
+            member.address,
+            member.role.name(),
+        )
+        .map_err(write)?;
+    }
+    // Said out loud, because the row above it is easy to read past — and because the next thing to
+    // do about it is one command.
+    if members
+        .members
+        .iter()
+        .any(|member| member.role == esker_proto::PdRole::Learner)
+    {
+        writeln!(
+            out,
+            "  a learner is still catching up: run `esker pd members add` again to finish it"
         )
         .map_err(write)?;
     }
