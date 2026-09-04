@@ -1,0 +1,46 @@
+crates/esker-pd/src/pd/mod.rs
+  s_555c5659f0909b::t_155a71af255067 39,640-650
+crates/esker-store/tests/pd_client.rs
+  s_555c5659f0909b::t_bfd90a7c489696 56
+crates/esker-proto/src/pd.rs
+  s_555c5659f0909b::t_56f41cb9080a4b 429-478,486-490,564,576-578,580-583
+crates/esker-cli/src/pd.rs
+  s_2bed4ac2b1c944::t_f7882cf143172d 333-336,348-350
+  s_2bed4ac2b1c944::t_5510dd8626a208 332
+  s_2bed4ac2b1c944::t_a1e57ed6ffb035 351-353
+  s_555c5659f0909b::t_9b12f179db02bb 354-364
+crates/esker-pd/src/driver.rs
+  s_555c5659f0909b::t_fa0b02812645f5 157-164,177,597
+crates/esker-pd/tests/failover.rs
+  s_555c5659f0909b::t_2b7eb8533790d4 1167-1226
+crates/esker-proto/tests/messages.rs
+  s_555c5659f0909b::t_da91a1f4f9afee 18,104,106-107,111,792,797,799,803,837,841-864
+crates/esker-proto/tests/golden/messages.hex
+  s_555c5659f0909b::t_6848ef28891dd2 63-67
+crates/esker-proto/src/lib.rs
+  s_555c5659f0909b::t_06383cee2d7db4 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cf0d64c0c64a1e259ade5585042e8c7ea5cd51f9",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
