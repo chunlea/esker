@@ -34,8 +34,10 @@ pub struct DateRange {
 }
 
 impl DateRange {
-    /// `daterange(a, b)` — the constructor, with PostgreSQL's own emptiness rule.
-    #[must_use]
+    /// `daterange(a, b)` — the constructor, with PostgreSQL's own emptiness rule and its refusal.
+    ///
+    /// `#[must_use]` is gone with the `Self` return: a `Result` carries it already, and the
+    /// attribute on top of one is the lint's `double_must_use`.
     pub fn new(start: Option<i32>, end: Option<i32>) -> Result<Self> {
         // **Meeting is empty; crossing is an error.** `[x,x)` contains nothing and is the case the
         // suite's `isempty` line pins; `[y,x)` with `y > x` is `22000` on a real server, and
