@@ -245,7 +245,8 @@ impl SkipList {
         self.bytes.get(offset, self.header(node, 2))
     }
 
-    /// The height `node` was built at.
+    /// The height `node` was built at. Read only by the tests that check a shape replays.
+    #[cfg(test)]
     fn height_of(&self, node: u32) -> u32 {
         self.header(node, 3)
     }
@@ -470,6 +471,65 @@ impl SkipList {
                 word.store(node, self.publication());
             }
         }
+    }
+}
+
+impl super::store::Store for SkipList {
+    /// A node offset. [`Default`] is zero, which is [`NIL`] — the arena spends its first word
+    /// so that no node can sit there, which is what lets "nowhere" and "the first node" be
+    /// told apart without a second field.
+    type Pos = u32;
+
+    fn new(comparator: Arc<InternalKeyComparator>, seed: u64) -> Self {
+        Self::new(comparator, seed)
+    }
+
+    fn comparator(&self) -> &Arc<InternalKeyComparator> {
+        Self::comparator(self)
+    }
+
+    fn insert(&self, head: &[u8], tail: &[u8], value: &[u8]) -> bool {
+        Self::insert(self, head, tail, value)
+    }
+
+    fn len(&self) -> usize {
+        Self::len(self)
+    }
+
+    fn valid(&self, pos: &Self::Pos) -> bool {
+        *pos != NIL
+    }
+
+    fn key<'a>(&'a self, pos: &'a Self::Pos) -> &'a [u8] {
+        Self::key(self, *pos)
+    }
+
+    fn value<'a>(&'a self, pos: &'a Self::Pos) -> &'a [u8] {
+        Self::value(self, *pos)
+    }
+
+    fn seek(&self, target: &[u8]) -> Self::Pos {
+        Self::seek(self, target)
+    }
+
+    fn seek_for_prev(&self, target: &[u8]) -> Self::Pos {
+        Self::seek_for_prev(self, target)
+    }
+
+    fn first(&self) -> Self::Pos {
+        Self::first(self)
+    }
+
+    fn last(&self) -> Self::Pos {
+        Self::last(self)
+    }
+
+    fn after(&self, pos: &Self::Pos) -> Self::Pos {
+        Self::after(self, *pos)
+    }
+
+    fn before(&self, pos: &Self::Pos) -> Self::Pos {
+        Self::before(self, *pos)
     }
 }
 

@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering as Memory};
 
 use proptest::prelude::*;
 
+use super::bought::Bought;
 use super::skiplist::{NIL, SkipList};
+use super::store::Store;
 use crate::dbformat::{
     BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, extract_user_key,
     internal_key, lookup_key,
@@ -39,8 +41,8 @@ fn comparator() -> Arc<InternalKeyComparator> {
     Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator)))
 }
 
-fn list() -> SkipList {
-    SkipList::new(comparator(), super::skiplist::DEFAULT_SEED)
+fn list<S: Store>() -> S {
+    S::new(comparator(), super::skiplist::DEFAULT_SEED)
 }
 
 /// An internal key under the order the memtable actually uses, restated.
@@ -151,9 +153,9 @@ fn user_key(user: u8) -> Vec<u8> {
 }
 
 /// The cursor, in both worlds: a node in the skiplist and a key in the model.
-struct Cursor {
-    /// Where the skiplist's cursor is. `NIL` is invalid.
-    node: u32,
+struct Cursor<S: Store> {
+    /// Where the store's cursor is.
+    node: S::Pos,
     /// Where the model's cursor is, as a key rather than an index — so that an insert landing
     /// ahead of a live cursor is modelled the way the skiplist behaves: the cursor stays where
     /// it is and the next step sees the new entry.
@@ -161,10 +163,10 @@ struct Cursor {
 }
 
 /// Applies one op to both worlds. Returns `false` when the op was skipped.
-fn apply(
-    list: &SkipList,
+fn apply<S: Store>(
+    list: &S,
     model: &mut BTreeMap<Ordered, Vec<u8>>,
-    cursor: &mut Cursor,
+    cursor: &mut Cursor<S>,
     op: &Op,
     step: usize,
 ) -> Result<bool, TestCaseError> {
@@ -213,11 +215,11 @@ fn apply(
             cursor.at = sorted.iter().rev().find(|k| **k <= key).cloned();
         }
         Op::Next => {
-            cursor.node = list.after(cursor.node);
+            cursor.node = list.after(&cursor.node);
             cursor.at = index.and_then(|i| sorted.get(i + 1).cloned());
         }
         Op::Prev => {
-            cursor.node = list.before(cursor.node);
+            cursor.node = list.before(&cursor.node);
             cursor.at = index
                 .filter(|i| *i > 0)
                 .and_then(|i| sorted.get(i - 1).cloned());
@@ -241,8 +243,9 @@ fn apply(
                 .at
                 .as_ref()
                 .filter(|k| extract_user_key(&k.0) == user.as_slice());
-            let found = (cursor.node != NIL)
-                .then(|| list.key(cursor.node))
+            let found = list
+                .valid(&cursor.node)
+                .then(|| list.key(&cursor.node))
                 .filter(|k| extract_user_key(k) == user.as_slice());
             prop_assert_eq!(
                 found.map(<[u8]>::to_vec),
@@ -258,11 +261,11 @@ fn apply(
 }
 
 /// Runs `ops` against the skiplist and against a `BTreeMap`, and stops at the first difference.
-fn differential(ops: &[Op]) -> Result<(), TestCaseError> {
-    let list = list();
+fn differential<S: Store>(ops: &[Op]) -> Result<(), TestCaseError> {
+    let list = list::<S>();
     let mut model: BTreeMap<Ordered, Vec<u8>> = BTreeMap::new();
-    let mut cursor = Cursor {
-        node: NIL,
+    let mut cursor = Cursor::<S> {
+        node: S::Pos::default(),
         at: None,
     };
 
@@ -271,7 +274,7 @@ fn differential(ops: &[Op]) -> Result<(), TestCaseError> {
             continue;
         }
         prop_assert_eq!(
-            cursor.node != NIL,
+            list.valid(&cursor.node),
             cursor.at.is_some(),
             "step {}: validity after {:?}",
             step,
@@ -279,14 +282,14 @@ fn differential(ops: &[Op]) -> Result<(), TestCaseError> {
         );
         if let Some(key) = &cursor.at {
             prop_assert_eq!(
-                list.key(cursor.node),
+                list.key(&cursor.node),
                 &key.0[..],
                 "step {}: key after {:?}",
                 step,
                 op
             );
             prop_assert_eq!(
-                list.value(cursor.node),
+                list.value(&cursor.node),
                 &model[key][..],
                 "step {}: value after {:?}",
                 step,
@@ -298,12 +301,12 @@ fn differential(ops: &[Op]) -> Result<(), TestCaseError> {
     // Whatever the program did to the cursor, the whole list still reads in order.
     let mut walked = Vec::new();
     let mut node = list.first();
-    while node != NIL {
+    while list.valid(&node) {
         // Bounded: a wrongly linked tower can leave a cycle at level zero, and an unbounded
         // walk over one hangs rather than fails.
         prop_assert!(walked.len() < list.len(), "the level-zero list has a cycle");
-        walked.push(Ordered(list.key(node).to_vec()));
-        node = list.after(node);
+        walked.push(Ordered(list.key(&node).to_vec()));
+        node = list.after(&node);
     }
     prop_assert_eq!(walked, model.keys().cloned().collect::<Vec<_>>());
     prop_assert_eq!(list.len(), model.len());
@@ -317,7 +320,15 @@ proptest! {
     /// against a `BTreeMap` under a restated order.
     #[test]
     fn the_skiplist_answers_what_a_sorted_map_would(ops in prop::collection::vec(op(), 1..80)) {
-        differential(&ops)?;
+        differential::<SkipList>(&ops)?;
+    }
+
+    /// The same programme through the store this one replaces. Two implementations that have
+    /// nothing in common but the trait, held to one model: a disagreement is a bug in whichever
+    /// of them the model does not match, and it is cheaper to find here than in the engine.
+    #[test]
+    fn the_bought_store_answers_the_same(ops in prop::collection::vec(op(), 1..80)) {
+        differential::<Bought>(&ops)?;
     }
 }
 
@@ -326,7 +337,7 @@ proptest! {
 /// `seek` lands one entry off.
 #[test]
 fn a_prefix_scan_sees_every_version_of_one_key_and_nothing_else() {
-    let list = list();
+    let list = list::<SkipList>();
     for user in ["k1", "k2", "k3"] {
         for seqno in 1..=5u64 {
             let key = internal_key(user.as_bytes(), seqno, EntryKind::Put);
@@ -372,7 +383,7 @@ fn readers_see_an_ordered_list_while_a_writer_inserts() {
     const WRITES: usize = 40;
     #[cfg(not(miri))]
     const WRITES: usize = 4000;
-    let list = Arc::new(list());
+    let list = Arc::new(list::<SkipList>());
     let order = comparator();
     let done = Arc::new(AtomicU64::new(0));
 
