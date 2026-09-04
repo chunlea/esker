@@ -1,0 +1,65 @@
+crates/esker-keys/src/array.rs
+  s_2bed4ac2b1c944::t_ce95bb16d06bb6 99,136
+crates/esker-keys/src/columnar.rs
+  s_2bed4ac2b1c944::t_d50c7a89f16401 121-122,184-185
+crates/esker-keys/src/row.rs
+  s_2bed4ac2b1c944::t_bb3de4e044a285 123-128,328-339,400,567-570,926-928,940,1662-1667,1717
+crates/esker-keys/src/value.rs
+  s_2bed4ac2b1c944::t_8c1f7e63825884 187-199,330,387-388,484-494,526-532,596
+crates/esker-sql/src/catalog/information_schema.rs
+  s_2bed4ac2b1c944::t_7b4e6c558debee 266-273
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_ab9c3d1be07ab1 1673-1674,1770,1772-1774,1803,1833
+crates/esker-sql/src/catalog/record.rs
+  s_2bed4ac2b1c944::t_9833cfaffad0c7 290-292,373-374,479-480
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_aa437d0f938a9f 1502-1510,2107,2490-2494
+crates/esker-sql/src/exec/aggregate.rs
+  s_2bed4ac2b1c944::t_cab3b210d7b649 194
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_d6d615bcc667b7 1178-1180,1195
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_a95d93d20ab2c9 332-347,3206-3212
+crates/esker-sql/src/exec/fragment.rs
+  s_2bed4ac2b1c944::t_ba2d705bd79691 653-654,680-683
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_4b4e57e72739fe 2633-2637,2659-2668
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_baf238f97878dc 6237-6238,6247-6250
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_24c4c9ed519af6 1671,1747,1817
+crates/esker-sql/src/row.rs
+  s_2bed4ac2b1c944::t_db72753cc2a0e0 43-46,55
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_1bfd1da2af37a6 47,517-519,529,657-658,768,807-809,831-832,887-890,904,983,1028-1031,1047,1129-1132,1194-1200,1215,1546-1549,1828
+crates/esker-sql/src/value/point.rs
+  s_2bed4ac2b1c944::t_9b0311ff11ca66 1-74
+crates/esker-sql/tests/corpus/pg19_point.txt
+  s_2bed4ac2b1c944::t_8d54eea37e4947 1-87
+crates/esker-sql/tests/pg_catalog.rs
+  s_2bed4ac2b1c944::t_8fc7b33c7ec3cf 194-197,378-390
+crates/esker-sql/tests/point.rs
+  s_2bed4ac2b1c944::t_ef4ef3496f4ff6 1-70
+crates/esker-sql/tests/row_order.rs
+  s_2bed4ac2b1c944::t_67a473e5c40b3a 96,99-110
+crates/esker-store/src/columnar/decode.rs
+  s_2bed4ac2b1c944::t_10caf2658719c1 223-225,234-236
+docs/plans/phase-9-rails.md
+  s_2bed4ac2b1c944::t_5554c3110450d2 1594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2d16868e058fa2b35d2f4cbe09b8f554cfd2acbe",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
