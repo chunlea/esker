@@ -1007,14 +1007,20 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
                 .map_or("unknown", crate::value::PgType::name)
         ))
     };
+    // **At least one operand has to be a real hstore.** A `Datum::Text` is accepted only as the
+    // `unknown` literal beside one — `h @> 'a=>b'` is how the suite writes containment — and never
+    // on its own: `||` is spelled the same for text, and reading *both* sides as hstores turned
+    // `title || $1` into `42601 syntax error in hstore` where a real server concatenates two
+    // strings. An operator this crate carries for one type must not answer for another's.
+    let anchored = args.iter().any(|value| matches!(value, Datum::Hstore(_)));
     let map = |value: Option<&Datum>| match value {
-        // A `Text` is an `unknown` literal on its way to being one; a `Hstore` is one already.
-        Some(Datum::Text(text) | Datum::Hstore(text)) => hstore::from_text(text).map(Some),
+        Some(Datum::Hstore(text)) => hstore::from_text(text).map(Some),
+        Some(Datum::Text(text)) if anchored => hstore::from_text(text).map(Some),
         Some(Datum::Null) | None => Ok(None),
         other => Err(wrong_type(other)),
     };
     let text = |value: Option<&Datum>| match value {
-        Some(Datum::Text(text)) => Ok(Some(text.clone())),
+        Some(Datum::Text(text) | Datum::Citext(text)) => Ok(Some(text.clone())),
         Some(Datum::Null) | None => Ok(None),
         other => Err(wrong_type(other)),
     };

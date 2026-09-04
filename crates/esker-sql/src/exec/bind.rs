@@ -224,8 +224,17 @@ fn walk(
         Statement::Update(update) => {
             if let Some(table) = tables.first() {
                 for (name, value) in &update.assignments {
-                    if let (Some(at), Expr::Parameter(number)) = (table.column(name), value) {
-                        seen(*number, table.columns[at].ty);
+                    match (table.column(name), value) {
+                        // `SET c = $1`: the column's own type, which is the whole of it.
+                        (Some(at), Expr::Parameter(number)) => {
+                            seen(*number, table.columns[at].ty);
+                        }
+                        // **`SET c = <expression holding $1>`**, which is what a counter cache
+                        // sends and what the `$1`-is-`text` bug was: the value is an arithmetic
+                        // expression, so the arm above never saw the parameter and it kept the
+                        // fallback. Walking it types the parameter from what it is *added to*,
+                        // which is how PostgreSQL resolves it.
+                        (_, value) => walk_predicate(value, tables, seen),
                     }
                 }
             }
@@ -267,6 +276,48 @@ fn walk(
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
+    }
+}
+
+/// An expression's type where this inference can name it without a planner.
+///
+/// Deliberately partial: a column in one of the statement's tables, a constant, a `COALESCE` of
+/// something it can name, and arithmetic over those. **`None` is the honest answer for everything
+/// else**, and it is what leaves `$1 + $2` unresolved so that a real server's
+/// `42725 operator is not unique: unknown + unknown` is what comes out, rather than a type this
+/// function invented.
+fn static_type(expr: &Expr, tables: &[std::sync::Arc<TableDef>]) -> Option<ColumnType> {
+    match expr {
+        Expr::Column { table, name } => {
+            let mut found = None;
+            for candidate in tables {
+                if table
+                    .as_deref()
+                    .is_some_and(|qualifier| qualifier != candidate.name)
+                {
+                    continue;
+                }
+                if let Some(at) = candidate.column(name) {
+                    // An ambiguous bare name names nothing, exactly as in `walk_predicate`.
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(candidate.columns[at].ty);
+                }
+            }
+            found
+        }
+        // A bare integer constant is an `int8` here and an `integer` there — the standing
+        // constant-width divergence, and it is the *resolution* that matters: `1 + $1` makes the
+        // parameter a number either way, and reading `"4"` as an `int8` gives the same answer.
+        Expr::Literal(literal) => super::query::literal_type(literal),
+        // `COALESCE`'s type is its first argument that has one, which is what makes
+        // `COALESCE(c, 0) + $1` an integer.
+        Expr::Coalesce(items) => items.iter().find_map(|item| static_type(item, tables)),
+        Expr::Arithmetic { left, right, .. } => {
+            static_type(left, tables).or_else(|| static_type(right, tables))
+        }
+        _ => None,
     }
 }
 
@@ -332,6 +383,37 @@ fn walk_predicate(
         Expr::Binary { left, right, .. } => {
             walk_predicate(left, tables, seen);
             walk_predicate(right, tables, seen);
+        }
+        // **A parameter in an arithmetic expression takes the *other operand's* type.** This is
+        // the shape run 51 reported as `operator does not exist: integer + text` and it is not an
+        // operator at all: `ActiveRecord`'s counter-cache update is
+        // `SET c = COALESCE(c, 0) + $1`, in which nothing is text — the parameter had simply
+        // fallen through to the `text` default before anything looked at what it was added to.
+        // PostgreSQL resolves the other way round: an untyped parameter takes its type from the
+        // context it appears in, and `pg_prepared_statements.parameter_types` says `integer` for
+        // this exact statement.
+        //
+        // **Only when the other side has a type of its own**: `$1 + $2` resolves nothing, which is
+        // what makes it `42725 operator is not unique: unknown + unknown` rather than a guess.
+        Expr::Arithmetic { left, right, .. } => {
+            match (left.as_ref(), right.as_ref()) {
+                (other, Expr::Parameter(number)) | (Expr::Parameter(number), other) => {
+                    if let Some(ty) = static_type(other, tables) {
+                        seen(*number, ty);
+                    }
+                }
+                _ => {}
+            }
+            walk_predicate(left, tables, seen);
+            walk_predicate(right, tables, seen);
+        }
+        // `COALESCE(c, 0)` is where the counter-cache update's type comes from, so its arguments
+        // are walked like any other expression — a parameter *inside* one is typed by whatever it
+        // sits beside further out.
+        Expr::Coalesce(items) => {
+            for item in items {
+                walk_predicate(item, tables, seen);
+            }
         }
         Expr::Not(operand) | Expr::IsNull { operand, .. } => walk_predicate(operand, tables, seen),
         // **`n IN ($1, $2, $3)` types every one of them from `n`.** Walking the list as

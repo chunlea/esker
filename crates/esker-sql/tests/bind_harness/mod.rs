@@ -289,6 +289,18 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
                     types: ours,
                     rows: theirs,
                 },
+                // **An undeclared types column pins nothing**, the rule `parity_harness` has had
+                // since it was written and this one was missing: a bind corpus's `\gdesc` pass
+                // runs in a second session, so a statement whose fixture the first session rolled
+                // back records *no* types — and asserting against nothing is asserting that this
+                // node declares nothing. The rows are the whole claim there.
+            ) if rows == theirs && types.is_empty() && types != ours => {}
+            (
+                Answer::Rows { types, rows },
+                Answer::Rows {
+                    types: ours,
+                    rows: theirs,
+                },
             ) if rows == theirs && types != ours => {
                 if !divergences.types.contains(&sql.as_str()) {
                     type_mismatched.push(format!(
