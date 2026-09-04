@@ -80,6 +80,24 @@ pub struct Prewrite {
     pub primary: Bytes,
     /// The transaction's snapshot.
     pub start_ts: u64,
+    /// **The snapshot the value being written was computed from**, which is `start_ts` unless the
+    /// statement that produced it was re-run after waiting for another transaction
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+    /// §4).
+    ///
+    /// First-committer-wins is measured against *this*, per key, and the difference is the whole
+    /// of what makes a READ COMMITTED waiter able to commit. A waiter that waits for another
+    /// transaction, re-reads at a fresh timestamp and computes the right answer would otherwise
+    /// meet that transaction's commit at its own prewrite: its `commit_ts` is above the waiter's
+    /// `start_ts` by construction, so the waiter would fail `40001` at `COMMIT` — the failure
+    /// moved from the `UPDATE` and nothing else changed.
+    ///
+    /// A key written by an **earlier** statement keeps its own, older stamp, so a commit that
+    /// slipped in between still conflicts. That is why it is per key and not a transaction-wide
+    /// "latest read timestamp", and it is the half that stops this being a licence to lose an
+    /// update. Nothing else moves: the data version is still written at `start_ts` and the lock
+    /// record still carries `start_ts`, so waiters classify this transaction exactly as before.
+    pub read_ts: u64,
     /// How long the lock should live without a heartbeat.
     pub ttl_ms: u64,
     /// What to write.
@@ -94,9 +112,20 @@ impl Prewrite {
             key,
             primary,
             start_ts,
+            // A statement that never waited computed its value from the transaction's own
+            // snapshot, which is what every prewrite said before ADR 0057 and what every one that
+            // does not say otherwise still means.
+            read_ts: start_ts,
             ttl_ms: crate::LOCK_TTL_MS,
             op,
         }
+    }
+
+    /// The same prewrite, saying which snapshot its value was computed from.
+    #[must_use]
+    pub fn read_at(mut self, read_ts: u64) -> Self {
+        self.read_ts = read_ts;
+        self
     }
 
     /// Whether this key is its own transaction's primary.
@@ -350,8 +379,10 @@ fn value_of(
 pub fn check_prewrite(snapshot: &impl TxnSnapshot, request: &Prewrite) -> Result<PrewriteDecision> {
     let key = &request.key[..];
 
-    // 1. A commit newer than our snapshot. First-committer-wins, and we are not it.
-    if let Some(winner) = snapshot.newest_write_after(key, request.start_ts)? {
+    // 1. A commit newer than the snapshot **this value was computed from**, which is the
+    //    transaction's own unless the statement waited and re-read (ADR 0057 §4).
+    //    First-committer-wins, and we are not it.
+    if let Some(winner) = snapshot.newest_write_after(key, request.read_ts)? {
         // Our own commit is not a conflict with ourselves: a retry of a prewrite whose
         // transaction has since committed this key finds its own record here.
         if winner.record.start_ts != request.start_ts {

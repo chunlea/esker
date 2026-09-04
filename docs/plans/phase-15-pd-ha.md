@@ -571,19 +571,29 @@ That is the trap, and the learner is what avoids it.
   observer for PD's own group.
 - **Changing a member's address in place.** Remove and add.
 
-### 11.7 What the `tls` lane should fold in
+### 11.7 What the `tls` lane folded in — **done, and the seam it left**
 
-`PdWiring` (`crates/esker-pd/src/wiring.rs`) holds a `PdTcpTransport` and **replaces it** when the
-group changes, because it may not add a queue to one. That costs every connection on every change,
-including to members that did not move — acceptable, because a membership change is an operator
-action and Raft retransmits, but it is not what the code would look like if the two were written
-together.
+`PdWiring` held a `PdTcpTransport` and replaced it on every change, because it could not add a
+queue to one while `transport.rs` belonged to another lane. The `tls` lane's RPC unit (`3141a240`)
+gave that type the real thing — `PdTcpTransport::reconfigure`, adding and dropping one queue per
+changed member and leaving the rest connected — so `wiring.rs` is gone and its whole reason for
+existing with it.
 
-What it would look like: `PdTcpTransport::reconfigure(&self, members: &MemberList)`, adding and
-dropping one queue and one task per changed member and leaving the rest connected. Once the TLS RPC
-unit lands, that method makes `wiring.rs` disappear.
+**The join between the two was not connected, and it was a live regression.** `PdCore::learn_routes`
+reaches a transport through the `PdTransport` *trait*, whose `reconfigure` is a **default no-op**,
+and `impl PdTransport for PdTcpTransport` implemented only `send`. So the inherent method existed,
+its own tests passed, the CLI built a `PdTcpTransport` — and a member added at run time was in the
+configuration, in the log, and unreachable from every member already there.
 
-`crates/esker-proto/src/transport/**` is used and not edited here.
+Neither lane's tests could see it. The inherent method's test calls the inherent method; this
+lane's failover tests use an in-process transport that resolves its target per message, so the
+rewiring path had no coverage over TCP at all. The test that closes it is written to the path the
+**driver** takes and nothing else: `PdTransport::reconfigure(&*transport, …)`.
+
+The lesson is the one a trait default always carries: **a default method is a silent opt-out.**
+Adding `reconfigure` to `PdTransport` with a `{}` body was right for `NoPeers` and for a test
+transport that needs nothing — and it meant the one implementation that *had* to override it could
+forget to, and compile.
 
 ### 11.8 Progress
 
@@ -633,5 +643,9 @@ way below a quorum and cannot undo it, because undoing needs the quorum it just 
   the listing. Adding `role` to `PdMemberInfo` would change a golden — one written in this same
   phase, in a message no other lane consumes yet — so it is a one-line ask for the human rather
   than something this lane took.
-- **`PdTcpTransport::reconfigure`**, which makes `wiring.rs` disappear. §11.7.
+- ~~`PdTcpTransport::reconfigure`~~ — landed with the `tls` lane's RPC unit; `wiring.rs` is gone.
+  What it left is in §11.7, and it was a live regression rather than a tidy-up.
+- **A membership change over a real socket.** The gap §11.7 names: every test of the rewiring path
+  either drives the inherent method directly or uses an in-process transport. Nothing has yet added
+  a member to a group of three real processes and watched a message reach it.
 

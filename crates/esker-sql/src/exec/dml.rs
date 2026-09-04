@@ -583,6 +583,13 @@ pub(super) fn write_row(
         .collect();
     let key = row::row_key(tenant, table.id, &primary_key)?;
 
+    // **The row lock, before anything is read or written** (ADR 0057). A concurrent writer holding
+    // it means this statement waits — which is what a real server does under READ COMMITTED and
+    // what this node answered `40001` for. Under the other isolation levels the wait is skipped
+    // and the conflict is still the transaction's to lose at commit, which is what those levels
+    // promise.
+    super::wait_for_row(executor, txn, &key)?;
+
     // The primary key is a unique index whose entry is the row itself.
     let detail = render_key(table, &table.primary_key, &primary_key);
     if txn.get(&key)?.is_some() {
