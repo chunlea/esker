@@ -590,6 +590,11 @@ pub enum SqlError {
     #[error("\"{0}\" is not a valid binary digit")]
     InvalidBinaryDigit(String),
 
+    /// `X'FG'`: a character that is not a hexadecimal digit. Its own word beside
+    /// [`SqlError::InvalidBinaryDigit`], and the same shape — the message names the character.
+    #[error("\"{0}\" is not a valid hexadecimal digit")]
+    InvalidHexadecimalDigit(String),
+
     /// A bit string assigned to a `bit(n)` column that is not `n` long — **either way**, short or
     /// long, which is what makes a fixed-width bit string different from a `character(n)`.
     #[error("bit string length {length} does not match type {ty}")]
@@ -2385,6 +2390,7 @@ impl SqlError {
             SqlError::MalformedRangeLiteral { .. }
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
+            | SqlError::InvalidHexadecimalDigit(_)
             | SqlError::InvalidLineSpecification
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }

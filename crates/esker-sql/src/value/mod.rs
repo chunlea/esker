@@ -361,10 +361,12 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         // `varchar` is `character varying` either way. It is what `min(c)` reports, since an
         // aggregate carries no typmod.
         (ColumnType::Bpchar, NO_TYPMOD) => "bpchar".to_owned(),
-        // **A bare `bit` column is `bit(1)`** — measured, `t.bit :another_bit` reports
-        // `character_maximum_length` 1 — and a bare `bit varying` has no length at all. Before
-        // the general `NO_TYPMOD` arm below, which would answer the bare name.
-        (ColumnType::Bit, NO_TYPMOD) => "bit(1)".to_owned(),
+        // **`"bit"`, quoted, and it is the *literal's* type and not a column's.** `bit` is a
+        // reserved word, so a real server writes `format_type(1560, -1)` as `"bit"` — and the only
+        // thing that reaches here with no typmod is a `B'…'` literal, whose length is the value's.
+        // A bare `bit` **column** carries `atttypmod` 1 and prints `bit(1)` through the arm below;
+        // `crate::parse::lower` is where the 1 is put on.
+        (ColumnType::Bit, NO_TYPMOD) => "\"bit\"".to_owned(),
         (_, NO_TYPMOD) => ty.name().to_owned(),
         // **`character varying(255)[]`, not `character varying[](255)`.** The typmod is the
         // element's and prints inside the element's name, with the brackets after the whole of

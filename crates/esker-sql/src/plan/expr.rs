@@ -1857,6 +1857,21 @@ impl Literal {
                     None => mismatch(),
                 }
             }
+            // **A `B'…'` literal assigns to either bit type**, which is a real server's
+            // `bit -> bit varying` assignment cast: `B'1100'` into a `bit varying(4)` column is
+            // that column's value and not a `42804`. The `varying` flag on a `Datum::Bit` is the
+            // *column's* everywhere in this crate — a value whose flag disagrees does not `fit` —
+            // so the literal is re-read as the column's type, the road the array arm above takes.
+            // The length rule then applies as it does to any assignment, `22026` and all.
+            Literal::Typed(value)
+                if matches!(**value, Datum::Bit { .. })
+                    && matches!(ty, ColumnType::Bit | ColumnType::VarBit) =>
+            {
+                match value.to_text() {
+                    Some(text) => Datum::from_text(ty, &text),
+                    None => mismatch(),
+                }
+            }
             Literal::Typed(_) => mismatch(),
 
             Literal::Bool(value) => match ty {
