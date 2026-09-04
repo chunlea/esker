@@ -1,0 +1,27 @@
+crates/esker-pd/src/driver.rs
+  s_2d916f5f540186::t_055ec72e852daf 47-48,54,82-117,184-188,193-200,223-228,291-297,333-339,365-427,444-447,449-461,639-671,775,787,871-904,984-996,1042,1084-1091
+crates/esker-pd/src/lib.rs
+  s_2d916f5f540186::t_5871080d182138 36,66,83
+crates/esker-pd/src/pd/mod.rs
+  s_2d916f5f540186::t_cdbed4bb1655ae 41,46,334,462-469,503,645-767,776-785
+crates/esker-pd/src/wiring.rs
+  s_2d916f5f540186::t_b1c55b51950954 1-223
+crates/esker-pd/tests/failover.rs
+  s_2d916f5f540186::t_e3b24c4eff54cd 267-377,994-1166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3d5394e103678f650ecb0ee014a78bce1420d8fe",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
