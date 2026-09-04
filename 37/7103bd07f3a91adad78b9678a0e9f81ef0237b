@@ -1,0 +1,23 @@
+crates/esker-proto/src/error.rs
+  s_2bed4ac2b1c944::t_0b07900b421ec2 66-67,70,89,126-146,325,357,397-403,457-463,521-524,711-714,825-846
+crates/esker-proto/tests/golden/messages.hex
+  s_2bed4ac2b1c944::t_b3885945936a5a 91-92
+crates/esker-proto/tests/messages.rs
+  s_2bed4ac2b1c944::t_9c92b50f4da892 873-875,1006-1022
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "377103bd07f3a91adad78b9678a0e9f81ef0237b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
