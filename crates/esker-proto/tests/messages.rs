@@ -15,7 +15,7 @@ use esker_proto::fragment::{
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
 use esker_proto::pd::{
     ColumnarWish, MemberChange, Operator, PdMemberInfo, PdMembership, PdRaftBatch, PdReq, PdResp,
-    StoreInfo,
+    PdRole, StoreInfo,
 };
 use esker_proto::schema::{SchemaReq, SchemaResp};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
@@ -101,10 +101,14 @@ fn growing_membership() -> PdMembership {
             PdMemberInfo {
                 id: 2,
                 address: "127.0.0.1:2380".to_owned(),
+                role: PdRole::Voter,
             },
+            // Mid-add: the member this message is about is still catching up, which is the state
+            // the field exists to make visible.
             PdMemberInfo {
                 id: 4,
                 address: "127.0.0.1:2382".to_owned(),
+                role: PdRole::Learner,
             },
         ],
     }
@@ -787,14 +791,18 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                     PdMemberInfo {
                         id: 1,
                         address: "127.0.0.1:2379".to_owned(),
+                        role: PdRole::Voter,
                     },
                     PdMemberInfo {
                         id: 2,
                         address: "127.0.0.1:2380".to_owned(),
+                        role: PdRole::Voter,
                     },
+                    // One learner, so the golden pins a group that is not uniform.
                     PdMemberInfo {
                         id: 3,
                         address: "127.0.0.1:2381".to_owned(),
+                        role: PdRole::Learner,
                     },
                 ],
             })),
@@ -828,7 +836,32 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
                 members: vec![PdMemberInfo {
                     id: 3,
                     address: "127.0.0.1:2381".to_owned(),
+                    role: PdRole::Voter,
                 }],
+            })),
+        ),
+        // A member **joining**: it holds the address book it was told and is in no configuration
+        // yet, because the group's snapshot has not reached it. Every variant of the role is
+        // pinned by one of these three, which is the point of having a third at all.
+        (
+            "pd-members-joining",
+            Response::Pd(PdResp::Members(PdMembership {
+                group_id: PD_GROUP,
+                this_id: 4,
+                leader_id: 0,
+                term: 0,
+                members: vec![
+                    PdMemberInfo {
+                        id: 1,
+                        address: "127.0.0.1:2379".to_owned(),
+                        role: PdRole::Unconfigured,
+                    },
+                    PdMemberInfo {
+                        id: 4,
+                        address: "127.0.0.1:2382".to_owned(),
+                        role: PdRole::Unconfigured,
+                    },
+                ],
             })),
         ),
         (

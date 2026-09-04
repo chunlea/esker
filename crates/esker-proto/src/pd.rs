@@ -426,6 +426,56 @@ impl ScannedRegion {
     }
 }
 
+/// What a placement driver is to its group (*fixed*). Zero is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PdRole {
+    /// In the configuration, and counted towards a quorum.
+    Voter = 1,
+    /// In the configuration and **not** counted towards a quorum: it is catching up.
+    ///
+    /// The state a member added at run time passes through, and the one an operator most wants to
+    /// see: an `add` that has stalled looks exactly like a group of the right size until you can
+    /// tell which of them is still a learner
+    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    Learner = 2,
+    /// Known by address, and in no configuration this member holds.
+    ///
+    /// Not a contradiction and not an error. A member **joining** a group starts with the address
+    /// book it was told and an empty configuration, and stays that way until the group's snapshot
+    /// reaches it — so this is what a joiner honestly answers about everyone, itself included.
+    Unconfigured = 3,
+}
+
+impl PdRole {
+    /// The wire byte.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The role for a byte, or `None` for one this version does not define.
+    #[must_use]
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Voter),
+            2 => Some(Self::Learner),
+            3 => Some(Self::Unconfigured),
+            _ => None,
+        }
+    }
+
+    /// What it is called in a report.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Voter => "voter",
+            Self::Learner => "learner",
+            Self::Unconfigured => "unconfigured",
+        }
+    }
+}
+
 /// One placement driver in a group, as `Pd::Members` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdMemberInfo {
@@ -433,6 +483,11 @@ pub struct PdMemberInfo {
     pub id: u64,
     /// Where it listens.
     pub address: String,
+    /// What it is to the group, as the member answering sees it.
+    ///
+    /// **As the member answering sees it**, which is the whole reason this is worth reporting: two
+    /// members can disagree while a change is in flight, and that disagreement is the diagnosis.
+    pub role: PdRole,
 }
 
 /// What `Pd::MemberChange` is asking for (*fixed*). Zero is reserved.
@@ -506,6 +561,7 @@ fn encode_membership(membership: &PdMembership, out: &mut Encoder) {
     for member in &membership.members {
         out.put_varint(member.id);
         out.put_str(&member.address);
+        out.put_u8(member.role.as_u8());
     }
 }
 
@@ -517,9 +573,14 @@ fn decode_membership(input: &mut Decoder<'_>) -> Result<PdMembership, DecodeErro
     let count = input.get_count("members.count")?;
     let mut members = Vec::with_capacity(count.min(16));
     for _ in 0..count {
+        let id = input.get_varint("members.id")?;
+        let address = input.get_str("members.address")?.to_owned();
+        let byte = input.get_u8("members.role")?;
         members.push(PdMemberInfo {
-            id: input.get_varint("members.id")?,
-            address: input.get_str("members.address")?.to_owned(),
+            id,
+            address,
+            role: PdRole::from_u8(byte)
+                .ok_or_else(|| DecodeError::invalid("members.role", format!("role {byte}")))?,
         });
     }
     Ok(PdMembership {
