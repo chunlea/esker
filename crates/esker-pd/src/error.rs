@@ -41,6 +41,20 @@ pub enum PdError {
         actual: u64,
     },
 
+    /// This member does not lead PD's Raft group, or leads it and has not yet caught up, so it
+    /// answers nothing ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+    ///
+    /// A refusal, not a failure: the request provably did not take effect, and the caller's repair
+    /// is to ask the member named — or, when nothing is named, to back off, because an election is
+    /// under way and chasing it would be a spin.
+    #[error("this placement driver is not the leader")]
+    NotLeader {
+        /// The member this one believes leads, or zero when it has no opinion.
+        leader_id: u64,
+        /// Where that member is, or empty when this one cannot say.
+        leader_address: String,
+    },
+
     /// A request PD will not serve as asked: a zero count, a batch larger than the format can
     /// hand out in one go.
     #[error("invalid request: {detail}")]
@@ -94,6 +108,13 @@ impl From<PdError> for ProtoError {
                 Self::ClusterMismatch { expected, actual }
             }
             PdError::Invalid { detail } => Self::InvalidRequest { detail },
+            PdError::NotLeader {
+                leader_id,
+                leader_address,
+            } => Self::PdNotLeader {
+                leader_id,
+                leader_address,
+            },
             other => Self::Internal {
                 detail: other.to_string(),
             },
@@ -109,8 +130,8 @@ mod tests {
     use super::PdError;
     use esker_proto::{ProtoError, RequestOutcome};
 
-    /// The two variants that exist so a caller can branch must survive the trip to the wire as
-    /// themselves. Collapsing either into `Internal` would make PD's refusals unreadable.
+    /// The variants that exist so a caller can branch must survive the trip to the wire as
+    /// themselves. Collapsing any of them into `Internal` would make PD's refusals unreadable.
     #[test]
     fn the_two_actionable_failures_stay_typed_on_the_wire() {
         assert!(matches!(
@@ -126,6 +147,13 @@ mod tests {
                 expected: 1,
                 actual: 2
             }
+        ));
+        assert!(matches!(
+            ProtoError::from(PdError::NotLeader {
+                leader_id: 2,
+                leader_address: "127.0.0.1:2380".to_owned(),
+            }),
+            ProtoError::PdNotLeader { leader_id: 2, .. }
         ));
     }
 
@@ -147,6 +175,10 @@ mod tests {
                 actual: 2,
             },
             PdError::invalid("count is zero"),
+            PdError::NotLeader {
+                leader_id: 0,
+                leader_address: String::new(),
+            },
         ] {
             let wire = ProtoError::from(error);
             assert_eq!(wire.outcome(), RequestOutcome::NotApplied, "{wire:?}");

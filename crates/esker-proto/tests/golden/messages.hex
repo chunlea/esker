@@ -36,6 +36,9 @@ request pd-tso 0603cdd70210
 request pd-schema-lease 0703cdd702
 request pd-status 0903cdd702
 request pd-scan-regions 0a03cdd702016d40
+request pd-raft 0b03cdd702efcdab8967452301020106020309
+request pd-raft-empty 0b03cdd702efcdab89674523010200
+request pd-members 0c03cdd702
 request raft-snapshot 0204032a07
 response hello 0100010000000780808008
 response get 0101010176
@@ -54,6 +57,9 @@ response raft-ack 0104
 response pd-bootstrap 0103cdd7020107016100020302010a01020b01
 response pd-bootstrap-registered 0103cdd70200
 response pd-store-heartbeat 0203
+response pd-raft 0b03
+response pd-members 0c03efcdab896745230102020703010e3132372e302e302e313a32333739020e3132372e302e302e313a32333830030e3132372e302e302e313a32333831
+response pd-members-electing 0c03efcdab896745230103000001030e3132372e302e302e313a32333831
 response pd-region-heartbeat 030300
 response pd-region-heartbeat-add-peer 030301010702030429
 response pd-region-heartbeat-remove-peer 030301020702030b
@@ -88,6 +94,8 @@ error not-sent 0f0012636f6e6e656374696f6e2072656675736564
 error timeout 1000106e6f20616e7377657220696e20333073
 error not-bootstrapped 1100
 error cluster-mismatch 1200effdb6f50d01
+error pd-not-leader 1300020e3132372e302e302e313a32333830
+error pd-not-leader-blind 13000000
 
 # TxnKv (service 0x02): Get 0x0201, Scan 0x0202, Prewrite 0x0203, Commit 0x0204,
 # Rollback 0x0205, ResolveLock 0x0206, Heartbeat 0x0207, GcSafepoint 0x0208. Every one
