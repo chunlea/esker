@@ -2594,6 +2594,17 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::JsonbArray => 46,
             ColumnType::OidArray => 47,
             ColumnType::CitextArray => 48,
+            // A family each, for the reason every range and every array already has one: a
+            // range compares only with a range of the same subtype, and an array's
+            // comparison is its element type's.
+            ColumnType::DateRange => 49,
+            ColumnType::NumRange => 50,
+            ColumnType::Int8Range => 51,
+            ColumnType::TstzRangeArray => 52,
+            ColumnType::Int4RangeArray => 53,
+            ColumnType::DateRangeArray => 54,
+            ColumnType::NumRangeArray => 55,
+            ColumnType::Int8RangeArray => 56,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

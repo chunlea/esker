@@ -1180,6 +1180,11 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::TextArray
         | ColumnType::HstoreArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1216,7 +1221,12 @@ fn placeholder(ty: ColumnType) -> Datum {
         }
         ColumnType::Citext => Datum::Citext(String::new()),
         // The empty range, which is a real value and not a NULL.
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => Datum::Range {
             subtype: Box::new(match ty {
                 ColumnType::TstzRange => ColumnType::TimestampTz,
                 ColumnType::Int4Range => ColumnType::Int8,

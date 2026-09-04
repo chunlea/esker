@@ -1294,7 +1294,14 @@ fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
                     other.column_type().map_or("unknown", PgType::name)
                 ))),
             };
-            Datum::Text(range::DateRange::new(day(args.first())?, day(args.get(1))?).to_text())
+            // **A `Datum::Range` now that `daterange` is a type**, where it used to be text.
+            // `pg_typeof(daterange(a, b))` is `daterange` on a real server, and a value that
+            // carries its subtype is what makes it one here; the text is the same either way,
+            // because `DateRange::to_text` is what writes it.
+            Datum::Range {
+                subtype: Box::new(ColumnType::Date),
+                text: range::DateRange::new(day(args.first())?, day(args.get(1))?).to_text(),
+            }
         }
         CatalogFunc::IsEmpty => match range_argument(args.first())? {
             None => Datum::Null,

@@ -120,11 +120,7 @@ pub const CITEXT_ARRAY_OID: u32 = 16403;
 /// standing constant-width trade, and the bound has to read as the type the literal makes.
 #[must_use]
 pub fn range_subtype(ty: ColumnType) -> ColumnType {
-    match ty {
-        ColumnType::TstzRange => ColumnType::TimestampTz,
-        ColumnType::Int4Range => ColumnType::Int8,
-        _ => ColumnType::Timestamp,
-    }
+    esker_keys::row::range_subtype(ty)
 }
 
 /// `tsrange[]`'s oid — PostgreSQL's own `_tsrange`, which is built in and therefore fixed.
@@ -496,11 +492,37 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
-        // No array of a `tstzrange` or an `int4range` here: `range_test.rb` declares only
-        // `tsrange[]`, and a `typarray` of 0 is what a real server holds for a type with none.
-        | ColumnType::TstzRange
-        | ColumnType::Int4Range => 0,
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray => 0,
+        // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
+        // declares two range arrays and an array type is built per element type, so three of the
+        // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
+        // is the type's plus one — measured, all six.
+        ColumnType::TstzRange => 3911,
+        ColumnType::Int4Range => 3905,
+        ColumnType::DateRange => 3913,
+        ColumnType::NumRange => 3907,
+        ColumnType::Int8Range => 3927,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -627,8 +649,8 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Citext
         | ColumnType::TsRange
         | ColumnType::TstzRange
-        | ColumnType::Int4Range
-        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
+        | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
 }
 
@@ -735,6 +757,9 @@ impl PgType for ColumnType {
             ColumnType::TsRange => 3908,
             ColumnType::TstzRange => 3910,
             ColumnType::Int4Range => 3904,
+            ColumnType::DateRange => 3912,
+            ColumnType::NumRange => 3906,
+            ColumnType::Int8Range => 3926,
             ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
             ColumnType::Real => 700,
@@ -768,7 +793,12 @@ impl PgType for ColumnType {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
-            | ColumnType::CitextArray => 0,
+            | ColumnType::CitextArray
+            | ColumnType::TstzRangeArray
+            | ColumnType::Int4RangeArray
+            | ColumnType::DateRangeArray
+            | ColumnType::NumRangeArray
+            | ColumnType::Int8RangeArray => 0,
         }
     }
 
@@ -787,6 +817,14 @@ impl PgType for ColumnType {
             ColumnType::TsRange => "tsrange",
             ColumnType::TstzRange => "tstzrange",
             ColumnType::Int4Range => "int4range",
+            ColumnType::DateRange => "daterange",
+            ColumnType::NumRange => "numrange",
+            ColumnType::Int8Range => "int8range",
+            ColumnType::TstzRangeArray => "tstzrange[]",
+            ColumnType::Int4RangeArray => "int4range[]",
+            ColumnType::DateRangeArray => "daterange[]",
+            ColumnType::NumRangeArray => "numrange[]",
+            ColumnType::Int8RangeArray => "int8range[]",
             ColumnType::TsRangeArray => "tsrange[]",
             ColumnType::BoolArray => "boolean[]",
             ColumnType::ByteaArray => "bytea[]",
@@ -849,8 +887,8 @@ impl PgType for ColumnType {
             | ColumnType::Citext
             | ColumnType::TsRange
             | ColumnType::TstzRange
-            | ColumnType::Int4Range
-            | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+            | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -983,6 +1021,11 @@ impl PgDatum for Datum {
             | ColumnType::TextArray
             | ColumnType::HstoreArray
             | ColumnType::TsRangeArray
+            | ColumnType::TstzRangeArray
+            | ColumnType::Int4RangeArray
+            | ColumnType::DateRangeArray
+            | ColumnType::NumRangeArray
+            | ColumnType::Int8RangeArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1024,7 +1067,12 @@ impl PgDatum for Datum {
             ColumnType::Citext => Datum::Citext(text.to_owned()),
             // Parsed and rendered back **canonical**, which is what makes equality and grouping the
             // text's — the same road `hstore` and `jsonb` take.
-            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
+            ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::Int8Range => {
                 let subtype = range_subtype(ty);
                 Datum::Range {
                     subtype: Box::new(subtype),
@@ -1129,6 +1177,11 @@ impl PgDatum for Datum {
             | ColumnType::TextArray
             | ColumnType::HstoreArray
             | ColumnType::TsRangeArray
+            | ColumnType::TstzRangeArray
+            | ColumnType::Int4RangeArray
+            | ColumnType::DateRangeArray
+            | ColumnType::NumRangeArray
+            | ColumnType::Int8RangeArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1225,9 +1278,12 @@ impl PgDatum for Datum {
             )?)),
             // The wire carries the printed form either way, so this is `from_text`'s road with the
             // bytes read first.
-            ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => {
-                binary_range(ty, bytes)?
-            }
+            ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::Int8Range => binary_range(ty, bytes)?,
             ColumnType::Json | ColumnType::Jsonb => {
                 return Err(SqlError::unsupported(
                     "a json or jsonb parameter in the binary format",
@@ -1733,8 +1789,8 @@ mod tests {
                         | ColumnType::Citext
                         | ColumnType::TsRange
                         | ColumnType::TstzRange
-                        | ColumnType::Int4Range
-                        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
+                        | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,
