@@ -1382,6 +1382,24 @@ const UNSUPPORTED: &[Unsupported] = &[
     // (`DROP SERVER IF EXISTS foreign_server CASCADE`), so every test in that file met the wrong
     // class on the way out.
     u("DROP SERVER", &["DROP", "SERVER"], &[]),
+    // --- `ALTER INDEX`, whose one implemented form parses ---
+    //
+    // `sqlparser` 0.62.0 reads `ALTER INDEX … RENAME TO` and no other operation, so everything
+    // here reaches this table only because the parser stopped — and a `42601` would claim the SQL
+    // was malformed when a real server runs three of these four. Named most specific first, the
+    // way `CREATE USER MAPPING` is: the words are what tells them apart.
+    u(
+        "ALTER INDEX ... SET TABLESPACE",
+        &["ALTER", "INDEX"],
+        &["TABLESPACE"],
+    ),
+    u(
+        "ALTER INDEX ... ALTER COLUMN",
+        &["ALTER", "INDEX"],
+        &["COLUMN"],
+    ),
+    u("ALTER INDEX ... SET", &["ALTER", "INDEX"], &["SET"]),
+    u("ALTER INDEX IF EXISTS", &["ALTER", "INDEX"], &["EXISTS"]),
 ];
 
 /// Builds a row of [`UNSUPPORTED`]. A free function because a `const` table cannot call a method.

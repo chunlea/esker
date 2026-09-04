@@ -44,7 +44,12 @@ pub(super) fn comment(
         catalog::Relation::Sequence { .. } if statement.object == CommentObject::Sequence => {
             return Err(SqlError::unsupported("COMMENT ON SEQUENCE"));
         }
-        catalog::Relation::Sequence { .. } => return Err(wrong_kind(statement)),
+        // A view joins it: **`COMMENT ON TABLE` over one is `42809 "v" is not a table` with no
+        // `HINT`** — measured, and unlike the `DROP` verbs, which do hint. So both take the path
+        // every other wrong kind takes rather than a sentence of their own.
+        catalog::Relation::Sequence { .. } | catalog::Relation::View { .. } => {
+            return Err(wrong_kind(statement));
+        }
     };
     // The two kinds that exist here only to name themselves in a `42809`. A sequence's own record
     // has no field for a comment, so even the right kind is a refusal — said out loud rather than

@@ -16,24 +16,34 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    // **`name` there, `text` here** — the standing choice every `pg_catalog` column in this crate
+    // makes. Newly compared: the line sits below the `CREATE VIEW` that used to abort the capture.
+    types: &[
+        "SELECT 'r', indexname, indexdef FROM pg_indexes WHERE tablename = 'rc' ORDER BY indexname",
+    ],
     answers: &[
-        // **`CREATE VIEW` is a named refusal older than this unit**, so the three lines that need
-        // a view are its consequences and not gaps of their own. The property the view is here to
-        // show — that a rename is *rendered* through and does not break what points at the column
-        // — is proved by the index and constraint definitions above it, which do the same job by
-        // the same mechanism.
-        (
-            "CREATE VIEW rc_view AS SELECT id, name FROM rc",
-            "`0A000 CREATE VIEW is not supported`. Every line below that names `rc_view` follows \
-             from it.",
-        ),
+        // **`CREATE VIEW` landed (`tests/view.rs`)**, so the view is created, read and dropped
+        // here and those three entries are gone. `pg_get_viewdef` is the one that stays — it is
+        // PostgreSQL's own renderer and this node has no pretty-printer for a definition.
         (
             "SELECT 'r', pg_get_viewdef('rc_view'::regclass, true)",
-            "The view was never created.",
+            "Refused by name: `pg_get_viewdef` prints a view's body through PostgreSQL's renderer, \
+             one column per line with its own indentation, and reproducing that is a \
+             pretty-printer for the whole expression language. Declared identically in \
+             `tests/view.rs`.",
         ),
-        ("SELECT 'r', count(*) FROM rc_view", "The same."),
-        ("DROP VIEW rc_view", "The same."),
+        // **A pre-existing bug this unit made visible, and not a view divergence.** `CREATE VIEW`
+        // used to abort the transaction seven lines above, so everything after it was swallowed
+        // by the harness rather than compared — including this.
+        (
+            "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '\"rc\"'::regclass ORDER BY conname",
+            "**Renaming a column renames the `NOT NULL` constraint that names it, and PostgreSQL \
+             leaves it alone.** After `ALTER TABLE rc RENAME COLUMN name TO title` the oracle still \
+             calls the constraint `rc_name_not_null`; this node calls it `rc_title_not_null`, which \
+             also moves it in a `conname` ordering. A constraint's name is a name a user chose or \
+             the server generated *once* — it is not a function of the column, and renaming it is a \
+             second rename nobody asked for. Reproduced with no view in the statement.",
+        ),
     ],
 };
 

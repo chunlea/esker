@@ -1415,6 +1415,13 @@ pub(super) fn drop_sequence(
                     found: "DROP TABLE",
                 });
             }
+            Some(catalog::Relation::View { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a sequence",
+                    found: "DROP VIEW",
+                });
+            }
             Some(catalog::Relation::Index { .. } | catalog::Relation::PrimaryKey { .. }) => {
                 return Err(SqlError::WrongObjectType {
                     name: name.clone(),
@@ -2366,6 +2373,133 @@ pub(super) fn drop_database(
     Ok(Outcome::done("DROP DATABASE"))
 }
 
+/// `CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT …`.
+///
+/// **The definition is lowered once, here, and then stored as text.** Lowering it proves the
+/// `SELECT` is one this node can run and that every relation it names exists — PostgreSQL resolves
+/// a view's body at creation too, which is why `CREATE VIEW v AS SELECT * FROM nosuch` is `42P01`
+/// rather than a view that fails later. What is kept is the text, for the reason
+/// [`plan::CreateView`] gives.
+pub(super) fn create_view(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateView,
+) -> Result<Outcome> {
+    catalog::pg_catalog::refuse_write(&create.name)?;
+    // The schema a bare name lands in, the same rule `CREATE TABLE` follows.
+    let name = if create.name.contains(catalog::SCHEMA_SEPARATOR) {
+        create.name.clone()
+    } else {
+        let schema = executor.creation_schema(txn)?;
+        catalog::qualify(&schema, &create.name)
+    };
+    let existing = existing_relation(executor, txn, &name)?;
+    match existing {
+        // `OR REPLACE` over a view replaces it; without it the name is taken and that is `42P07`,
+        // the same answer a second `CREATE TABLE` of the name gets.
+        Some(catalog::Relation::View { .. }) if create.or_replace => {}
+        Some(catalog::Relation::View { .. }) => {
+            return Err(SqlError::DuplicateTable(create.name.clone()));
+        }
+        // **`OR REPLACE` does not replace a table with a view.** Measured: `CREATE TABLE v` over a
+        // view is `42P07 relation "v" already exists`, and the mirror of it is this.
+        Some(_) => return Err(SqlError::DuplicateTable(create.name.clone())),
+        None => {}
+    }
+    // Proves the body before it is stored, and gives the shape its columns are checked against.
+    let shape = view_shape(executor, txn, &create.definition, &create.columns)?;
+    let id = catalog::allocate_id(txn, executor.tenant)?;
+    catalog::create_view(
+        txn,
+        executor.tenant,
+        &catalog::ViewDef {
+            id,
+            name,
+            definition: create.definition.clone(),
+            columns: shape,
+        },
+    )?;
+    executor.catalog_written = true;
+    Ok(Outcome::done("CREATE VIEW"))
+}
+
+/// The names a view's columns will have: the ones it was declared with, or the ones its own
+/// `SELECT` produces.
+///
+/// **A column list that does not match the query's width is `42P10`** on a real server, and it has
+/// to be caught here rather than where the view is read: a stored view whose list is the wrong
+/// length would be a relation whose shape is a lie.
+fn view_shape(
+    executor: &Executor,
+    txn: &dyn Txn,
+    definition: &str,
+    declared: &[String],
+) -> Result<Vec<String>> {
+    let parsed = crate::parse::parse_statements(definition)?;
+    let [statement] = parsed.as_slice() else {
+        return Err(SqlError::unsupported(
+            "a view definition that is more than one statement",
+        ));
+    };
+    let plan::Statement::Select(select) = statement.lower()? else {
+        return Err(SqlError::unsupported(
+            "a view definition that is not a SELECT",
+        ));
+    };
+    let planned = executor.plan_select(txn, &select)?;
+    let produced: Vec<String> = planned
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    if declared.is_empty() {
+        return Ok(produced);
+    }
+    if declared.len() != produced.len() {
+        return Err(SqlError::ViewColumnCount {
+            declared: declared.len(),
+            produced: produced.len(),
+        });
+    }
+    Ok(declared.to_vec())
+}
+
+/// `DROP VIEW [IF EXISTS] name [, …]`.
+pub(super) fn drop_view(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropView,
+) -> Result<Outcome> {
+    for name in &drop.names {
+        let stored = executor.resolve_unqualified(txn, name)?;
+        match existing_relation(executor, txn, &stored)? {
+            Some(catalog::Relation::View { .. }) => {
+                catalog::drop_view(txn, executor.tenant, &stored)?;
+                executor.catalog_written = true;
+            }
+            // **`42809`, with a `HINT` naming the verb that would have worked** — the same shape
+            // `DROP TABLE` over a view gets, measured in both directions.
+            Some(_) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a view",
+                    found: "DROP TABLE",
+                });
+            }
+            None if drop.if_exists => {
+                executor.notice(SqlError::DoesNotExistSkipping {
+                    kind: "view",
+                    name: name.clone(),
+                });
+            }
+            // **`view "x" does not exist`, not `relation`** — the noun is the statement's, which
+            // is the rule `DROP TABLE` follows too.
+            None => return Err(SqlError::UndefinedViewForDrop(name.clone())),
+        }
+    }
+    Ok(Outcome::done("DROP VIEW"))
+}
+
 /// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.
 ///
 /// **`IF EXISTS` covers absence and not dependence**: a schema with something in it is `2BP01`
@@ -2459,6 +2593,14 @@ pub(super) fn drop_table(
                     name: name.clone(),
                     expected: "a table",
                     found: "DROP INDEX",
+                });
+            }
+            // Measured: `"v" is not a table`, with `HINT: Use DROP VIEW to remove a view.`
+            Some(catalog::Relation::View { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "a table",
+                    found: "DROP VIEW",
                 });
             }
             Some(catalog::Relation::Sequence { .. }) => {
@@ -3041,6 +3183,13 @@ pub(super) fn drop_index(
                     found: "DROP TABLE",
                 });
             }
+            Some(catalog::Relation::View { .. }) => {
+                return Err(SqlError::WrongObjectType {
+                    name: name.clone(),
+                    expected: "an index",
+                    found: "DROP VIEW",
+                });
+            }
             Some(catalog::Relation::Sequence { .. }) => {
                 return Err(SqlError::WrongObjectType {
                     name: name.clone(),
@@ -3191,6 +3340,15 @@ pub(super) fn alter_table(
                 action: "ADD COLUMN",
                 name: alter.name.clone(),
                 kind: "indexes",
+            });
+        }
+        // Measured: `ALTER action ADD COLUMN cannot be performed on relation "v"` with
+        // `DETAIL: This operation is not supported for views.`
+        Some(catalog::Relation::View { .. }) => {
+            return Err(SqlError::AlterActionOnWrongObject {
+                action: "ADD COLUMN",
+                name: alter.name.clone(),
+                kind: "views",
             });
         }
         // **A sequence takes `RENAME TO` and nothing else**, and getting that wrong cost run 55

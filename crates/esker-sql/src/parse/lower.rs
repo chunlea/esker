@@ -444,6 +444,34 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 template: None,
             }))
         }
+        // `CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT …`.
+        Statement::CreateView(create) => {
+            refuse_if(create.materialized, "CREATE MATERIALIZED VIEW")?;
+            refuse_if(create.temporary, "CREATE TEMPORARY VIEW")?;
+            refuse_if(create.or_alter, "CREATE OR ALTER VIEW")?;
+            refuse_if(create.secure, "CREATE SECURE VIEW")?;
+            refuse_if(create.if_not_exists, "CREATE VIEW IF NOT EXISTS")?;
+            refuse_if(create.with_no_schema_binding, "WITH NO SCHEMA BINDING")?;
+            refuse_if(create.to.is_some(), "CREATE VIEW ... TO")?;
+            refuse_if(create.params.is_some(), "CREATE VIEW with view parameters")?;
+            refuse_if(!create.cluster_by.is_empty(), "CREATE VIEW ... CLUSTER BY")?;
+            // A column list on the view names its columns; a *type* on one is not PostgreSQL's
+            // grammar, and an option list on a column is nobody's.
+            for column in &create.columns {
+                refuse_if(column.data_type.is_some(), "a type on a view column")?;
+                refuse_if(column.options.is_some(), "an option on a view column")?;
+            }
+            Ok(plan::Statement::CreateView(plan::CreateView {
+                name: object_name(&create.name)?,
+                columns: create.columns.iter().map(|c| ident(&c.name)).collect(),
+                // **Rendered back rather than kept verbatim**, because the parser is what this
+                // node re-reads it with: a definition that round-trips through `sqlparser`'s own
+                // rendering is one it can certainly parse again, where the user's text may carry
+                // comments and line breaks that no catalog needs.
+                definition: create.query.to_string(),
+                or_replace: create.or_replace,
+            }))
+        }
         Statement::AlterSchema(alter) => {
             use sqlparser::ast::AlterSchemaOperation;
             refuse_if(alter.if_exists, "ALTER SCHEMA IF EXISTS")?;
@@ -503,6 +531,16 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                // **`CASCADE` on a `DROP VIEW` is refused rather than ignored**: nothing here
+                // depends on a view yet, but a clause that silently did nothing would be a
+                // promise broken the day something does.
+                ObjectType::View => {
+                    refuse_if(*cascade, "DROP VIEW ... CASCADE")?;
+                    plan::Statement::DropView(plan::DropView {
+                        names,
+                        if_exists: *if_exists,
+                    })
+                }
                 ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,

@@ -174,53 +174,7 @@ fn walk(
                 }
             }
         }
-        Statement::Select(select) => {
-            // **Every predicate, not only the `WHERE`.** A `HAVING` and a join's `ON` are
-            // predicates over the same columns, and a parameter in one is typed by the column it
-            // is compared against exactly as in a `WHERE`.
-            for predicate in select
-                .filter
-                .iter()
-                .chain(select.having.iter())
-                .chain(select.joins.iter().filter_map(|join| join.on.as_ref()))
-                // A `GROUP BY` expression is typed the same way: `GROUP BY n > $1` compares a
-                // column against a parameter exactly as a `WHERE` does.
-                .chain(select.group_by.iter())
-            {
-                walk_predicate(predicate, tables, seen);
-            }
-            // **And the target list**, which holds no predicate of its own but may hold a
-            // *subquery* that does: `SELECT (SELECT count(*) FROM t WHERE n > $1)` types `$1`
-            // from `n`, and reaching it means walking the projection the same way. Anything else
-            // there matches no arm and costs one call.
-            for item in &select.projection {
-                if let crate::plan::SelectItem::Expr { expr, .. } = item {
-                    walk_predicate(expr, tables, seen);
-                }
-            }
-            // **A derived table's predicates too.** Its parameters are numbered in the same
-            // statement, so `SELECT … FROM (SELECT … WHERE n > $1) AS x` types `$1` from `n` —
-            // the relations are already all in `tables`, which is the whole statement's.
-            for table in select
-                .from
-                .iter()
-                .chain(select.joins.iter().map(|join| &join.table))
-                .chain(select.ctes.iter())
-            {
-                if let Some(derived) = &table.derived {
-                    walk(&Statement::Select(derived.select.clone()), tables, seen);
-                }
-            }
-            // `LIMIT $1` is a count, whatever else is going on.
-            for clause in [select.limit.as_ref(), select.offset.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if let Expr::Parameter(number) = clause {
-                    seen(*number, ColumnType::Int8);
-                }
-            }
-        }
+        Statement::Select(select) => walk_select(select, tables, seen),
         Statement::Update(update) => {
             if let Some(table) = tables.first() {
                 for (name, value) in &update.assignments {
@@ -260,6 +214,8 @@ fn walk(
         | Statement::DropExtension(_)
         | Statement::AlterIndexRename(_)
         | Statement::CreateSchema(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_)
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropSchema(_)
@@ -278,6 +234,60 @@ fn walk(
         | Statement::AlterTable(_)
         | Statement::Session(_)
         | Statement::TimeMachine(_) => {}
+    }
+}
+
+/// The `SELECT` half of [`walk`], which is most of it: a `SELECT` has five places a parameter
+/// can be typed from and the other statements have one each.
+fn walk_select(
+    select: &crate::plan::Select,
+    tables: &[std::sync::Arc<TableDef>],
+    seen: &mut impl FnMut(u32, ColumnType),
+) {
+    // **Every predicate, not only the `WHERE`.** A `HAVING` and a join's `ON` are
+    // predicates over the same columns, and a parameter in one is typed by the column it
+    // is compared against exactly as in a `WHERE`.
+    for predicate in select
+        .filter
+        .iter()
+        .chain(select.having.iter())
+        .chain(select.joins.iter().filter_map(|join| join.on.as_ref()))
+        // A `GROUP BY` expression is typed the same way: `GROUP BY n > $1` compares a
+        // column against a parameter exactly as a `WHERE` does.
+        .chain(select.group_by.iter())
+    {
+        walk_predicate(predicate, tables, seen);
+    }
+    // **And the target list**, which holds no predicate of its own but may hold a
+    // *subquery* that does: `SELECT (SELECT count(*) FROM t WHERE n > $1)` types `$1`
+    // from `n`, and reaching it means walking the projection the same way. Anything else
+    // there matches no arm and costs one call.
+    for item in &select.projection {
+        if let crate::plan::SelectItem::Expr { expr, .. } = item {
+            walk_predicate(expr, tables, seen);
+        }
+    }
+    // **A derived table's predicates too.** Its parameters are numbered in the same
+    // statement, so `SELECT … FROM (SELECT … WHERE n > $1) AS x` types `$1` from `n` —
+    // the relations are already all in `tables`, which is the whole statement's.
+    for table in select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+        .chain(select.ctes.iter())
+    {
+        if let Some(derived) = &table.derived {
+            walk(&Statement::Select(derived.select.clone()), tables, seen);
+        }
+    }
+    // `LIMIT $1` is a count, whatever else is going on.
+    for clause in [select.limit.as_ref(), select.offset.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Expr::Parameter(number) = clause {
+            seen(*number, ColumnType::Int8);
+        }
     }
 }
 
@@ -675,6 +685,8 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::DropExtension(_)
         | Statement::AlterIndexRename(_)
         | Statement::CreateSchema(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_)
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropSchema(_)
@@ -886,6 +898,8 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::DropExtension(_)
         | Statement::AlterIndexRename(_)
         | Statement::CreateSchema(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_)
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropSchema(_)
@@ -969,6 +983,8 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::DropExtension(_)
         | Statement::AlterIndexRename(_)
         | Statement::CreateSchema(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_)
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropSchema(_)

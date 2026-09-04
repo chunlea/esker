@@ -1116,6 +1116,23 @@ pub enum SqlError {
         lock: &'static str,
     },
 
+    /// `CREATE VIEW v (a, b) AS SELECT one_column …` — a column list of the wrong width.
+    ///
+    /// Caught where the view is created rather than where it is read: a stored view whose declared
+    /// list is a different length from its query's is a relation whose shape is a lie.
+    #[error("CREATE VIEW specifies more column names than columns")]
+    ViewColumnCount {
+        /// How many names the statement gave.
+        declared: usize,
+        /// How many the query produces.
+        produced: usize,
+    },
+
+    /// `DROP VIEW nosuch` — **`view`, not `relation`**. The noun is the statement's, which is the
+    /// rule `DROP TABLE` follows too (`tests/corpus/pg19_view.txt`).
+    #[error("view \"{0}\" does not exist")]
+    UndefinedViewForDrop(String),
+
     /// `DROP DATABASE` naming the one the session is connected to.
     ///
     /// PostgreSQL's own sentence and its own class: a database in use is not a missing one and not
@@ -1905,6 +1922,7 @@ impl SqlError {
             | SqlError::PartitionKeyNotCovered { .. }
             | SqlError::AccessMethodWithoutInclude(_)
             | SqlError::SetFunctionNotAllowed(_)
+            | SqlError::ViewColumnCount { .. }
             | SqlError::OnConflictMovesPartition
             // A locking clause on a shape that cannot be locked: the one place PostgreSQL spends
             // `0A000` on something it will never implement rather than on something it has not
@@ -1943,6 +1961,7 @@ impl SqlError {
             SqlError::LockingRelationNotInFrom { .. }
             | SqlError::UndefinedTable(_)
             | SqlError::UndefinedTableForDrop(_)
+            | SqlError::UndefinedViewForDrop(_)
             | SqlError::UndefinedSequenceForDrop(_)
             | SqlError::MissingFromEntry(_)
             | SqlError::ForwardCteReference(_)
@@ -2356,18 +2375,7 @@ impl SqlError {
             | SqlError::DependentFunction { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
-            SqlError::WrongObjectType {
-                found: "DROP INDEX",
-                ..
-            } => Some("Use DROP INDEX to remove an index.".to_owned()),
-            SqlError::WrongObjectType {
-                found: "DROP TABLE",
-                ..
-            } => Some("Use DROP TABLE to remove a table.".to_owned()),
-            SqlError::WrongObjectType {
-                found: "DROP SEQUENCE",
-                ..
-            } => Some("Use DROP SEQUENCE to remove a sequence.".to_owned()),
+            SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),
             // PostgreSQL's own, and it names the **constraint** — measured for both the primary
             // key and a `UNIQUE` constraint, which give the identical sentence. The hint here used
             // to say "drop the table", which was advice a user could follow and not the advice a
@@ -2472,6 +2480,22 @@ impl From<esker_keys::row::RowError> for SqlError {
             RowError::InvalidUtf8(byte) => SqlError::InvalidByteSequence(byte),
         }
     }
+}
+
+/// The `HINT` on a `42809`: the verb that would have worked, named the way PostgreSQL names it.
+///
+/// One arm per verb rather than a sentence built from `found`, because the noun is not the verb's
+/// last word — `DROP SEQUENCE` hints "a sequence" and `DROP INDEX` hints "an index", and an
+/// article picked by rule would get one of them wrong.
+fn drop_verb_hint(found: &str) -> Option<String> {
+    let sentence = match found {
+        "DROP INDEX" => "Use DROP INDEX to remove an index.",
+        "DROP TABLE" => "Use DROP TABLE to remove a table.",
+        "DROP SEQUENCE" => "Use DROP SEQUENCE to remove a sequence.",
+        "DROP VIEW" => "Use DROP VIEW to remove a view.",
+        _ => return None,
+    };
+    Some(sentence.to_owned())
 }
 
 #[cfg(test)]

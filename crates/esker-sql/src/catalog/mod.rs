@@ -1792,6 +1792,16 @@ pub enum Relation {
         /// Its own id.
         sequence_id: u64,
     },
+    /// A view: the `SELECT` it stands for, re-lowered wherever it is read.
+    ///
+    /// **A view is a stored derived table.** `FROM v` becomes `FROM (<definition>) AS v` before
+    /// anything plans it, which is the rewrite `plan::cte` already performs for a `WITH` item —
+    /// the difference is only where the text comes from. So a view needs no node, no access path
+    /// and no read of its own: everything a derived table can do, it does.
+    View {
+        /// Its own id, which is its `pg_class` oid.
+        view_id: u64,
+    },
     /// A primary key constraint's name — `<table>_pkey`.
     ///
     /// It points at no index because there is none to point at: the row key *is* the primary key
@@ -1969,8 +1979,15 @@ impl View<'_> {
         }
         match self.relation(name)? {
             Some(Relation::Table { table_id }) => self.table_by_id(table_id),
+            // **A view is not a table and this is the function that says so.** What `FROM v`
+            // resolves to is the derived table the expansion builds, not a `TableDef` — so
+            // answering one here would give a view a row shape it does not have and a key range
+            // it certainly does not.
             Some(
-                Relation::Index { .. } | Relation::PrimaryKey { .. } | Relation::Sequence { .. },
+                Relation::Index { .. }
+                | Relation::PrimaryKey { .. }
+                | Relation::Sequence { .. }
+                | Relation::View { .. },
             )
             | None => Ok(None),
         }
@@ -2243,8 +2260,14 @@ pub fn replace_table(
     {
         txn.delete(&record::name_key(tenant, &previous.primary_key_name));
     }
+    // **Reconciled by name, not by id.** An index that was *renamed* keeps its id, so an
+    // id-keyed comparison saw it as still present and left the old name record behind — two names
+    // resolving to one index, and the definition still printing the first. That is the same leak
+    // the table's own name, the primary key's and a sequence's each had, in its fifth costume: the
+    // question this loop asks is "is this **name** still in use", and it has to be asked about the
+    // name.
     for index in &previous.indexes {
-        if !table.indexes.iter().any(|kept| kept.id == index.id) {
+        if !table.indexes.iter().any(|kept| kept.name == index.name) {
             txn.delete(&record::name_key(tenant, &index.name));
         }
     }
@@ -3004,6 +3027,75 @@ pub fn allocate_database_id(txn: &mut dyn Txn) -> Result<u64> {
 pub fn has_relations(txn: &dyn Txn, tenant: u64) -> Result<bool> {
     let (start, end) = record::name_range(tenant);
     Ok(!txn.scan(&start, &end, 1)?.is_empty())
+}
+
+/// One view: what it is called, the `SELECT` it stands for, and the columns it was declared with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    /// Its own id, which is its `pg_class` oid.
+    pub id: u64,
+    /// The stored name — bare in `public`, `schema ++ NUL ++ name` anywhere else.
+    pub name: String,
+    /// The `SELECT` text, as written.
+    pub definition: String,
+    /// `CREATE VIEW v (a, b) AS …` — the names the view gives its columns, or empty when it takes
+    /// them from the query.
+    pub columns: Vec<String>,
+}
+
+/// Every view of one tenant, by stored name.
+pub fn views(txn: &dyn Txn, tenant: u64) -> Result<Vec<ViewDef>> {
+    let (start, end) = record::view_range(tenant);
+    let mut out = Vec::new();
+    for (key, value) in txn.scan(&start, &end, u32::MAX)? {
+        let name = record::view_name_of(tenant, &key)?;
+        let (id, definition, columns) = record::decode_view(&value)?;
+        out.push(ViewDef {
+            id,
+            name,
+            definition,
+            columns,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// One view by stored name, or `None`.
+pub fn view(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<ViewDef>> {
+    let Some(bytes) = txn.get(&record::view_key(tenant, name))? else {
+        return Ok(None);
+    };
+    let (id, definition, columns) = record::decode_view(&bytes)?;
+    Ok(Some(ViewDef {
+        id,
+        name: name.to_owned(),
+        definition,
+        columns,
+    }))
+}
+
+/// Records a view and takes its name. The caller has already decided the name is free.
+pub fn create_view(txn: &mut dyn Txn, tenant: u64, view: &ViewDef) -> Result<()> {
+    txn.put(
+        &record::view_key(tenant, &view.name),
+        &record::encode_view(view.id, &view.definition, &view.columns),
+    );
+    // **The name record too**, because a view competes for names with every other relation: a
+    // `CREATE TABLE` of the same name is `42P07` and `FROM v` has to find it the way it finds a
+    // table.
+    txn.put(
+        &record::name_key(tenant, &view.name),
+        &record::encode_relation(&Relation::View { view_id: view.id }),
+    );
+    bump_version(txn)
+}
+
+/// Removes one, and the name it held.
+pub fn drop_view(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
+    txn.delete(&record::view_key(tenant, name));
+    txn.delete(&record::name_key(tenant, name));
+    bump_version(txn)
 }
 
 /// The one schema every tenant has.
