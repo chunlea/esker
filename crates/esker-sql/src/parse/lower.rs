@@ -819,7 +819,7 @@ fn verb_arguments(function: &sqlparser::ast::Function) -> Option<Vec<String>> {
 /// real server accepts and stores, and `SET TRANSACTION SNAPSHOT`, which a real server *acts* on
 /// and whose every precondition is one this feature wants anyway.
 fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
-    use sqlparser::ast::{ContextModifier, Set};
+    use sqlparser::ast::{ContextModifier, Set, SetSessionAuthorizationParamKind};
 
     match set {
         Set::SingleAssignment {
@@ -910,6 +910,24 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 plan::SessionStatement::SetSnapshot(id.clone()),
             ))
         }
+        // **`SET SESSION AUTHORIZATION` on a node with no roles**, which is the 12 refusals behind
+        // run 57's aborted-transaction row — every one of them in `schema_authorization_test.rb`,
+        // whose `set_session_auth` sends `DEFAULT` between each named user.
+        //
+        // `DEFAULT` asks for what is already the case and succeeds. Any *name* is
+        // `22023 role "x" does not exist`, which is true of every name here — and `22023` rather
+        // than the `42704` the same sentence takes for `CREATE DATABASE … OWNER`, because
+        // PostgreSQL reads an authorization name as a parameter value and an owner as an object.
+        // Measured, both. The file still needs `CREATE USER` to pass; what changes is that it now
+        // fails on the feature that is missing instead of aborting the transaction on this.
+        Set::SetSessionAuthorization(param) => match &param.kind {
+            SetSessionAuthorizationParamKind::Default => Ok(plan::Statement::Session(
+                plan::SessionStatement::SetSessionAuthorization,
+            )),
+            SetSessionAuthorizationParamKind::User(name) => {
+                Err(SqlError::UndefinedRoleForAuthorization(ident(name)))
+            }
+        },
         other => Err(SqlError::unsupported(set_feature_name(other))),
     }
 }

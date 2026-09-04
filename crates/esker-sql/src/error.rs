@@ -220,6 +220,20 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `SET SESSION AUTHORIZATION <name>` on a node that has no roles.
+    ///
+    /// **`22023`, not `42704`** — measured, and it is not the class the same condition takes
+    /// elsewhere: `CREATE DATABASE … OWNER x` is `42704 role "x" does not exist` and this is
+    /// `22023` with the identical sentence. PostgreSQL treats the authorization name as a
+    /// *parameter value* and the owner as an object reference, so a rule copied from one to the
+    /// other would give the right words under the wrong code.
+    ///
+    /// Every name reaches this, because this node has no roles at all — the sentence is true of
+    /// all of them rather than of the ones somebody mistyped. `DEFAULT` is accepted: it asks for
+    /// what is already the case.
+    #[error("role \"{0}\" does not exist")]
+    UndefinedRoleForAuthorization(String),
+
     /// A condition that is not a boolean: `WHERE name AND true`, `CASE WHEN name THEN …`.
     ///
     /// **The type, never the value.** PostgreSQL says `argument of AND must be type boolean, not
@@ -2038,6 +2052,7 @@ impl SqlError {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
+            SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
