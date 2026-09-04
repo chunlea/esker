@@ -47,8 +47,9 @@ impl TcpStores {
         let connection = BlockingTransport::connect_with(addr, config)?;
         let store_id = connection.hello_ack().store_id;
         Ok(Self {
-            // TODO(phase-4): PD's store list replaces this, and one connection becomes one
-            // case of a book that grows as regions are learned.
+            // `TODO(debt-c6 #4)`: PD's store list would replace this, and one connection would
+            // become one case of a book that grows as stores are learned
+            // (`docs/plans/debt-c6.md` §4).
             connections: BTreeMap::from([(store_id, connection)]),
         })
     }

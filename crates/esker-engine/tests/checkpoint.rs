@@ -307,7 +307,8 @@ fn two_ingested_files_that_overlap_each_other_are_refused() {
     let second = build_source(&fs, "/source-b", 20..60);
     let db = open(&fs, DIR, options(), &[cf::DEFAULT]);
     let err = db.ingest(cf::DEFAULT, &[first, second]).unwrap_err();
-    assert!(err.to_string().contains("same keys"), "{err}");
+    assert!(err.to_string().contains("the same key"), "{err}");
+    assert!(err.to_string().contains("k020"), "{err}");
 }
 
 #[test]

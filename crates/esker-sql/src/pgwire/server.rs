@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 use crate::backend::Backend;
 use crate::error::{Result, Severity, SqlError};
@@ -21,6 +21,7 @@ use crate::pgwire::message::{
     decode_startup,
 };
 use crate::pgwire::session::{Execute, Session};
+use crate::pgwire::tls::{MaybeTlsStream, TlsConfig};
 use crate::pgwire::{Negotiation, error_fields, error_message, negotiation};
 
 /// How a connecting client proves who it is.
@@ -49,6 +50,12 @@ pub struct Config {
     /// Reported to the client as `server_version`. PostgreSQL clients parse this and change
     /// behaviour on it, so it names a real PostgreSQL version and then says what is actually here.
     pub server_version: String,
+    /// Whether this node terminates TLS, and what with.
+    ///
+    /// [`TlsConfig::disabled`] is the default and answers `SSLRequest` with `N`, which is what
+    /// every build without the `tls` feature can do. Building an enabled one is a startup-time
+    /// decision the binary makes ([`TlsConfig::from_pem_files`]), never a per-connection one.
+    pub tls: TlsConfig,
 }
 
 impl Default for Config {
@@ -57,6 +64,7 @@ impl Default for Config {
             address: "127.0.0.1:5432".to_owned(),
             auth: Auth::Trust,
             server_version: "19.0 (Esker)".to_owned(),
+            tls: TlsConfig::disabled(),
         }
     }
 }
@@ -93,8 +101,7 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
             // Nagle would add a round trip's worth of latency to every small reply, and almost
             // every reply in this protocol is small.
             let _ = stream.set_nodelay(true);
-            let mut connection = Connection::new(stream, config);
-            if let Err(error) = connection.run(executors.as_ref()).await {
+            if let Err(error) = accept(stream, config, executors.as_ref()).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });
@@ -119,6 +126,10 @@ pub struct Connection<S> {
     /// It travels to the blocking thread with the session and comes back, so "reused" survives
     /// that trip — which is the point of moving the whole bundle rather than copying out of it.
     out: Vec<u8>,
+    /// A startup packet the accept path read while answering `SSLRequest`, waiting to be decoded.
+    ///
+    /// `None` for a connection built directly, which is what the in-memory tests do.
+    pending: Option<Vec<u8>>,
 }
 
 /// What one message's worth of work owns while it runs.
@@ -137,6 +148,14 @@ struct Work {
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// Wraps a stream that has not yet sent its startup packet.
     pub fn new(stream: S, config: Config) -> Self {
+        Self::resuming(stream, config, None)
+    }
+
+    /// Wraps a stream whose first startup packet has already been read by the accept path.
+    ///
+    /// `pending` is that packet, when it was not an encryption request and so still has to be
+    /// decoded by [`Connection::startup`].
+    fn resuming(stream: S, config: Config, pending: Option<Vec<u8>>) -> Self {
         Connection {
             stream,
             config,
@@ -144,6 +163,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             user: String::new(),
             database: String::new(),
             out: Vec::with_capacity(8 * 1024),
+            pending,
         }
     }
 
@@ -259,12 +279,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             };
             match startup {
-                // We terminate no TLS and no GSSAPI. A single `N` is the documented refusal, and
-                // the client then either continues in the clear or gives up — either way this is
-                // not an error, which is why the loop goes round rather than returning.
+                // A single `N` is the documented refusal, and the client then either continues in
+                // the clear or gives up — either way this is not an error, which is why the loop
+                // goes round rather than returning.
+                //
+                // **The refusal is logged, because the client's half of it is invisible here.** A
+                // client on `sslmode=require` reads the `N` and closes without sending a startup
+                // packet, so what an operator sees from this end is a connection that opened and
+                // went away: no user, no database, no error. The line below is the only place that
+                // says why, and it names the way out. GSSAPI encryption is refused the same way
+                // and stays refused — nothing in this project speaks it (ADR 0055).
                 Startup::SslRequest | Startup::GssEncRequest => {
-                    self.stream.write_all(b"N").await?;
-                    self.stream.flush().await?;
+                    refuse(&mut self.stream, &self.config.tls).await?;
                 }
                 // Cancellation needs a registry of running queries, which arrives with the
                 // executor. Closing is what a server that cannot cancel should do: the protocol
@@ -373,23 +399,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
     }
 
-    /// Reads a startup packet: a four-byte length that counts itself, then the rest.
+    /// Reads a startup packet, or hands back the one the accept path already read.
+    ///
+    /// The accept path has to read the first packet itself to answer `SSLRequest` before there is
+    /// a session at all; when that packet turns out to be an ordinary startup message it is
+    /// carried here rather than pushed back onto the socket. There is still only one reader
+    /// ([`read_startup_packet`]) and one decoder, which is the point.
     async fn read_startup_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        let mut length_bytes = [0u8; 4];
-        if !self.read_exact_or_eof(&mut length_bytes).await? {
-            return Ok(None);
+        if let Some(packet) = self.pending.take() {
+            return Ok(Some(packet));
         }
-        let length = u32::from_be_bytes(length_bytes) as usize;
-        if !(8..=MAX_MESSAGE_LEN).contains(&length) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("startup packet length {length} is out of range"),
-            ));
-        }
-        let mut packet = length_bytes.to_vec();
-        packet.resize(length, 0);
-        self.stream.read_exact(&mut packet[4..]).await?;
-        Ok(Some(packet))
+        read_startup_packet(&mut self.stream).await
     }
 
     /// Reads one framed message: a tag byte, a length that counts itself but not the tag, a body.
@@ -417,22 +437,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// A client that hangs up between messages is ordinary, not an error; one that hangs up
     /// *inside* a message is a real failure and `read_exact` reports it.
     async fn read_exact_or_eof(&mut self, buffer: &mut [u8]) -> std::io::Result<bool> {
-        let mut filled = 0;
-        while filled < buffer.len() {
-            let read = self.stream.read(&mut buffer[filled..]).await?;
-            if read == 0 {
-                return if filled == 0 {
-                    Ok(false)
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "the connection ended in the middle of a message",
-                    ))
-                };
-            }
-            filled += read;
-        }
-        Ok(true)
+        read_exact_or_eof(&mut self.stream, buffer).await
     }
 
     /// Sends one error and flushes. Used on the paths where the connection is about to end, which
@@ -473,6 +478,134 @@ where
     }
 }
 
+/// Negotiates encryption, then runs the connection to completion.
+///
+/// The one place both listeners meet, so `SSLRequest` is answered identically whether the node was
+/// started by [`serve`] or by a test through [`serve_on`].
+async fn accept<S>(stream: S, config: Config, executors: &dyn Executors) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tls = config.tls.clone();
+    let (stream, pending) = negotiate(stream, &tls).await?;
+    Connection::resuming(stream, config, pending)
+        .run(executors)
+        .await
+}
+
+/// Reads a startup packet: a four-byte length that counts itself, then the rest.
+///
+/// Free rather than a method because the accept path reads one before a [`Connection`] exists —
+/// the `SSLRequest` that decides whether the rest of the conversation is encrypted arrives before
+/// there is a session to own it.
+async fn read_startup_packet<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut length_bytes = [0u8; 4];
+    if !read_exact_or_eof(stream, &mut length_bytes).await? {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if !(8..=MAX_MESSAGE_LEN).contains(&length) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("startup packet length {length} is out of range"),
+        ));
+    }
+    let mut packet = length_bytes.to_vec();
+    packet.resize(length, 0);
+    stream.read_exact(&mut packet[4..]).await?;
+    Ok(Some(packet))
+}
+
+/// Reads exactly `buffer.len()` bytes, or reports a clean end of stream.
+async fn read_exact_or_eof<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buffer: &mut [u8],
+) -> std::io::Result<bool> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = stream.read(&mut buffer[filled..]).await?;
+        if read == 0 {
+            return if filled == 0 {
+                Ok(false)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the connection ended in the middle of a message",
+                ))
+            };
+        }
+        filled += read;
+    }
+    Ok(true)
+}
+
+/// Answers the client's encryption request, if it makes one, and returns the stream to serve on.
+///
+/// **This runs before any framed message, because the protocol puts it there.** `SSLRequest` is
+/// eight bytes in the position a startup packet would occupy, and the answer — one byte, `S` or
+/// `N`, with no length and no tag — decides whether everything after it is inside TLS records.
+/// The packet that is *not* an encryption request is handed back with the stream rather than
+/// pushed back onto the socket, so the framed reader never sees a partial one.
+///
+/// A client may ask more than once (`psql` with `gssencmode` tries GSSAPI first), so this loops:
+/// GSSAPI is always refused, and a second `SSLRequest` after the connection is already encrypted
+/// is refused too rather than nesting a session inside itself.
+async fn negotiate<S>(
+    mut stream: S,
+    tls: &TlsConfig,
+) -> std::io::Result<(MaybeTlsStream<S>, Option<Vec<u8>>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let Some(packet) = read_startup_packet(&mut stream).await? else {
+            return Ok((MaybeTlsStream::Plain(stream), None));
+        };
+        // A packet this cannot decode is not this function's to answer: handing it on lets the
+        // session reply with a real `ErrorResponse` the way it always has.
+        let Ok(startup) = decode_startup(&packet) else {
+            return Ok((MaybeTlsStream::Plain(stream), Some(packet)));
+        };
+        match startup {
+            Startup::SslRequest => {
+                #[cfg(feature = "tls")]
+                if let Some(server) = tls.server() {
+                    stream.write_all(b"S").await?;
+                    stream.flush().await?;
+                    // From here the client starts a TLS handshake and then sends its real startup
+                    // packet inside it, so there is nothing pending: the session reads it through
+                    // the encrypted stream like any other.
+                    let encrypted = crate::pgwire::tls::accept(stream, server).await?;
+                    return Ok((MaybeTlsStream::Tls(encrypted), None));
+                }
+                refuse(&mut stream, tls).await?;
+            }
+            Startup::GssEncRequest => refuse(&mut stream, tls).await?,
+            Startup::Cancel { .. } | Startup::Parameters { .. } => {
+                return Ok((MaybeTlsStream::Plain(stream), Some(packet)));
+            }
+        }
+    }
+}
+
+/// Answers `N` to an encryption request, and says why in the log.
+///
+/// The client's half of this is invisible from here: `libpq` on `sslmode=require` reads the `N` and
+/// closes without sending a startup packet, so what an operator sees is a connection that opened
+/// and went away — no user, no database, no error. This line is the only place that says why, and
+/// it names the two ways out.
+async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, tls: &TlsConfig) -> std::io::Result<()> {
+    tracing::debug!(
+        tls_available = tls.is_enabled(),
+        "refusing an encryption request: put a TLS-terminating proxy in front of this node, or \
+         build with `--features tls` and pass --tls-cert/--tls-key"
+    );
+    stream.write_all(b"N").await?;
+    stream.flush().await
+}
+
 /// Binds a listener without serving, so a caller can learn the port before clients arrive.
 ///
 /// # Errors
@@ -499,8 +632,7 @@ pub async fn serve_on(
         let executors = Arc::clone(&executors);
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            let mut connection = Connection::<TcpStream>::new(stream, config);
-            if let Err(error) = connection.run(executors.as_ref()).await {
+            if let Err(error) = accept(stream, config, executors.as_ref()).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });

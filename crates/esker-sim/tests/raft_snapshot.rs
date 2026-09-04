@@ -160,8 +160,7 @@ fn five_nodes_with_compaction_hold_every_safety_property() {
     }
 }
 
-// TODO(phase-3d): membership change. `RawNode::propose_conf_change` exists, but the harness has
-// no action that adds or removes a voter, and the checkers assume a fixed membership (the
-// quorum they count against is the one the cluster started with). Wiring it needs the
-// membership to become part of the observation so that a quorum is computed per configuration.
-// Reported to the core lane rather than guessed at here.
+// Membership change is `raft_membership.rs`, which is what this note used to ask for: the
+// harness gained actions that add and remove voters, the membership became part of the
+// observation, and the checkers compute a quorum per configuration rather than against the one
+// the cluster started with.
