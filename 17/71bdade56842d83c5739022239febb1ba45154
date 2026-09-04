@@ -1,0 +1,67 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_6f7019c05b578b::t_73005dbccca748 52-63,79
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_38249529142d07 753,875-880,3141-3159,3837,3926,4019,4101,4199-4203,5418
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_6f7019c05b578b::t_94602a61c01812 217-221
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_e55ef0218201a1 158-163,219,238,276,375-378,477-481,569-581,713,844,892,1254-1283,1662-1664,1731-1739,1760
+crates/esker-sql/src/catalog/pg_index.rs
+  s_6f7019c05b578b::t_5854928df3038a 446-448
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_6f7019c05b578b::t_821177d9e34502 86-94,118,311-314,373-380,385
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_bd34b26ef149c7 106,1823-1835,1839-1855,2480,2484
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_b2ee9f3f6a1ef0 173-180,858-877,2236,2273,2385-2389,2740-2747,2865
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_81c5cc08291daf 220-222,758-760,976-978,1066-1068
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_0ce26d3149d975 177,2982-3288,3306-3316,3483-3494,3619-3620,3626,3628-3629,3634-3638,3711-3727,3729-3737,3739-3745,3748,3751-3752,3804-3812,4606-4619
+crates/esker-sql/src/exec/dml.rs
+  s_6f7019c05b578b::t_0336bec1b715c8 282-298,307,746,877
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_1814dc92864eb0 798-804,1225-1237,1266-1274,2800-2811
+crates/esker-sql/src/exec/subquery.rs
+  s_6f7019c05b578b::t_30c4b96b7e41f1 204,343,462,473-487
+crates/esker-sql/src/exec/values.rs
+  s_6f7019c05b578b::t_fe3991d21e0417 58
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_222dc260fa3af4 99-110,112-117,508-511,522-543,546-547,619-625
+crates/esker-sql/src/parse/mod.rs
+  s_6f7019c05b578b::t_bf96a68f252868 277-305,351-362,468-482,502-503,544-655,1707-1719,2084-2089
+crates/esker-sql/src/plan/ddl.rs
+  s_6f7019c05b578b::t_47f432da0f50b1 314-358
+crates/esker-sql/src/plan/mod.rs
+  s_6f7019c05b578b::t_4e99e0c1fa4419 36-40,112-118,223-227,288-290
+crates/esker-sql/tests/corpus/pg19_matview.txt
+  s_6f7019c05b578b::t_e58cc1b7acb835 1-58
+crates/esker-sql/tests/corpus/pg19_matview_guards.txt
+  s_6f7019c05b578b::t_f09629a8b95a0f 1-33
+crates/esker-sql/tests/matview.rs
+  s_6f7019c05b578b::t_a01c67e1eb2649 1-65
+crates/esker-sql/tests/slt/unsupported.slt
+  s_6f7019c05b578b::t_1cacefc70bc568 116-118
+docs/DESIGN.md
+  s_6f7019c05b578b::t_9fd8b7c253c9de 965-973,976-977
+docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md
+  s_6f7019c05b578b::t_3efac650c7e468 1-86
+docs/plans/debts-v1.md
+  s_6f7019c05b578b::t_e118d49cf2ecbc 4-5,24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1771bdade56842d83c5739022239febb1ba45154",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
