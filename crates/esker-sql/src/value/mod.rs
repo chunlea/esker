@@ -418,6 +418,104 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
     }
 }
 
+/// A type name as written, split into its optional schema and the name itself.
+///
+/// **One grammar, one parser.** The same three-line rule decides `'public.mood'::regtype`,
+/// `'public.mood'::text` and a `CREATE TABLE` column type, and it was three readers before this:
+/// a `regtype` over a built-in stripped nothing, a `regtype` over a user type compared the whole
+/// string against a bare name, and a cast did the same.
+///
+/// Measured on 19beta1, one spelling at a time:
+///
+/// * `public.mood`, `public."mood"`, `"public"."mood"` and ` public . mood ` all resolve. Space
+///   around the dot is not part of either identifier;
+/// * **`"public.mood"` does not**: the quotes make it *one* identifier holding a dot, so it is a
+///   type nobody declared and a real server quotes the whole of it back;
+/// * an unquoted part folds to lower case and a quoted one does not — `'"MOOD"'::regtype` is
+///   `42704 type "MOOD" does not exist` where `'MOOD'::regtype` resolves;
+/// * `""` inside a quoted part is one `"`.
+///
+/// The parts come back **already folded or already verbatim**, so what a caller compares and what
+/// it quotes in an error are the same string.
+#[must_use]
+pub fn split_type_name(spelled: &str) -> (Option<String>, String) {
+    let (schema, name, _) = split_type_name_parts(spelled);
+    (schema, name)
+}
+
+/// [`split_type_name`], plus whether the name may use PostgreSQL's **SQL grammar**.
+///
+/// The third answer is the one nothing about the first two suggests, and it is measured:
+///
+/// | | |
+/// |---|---|
+/// | `'integer'::regtype` | `integer` |
+/// | `'"integer"'::regtype` | `42704 type "integer" does not exist` |
+/// | `'pg_catalog.integer'::regtype` | `42704 type "pg_catalog.integer" does not exist` |
+/// | `'pg_catalog.int4'::regtype` | `integer` |
+/// | `'"character varying"'::regtype` | `42704 …`, where `'character varying'` resolves |
+/// | `'pg_catalog.character varying'` | `42601 syntax error at or near "varying"` |
+///
+/// **A bare unquoted name is read by the SQL grammar; a quoted or qualified one is an identifier**
+/// and is looked up in `pg_type.typname` alone. `integer` and `character varying` are names only
+/// the grammar has — `pg_type` holds `int4` and `varchar` — so the moment a name stops being
+/// grammar and becomes an identifier, they stop resolving. A typmod and a `[]` still apply either
+/// way: `'pg_catalog.varchar(255)'` and `'"int4"[]'` are both fine.
+fn split_type_name_parts(spelled: &str) -> (Option<String>, String, bool) {
+    let chars: Vec<char> = spelled.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut part = String::new();
+    let mut quoted = false;
+    // Whether a quote appeared anywhere: a quoted name is an identifier, not SQL grammar.
+    let mut any_quote = false;
+    let mut at = 0;
+    let mut depth = 0usize;
+    while at < chars.len() {
+        let ch = chars[at];
+        match ch {
+            '"' if depth == 0 => {
+                // `""` inside a quoted run is one quote; anywhere else it opens or closes one.
+                if quoted && chars.get(at + 1) == Some(&'"') {
+                    part.push('"');
+                    at += 2;
+                    continue;
+                }
+                // The quotes are not the part; what is inside them is, verbatim. A part is
+                // pushed on the dot or at the end, so `"A"b` is the one name `Ab` — PostgreSQL
+                // folds only the unquoted half of a mixed identifier.
+                quoted = !quoted;
+                any_quote = true;
+            }
+            // A typmod's parentheses hide their contents: `numeric(10,2)` has no schema in it.
+            '(' if !quoted => {
+                depth += 1;
+                part.push(ch);
+            }
+            ')' if !quoted => {
+                depth = depth.saturating_sub(1);
+                part.push(ch);
+            }
+            '.' if !quoted && depth == 0 => parts.push(std::mem::take(&mut part)),
+            _ if quoted => part.push(ch),
+            // Unquoted: folded, and the space around a dot is not part of the name.
+            _ => part.extend(ch.to_lowercase()),
+        }
+        at += 1;
+    }
+    parts.push(part);
+    let parts: Vec<String> = parts
+        .into_iter()
+        .map(|part| part.trim().to_owned())
+        .collect();
+    match parts.as_slice() {
+        [name] => (None, name.clone(), !any_quote),
+        [schema, name] => (Some(schema.clone()), name.clone(), false),
+        // Three or more is not a type name anywhere, and the whole of it is what a real server
+        // would quote back — so it is handed on as a name nothing resolves.
+        _ => (None, parts.join("."), false),
+    }
+}
+
 /// The type a name means, under **every spelling PostgreSQL accepts for it**.
 ///
 /// What `'x'::regtype` resolves, and what `pg_typeof` would answer. Three rules, all measured
@@ -444,7 +542,20 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
 /// here the moment it exists, and the only hand-written part left is `ALIASES` — the handful of
 /// spellings that are neither of a type's two names.
 pub fn named_type(spelled: &str) -> Result<Option<Named>> {
-    let lowered = spelled.trim().to_ascii_lowercase();
+    let (schema, bare, sql_grammar) = split_type_name_parts(spelled);
+    // **A schema nobody declared is `3F000`, not `42704`** — measured: `'nosuchschema.mood'` is
+    // `schema "nosuchschema" does not exist` and `'public.nosuchtype'` is
+    // `type "public.nosuchtype" does not exist`. A real server decides which is missing before it
+    // says anything, so the two errors are two different questions.
+    if let Some(schema) = &schema
+        && !matches!(
+            schema.as_str(),
+            "public" | "pg_catalog" | "information_schema"
+        )
+    {
+        return Err(SqlError::UndefinedSchema(schema.clone()));
+    }
+    let lowered = bare.trim().to_ascii_lowercase();
     // **Dimensions are ignored and the internal name works.** `integer[]`, `integer[][]`,
     // `integer[3]` and `_int4` are all 1007 on a real server — an array's *shape* is not part of
     // its type — so every one of those spellings reduces to the element name here.
@@ -465,13 +576,19 @@ pub fn named_type(spelled: &str) -> Result<Option<Named>> {
     if is_array {
         // A typmod on an array name is refused by the same rule the scalar is, so this goes
         // through the ordinary resolution and wraps whatever it finds.
-        return Ok(type_by_name(&element)?.map(Named::Array));
+        return Ok(named_by_grammar(&element, sql_grammar)?.map(Named::Array));
     }
-    type_by_name(&lowered).map(|found| found.map(Named::Scalar))
+    named_by_grammar(&lowered, sql_grammar).map(|found| found.map(Named::Scalar))
 }
 
 /// The type a name means, ignoring arrays. See [`named_type`] for the whole answer.
 pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
+    named_by_grammar(spelled, true)
+}
+
+/// [`type_by_name`], told whether PostgreSQL's SQL names are in scope — see
+/// [`split_type_name_parts`], which is where that question is decided.
+fn named_by_grammar(spelled: &str, sql_grammar: bool) -> Result<Option<ColumnType>> {
     let lowered = spelled.trim().to_ascii_lowercase();
     if lowered.is_empty() {
         return Err(SqlError::InvalidTypeName(String::new()));
@@ -486,7 +603,7 @@ pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
         _ => (lowered, None),
     };
     let bare = bare.split_whitespace().collect::<Vec<_>>().join(" ");
-    let Some(ty) = resolve_type_name(&bare) else {
+    let Some(ty) = resolve_type_name(&bare, sql_grammar) else {
         return Ok(None);
     };
     let Some(arguments) = arguments else {
@@ -738,10 +855,18 @@ const ALIASES: [(&str, ColumnType); 4] = [
 ];
 
 /// A bare, normalised type name as one of this node's types.
-fn resolve_type_name(name: &str) -> Option<ColumnType> {
-    ColumnType::ALL
+fn resolve_type_name(name: &str, sql_grammar: bool) -> Option<ColumnType> {
+    // **`typname` is always in scope and the SQL names are not.** A quoted or schema-qualified
+    // name is an identifier, and `integer` is a name only the grammar has — `pg_type` holds
+    // `int4`. See [`split_type_name_parts`] for the six spellings that settle it.
+    let internal = ColumnType::ALL
         .into_iter()
-        .find(|ty| ty.name() == name || crate::catalog::pg_catalog::typname(*ty) == name)
+        .find(|ty| crate::catalog::pg_catalog::typname(*ty) == name);
+    if !sql_grammar {
+        return internal;
+    }
+    internal
+        .or_else(|| ColumnType::ALL.into_iter().find(|ty| ty.name() == name))
         .or_else(|| {
             ALIASES
                 .iter()

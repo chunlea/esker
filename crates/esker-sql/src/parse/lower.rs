@@ -5378,17 +5378,15 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
 /// `oid` says which half was asked for: the number, which is what
 /// `SELECT 'color'::regtype::oid` wants, or the name it prints as.
 fn user_regtype(name: &str, oid: bool) -> plan::Expr {
-    // **A quoted name keeps its case and an unquoted one folds**, which is the identifier rule
-    // and is what `'"mood"'::regtype` needs — the same reading `'"companies"'::regclass` gets.
-    let trimmed = name.trim();
-    let name = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        Some(quoted) if trimmed.len() > 1 => quoted.to_owned(),
-        _ => trimmed.to_ascii_lowercase(),
-    };
+    // **The name is carried as written and read once, by `value::split_type_name`.** It was read
+    // here too — strip one leading and one trailing quote, fold otherwise — and that is a
+    // different grammar from the executor's: `'"public"."mood"'` lost its outer quotes and became
+    // the single name `public"."mood`, while `'"public.mood"'` lost them and *split*, so the two
+    // answered each other's answers. One grammar, one parser.
     plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
         func: plan::CatalogFunc::UserRegType,
         args: vec![
-            plan::Expr::Literal(plan::Literal::String(name)),
+            plan::Expr::Literal(plan::Literal::String(name.to_owned())),
             plan::Expr::Literal(plan::Literal::Bool(oid)),
         ],
     }))

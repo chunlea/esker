@@ -259,6 +259,19 @@ impl Relations {
         self.user_types.get(&oid).map(|def| def.name.as_str())
     }
 
+    /// The user-defined type of this **name**, or `None` — the reverse of
+    /// [`Self::user_type_name`].
+    ///
+    /// `format_type('mood'::regtype, NULL)` is what needs it: `'mood'::regtype` resolves to the
+    /// type's *name* rather than its oid (see `exec::mod`'s `UserRegType`, and ADR 0053 for why
+    /// position cannot decide which half a `regtype` wants), so the only thing `format_type` is
+    /// handed is a string — and a user type's name is not in `value::type_by_name`, which knows
+    /// only the built-ins.
+    #[must_use]
+    pub fn user_type_by_name(&self, name: &str) -> Option<&super::TypeDef> {
+        self.user_types.values().find(|def| def.name == name)
+    }
+
     /// The user-defined type with this oid, or `None`.
     #[must_use]
     pub fn user_type(&self, oid: u64) -> Option<&super::TypeDef> {
