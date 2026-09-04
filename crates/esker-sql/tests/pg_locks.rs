@@ -40,7 +40,10 @@ fn an_idle_node_holds_no_locks_and_the_view_has_postgresql_s_columns() {
     );
     // And it is a relation like any other: `pg_catalog.pg_locks` resolves, and so does the bare
     // name, which is what a schema dump and a `::regclass` both need.
-    assert!(node.rows("SELECT count(*) FROM pg_catalog.pg_locks")[0][0] == "0");
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_catalog.pg_locks")[0][0],
+        "0"
+    );
 }
 
 /// **A held row is one `tuple` row, and a blocked writer is one `transactionid` row that is not
