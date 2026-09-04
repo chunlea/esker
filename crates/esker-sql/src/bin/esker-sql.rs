@@ -22,6 +22,7 @@ use esker_sql::fragment::{ClientFragments, FragmentSource};
 use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
 use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
 use esker_sql::pgwire::session::Execute;
+use esker_sql::pgwire::tls::TlsConfig;
 
 /// The tenant every connection is served as, until there is a way to say otherwise.
 const TENANT: u64 = 1;
@@ -84,10 +85,14 @@ async fn main() -> std::io::Result<()> {
         address,
         stores,
         pd,
+        tls_cert,
+        tls_key,
     } = Args::parse(std::env::args().skip(1))?;
+    let tls = configure_tls(tls_cert, tls_key)?;
     let config = Config {
         address,
         auth: Auth::Trust,
+        tls,
         ..Config::default()
     };
     // The lease this node holds, or nothing at all. **Absent `--pd` changes nothing**: no lease
@@ -194,6 +199,42 @@ async fn main() -> std::io::Result<()> {
     serve(config, Arc::new(sessions)).await
 }
 
+/// Turns `--tls-cert`/`--tls-key` into a [`TlsConfig`], or refuses to start.
+///
+/// **Before anything else, and fatal if it fails.** A node told to serve TLS that came up without
+/// it would serve plaintext on a port an operator believes is encrypted, which is the one outcome
+/// worse than refusing to start — the same rule `esker_s3::Endpoint::parse` follows for `https://`
+/// (ADR 0025), applied to the surface ADR 0055 put first. Whether it *can* succeed is decided at
+/// compile time by the `tls` feature; [`TlsConfig::from_pem_files`] says so in the error when it
+/// cannot, rather than handing back a disabled configuration that reads like success.
+fn configure_tls(
+    certificate: Option<std::path::PathBuf>,
+    key: Option<std::path::PathBuf>,
+) -> std::io::Result<TlsConfig> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    match (certificate, key) {
+        (Some(certificate), Some(key)) => {
+            let tls = TlsConfig::from_pem_files(&certificate, &key)
+                .map_err(|error| invalid(error.to_string()))?;
+            tracing::info!(cert = %certificate.display(), "terminating TLS on the client port");
+            Ok(tls)
+        }
+        (None, None) => Ok(TlsConfig::disabled()),
+        // One without the other is a typo with a security consequence, so it is refused rather
+        // than half-honoured.
+        (certificate, _) => {
+            let missing = if certificate.is_some() {
+                "--tls-key"
+            } else {
+                "--tls-cert"
+            };
+            Err(invalid(format!(
+                "TLS needs both a certificate and a key: {missing} is missing"
+            )))
+        }
+    }
+}
+
 /// What this node was told on its command line.
 ///
 /// Hand-parsed, like every other argument list in this project. The positional form is unchanged —
@@ -210,6 +251,10 @@ struct Args {
     /// before the flag existed, which is what makes the flag additive rather than a change of
     /// behaviour with an opt-out.
     pd: Option<std::net::SocketAddr>,
+    /// PEM certificate chain for the client port, or `None` to terminate no TLS.
+    tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for [`Args::tls_cert`]. Both or neither.
+    tls_key: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -218,21 +263,41 @@ impl Args {
             |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
         let mut positional = Vec::new();
         let mut pd = None;
+        let mut tls_cert = None;
+        let mut tls_key = None;
         let mut arguments = arguments.peekable();
+        // Each flag takes `--flag=value` or `--flag value`, because an operator who learned one
+        // form on `--pd` should not find the other is required on `--tls-cert`.
         while let Some(argument) = arguments.next() {
-            let raw = if let Some(value) = argument.strip_prefix("--pd=") {
-                value.to_owned()
-            } else if argument == "--pd" {
-                arguments
-                    .next()
-                    .ok_or_else(|| invalid("--pd needs an address".to_owned()))?
-            } else {
-                positional.push(argument);
-                continue;
-            };
-            pd = Some(raw.parse().map_err(|error| {
-                invalid(format!("{raw} is not a placement-driver address: {error}"))
-            })?);
+            // `(flag, what it needs)` for the three flags that take a value. A flag whose value is
+            // the next argument consumes it; one written with `=` carries it.
+            let taken = ["--pd", "--tls-cert", "--tls-key"]
+                .into_iter()
+                .find_map(|flag| {
+                    if let Some(value) = argument.strip_prefix(&format!("{flag}=")) {
+                        Some((flag, Ok(value.to_owned())))
+                    } else if argument == flag {
+                        Some((
+                            flag,
+                            arguments
+                                .next()
+                                .ok_or_else(|| invalid(format!("{flag} needs a value"))),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+            match taken {
+                Some(("--pd", value)) => {
+                    let raw = value?;
+                    pd = Some(raw.parse().map_err(|error| {
+                        invalid(format!("{raw} is not a placement-driver address: {error}"))
+                    })?);
+                }
+                Some(("--tls-cert", value)) => tls_cert = Some(std::path::PathBuf::from(value?)),
+                Some(("--tls-key", value)) => tls_key = Some(std::path::PathBuf::from(value?)),
+                Some((_, _)) | None => positional.push(argument),
+            }
         }
         let mut positional = positional.into_iter();
         Ok(Self {
@@ -241,6 +306,8 @@ impl Args {
                 .unwrap_or_else(|| "127.0.0.1:5432".to_owned()),
             stores: positional.collect(),
             pd,
+            tls_cert,
+            tls_key,
         })
     }
 }
