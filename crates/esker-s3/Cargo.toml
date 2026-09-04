@@ -14,6 +14,22 @@ publish.workspace = true
 esker-base.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# **Optional, and off by default** (`tls` below). The same two crates and the same provider the
+# PostgreSQL port took (ADR 0055, accepted 2026-09-04); this is the second surface, so it costs
+# nothing further against the budget. Contained to `src/tls.rs`: a `use rustls::` anywhere else
+# in this crate is a review failure, which is the rule `sqlparser` and `pgwire::tls` live by.
+rustls = { workspace = true, optional = true }
+rustls-graviola = { workspace = true, optional = true }
+
+[features]
+# HTTPS to the object store. Off by default, and with it off `Endpoint::parse` refuses an
+# `https://` endpoint rather than speaking plaintext to it (ADR 0025's rule, ADR 0055's option 1).
+#
+# `just check` builds `--all-features`, and features unify across the workspace, so a workspace
+# build with this on hands `esker-cli` and `esker-engine` a TLS-capable client without either
+# manifest naming it. A *production* build of `esker-cli` alone still needs a forwarding feature
+# in that crate — one line, `tls = ["esker-s3/tls"]` — which this lane does not own.
+tls = ["dep:rustls", "dep:rustls-graviola"]
 
 [dev-dependencies]
 # The response parser is fed bytes we did not write, so it gets a property test that throws

@@ -32,25 +32,39 @@ pub struct Endpoint {
     pub host: String,
     /// The port.
     pub port: u16,
+    /// Whether to speak TLS to it.
+    ///
+    /// Set only by parsing an `https://` URL, and only in a build with the `tls` feature — so a
+    /// client cannot be pointed at an encrypted endpoint by a build that has no encryption.
+    pub tls: bool,
 }
 
 impl Endpoint {
-    /// Parses `http://host[:port]`.
+    /// Parses `http://host[:port]`, or `https://host[:port]` with the `tls` feature.
     ///
-    /// **`https://` is refused**, with a message pointing at ADR 0025. Accepting it and
-    /// speaking plaintext anyway would be the worst possible outcome: a configuration that
-    /// looks encrypted, is not, and gives no sign of it.
+    /// **Without the feature, `https://` is refused**, and that refusal is the whole point:
+    /// accepting it and speaking plaintext anyway would be the worst outcome available — a
+    /// configuration that looks encrypted, is not, and gives no sign of it (ADR 0025, and the same
+    /// rule the PostgreSQL port follows for `--tls-cert` in ADR 0055).
     pub fn parse(url: &str) -> Result<Self> {
-        if url.starts_with("https://") {
+        let (rest, tls) = if let Some(rest) = url.strip_prefix("https://") {
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = rest;
+                return Err(Error::Config(format!(
+                    "{url}: this build has no TLS, so an https endpoint would silently be spoken \
+                     in plaintext. Rebuild with `--features tls`, or use http:// to a MinIO or a \
+                     local TLS terminator — docs/adr/0055-the-tls-options-across-three-surfaces-\
+                     measured.md is the decision and 0025 is its history"
+                )));
+            }
+            #[cfg(feature = "tls")]
+            (rest, true)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            (rest, false)
+        } else {
             return Err(Error::Config(format!(
-                "{url}: this build has no TLS, so an https endpoint would silently be spoken \
-                 in plaintext. Use http:// to a MinIO or a local TLS terminator — \
-                 docs/adr/0025-s3-transport-and-tls.md says when this changes"
-            )));
-        }
-        let Some(rest) = url.strip_prefix("http://") else {
-            return Err(Error::Config(format!(
-                "{url}: an endpoint must start with http://"
+                "{url}: an endpoint must start with http:// or https://"
             )));
         };
 
@@ -68,7 +82,7 @@ impl Endpoint {
                     .map_err(|_| Error::Config(format!("{url}: {port:?} is not a port number")))?;
                 (host, port)
             }
-            _ => (authority, 80),
+            _ => (authority, if tls { 443 } else { 80 }),
         };
         if host.is_empty() {
             return Err(Error::Config(format!("{url}: no host")));
@@ -76,13 +90,18 @@ impl Endpoint {
         Ok(Self {
             host: host.to_string(),
             port,
+            tls,
         })
     }
 
-    /// The `Host` header value: the port is omitted when it is the default.
+    /// The `Host` header value: the port is omitted when it is the scheme's default.
+    ///
+    /// **The scheme decides which default**, and getting that wrong changes the signature: the
+    /// `Host` header is a signed header, so `example.com` and `example.com:443` sign differently
+    /// and one of them is refused by the server.
     #[must_use]
     pub fn host_header(&self) -> String {
-        if self.port == 80 {
+        if self.port == if self.tls { 443 } else { 80 } {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
@@ -577,14 +596,48 @@ mod tests {
         (S3Client::with_transport(config, recorder.clone()), recorder)
     }
 
+    /// Without the feature, an `https://` endpoint is a refusal that names the way out — never a
+    /// silent plain-HTTP fallback to a port an operator believes is encrypted.
+    #[cfg(not(feature = "tls"))]
     #[test]
     fn an_https_endpoint_is_refused_with_a_reason() {
         let err = Endpoint::parse("https://s3.amazonaws.com").unwrap_err();
         assert!(err.to_string().contains("no TLS"), "{err}");
-        assert!(err.to_string().contains("0025"), "{err}");
+        assert!(err.to_string().contains("--features tls"), "{err}");
         assert!(
             !err.is_retryable(),
             "a misconfiguration is not worth retrying"
+        );
+    }
+
+    /// With the feature, it parses — and carries the scheme, which decides the default port and
+    /// therefore the `Host` header the signature covers.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_https_endpoint_parses_and_defaults_to_443() {
+        let endpoint = Endpoint::parse("https://s3.amazonaws.com").unwrap();
+        assert_eq!(
+            endpoint,
+            Endpoint {
+                host: "s3.amazonaws.com".into(),
+                port: 443,
+                tls: true,
+            }
+        );
+        // 443 is https's default, so it is omitted; on http it is not the default and stays.
+        assert_eq!(endpoint.host_header(), "s3.amazonaws.com");
+        assert_eq!(
+            Endpoint::parse("https://minio.internal:9443")
+                .unwrap()
+                .host_header(),
+            "minio.internal:9443"
+        );
+        assert_eq!(
+            Endpoint::parse("http://minio.internal:443")
+                .unwrap()
+                .host_header(),
+            "minio.internal:443",
+            "443 is not http's default and must stay in the signed Host header"
         );
     }
 
@@ -594,7 +647,8 @@ mod tests {
             Endpoint::parse("http://localhost:9000").unwrap(),
             Endpoint {
                 host: "localhost".into(),
-                port: 9000
+                port: 9000,
+                tls: false,
             }
         );
         let bare = Endpoint::parse("http://minio.internal").unwrap();
