@@ -458,12 +458,22 @@ impl SkipList {
             self.height.store(height, Memory::Release);
         }
         // One resolution for all four, for the same reason `header` reads them in one.
-        if let Some([offset, key, value, tall]) = self.header(node).first_chunk::<4>() {
-            offset.store(bytes, Memory::Relaxed);
-            key.store(key_len, Memory::Relaxed);
-            value.store(value_len, Memory::Relaxed);
-            tall.store(height, Memory::Relaxed);
-        }
+        //
+        // A refusal rather than a skip. `alloc` puts a node's words in one chunk, so this cannot
+        // fail; if it ever did, publishing a node whose header was never written would put a
+        // node with an empty key at the front of the list, and every reader would believe it.
+        // Not publishing is the only way to be wrong here that costs one entry instead of the
+        // order of all of them.
+        let Some([offset, key_word, value_word, height_word]) =
+            self.header(node).first_chunk::<4>()
+        else {
+            return false;
+        };
+        offset.store(bytes, Memory::Relaxed);
+        key_word.store(key_len, Memory::Relaxed);
+        value_word.store(value_len, Memory::Relaxed);
+        height_word.store(height, Memory::Relaxed);
+
         self.publish(node, height, &writer.prev);
         self.len.fetch_add(1, Memory::Relaxed);
         true
