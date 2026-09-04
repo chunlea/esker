@@ -1,0 +1,127 @@
+# `hstore` as a **column type and a value** — what `hstore_test.rb` sends, as PostgreSQL 19beta1
+# answers it.
+#
+# Run 47's ranking row 7 is `extension "…" is not available`, **114 tests over 9 files**, and hstore
+# is the bulk of it. `captures/pg19_extensions.txt` already pins the *install* mechanics —
+# availability, `CREATE`/`DROP EXTENSION`, the error probes — and this file does not repeat them: it
+# is the type once it is installed.
+#
+# **Derived from `esker-rails-harness/captures/pg19_hstore_citext.txt` and re-captured on its own.**
+# r1's file measures hstore and citext in one session, and citext is a later unit — replayed here,
+# its first refusal would abort the transaction and swallow every hstore statement after it. So the
+# hstore statements were taken from r1's list and run as their own `BEGIN … ROLLBACK` session with
+# `scratchpad/sesscap.py`; every answer they share is byte-identical to r1's. The citext half stays
+# in r1's file for the unit that takes it.
+#
+# The `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing behind, and both answer 0.
+# The `\gdesc` pass runs after that rollback, so every statement naming `hstore` has an **empty**
+# declared-types column; the `pg_typeof` lines pin the types instead.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An hstore does not print as it was written.** `'a=>b, 1=>2'` comes back
+#     `"1"=>"2", "a"=>"b"` — **ordered by key, every key and value quoted, `, ` between pairs** — so
+#     the output function is a canonical form and not an echo. A round trip that returned the input
+#     would pass `test_parse1` and fail everything after it.
+#   * **The order is the key's LENGTH first and its bytes second**, which is the one rule here that
+#     plain reasoning gets backwards: `'z=>1, aa=>2'` prints `"z"=>"1", "aa"=>"2"` — `z` before
+#     `aa`, where any byte-wise sort puts `aa` first. `'bb=>1, a=>2, ccc=>3, b=>4'` is
+#     `"a", "b", "bb", "ccc"`: within one length it *is* byte order, which is why a shorter corpus
+#     would have agreed with the wrong rule. Probed for this file rather than found in the suite.
+#   * **A repeated key in one literal keeps the FIRST**, and `||` keeps the **right**:
+#     `'a=>1, a=>2'` is `"a"=>"1"` while `'a=>1'::hstore || 'a=>2'::hstore` is `"a"=>"2"`. Two
+#     opposite rules for the same collision, and both are measured below.
+#   * **An unquoted `NULL` value is case-insensitive and is a real NULL** — `a=>null` and
+#     `b=>NuLl` are both NULL — while a *quoted* `"NULL"` is the four-character string. Whitespace
+#     around a key or a value is trimmed: `'  a  =>  b  '` is `"a"=>"b"`.
+#   * **A NULL value is the bare word `NULL`, unquoted, and is a real NULL**: `'key=>NULL'` prints
+#     `"key"=>NULL` and `->'key'` `IS NULL` is `t`. A *key* called `NULL` is quoted like any other
+#     — `'NULL=>NULL'` is `"NULL"=>NULL` — so the two spellings of the same four letters mean
+#     different things on the two sides of `=>`.
+#   * **`''::hstore` is an empty hstore, not NULL.** It equals itself, `IS NULL` is false, and it
+#     prints as the empty string — which is why `t.hstore "tags", default: ""` needs the empty
+#     string and the NULL told apart.
+#   * **`=>` inside a value needs no escape**: `'a=>b=>c'` is `"a"=>"b=>c"`, one pair. But a bare
+#     `'a'` is **`42601 syntax error in hstore: unexpected end of string`** — a syntax error, not
+#     `22P02`, which is the class every other bad literal in this crate uses.
+#   * The quoting the suite actually pushes through, from `test_quotes`, `test_backslash`,
+#     `test_comma` and `test_parse6/7`: `\"`, `\\`, a comma inside a key, and `}`. Those exact pairs
+#     are below, and a parser that handles `a=>b` and not these passes no test in that file.
+#   * **`->` is `text`, `akeys` is `text[]`, `?` is `boolean`** — measured, and `->` on a missing
+#     key is NULL rather than an error.
+#   * **`hstore[]` escapes the whole hstore inside the array**: an element `"AA"=>"BB", "CC"=>"DD"`
+#     prints as `"\"AA\"=>\"BB\", \"CC\"=>\"DD\""`. A NULL *value inside* an hstore inside an array
+#     is not a NULL element, and `test_change_table_supports_hstore` needs both.
+#   * **A default prints with its own cast**: `''::hstore`, and
+#     `'"users"=>"read", "articles"=>"write"'::hstore` — the canonical form, quoted and cast, which
+#     is what `ActiveRecord`'s `column_defaults` reads.
+#   * **The oid is assigned when the extension is installed and is never fixed.** AR's boot
+#     type-map query reads it by `typname`; `typcategory` is `U`, `typinput` is `hstore_in`, and
+#     `typarray` is not zero. Nothing may hard-code the number.
+BEGIN		-
+SELECT 'r', true FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+SELECT 'r', installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|f
+CREATE EXTENSION IF NOT EXISTS "hstore"		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname IN ('hstore') ORDER BY extname	text,name,text	r|hstore|1.8
+SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('hstore') ORDER BY t.typname	text,name,oid,"char",regproc,"char",oid,"char",smallint	r|hstore|0|,|hstore_in|b|0|U|-1
+SELECT 'r', t.typname, t.oid = 0 AS oid_is_zero, t.typarray = 0 AS no_array_type FROM pg_type t WHERE t.typname IN ('hstore') ORDER BY t.typname	text,name,boolean,boolean	r|hstore|f|f
+DROP TABLE IF EXISTS hst		-
+CREATE TABLE hst (id serial primary key, tags hstore DEFAULT '', payload hstore[], settings hstore)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypmod, c.collname, col_description(a.attrelid, a.attnum) AS comment, attidentity AS identity, attgenerated as attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '"hst"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('hst_id_seq'::regclass)|t|-1|\N|\N|| ; r|tags|hstore|''::hstore|f|-1|\N|\N|| ; r|payload|hstore[]|\N|f|-1|\N|\N|| ; r|settings|hstore|\N|f|-1|\N|\N||
+INSERT INTO hst (tags) VALUES ('1=>2')		-
+SELECT 'r', tags FROM hst ORDER BY id		r|"1"=>"2"
+SELECT 'r', 'a=>b'::hstore		r|"a"=>"b"
+SELECT 'r', ''::hstore = ''::hstore, ''::hstore IS NULL		r|t|f
+SELECT 'r', 'key=>NULL'::hstore, ('key=>NULL'::hstore)->'key' IS NULL		r|"key"=>NULL|t
+SELECT 'r', 'a=>b, 1=>2'::hstore		r|"1"=>"2", "a"=>"b"
+SELECT 'r', '"a"=>"b\"ar", "1\"foo"=>"2"'::hstore		r|"a"=>"b\"ar", "1\"foo"=>"2"
+SELECT 'r', '"a b"=>"b ar"'::hstore		r|"a b"=>"b ar"
+SELECT 'r', '"a\\b"=>"b\\ar"'::hstore		r|"a\\b"=>"b\\ar"
+SELECT 'r', '"a, b"=>"bar"'::hstore		r|"a, b"=>"bar"
+SELECT 'r', '"\"a"=>"q>w"'::hstore		r|"\"a"=>"q>w"
+SELECT 'r', '"\"a"=>"q\"w"'::hstore		r|"\"a"=>"q\"w"
+SELECT 'r', '"c"=>"}", "\"a\""=>"b \"a b"'::hstore		r|"c"=>"}", "\"a\""=>"b \"a b"
+SELECT 'r', 'NULL=>NULL'::hstore, ('NULL=>NULL'::hstore)->'NULL' IS NULL		r|"NULL"=>NULL|t
+SELECT 'r', ('a=>b, c=>d'::hstore)->'a', ('a=>b'::hstore) ? 'a', ('a=>b, c=>d'::hstore) @> 'a=>b'		r|b|t|t
+SELECT 'r', akeys('a=>1, b=>2'::hstore), avals('a=>1, b=>2'::hstore)		r|{a,b}|{1,2}
+SELECT 'r', hstore('a','b'), hstore(ARRAY['a','b'], ARRAY['1','2'])		r|"a"=>"b"|"a"=>"1", "b"=>"2"
+SELECT 'r', pg_typeof(('a=>b'::hstore)->'a'), pg_typeof(akeys('a=>b'::hstore)), pg_typeof(('a=>b'::hstore) ? 'a')		r|text|text[]|boolean
+SELECT 'r', 'bb=>1, a=>2, ccc=>3, b=>4'::hstore		r|"a"=>"2", "b"=>"4", "bb"=>"1", "ccc"=>"3"
+SELECT 'r', 'z=>1, aa=>2'::hstore		r|"z"=>"1", "aa"=>"2"
+SELECT 'r', 'a=>1, a=>2'::hstore		r|"a"=>"1"
+SELECT 'r', 'NULL=>x, null=>y, Null=>z'::hstore		r|"NULL"=>"x", "Null"=>"z", "null"=>"y"
+SELECT 'r', 'a=>null, b=>NuLl, c=>"NULL"'::hstore		r|"a"=>NULL, "b"=>NULL, "c"=>"NULL"
+SELECT 'r', '  a  =>  b  ,  c=>d  '::hstore		r|"a"=>"b", "c"=>"d"
+SELECT 'r', ('a=>b'::hstore)->'zz' IS NULL, ''::hstore::text = ''		r|t|t
+SELECT 'r', 'a=>1'::hstore || 'b=>2'::hstore, 'a=>1'::hstore || 'a=>2'::hstore		r|"a"=>"1", "b"=>"2"|"a"=>"2"
+SELECT 'r', ''::hstore || 'a=>1'::hstore, pg_typeof('a=>1'::hstore || 'b=>2'::hstore)		r|"a"=>"1"|hstore
+SAVEPOINT s0		-
+SELECT 'r', 'a=>1, b=>2'::hstore - 'a'::text, 'a=>1'::hstore ?& ARRAY['a']		r|"b"=>"2"|t
+ROLLBACK TO SAVEPOINT s0		-
+INSERT INTO hst (payload) VALUES (ARRAY['"AA"=>"BB", "CC"=>"DD"'::hstore, '"AA"=>NULL'::hstore])		-
+SELECT 'r', payload FROM hst WHERE payload IS NOT NULL		r|{"\"AA\"=>\"BB\", \"CC\"=>\"DD\"","\"AA\"=>NULL"}
+SELECT 'r', array_length(payload, 1), (payload)[1]->'AA' FROM hst WHERE payload IS NOT NULL		r|2|BB
+INSERT INTO hst (payload) VALUES (ARRAY['"this,has"=>"many,values"'::hstore])		-
+SELECT 'r', payload FROM hst WHERE payload IS NOT NULL ORDER BY id		r|{"\"AA\"=>\"BB\", \"CC\"=>\"DD\"","\"AA\"=>NULL"} ; r|{"\"this,has\"=>\"many,values\""}
+INSERT INTO hst (settings) VALUES ('one=>two')		-
+SELECT 'r', tags, tags = ''::hstore FROM hst WHERE settings IS NOT NULL		r||t
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = '"hst"'::regclass AND a.attname = 'tags'		r|''::hstore
+SAVEPOINT s1		-
+SELECT 'r', 'a'::hstore	!42601 syntax error in hstore: unexpected end of string
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'a=>b=>c'::hstore		r|"a"=>"b=>c"
+ROLLBACK TO s2		-
+ALTER TABLE hst ADD COLUMN "users" hstore DEFAULT ''		-
+ALTER TABLE hst ADD COLUMN "permissions" hstore DEFAULT '"users"=>"read", "articles"=>"write"'		-
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = '"hst"'::regclass AND a.attname = 'permissions'		r|'"users"=>"read", "articles"=>"write"'::hstore
+DROP TABLE hst		-
+DROP EXTENSION IF EXISTS "hstore" CASCADE		-
+SELECT 'r', installed_version IS NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('hst')	bigint	0
+SELECT count(*) FROM pg_extension WHERE extname IN ('hstore')	bigint	0

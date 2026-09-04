@@ -89,6 +89,7 @@ impl ArrayValue {
             ColumnType::Int2 => ColumnType::Int2Array,
             ColumnType::Numeric => ColumnType::NumericArray,
             ColumnType::Text => ColumnType::TextArray,
+            ColumnType::Hstore => ColumnType::HstoreArray,
             _ => return None,
         })
     }
@@ -102,6 +103,7 @@ impl ArrayValue {
             ColumnType::Int2Array => ColumnType::Int2,
             ColumnType::NumericArray => ColumnType::Numeric,
             ColumnType::TextArray => ColumnType::Text,
+            ColumnType::HstoreArray => ColumnType::Hstore,
             _ => return None,
         })
     }

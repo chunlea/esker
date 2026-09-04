@@ -2210,6 +2210,22 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                         })),
                     }
                 }
+                // **`hstore` is stored as text, so the value cannot say what it is.** The static
+                // type can — the same reason an enum is folded above, and the same fix: the name
+                // is known here and nowhere else. Only for the types whose storage is another
+                // type's; everything else still reads the value, which is what makes
+                // `pg_typeof` of an aggregate over no rows NULL.
+                (crate::plan::CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
+                    match expr_type(arg, scope) {
+                        Ok(ty @ (ColumnType::Hstore | ColumnType::HstoreArray)) => {
+                            Expr::Literal(Literal::String(ty.name().to_owned()))
+                        }
+                        _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                            func: call.func,
+                            args,
+                        })),
+                    }
+                }
                 _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
                     func: call.func,
                     args,
@@ -2499,6 +2515,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Int2Array => 25,
             ColumnType::NumericArray => 22,
             ColumnType::TextArray => 23,
+            ColumnType::HstoreArray => 26,
             ColumnType::Int8
             | ColumnType::Int4
             | ColumnType::Int2
@@ -2523,6 +2540,8 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // and it is its own family: `json = jsonb` is `42883` like everything else about
             // `json`, and there is no implicit cast between `jsonb` and `text`. Measured.
             ColumnType::Jsonb => 5,
+            // A family of its own: an hstore compares only with an hstore.
+            ColumnType::Hstore => 27,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

@@ -274,3 +274,76 @@ fn the_last_column_can_go_and_the_rows_stay() {
         .unwrap();
     assert_eq!(node.rows("SELECT count(*) FROM dc1"), [["2"]]);
 }
+
+/// **Run 50's regression: a name must not outlive the table it points at.**
+///
+/// `t.references :rocket, foreign_key: true` makes a column, an **index** over it and a foreign
+/// key. `remove_column` takes all three, and the migration's own teardown then drops the tables —
+/// which came back `XX001 corrupt data: a name points at table N, which is not there`, 66 tests
+/// over 2 files (`ForeignKeyChangeColumnWithPrefixTest#test_remove_reference_column_of_child_table`
+/// and its siblings). The sequence is that test's, with the prefix its class sets.
+#[test]
+fn dropping_a_referenced_column_leaves_no_name_behind() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE p_rockets (id bigint PRIMARY KEY, name text)")
+        .unwrap();
+    node.run("CREATE TABLE p_astronauts (id bigint PRIMARY KEY, name text, rocket_id bigint)")
+        .unwrap();
+    node.run("CREATE INDEX index_p_astronauts_on_rocket_id ON p_astronauts (rocket_id)")
+        .unwrap();
+    node.run(
+        "ALTER TABLE p_astronauts ADD CONSTRAINT fk_rails_a1 FOREIGN KEY (rocket_id) \
+         REFERENCES p_rockets (id)",
+    )
+    .unwrap();
+
+    node.run("ALTER TABLE p_astronauts DROP COLUMN rocket_id")
+        .unwrap();
+
+    // The teardown the migration replays.
+    node.run("DROP TABLE p_astronauts").unwrap();
+    node.run("DROP TABLE p_rockets").unwrap();
+
+    // And nothing is left claiming a relation: the next statement to walk the names must not meet
+    // one that points at a table which is gone.
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname LIKE 'p\\_%'"),
+        [["0"]]
+    );
+    node.run("CREATE TABLE p_rockets (id bigint PRIMARY KEY)")
+        .unwrap();
+}
+
+/// **The back-reference is per `(parent, child)` pair, not per constraint**, which is what makes
+/// the fix for the above a rule rather than a delete.
+///
+/// A child holding two foreign keys into one parent has **one** back-reference between them. If
+/// dropping the column under the first key deleted it, the parent would be told nothing references
+/// it while the second key still does — and the `DROP TABLE` that must be `2BP01` would go
+/// through. That is a wrong answer, where the bug this pairs with was only a stale key.
+#[test]
+fn two_keys_into_one_parent_keep_the_back_reference_until_the_last_goes() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE p (id bigint PRIMARY KEY, u bigint UNIQUE)")
+        .unwrap();
+    node.run(
+        "CREATE TABLE c (id bigint PRIMARY KEY, a bigint REFERENCES p (id), \
+         b bigint REFERENCES p (id))",
+    )
+    .unwrap();
+
+    // One of the two goes with its column; the other still points at `p`.
+    node.run("ALTER TABLE c DROP COLUMN a").unwrap();
+    let refused = node.answer("DROP TABLE p").to_string();
+    assert!(
+        refused.starts_with("!2BP01"),
+        "the surviving key must still protect the parent: {refused}"
+    );
+
+    // The last one goes, and only now is the parent free.
+    node.run("ALTER TABLE c DROP COLUMN b").unwrap();
+    node.run("DROP TABLE p").unwrap();
+    // And the child outliving it must leave nothing behind either.
+    node.run("DROP TABLE c").unwrap();
+    node.run("CREATE TABLE p (id bigint PRIMARY KEY)").unwrap();
+}

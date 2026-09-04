@@ -689,6 +689,24 @@ pub enum CatalogFunc {
     /// Written as an operator and carried as a call, because it is not a comparison — `pg_cmp` says
     /// nothing about two ranges, and every walker already descends into a call's arguments.
     RangeOverlaps,
+    /// `h -> k`: the value a key has, or NULL for one the hstore does not hold.
+    ///
+    /// Carried as a call for the same reason `&&` is: it is an operator that is not a comparison,
+    /// and every walker already descends into a call's arguments.
+    HstoreFetch,
+    /// `h ? k`: whether the hstore holds the key, **including one whose value is NULL**.
+    HstoreHasKey,
+    /// `a @> b`: whether every pair of `b` is in `a`.
+    HstoreContains,
+    /// `a || b`: the two hstores merged, **the right winning a shared key** — which is the
+    /// opposite of what a repeated key inside one literal does (`crate::value::hstore`).
+    HstoreConcat,
+    /// `akeys(h)` and `avals(h)`: the keys and the values as `text[]`, in canonical order.
+    HstoreAkeys,
+    /// See [`CatalogFunc::HstoreAkeys`].
+    HstoreAvals,
+    /// `hstore(k, v)` and `hstore(keys[], vals[])`: the two constructors the adapter reaches for.
+    HstoreBuild,
     /// `pg_get_triggerdef(oid)`: a trigger's `CREATE TRIGGER`, re-printed.
     ///
     /// **It normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`**, so the text that comes out is
@@ -839,6 +857,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("clock_timestamp") => Some(CatalogFunc::ClockTimestamp),
             () if name.eq_ignore_ascii_case("daterange") => Some(CatalogFunc::DateRange),
             () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
+            // The hstore functions. `hstore(…)` is two shapes of one name, told apart by whether
+            // its arguments are arrays — an overload, the way a real server tells them apart.
+            () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
+            () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
+            () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
@@ -890,6 +913,13 @@ impl CatalogFunc {
             CatalogFunc::DateRange => "daterange",
             CatalogFunc::IsEmpty => "isempty",
             CatalogFunc::RangeOverlaps => "&&",
+            CatalogFunc::HstoreFetch => "->",
+            CatalogFunc::HstoreHasKey => "?",
+            CatalogFunc::HstoreContains => "@>",
+            CatalogFunc::HstoreConcat => "||",
+            CatalogFunc::HstoreAkeys => "akeys",
+            CatalogFunc::HstoreAvals => "avals",
+            CatalogFunc::HstoreBuild => "hstore",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             CatalogFunc::ArrayPosition => "array_position",
@@ -928,11 +958,18 @@ impl CatalogFunc {
             | CatalogFunc::ArrayLength
             | CatalogFunc::ConvertTo
             | CatalogFunc::DateRange
-            | CatalogFunc::RangeOverlaps => &[2],
+            | CatalogFunc::RangeOverlaps
+            | CatalogFunc::HstoreFetch
+            | CatalogFunc::HstoreHasKey
+            | CatalogFunc::HstoreContains
+            | CatalogFunc::HstoreConcat
+            | CatalogFunc::HstoreBuild => &[2],
             CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::PgEncodingToChar
+            CatalogFunc::HstoreAkeys
+            | CatalogFunc::HstoreAvals
+            | CatalogFunc::PgEncodingToChar
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
@@ -975,7 +1012,8 @@ impl CatalogFunc {
             | CatalogFunc::Concat
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
             // this node has no `regtype`, and what it prints is the name either way.
-            | CatalogFunc::PgTypeof => ColumnType::Text,
+            | CatalogFunc::PgTypeof
+            | CatalogFunc::HstoreFetch => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
 
@@ -988,7 +1026,14 @@ impl CatalogFunc {
             | CatalogFunc::Cardinality => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
-            CatalogFunc::IsEmpty | CatalogFunc::RangeOverlaps => ColumnType::Bool,
+            CatalogFunc::IsEmpty
+            | CatalogFunc::RangeOverlaps
+            | CatalogFunc::HstoreHasKey
+            | CatalogFunc::HstoreContains => ColumnType::Bool,
+            // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
+            // and `?`/`@>`'s `boolean` are folded into the lists above and below.
+            CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
+            CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.
             CatalogFunc::Now
@@ -1458,7 +1503,11 @@ impl Literal {
                 | ColumnType::Int4Array
         | ColumnType::Int2Array
                 | ColumnType::NumericArray
-                | ColumnType::TextArray => mismatch(),
+                | ColumnType::TextArray
+                // A number or a boolean is not an hstore literal, and a real server says so with the
+                // same `42804` every other pair here gives.
+                | ColumnType::Hstore
+                | ColumnType::HstoreArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1523,7 +1572,11 @@ impl Literal {
                 | ColumnType::Int4Array
         | ColumnType::Int2Array
                 | ColumnType::NumericArray
-                | ColumnType::TextArray => mismatch(),
+                | ColumnType::TextArray
+                // A number or a boolean is not an hstore literal, and a real server says so with the
+                // same `42804` every other pair here gives.
+                | ColumnType::Hstore
+                | ColumnType::HstoreArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1562,7 +1615,11 @@ impl Literal {
                 | ColumnType::Int4Array
         | ColumnType::Int2Array
                 | ColumnType::NumericArray
-                | ColumnType::TextArray => mismatch(),
+                | ColumnType::TextArray
+                // A number or a boolean is not an hstore literal, and a real server says so with the
+                // same `42804` every other pair here gives.
+                | ColumnType::Hstore
+                | ColumnType::HstoreArray => mismatch(),
             },
         }
     }

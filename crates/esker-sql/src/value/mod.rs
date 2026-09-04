@@ -39,6 +39,7 @@ pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
 pub(crate) mod float;
+pub mod hstore;
 pub mod interval;
 pub(crate) mod json;
 pub mod numeric;
@@ -72,6 +73,17 @@ const VARHDRSZ: i32 = 4;
 
 /// No typmod: the number a column declared without one carries.
 pub const NO_TYPMOD: i32 = -1;
+
+/// `hstore`'s oid, and its array's.
+///
+/// **Chosen in the user-oid range** (PostgreSQL's own fixed types stop below 16384), because that
+/// is where a real server puts an extension's types: they are allocated at `CREATE EXTENSION` time
+/// and differ per database, which is why `ActiveRecord` looks hstore up by `typname` and why
+/// nothing may hard-code the number. Fixed here, and invisible to a client that reads it the way
+/// the adapter does.
+pub const HSTORE_OID: u32 = 16400;
+/// See [`HSTORE_OID`].
+pub const HSTORE_ARRAY_OID: u32 = 16401;
 
 /// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
 ///
@@ -401,7 +413,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => 0,
+        | ColumnType::TextArray
+        | ColumnType::HstoreArray => 0,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -421,6 +434,10 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Interval => 1187,
         ColumnType::Numeric => 1231,
         ColumnType::Uuid => 2951,
+        // **In the user-oid range on purpose.** A real server allocates an extension's types when
+        // it installs them, so their oids are above 16384 and differ per database; fixed ones here
+        // are invisible to a client that reads them the way `ActiveRecord` does — by `typname`.
+        ColumnType::Hstore => HSTORE_ARRAY_OID,
         ColumnType::Jsonb => 3807,
     }
 }
@@ -507,7 +524,10 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
-        | ColumnType::TextArray => false,
+        | ColumnType::TextArray
+        // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
+        | ColumnType::Hstore
+        | ColumnType::HstoreArray => false,
     }
 }
 
@@ -608,6 +628,8 @@ impl PgType for ColumnType {
             ColumnType::Bpchar => 1042,
             ColumnType::Json => 114,
             ColumnType::Jsonb => 3802,
+            ColumnType::Hstore => HSTORE_OID,
+            ColumnType::HstoreArray => HSTORE_ARRAY_OID,
             ColumnType::Real => 700,
             ColumnType::Double => 701,
             ColumnType::Timestamp => 1114,
@@ -637,6 +659,8 @@ impl PgType for ColumnType {
             ColumnType::Int2Array => "smallint[]",
             ColumnType::NumericArray => "numeric[]",
             ColumnType::TextArray => "text[]",
+            ColumnType::Hstore => "hstore",
+            ColumnType::HstoreArray => "hstore[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
             ColumnType::Int2 => "smallint",
@@ -674,7 +698,11 @@ impl PgType for ColumnType {
             | ColumnType::Timestamp
             | ColumnType::Time
             | ColumnType::Double => 8,
-            ColumnType::Text
+            // Variable length, which `pg_type.typlen` spells `-1` — measured for hstore in the
+            // adapter's own boot query.
+            ColumnType::Hstore
+            | ColumnType::HstoreArray
+            | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
             | ColumnType::Json
@@ -799,7 +827,8 @@ impl PgDatum for Datum {
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
-            | ColumnType::TextArray => {
+            | ColumnType::TextArray
+            | ColumnType::HstoreArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -818,6 +847,9 @@ impl PgDatum for Datum {
                 Datum::Text(text.to_owned())
             }
             ColumnType::Jsonb => Datum::Text(json::canonicalise(text)?),
+            // Read and written back **canonical**, the same road `jsonb` takes: the stored form is
+            // what the type prints, so equality and ordering are the text's (`crate::value::hstore`).
+            ColumnType::Hstore => Datum::Text(hstore::to_text(&hstore::from_text(text)?)),
             ColumnType::Bool => Datum::Bool(parse_bool(text)?),
             ColumnType::Bytea => Datum::Bytea(parse_bytea(text)?),
             ColumnType::TimestampTz => Datum::TimestampTz(timestamp::from_text(text)?),
@@ -905,7 +937,8 @@ impl PgDatum for Datum {
             | ColumnType::Int4Array
             | ColumnType::Int2Array
             | ColumnType::NumericArray
-            | ColumnType::TextArray => {
+            | ColumnType::TextArray
+            | ColumnType::HstoreArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -977,6 +1010,13 @@ impl PgDatum for Datum {
             // A `json` or `jsonb` **binary** parameter is its text with a leading version byte
             // on a real server; this node has never sent one and the corpus does not cover it, so
             // it is refused rather than guessed. The text path is what a client actually uses.
+            // An hstore arrives as its own text and is canonicalised on the way in, exactly as
+            // it is from the text format — the wire carries the printed form either way.
+            ColumnType::Hstore => Datum::Text(hstore::to_text(&hstore::from_text(
+                std::str::from_utf8(bytes).map_err(|_| {
+                    SqlError::ProtocolViolation("a binary hstore is not UTF-8".into())
+                })?,
+            )?)),
             ColumnType::Json | ColumnType::Jsonb => {
                 return Err(SqlError::unsupported(
                     "a json or jsonb parameter in the binary format",
@@ -1423,6 +1463,12 @@ mod tests {
         assert_eq!(ColumnType::Json.oid(), 114);
         assert_eq!(ColumnType::Jsonb.oid(), 3802);
         assert_eq!(ColumnType::Numeric.oid(), 1700);
+        // **Not PostgreSQL's own, and deliberately so.** An extension's types are allocated when
+        // it is installed, so hstore's oid is above 16384 and differs per database on a real
+        // server; a client reads it by `typname`, which is what `ActiveRecord` does. Asserted here
+        // so that the exception is on the record rather than looking like an oversight.
+        assert_eq!(ColumnType::Hstore.oid(), 16400);
+        assert_eq!(ColumnType::HstoreArray.oid(), 16401);
         for ty in ColumnType::ALL {
             assert_eq!(
                 ty.type_len() == -1,
@@ -1433,6 +1479,8 @@ mod tests {
                         | ColumnType::Bpchar
                         | ColumnType::Json
                         | ColumnType::Jsonb
+                        | ColumnType::Hstore
+                        | ColumnType::HstoreArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

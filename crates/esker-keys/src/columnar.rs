@@ -82,6 +82,13 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int2Array => 25,
         ColumnType::NumericArray => 23,
         ColumnType::TextArray => 24,
+        // **27 and 28, past the highest in use rather than the next after the last line.** 25 is
+        // `smallint[]`, appended out of numeric order, and taking "the next one" gave it a second
+        // owner — clippy's `unreachable pattern` on the decode side is what caught it, and a
+        // duplicate tag here decodes one column type as another. 26 is free and is left free:
+        // a gap costs nothing and a guess about why it is there costs a reader.
+        ColumnType::Hstore => 27,
+        ColumnType::HstoreArray => 28,
     }
 }
 
@@ -112,6 +119,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         25 => ColumnType::Int2Array,
         23 => ColumnType::NumericArray,
         24 => ColumnType::TextArray,
+        27 => ColumnType::Hstore,
+        28 => ColumnType::HstoreArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

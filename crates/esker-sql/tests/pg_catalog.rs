@@ -231,6 +231,11 @@ fn activerecord_s_four_type_map_queries_answer() {
             // refusals in `postgresql_specific_schema.rb`.
             vec!["2950", "uuid", "0", ",", "uuid_in", "\\N", "b", "0"],
             vec!["3802", "jsonb", "0", ",", "jsonb_in", "\\N", "b", "0"],
+            // **Last, because its oid is in the user range.** An extension's types are allocated
+            // when it is installed, so a real server's hstore is above 16384 too and this query
+            // orders by oid — the adapter reads the name and the input function, both of which
+            // are what a real server's are.
+            vec!["16400", "hstore", "0", ",", "hstore_in", "\\N", "b", "0"],
         ]
     );
 

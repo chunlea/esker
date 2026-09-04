@@ -239,6 +239,12 @@ const TAG_INT4_ARRAY: u8 = 22;
 const TAG_INT2_ARRAY: u8 = 25;
 const TAG_NUMERIC_ARRAY: u8 = 23;
 const TAG_TEXT_ARRAY: u8 = 24;
+/// The `hstore` extension's type and its array. **26 and 27, because 25 is taken**: `smallint[]`
+/// was appended out of numeric order and holds 25, which the list above says in a comment and
+/// nothing enforces. A column's type tag is a byte in a stored record, so a duplicate would decode
+/// one type as another — read the constants, do not count the lines.
+const TAG_HSTORE: u8 = 26;
+const TAG_HSTORE_ARRAY: u8 = 27;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -288,6 +294,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Bpchar => TAG_BPCHAR,
         ColumnType::Json => TAG_JSON,
         ColumnType::Jsonb => TAG_JSONB,
+        ColumnType::Hstore => TAG_HSTORE,
+        ColumnType::HstoreArray => TAG_HSTORE_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -361,6 +369,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_BPCHAR => ColumnType::Bpchar,
         TAG_JSON => ColumnType::Json,
         TAG_JSONB => ColumnType::Jsonb,
+        TAG_HSTORE => ColumnType::Hstore,
+        TAG_HSTORE_ARRAY => ColumnType::HstoreArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,
