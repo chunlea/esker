@@ -261,10 +261,34 @@ fn one_round(dir: &Path, seed: u64) -> usize {
         })
     };
 
-    // Kill at a random moment, so the cut lands in a different place each round: inside a
-    // write, between two, or while a response frame is on its way out.
+    // **Kill after a random number of acknowledged writes, not after a random number of
+    // milliseconds.**
+    //
+    // The cut still lands in a different place each round — inside a write, between two, or
+    // while a response frame is on its way out — because the offset below still varies it. What
+    // changed is the *precondition*: the round has something to verify by construction, instead
+    // of by the writer having outrun a wall clock.
+    //
+    // It used to sleep 15-250 ms and kill. The writes it interrupts are CPU-bound and that sleep
+    // is not, so on a loaded box the kill landed before the first acknowledgement and the round
+    // had nothing to check — 6 failures in 10 under twenty-four spinning threads, in a single
+    // container where no port collision is possible, every one of them at the `acked > 0` guard
+    // below and none at the durability assertion (`docs/plans/debt-c6.md` §12).
     let mut rng = Pcg32::from_seed(seed);
-    std::thread::sleep(Duration::from_millis(rng.range_inclusive(15, 250)));
+    let target = usize::try_from(rng.range_inclusive(1, 8)).unwrap_or(1);
+    let waiting_since = std::time::Instant::now();
+    while acked.lock().unwrap().len() < target {
+        assert!(
+            waiting_since.elapsed() < Duration::from_secs(30),
+            "the writer acknowledged {} writes in 30 s, short of the {target} this round waits \
+             for: the server is not answering, which is a failure and not a slow box",
+            acked.lock().unwrap().len()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A small offset so the cut is not always immediately after an acknowledgement. It cannot
+    // make the round vacuous: `target` acknowledgements have already happened.
+    std::thread::sleep(Duration::from_millis(rng.range_inclusive(0, 15)));
     child.kill();
 
     stop.store(true, Ordering::Relaxed);

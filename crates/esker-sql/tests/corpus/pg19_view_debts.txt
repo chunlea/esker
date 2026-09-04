@@ -1,0 +1,76 @@
+# The three debts the `CREATE VIEW` unit left: a dependency edge, `is_updatable`, `pg_get_viewdef`.
+#
+# Things reasoning would get wrong:
+#
+#   * **A view is a dependency of its base table, not a copy of it.** `DROP TABLE` of the base is
+#     `2BP01` naming the view, and the `DETAIL` says which object depends on which. `CASCADE` takes
+#     the view with it — and dropping the *view* never needs one.
+#   * **`is_updatable` is a property of the query, not of the view.** PostgreSQL's rule for an
+#     automatically updatable view: exactly one entry in `FROM` (a table or another updatable
+#     view), no aggregate or window function, no `DISTINCT`, no `GROUP BY`/`HAVING`, no set
+#     operation, no `LIMIT`/`OFFSET`. A **join makes it `NO`** even though nothing about it looks
+#     like a computation.
+#   * **A computed column does NOT make the view read-only** — `SELECT id, a + 1 AS a1 FROM vb` is
+#     `is_updatable = YES`. This capture's first draft said every target entry had to be a plain
+#     column and the measurement said otherwise: what a computation costs is that *column*'s own
+#     updatability (`information_schema.columns.is_updatable`), not the view's.
+#   * **`pg_get_viewdef` prints PostgreSQL's own reconstruction, not the text the user typed** —
+#     re-cased, re-qualified, re-indented, and terminated with a semicolon. The `oid` form and the
+#     `(oid, pretty)` form differ in whitespace only.
+#   * `information_schema.views.is_updatable` is `YES`/`NO` text, not a boolean.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`.
+
+BEGIN;		-
+
+CREATE TABLE vb (id bigint PRIMARY KEY, a int, b text);		-
+CREATE TABLE vb2 (id bigint PRIMARY KEY, vb_id bigint, c int);		-
+INSERT INTO vb VALUES (1, 10, 'x'), (2, 20, 'y');		-
+INSERT INTO vb2 VALUES (1, 1, 100);		-
+
+-- ------------------------------------------------- the shapes, and what each is updatable as		-
+CREATE VIEW v_plain AS SELECT id, a, b FROM vb;		-
+CREATE VIEW v_star AS SELECT * FROM vb;		-
+CREATE VIEW v_where AS SELECT id, a FROM vb WHERE a > 5;		-
+CREATE VIEW v_expr AS SELECT id, a + 1 AS a1 FROM vb;		-
+CREATE VIEW v_distinct AS SELECT DISTINCT a FROM vb;		-
+CREATE VIEW v_group AS SELECT a, count(*) AS n FROM vb GROUP BY a;		-
+CREATE VIEW v_join AS SELECT vb.id, vb2.c FROM vb JOIN vb2 ON vb2.vb_id = vb.id;		-
+CREATE VIEW v_limit AS SELECT id, a FROM vb LIMIT 5;		-
+CREATE VIEW v_union AS SELECT id, a FROM vb UNION SELECT id, c FROM vb2;		-
+CREATE VIEW v_over_view AS SELECT id, a FROM v_plain;		-
+
+SELECT table_name, is_updatable, is_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;	name,character varying(3),character varying(3)	v_distinct|NO|NO ; v_expr|YES|YES ; v_group|NO|NO ; v_join|NO|NO ; v_limit|NO|NO ; v_over_view|YES|YES ; v_plain|YES|YES ; v_star|YES|YES ; v_union|NO|NO ; v_where|YES|YES
+
+-- ------------------------------------------------- pg_get_viewdef, both forms		-
+SELECT pg_get_viewdef('v_plain'::regclass);		-
+SELECT pg_get_viewdef('v_where'::regclass);		-
+SELECT pg_get_viewdef('v_expr'::regclass);		-
+SELECT pg_get_viewdef('v_group'::regclass);		-
+SELECT pg_get_viewdef('v_join'::regclass);		-
+SELECT pg_get_viewdef('v_plain'::regclass, true);		-
+SELECT definition FROM pg_views WHERE viewname = 'v_where';	text	-
+
+-- ------------------------------------------------- the dependency edge		-
+SAVEPOINT s1;		-
+DROP TABLE vb;	!2BP01 cannot drop table vb because other objects depend on it DETAIL: view v_plain depends on table vb HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s1;		-
+SAVEPOINT s2;		-
+DROP TABLE vb RESTRICT;	!2BP01 cannot drop table vb because other objects depend on it DETAIL: view v_plain depends on table vb HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s2;		-
+-- dropping the view needs no cascade, and does not take the table		-
+DROP VIEW v_over_view;		-
+DROP VIEW v_plain;		-
+SELECT count(*) FROM vb;		2
+-- a view over a view: dropping the inner one is refused while the outer exists		-
+CREATE VIEW v_inner AS SELECT id, a FROM vb;		-
+CREATE VIEW v_outer AS SELECT id FROM v_inner;		-
+SAVEPOINT s3;		-
+DROP VIEW v_inner;	!2BP01 cannot drop view v_inner because other objects depend on it DETAIL: view v_outer depends on view v_inner HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s3;		-
+-- and CASCADE takes the dependents		-
+DROP TABLE vb CASCADE;		drop cascades to view v_where ; drop cascades to view v_expr ; drop cascades to view v_distinct ; drop cascades to view v_group ; drop cascades to view v_join ; drop cascades to view v_limit ; drop cascades to view v_union ; drop cascades to view v_inner ; drop cascades to view v_outer
+SELECT count(*) FROM information_schema.views WHERE table_schema = 'public';	bigint	0
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'v\_%' OR relname LIKE 'vb%';	bigint	0

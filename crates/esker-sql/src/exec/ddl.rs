@@ -1991,6 +1991,30 @@ fn drop_column(
     // **Before anything is changed**, so a refusal leaves the definition as it was.
     refuse_referencing_keys(txn, executor, updated, name, at, cascade)?;
 
+    // A view that reads this column is a dependent too, and the message names the column rather
+    // than the table. This was the recorded debt on the other side of `tests/drop_column.rs`'s two
+    // divergence entries: the column went and the view was left reading one that is gone.
+    let dependents = views_depending_on_column(executor, txn, relation, name)?;
+    if let Some(view) = dependents.first()
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind: "column",
+            name: format!(
+                "{} of table {}",
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+            detail: format!(
+                "view {} depends on column {} of table {}",
+                catalog::display_name(view),
+                catalog::display_name(name),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+    drop_views_cascading(executor, txn, dependents)?;
+
     // The tombstone. `ty`, `typmod` and `missing` survive because the row codec reads them;
     // everything else was a promise to a user who can no longer see the column.
     let column = &mut updated.columns[at];
@@ -2115,7 +2139,18 @@ fn add_unique_constraint(
         predicate: None,
         comment: None,
     });
-    Ok(())
+    // **The index has to be filled, not merely declared.** Without this the constraint was a
+    // catalog entry over an empty index: the rows already in the table were not in it, so a later
+    // duplicate of one of them was accepted *and* a `SELECT … WHERE a = <that value>` answered
+    // with only the new row. A wrong answer to an ordinary query, reached through a statement that
+    // succeeded — and the scan that fixes it is the same one that refuses a constraint the
+    // existing rows already break (ADR 0020's recorded gap).
+    let index = updated
+        .indexes
+        .last()
+        .ok_or_else(|| SqlError::Internal("the index just pushed is not there".to_owned()))?
+        .clone();
+    backfill(executor, txn, updated, &index)
 }
 
 /// The derived name, or the first `<name><n>` that nothing answers to.
@@ -2814,6 +2849,9 @@ pub(super) fn drop_view(
         let stored = executor.resolve_unqualified(txn, name)?;
         match existing_relation(executor, txn, &stored)? {
             Some(catalog::Relation::View { .. }) => {
+                // A view built on this one is a dependency exactly as a view on a table is —
+                // same `2BP01`, with `view` on both sides of the `DETAIL`.
+                refuse_or_drop_dependent_views(executor, txn, &stored, "view", drop.cascade)?;
                 catalog::drop_view(txn, executor.tenant, &stored)?;
                 executor.catalog_written = true;
             }
@@ -2921,6 +2959,120 @@ pub(super) fn alter_schema_rename(
     Ok(Outcome::done("ALTER SCHEMA"))
 }
 
+/// The view half of a `DROP`: refuse if anything is built on `relation`, or take it with `CASCADE`.
+///
+/// Checked **before** the foreign keys, because PostgreSQL reports the first dependent it finds and
+/// views come first in its own order. Without this the base could go and the view be left naming a
+/// relation that is gone — a name outliving its object, reached from an ordinary `DROP TABLE`.
+fn refuse_or_drop_dependent_views(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    relation: &str,
+    kind: &'static str,
+    cascade: bool,
+) -> Result<()> {
+    let dependents = dependent_views(executor, txn, relation)?;
+    if let Some(view) = dependents.first()
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind,
+            name: catalog::display_name(relation),
+            detail: format!(
+                "view {} depends on {kind} {}",
+                catalog::display_name(view),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+    drop_views_cascading(executor, txn, dependents)
+}
+
+/// Drops each view and everything built on it, depth first.
+///
+/// **A view over a view is a dependency too**, so a cascade that dropped only the direct
+/// dependents would leave the outer one naming a relation that is gone — the very thing the edge
+/// exists to prevent, reintroduced by the `CASCADE` that was meant to clean up. Depth first so a
+/// view is dropped after everything that reads it.
+fn drop_views_cascading(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    views: Vec<String>,
+) -> Result<()> {
+    for view in views {
+        let outer = dependent_views(executor, txn, &view)?;
+        drop_views_cascading(executor, txn, outer)?;
+        // Already gone with an earlier branch: two views over one table can share a dependent.
+        if catalog::view(txn, executor.tenant, &view)?.is_none() {
+            continue;
+        }
+        executor.notice(SqlError::CascadeDropsView(catalog::display_name(&view)));
+        catalog::drop_view(txn, executor.tenant, &view)?;
+    }
+    Ok(())
+}
+
+/// Every view whose query names `column` of `relation`, by stored name.
+///
+/// **Column-precise, because PostgreSQL's message is.** `DROP COLUMN` says `view v depends on
+/// column c of table t`, so a view that reads the table but not the column does not stop the
+/// statement. A bare column reference counts wherever it appears — target list, `WHERE`, `ORDER
+/// BY` — and a qualified one counts only when the qualifier is the table or its alias.
+///
+/// `SELECT *` is the case worth naming: it lowers to the columns the table had **when the view was
+/// created**, so it names the column explicitly and is caught like any other.
+fn views_depending_on_column(
+    executor: &Executor,
+    txn: &dyn Txn,
+    relation: &str,
+    column: &str,
+) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for view in dependent_views(executor, txn, relation)? {
+        let Some(def) = catalog::view(txn, executor.tenant, &view)? else {
+            continue;
+        };
+        let Ok(parsed) = crate::parse::parse_statements(&def.definition) else {
+            continue;
+        };
+        let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
+            continue;
+        };
+        if super::bind::any(&lowered, |expr| {
+            matches!(expr, plan::Expr::Column { name, table }
+                if name == column
+                    && table.as_deref().is_none_or(|qualifier| qualifier == relation))
+        }) {
+            found.push(view);
+        }
+    }
+    Ok(found)
+}
+
+/// Every view whose query names `relation`, by stored name.
+///
+/// **Read out of the definitions rather than out of an edge.** A `ViewDef` stores the `SELECT`
+/// text and nothing else, so the dependency is recovered by parsing each view — which is
+/// affordable because `DROP` is rare and a tenant has few views, and which needs no format change.
+/// A definition that no longer parses is skipped rather than fatal: it cannot be a dependency this
+/// statement understands, and refusing every `DROP TABLE` in the database because one view is
+/// unreadable would be the worse answer.
+fn dependent_views(executor: &Executor, txn: &dyn Txn, relation: &str) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for view in catalog::views(txn, executor.tenant)? {
+        let Ok(parsed) = crate::parse::parse_statements(&view.definition) else {
+            continue;
+        };
+        let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
+            continue;
+        };
+        if super::bind::table_names(&lowered).contains(&relation) {
+            found.push(view.name.clone());
+        }
+    }
+    Ok(found)
+}
+
 pub(super) fn drop_table(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -2967,6 +3119,7 @@ pub(super) fn drop_table(
                 return Err(SqlError::UndefinedTableForDrop(name.clone()));
             }
         };
+        refuse_or_drop_dependent_views(executor, txn, &table.name, "table", drop.cascade)?;
         // **A table something references cannot be dropped**, and `2BP01` names the constraint
         // that stops it — unless `CASCADE`, which takes the constraint with the table instead.
         // `RESTRICT` is the default and the same thing as writing nothing; measured, both.
@@ -4092,9 +4245,17 @@ fn backfill(
             if entry.by_value && entries.iter().any(|(existing, _)| existing == &entry.key) {
                 // Out of the walk as well as out of the page: the index cannot be built and
                 // reading the rest of the table would learn nothing.
-                return Err(SqlError::UniqueViolation {
-                    constraint: index.name.clone(),
-                    key: None,
+                //
+                // **The build's sentence, not the insert's.** Nothing was inserted here, and
+                // PostgreSQL says so — `could not create unique index "…"`, with the `DETAIL`
+                // naming the first duplicate found.
+                return Err(SqlError::CouldNotCreateUniqueIndex {
+                    index: index.name.clone(),
+                    // `render_key` already writes the leading `Key `.
+                    detail: format!(
+                        "{} is duplicated.",
+                        super::index::render_key(table, &index.keys, &entry.values)
+                    ),
                 });
             }
             entries.push((

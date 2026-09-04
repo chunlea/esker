@@ -67,6 +67,79 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         .collect())
 }
 
+/// The columns of `information_schema.views`, in the standard's order.
+pub const VIEWS_COLUMNS: &[(&str, ColumnType)] = &[
+    ("table_schema", ColumnType::Text),
+    ("table_name", ColumnType::Text),
+    ("view_definition", ColumnType::Text),
+    ("is_updatable", ColumnType::Text),
+    ("is_insertable_into", ColumnType::Text),
+];
+
+/// Whether PostgreSQL would treat this view's query as **automatically updatable**.
+///
+/// The rule, measured: exactly one entry in `FROM` (a table, or another view that is itself
+/// updatable), and no aggregate or window function, `DISTINCT`, `GROUP BY`, `HAVING`, set
+/// operation, `LIMIT` or `OFFSET`.
+///
+/// **A computed column does not make the view read-only.** `SELECT id, a + 1 AS a1 FROM vb` is
+/// `YES` — this function's first draft required every target entry to be a plain column and the
+/// oracle said otherwise. What a computation costs is that *column*'s own updatability
+/// (`information_schema.columns.is_updatable`), which is a different question from this one.
+///
+/// A definition this node cannot parse is `NO`: an answer of `YES` is a promise that an `UPDATE`
+/// through the view will work, and a query nothing here understands cannot make it.
+fn is_automatically_updatable(definition: &str) -> bool {
+    let Ok(parsed) = crate::parse::parse_statements(definition) else {
+        return false;
+    };
+    let Some(Ok(crate::plan::Statement::Select(select))) =
+        parsed.first().map(crate::parse::Parsed::lower)
+    else {
+        return false;
+    };
+    select.from.is_some()
+        && select.joins.is_empty()
+        && !select.distinct
+        && select.group_by.is_empty()
+        && select.having.is_none()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        // No window functions exist in this plan at all, so an aggregate is the whole of the
+        // "not a plain projection" case.
+        && !crate::exec::bind::any(&crate::plan::Statement::Select(select), |expr| {
+            matches!(expr, crate::plan::Expr::Aggregate(_))
+        })
+}
+
+/// Every `information_schema.views` row: one per view, with PostgreSQL's updatability rule.
+pub fn views(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    Ok(crate::catalog::views(txn, tenant)?
+        .into_iter()
+        .map(|view| {
+            let (schema, name) = crate::catalog::split_qualified(&view.name);
+            // **`YES`/`NO` text, not a boolean** — the standard spells these as
+            // `character varying(3)`, and a client comparing against the string would read a
+            // boolean as neither.
+            let updatable = if is_automatically_updatable(&view.definition) {
+                "YES"
+            } else {
+                "NO"
+            };
+            vec![
+                Datum::Text(schema.to_owned()),
+                Datum::Text(name.to_owned()),
+                Datum::Text(view.definition.clone()),
+                Datum::Text(updatable.to_owned()),
+                // The two agree for every automatically updatable view: what makes one insertable
+                // is what makes it updatable, and a trigger could separate them only if this node
+                // had `INSTEAD OF` triggers.
+                Datum::Text(updatable.to_owned()),
+            ]
+        })
+        .collect())
+}
+
 /// Every `information_schema.columns` row: one per column of a table, in declaration order.
 pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;

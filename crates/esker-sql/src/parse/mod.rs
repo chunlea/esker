@@ -326,6 +326,33 @@ impl Parsed {
         }))
     }
 
+    /// The isolation level a `BEGIN ISOLATION LEVEL …` named, or `None` for a plain `BEGIN`.
+    ///
+    /// Read here rather than lowered, for the reason [`Parsed::begins_read_only`] is: `BEGIN` is a
+    /// session statement the executor answers directly, and its modes are the parser's to report
+    /// (ADR 0057).
+    #[must_use]
+    pub fn begins_isolation(&self) -> Option<crate::parameter::Isolation> {
+        use sqlparser::ast::{TransactionIsolationLevel, TransactionMode};
+
+        let Statement::StartTransaction { modes, .. } = &self.statement else {
+            return None;
+        };
+        modes.iter().find_map(|mode| match mode {
+            TransactionMode::IsolationLevel(level) => Some(match level {
+                TransactionIsolationLevel::RepeatableRead => {
+                    crate::parameter::Isolation::RepeatableRead
+                }
+                TransactionIsolationLevel::Serializable => {
+                    crate::parameter::Isolation::Serializable
+                }
+                // `READ UNCOMMITTED` is `READ COMMITTED` on a real server: there is no weaker one.
+                _ => crate::parameter::Isolation::ReadCommitted,
+            }),
+            TransactionMode::AccessMode(_) => None,
+        })
+    }
+
     /// Whether a `DROP INDEX` asked for `CONCURRENTLY`, which is stripped from the source
     /// before `sqlparser` sees it and remembered rather than inferred.
     #[must_use]

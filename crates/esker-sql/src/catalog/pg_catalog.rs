@@ -88,6 +88,11 @@ pub enum CatalogView {
     /// schema because a bare `tables` is `42P01` on a real server
     /// ([`crate::catalog::information_schema`]).
     InformationSchemaTables,
+    /// `information_schema.views`: one row per view, with the standard's `is_updatable`.
+    ///
+    /// **`YES`/`NO` text, not a boolean** — the standard spells these `character varying(3)`, and
+    /// a client comparing against the string would read a boolean as neither.
+    InformationSchemaViews,
     /// `information_schema.columns`.
     InformationSchemaColumns,
     /// `information_schema.table_constraints`, where a `NOT NULL` appears as a `CHECK`.
@@ -202,7 +207,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 29] = [
+    pub const ALL: [CatalogView; 30] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -228,6 +233,7 @@ impl CatalogView {
         CatalogView::PgEnum,
         CatalogView::PgAvailableExtensions,
         CatalogView::InformationSchemaTables,
+        CatalogView::InformationSchemaViews,
         CatalogView::InformationSchemaColumns,
         CatalogView::InformationSchemaTableConstraints,
         CatalogView::InformationSchemaKeyColumnUsage,
@@ -263,6 +269,7 @@ impl CatalogView {
             CatalogView::PgSequence => "pg_sequence",
             CatalogView::PgEnum => "pg_enum",
             CatalogView::InformationSchemaTables => "information_schema.tables",
+            CatalogView::InformationSchemaViews => "information_schema.views",
             CatalogView::InformationSchemaColumns => "information_schema.columns",
             CatalogView::InformationSchemaTableConstraints => {
                 "information_schema.table_constraints"
@@ -286,6 +293,7 @@ impl CatalogView {
     pub fn schema(self) -> &'static str {
         match self {
             CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -317,6 +325,7 @@ impl CatalogView {
             | CatalogView::PgStatActivity
             | CatalogView::PgAvailableExtensions
             | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage
@@ -359,6 +368,7 @@ impl CatalogView {
                 CatalogView::PgEnum => 16,
                 CatalogView::PgAvailableExtensions => 17,
                 CatalogView::InformationSchemaTables => 9,
+                CatalogView::InformationSchemaViews => 33,
                 CatalogView::InformationSchemaColumns => 10,
                 CatalogView::InformationSchemaTableConstraints => 11,
                 CatalogView::InformationSchemaKeyColumnUsage => 12,
@@ -624,6 +634,7 @@ impl CatalogView {
                 ("enumsortorder", ColumnType::Real),
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
+            CatalogView::InformationSchemaViews => super::information_schema::VIEWS_COLUMNS,
             CatalogView::InformationSchemaColumns => super::information_schema::COLUMNS_COLUMNS,
             CatalogView::InformationSchemaTableConstraints => {
                 super::information_schema::TABLE_CONSTRAINTS_COLUMNS
@@ -668,6 +679,7 @@ impl CatalogView {
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
+            CatalogView::InformationSchemaViews => super::information_schema::views(txn, tenant),
             CatalogView::InformationSchemaColumns => {
                 super::information_schema::columns(txn, tenant)
             }
@@ -819,6 +831,7 @@ impl CatalogView {
             | CatalogView::PgIndex
             | CatalogView::PgConstraint
             | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaViews
             | CatalogView::InformationSchemaColumns
             | CatalogView::InformationSchemaTableConstraints
             | CatalogView::InformationSchemaKeyColumnUsage

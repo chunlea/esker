@@ -53,11 +53,20 @@ pub enum TxnWrite {
         key: Bytes,
         /// The value.
         value: Bytes,
+        /// **The snapshot this value was computed from**, or `None` for "the transaction's own"
+        /// (ADR 0057 §4).
+        ///
+        /// `None` in the log today: this is a **replicated** command, so carrying it is a log
+        /// format change as well as a wire one, and both wait for the human's ruling. The field is
+        /// here so that everything above it is built and tested; the encoding is untouched.
+        read_ts: Option<u64>,
     },
     /// Remove `key`.
     Delete {
         /// The user key.
         key: Bytes,
+        /// As [`TxnWrite::Put::read_ts`].
+        read_ts: Option<u64>,
     },
 }
 
@@ -66,7 +75,7 @@ impl TxnWrite {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } => key,
         }
     }
 
@@ -74,11 +83,19 @@ impl TxnWrite {
     #[must_use]
     pub fn to_wire(&self) -> TxnMutation {
         match self {
-            Self::Put { key, value } => TxnMutation::Put {
+            Self::Put {
+                key,
+                value,
+                read_ts,
+            } => TxnMutation::Put {
                 key: key.clone(),
                 value: value.clone(),
+                read_ts: *read_ts,
             },
-            Self::Delete { key } => TxnMutation::Delete { key: key.clone() },
+            Self::Delete { key, read_ts } => TxnMutation::Delete {
+                key: key.clone(),
+                read_ts: *read_ts,
+            },
         }
     }
 }
@@ -154,11 +171,19 @@ impl TxnCommand {
                 writes: mutations
                     .iter()
                     .map(|mutation| match mutation {
-                        TxnMutation::Put { key, value } => TxnWrite::Put {
+                        TxnMutation::Put {
+                            key,
+                            value,
+                            read_ts,
+                        } => TxnWrite::Put {
                             key: key.clone(),
                             value: value.clone(),
+                            read_ts: *read_ts,
                         },
-                        TxnMutation::Delete { key } => TxnWrite::Delete { key: key.clone() },
+                        TxnMutation::Delete { key, read_ts } => TxnWrite::Delete {
+                            key: key.clone(),
+                            read_ts: *read_ts,
+                        },
                     })
                     .collect(),
             }),
@@ -234,14 +259,42 @@ impl TxnCommand {
                 out.put_varint(writes.len() as u64);
                 for write in writes {
                     match write {
-                        TxnWrite::Put { key, value } => {
+                        // **Four kinds, and the first two are unchanged.** A write whose value
+                        // came from the transaction's own snapshot encodes exactly the bytes it
+                        // always did, so every log entry ever written still decodes and every
+                        // golden is byte-identical. A write that says which snapshot it read at
+                        // takes a kind of its own, which an older node refuses as unknown rather
+                        // than misreading as a shorter entry (ADR 0057 §4).
+                        TxnWrite::Put {
+                            key,
+                            value,
+                            read_ts: None,
+                        } => {
                             out.put_u8(1);
                             out.put_bytes(key);
                             out.put_bytes(value);
                         }
-                        TxnWrite::Delete { key } => {
+                        TxnWrite::Delete { key, read_ts: None } => {
                             out.put_u8(2);
                             out.put_bytes(key);
+                        }
+                        TxnWrite::Put {
+                            key,
+                            value,
+                            read_ts: Some(read_ts),
+                        } => {
+                            out.put_u8(3);
+                            out.put_bytes(key);
+                            out.put_bytes(value);
+                            out.put_varint(*read_ts);
+                        }
+                        TxnWrite::Delete {
+                            key,
+                            read_ts: Some(read_ts),
+                        } => {
+                            out.put_u8(4);
+                            out.put_bytes(key);
+                            out.put_varint(*read_ts);
                         }
                     }
                 }
@@ -306,9 +359,20 @@ impl TxnCommand {
                         1 => TxnWrite::Put {
                             key: bytes(input, "txn.write.key")?,
                             value: bytes(input, "txn.write.value")?,
+                            read_ts: None,
+                        },
+                        3 => TxnWrite::Put {
+                            key: bytes(input, "txn.write.key")?,
+                            value: bytes(input, "txn.write.value")?,
+                            read_ts: Some(varint(input, "txn.write.read_ts")?),
+                        },
+                        4 => TxnWrite::Delete {
+                            key: bytes(input, "txn.write.key")?,
+                            read_ts: Some(varint(input, "txn.write.read_ts")?),
                         },
                         2 => TxnWrite::Delete {
                             key: bytes(input, "txn.write.key")?,
+                            read_ts: None,
                         },
                         other => {
                             return Err(ProtoError::corrupt(
@@ -416,9 +480,11 @@ mod tests {
                     TxnWrite::Put {
                         key: Bytes::from_static(b"a"),
                         value: Bytes::from_static(b"1"),
+                        read_ts: None,
                     },
                     TxnWrite::Delete {
                         key: Bytes::from_static(b"b"),
+                        read_ts: None,
                     },
                 ],
             },
@@ -549,9 +615,11 @@ mod tests {
                 TxnMutation::Put {
                     key: Bytes::from_static(b"a"),
                     value: Bytes::from_static(b"1"),
+                    read_ts: None,
                 },
                 TxnMutation::Delete {
                     key: Bytes::from_static(b"b"),
+                    read_ts: None,
                 },
             ],
         })

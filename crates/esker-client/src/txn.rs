@@ -399,6 +399,8 @@ impl TxnClient {
             max_lock_resolutions: self.max_lock_resolutions,
             max_scan_regions: self.max_scan_regions,
             buffer: BTreeMap::new(),
+            read_ts: BTreeMap::new(),
+            statement_ts: None,
             read_only,
             refused_write: None,
             state: State::Open,
@@ -441,6 +443,18 @@ pub struct Transaction {
     /// writes a key twice must send one mutation, not two — and because the *first* key in
     /// order is a stable choice of primary, which makes a retried commit pick the same one.
     buffer: BTreeMap<Bytes, Write>,
+    /// `key -> the read timestamp of the statement that produced this write`, for the keys whose
+    /// statement did not read at the transaction's own snapshot
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+    /// §4).
+    ///
+    /// Empty for every transaction whose statements never waited, which is why it is a second map
+    /// rather than a field on `Write`: the common case pays nothing, and the absence of an entry
+    /// *is* "the transaction's own snapshot" rather than a value repeated on every key.
+    read_ts: BTreeMap<Bytes, u64>,
+    /// The read timestamp of the statement running now, or `None` while it is the transaction's
+    /// own. Set by [`Transaction::reading_at`] when a statement is re-run after waiting.
+    statement_ts: Option<u64>,
     /// Whether this transaction reads a past snapshot and so may not write
     /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
     read_only: bool,
@@ -486,10 +500,29 @@ impl Transaction {
         if self.refuse_write(key) {
             return;
         }
+        self.stamp(key);
         self.buffer.insert(
             Bytes::copy_from_slice(key),
             Write::Put(Bytes::copy_from_slice(value)),
         );
+    }
+
+    /// Says which snapshot the value about to be written was computed from
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+    /// §4).
+    ///
+    /// **Only when it is not the transaction's own**, which is why the map stays empty for every
+    /// transaction whose statements never waited: an absent entry *is* `start_ts`, said once
+    /// rather than repeated on every key.
+    pub fn reading_at(&mut self, read_ts: u64) {
+        self.statement_ts = Some(read_ts);
+    }
+
+    /// Records the current statement's read timestamp against a key, if there is one to record.
+    fn stamp(&mut self, key: &[u8]) {
+        if let Some(read_ts) = self.statement_ts {
+            self.read_ts.insert(Bytes::copy_from_slice(key), read_ts);
+        }
     }
 
     /// Buffers a delete. No I/O.
@@ -497,6 +530,7 @@ impl Transaction {
         if self.refuse_write(key) {
             return;
         }
+        self.stamp(key);
         self.buffer
             .insert(Bytes::copy_from_slice(key), Write::Delete);
     }
@@ -778,10 +812,17 @@ impl Transaction {
                 Some(Write::Put(value)) => TxnMutation::Put {
                     key: key.clone(),
                     value: value.clone(),
+                    // **The snapshot this value was computed from** (ADR 0057 §4). `None` means
+                    // the transaction's own, which is every write a statement that never waited
+                    // makes — and every write at all until the framing change lands.
+                    read_ts: self.read_ts.get(key).copied(),
                 },
                 // A key that is not in the buffer cannot be reached: every list here is built
                 // from the buffer's own keys. `Delete` is the safe reading if it ever were.
-                Some(Write::Delete) | None => TxnMutation::Delete { key: key.clone() },
+                Some(Write::Delete) | None => TxnMutation::Delete {
+                    key: key.clone(),
+                    read_ts: self.read_ts.get(key).copied(),
+                },
             })
             .collect()
     }

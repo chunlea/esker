@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::rpc_tls::RpcTlsFlags;
 use esker_proto::{Server, TransportConfig};
 use esker_store::server::RaftOptions;
 use esker_store::{PdClient, PeerAddress, RemotePd, Store, StoreOptions, StoreService};
@@ -29,6 +30,8 @@ pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:20160";
 pub(crate) struct ServerOptions {
     /// The directory holding the database. Created if it is not there.
     pub(crate) data_dir: PathBuf,
+    /// The RPC TLS this store speaks, to its clients and to its peers.
+    pub(crate) tls: RpcTlsFlags,
     /// The address to listen on.
     pub(crate) listen: String,
     /// This store's id, reported in the handshake.
@@ -96,6 +99,7 @@ pub(crate) struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
+            tls: RpcTlsFlags::default(),
             data_dir: PathBuf::from("esker-data"),
             listen: DEFAULT_LISTEN.to_owned(),
             store_id: 1,
@@ -144,6 +148,20 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
 
+    // **Before the database is opened.** A store told to speak TLS that came up without it would
+    // serve in the clear on a port an operator believes is protected (ADR 0055).
+    let tls = options.tls.build()?;
+    if tls.is_enabled() {
+        println!(
+            "esker server: the RPC links speak TLS{}",
+            if tls.is_mutual() {
+                " with client certificates"
+            } else {
+                ""
+            }
+        );
+    }
+
     // A replicated store's transport tasks and ticker live in a runtime, so the runtime is
     // built before the store rather than after it.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -162,7 +180,13 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
                 .map_err(|error| format!("`--peer {id}@{address}` is not an address: {error}"))?;
             peers.push(PeerAddress::new(*id, *id, addr));
         }
-        Some(RaftOptions::new(peers, options.seed))
+        // The same configuration the listener uses, so a store cannot end up encrypting what its
+        // clients see while speaking to its peers in the clear — the half-configured state this
+        // whole surface refuses (ADR 0055).
+        Some(RaftOptions {
+            tls: tls.clone(),
+            ..RaftOptions::new(peers, options.seed)
+        })
     };
 
     // Connecting is lazy, so a placement driver that is not up yet fails the *bootstrap* with
@@ -267,8 +291,12 @@ async fn serve(
     options: &ServerOptions,
 ) -> Result<(), String> {
     let service = StoreService::new(Arc::clone(&store));
+    // `run` already validated and reported these; building them again here is cheaper than
+    // threading the value through and cannot disagree, because the flags are the same flags.
+    let tls = options.tls.build()?;
     let server = Server::bind(address, service, TransportConfig::new())
         .await
+        .map(|server| server.with_tls(tls))
         .map_err(|error| format!("listening on {address}: {error}"))?;
     let bound = server
         .local_addr()

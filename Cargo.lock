@@ -427,6 +427,8 @@ dependencies = [
  "esker-base",
  "esker-raft",
  "proptest",
+ "rustls",
+ "rustls-graviola",
  "thiserror",
  "tokio",
  "tracing",

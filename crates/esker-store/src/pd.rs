@@ -197,6 +197,19 @@ impl FakePd {
         self.lock().operators.insert(operator.region_id(), operator);
     }
 
+    /// Whether an operator for `region_id` is still waiting to be handed out.
+    ///
+    /// [`region_heartbeat`](PdClient::region_heartbeat) removes an operator as it returns it, so
+    /// this going false is the evidence that a store has **taken** the operator — which is what a
+    /// test asserting "and then nothing happened" needs, and what a wall-clock sleep cannot give
+    /// it. A sleep that ends before the store has fetched the operator makes the assertion pass
+    /// without the store having considered it at all: green, and about nothing
+    /// (`docs/plans/debt-c6.md` §11).
+    #[must_use]
+    pub fn operator_pending(&self, region_id: u64) -> bool {
+        self.lock().operators.contains_key(&region_id)
+    }
+
     /// Forgets the heartbeats so far, so a test can assert about one window.
     pub fn clear_beats(&self) {
         let mut state = self.lock();

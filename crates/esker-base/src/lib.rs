@@ -25,6 +25,7 @@
 pub mod crc32c;
 pub mod hash;
 pub mod hmac;
+pub mod pem;
 pub mod rng;
 pub mod sha256;
 pub mod varint;

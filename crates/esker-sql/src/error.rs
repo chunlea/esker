@@ -220,6 +220,35 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// A row wait that ran out of `lock_timeout`.
+    ///
+    /// **`55P03`, and PostgreSQL's own sentence** — the same code `FOR UPDATE NOWAIT` answers and
+    /// a *different* sentence, measured: `NOWAIT` says `could not obtain lock on row in relation
+    /// "x"` and a timeout says this. One code, two conditions, two messages.
+    #[error("canceling statement due to lock timeout")]
+    LockTimeout,
+
+    /// Two transactions waiting for each other's rows. **`40P01`**, and exactly one of them gets
+    /// it — measured on PostgreSQL 19, where the survivor's *both* updates landed.
+    ///
+    /// PostgreSQL's `DETAIL` names the two backend processes and the two transactions; this node
+    /// says the sentence and not the detail, which is declared rather than invented.
+    #[error("deadlock detected")]
+    Deadlock,
+
+    /// **Not an answer — a signal**, caught at the statement boundary and never seen by a client.
+    ///
+    /// A writer that had to wait for the row in front of it has, by the time it gets the lock,
+    /// already read a version somebody else has replaced. `n + 100` over a row that moved from 10
+    /// to 11 while this statement waited is **111** on a real server, and applying the value this
+    /// statement already computed would answer 110 — a lost update wearing a successful commit.
+    /// So the statement is undone to its implicit savepoint and re-run at a fresh read timestamp
+    /// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    ///
+    /// It reaches a client only if something forgot to catch it, which is why it says so.
+    #[error("a statement that waited for a row lock was not restarted")]
+    StatementMustRestart,
+
     /// `SET SESSION AUTHORIZATION <name>` on a node that has no roles.
     ///
     /// **`22023`, not `42704`** — measured, and it is not the class the same condition takes
@@ -314,6 +343,21 @@ pub enum SqlError {
         index: String,
         /// The table it is on.
         table: String,
+    },
+
+    /// `DROP TABLE`/`DROP VIEW` of something a view is built on: `2BP01`, unless `CASCADE`.
+    ///
+    /// **A view is a dependency of its base relation, not a copy of it.** Without this edge the
+    /// base could be dropped and the view left naming a relation that is gone — the same shape as
+    /// a name record outliving its object, reached from an ordinary `DROP TABLE`.
+    #[error("cannot drop {kind} {name} because other objects depend on it")]
+    ViewDependsOnRelation {
+        /// `table` or `view` — what is being dropped.
+        kind: &'static str,
+        /// Its name, unquoted the way PostgreSQL writes it in this sentence.
+        name: String,
+        /// `view v_plain depends on table vb` — the `DETAIL`, naming the first dependent found.
+        detail: String,
     },
 
     /// No such column.
@@ -758,6 +802,20 @@ pub enum SqlError {
         column: String,
         /// The target type.
         target: String,
+    },
+
+    /// A `UNIQUE` index that cannot be **built**, because the rows already there break it: `23505`.
+    ///
+    /// **A different sentence from the one an `INSERT` gets**, and deliberately: nothing was
+    /// inserted. PostgreSQL says `could not create unique index "…"` here and `duplicate key value
+    /// violates unique constraint "…"` there, both `23505`, and `ALTER TABLE … ADD CONSTRAINT …
+    /// UNIQUE` uses *this* one because what it does is build an index.
+    #[error("could not create unique index \"{index}\"")]
+    CouldNotCreateUniqueIndex {
+        /// The index or constraint being built.
+        index: String,
+        /// `Key (a)=(5) is duplicated.` — the first duplicate found, for the `DETAIL` field.
+        detail: String,
     },
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
@@ -1827,6 +1885,10 @@ pub enum SqlError {
         relation: String,
     },
 
+    /// What a `CASCADE` took: a **notice**, one per view, in PostgreSQL's own wording.
+    #[error("drop cascades to view {0}")]
+    CascadeDropsView(String),
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -2116,11 +2178,14 @@ impl SqlError {
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
+            SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
+            SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
@@ -2169,7 +2234,8 @@ impl SqlError {
             SqlError::DuplicateColumn(_)
             | SqlError::DuplicateColumnInRelation { .. }
             | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
-            SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
+            SqlError::CouldNotCreateUniqueIndex { .. }
+            | SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
             SqlError::ColumnContainsNulls { .. }
             | SqlError::NotNullViolation(_)
             | SqlError::NotNullViolationInRelation { .. } => {
@@ -2266,7 +2332,8 @@ impl SqlError {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
             SqlError::NoUniqueConstraintForReference(_) => sqlstate::INVALID_FOREIGN_KEY,
-            SqlError::DependentObjectsStillExist { .. }
+            SqlError::ViewDependsOnRelation { .. }
+            | SqlError::DependentObjectsStillExist { .. }
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
@@ -2324,7 +2391,9 @@ impl SqlError {
             SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
             SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
-            SqlError::Internal(_) => sqlstate::INTERNAL_ERROR,
+            // `StatementMustRestart` is a signal, not an answer — it reaches a client only if
+            // something forgot to catch it, which is exactly an internal error.
+            SqlError::Internal(_) | SqlError::StatementMustRestart => sqlstate::INTERNAL_ERROR,
         }
     }
 
@@ -2341,6 +2410,7 @@ impl SqlError {
             | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::CascadeDropsColumn { .. }
+            | SqlError::CascadeDropsView(_)
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::Raised { severity, .. } => *severity,
             SqlError::ActiveTransaction
@@ -2398,7 +2468,9 @@ impl SqlError {
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
-            SqlError::DependentType { detail, .. }
+            SqlError::CouldNotCreateUniqueIndex { detail, .. }
+            | SqlError::ViewDependsOnRelation { detail, .. }
+            | SqlError::DependentType { detail, .. }
             | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
@@ -2545,7 +2617,8 @@ impl SqlError {
             | SqlError::DependentConstraint { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentType { .. }
-            | SqlError::DependentFunction { .. } => {
+            | SqlError::DependentFunction { .. }
+            | SqlError::ViewDependsOnRelation { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),

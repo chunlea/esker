@@ -272,6 +272,15 @@ Server options:
       --adopt-sst-store Claim an --sst-store prefix that already holds objects but
                         no claim marker, instead of refusing. Only do this when you
                         know no other database is using those objects
+      --rpc-tls-cert PATH, --rpc-tls-key PATH, --rpc-tls-ca PATH
+                        Speak TLS on the RPC port: this store's PEM certificate and
+                        key, and the roots that verify whoever connects. All three
+                        or none — two of them is refused rather than serving in the
+                        clear on a port you believe is encrypted (ADR 0055). Needs a
+                        binary built with --features tls
+      --rpc-tls-mutual  Also require a certificate from whoever connects, and present
+                        one when connecting out. For links where both ends are yours.
+                        It authenticates the peer; it does not yet authorise it
       --pd LIST         The placement driver to register with and report to, as one
                         HOST:PORT or several separated by commas — a placement
                         driver is a Raft group of up to three and only its leader
@@ -304,6 +313,13 @@ Pd options:
                             set is memory and dies with the process, so `inspect`
                             cannot show it and this is the only thing that can
       --data-dir PATH       PD's database, for serve and inspect (default ./esker-pd)
+      --rpc-tls-cert PATH, --rpc-tls-key PATH, --rpc-tls-ca PATH, --rpc-tls-mutual
+                            Speak TLS between the members of the group: this member's
+                            PEM certificate and key, and the roots that verify the
+                            others. All three or none. --rpc-tls-mutual requires a
+                            certificate from peers as well as presenting one, which is
+                            what a group whose every end is yours should use. Needs a
+                            binary built with --features tls (ADR 0055)
       --id N                This member's id in its group, for serve (default 1)
       --peers LIST          The whole group as id@host:port, comma-separated, this
                             member included, when FOUNDING a group. Every member is
@@ -896,6 +912,19 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
                     });
                 }
             }
+            "--rpc-tls-cert" => {
+                serve.tls.cert =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-cert")?.into());
+            }
+            "--rpc-tls-key" => {
+                serve.tls.key =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-key")?.into());
+            }
+            "--rpc-tls-ca" => {
+                serve.tls.ca =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-ca")?.into());
+            }
+            "--rpc-tls-mutual" => serve.tls.mutual = true,
             "--peers" => {
                 serve.peers = take_value(arguments, &mut index, inline, "--peers")?;
             }
@@ -1125,6 +1154,19 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                     value: raw.clone(),
                 })?;
             }
+            "--rpc-tls-cert" => {
+                options.tls.cert =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-cert")?.into());
+            }
+            "--rpc-tls-key" => {
+                options.tls.key =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-key")?.into());
+            }
+            "--rpc-tls-ca" => {
+                options.tls.ca =
+                    Some(take_value(arguments, &mut index, inline, "--rpc-tls-ca")?.into());
+            }
+            "--rpc-tls-mutual" => options.tls.mutual = true,
             "--pd" => {
                 let raw = take_value(arguments, &mut index, inline, "--pd")?;
                 if raw.is_empty() {
