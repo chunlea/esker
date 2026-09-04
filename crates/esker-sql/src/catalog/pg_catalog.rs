@@ -23,10 +23,13 @@
 //! **A short `pg_type` costs a client nothing it can see, and this node never sends an OID that is
 //! not in it.** `tests/corpus/pg19_pg_catalog.txt` carries the argument beside the rows.
 //!
-//! **`pg_range` is empty**, because this node has no range types, and it has no `oid` column —
-//! which is not an omission but the capture: `SELECT oid FROM pg_range` is `42703` on a real
-//! server, and that is what makes `ActiveRecord`'s `LEFT JOIN pg_range AS r ON oid = rngtypid`
-//! legal with an unqualified `oid`. A `pg_range` given an `oid` would make that statement `42702`.
+//! **`pg_range` has a row per range type and no `oid` column.** It was empty while this node had
+//! no range types; it cannot be now, because `ActiveRecord`'s boot query is
+//! `pg_type LEFT JOIN pg_range ON oid = rngtypid` and a range type whose `rngsubtype` comes back
+//! NULL is one it does not register — a `floatrange` column would then hand a client the raw text.
+//! The missing `oid` column is not an omission but the capture: `SELECT oid FROM pg_range` is
+//! `42703` on a real server, and that is what makes that unqualified `oid` legal. A `pg_range`
+//! given an `oid` would make the same statement `42702`.
 //!
 //! # Read-only, and the refusal is `42501`
 //!
@@ -663,6 +666,7 @@ impl CatalogView {
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
+            CatalogView::PgRange => pg_range_rows(txn, tenant),
             CatalogView::PgEnum => pg_enum_rows(txn, tenant),
             CatalogView::PgDepend => pg_depend_rows(txn, tenant),
             CatalogView::PgSequence => pg_sequence_rows(txn, tenant),
@@ -1408,6 +1412,51 @@ fn pg_enum_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
     Ok(rows)
 }
 
+/// Every `pg_range` row: one per range type, built-in or this tenant's own.
+///
+/// **It was empty until this node had range types**, which the module note above still described.
+/// It cannot stay empty now: `ActiveRecord`'s boot query is
+/// `pg_type LEFT JOIN pg_range ON oid = rngtypid`, and a range type whose `rngsubtype` comes back
+/// NULL is one it does not register — so a `floatrange` column would hand a client the raw text
+/// instead of a range, which is the whole of what `range_test.rb` reads back.
+///
+/// `rngsubtype` is the subtype's **own** oid and not the one this node reads its bounds with:
+/// `int4range` reports `integer` on a real server even though every integer here is an `i64`.
+/// `rngcanonical` and `rngsubdiff` are not columns of this view — nothing reads them — for the
+/// reason `oid` is not one either (see the module note).
+fn pg_range_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let builtin = [
+        (ColumnType::TsRange, ColumnType::Timestamp),
+        (ColumnType::TstzRange, ColumnType::TimestampTz),
+        (ColumnType::Int4Range, ColumnType::Int4),
+        (ColumnType::DateRange, ColumnType::Date),
+        (ColumnType::NumRange, ColumnType::Numeric),
+        (ColumnType::Int8Range, ColumnType::Int8),
+    ];
+    let mut rows: Vec<Vec<Datum>> = builtin
+        .into_iter()
+        .map(|(range, subtype)| {
+            vec![
+                Datum::Int8(i64::from(range.oid())),
+                Datum::Int8(i64::from(subtype.oid())),
+            ]
+        })
+        .collect();
+    for def in super::user_types(txn, tenant)? {
+        if let super::TypeKind::Range { subtype, .. } = def.kind {
+            rows.push(vec![
+                Datum::Int8(super::pg_relations::as_oid(def.oid)),
+                Datum::Int8(i64::from(subtype.oid())),
+            ]);
+        }
+    }
+    rows.sort_by_key(|row| match row.first() {
+        Some(Datum::Int8(oid)) => *oid,
+        _ => 0,
+    });
+    Ok(rows)
+}
+
 /// Every `pg_type` row: the built-in types, then this tenant's own.
 ///
 /// The built-ins are derived from `ColumnType::ALL` rather than written out, so a type cannot be
@@ -1684,6 +1733,12 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::DateRange => "daterange",
         ColumnType::NumRange => "numrange",
         ColumnType::Int8Range => "int8range",
+        // **No row of their own.** These two are the representation a user-defined range type
+        // gets, and its `pg_type` row is written by `user_type_rows` under the name the
+        // `CREATE TYPE` gave it — `ColumnType::ALL`, which is what this view iterates, leaves
+        // them out for exactly that reason. What is here is the fallback a debugger sees.
+        ColumnType::FloatRange => "float8range",
+        ColumnType::VarcharRange => "varcharrange",
         ColumnType::Point => "point",
         ColumnType::PointArray => "_point",
         ColumnType::TstzRangeArray => "_tstzrange",
@@ -1736,7 +1791,9 @@ fn typtype(ty: ColumnType) -> &'static str {
         | ColumnType::Int4Range
         | ColumnType::DateRange
         | ColumnType::NumRange
-        | ColumnType::Int8Range => "r",
+        | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => "r",
         _ => "b",
     }
 }
@@ -1786,7 +1843,8 @@ fn typcategory(ty: ColumnType) -> &'static str {
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`.
         ColumnType::Point => "G",
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => "R",
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+        | ColumnType::FloatRange | ColumnType::VarcharRange => "R",
     }
 }
 
@@ -1848,6 +1906,11 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::DateRange => "daterange_in",
         ColumnType::NumRange => "numrange_in",
         ColumnType::Int8Range => "int8range_in",
+        // **`range_in` for a user-defined range**, measured: a real server's `floatrange` has
+        // `typinput = range_in`, not `floatrange_in` — the input function belongs to the range
+        // *machinery* and reads the subtype out of `pg_range`. These two have no row of their
+        // own here (see `typname`); `user_type_rows` is where a `floatrange` gets one.
+        ColumnType::FloatRange | ColumnType::VarcharRange => "range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

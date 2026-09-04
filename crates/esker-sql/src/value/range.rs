@@ -366,6 +366,14 @@ fn bound(chars: &[char], at: &mut usize, whole: &str) -> Result<Option<String>> 
                     out.push(chars[*at + 1]);
                     *at += 2;
                 }
+                // **A doubled quote is one quote**, not the end of the bound — the rule every
+                // quoted PostgreSQL literal shares. `range_test.rb`'s own escaped row is
+                // `["ca""t","do\\g")`, whose lower bound is `ca"t`, and reading the second `"`
+                // as the closing one made that value `22P02 malformed range literal`.
+                '"' if chars.get(*at + 1) == Some(&'"') => {
+                    out.push('"');
+                    *at += 2;
+                }
                 '"' => {
                     *at += 1;
                     return Ok(Some(out));
@@ -413,8 +421,15 @@ fn quote_bound(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for ch in text.chars() {
-        if ch == '"' || ch == '\\' {
-            out.push('\\');
+        // **The two are escaped differently**, measured: a bound of `ca"t` prints `"ca""t"` and a
+        // bound of `do\g` prints `"do\\g"` — the quote is *doubled* and the backslash is
+        // backslash-escaped. Escaping both the same way round-trips and still prints a value no
+        // real server prints, which is the trap `quote_bound`'s "quote only what needs it"
+        // comment already warns about one level up.
+        match ch {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            _ => {}
         }
         out.push(ch);
     }
@@ -428,7 +443,7 @@ mod range_tests {
     //! corpus cannot run until a column can hold one and these can run now.
 
     use super::{Range, from_text};
-    use crate::value::ColumnType;
+    use crate::value::{ColumnType, Datum};
 
     fn round(subtype: ColumnType, text: &str) -> String {
         from_text(subtype, text).unwrap().to_text()
@@ -529,6 +544,30 @@ mod range_tests {
         assert_eq!(
             nonsense.detail().as_deref(),
             Some("Missing left parenthesis or bracket.")
+        );
+    }
+
+    /// **A quoted bound doubles its quote and escapes its backslash**, and the two are different
+    /// characters doing different things.
+    ///
+    /// `range_test.rb`'s own escaped row is `'["ca""t","do\\g")'`, whose bounds are `ca"t` and
+    /// `do\g` — the one place in that file where the *text* of a range is the assertion. Reading
+    /// the second `"` of `""` as the end of the bound made the whole literal
+    /// `22P02 malformed range literal`, and escaping the quote on the way back out as `\"`
+    /// round-tripped through this node and printed a value no real server prints.
+    #[test]
+    fn a_quoted_bound_round_trips_through_the_escapes_postgresql_uses() {
+        let range = from_text(ColumnType::Varchar, r#"["ca""t","do\\g")"#).unwrap();
+        assert_eq!(range.lower, Some(Datum::Text("ca\"t".to_owned())));
+        assert_eq!(range.upper, Some(Datum::Text("do\\g".to_owned())));
+        assert_eq!(range.to_text(), r#"["ca""t","do\\g")"#);
+
+        // And a bound that needs no quotes keeps none, which is the rule one level up.
+        assert_eq!(round(ColumnType::Varchar, "[a,b]"), "[a,b]");
+        // Whitespace is a character a `varchar` keeps and a reason to quote.
+        assert_eq!(
+            round(ColumnType::Varchar, r#"["a b","c d")"#),
+            r#"["a b","c d")"#
         );
     }
 }

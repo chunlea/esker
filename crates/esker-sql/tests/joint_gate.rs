@@ -442,9 +442,37 @@ impl Gate {
     /// *rule* with the columnar path and none of its code, which is what makes the comparison
     /// worth making (`docs/plans/phase-8-learner.md`, RULED-2).
     fn row_scan(&self, ts: u64, table_id: u64, projection: &[u32]) -> Vec<Vec<Cell>> {
-        let txn = self.backend.begin_at(ts).unwrap();
         let (start, end) = esker_keys::row::table_row_range(TENANT, table_id);
-        let pairs = txn.scan(&start, &end, 1024).unwrap();
+        // **A read here can be a write, which is why it retries.** The lock-TTL test's scan meets
+        // a standing lock and *resolves* it — a `TxnRollback` or a roll-forward proposed from
+        // inside the read — and a proposal whose leader steps down before it commits is answered
+        // `OutcomeUnknown`. That is the honest answer and the reason `settle` exists for this
+        // file's writes; the scan needed the same treatment and had a one-shot `unwrap`, which
+        // made "leadership does not move" a silent precondition of a test *about* a resolver.
+        //
+        // Re-reading is what a client does and is safe whatever the ambiguous attempt did: the
+        // resolution is idempotent, and a lock already resolved by the lost attempt simply is not
+        // there on the retry. Seen twice under `cargo test --workspace` and never alone, which is
+        // the shape this file has now met three times.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (txn, pairs) = loop {
+            let txn = self.backend.begin_at(ts).unwrap();
+            match txn.scan(&start, &end, 1024) {
+                Ok(pairs) => break (txn, pairs),
+                Err(
+                    error @ (esker_sql::SqlError::OutcomeUnknown(_)
+                    | esker_sql::SqlError::StoreUnavailable(_)),
+                ) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the row scan never settled: {error}"
+                    );
+                    let _ = txn.rollback();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => panic!("the row scan failed: {error}"),
+            }
+        };
         let schema = {
             let view = self.catalog.view(&*txn, TENANT).unwrap();
             view.table("t").unwrap().unwrap().row_schema()

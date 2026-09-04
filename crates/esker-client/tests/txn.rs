@@ -1525,3 +1525,43 @@ fn both_clients_can_share_one_router() {
     assert_eq!(txn.get(b"k").unwrap(), None);
     assert_eq!(transport.methods(), vec![Method::RawGet, Method::TxnGet]);
 }
+
+/// **A key two statements wrote carries the FIRST statement's read timestamp**
+/// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md) §4).
+///
+/// The stamp says which snapshot the value was computed from, and the prewrite validates against
+/// it. A second statement writing a key this transaction already wrote reads the value back from
+/// the **buffer** — read-your-writes — so it computes from the *earlier* statement's snapshot and
+/// never saw the later one. Overwriting the stamp claims it did, and the prewrite then looks for
+/// conflicts after a moment too late to find them: that is a commit over somebody else's version
+/// with no error, which is what run 66 measured in the SQL layer's own buffer.
+///
+/// The same defect lives here, one layer down, and it is dormant only because nothing calls
+/// [`Transaction::reading_at`] per statement yet. `StoreTxn` is about to.
+#[test]
+fn a_key_written_twice_keeps_the_earlier_statements_read_timestamp() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.reading_at(at_ms(101_000));
+    txn.put(b"k", b"1");
+    // A later statement, at a later snapshot, writing the same key from the buffered value.
+    txn.reading_at(at_ms(102_000));
+    txn.put(b"k", b"2");
+    txn.commit().unwrap();
+
+    match nth_txn(&transport, 0) {
+        TxnKvReq::Prewrite { mutations, .. } => assert_eq!(
+            mutations,
+            vec![TxnMutation::Put {
+                key: key(b"k"),
+                value: key(b"2"),
+                read_ts: Some(at_ms(101_000)),
+            }],
+            "the value is the later one and the snapshot it came from is the earlier one"
+        ),
+        other => panic!("{other:?}"),
+    }
+}

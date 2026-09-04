@@ -185,6 +185,8 @@ impl Aggregation {
                 | ColumnType::DateRange
                 | ColumnType::NumRange
                 | ColumnType::Int8Range
+                | ColumnType::FloatRange
+                | ColumnType::VarcharRange
                 | ColumnType::TsRangeArray
                 | ColumnType::TstzRangeArray
                 | ColumnType::Int4RangeArray

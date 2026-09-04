@@ -172,6 +172,24 @@ pub enum ColumnType {
     NumRange,
     /// `int8range`. Discrete like `int4range`: `[10,100]` comes back `[10,101)`.
     Int8Range,
+    /// A range over `float8`, which is **no PostgreSQL type at all** — it is the representation a
+    /// user-defined `CREATE TYPE … AS RANGE (subtype = float8)` gets.
+    ///
+    /// `range_test.rb`'s own `floatrange` is the reason it exists, and the name here is the
+    /// *subtype*, not that type: two different user types over `float8` share this representation
+    /// and stay two types, exactly as two enums share `int2` and stay two (ADR 0050). Which one a
+    /// column is comes from `esker_sql::catalog::ColumnDef::user_type`, and every name a client
+    /// sees comes from the catalog with it.
+    ///
+    /// **Continuous, so it does not canonicalise**: `[0.5,0.7]` comes back `[0.5,0.7]`, measured
+    /// beside `numrange`'s.
+    FloatRange,
+    /// A range over `varchar`, the other half of the same statement —
+    /// `CREATE TYPE stringrange AS RANGE (subtype = varchar)`, which the same `setup` runs.
+    ///
+    /// **The bounds are quoted text**, which no other range here has needed: `'["ca""t","do\\g")'`
+    /// round-trips byte for byte on a real server and the suite asserts exactly that value.
+    VarcharRange,
     /// `tstzrange[]`. **`range_test.rb` declares two range arrays, not one** — `ts_ranges` and
     /// `tstz_ranges` — and an array type is built per element type, so three of the four left the
     /// file's 46 tests exactly where they were.
@@ -326,7 +344,12 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    /// Every type, for tests that must not silently skip one.
+    /// Every type **that has a `pg_type` row of its own**, for tests that must not silently skip
+    /// one — and for the catalog, which derives that view from this list.
+    ///
+    /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
+    /// representations of a user-defined type rather than types, and whose `pg_type` row is
+    /// written by the `CREATE TYPE` that made them.
     pub const ALL: [ColumnType; 58] = [
         ColumnType::Int8,
         ColumnType::Int4,
@@ -387,6 +410,21 @@ impl ColumnType {
         ColumnType::Point,
         ColumnType::PointArray,
     ];
+
+    /// The range representations a **user-defined** type gets, which are deliberately *not* in
+    /// [`ColumnType::ALL`].
+    ///
+    /// `ALL` is every type that has a `pg_type` row of its own, and everything derived from it
+    /// says so: `esker_sql`'s `pg_type` view, `'name'::regtype`, `type_by_oid` for a parameter's
+    /// declared oid. A `floatrange` has a `pg_type` row too — written by the `CREATE TYPE` that
+    /// made it, with the oid that statement allocated — so putting these two in `ALL` would give
+    /// it a *second* row, named after the subtype and with oid `0`, and would make
+    /// `'float8range'::regtype` resolve where a real server answers `42704`.
+    ///
+    /// They are listed here so the codec's round-trip properties can still reach them: a type
+    /// nothing generates is a type whose encoding is unchecked, which is how `range_subtype` came
+    /// to have two copies that disagreed.
+    pub const USER_RANGES: [ColumnType; 2] = [ColumnType::FloatRange, ColumnType::VarcharRange];
 }
 
 /// One column's value, or its absence.
@@ -606,6 +644,8 @@ impl Datum {
                 ColumnType::Int4 | ColumnType::Int8 => ColumnType::Int4Range,
                 ColumnType::Date => ColumnType::DateRange,
                 ColumnType::Numeric => ColumnType::NumRange,
+                ColumnType::Double => ColumnType::FloatRange,
+                ColumnType::Varchar => ColumnType::VarcharRange,
                 _ => ColumnType::TsRange,
             },
             Datum::Int4(_) => ColumnType::Int4,

@@ -649,11 +649,27 @@ fn a_star_expands_to_every_column_of_the_view() {
         "one row per type this server has, and the catalog cannot fall behind the enum"
     );
 
-    // `pg_range` is empty, so its columns can only be read off the description.
+    // **`pg_range` was empty until this node had range types**, and this assertion said so. It
+    // has six now — one per built-in range — and each carries the subtype's **own** oid, which is
+    // not the one this node reads its bounds with: `int4range` reports `integer` (23) where every
+    // integer here is an `i64`. `ActiveRecord`'s boot query is
+    // `pg_type LEFT JOIN pg_range ON oid = rngtypid` and a NULL `rngsubtype` is a range type it
+    // does not register, so these rows are what make a user-defined range readable at all.
     match node.answer("SELECT * FROM pg_range") {
         parity::Answer::Rows { types, rows } => {
-            assert!(rows.is_empty(), "pg_range has no rows here");
             assert_eq!(types.len(), 2, "rngtypid and rngsubtype, and no `oid`");
+            assert_eq!(
+                rows,
+                vec![
+                    vec!["3904".to_owned(), "23".to_owned()],
+                    vec!["3906".to_owned(), "1700".to_owned()],
+                    vec!["3908".to_owned(), "1114".to_owned()],
+                    vec!["3910".to_owned(), "1184".to_owned()],
+                    vec!["3912".to_owned(), "1082".to_owned()],
+                    vec!["3926".to_owned(), "20".to_owned()],
+                ],
+                "int4range, numrange, tsrange, tstzrange, daterange, int8range, in oid order"
+            );
         }
         other => panic!("SELECT * FROM pg_range answered {other}"),
     }
