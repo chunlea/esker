@@ -153,6 +153,18 @@ pub struct ColumnDef {
     /// rather than a flag beside [`ColumnDef::default`] — the two are read by different columns of
     /// different views, and a writer may not supply a value for this one at all.
     pub generated: Option<String>,
+    /// Whether that expression was declared `VIRTUAL` rather than `STORED`.
+    ///
+    /// **A statement about storage, not about answers.** The two kinds are indistinguishable from
+    /// SQL except in `pg_attribute.attgenerated` (`v` against `s`) — same values, same recompute
+    /// on `UPDATE`, same refusal of a non-DEFAULT write. So this node computes and stores both and
+    /// reports the letter that was written, and the divergence is where the bytes live: nothing in
+    /// SQL can see it, because a generated expression reads only its own row and any change to
+    /// that row recomputes it.
+    ///
+    /// **The keyword-less form is virtual**, measured on PostgreSQL 19 — it meant *stored* before
+    /// PostgreSQL 18, so the old rule read from memory would have this backwards.
+    pub generated_virtual: bool,
     /// `COMMENT ON COLUMN t.c IS '…'`, or `None` for a column that has none.
     ///
     /// **`None` and the empty string are the same thing**, which is not a shortcut: PostgreSQL
@@ -732,6 +744,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         default: None,
         missing: None,
         generated: None,
+        generated_virtual: false,
         comment: None,
         user_type: None,
         dropped: false,
@@ -3780,6 +3793,7 @@ mod tests {
                     default: None,
                     missing: None,
                     generated: None,
+                    generated_virtual: false,
                     comment: None,
                     dropped: false,
                     user_type: None,
@@ -3793,6 +3807,7 @@ mod tests {
                     default: None,
                     missing: None,
                     generated: None,
+                    generated_virtual: false,
                     comment: None,
                     dropped: false,
                     user_type: None,
@@ -3850,7 +3865,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1c",               // catalog format version
+                "1d",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3943,7 +3958,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1c",       // catalog format version
+                "1d",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4025,7 +4040,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1c",                 // catalog format version
+                "1d",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4065,7 +4080,11 @@ mod tests {
                 "00", // version 10: no FOREIGN KEY constraints
                 "00", // version 11: the one index is not NULLS NOT DISTINCT
                 "00", // version 12: its triggers have not been disabled
-                "00", // version 13: neither column is generated
+                // Version 13, and version 29 beside it: the expression, then the kind. Neither
+                // column is generated, so both are the empty string and the stored flag.
+                "00",
+                "00",
+                "00",
                 "00",
                 // Version 14. One string per column again, and empty for both: neither default
                 // stays an expression, which is what the two `no DEFAULT` bytes above already
@@ -4580,6 +4599,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -4593,6 +4613,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -4606,6 +4627,7 @@ mod tests {
             default: None,
             missing: None,
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -5280,6 +5302,7 @@ mod tests {
             default: Some(Datum::Int8(42)),
             missing: Some(Datum::Int8(42)),
             generated: None,
+            generated_virtual: false,
             comment: None,
             dropped: false,
             user_type: None,
@@ -5329,7 +5352,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1c",               // catalog format version
+                "1d",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

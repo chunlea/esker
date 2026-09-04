@@ -114,6 +114,31 @@ impl Parsed {
                 )?);
             }
         }
+        // Which generated columns were `VIRTUAL`: the rewritten tree says `STORED` for all of
+        // them, so the flags are applied here, in the order the clauses appeared in the source.
+        // The lowering walks a table's columns in that same order, which is what makes an index
+        // into the flag list line up with a column.
+        let mut virtual_flags = self.virtual_generated().iter().copied();
+        let mut mark = |columns: &mut Vec<plan::Column>| {
+            for column in columns {
+                if column.generated.is_some() {
+                    column.generated_virtual = virtual_flags.next().unwrap_or(false);
+                }
+            }
+        };
+        match &mut lowered {
+            plan::Statement::CreateTable(create) => mark(&mut create.columns),
+            plan::Statement::AlterTable(alter) => {
+                for action in &mut alter.actions {
+                    if let plan::AlterTableAction::AddColumn { column, .. } = action
+                        && column.generated.is_some()
+                    {
+                        column.generated_virtual = virtual_flags.next().unwrap_or(false);
+                    }
+                }
+            }
+            _ => {}
+        }
         // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
         // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
         if let plan::Statement::CreateType(create) = &mut lowered {
@@ -1969,6 +1994,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             default,
             sequence,
             generated,
+            // Applied by `Parsed::lower`, which is the only place that can see which spelling the
+            // source used: the tree it lowers says `STORED` for every one of them.
+            generated_virtual: false,
         });
     }
 
@@ -2226,6 +2254,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         )?;
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
+        let mut generated: Option<String> = None;
         let mut default = None;
         for option in &column_def.options {
             let named = match &option.option {
@@ -2262,6 +2291,33 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 }
                 ColumnOption::NotNull => {
                     not_null = true;
+                    continue;
+                }
+                // A generated column added by `ALTER`, which is what `t.virtual` sends when a
+                // migration adds one. The expression is lowered the same way `CREATE TABLE`'s is;
+                // the executor computes it for the rows already there.
+                ColumnOption::Generated {
+                    generated_as,
+                    sequence_options,
+                    generation_expr,
+                    generation_expr_mode,
+                    ..
+                } => {
+                    match lower_generated(
+                        *generated_as,
+                        sequence_options.as_deref(),
+                        generation_expr.as_ref(),
+                        generation_expr_mode.as_ref(),
+                    )? {
+                        Ok(expr) => generated = Some(expr),
+                        // An identity column added by `ALTER` is its own feature: it needs a
+                        // sequence and a value for every row already there.
+                        Err(_) => {
+                            return Err(SqlError::unsupported(
+                                "ALTER TABLE ... ADD COLUMN ... GENERATED AS IDENTITY",
+                            ));
+                        }
+                    }
                     continue;
                 }
                 ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
@@ -2303,7 +2359,8 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // `ADD COLUMN … GENERATED ALWAYS AS (…) STORED` would have to compute the
                 // expression for every row already there, which is a backfill and not a catalog
                 // write — refused by name with every other option this action does not take.
-                generated: None,
+                generated,
+                generated_virtual: false,
             },
             if_not_exists: *if_not_exists,
         });
@@ -3825,18 +3882,14 @@ fn lower_generated(
     let Some(expr) = generation_expr else {
         return Ok(Err(identity_kind(generated_as, sequence_options, None)?));
     };
-    // `VIRTUAL` computes on read where `STORED` computes on write, so a node that took the word
-    // and stored anyway would answer the same value after the source changed under it. Named
-    // rather than approximated.
-    //
-    // **Currently unreachable, and kept anyway**: `sqlparser` 0.62.0 expects `STORED` and makes
-    // `VIRTUAL` a syntax error, which is a contract C1 gap in the plan's register — PostgreSQL 19
-    // takes the word and reports `attgenerated` `v`. This is what the day the parser learns it
-    // needs.
-    refuse_if(
-        matches!(mode, Some(sqlparser::ast::GeneratedExpressionMode::Virtual)),
-        "GENERATED ALWAYS AS (expression) VIRTUAL",
-    )?;
+    // **`VIRTUAL` is not refused, and the old argument for refusing it was wrong.** It read: a
+    // node that took the word and stored anyway "would answer the same value after the source
+    // changed under it". It would not — a generated expression reads only its own row, so any
+    // change to the source rewrites the row and recomputes. Measured: the two kinds agree on every
+    // query, on `UPDATE`, and on refusing a non-DEFAULT write, and differ only in
+    // `pg_attribute.attgenerated`. The word reaches here as `STORED` anyway
+    // (`crate::parse::strip_virtual_generated`); which one was written travels on `Parsed`.
+    let _ = mode;
     refuse_if(
         generated_as == GeneratedAs::ByDefault,
         "GENERATED BY DEFAULT AS (expression)",
