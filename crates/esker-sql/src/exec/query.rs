@@ -2781,6 +2781,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::DateRangeArray => 54,
             ColumnType::NumRangeArray => 55,
             ColumnType::Int8RangeArray => 56,
+            // **A family of one, and it compares with nothing — not even itself.**
+            // `point = point` is `42883` on a real server, so `Point` joins `Json` in the
+            // early return below; this rank exists so the match stays total.
+            ColumnType::Point => 57,
+            ColumnType::PointArray => 58,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
@@ -2802,9 +2807,16 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // `42883 could not identify an equality operator for type json` — a different sentence
     // from the one above and the same reason: an array's equality is its element's, and
     // `json` has none to lend.
-    if matches!(left, ColumnType::Json | ColumnType::JsonArray)
-        || matches!(right, ColumnType::Json | ColumnType::JsonArray)
-    {
+    // **And `point` with them.** `'(1,2)'::point = '(1,2)'::point` is
+    // `42883 operator does not exist: point = point` — a type with no equality even with
+    // itself, which is why `CREATE INDEX` on one is `42704` and why it is not a key here.
+    if matches!(
+        left,
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point
+    ) || matches!(
+        right,
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point
+    ) {
         return false;
     }
     family(left) == family(right)

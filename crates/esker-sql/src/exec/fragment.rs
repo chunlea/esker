@@ -650,6 +650,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::DateRangeArray
         | Row::NumRangeArray
         | Row::Int8RangeArray
+        | Row::Point
+        | Row::PointArray
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray
@@ -680,7 +682,11 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // a wrong *answer* would be a filter that silently matched.
         // A citext never reaches this either — the column is refused above, for the same reason
         // an array is: this vocabulary has no way to carry a comparison that folds.
-        Datum::Null
+        // A point never reaches this either: `column_type` refuses the column, for the reason
+        // a citext's is refused — this vocabulary has no way to carry a type with no
+        // comparison at all.
+        Datum::Point { .. }
+        | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)
         | Datum::Hstore(_)

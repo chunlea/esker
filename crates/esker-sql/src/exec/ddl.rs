@@ -329,6 +329,22 @@ fn resolve_user_type(
     }
 }
 
+/// **`json` and `point` cannot be indexed**, and they are the only two — measured, one type at a
+/// time, against a real server: `jsonb`, every range, `hstore` and every array all have a default
+/// btree operator class there and index fine.
+///
+/// The message is PostgreSQL's own, HINT included, and it names the *type* because that is what a
+/// client has to change. Without it this node **built the index**: `CREATE INDEX … (j)` on a
+/// `json` column answered `Done` where a real server refuses, and the first write into it then
+/// found the row codec's own "an index key column of type json, jsonb, hstore or a range", which
+/// is an internal corruption error for a table the user was allowed to create.
+fn refuse_unindexable(ty: ColumnType) -> Result<()> {
+    if matches!(ty, ColumnType::Json | ColumnType::Point) {
+        return Err(SqlError::NoDefaultOperatorClass(ty.name()));
+    }
+    Ok(())
+}
+
 /// A `CHECK` added after the fact.
 ///
 /// It bumps the schema version like any other change to the table definition, because every
@@ -3340,10 +3356,13 @@ pub(super) fn create_index(
         .iter()
         .map(|key| {
             let part = match &key.part {
-                plan::KeyPartName::Column(column) => table
-                    .column(column)
-                    .map(KeyPart::Column)
-                    .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?,
+                plan::KeyPartName::Column(column) => {
+                    let at = table
+                        .column(column)
+                        .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?;
+                    refuse_unindexable(table.columns[at].ty)?;
+                    KeyPart::Column(at)
+                }
                 plan::KeyPartName::Expression { expr, shape } => {
                     let (expr, ty) = index_expression(&table, expr)?;
                     KeyPart::Expression {

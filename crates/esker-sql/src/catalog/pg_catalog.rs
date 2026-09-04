@@ -1683,6 +1683,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::DateRange => "daterange",
         ColumnType::NumRange => "numrange",
         ColumnType::Int8Range => "int8range",
+        ColumnType::Point => "point",
+        ColumnType::PointArray => "_point",
         ColumnType::TstzRangeArray => "_tstzrange",
         ColumnType::Int4RangeArray => "_int4range",
         ColumnType::DateRangeArray => "_daterange",
@@ -1778,8 +1780,11 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
+        // **`G` for geometric**, which is neither the `U` an extension type gets nor the
+        // `S` a string does. Measured off `pg_type.typcategory`.
+        ColumnType::Point => "G",
         ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => "R",
     }
 }
@@ -1808,6 +1813,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
+        | ColumnType::PointArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1837,6 +1843,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::TsRange => "tsrange_in",
         ColumnType::TstzRange => "tstzrange_in",
         ColumnType::Int4Range => "int4range_in",
+        ColumnType::Point => "point_in",
         ColumnType::DateRange => "daterange_in",
         ColumnType::NumRange => "numrange_in",
         ColumnType::Int8Range => "int8range_in",
