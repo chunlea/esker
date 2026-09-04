@@ -2954,6 +2954,47 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             left: Box::new(lower_expr(left)?),
             right: Box::new(lower_expr(right)?),
         }),
+        // **`a BETWEEN x AND y` is `a >= x AND a <= y`**, and the rewrite is the whole feature:
+        // every rule a corpus can ask about falls out of it rather than needing one of its own.
+        // The ends are inclusive because `>=` and `<=` are; reversed bounds match nothing because
+        // nothing is both above 3 and below 2; a NULL bound is **three-valued AND** rather than
+        // "NULL anywhere means NULL", so `3 BETWEEN NULL AND 2` is `false` and `1 BETWEEN NULL AND
+        // 2` is NULL; and a type mismatch is `42883 operator does not exist: character varying >=
+        // integer` — a real server's own message, naming `>=` rather than `BETWEEN`, which is what
+        // says PostgreSQL rewrites it too.
+        //
+        // `NOT BETWEEN` is `NOT (…)` around the pair, which inherits the NULL: `1 NOT BETWEEN NULL
+        // AND 2` is NULL and not true. Measured, all of it.
+        //
+        // `BETWEEN SYMMETRIC` is refused by name before the parser sees it
+        // (`crate::parse`'s unsupported list) and stays that way: `sqlparser` 0.62.0's `Between`
+        // has no flag for it, so there is nothing to lower even if the keyword got through.
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let value = lower_expr(expr)?;
+            let pair = plan::Expr::Binary {
+                op: plan::BinaryOp::And,
+                left: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::GtEq,
+                    left: Box::new(value.clone()),
+                    right: Box::new(lower_expr(low)?),
+                }),
+                right: Box::new(plan::Expr::Binary {
+                    op: plan::BinaryOp::LtEq,
+                    left: Box::new(value),
+                    right: Box::new(lower_expr(high)?),
+                }),
+            };
+            Ok(if *negated {
+                plan::Expr::Not(Box::new(pair))
+            } else {
+                pair
+            })
+        }
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
