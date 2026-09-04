@@ -189,3 +189,28 @@ Driving the first step by hand left the region's peer running, and the restarted
 underneath the batch that deleted it. `retire_region` stops the peer before it destroys anything,
 so the test now does too. The failure was the test's, and the reason it is written down is that it
 is also a statement about the production order — the stop is not tidiness, it is a precondition.
+
+### And the same thing with a real `SIGKILL`
+
+`crates/esker-store/tests/retire_crash_kill.rs`, in the shape `crates/esker-engine/tests/crash_kill.rs`
+established: the test binary re-executes itself with `--exact`, so the child is a test in the same
+file and there is no second binary to keep in step. The child opens a store, commits eight keys,
+performs step one of the retirement, **reports that it is durable**, and waits to be killed; the
+parent kills it and starts the store again.
+
+The kill is aimed rather than random, and the file says why: the window is two adjacent synced
+writes, so a signal thrown at a running retirement lands in it about never, and a test that reaches
+its subject about never passes for other reasons. What is arranged is *when* the process dies; that
+it dies, and what it leaves on the filesystem, is real.
+
+It is not a duplicate of the simulated crash. That one is the precise instrument — it can stop
+exactly between the steps — and it proves the recovery logic. This one proves the half about the
+process: that the announcement is on the platter and not in a buffer when the process ceases to
+exist, and that `Store::open` of a database a killed process left behind finishes the job. Red
+without the sweep, with the count the crash really left:
+
+```
+assertion `left == right` failed: a retirement a SIGKILL interrupted left its 8 keys on disk for ever
+  left: [("default", 8), ("lock", 0), ("write", 0)]
+ right: [("default", 0), ("lock", 0), ("write", 0)]
+```
