@@ -52,7 +52,7 @@ use crate::dbformat::{Comparator, InternalKeyComparator};
 /// Zero, and [`SkipList::new`] spends the arena's first word on nothing so that no node can ever
 /// sit there. A fresh chunk of words is all zeros, so an unwritten forward pointer already reads
 /// `NIL` and the writer never has to store it.
-const NIL: u32 = 0;
+pub(super) const NIL: u32 = 0;
 
 /// The head node, at the first offset after the reserved word. Always this, because it is the
 /// second thing [`SkipList::new`] allocates out of an empty arena.
@@ -115,6 +115,10 @@ pub(super) struct SkipList {
     /// How many nodes have been published.
     len: AtomicUsize,
     writer: Mutex<Writer>,
+    /// The ordering [`SkipList::publish`] uses for the store that makes a node reachable.
+    /// `Release` in every build that is not a test; see [`SkipList::with_relaxed_publication`].
+    #[cfg(test)]
+    publication: Memory,
 }
 
 impl SkipList {
@@ -148,7 +152,43 @@ impl SkipList {
                 rng: Pcg32::from_seed(seed),
                 prev: [HEAD; MAX_HEIGHT],
             }),
+            #[cfg(test)]
+            publication: Memory::Release,
         }
+    }
+
+    /// A deliberately broken list: the store that makes a node reachable is `Relaxed`, so a
+    /// reader that sees the node has no happens-before edge to the bytes it names.
+    ///
+    /// ADR 0041 item 3, which the ADR calls not negotiable and which this repository has its
+    /// own lesson about: a checker that has never been shown red is evidence of nothing. The
+    /// checker that can see this is Miri, whose data-race detector implements the C++ model —
+    /// on x86 and on ARM the two orderings compile to instructions that will very likely never
+    /// diverge in a test run, so a thread test passing against this list says nothing at all.
+    ///
+    /// See `relaxed_publication_is_a_data_race` in the tests beside this file for how to run it.
+    #[cfg(test)]
+    pub(super) fn with_relaxed_publication(comparator: Arc<InternalKeyComparator>) -> Self {
+        Self {
+            publication: Memory::Relaxed,
+            ..Self::new(comparator, DEFAULT_SEED)
+        }
+    }
+
+    /// The ordering that publishes a node. Always `Release` outside tests.
+    #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the test build reads a field here; see with_relaxed_publication"
+    )]
+    fn publication(&self) -> Memory {
+        Memory::Release
+    }
+
+    /// The ordering that publishes a node.
+    #[cfg(test)]
+    fn publication(&self) -> Memory {
+        self.publication
     }
 
     /// The comparator this list is ordered by.
@@ -337,6 +377,11 @@ impl SkipList {
             return NIL;
         }
         let found = self.find_lt(self.key(node));
+        // A `find_lt` that answered "the last node at or before" rather than "strictly before"
+        // would return `node` itself, and every backwards walk in the engine would loop
+        // forever rather than fail. That is worth a line to turn into a test failure: an
+        // injected version of exactly this bug hung the suite instead of reddening it.
+        debug_assert_ne!(found, node, "a backwards step landed where it started");
         if found == HEAD { NIL } else { found }
     }
 
@@ -422,7 +467,7 @@ impl SkipList {
                 word.store(after, Memory::Relaxed);
             }
             if let Some(word) = self.words.word(previous.saturating_add(HEADER) + level) {
-                word.store(node, Memory::Release);
+                word.store(node, self.publication());
             }
         }
     }
@@ -447,6 +492,13 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    /// How many entries the bulk tests build. Miri interprets every instruction, so a run
+    /// sized for a native build would take hours there and get skipped instead of run.
+    #[cfg(miri)]
+    const BULK: u64 = 60;
+    #[cfg(not(miri))]
+    const BULK: u64 = 3000;
+
     fn list() -> SkipList {
         SkipList::new(
             Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator))),
@@ -460,10 +512,15 @@ mod tests {
     }
 
     /// Every key in the list, in iteration order.
+    ///
+    /// Bounded by `len`, because a `publish` that linked a tower from the wrong predecessor can
+    /// leave a cycle in the level-zero list — and an unbounded walk over one hangs the suite
+    /// instead of failing it. An injected version of exactly that bug did.
     fn walk(list: &SkipList) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut node = list.first();
         while node != NIL {
+            assert!(out.len() < list.len(), "the level-zero list has a cycle");
             out.push(list.key(node).to_vec());
             node = list.after(node);
         }
@@ -613,7 +670,7 @@ mod tests {
                 seed,
             );
             let mut heights = Vec::new();
-            for i in 0..200u64 {
+            for i in 0..BULK.min(200) {
                 assert!(list.insert(&key("k", i), b"", b"v"));
             }
             let mut node = list.first();
@@ -642,7 +699,7 @@ mod tests {
         let node = list.first();
         let borrowed = list.key(node);
         let value = list.value(node);
-        for i in 0..4000u64 {
+        for i in 0..BULK {
             assert!(list.insert(&key("filler", i), b"", &[b'x'; 64]));
         }
         assert_eq!(borrowed, &key("first", 1)[..]);
@@ -656,7 +713,7 @@ mod tests {
         let list = list();
         let mut model = BTreeSet::new();
         let mut seed = 12_345u64;
-        for _ in 0..3000 {
+        for _ in 0..BULK {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let internal = key(&format!("k{:05}", seed % 900), seed % 50);
             if model.insert(internal.clone()) {
