@@ -2290,6 +2290,12 @@ impl Executor {
     }
 
     /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three shapes a user-defined name can arrive in — a cast, a `pg_typeof` \
+                  over one, and a `regtype` — resolved against one catalog read; splitting them \
+                  would put a shape somewhere other than beside the read it shares"
+    )]
     fn user_cast(
         &self,
         types: &mut Option<Vec<crate::catalog::TypeDef>>,
@@ -2328,6 +2334,42 @@ impl Executor {
             };
             self.user_cast(types, txn, &call.args[0].clone(), true)?;
             return Ok(Some(Expr::Literal(Literal::String(name))));
+        }
+        // **`'<name>'::regtype` over a type the catalog made**, resolved in this pass because it
+        // needs the same one catalog read and answers the same `42704` when the name is nobody's.
+        if call.func == crate::plan::CatalogFunc::UserRegType {
+            let (
+                Some(Expr::Literal(Literal::String(name))),
+                Some(Expr::Literal(Literal::Bool(want_oid))),
+            ) = (call.args.first(), call.args.get(1))
+            else {
+                return Err(SqlError::Internal(
+                    "a regtype over a user type without its name".to_owned(),
+                ));
+            };
+            let known = match types {
+                Some(known) => known,
+                None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
+            };
+            let Some(def) = known.iter().find(|def| &def.name == name) else {
+                // The same sentence a real server gives, and the same class: a name that is not a
+                // type is `42704`, not the `0A000` a *feature* this node lacks would get.
+                return Err(SqlError::UndefinedType(name.clone()));
+            };
+            // **The name unless the `::oid` was written**, which is the half `ActiveRecord`
+            // asks for and the half this node can answer without a `regtype` type of its own.
+            // ADR 0053's projection rule was tried here and is *not* the right one: a
+            // `regtype` is not an enum, and `'mood'::regtype::text` sits outside a projection
+            // while still wanting the name — so position does not decide it. What is left, and
+            // is declared in `tests/regtype_user.rs`, is `WHERE enumtypid = 'mood'::regtype`,
+            // which wants the oid from a position that cannot say so.
+            return Ok(Some(if *want_oid {
+                Expr::Literal(Literal::Typed(Box::new(Datum::Oid(
+                    u32::try_from(def.oid).unwrap_or(u32::MAX),
+                ))))
+            } else {
+                Expr::Literal(Literal::String(def.name.clone()))
+            }));
         }
         if call.func != crate::plan::CatalogFunc::UserCast {
             return Ok(None);

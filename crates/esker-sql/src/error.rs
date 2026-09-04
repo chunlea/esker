@@ -556,6 +556,34 @@ pub enum SqlError {
     #[error("you don't own a lock of type {0}")]
     LockNotHeld(&'static str),
 
+    /// `'FF'::bit(8)`: a character that is not a binary digit. **The message names the
+    /// character**, not the type, which is its own sentence and not the
+    /// `invalid input syntax for type …` every other type gives. Measured, `0x` included:
+    /// `'0xF'::bit(4)` is `"x" is not a valid binary digit`.
+    #[error("\"{0}\" is not a valid binary digit")]
+    InvalidBinaryDigit(String),
+
+    /// A bit string assigned to a `bit(n)` column that is not `n` long — **either way**, short or
+    /// long, which is what makes a fixed-width bit string different from a `character(n)`.
+    #[error("bit string length {length} does not match type {ty}")]
+    BitStringLengthMismatch {
+        /// The length that was given.
+        length: usize,
+        /// The column's type, as `format_type` writes it.
+        ty: String,
+    },
+
+    /// A bit string longer than a `bit varying(n)` column. `22001`, the class a `varchar` overflow
+    /// gets, where the fixed-width mismatch above is `22026`.
+    #[error("bit string too long for type {0}")]
+    BitStringTooLong(String),
+
+    /// `'192.168.1.5/24'::cidr`: the text parsed and the value is not a network. Its own
+    /// sentence and its own DETAIL, neither of which is the ordinary input-syntax one — measured,
+    /// and the reason `cidr` does not simply share `inet`'s error.
+    #[error("invalid cidr value: \"{0}\"")]
+    InvalidCidrValue(String),
+
     /// `money` overflowing, which is its own sentence: PostgreSQL quotes no value in it, unlike
     /// every other overflow message. Measured — `'92233720368547758.07'::money + '0.01'::money`.
     #[error("money out of range")]
@@ -2327,6 +2355,8 @@ impl SqlError {
             }
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
             SqlError::MalformedRangeLiteral { .. }
+            | SqlError::InvalidCidrValue(_)
+            | SqlError::InvalidBinaryDigit(_)
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {
@@ -2442,7 +2472,12 @@ impl SqlError {
             | SqlError::DuplicateExtension(_) => {
                 sqlstate::DUPLICATE_OBJECT
             }
-            SqlError::StringDataRightTruncation(_) => sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+            // A bit string too long for a `bit varying(n)` is the same class a `varchar`
+            // overflow gets; the fixed-width mismatch beside it is not, and has its own.
+            SqlError::StringDataRightTruncation(_) | SqlError::BitStringTooLong(_) => {
+                sqlstate::STRING_DATA_RIGHT_TRUNCATION
+            }
+            SqlError::BitStringLengthMismatch { .. } => "22026",
             SqlError::UnsupportedUnicodeEscape => sqlstate::UNSUPPORTED_UNICODE_ESCAPE,
             // A declared length is `22023` too, which is not a family resemblance with the
             // parameter errors beside it — it is `anychar_typmodin` reaching for the same code.
@@ -2527,6 +2562,9 @@ impl SqlError {
         match self {
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
+            }
+            SqlError::InvalidCidrValue(_) => {
+                Some("Value has bits set to right of mask.".to_owned())
             }
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())

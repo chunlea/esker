@@ -218,6 +218,16 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::Int8Range
         | StoredType::Money
         | StoredType::MoneyArray
+        | StoredType::Inet
+        | StoredType::Cidr
+        | StoredType::MacAddr
+        | StoredType::InetArray
+        | StoredType::CidrArray
+        | StoredType::MacAddrArray
+        | StoredType::Bit
+        | StoredType::VarBit
+        | StoredType::BitArray
+        | StoredType::VarBitArray
         | StoredType::FloatRange
         | StoredType::VarcharRange
         | StoredType::TstzRangeArray
@@ -241,6 +251,9 @@ fn value_of(datum: &Datum) -> Value {
         // it refuses a citext and an array.
         Datum::Point { .. }
         | Datum::Money(_)
+        | Datum::Inet { .. }
+        | Datum::MacAddr(_)
+        | Datum::Bit { .. }
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)

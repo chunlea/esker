@@ -16,7 +16,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `oid` is a four-byte type this node does not have; a `::oid` answers `bigint`, whose
         // value is identical. Already declared in `tests/regtype.rs` and repeated here because
         // this corpus asks the same question about `float`'s three spellings.
-        "SELECT 'float'::regtype::oid, 'float4'::regtype::oid, 'float8'::regtype::oid",
     ],
     answers: &[],
 };

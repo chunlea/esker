@@ -128,6 +128,18 @@ fn column_type(name: &str) -> ColumnType {
         // Cents in an `i64`, so the order is the integer's — and both ends of the range are in
         // the fixture, because a `money` really can hold either.
         "money" => ColumnType::Money,
+        // Family, then address, then prefix — an order no sorting of the printed text gives.
+        // Bit by bit, then by length — which the digits' byte order already gives.
+        "bit" => ColumnType::Bit,
+        "bit varying" => ColumnType::VarBit,
+        "bit[]" => ColumnType::BitArray,
+        "bit varying[]" => ColumnType::VarBitArray,
+        "inet" => ColumnType::Inet,
+        "cidr" => ColumnType::Cidr,
+        "macaddr" => ColumnType::MacAddr,
+        "inet[]" => ColumnType::InetArray,
+        "cidr[]" => ColumnType::CidrArray,
+        "macaddr[]" => ColumnType::MacAddrArray,
         "money[]" => ColumnType::MoneyArray,
         "citext" => ColumnType::Citext,
         "int4" => ColumnType::Int4,

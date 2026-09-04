@@ -195,12 +195,17 @@ fn activerecord_s_four_type_map_queries_answer() {
             // geometric type is a `b`ase type like any other, and its `typelem` is 0 because a
             // point is not an array of its coordinates.
             vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
+            // **`cidr`, `macaddr` and `inet`** — three more names the adapter's list has always
+            // held and got nothing back for. `cidr_in`, `macaddr_in`, `inet_in`.
+            vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             // **`money` is in the adapter's own list** and was one of the names it asked about
             // and got nothing back for. `cash_in`, not `money_in`: the input function is named
             // for the C type behind it.
             vec!["790", "money", "0", ",", "cash_in", "\\N", "b", "0"],
+            vec!["829", "macaddr", "0", ",", "macaddr_in", "\\N", "b", "0"],
+            vec!["869", "inet", "0", ",", "inet_in", "\\N", "b", "0"],
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
             vec!["1042", "bpchar", "0", ",", "bpcharin", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
@@ -234,6 +239,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `numeric` is in this list of forty too, and its `typinput` is PostgreSQL's own
             // `numeric_in` — derived from `ColumnType::ALL` like every row above it.
             vec!["1186", "interval", "0", ",", "interval_in", "\\N", "b", "0"],
+            // **`bit` and `varbit`**, two more names the adapter's list has always held: the
+            // internal name of `bit varying` is `varbit`, as `bigint`'s is `int8`.
+            vec!["1560", "bit", "0", ",", "bit_in", "\\N", "b", "0"],
+            vec!["1562", "varbit", "0", ",", "varbit_in", "\\N", "b", "0"],
             vec!["1700", "numeric", "0", ",", "numeric_in", "\\N", "b", "0"],
             // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
             // refusals in `postgresql_specific_schema.rb`.
@@ -293,6 +302,16 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "199".to_owned(),
                 "_json".to_owned(),
                 "114".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "651".to_owned(),
+                "_cidr".to_owned(),
+                "650".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),
@@ -435,6 +454,26 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "0".to_owned(),
             ],
             vec![
+                "1040".to_owned(),
+                "_macaddr".to_owned(),
+                "829".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1041".to_owned(),
+                "_inet".to_owned(),
+                "869".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
                 "1115".to_owned(),
                 "_timestamp".to_owned(),
                 "1114".to_owned(),
@@ -488,6 +527,26 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1231".to_owned(),
                 "_numeric".to_owned(),
                 "1700".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1561".to_owned(),
+                "_bit".to_owned(),
+                "1560".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1563".to_owned(),
+                "_varbit".to_owned(),
+                "1562".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

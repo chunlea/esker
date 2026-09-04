@@ -202,7 +202,13 @@ impl Aggregation {
                 | ColumnType::Bool
                 | ColumnType::Json
                 | ColumnType::Jsonb
-                | ColumnType::Uuid => undefined(),
+                | ColumnType::Uuid
+                // **And a bit string**, measured: `min(bit)` is `42883 function min(bit) does
+                // not exist` on a real server even though `<` works and `ORDER BY` works. The
+                // seventh member of the list ADR 0031 turned into a rule — the aggregate set is
+                // per type and cannot be derived from whether the type is ordered.
+                | ColumnType::Bit
+                | ColumnType::VarBit => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

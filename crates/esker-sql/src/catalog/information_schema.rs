@@ -359,12 +359,26 @@ fn data_type(ty: ColumnType) -> String {
     }
     match ty {
         ColumnType::Bpchar => "character".to_owned(),
+        // **The bare name, where `pg_attribute`'s `format_type` says `bit(1)`.** The two views
+        // disagree on purpose: `information_schema.data_type` names the type and
+        // `character_maximum_length` beside it carries the 1.
+        ColumnType::Bit => "bit".to_owned(),
+        ColumnType::VarBit => "bit varying".to_owned(),
         other => value::format_type(other, value::NO_TYPMOD),
     }
 }
 
 /// `character_maximum_length`: the declared length of a string type, or NULL.
 fn length_of(column: &ColumnDef) -> Datum {
+    // **A bare `bit` is one bit long** and a bare `bit varying` has no limit at all, which is the
+    // asymmetry: `t.bit :another_bit` reports 1 and `t.bit_varying :another_bit_varying` NULL.
+    if matches!(column.ty, ColumnType::Bit | ColumnType::VarBit) {
+        return match (column.ty, column.typmod) {
+            (ColumnType::Bit, value::NO_TYPMOD) => Datum::Int4(1),
+            (_, value::NO_TYPMOD) => Datum::Null,
+            (_, length) => Datum::Int4(length),
+        };
+    }
     match column.length() {
         Some(length) => Datum::Int4(i32::try_from(length).unwrap_or(i32::MAX)),
         None => Datum::Null,

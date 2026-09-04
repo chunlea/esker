@@ -4829,6 +4829,42 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::Bytea(bytes.to_vec()),
             ))));
         }
+        // **An address cast keeps the prefix the output function hides, and `inet::cidr` masks
+        // rather than refuses.** Both were measured and both differ from "print it and read it
+        // back": `'192.168.1.1'::inet::text` is `192.168.1.1/32` where the field is
+        // `192.168.1.1`, and `'192.168.1.5/24'::inet::cidr` is `192.168.1.0/24` where the same
+        // text handed to `cidr_in` is `22P02 invalid cidr value`.
+        if let Some(from) = source_type(expr)?
+            && matches!(from, ColumnType::Inet | ColumnType::Cidr)
+            && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            let address = value::inet::from_text(&text, from == ColumnType::Cidr)?;
+            match to {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                    return Ok(plan::Expr::Literal(plan::Literal::String(
+                        value::inet::to_cast_text(&address),
+                    )));
+                }
+                ColumnType::Cidr | ColumnType::Inet => {
+                    let cidr = to == ColumnType::Cidr;
+                    let address = if cidr {
+                        value::inet::masked_to_cidr(&address)
+                    } else {
+                        address
+                    };
+                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                        Datum::Inet {
+                            family: address.family,
+                            bits: address.bits,
+                            cidr,
+                            addr: address.addr,
+                        },
+                    ))));
+                }
+                _ => {}
+            }
+        }
         // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
         // output function writes `$567.89` and `numeric`'s input function refuses it, so the
         // ordinary text path made a conversion a real server performs into a `22P02` about the
@@ -4888,10 +4924,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
             let name = cast_operand(inner, data_type)?;
-            let named = value::named_type(&name)?
-                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
-            Ok(plan::Expr::Literal(plan::Literal::Integer(i64::from(
-                named.oid(),
+            // **A name the catalog might know**, which is where `ActiveRecord`'s
+            // `lookup_cast_type` lands: `SELECT 'color'::regtype::oid` over a type a
+            // `CREATE TYPE` made. Lowering has no catalog, so the name is carried and the
+            // executor answers (ADR 0053), exactly as a cast *to* a user type already is.
+            let Some(named) = value::named_type(&name)? else {
+                return Ok(user_regtype(&name, true));
+            };
+            // **An `oid`, not a `bigint`.** `'23'::oid` has been a real `ColumnType::Oid` since
+            // that type's own unit and this spelling had not caught up, so
+            // `pg_typeof('int4'::regtype::oid)` answered `bigint` where a real server says `oid`.
+            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Oid(named.oid()),
             ))))
         }
         // `'cb'::regclass::oid` — the same value, since a `regclass` here already *is* the oid.
@@ -4931,8 +4975,9 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
-            let named = value::named_type(&name)?
-                .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+            let Some(named) = value::named_type(&name)? else {
+                return Ok(user_regtype(&name, false));
+            };
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Text(named.printed()),
             ))))
@@ -5194,6 +5239,27 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
         }
         _ => None,
     })
+}
+
+/// A `regtype` over a name only the catalog can resolve, carried for the executor.
+///
+/// `oid` says which half was asked for: the number, which is what
+/// `SELECT 'color'::regtype::oid` wants, or the name it prints as.
+fn user_regtype(name: &str, oid: bool) -> plan::Expr {
+    // **A quoted name keeps its case and an unquoted one folds**, which is the identifier rule
+    // and is what `'"mood"'::regtype` needs — the same reading `'"companies"'::regclass` gets.
+    let trimmed = name.trim();
+    let name = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(quoted) if trimmed.len() > 1 => quoted.to_owned(),
+        _ => trimmed.to_ascii_lowercase(),
+    };
+    plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+        func: plan::CatalogFunc::UserRegType,
+        args: vec![
+            plan::Expr::Literal(plan::Literal::String(name)),
+            plan::Expr::Literal(plan::Literal::Bool(oid)),
+        ],
+    }))
 }
 
 /// `date + time` as an instant, when both sides are constants and one of each.
@@ -6450,6 +6516,11 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         // this one — a `Custom` name here like the rest. `money_test.rb` writes `t.money`, which
         // the adapter sends as the bare word.
         "money" => Some(ColumnType::Money),
+        // **The three network types**, which `sqlparser` has no variant for either.
+        // `network_test.rb` writes `t.inet`, `t.cidr` and `t.macaddr` in one `create_table`.
+        "inet" => Some(ColumnType::Inet),
+        "cidr" => Some(ColumnType::Cidr),
+        "macaddr" => Some(ColumnType::MacAddr),
         _ => None,
     }
 }
@@ -6460,6 +6531,20 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
 
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
+    // **The typmod is the length**, not the length plus a header: `character_maximum_length` for
+    // `bit(8)` is 8 and `format_type(1560, 8)` is `bit(8)`, both measured. A bare `bit` keeps
+    // `NO_TYPMOD` and reads back as `bit(1)`, which is where that rule lives.
+    if let DataType::Bit(length) | DataType::BitVarying(length) = data_type {
+        let ty = if matches!(data_type, DataType::Bit(_)) {
+            ColumnType::Bit
+        } else {
+            ColumnType::VarBit
+        };
+        return Ok((
+            ty,
+            length.map_or(NO_TYPMOD, |n| i32::try_from(n).unwrap_or(i32::MAX)),
+        ));
+    }
     match data_type {
         // **`int8[]` is a column type**, over every element type this node has. The element's own
         // declaration is read first and **its typmod is the array's**: `character varying(255)[]`

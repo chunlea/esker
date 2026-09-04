@@ -84,3 +84,20 @@ citext		_a	A	a	a b	AB	ab	B	b	~	É	é
 # in the fixture because both are values a client can write. Captured with lc_monetary = 'C'.
 money	-$92,233,720,368,547,758.08	-$1.00	-$0.01	$0.00	$0.01	$1.00	$123.45	$1,234.56	$92,233,720,368,547,758.07
 money[]	{}	{-$1.00}	{$0.00}	{$1.00}	{$1.00,$2.00}	{NULL}
+# The three network types. An `inet` orders by **family, then address, then prefix length** —
+# `192.168.1.1/24` before `192.168.1.1/32`, which no ordering of the printed text reproduces —
+# and every IPv4 sorts below every IPv6, which is why the family is the first byte of the key.
+# Captured through `::text`, so a full-length prefix is written out; it is the same value.
+inet	0.0.0.0/32	9.0.0.1/32	10.0.0.0/8	10.0.0.1/32	172.16.1.254/32	192.168.1.1/24	192.168.1.1/32	255.255.255.255/32	::/128	::1/128	2001:db8::1/128
+cidr	0.0.0.0/0	10.0.0.0/8	10.0.0.0/24	192.168.1.0/24	255.255.255.255/32	::/0	2001:db8::/32
+macaddr	00:00:00:00:00:00	00:00:00:00:00:01	01:23:45:67:89:0a	ab:cd:ef:01:02:03	ff:ff:ff:ff:ff:ff
+inet[]	{}	{0.0.0.0}	{10.0.0.1}	{10.0.0.1,10.0.0.2}	{NULL}
+cidr[]	{}	{10.0.0.0/8}	{192.168.1.0/24}	{NULL}
+macaddr[]	{}	{00:00:00:00:00:00}	{ff:ff:ff:ff:ff:ff}	{NULL}
+# `bit` and `bit varying`. PostgreSQL compares a bit string **bit by bit and then by length**,
+# which is what the digits' byte order already gives: `0` below `1`, and a prefix below what
+# extends it — `0` `01` `010` `1` `10`. The empty string is the first `bit varying` value.
+bit	0	1
+bit varying		0	01	010	1	10
+bit[]	{}	{0}	{0,1}	{1}	{NULL}
+bit varying[]	{}	{0}	{01}	{NULL}
