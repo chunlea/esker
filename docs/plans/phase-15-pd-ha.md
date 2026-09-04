@@ -144,6 +144,13 @@ mark by the same fsync-then-answer rule that made a *restart* safe, and the new 
 above it. Nothing in that argument depends on either member's clock being right, or on the two
 clocks agreeing, which is what invariant 6 is for.
 
+**The allocator's reservation is the same lease, one field over**, and the symmetry is worth
+stating because it is what makes the design one rule rather than two. A deposed leader can hand
+out ids without committing anything — up to `allocated_end`, and no further, because crossing it
+takes a `ReserveIds` that will not commit. A new leader resumes at `allocated_end + 1`. The two
+ranges cannot overlap for exactly the reason the two timestamp ranges cannot, and neither answer
+needs to know whether the old leader has noticed yet.
+
 ### 3.4 The wire
 
 Two additions to `esker-proto`. Neither changes a byte of an existing golden; both get a golden
@@ -278,4 +285,43 @@ when it is not.
 
 ## 9. Progress
 
-- Unit 0 — plan and ADR. **Done.**
+- **Unit 0 — plan and ADR.** Done: `docs/adr/0055-pd-is-a-raft-group.md`.
+- **Unit 1 — the state machine behind a single-member group.** Done, in two commits rather than
+  one: the wire addition came first because a typed refusal is what everything above it branches
+  on, and a temporary mapping onto `Internal` would have been a lie that later commits had to
+  find again.
+  - `feat(proto): PdNotLeader` — error code 19 and its two goldens.
+  - `feat(pd): every durable write goes through a Raft log` — `raft_log`, `command`, `machine`,
+    `member`, `driver`, and `Pd` rewired onto them.
+
+  **All 187 `esker-pd` tests pass unchanged**, which was the unit's acceptance criterion, and the
+  workspace is 3,093 green.
+
+### 9.1 Changes against §3 and §5, and why
+
+- **The wire addition moved from unit 2 into unit 1** (above).
+- **Snapshot and compaction were built in unit 1, not left for unit 2.** `Ready`'s snapshot arm
+  had to be *something*, and a stub that logs is what left a store's peer holding a log position it
+  had no data for (`docs/plans/phase-4.md` §17). PD's whole state machine is a couple of hundred
+  kilobytes, so the snapshot is the `default` column family serialised as pairs and installing one
+  is a `delete_range` plus the pairs — small enough that writing it was cheaper than writing down
+  why it was missing. Unreachable until unit 2 puts a second member behind it, and the unit tests
+  drive it directly in the meantime.
+- **`Pd`'s state was split in two, which §3 did not say and the deadlock in §8.2 forces.** The
+  applied records — cluster, `allocated_end`, `high_water_ms`, history, columnar wishes — moved out
+  of `Pd`'s mutex into `machine::AppliedState` behind its own lock. A leader's `Allocator` calls a
+  persist that blocks on the driver *while holding `Pd`'s mutex*, so the driver may never take that
+  mutex; putting the two on separate locks is what makes "propose under the state lock" safe, and
+  it is written at the top of `driver.rs` rather than remembered.
+- **The `TakeOffice` barrier is proposed by the driver, not read out of the core.** `esker-raft`
+  exposes no accessor for its own term-start index, and this lane may read that crate but not
+  change it. Proposing an explicit barrier needs nothing from it and says the thing that actually
+  matters — that the *state machine* has caught up, not that the log has.
+- **`State` gained `office_term`.** A member rebuilds its allocator and oracle lazily, on the first
+  write after taking office, rather than the driver reaching across to do it. That keeps the
+  rebuild on the side of the lock that owns the state.
+- **The leader check went into `service::serve`, beside the cluster check**, and covers the reads.
+  The writes refuse themselves inside `Pd`; without this a follower would still answer a
+  `GetRegion` out of whatever it had applied. `Status` is exempt, for the reason it is exempt from
+  the cluster check: it is a question about *this process*, and it is exactly what an operator asks
+  a placement driver that is not answering.

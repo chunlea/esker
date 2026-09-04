@@ -20,6 +20,10 @@ esker-engine.workspace = true
 # The wire: the Region/Peer/Epoch types the routing table stores, the encoder the
 # records are written with, and the typed error every method answers with.
 esker-proto.workspace = true
+# PD replicates itself: the same pure `RawNode` a region's peer is driven by
+# (docs/adr/0055-pd-is-a-raft-group.md). Read-only to this crate — PD drives it and
+# adds nothing to it.
+esker-raft.workspace = true
 # `mix64`, for minting a cluster id out of the one-time facts of a bootstrap.
 esker-base.workspace = true
 bytes.workspace = true

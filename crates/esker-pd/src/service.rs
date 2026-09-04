@@ -5,9 +5,9 @@
 //! edge": the engine's `fsync` runs on a blocking thread, never on the reactor that every
 //! other connection is served on.
 //!
-//! The one piece of policy here is the cluster check. It runs **once**, at the top of the
-//! dispatch, for every method but `Bootstrap` — in one place, so that adding a method cannot
-//! quietly add one that skips it.
+//! The two pieces of policy here are the cluster check and the leader check. Both run **once**, at
+//! the top of the dispatch — in one place, so that adding a method cannot quietly add one that
+//! skips them.
 
 use std::sync::Arc;
 
@@ -81,6 +81,23 @@ impl Service for PdService {
 
 /// One request, synchronously.
 fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError> {
+    // **Only the leader answers** ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)). A
+    // follower that answered a `Tso` would hand out a timestamp the leader may also hand out, and
+    // a duplicate commit timestamp corrupts MVCC ordering silently — so the refusal is here, at
+    // the top, rather than method by method where the next method could miss it.
+    //
+    // The writes refuse themselves as well, inside `Pd`, and that is not redundancy: this covers
+    // the *reads*, which take no proposal and would otherwise be answered by any member out of
+    // whatever it happens to have applied.
+    //
+    // `Status` is exempt, for the reason it is exempt from the cluster check: it is a question
+    // about **this process**. "Which member am I, and do I lead" is exactly what an operator asks
+    // a placement driver that is not answering, and refusing it with "ask the leader" would answer
+    // a question nobody asked.
+    if !matches!(request, PdReq::Status) && !pd.is_serving() {
+        return Err(pd.not_leading().into());
+    }
+
     // The cluster check, in one place. `Bootstrap` may carry zero — asking is how a caller
     // learns the id — but a caller that *does* name a cluster is checked even there, so a store
     // that already belongs to one cannot bootstrap a second cluster on a wiped PD by accident.

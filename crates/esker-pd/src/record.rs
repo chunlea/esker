@@ -519,6 +519,42 @@ impl EventOutcome {
 /// and there is no cursor to keep.
 pub const HISTORY_CAPACITY: usize = 64;
 
+/// One event's fields, in the order both readers of them expect.
+///
+/// Shared by the history ring and by [`crate::command::Command::History`], which is the whole
+/// reason it is a function: an event travelling through PD's Raft log and an event resting in the
+/// ring are the same six fields, and two encoders for them would be two places to keep in step.
+pub fn put_event(out: &mut Encoder, event: &OperatorEvent) {
+    out.put_varint(event.at_ms);
+    out.put_varint(event.region_id);
+    out.put_u8(event.kind.as_u8());
+    out.put_u8(event.outcome.as_u8());
+    out.put_varint(event.store_id);
+    out.put_varint(event.peer_id);
+}
+
+/// Reads one event written by [`put_event`]. `what` names the record for the error.
+pub fn get_event(input: &mut Decoder<'_>, what: &'static str) -> Result<OperatorEvent> {
+    let at_ms = input.get_varint("event.at_ms").map_err(field(what))?;
+    let region_id = input.get_varint("event.region_id").map_err(field(what))?;
+    let kind = input.get_u8("event.kind").map_err(field(what))?;
+    let outcome = input.get_u8("event.outcome").map_err(field(what))?;
+    let Some(kind) = EventKind::from_u8(kind) else {
+        return Err(PdError::corrupt(what, format!("operator kind {kind}")));
+    };
+    let Some(outcome) = EventOutcome::from_u8(outcome) else {
+        return Err(PdError::corrupt(what, format!("outcome {outcome}")));
+    };
+    Ok(OperatorEvent {
+        at_ms,
+        region_id,
+        kind,
+        outcome,
+        store_id: input.get_varint("event.store_id").map_err(field(what))?,
+        peer_id: input.get_varint("event.peer_id").map_err(field(what))?,
+    })
+}
+
 /// The ring of recent operator events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistoryRecord {
@@ -543,12 +579,7 @@ impl HistoryRecord {
         start(&mut out);
         out.put_varint(self.events.len() as u64);
         for event in &self.events {
-            out.put_varint(event.at_ms);
-            out.put_varint(event.region_id);
-            out.put_u8(event.kind.as_u8());
-            out.put_u8(event.outcome.as_u8());
-            out.put_varint(event.store_id);
-            out.put_varint(event.peer_id);
+            put_event(&mut out, event);
         }
         out.finish()
     }
@@ -560,24 +591,7 @@ impl HistoryRecord {
         let count = input.get_count("history.count").map_err(field(WHAT))?;
         let mut events = Vec::with_capacity(count);
         for _ in 0..count {
-            let at_ms = input.get_varint("event.at_ms").map_err(field(WHAT))?;
-            let region_id = input.get_varint("event.region_id").map_err(field(WHAT))?;
-            let kind = input.get_u8("event.kind").map_err(field(WHAT))?;
-            let outcome = input.get_u8("event.outcome").map_err(field(WHAT))?;
-            let Some(kind) = EventKind::from_u8(kind) else {
-                return Err(PdError::corrupt(WHAT, format!("operator kind {kind}")));
-            };
-            let Some(outcome) = EventOutcome::from_u8(outcome) else {
-                return Err(PdError::corrupt(WHAT, format!("outcome {outcome}")));
-            };
-            events.push(OperatorEvent {
-                at_ms,
-                region_id,
-                kind,
-                outcome,
-                store_id: input.get_varint("event.store_id").map_err(field(WHAT))?,
-                peer_id: input.get_varint("event.peer_id").map_err(field(WHAT))?,
-            });
+            events.push(get_event(&mut input, WHAT)?);
         }
         close(WHAT, input)?;
         if events.len() > HISTORY_CAPACITY {

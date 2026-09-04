@@ -10,11 +10,10 @@
 //! relationship these two have.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use esker_proto::Operator;
 
-use super::{Pd, State, persist_alloc};
+use super::{Pd, State, reserve};
 use crate::balance::{self, Balance};
 use crate::error::Result;
 use crate::operator::{InFlight, Observed};
@@ -177,7 +176,7 @@ impl Pd {
         state
             .cooling
             .insert(region_id, now_ms.saturating_add(self.balance_cooldown_ms));
-        self.record_event(state, event)?;
+        self.record_event(event)?;
         Ok(Free)
     }
 
@@ -221,9 +220,7 @@ impl Pd {
         //
         // `wanted_for` is zero for every range nobody reported, so a cluster that has never been
         // told about columnar replicas does one range comparison per heartbeat and stops.
-        let wanted = state
-            .columnar
-            .wanted_for(&record.region.start_key, &record.region.end_key);
+        let wanted = self.columnar_wanted_for(&record.region.start_key, &record.region.end_key);
         if let Some(repair) = schedule::columnar_for(record, cluster, wanted) {
             tracing::debug!(
                 region_id = record.region.id,
@@ -361,7 +358,7 @@ impl Pd {
 
         let region_id = record.region.id;
         tracing::info!(region_id, operator = operator.name(), "operator issued");
-        self.record_event(state, event_of(&operator, EventOutcome::Issued, now_ms))?;
+        self.record_event(event_of(&operator, EventOutcome::Issued, now_ms))?;
         state
             .in_flight
             .insert(region_id, InFlight::new(operator.clone(), now_ms, load));
@@ -403,11 +400,11 @@ impl Pd {
             .retain(|(_, retired_ms)| *retired_ms > absorbed && *retired_ms > too_old);
     }
 
-    /// One cluster-unique peer id, persisted before it is handed out ([`crate::alloc`]).
+    /// One cluster-unique peer id, its reservation committed before it is handed out
+    /// ([`crate::alloc`], [ADR 0055](../../../../docs/adr/0055-pd-is-a-raft-group.md)).
     fn next_peer_id(&self, state: &mut State) -> Result<u64> {
-        let db = Arc::clone(&self.db);
-        let cf = self.cf;
-        state.alloc.allocate(1, |end| persist_alloc(&db, cf, end))
+        let driver = self.driver();
+        state.alloc.allocate(1, |end| reserve(driver, end))
     }
 
     /// The operators PD is waiting on, by region. For the inspector and the tests.
@@ -418,11 +415,12 @@ impl Pd {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::clock::TestClock;
     use crate::pd::{MAX_STORE_DOWN_TIME_MS, Pd, PdOptions};
     use crate::routing::{RegionBeat, StoreBeat};
     use esker_proto::{Epoch, Operator, Peer, Region};
-    use std::sync::Arc;
 
     fn open() -> (tempfile::TempDir, Arc<TestClock>, Arc<Pd>) {
         let dir = tempfile::tempdir().unwrap();

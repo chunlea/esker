@@ -35,22 +35,21 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use esker_engine::{
-    Db, FileSystem, LocalFileSystem, Options, ReadOptions, WalSyncMode, WriteBatch, WriteOptions,
-    cf,
-};
+use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, cf};
 use esker_proto::pd::ColumnarWish;
 use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
+use esker_raft::{Config, NodeId, Term};
 
 use crate::alloc::{ALLOC_BATCH, Allocator};
 use crate::clock::{Clock, SystemClock};
+use crate::command::Command;
+use crate::driver::{Leadership, NoPeers, PdDriver, PdTransport};
 use crate::error::{PdError, Result};
-use crate::keys;
+use crate::machine::{Answer, Machine};
+use crate::member::MemberList;
 use crate::operator::{InFlight, Progress};
-use crate::record::{
-    AllocRecord, ClusterRecord, ColumnarRecord, HistoryRecord, OperatorEvent, RegionRecord,
-    StoreRecord, TsoRecord,
-};
+use crate::raft_log::PdLogStorage;
+use crate::record::{ClusterRecord, OperatorEvent, RegionRecord, StoreRecord};
 use crate::routing::{self, RegionBeat, StoreBeat, Upsert};
 use crate::schedule::{self, LoadDelta};
 use crate::tso::Oracle;
@@ -184,6 +183,19 @@ pub struct PdOptions {
     /// Whether the balance rules run at all. On by default; a test or an operator wanting a
     /// cluster left exactly as it is turns them off, and repair still runs.
     pub balance: bool,
+    /// This placement driver's own member id.
+    pub id: NodeId,
+    /// The group it belongs to, itself included. One member is the 4a shape and needs no
+    /// addresses; three is high availability ([`crate::member`]).
+    pub members: MemberList,
+    /// Where this member's Raft messages go. `None` is [`NoPeers`], which is right for a group of
+    /// one and a dropped message for anything else.
+    pub transport: Option<Arc<dyn PdTransport>>,
+    /// The seed for the election-timeout generator.
+    ///
+    /// Shared across a whole group on purpose: the member id selects the stream, so members still
+    /// differ while one number still reproduces a run (`esker_raft::Config`).
+    pub raft_seed: u64,
     /// Where PD's database keeps its bytes. `None` is the real filesystem.
     ///
     /// The seam exists for the scheduling tests, which drive tens of thousands of heartbeats:
@@ -220,8 +232,26 @@ impl PdOptions {
             balance_cooldown_ms: BALANCE_COOLDOWN_MS,
             max_balance_operators: MAX_BALANCE_OPERATORS,
             balance: true,
+            id: 1,
+            members: MemberList::alone(1),
+            transport: None,
+            raft_seed: 0x0E5C_0E5C_0E5C_0E5C,
             filesystem: None,
         }
+    }
+
+    /// The defaults, for member `id` of `members`.
+    pub fn with_members(id: NodeId, members: MemberList) -> Result<Self> {
+        if !members.contains(id) {
+            return Err(PdError::invalid(format!(
+                "placement driver {id} is not in its own member list"
+            )));
+        }
+        Ok(Self {
+            id,
+            members,
+            ..Self::new()
+        })
     }
 
     /// The defaults, with `clock` in place of the system clock.
@@ -288,8 +318,19 @@ pub struct Beat {
 #[derive(Debug)]
 pub struct Pd {
     db: Arc<Db>,
-    cf: u32,
     clock: Arc<dyn Clock>,
+    /// The replicated state machine every durable write goes through
+    /// ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+    machine: Arc<Machine>,
+    /// The Raft group underneath. Dropped last, which joins its thread.
+    driver: PdDriver,
+    /// The group as this member was configured to see it. Configuration, not state
+    /// ([`crate::member`]).
+    members: MemberList,
+    /// Ids reserved per commit. Kept because a member rebuilds its allocator on taking office.
+    alloc_batch: u64,
+    /// How far ahead the mark is written. Kept for the same reason.
+    tso_save_interval_ms: u64,
     max_store_down_time_ms: u64,
     /// See [`PdOptions::lock_ttl_ms`]. Read only by [`Pd::schema_lease`].
     lock_ttl_ms: u64,
@@ -303,10 +344,22 @@ pub struct Pd {
     state: Mutex<State>,
 }
 
-/// The part that must not interleave.
+/// The **leader's** working state: the part that must not interleave, and that a member rebuilds
+/// when it takes office.
+///
+/// None of it is durable, and that is the point. The allocator's reservation and the oracle's mark
+/// live in the log ([`crate::machine::AppliedState`]); what is here is the position inside a
+/// reservation, which a new leader recomputes as `allocated_end + 1` — and which is why a deposed
+/// leader that has not noticed can keep handing out ids and timestamps without colliding with its
+/// successor's.
 #[derive(Debug)]
 pub(crate) struct State {
-    pub(crate) cluster: Option<ClusterRecord>,
+    /// The term this working state was rebuilt for; `0` before this member has ever served.
+    ///
+    /// Compared against [`Leadership::office_term`] on every write. A member that finds them
+    /// different has just taken office and reloads the allocator and the oracle from what it has
+    /// applied, which is the whole of the failover rule on this side.
+    pub(crate) office_term: Term,
     pub(crate) alloc: Allocator,
     pub(crate) oracle: Oracle,
     /// The operator in flight for each region, keyed by region id — which is what makes
@@ -318,21 +371,6 @@ pub(crate) struct State {
     /// reconciling a remembered plan with a cluster that moved on while PD was down, which is
     /// strictly harder than recomputing.
     pub(crate) in_flight: BTreeMap<u64, InFlight>,
-    /// The last few things PD asked for, mirrored to disk on every change.
-    ///
-    /// Held here as well as on disk so that appending is a push rather than a read-modify-write
-    /// of the whole ring, and so that [`Pd::history`] answers without touching the engine.
-    pub(crate) history: HistoryRecord,
-    /// Which key ranges want columnar replicas, as the SQL layer last reported
-    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
-    ///
-    /// **Persisted**, unlike the in-flight set above, and the difference is where the fact lives.
-    /// An operator can be recomputed from the next heartbeat because the cluster itself is the
-    /// source of truth about its own membership. This cannot: PD has no way to read the catalog
-    /// it comes from — it links neither `esker-sql` nor a client, and every method it serves is
-    /// inbound — so a restart that forgot it would retire every columnar replica in the cluster
-    /// and wait for a SQL node to mention them again.
-    pub(crate) columnar: ColumnarRecord,
     /// When each region becomes eligible for a *balance* move again, by region id.
     ///
     /// Memory, like the in-flight set: a restart forgets it, and the worst that costs is one
@@ -368,43 +406,85 @@ impl Pd {
     /// [`PdError::NotBootstrapped`] to everything except [`Pd::bootstrap`], rather than
     /// inventing a cluster of its own.
     pub fn open(path: impl AsRef<Path>, options: PdOptions) -> Result<Arc<Self>> {
+        if !options.members.contains(options.id) {
+            return Err(PdError::invalid(format!(
+                "placement driver {} is not in its own member list",
+                options.id
+            )));
+        }
         let filesystem = options
             .filesystem
             .clone()
             .unwrap_or_else(|| Arc::new(LocalFileSystem::new()) as Arc<dyn FileSystem>);
-        let db = Db::open_with(path, options.engine.clone(), filesystem, &[cf::DEFAULT])?;
+        // Two families, one WAL: the records in `default` and the Raft log in `raft`, so an apply
+        // writes the record and the apply index in one atomic batch. A 4a directory has no `raft`
+        // family and gains one here; nothing else about it changes
+        // ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+        let db = Db::open_with(
+            path,
+            options.engine.clone(),
+            filesystem,
+            &[cf::DEFAULT, cf::RAFT],
+        )?;
         let cf = db
             .cf_id(cf::DEFAULT)
             .ok_or_else(|| PdError::internal("the default column family is missing after open"))?;
         let db = Arc::new(db);
 
-        let cluster = read(&db, &keys::cluster_key())?
-            .map(|bytes| ClusterRecord::decode(&bytes))
-            .transpose()?;
-        let alloc = read(&db, &keys::alloc_key())?
-            .map(|bytes| AllocRecord::decode(&bytes))
-            .transpose()?;
-        let mark = read(&db, &keys::tso_key())?
-            .map(|bytes| TsoRecord::decode(&bytes))
-            .transpose()?;
-        let history = read(&db, &keys::history_key())?
-            .map(|bytes| HistoryRecord::decode(&bytes))
-            .transpose()?
-            .unwrap_or_default();
-        // Loaded rather than defaulted-and-waited-for: PD cannot re-derive this from any
-        // heartbeat, so a restart that forgot it would retire every columnar replica in the
-        // cluster until a SQL node happened to report again.
-        let columnar = read(&db, &keys::columnar_key())?
-            .map(|bytes| ColumnarRecord::decode(&bytes))
-            .transpose()?
-            .unwrap_or_default();
+        let machine = Arc::new(Machine::load(
+            Arc::clone(&db),
+            cf,
+            Arc::clone(&options.clock),
+        )?);
+        let log = PdLogStorage::open(
+            Arc::clone(&db),
+            esker_raft::ConfState::from_voters(options.members.ids()),
+        )?;
+        let applied = log.applied_index();
+
+        let mut config = Config::new(options.id, options.members.ids(), options.raft_seed);
+        config.applied = applied;
+        let transport = options
+            .transport
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoPeers) as Arc<dyn PdTransport>);
+        let driver = PdDriver::start(config, log, Arc::clone(&machine), transport)?;
+
+        // A group of one wins with a quorum of itself, so it is leading and caught up before this
+        // returns — which is what keeps `Pd::open` synchronous, runtime-free and behaviourally
+        // identical to the single durable PD it replaces. A larger group elects on ticks.
+        if options.members.is_alone() {
+            driver.campaign()?;
+            if !driver.leadership().serving {
+                return Err(PdError::internal(
+                    "a single-member placement driver did not take office",
+                ));
+            }
+        }
+
+        let (allocated_end, high_water_ms) = {
+            let state = machine
+                .applied()
+                .read()
+                .map_err(|_| PdError::internal("pd applied state lock is poisoned"))?;
+            (state.allocated_end, state.high_water_ms)
+        };
+        let office = driver.leadership();
         // `max(clock, mark)`, the restart rule, is inside `Oracle::load`.
-        let oracle = Oracle::load(mark, options.clock.now_ms(), options.tso_save_interval_ms);
+        let oracle = Oracle::load(
+            (high_water_ms > 0).then_some(crate::record::TsoRecord { high_water_ms }),
+            office_clock(&office, options.clock.as_ref()),
+            options.tso_save_interval_ms,
+        );
 
         Ok(Arc::new(Self {
             db,
-            cf,
             clock: options.clock,
+            machine,
+            driver,
+            members: options.members,
+            alloc_batch: options.alloc_batch,
+            tso_save_interval_ms: options.tso_save_interval_ms,
             max_store_down_time_ms: options.max_store_down_time_ms,
             lock_ttl_ms: options.lock_ttl_ms,
             retention_ms: options.retention_ms,
@@ -414,14 +494,15 @@ impl Pd {
             max_balance_operators: options.max_balance_operators,
             balance: options.balance,
             state: Mutex::new(State {
-                cluster,
-                alloc: Allocator::load(alloc, options.alloc_batch),
+                office_term: office.office_term,
+                alloc: Allocator::load(
+                    (allocated_end > 0).then_some(crate::record::AllocRecord { allocated_end }),
+                    options.alloc_batch,
+                ),
                 oracle,
                 in_flight: BTreeMap::new(),
                 cooling: BTreeMap::new(),
                 settling: Vec::new(),
-                history,
-                columnar,
             }),
         }))
     }
@@ -440,15 +521,33 @@ impl Pd {
 
     /// The cluster record, or `None` if nothing has bootstrapped yet.
     pub fn cluster(&self) -> Result<Option<ClusterRecord>> {
-        Ok(self.lock()?.cluster)
+        Ok(self.applied()?.cluster)
     }
 
     /// The cluster's id, or [`PdError::NotBootstrapped`].
     pub fn cluster_id(&self) -> Result<u64> {
-        self.lock()?
+        self.applied()?
             .cluster
             .map(|cluster| cluster.cluster_id)
             .ok_or(PdError::NotBootstrapped)
+    }
+
+    /// What this member believes about who leads PD's own Raft group.
+    #[must_use]
+    pub fn leadership(&self) -> Leadership {
+        self.driver.leadership()
+    }
+
+    /// The group this member belongs to.
+    #[must_use]
+    pub fn members(&self) -> &MemberList {
+        &self.members
+    }
+
+    /// Whether this member may answer. A follower answers nothing but [`PdError::NotLeader`].
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        self.driver.leadership().serving
     }
 
     /// Refuses a request meant for another cluster.
@@ -479,62 +578,31 @@ impl Pd {
             return Err(PdError::invalid("store id zero is not a store"));
         }
         let now_ms = self.clock.now_ms();
-        let mut state = self.lock()?;
+        let mut state = self.leading()?;
 
-        if let Some(cluster) = state.cluster {
-            let mut batch = WriteBatch::new();
-            routing::stage_store(
-                &mut batch,
-                self.cf,
-                &self.store_record(store_id, address, now_ms)?,
-            );
-            self.write(batch)?;
-            return Ok(Bootstrapped {
-                cluster_id: cluster.cluster_id,
-                region: None,
-            });
-        }
-
-        // Two ids in one reservation: the region and its first peer. The reservation is
-        // persisted inside `allocate`, before either id is used for anything.
+        // Two ids in one reservation: the region and its first peer. The reservation commits
+        // inside `allocate`, before either id is used for anything — and if the cluster turns out
+        // to exist, the two are simply skipped, which is what ids being cheap is for.
         let base = {
-            let db = Arc::clone(&self.db);
-            let cf = self.cf;
-            state.alloc.allocate(2, |end| persist_alloc(&db, cf, end))?
+            let driver = &self.driver;
+            state.alloc.allocate(2, |end| reserve(driver, end))?
         };
-        let region = Region::bootstrap(base, store_id, base + 1);
-        let cluster = ClusterRecord {
-            cluster_id: mint_cluster_id(now_ms, store_id, address),
-            first_region_id: region.id,
-            created_ms: now_ms,
-        };
+        // Minted here rather than at apply, so that three members do not mint three
+        // ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)). Ignored by an apply that
+        // finds a cluster already there.
+        let cluster_id = mint_cluster_id(now_ms, store_id, address);
+        drop(state);
 
-        let mut batch = WriteBatch::new();
-        batch.put(self.cf, &keys::cluster_key(), &cluster.encode());
-        routing::stage_store(
-            &mut batch,
-            self.cf,
-            &self.store_record(store_id, address, now_ms)?,
-        );
-        routing::stage_region(
-            &mut batch,
-            self.cf,
-            &RegionRecord::new(region.clone(), now_ms),
-            None,
-        );
-        self.write(batch)?;
-
-        state.cluster = Some(cluster);
-        tracing::info!(
-            cluster_id = cluster.cluster_id,
-            region_id = region.id,
+        match self.propose(Command::Bootstrap {
             store_id,
-            "cluster bootstrapped"
-        );
-        Ok(Bootstrapped {
-            cluster_id: cluster.cluster_id,
-            region: Some(region),
-        })
+            address: address.to_owned(),
+            base_id: base,
+            cluster_id,
+            now_ms,
+        })? {
+            Answer::Bootstrapped(done) => Ok(done),
+            other => Err(PdError::internal(format!("bootstrap applied to {other:?}"))),
+        }
     }
 
     /// The first of `count` consecutive cluster-unique ids.
@@ -542,12 +610,9 @@ impl Pd {
     /// The batch they come from is persisted before any of them is returned, so a crash skips
     /// ids and never repeats one ([`crate::alloc`]).
     pub fn alloc_id(&self, count: u64) -> Result<u64> {
-        let mut state = self.lock()?;
-        let db = Arc::clone(&self.db);
-        let cf = self.cf;
-        state
-            .alloc
-            .allocate(count, |end| persist_alloc(&db, cf, end))
+        let mut state = self.leading()?;
+        let driver = &self.driver;
+        state.alloc.allocate(count, |end| reserve(driver, end))
     }
 
     /// A run of `count` consecutive timestamps, starting at the returned one.
@@ -557,17 +622,16 @@ impl Pd {
     /// whose ordering every layer above depends on (`CLAUDE.md` invariant 6).
     pub fn tso(&self, count: u32) -> Result<u64> {
         let now_ms = self.clock.now_ms();
-        let mut state = self.lock()?;
-        let db = Arc::clone(&self.db);
-        let cf = self.cf;
+        let mut state = self.leading()?;
+        let driver = &self.driver;
         state
             .oracle
-            .allocate(count, now_ms, |mark| persist_tso(&db, cf, mark))
+            .allocate(count, now_ms, |mark| commit_tso(driver, mark))
     }
 
     /// The oracle's high-water mark, for the inspector and the tests.
     pub fn tso_high_water_ms(&self) -> Result<u64> {
-        Ok(self.lock()?.oracle.high_water_ms())
+        Ok(self.applied()?.high_water_ms)
     }
 
     /// Records which key ranges want columnar replicas, replacing whatever was there.
@@ -577,20 +641,26 @@ impl Pd {
     /// last writer is right whoever it was; a delta would need an ordering this service does not
     /// impose. Durable before it answers, for the reason above: PD cannot re-derive it.
     pub fn report_columnar(&self, wishes: Vec<ColumnarWish>) -> Result<()> {
-        let mut state = self.lock()?;
-        let record = ColumnarRecord { wishes };
-        let mut batch = WriteBatch::new();
-        batch.put(self.cf, &keys::columnar_key(), &record.encode());
-        self.db.write(batch, &WriteOptions::synced())?;
-        state.columnar = record;
-        Ok(())
+        let _serving = self.leading()?;
+        self.propose(Command::Columnar { wishes }).map(|_| ())
+    }
+
+    /// How many columnar replicas a region covering `[start, end)` should have, as the SQL layer
+    /// last reported ([`crate::record::ColumnarRecord::wanted_for`]).
+    ///
+    /// Read out of applied state rather than out of `Pd`'s own, because the wishes are replicated:
+    /// PD cannot re-derive them from any heartbeat, so they go through the log like every other
+    /// record ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+    pub(crate) fn columnar_wanted_for(&self, start: &[u8], end: &[u8]) -> u8 {
+        self.applied()
+            .map_or(0, |applied| applied.columnar.wanted_for(start, end))
     }
 
     /// What the SQL layer last said about columnar placement.
     #[must_use]
     pub fn columnar_wishes(&self) -> Vec<ColumnarWish> {
-        self.lock()
-            .map(|state| state.columnar.wishes.clone())
+        self.applied()
+            .map(|applied| applied.columnar.wishes.clone())
             .unwrap_or_default()
     }
 
@@ -689,21 +759,22 @@ impl Pd {
     /// anyway.
     pub fn store_heartbeat(&self, beat: &StoreBeat) -> Result<()> {
         let now_ms = self.clock.now_ms();
-        let _state = self.lock()?;
-        let Some(existing) = routing::read_store(&self.db, beat.store_id)? else {
+        // Refused here, before the propose, and that is the rule: the log carries decisions, so a
+        // request PD will not serve never reaches it ([`crate::machine`]). Safe to read outside the
+        // log because a store record is never deleted — one that exists now exists at the apply.
+        let _serving = self.leading()?;
+        if routing::read_store(&self.db, beat.store_id)?.is_none() {
             return Err(PdError::invalid(format!(
                 "store {} has not registered; call Bootstrap first",
                 beat.store_id
             )));
-        };
-        let record = StoreRecord {
+        }
+        self.propose(Command::StoreBeat {
+            store_id: beat.store_id,
             stats: beat.stats,
-            last_heartbeat_ms: now_ms,
-            ..existing
-        };
-        let mut batch = WriteBatch::new();
-        routing::stage_store(&mut batch, self.cf, &record);
-        self.write(batch)
+            now_ms,
+        })
+        .map(|_| ())
     }
 
     /// Records what a region's leader reports, unless PD already holds something newer.
@@ -722,48 +793,50 @@ impl Pd {
             )));
         }
         let now_ms = self.clock.now_ms();
-        let mut state = self.lock()?;
+        // The guard is **not** evaluated here. A leader that read the record, decided, and then
+        // proposed would be deciding against a state the log may have moved past by the time the
+        // entry lands; letting the log's order settle which beat is newer is what the guard means,
+        // and under Raft the log's order is the same on every member
+        // ([`crate::machine`], [ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+        let serving = self.leading()?;
+        let record = RegionRecord {
+            region: beat.region.clone(),
+            leader_peer_id: beat.leader_peer_id,
+            term: beat.term,
+            approximate_size: beat.approximate_size,
+            applied_index: beat.applied_index,
+            last_heartbeat_ms: now_ms,
+        };
+        drop(serving);
 
-        let previous = routing::read_region(&self.db, beat.region.id)?;
-        let outdated = previous
-            .as_ref()
-            .is_some_and(|held| !routing::accepts(held, beat.region.epoch, beat.term));
-
-        // The record PD holds after this beat: the new one, or the one it kept.
-        let record = if outdated {
-            tracing::debug!(
-                region_id = beat.region.id,
-                "dropping a heartbeat older than the record it would replace"
-            );
-            previous.clone().unwrap_or_else(|| unreachable_stale(beat))
-        } else {
-            let record = RegionRecord {
-                region: beat.region.clone(),
-                leader_peer_id: beat.leader_peer_id,
-                term: beat.term,
-                approximate_size: beat.approximate_size,
-                applied_index: beat.applied_index,
-                last_heartbeat_ms: now_ms,
-            };
-            let mut batch = WriteBatch::new();
-            routing::stage_region(&mut batch, self.cf, &record, previous.as_ref());
-            self.write(batch)?;
-            record
+        let upsert = match self.propose(Command::RegionBeat {
+            record: record.clone(),
+        })? {
+            Answer::Upserted(upsert) => upsert,
+            other => {
+                return Err(PdError::internal(format!(
+                    "a region heartbeat applied to {other:?}"
+                )));
+            }
+        };
+        // What PD holds after this beat: the record it just wrote, or the newer one it kept.
+        let held = match upsert {
+            Upsert::Applied => record,
+            Upsert::Stale => routing::read_region(&self.db, beat.region.id)?
+                .unwrap_or_else(|| unreachable_stale(beat)),
         };
 
         // Scheduling happens here, on the heartbeat, and nowhere else. A store going down is
         // noticed by *absence*, so the trigger has to be somebody else's beat: repair latency
         // is therefore bounded by `max_store_down_time` plus one region-heartbeat interval,
         // and PD needs no timer thread to have it (`docs/DESIGN.md` §7, §14).
-        let operator = self.schedule(&mut state, &record, now_ms)?;
-        Ok(Beat {
-            upsert: if outdated {
-                Upsert::Stale
-            } else {
-                Upsert::Applied
-            },
-            operator,
-        })
+        //
+        // It runs **after** the apply and outside its lock, because it is leader-only memory that
+        // no member replicates (ADR 0013) — and because a scheduler that ran while the driver was
+        // waiting on this thread would be the deadlock this whole layout avoids.
+        let mut state = self.leading()?;
+        let operator = self.schedule(&mut state, &held, now_ms)?;
+        Ok(Beat { upsert, operator })
     }
 
     /// The last few things PD asked for, oldest first.
@@ -771,7 +844,7 @@ impl Pd {
     /// A debugging record: no decision reads it, and losing it costs an explanation rather than
     /// a repair ([`crate::record::HistoryRecord`]).
     pub fn history(&self) -> Result<Vec<OperatorEvent>> {
-        Ok(self.lock()?.history.events.clone())
+        Ok(self.applied()?.history.events.clone())
     }
 
     /// Every operator in flight right now, in region order, with PD's clock.
@@ -807,16 +880,17 @@ impl Pd {
         Ok((now_ms, operators))
     }
 
-    /// Appends one event to the history, on disk and in memory.
+    /// Appends one event to the history ring.
     ///
-    /// Called with the lock held. The write is durable like every other write PD makes, which
-    /// costs one small `fsync` per operator transition — a handful per region per repair, and
-    /// the price of being able to answer "what did PD do" after the process is gone.
-    pub(crate) fn record_event(&self, state: &mut State, event: OperatorEvent) -> Result<()> {
-        state.history.push(event);
-        let mut batch = WriteBatch::new();
-        batch.put(self.cf, &keys::history_key(), &state.history.encode());
-        self.write(batch)
+    /// Called with `Pd`'s state lock held, which is safe and is worth saying why: the driver
+    /// applies into [`crate::machine::AppliedState`], a different lock, and takes this one never
+    /// — so a propose made under this lock cannot wait on itself ([`crate::driver`]).
+    ///
+    /// The write is durable like every other write PD makes, which now costs one Raft round trip
+    /// per operator transition — a handful per region per repair, and the price of being able to
+    /// answer "what did PD do" after the process is gone.
+    pub(crate) fn record_event(&self, event: OperatorEvent) -> Result<()> {
+        self.propose(Command::History { event }).map(|_| ())
     }
 
     /// Every region PD knows about, in id order.
@@ -841,28 +915,97 @@ impl Pd {
         ))
     }
 
-    /// The store record to write for a registering store, keeping the id it already had.
-    fn store_record(&self, store_id: u64, address: &str, now_ms: u64) -> Result<StoreRecord> {
-        let existing = routing::read_store(&self.db, store_id)?;
-        Ok(StoreRecord {
-            store_id,
-            address: address.to_owned(),
-            started_ms: now_ms,
-            last_heartbeat_ms: now_ms,
-            stats: existing.map(|store| store.stats).unwrap_or_default(),
-        })
+    /// The leader's working state, or a refusal.
+    ///
+    /// Two things in one call, because they belong together and because doing the second without
+    /// the first is the failover bug this phase exists to close:
+    ///
+    /// * **Refuse unless this member may serve.** A follower — and a leader that has not yet
+    ///   applied its own `TakeOffice` — answers [`PdError::NotLeader`] with the hint it has. The
+    ///   address comes from the member list, so a caller that was given three endpoints can act
+    ///   on the answer without a fourth round trip.
+    /// * **Rebuild on a new term.** A member that has just taken office reloads its allocator and
+    ///   its oracle from what it has *applied* — `allocated_end + 1` and `max(clock, mark)` — which
+    ///   is the same pair of constructors a restart uses, because a failover is a restart that
+    ///   kept its socket ([ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md)).
+    fn leading(&self) -> Result<std::sync::MutexGuard<'_, State>> {
+        let office = self.driver.leadership();
+        if !office.serving {
+            return Err(self.not_leader(&office));
+        }
+        let mut state = self.lock()?;
+        if state.office_term == office.office_term {
+            return Ok(state);
+        }
+        let applied = self.applied()?;
+        state.alloc = Allocator::load(
+            (applied.allocated_end > 0).then_some(crate::record::AllocRecord {
+                allocated_end: applied.allocated_end,
+            }),
+            self.alloc_batch,
+        );
+        state.oracle = Oracle::load(
+            (applied.high_water_ms > 0).then_some(crate::record::TsoRecord {
+                high_water_ms: applied.high_water_ms,
+            }),
+            office_clock(&office, self.clock.as_ref()),
+            self.tso_save_interval_ms,
+        );
+        state.office_term = office.office_term;
+        tracing::info!(
+            id = office.id,
+            term = office.office_term,
+            next_id = state.alloc.next_id(),
+            physical_ms = state.oracle.physical_ms(),
+            "took office; the allocator and the oracle resume above what is committed"
+        );
+        Ok(state)
+    }
+
+    /// The refusal a member that cannot serve answers, with the address of the one that can.
+    ///
+    /// For the service, which checks leadership once at the top of its dispatch rather than
+    /// per method.
+    #[must_use]
+    pub fn not_leading(&self) -> PdError {
+        self.not_leader(&self.driver.leadership())
+    }
+
+    /// The refusal a member that cannot serve answers, with the address of the one that can.
+    fn not_leader(&self, office: &Leadership) -> PdError {
+        let leader_id = office.leader.unwrap_or(0);
+        PdError::NotLeader {
+            leader_id,
+            leader_address: self
+                .members
+                .address_of(leader_id)
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
+
+    /// Proposes a command and waits for it to apply. Every durable write goes through here.
+    fn propose(&self, command: Command) -> Result<Answer> {
+        self.driver.propose(command)
+    }
+
+    /// The Raft group underneath, for the child module that also allocates ids.
+    pub(crate) fn driver(&self) -> &PdDriver {
+        &self.driver
+    }
+
+    /// What the state machine has applied, for the reads that come out of memory.
+    fn applied(&self) -> Result<std::sync::RwLockReadGuard<'_, crate::machine::AppliedState>> {
+        self.machine
+            .applied()
+            .read()
+            .map_err(|_| PdError::internal("pd applied state lock is poisoned"))
     }
 
     pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>> {
         self.state
             .lock()
             .map_err(|_| PdError::internal("pd state lock is poisoned"))
-    }
-
-    /// Every write PD makes is durable before it is acknowledged (invariant 1).
-    pub(crate) fn write(&self, batch: WriteBatch) -> Result<()> {
-        self.db.write(batch, &WriteOptions::synced())?;
-        Ok(())
     }
 }
 
@@ -873,28 +1016,40 @@ fn unreachable_stale(beat: &RegionBeat) -> RegionRecord {
     RegionRecord::new(beat.region.clone(), 0)
 }
 
-fn read(db: &Db, key: &[u8]) -> Result<Option<bytes::Bytes>> {
-    Ok(db.get(cf::DEFAULT, key, &ReadOptions::default())?)
+/// Commits the oracle's mark. Called *before* a timestamp at or above it is handed out.
+///
+/// "Durable" now means "applied", and the difference is the whole of
+/// [ADR 0055](../../../docs/adr/0055-pd-is-a-raft-group.md): this returns only once the entry has
+/// committed and this member has applied it, so a leader that has quietly lost office fails here
+/// rather than handing out a timestamp its successor will hand out again.
+fn commit_tso(driver: &PdDriver, high_water_ms: u64) -> Result<()> {
+    driver
+        .propose(Command::AdvanceTso {
+            mark: high_water_ms,
+        })
+        .map(|_| ())
 }
 
-/// Makes the oracle's mark durable. Called *before* a timestamp at or above it is handed out.
-fn persist_tso(db: &Db, cf: u32, high_water_ms: u64) -> Result<()> {
-    let mut batch = WriteBatch::new();
-    batch.put(cf, &keys::tso_key(), &TsoRecord { high_water_ms }.encode());
-    db.write(batch, &WriteOptions::synced())?;
-    Ok(())
+/// Commits an id reservation. Called by the allocator *before* it hands out an id, and durable in
+/// the same sense as [`commit_tso`].
+fn reserve(driver: &PdDriver, allocated_end: u64) -> Result<()> {
+    driver
+        .propose(Command::ReserveIds { end: allocated_end })
+        .map(|_| ())
 }
 
-/// Makes an id reservation durable. Called by the allocator *before* it hands out an id.
-fn persist_alloc(db: &Db, cf: u32, allocated_end: u64) -> Result<()> {
-    let mut batch = WriteBatch::new();
-    batch.put(
-        cf,
-        &keys::alloc_key(),
-        &AllocRecord { allocated_end }.encode(),
-    );
-    db.write(batch, &WriteOptions::synced())?;
-    Ok(())
+/// The clock a member resumes its oracle against on taking office.
+///
+/// The term's own `TakeOffice` stamp when there is one, so the resume point is the instant the log
+/// records rather than a second, later reading of the same clock; the clock itself before a member
+/// has ever taken office. Either way `Oracle::load` takes `max(clock, mark)`, so neither can pull
+/// time backwards — this only decides which reading is used.
+fn office_clock(office: &Leadership, clock: &dyn Clock) -> u64 {
+    if office.office_now_ms > 0 {
+        office.office_now_ms
+    } else {
+        clock.now_ms()
+    }
 }
 
 /// Mints a cluster id from the one-time facts of a bootstrap.
