@@ -66,17 +66,29 @@ model was never in question.
 The test took its four cells strictly in sequence — subject small, subject large, then control
 small, control large — so **the control was measured after the subject rather than beside it**, and
 load arriving or departing between the arms moved `growth` and `control` independently. Cancelling
-load common to both arms is the one thing a control is for. The middle of the load curve is the
-danger zone precisely because at eighty threads both arms are slow together and the ratio is stable
-again.
+load common to both arms is the one thing a control is for.
 
-The arms are now interleaved: each round takes the subject and its control adjacently at each size,
-so the asserted figure is `(subject ÷ control at LARGE) ÷ (subject ÷ control at SMALL)` — the same
-growth-against-growth number, arranged so every division sits between two measurements taken next
-to each other. Five rounds, the **median** asserted, a discarded warm-up round, and the small case
-lifted from 250 rows to 1,000 because its 1.6 ms sample was the ratio's denominator and one
-preemption of a few milliseconds was an error of over 100% in it. The fixture inserts in batches,
-which is what pays for the larger sizes. `tests/join_cost.rs`.
+**The first reshape fixed that and still could not see the bug**, which is what the red-first run
+found before it landed. Disabling the inner-side grouping so a materialised join is a cross product
+again, the test **passed in 131 seconds**:
+
+| | subject ÷ control at 1,000 | at 8,000 | growth ÷ growth |
+|---|---:|---:|---:|
+| grouped | 3.3 | 2.8 | 0.9 |
+| cross product | 130 | 321 | **2.9** (bound 3.0) |
+
+Two facts no amount of reading would have produced. **The cross product is already fully visible at
+the small size**, so a growth term carries only the extra eight-fold rather than the fault. And
+**`count(*)` is not linear across these sizes** — it grew 26x for 8x the rows — so dividing by its
+growth removed most of what was left.
+
+So what is asserted is the **level, not the growth**: at each size, the median over five rounds of
+one *adjacent* pair — the join, then a scan of the same rows — must be under twenty scans. It needs
+nothing to be linear, only that a scan and a join of the same rows meet the same machine. Measured
+on both sides: **3.3 and 2.8 scans grouped, 130 and 321 as a cross product**, and the red-first run
+now fails at **163.8 scans in 2.6 seconds** where it used to pass in 131. Both sizes are still
+measured, smallest first, because a plan that is linear at one size and quadratic at the next is
+what one size cannot see. `tests/join_cost.rs`.
 
 ## 3. ADR numbering
 
