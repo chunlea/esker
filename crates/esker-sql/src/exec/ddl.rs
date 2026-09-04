@@ -1625,6 +1625,203 @@ fn drop_column(
     Ok(true)
 }
 
+/// `ALTER TABLE … ADD CONSTRAINT <name> UNIQUE (…)`.
+///
+/// Builds the same index `CREATE UNIQUE INDEX` would and marks it as a **constraint**, which is the
+/// only difference between them and the one that decides which statement can remove it. The rows
+/// already stored are not checked here for the same reason `CREATE UNIQUE INDEX` does not: an index
+/// that is `Public` from the start is this node's declared trade
+/// (`crate::catalog::SchemaState`), and a duplicate surfaces at the next write.
+fn add_unique_constraint(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    constraint: &plan::UniqueConstraint,
+) -> Result<()> {
+    let name = constraint
+        .name
+        .clone()
+        .unwrap_or_else(|| plan::unique_constraint_name(&updated.name, &constraint.columns));
+    if updated.indexes.iter().any(|index| index.name == name)
+        || updated.checks.iter().any(|check| check.name == name)
+        || updated.foreign_keys.iter().any(|key| key.name == name)
+    {
+        return Err(SqlError::DuplicateConstraint {
+            constraint: name,
+            relation: updated.name.clone(),
+        });
+    }
+    let ordinals = constraint
+        .columns
+        .iter()
+        .map(|column| {
+            updated
+                .column(column)
+                .ok_or_else(|| SqlError::UndefinedColumnInKey(column.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    updated.indexes.push(IndexDef {
+        id: catalog::allocate_id(txn, executor.tenant)?,
+        name,
+        unique: true,
+        keys: ordinals.into_iter().map(IndexKey::column).collect(),
+        nulls_not_distinct: constraint.nulls_not_distinct,
+        constraint: Some(match (constraint.deferrable, constraint.deferred) {
+            (_, true) => catalog::UniqueKind::Deferred,
+            (true, false) => catalog::UniqueKind::Deferrable,
+            (false, false) => catalog::UniqueKind::Immediate,
+        }),
+        state: catalog::SchemaState::Public,
+        state_since: updated.schema_version + 1,
+        include: Vec::new(),
+        predicate: None,
+        comment: None,
+    });
+    Ok(())
+}
+
+/// `ALTER TABLE … DROP CONSTRAINT [IF EXISTS] <name> [CASCADE]`. Answers whether anything changed,
+/// which is `false` only for `IF EXISTS` on a name that is nothing.
+///
+/// **Six kinds, and the search order is not arbitrary.** A `UNIQUE` *constraint* and a
+/// `CREATE UNIQUE INDEX` build the same index and `IndexDef::constraint` is the only thing that
+/// tells them apart — an index without one is not a constraint and must reach the `42704`, which
+/// is the distinction the capture spends four lines on. `NOT NULL` is last because its name is
+/// derived rather than stored, so a real constraint of the same spelling wins.
+fn drop_constraint(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    updated: &mut TableDef,
+    relation: &str,
+    name: &str,
+    if_exists: bool,
+    cascade: bool,
+) -> Result<bool> {
+    // A `CHECK`, the plain case: nothing owns it and nothing depends on it.
+    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+        updated.checks.remove(at);
+        return Ok(true);
+    }
+    // An `EXCLUDE`, which owns a synthesised relation and no stored index (ADR 0031's EXCLUDE note).
+    if let Some(at) = updated
+        .excludes
+        .iter()
+        .position(|exclude| exclude.name == name)
+    {
+        updated.excludes.remove(at);
+        return Ok(true);
+    }
+    // A `FOREIGN KEY` — what `remove_foreign_key` sends. **Its back-reference goes with it**, and
+    // only once nothing else of this table's points at that parent: the key is per
+    // `(parent, child)` pair, which is the rule run 50's regression established.
+    if let Some(at) = updated.foreign_keys.iter().position(|key| key.name == name) {
+        let parent = updated.foreign_keys[at].parent;
+        updated.foreign_keys.remove(at);
+        forget_backref_if_last(txn, executor.tenant, updated, parent);
+        return Ok(true);
+    }
+    // A `UNIQUE` constraint. **Its index goes with it, silently** — measured — and an index that
+    // is not a constraint is not found here at all.
+    if let Some(at) = updated
+        .indexes
+        .iter()
+        .position(|index| index.name == name && index.constraint.is_some())
+    {
+        updated.indexes.remove(at);
+        return Ok(true);
+    }
+    // The `PRIMARY KEY`, which another table's foreign key can depend on — the one kind here with
+    // a dependent outside its own table, and so the only one `CASCADE` means anything for.
+    if !updated.primary_key_name.is_empty() && updated.primary_key_name == name {
+        refuse_keys_on_the_primary(txn, executor, updated, name, cascade)?;
+        updated.primary_key.clear();
+        updated.primary_key_name.clear();
+        updated.primary_key_comment = None;
+        // The index behind it goes too, the way a `UNIQUE` constraint's does.
+        updated.indexes.retain(|index| index.name != name);
+        return Ok(true);
+    }
+    // `NOT NULL`, which **is** a droppable constraint in PostgreSQL 19: every such column has its
+    // own `pg_constraint` row named `<table>_<column>_not_null`, and dropping it clears
+    // `attnotnull` exactly as `ALTER COLUMN … DROP NOT NULL` does.
+    let not_null_at = updated
+        .live_columns()
+        .find(|(_, column)| column.not_null && not_null_constraint_name(updated, column) == name)
+        .map(|(at, _)| at);
+    if let Some(at) = not_null_at {
+        updated.columns[at].not_null = false;
+        return Ok(true);
+    }
+
+    if if_exists {
+        executor.notice(SqlError::UndefinedConstraintSkipping {
+            constraint: name.to_owned(),
+            relation: relation.to_owned(),
+        });
+        return Ok(false);
+    }
+    Err(SqlError::UndefinedConstraint {
+        constraint: name.to_owned(),
+        relation: relation.to_owned(),
+    })
+}
+
+/// The name a `NOT NULL` column's constraint has: `<table>_<column>_not_null`, PostgreSQL's own
+/// derivation and the one `crate::catalog::pg_constraint` reports.
+fn not_null_constraint_name(table: &TableDef, column: &ColumnDef) -> String {
+    format!("{}_{}_not_null", table.name, column.name)
+}
+
+/// `2BP01` when another table's foreign key depends on this table's primary key, unless `CASCADE`.
+///
+/// PostgreSQL's sentence names the **index** the foreign key needs rather than the constraint,
+/// which is the shape of the dependency: a referencing key is validated through the unique index
+/// the primary key owns.
+fn refuse_keys_on_the_primary(
+    txn: &mut dyn Txn,
+    executor: &mut Executor,
+    table: &TableDef,
+    name: &str,
+    cascade: bool,
+) -> Result<()> {
+    let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
+    for (key, _) in txn.scan(&start, &end, 0)? {
+        let child_id = catalog::foreign_key_backref_child(executor.tenant, table.id, &key)?;
+        if child_id == table.id {
+            continue;
+        }
+        let child = executor.table_by_id(txn, child_id)?;
+        let depends: Vec<String> = child
+            .foreign_keys
+            .iter()
+            .filter(|constraint| constraint.parent == table.id)
+            .map(|constraint| constraint.name.clone())
+            .collect();
+        if depends.is_empty() {
+            continue;
+        }
+        if !cascade {
+            return Err(SqlError::DependentConstraint {
+                constraint: name.to_owned(),
+                relation: table.name.clone(),
+                detail: format!(
+                    "constraint {} on table {} depends on index {name}",
+                    depends[0], child.name
+                ),
+            });
+        }
+        // **The key goes and the column stays** — measured: the referencing table keeps `dcp_id`.
+        let mut without = (*child).clone();
+        without
+            .foreign_keys
+            .retain(|constraint| !depends.contains(&constraint.name));
+        without.schema_version += 1;
+        catalog::replace_table(txn, executor.tenant, &child, &without)?;
+        forget_backref_if_last(txn, executor.tenant, &without, table.id);
+    }
+    Ok(())
+}
+
 /// Deletes a child's back-reference to one parent, **only once nothing points there any more**.
 ///
 /// The key is `(parent, child)` and not `(parent, child, constraint)`, so a child holding two
@@ -2475,7 +2672,6 @@ fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
         },
     }
 }
-
 /// Walks one resolved expression, refusing every node that may not be an index key.
 fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
     use crate::plan::Expr;
@@ -2513,6 +2709,26 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
 /// Positions cannot do it: the copy's ordinals are the partition's and the original's are the
 /// parent's, and the two differ the moment a partition carries an internal row id the parent has
 /// not. An expression part has no column and is named by its printed text, so two copies of one
+///
+/// **The second half of the distinction this whole family turns on**: `CREATE UNIQUE INDEX` and
+/// `ADD CONSTRAINT … UNIQUE` build the same index, and only the second has a `pg_constraint` row —
+/// which is exactly what makes `DROP INDEX` refuse it and `DROP CONSTRAINT` remove it. The primary
+/// key's case is the same rule one relation kind over, and it is checked where the relation is
+/// resolved because a primary key has no `IndexDef` to find here.
+fn refuse_a_constraints_index(table: &TableDef, index_id: u64, name: &str) -> Result<()> {
+    if table
+        .indexes
+        .iter()
+        .any(|index| index.id == index_id && index.constraint.is_some())
+    {
+        return Err(SqlError::DependentObjectsStillExist {
+            index: name.to_owned(),
+            table: table.name.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// expression index still match.
 fn index_key_names(table: &TableDef, index: &IndexDef) -> Vec<String> {
     index
@@ -2572,6 +2788,8 @@ pub(super) fn drop_index(
             }
         };
         let table = executor.table_by_id(txn, table_id)?;
+
+        refuse_a_constraints_index(&table, index_id, name)?;
 
         if drop.concurrently {
             // The **removal direction**: the index stays where it is and a job walks it backwards,
@@ -2723,6 +2941,28 @@ pub(super) fn alter_table(
         if let AlterTableAction::SetDefault { column, default } = action {
             set_column_default(txn, executor, &mut updated, column, default.as_ref())?;
             changed = true;
+            continue;
+        }
+        if let AlterTableAction::AddUnique(constraint) = action {
+            add_unique_constraint(txn, executor, &mut updated, constraint)?;
+            changed = true;
+            continue;
+        }
+        if let AlterTableAction::DropConstraint {
+            name,
+            if_exists,
+            cascade,
+        } = action
+        {
+            changed |= drop_constraint(
+                txn,
+                executor,
+                &mut updated,
+                &alter.name,
+                name,
+                *if_exists,
+                *cascade,
+            )?;
             continue;
         }
         if let AlterTableAction::DropColumn {

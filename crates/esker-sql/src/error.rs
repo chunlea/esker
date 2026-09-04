@@ -1559,6 +1559,48 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `ALTER TABLE … DROP CONSTRAINT` for a name this relation has no constraint of: `42704`.
+    ///
+    /// **The relation is named**, where `SET CONSTRAINTS`'s shorter `constraint "x" does not exist`
+    /// is not — two sentences for one condition, both captured, because a client may match either.
+    /// A unique *index* reaches this one: it is not a constraint, however alike the two look in
+    /// `pg_indexes`.
+    #[error("constraint \"{constraint}\" of relation \"{relation}\" does not exist")]
+    UndefinedConstraint {
+        /// The constraint that is not there.
+        constraint: String,
+        /// The relation it was looked for in.
+        relation: String,
+    },
+
+    /// The same, under `IF EXISTS`: a **notice**, and the statement succeeds. This is what makes
+    /// `ActiveRecord`'s idempotent migrations work.
+    #[error("constraint \"{constraint}\" of relation \"{relation}\" does not exist, skipping")]
+    UndefinedConstraintSkipping {
+        /// The constraint that is not there.
+        constraint: String,
+        /// The relation it was looked for in.
+        relation: String,
+    },
+
+    /// A **constraint** something outside its own table depends on: `2BP01`, and PostgreSQL's
+    /// fourth sentence in this class.
+    ///
+    /// Only a primary key or unique constraint can have one, and the dependent is always another
+    /// table's foreign key — which needs the *index* the constraint owns, so the `DETAIL` names
+    /// the index rather than the constraint. Measured.
+    #[error(
+        "cannot drop constraint {constraint} on table {relation} because other objects depend on it"
+    )]
+    DependentConstraint {
+        /// The constraint that cannot be dropped.
+        constraint: String,
+        /// The table it belongs to.
+        relation: String,
+        /// `constraint fk_dcc_dcp2 on table dcc depends on index dcp_pkey`
+        detail: String,
+    },
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -1830,6 +1872,8 @@ impl SqlError {
             // the role and the tablespace this node has none of.
             | SqlError::InvalidEncodingName(_)
             | SqlError::UndefinedRole(_)
+            | SqlError::UndefinedConstraint { .. }
+            | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::WrongObjectType { .. }
@@ -1964,6 +2008,7 @@ impl SqlError {
             | SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
+            | SqlError::DependentConstraint { .. }
             | SqlError::DependentType { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
@@ -2026,6 +2071,7 @@ impl SqlError {
             SqlError::AlreadyExistsSkipping(_)
             | SqlError::DoesNotExistSkipping { .. }
             | SqlError::DuplicateColumnSkipping { .. }
+            | SqlError::UndefinedConstraintSkipping { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
@@ -2079,6 +2125,7 @@ impl SqlError {
             | SqlError::ForeignKeyStillReferenced { detail, .. }
             | SqlError::DependentTable { detail, .. }
             | SqlError::DependentColumn { detail, .. }
+            | SqlError::DependentConstraint { detail, .. }
             | SqlError::DependentFunction { detail, .. }
             | SqlError::DependentSchema { detail, .. }
             | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
@@ -2204,6 +2251,7 @@ impl SqlError {
             SqlError::DependentSchema { .. }
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
+            | SqlError::DependentConstraint { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::DependentType { .. }
             | SqlError::DependentFunction { .. } => {
@@ -2221,7 +2269,13 @@ impl SqlError {
                 found: "DROP SEQUENCE",
                 ..
             } => Some("Use DROP SEQUENCE to remove a sequence.".to_owned()),
-            SqlError::DependentObjectsStillExist { .. } => Some("You can drop the table instead.".to_owned()),
+            // PostgreSQL's own, and it names the **constraint** — measured for both the primary
+            // key and a `UNIQUE` constraint, which give the identical sentence. The hint here used
+            // to say "drop the table", which was advice a user could follow and not the advice a
+            // real server gives.
+            SqlError::DependentObjectsStillExist { index, table } => Some(format!(
+                "You can drop constraint {index} on table {table} instead."
+            )),
             SqlError::SchemaLeaseExpired { .. } => Some(
                 "Reads are unaffected. Writes resume when this node can reach the placement driver."
                     .to_owned(),

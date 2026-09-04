@@ -770,6 +770,29 @@ pub enum AlterTableAction {
         /// referencing it; without it those are `2BP01`.
         cascade: bool,
     },
+    /// `ADD CONSTRAINT <name> UNIQUE (…)`, which is what `add_unique_constraint` sends — and the
+    /// setup every `remove_unique_constraint` test needs before it can remove one.
+    ///
+    /// **The index it builds is a constraint's**, not a `CREATE UNIQUE INDEX`'s: the two make the
+    /// same index and only `IndexDef::constraint` tells them apart, which is what decides whether
+    /// `DROP CONSTRAINT` or `DROP INDEX` can remove it.
+    AddUnique(UniqueConstraint),
+    /// `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE|RESTRICT]`.
+    ///
+    /// **The one statement four `ActiveRecord` methods end in** — `remove_check_constraint`,
+    /// `remove_foreign_key`, `remove_unique_constraint` and `remove_exclusion_constraint` all
+    /// render through `schema_creation.rb:101`.
+    DropConstraint {
+        /// The constraint, folded.
+        name: String,
+        /// `IF EXISTS`: a name that is nothing is a notice rather than a `42704`, which is what
+        /// makes `ActiveRecord`'s idempotent migrations work.
+        if_exists: bool,
+        /// `CASCADE`: also drop what depends on the constraint. Only a primary key or unique
+        /// constraint has anything that can — another table's foreign key needs the index behind
+        /// it — and the cascade takes that foreign key, leaving the referencing *column* alone.
+        cascade: bool,
+    },
     /// `ALTER COLUMN c SET DEFAULT <expr>` and `ALTER COLUMN c DROP DEFAULT`.
     SetDefault {
         /// The column, folded.

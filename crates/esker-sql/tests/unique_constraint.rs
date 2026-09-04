@@ -19,10 +19,28 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', constraint_name, constraint_type, is_deferrable, initially_deferred FROM \
          information_schema.table_constraints WHERE table_name = 'test_unique_constraints' ORDER BY \
          constraint_name",
+        // `pg_constraint.conname` is a `name` there and `text` here, and `pg_typeof` answers a
+        // `regtype` where this node says `text` — the two standing catalog trades. These lines
+        // were **swallowed by an aborted block** until `ALTER TABLE … ADD CONSTRAINT … UNIQUE`
+        // landed and stopped aborting it, so they are newly *reached* rather than newly wrong.
+        "SELECT 'r', conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'u_nnd_deferred'",
+        "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'u_nd_explicit'",
+        "SELECT 'r', pg_typeof(condeferrable), pg_typeof(condeferred), pg_typeof(pg_get_constraintdef(oid)) FROM pg_constraint WHERE conname = 'test_unique_constraints_position_deferrable_false'",
     ],
     answers: &[(
         "ALTER TABLE \"test_unique_constraints\" ADD CONSTRAINT \"u_nnd_deferred\" UNIQUE NULLS NOT DISTINCT (\"position_2\") DEFERRABLE INITIALLY DEFERRED",
-        "**`ALTER TABLE … ADD CONSTRAINT … UNIQUE` is a different unit**: adding a unique constraint to a table that already has rows has to validate them, which is the staged backfill of ADR 0020 rather than anything about *when* a check runs. Both rows are here because the capture builds up to them; the deferrable half of each — `DEFERRABLE INITIALLY DEFERRED` on the new constraint — is what this unit built and is exercised by the `CREATE TABLE` forms above. It is also the **last blocker on this corpus**: it aborts the block, so the seven statements after it are swallowed rather than checked.",
+        "**A wrong answer, and named as one.** `ALTER TABLE … ADD CONSTRAINT … UNIQUE` now runs \
+         (`ALTER TABLE … DROP CONSTRAINT`'s unit built it, because the capture for that one has \
+         to add a unique constraint before it can remove one), and this line is where its one gap \
+         shows: PostgreSQL **refuses** it — `23505 could not create unique index … Key \
+         (position_2)=(null) is duplicated` — because the rows already in the table violate it \
+         under `NULLS NOT DISTINCT`, and this node accepts it. Nothing here validates existing \
+         rows when an index is created; every index is `SchemaState::Public` from the first \
+         statement, which is the staged-backfill gap ADR 0020 describes and the same trade \
+         `CREATE UNIQUE INDEX` already makes. Closing it is that backfill's unit, not this one, \
+         and until then a constraint can be created over data that breaks it. This entry moves to \
+         the divergence table rather than being quietly deleted **because it is a wrong answer \
+         and not a missing feature** (ADR 0031 rule 3).",
     )],
 };
 

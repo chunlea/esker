@@ -1925,6 +1925,19 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         // `ADD COLUMN` in the same one — which the loop this sits in already allows. `sqlparser`
         // additionally reads `DROP COLUMN a, b` as one action naming two columns, so the names
         // are a list here and each becomes its own action.
+        if let AlterTableOperation::DropConstraint {
+            name,
+            if_exists,
+            drop_behavior,
+        } = operation
+        {
+            actions.push(plan::AlterTableAction::DropConstraint {
+                name: ident(name),
+                if_exists: *if_exists,
+                cascade: matches!(drop_behavior, Some(sqlparser::ast::DropBehavior::Cascade)),
+            });
+            continue;
+        }
         if let AlterTableOperation::DropColumn {
             has_column_keyword: _,
             column_names,
@@ -2218,6 +2231,19 @@ fn lower_added_constraint(
             table,
             foreign_key,
         )?));
+    }
+    // `UNIQUE`, which `add_unique_constraint` sends and which every `remove_unique_constraint`
+    // test has to send first. It builds a constraint's index rather than a bare one — the
+    // distinction `DROP CONSTRAINT` and `DROP INDEX` disagree about.
+    if let TableConstraint::Unique(key) = constraint {
+        let (deferrable, deferred) = unique_deferrable(key.characteristics.as_ref())?;
+        return Ok(plan::AlterTableAction::AddUnique(plan::UniqueConstraint {
+            name: key.name.as_ref().map(ident),
+            columns: index_columns(&key.columns)?,
+            nulls_not_distinct: key.nulls_distinct == NullsDistinctOption::NotDistinct,
+            deferrable,
+            deferred,
+        }));
     }
     let TableConstraint::Check(check) = constraint else {
         return Err(SqlError::unsupported(format!(

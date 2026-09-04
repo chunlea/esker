@@ -1602,7 +1602,22 @@ impl TableDef {
         if sequence_of_relation(self.id).is_some() {
             return None;
         }
-        self.primary_key_name.is_empty().then_some(0)
+        // **By the column's own name, not by "has no primary key".**
+        //
+        // The derived form was right for as long as a table's key could not change, and
+        // `DROP CONSTRAINT` on a primary key ended that: clearing `primary_key_name` made a table
+        // that never had a hidden column look keyless, and column 0 — the user's `id` — became the
+        // row id. `SELECT *` then came back a column short and `pg_constraint` lost its
+        // `NOT NULL` row, which is how it was found.
+        //
+        // Whether the row id is there is a fact about the **stored rows**, fixed when the table
+        // was created, and [`INTERNAL_ROW_ID_NAME`] is a name no statement can contain — so
+        // reading it is exact where deriving it was a guess. The three guards above are now
+        // implied by this and kept for the messages they carry.
+        self.columns
+            .first()
+            .filter(|column| column.name == INTERNAL_ROW_ID_NAME)
+            .map(|_| 0)
     }
 
     /// The columns a user can see: every column except the internal row id.
@@ -2178,6 +2193,15 @@ pub fn replace_table(
     previous: &TableDef,
     table: &TableDef,
 ) -> Result<()> {
+    // **The primary key's name is reconciled here too**, and it has to be: it is a name record
+    // like an index's, written by `write_table` and pointing at a relation nothing else owns. A
+    // `DROP CONSTRAINT` on the primary key clears the name in the definition, and leaving the key
+    // behind is a name that outlives its object — which `pg_class` then reads and calls
+    // corruption. Run 50's regression was that same shape one object over.
+    if !previous.primary_key_name.is_empty() && previous.primary_key_name != table.primary_key_name
+    {
+        txn.delete(&record::name_key(tenant, &previous.primary_key_name));
+    }
     for index in &previous.indexes {
         if !table.indexes.iter().any(|kept| kept.id == index.id) {
             txn.delete(&record::name_key(tenant, &index.name));
