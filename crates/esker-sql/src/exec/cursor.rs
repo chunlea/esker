@@ -2403,6 +2403,12 @@ fn catalog_function(
                 "a ::regclass reached the row evaluator unresolved".to_owned(),
             ));
         }
+        // The same, one cast over: resolved in the same pass and for the same reason.
+        CatalogFunc::UserCast => {
+            return Err(SqlError::Internal(
+                "a cast to a user-defined type reached the row evaluator unresolved".to_owned(),
+            ));
+        }
     })
 }
 

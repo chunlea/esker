@@ -558,9 +558,21 @@ fn walk_select_mut(select: &mut crate::plan::Select, visit: &mut impl FnMut(&mut
 }
 
 /// A `FROM` entry: a derived table is a `SELECT`, walked as one.
+///
+/// **A `VALUES` list in a `FROM` is walked too**, and it was not: its rows are expressions in the
+/// same statement, numbered in the same `$n` sequence, and skipping them left a parameter in
+/// `SELECT v FROM (VALUES ($1)) t(v)` counted and never filled. Found by a cast to a user-defined
+/// type reaching the row evaluator unresolved (ADR 0053) — the same hole, one pass over.
 fn walk_table_ref_mut(table: &mut crate::plan::TableRef, visit: &mut impl FnMut(&mut Expr)) {
     if let Some(derived) = &mut table.derived {
         walk_select_mut(&mut derived.select, visit);
+    }
+    if let Some(values) = &mut table.values {
+        for row in &mut values.rows {
+            for expr in row {
+                walk_expr_mut(expr, visit);
+            }
+        }
     }
 }
 
@@ -602,6 +614,11 @@ fn for_each_in_select<'a>(select: &'a crate::plan::Select, each: &mut impl FnMut
 
 /// A `FROM` entry, for [`for_each_in_select`].
 fn for_each_in_table_ref<'a>(table: &'a crate::plan::TableRef, each: &mut impl FnMut(&'a Expr)) {
+    if let Some(values) = &table.values {
+        for row in &values.rows {
+            row.iter().for_each(&mut *each);
+        }
+    }
     if let Some(derived) = &table.derived {
         for_each_in_select(&derived.select, each);
     }

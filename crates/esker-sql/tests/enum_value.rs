@@ -74,21 +74,41 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // is `0A000` naming the type, and the two that a real server *refuses* refuse here too, so
         // the divergence is the code and not the outcome. It is the next unit, with `::regtype`
         // below, because both are "a user type is a name you can write in an expression".
+        // **`||` over text is unbuilt for every type**, which is where this statement stops — the
+        // cast in front of it is right, and `'happy'::mood::text` on the line above proves it.
+        // `tests/citext.rs` declares the same operator for the same reason.
         (
-            "SELECT 'r', 'happy'::mood, pg_typeof('happy'::mood)",
-            "a cast to a user-defined type is not built",
+            "SELECT 'r', ('happy'::mood)::text || '!'",
+            "|| over text is not built for any type",
+        ),
+        // **A name that is nobody's type is `42704` there and `0A000` here**, and this is the one
+        // place the pass cannot do better: after the catalog says no, the name is either a type
+        // PostgreSQL has and this node has not built — `money`, `tsvector` — or a name that is no
+        // type at all, and nothing here can tell them apart. Naming the type in a `0A000` is the
+        // honest half; claiming it does not exist would be wrong for the first case, which is the
+        // commoner one.
+        (
+            "SELECT 'r', 'happy'::nosuchtype",
+            "a name the catalog does not have is either an unbuilt type or no type; 0A000 says \
+             which is not known",
+        ),
+        // **An enum value in a relation that is not a table has no column to carry its type.**
+        // ADR 0050 puts the identity on the `ColumnDef` and ADR 0053 keeps the label only where
+        // the cast *is* the projection; a `VALUES` list is neither, so these two print the
+        // ordinal. Every ordering in them is right — `min`/`max` are the first and last
+        // **declared** and `ORDER BY` sorts `sad, ok, happy` — which is the half that would be
+        // hard; what is missing is the rendering. The fix is the synthetic `TableDef` of ADR 0048
+        // carrying `user_type`, which is where a `VALUES` list's column types already come from,
+        // and it closes both lines at once.
+        (
+            "SELECT 'r', min(v), max(v) FROM (VALUES ('sad'::mood), ('happy'::mood), \
+             ('ok'::mood)) t(v)",
+            "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
         ),
         (
-            "SELECT 'r', 'happy'::text::mood",
-            "a cast to a user-defined type is not built",
-        ),
-        (
-            "SELECT 'r', 'sad'::mood < 'happy'::mood, 'happy'::mood < 'ok'::mood",
-            "a cast to a user-defined type is not built, so neither operand exists",
-        ),
-        (
-            "SELECT 'angry'::mood",
-            "a cast to a user-defined type is not built; both refuse and only the code differs",
+            "SELECT 'r', v FROM (VALUES ('happy'::mood), ('sad'::mood), ('ok'::mood)) t(v) ORDER \
+             BY v",
+            "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
         ),
         // **`'mood'::regtype` resolves against this node's own type names and not the catalog.**
         // The lowering answers `42704` for a name `crate::value::named_type` does not have, which

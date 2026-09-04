@@ -59,6 +59,7 @@
 #     `timestamp_test.rb`'s, which uses raw `execute`.
 BEGIN		-
 CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TYPE tense AS ENUM ('past', 'present', 'future')		-
 CREATE TABLE postgresql_enums (id bigserial primary key, current_mood mood)		-
 SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), t.typtype, t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'postgresql_enums'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint|b|int8 ; r|current_mood|mood|e|mood
 SELECT 'r', typname, typtype FROM pg_type WHERE typtype IN ('r','e','d') ORDER BY typname	text,name,"char"	r|cardinal_number|d ; r|character_data|d ; r|daterange|r ; r|int4range|r ; r|int8range|r ; r|mood|e ; r|numrange|r ; r|sql_identifier|d ; r|time_stamp|d ; r|tsrange|r ; r|tstzrange|r ; r|yes_or_no|d
@@ -102,7 +103,7 @@ ROLLBACK TO SAVEPOINT sc3		-
 SAVEPOINT sc5		-
 SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder		r|sad|1 ; r|ok|2 ; r|happy|3
 ROLLBACK TO SAVEPOINT sc5		-
-SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname	text,name,name,name[]	r|mood|public|{sad,ok,happy}
+SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname	text,name,name,name[]	r|mood|public|{sad,ok,happy} ; r|tense|public|{past,present,future}
 SAVEPOINT s1		-
 INSERT INTO postgresql_enums (current_mood) VALUES ('angry')	!22P02 invalid input value for enum mood: "angry"
 ROLLBACK TO SAVEPOINT s1		-
@@ -147,13 +148,62 @@ ROLLBACK TO SAVEPOINT s6		-
 # and that `enumsortorder` is a `real` starting at **1** — not the label's index, and a float
 # because `ALTER TYPE … ADD VALUE … BEFORE` puts a new label *between* two numbers on a real
 # server. This node appends only, so its numbers are 1, 2, 3.
-CREATE TYPE tense AS ENUM ('past', 'present', 'future')		-
 SELECT 'r', t.typname, e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') ORDER BY t.typname, e.enumsortorder	text,name,name,real	r|mood|sad|1 ; r|mood|ok|2 ; r|mood|happy|3 ; r|tense|past|1 ; r|tense|present|2 ; r|tense|future|3
 SELECT 'r', t.typname, count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') GROUP BY t.typname ORDER BY t.typname	text,name,bigint	r|mood|3 ; r|tense|3
 SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder	text,real,regtype	r|1|real ; r|2|real ; r|3|real
 SELECT 'r', t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense') GROUP BY t.typname ORDER BY t.typname	text,name,name[]	r|mood|{sad,ok,happy} ; r|tense|{past,present,future}
 SELECT 'r', count(*) AS labels_of_an_empty_enum FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'emptymood'	text,bigint	r|0
 SELECT 'r', count(*) FROM pg_type t WHERE t.typname IN ('mood','tense','emptymood') AND t.typtype = 'e'	text,bigint	r|3
+# **A cast to a user-defined type**, the second slice of the enum follow-on (ADR 0053). The four
+# statements further up are `enum_test.rb`'s own; these are the surface around them, and three of
+# them are answers no reasoning would reach: `min`/`max` over enum values are the **first and last
+# declared**, not the alphabet's; `ORDER BY` on one sorts `sad, ok, happy`; and the label is
+# **case-sensitive**, so `'HAPPY'::mood` is `22P02` and not a fold. `''::mood` is `22P02` too --
+# an empty label is a label the type does not have, not a NULL.
+#
+# `'happy'::nosuchtype` is `42704` on a real server and `0A000` here, and that is the one place
+# this node cannot do better: after the catalog says no, a name is either a type PostgreSQL has
+# and this node has not built (`money`) or a name that is nobody's type, and nothing here can
+# tell them apart. Naming the type in a `0A000` is the honest half of the answer.
+SAVEPOINT u1		-
+SELECT 'r', 'happy'::mood = 'happy'::mood, 'happy'::mood = 'sad'::mood		r|t|f
+ROLLBACK TO SAVEPOINT u1		-
+SAVEPOINT u2		-
+SELECT 'r', 'ok'::mood > 'sad'::mood, 'ok'::mood <= 'happy'::mood		r|t|t
+ROLLBACK TO SAVEPOINT u2		-
+SAVEPOINT u3		-
+SELECT 'r', NULL::mood IS NULL		r|t
+ROLLBACK TO SAVEPOINT u3		-
+SAVEPOINT u4		-
+SELECT 'r', 'happy'::mood::text, pg_typeof('happy'::mood::text)		r|happy|text
+ROLLBACK TO SAVEPOINT u4		-
+SAVEPOINT u5		-
+SELECT 'r', ('happy'::mood)::text || '!'		r|happy!
+ROLLBACK TO SAVEPOINT u5		-
+SAVEPOINT u6		-
+SELECT 'r', 'past'::tense < 'future'::tense, 'past'::tense = 'past'::tense		r|t|t
+ROLLBACK TO SAVEPOINT u6		-
+SAVEPOINT u7		-
+SELECT 'r', 'x'::emptymood	!22P02 invalid input value for enum emptymood: "x"
+ROLLBACK TO SAVEPOINT u7		-
+SAVEPOINT u8		-
+SELECT 'r', 'HAPPY'::mood	!22P02 invalid input value for enum mood: "HAPPY"
+ROLLBACK TO SAVEPOINT u8		-
+SAVEPOINT u9		-
+SELECT 'r', ''::mood	!22P02 invalid input value for enum mood: ""
+ROLLBACK TO SAVEPOINT u9		-
+SAVEPOINT u10		-
+SELECT 'r', 'happy'::nosuchtype	!42704 type "nosuchtype" does not exist
+ROLLBACK TO SAVEPOINT u10		-
+SAVEPOINT u11		-
+SELECT 'r', min(v), max(v) FROM (VALUES ('sad'::mood), ('happy'::mood), ('ok'::mood)) t(v)		r|sad|happy
+ROLLBACK TO SAVEPOINT u11		-
+SAVEPOINT u12		-
+SELECT 'r', v FROM (VALUES ('happy'::mood), ('sad'::mood), ('ok'::mood)) t(v) ORDER BY v		r|sad ; r|ok ; r|happy
+ROLLBACK TO SAVEPOINT u12		-
+SAVEPOINT u13		-
+SELECT 'r', count(DISTINCT v) FROM (VALUES ('happy'::mood), ('happy'::mood), ('sad'::mood)) t(v)		r|2
+ROLLBACK TO SAVEPOINT u13		-
 DROP TYPE tense		-
 ROLLBACK		-
 SELECT count(*) FROM pg_type WHERE typname IN ('mood','emptymood','tense')	bigint	0

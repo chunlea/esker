@@ -772,6 +772,20 @@ pub enum CatalogFunc {
     /// oid **0** — PostgreSQL's rendering of `InvalidOid`, which every non-array row of `pg_type`
     /// has in `typelem` — and the number back for an oid this node does not know.
     RegTypeName,
+    /// `'happy'::mood` — a cast to a **user-defined type**, which is a name until the catalog is
+    /// read.
+    ///
+    /// Two arguments: the type's name as a string literal, and the operand. Like
+    /// [`CatalogFunc::RegClass`] it is replaced before the plan is built and never reaches the row
+    /// evaluator — the catalog answer is the same for every row, and reading it per row is the
+    /// cost trap `::regclass` already paid for once
+    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    ///
+    /// What it is replaced *with* depends on where it sits, and that is what an enum is rather
+    /// than a special case: **the label** when it is a projection on its own, so
+    /// `SELECT 'happy'::mood` prints `happy`; **the ordinal** everywhere else, so
+    /// `'sad'::mood < 'happy'::mood` is `1 < 3` and is `t`.
+    UserCast,
     /// `pg_typeof(x)`: the name of the type `x` has.
     ///
     /// **Read from the value, not from the plan.** A real server answers the *static* type, and
@@ -972,6 +986,9 @@ impl CatalogFunc {
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             CatalogFunc::RegTypeName => "regtype",
+            // What a `42883` would call it, and nothing reaches one: the pass either
+            // resolves it or raises about the type by name.
+            CatalogFunc::UserCast => "cast",
             CatalogFunc::ArrayPosition => "array_position",
             CatalogFunc::ArrayLower => "array_lower",
             CatalogFunc::ArrayUpper => "array_upper",
@@ -1003,6 +1020,8 @@ impl CatalogFunc {
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
             | CatalogFunc::ArrayPosition
+            // The type's name, then the operand.
+            | CatalogFunc::UserCast
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
@@ -1075,6 +1094,10 @@ impl CatalogFunc {
             | CatalogFunc::HstoreFetch => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
+            // **The storage, which is what an enum's value is** (ADR 0050) — and the label
+            // the projection form is replaced by is a `text` literal by then, so nothing
+            // reads this for that shape.
+            CatalogFunc::UserCast => ColumnType::Int2,
 
             // Every one of the five answers `integer` on a real server, including `cardinality`,
             // which counts every element of every dimension where `array_length` counts one.

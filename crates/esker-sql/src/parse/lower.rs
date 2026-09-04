@@ -4242,6 +4242,11 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
 ///
 /// So the pair is recognised together. That is not a shortcut around a missing type — it is the
 /// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per cast shape, and each arm is a measured answer; splitting it would \
+              hide which shapes are folded at plan time and which are not"
+)]
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
     // what the cast carries is the type, and everything downstream resolves against it — a
@@ -4261,6 +4266,29 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         return Ok(array);
     }
     let Some(target) = cast_target(data_type) else {
+        // **A cast to a name the catalog might know**, and it is asked *after* `cast_target`,
+        // because `regclass`, `regtype` and `oid` are `DataType::Custom` too — every one of them
+        // is a name `sqlparser` has no type for. `lower_type` refuses what is left because this
+        // node's own type table does not have it, which is the right answer for a typo and the
+        // wrong one for a type somebody declared: the same place `CREATE TABLE t (c mood)` was
+        // before `lower_column_type` learned to carry the name. Carried here too and resolved once
+        // per statement (ADR 0053); the operand goes with it, because the label is what is looked
+        // up.
+        if lower_type(data_type).is_err()
+            && let DataType::Custom(name, modifiers) = data_type
+            && modifiers.is_empty()
+            && name.0.len() == 1
+            && !is_serial_spelling(data_type)
+            && let Some(part) = name.0.first().and_then(|part| part.as_ident())
+        {
+            return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::UserCast,
+                args: vec![
+                    plan::Expr::Literal(plan::Literal::String(ident(part))),
+                    lower_expr(expr)?,
+                ],
+            })));
+        }
         // A cast to a **stored type**, which is a different thing from `regtype` and `oid`: it
         // reads the operand with that type's input function, exactly as assigning it to a column
         // of that type would. Only a literal, and only a chain of them — `'{"a":1}'::json::jsonb`
