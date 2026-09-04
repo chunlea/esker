@@ -282,7 +282,7 @@ fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
             pd.step_raft(batch)?;
             PdResp::Raft
         }
-        PdReq::Members => PdResp::Members(pd.membership()),
+        PdReq::Members | PdReq::MemberChange { .. } => operator(pd, request)?,
         PdReq::Status => {
             let (now_ms, operators) = pd.status()?;
             PdResp::Status { now_ms, operators }
@@ -294,6 +294,41 @@ fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
                 step_interval_ms: lease.step_interval_ms,
                 removal_extra_ms: lease.removal_extra_ms,
             }
+        }
+    })
+}
+
+/// The two methods an **operator** calls, as opposed to a store or a client.
+///
+/// Split from the dispatch above because they are a different audience asking a different kind of
+/// question — who is in this group, and change it — and because a placement driver's own membership
+/// has nothing to do with the routing table the other methods are all about.
+fn operator(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
+    Ok(match request {
+        PdReq::Members => PdResp::Members(pd.membership()),
+        // **One step.** Adding a member is three things with a catch-up between them, and a call
+        // that did all three would hold a request open across a snapshot transfer, past any
+        // sensible deadline. Each call does what is missing; `done` says whether to call again
+        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        PdReq::MemberChange {
+            change,
+            id,
+            address,
+        } => {
+            let done = match change {
+                esker_proto::pd::MemberChange::Add => pd.add_member(*id, address)?,
+                esker_proto::pd::MemberChange::Remove => pd.remove_member(*id)?,
+            };
+            PdResp::MemberChange {
+                membership: pd.membership(),
+                done,
+            }
+        }
+        other => {
+            return Err(ProtoError::internal(format!(
+                "{} is not an operator method",
+                other.method().name()
+            )));
         }
     })
 }
