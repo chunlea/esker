@@ -1,0 +1,18 @@
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 386-389
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 2476-2477,2495,2497,2503
+crates/esker-sql/tests/foreign_key_drop_cycle.rs
+  h_44076b318daf9c 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "632b1f32858524200194f7fcceaff3bc96658ba8",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
