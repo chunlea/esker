@@ -298,7 +298,50 @@ when it is not.
   **All 187 `esker-pd` tests pass unchanged**, which was the unit's acceptance criterion, and the
   workspace is 3,093 green.
 
-### 9.1 Changes against §3 and §5, and why
+- **Units 2, 3, 4, 6 and 7 — three members, the timestamp proof, the redirect, the tools, the
+  docs.** Done, and landed together rather than one commit apiece: unit 2's mechanism is only
+  meaningful with unit 3's tests pointed at it, and unit 4's redirect is only reachable once a
+  follower exists to refuse. What each added:
+  - **Three members.** `member.rs` (the group and its id), `transport.rs` (one connection per
+    member pair, a batch per tick), `Method::PdRaft` carrying ADR 0009's real `Message`, the
+    leader check in `service::serve`, and the tick at the service edge.
+  - **The timestamp proof.** `tests/failover.rs`: three placement drivers in one process over a
+    queue the test drains by hand, so delivery is deterministic and a message can be dropped on
+    purpose. It elects, cuts the leader off, moves every clock **backwards**, and asserts the
+    successor's first timestamp is above the predecessor's last — and that a deposed leader that
+    has not noticed cannot cross its own mark.
+  - **The redirect.** `RemotePd::connect_to` takes the whole endpoint list, follows a named hint
+    up to `REDIRECT_BUDGET` times, backs off when nobody will say who leads, and refuses a hint
+    naming an address outside its configured set.
+  - **The tools.** `esker pd serve --id --peers`, `esker pd members`, `--pd a,b,c` on
+    `esker server`, and an `inspect` that shows the durable half of consensus.
+  - **DESIGN.md** §7 rewritten to what was built, §15's "PD HA timing" closed and replaced by
+    dynamic membership.
+
+### 9.1 What the tests were shown red against
+
+A green suite over a mechanism nobody has broken is evidence of nothing, so each rule was removed
+in turn and `tests/failover.rs` re-run. The third row is the one worth reading.
+
+| Mutation | Went red |
+|---|---|
+| `Oracle::load` resumes at the clock instead of `max(clock, mark)` | `a_new_leader_starts_above_the_last_committed_window` ("the mark did not survive the failover"), and `a_returning_leader_hands_out_nothing_its_successor_already_did` with an actual **duplicate** timestamp in the list |
+| a proposal is answered when it is appended instead of when it applies | 10 of 14 |
+| the leader check removed from both `Pd::leading` and `service::serve` | **1 of 14 at first, and for the wrong reason** — see below |
+
+**The third mutation is why this section exists.** With the leader check gone,
+`a_follower_refuses_every_answer_only_a_leader_may_give` still passed: a follower's `Tso` fails
+*twice over* — once at the leader check, and once because `esker-raft` will not let a non-leader
+propose — and the test only asked which variant came back. It was passing on the mechanism it was
+not testing.
+
+Two things came out of that. The refusal tests now assert the **address**, which only the leader
+check can fill in because only `Pd` holds the member list; and a new test drives a follower through
+`PdService` to prove it refuses a **read** — `GetRegion` takes no proposal, so before that test the
+service's check had no coverage at all. The same mutation now turns three tests red, each naming
+what it lost.
+
+### 9.2 Changes against §3 and §5, and why
 
 - **The wire addition moved from unit 2 into unit 1** (above).
 - **Snapshot and compaction were built in unit 1, not left for unit 2.** `Ready`'s snapshot arm
@@ -321,8 +364,40 @@ when it is not.
 - **`State` gained `office_term`.** A member rebuilds its allocator and oracle lazily, on the first
   write after taking office, rather than the driver reaching across to do it. That keeps the
   rebuild on the side of the lock that owns the state.
+- **`Pd::Members` is a new method, not a field on `Pd::Status`.** The brief asks for `inspect` to
+  show the leader; the honest version is two commands, because they answer two questions. `inspect`
+  opens a **stopped** placement driver and can only show what it left behind — its term, its vote,
+  how far it applied — and `members` asks a *running* group who leads. Adding the group to
+  `PdResp::Status` would have changed a message whose bytes are frozen by a golden, which needs the
+  human; a new method is an addition and needs only this note.
+- **`esker pd inspect` grew a read-only type of its own (`inspect.rs`).** This is a **bug this
+  phase introduced and closed in the same phase**: `Pd::open` now campaigns, and a campaign is a
+  write, so the inspector as it stood would have appended a `TakeOffice` entry to the database it
+  was asked to look at. `PdInspector` names no column family (so a 4a directory does not gain a
+  `raft` one just by being looked at), starts no driver, and has a test that opens the same
+  directory three times and asserts the term and the apply index never move.
+- **Nothing was added to `esker-client`.** §4 declared a new `pd.rs` there; on reading the tree
+  there are already three PD clients — `esker_store::pd_remote`, `esker_cli::region::PdConn` and
+  `esker_sql::pd::PdConn` — and none of them is `esker-client`'s. A fourth that nothing calls would
+  be a fourth place for the redirect rule to drift. What was built instead is the redirect inside
+  `esker_store::pd_remote`, which `esker-cli` already uses for `esker server`. **Escalated:**
+  `esker_sql::pd::PdConn` still holds one address and belongs to the SQL lane — §10 says what it
+  must add.
 - **The leader check went into `service::serve`, beside the cluster check**, and covers the reads.
   The writes refuse themselves inside `Pd`; without this a follower would still answer a
   `GetRegion` out of whatever it had applied. `Status` is exempt, for the reason it is exempt from
   the cluster check: it is a question about *this process*, and it is exactly what an operator asks
   a placement driver that is not answering.
+
+## 10. What another lane must add
+
+- **`esker-sql`: `crates/esker-sql/src/pd.rs`.** `PdConn` holds one `SocketAddr` and implements
+  `RegionResolver`, so a SQL node whose placement driver has changed leader stops resolving until
+  it is restarted. It needs the same three rules `esker_store::pd_remote` now has, and they are
+  small: hold the endpoint list rather than one address; on `ProtoError::PdNotLeader` with a
+  non-empty `leader_address` that is **in the list**, move to it and retry, bounded by a budget;
+  on an empty hint, back off and try the next endpoint. A hint naming an address outside the list
+  is a misconfiguration and must not be followed. The `--pd` flag that feeds it should take a
+  comma-separated list, as `esker server`'s now does.
+- **Nothing is asked of `esker-raft`.** PD drives the same pure `RawNode` under the same `Ready`
+  contract, and this lane found no gap in it.

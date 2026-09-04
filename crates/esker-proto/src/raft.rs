@@ -151,7 +151,12 @@ impl RaftBatch {
     }
 }
 
-fn encode_message(message: &Message, out: &mut Encoder) {
+/// One [`Message`], as ADR 0009 decided: the real type, not a mirror of it.
+///
+/// `pub(crate)` because the placement driver's own group sends the same messages with none of the
+/// routing around them — no region, no epoch, no stores ([`crate::pd::PdRaftBatch`]). A second
+/// encoder for the same thirty-odd fields is exactly what that ADR argues against.
+pub(crate) fn encode_message(message: &Message, out: &mut Encoder) {
     match message {
         Message::RequestVote {
             from,
@@ -256,7 +261,8 @@ fn head(out: &mut Encoder, kind: u8, from: u64, to: u64, term: u64) {
     out.put_varint(term);
 }
 
-fn decode_message(input: &mut Decoder<'_>) -> Result<Message, DecodeError> {
+/// Reads a message written by [`encode_message`].
+pub(crate) fn decode_message(input: &mut Decoder<'_>) -> Result<Message, DecodeError> {
     let kind = input.get_u8("raft.kind")?;
     let from = input.get_varint("raft.from")?;
     let to = input.get_varint("raft.to")?;

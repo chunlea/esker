@@ -13,7 +13,9 @@ use esker_proto::fragment::{
     Value, ValueType,
 };
 use esker_proto::messages::{DEFAULT_SCAN_LIMIT, Hello, HelloAck, RawKvReq, RawKvResp};
-use esker_proto::pd::{ColumnarWish, Operator, PdReq, PdResp, StoreInfo};
+use esker_proto::pd::{
+    ColumnarWish, Operator, PdMemberInfo, PdMembership, PdRaftBatch, PdReq, PdResp, StoreInfo,
+};
 use esker_proto::schema::{SchemaReq, SchemaResp};
 use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
 use esker_proto::{
@@ -80,6 +82,13 @@ fn pd_region() -> Region {
 /// The cluster id every `Pd` golden but `Bootstrap` carries.
 const PD_CLUSTER: u64 = 0xABCD;
 
+/// The placement-driver group id the `Pd::Raft` goldens carry.
+///
+/// Every byte distinct, because the field is a **fixed** eight little-endian bytes rather than a
+/// varint — a group id is a hash, so it is large in the ordinary case — and a value with repeated
+/// bytes would not catch a byte order that had been reversed.
+const PD_GROUP: u64 = 0x0123_4567_89AB_CDEF;
+
 /// The `Pd` goldens, in their own function: `docs/DESIGN.md` §9 gives the service six methods,
 /// and a corpus function holding every message of every service is one nobody reads.
 /// The columnar report's two wishes: one bounded range and one running to the end of the key
@@ -108,6 +117,37 @@ fn golden_pd_requests() -> Vec<(&'static str, Request)> {
                 request: PdReq::ReportColumnar {
                     wishes: columnar_wishes(),
                 },
+            },
+        ),
+        (
+            "pd-raft",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Raft(PdRaftBatch::new(
+                    PD_GROUP,
+                    2,
+                    vec![Message::TimeoutNow {
+                        from: 2,
+                        to: 3,
+                        term: 9,
+                    }],
+                )),
+            },
+        ),
+        // An empty batch is legal — "nothing to say" — and it is a different shape on the wire
+        // from a batch of one, so it gets a golden rather than an assumption.
+        (
+            "pd-raft-empty",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Raft(PdRaftBatch::new(PD_GROUP, 2, Vec::new())),
+            },
+        ),
+        (
+            "pd-members",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Members,
             },
         ),
         (
@@ -662,6 +702,47 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
             }),
         ),
         ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),
+        // Empty on purpose: Raft answers Raft, so a follower's reply is a message in a later
+        // batch and not a value here.
+        ("pd-raft", Response::Pd(PdResp::Raft)),
+        (
+            "pd-members",
+            Response::Pd(PdResp::Members(PdMembership {
+                group_id: PD_GROUP,
+                this_id: 2,
+                leader_id: 2,
+                term: 7,
+                members: vec![
+                    PdMemberInfo {
+                        id: 1,
+                        address: "127.0.0.1:2379".to_owned(),
+                    },
+                    PdMemberInfo {
+                        id: 2,
+                        address: "127.0.0.1:2380".to_owned(),
+                    },
+                    PdMemberInfo {
+                        id: 3,
+                        address: "127.0.0.1:2381".to_owned(),
+                    },
+                ],
+            })),
+        ),
+        // "Nobody leads yet" is a different answer from "the leader is member zero", and only a
+        // golden for both pins the difference — the same reason `not-leader-blind` has one.
+        (
+            "pd-members-electing",
+            Response::Pd(PdResp::Members(PdMembership {
+                group_id: PD_GROUP,
+                this_id: 3,
+                leader_id: 0,
+                term: 0,
+                members: vec![PdMemberInfo {
+                    id: 3,
+                    address: "127.0.0.1:2381".to_owned(),
+                }],
+            })),
+        ),
         (
             "pd-get-region",
             Response::Pd(PdResp::GetRegion {

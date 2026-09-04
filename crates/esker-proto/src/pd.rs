@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
+use esker_raft::Message;
+
 use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::messages::Method;
 use crate::region::{Epoch, Region};
@@ -424,6 +426,111 @@ impl ScannedRegion {
     }
 }
 
+/// One placement driver in a group, as `Pd::Members` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdMemberInfo {
+    /// Its member id within the group.
+    pub id: u64,
+    /// Where it listens.
+    pub address: String,
+}
+
+/// Who is in a placement driver's group, and which member leads.
+///
+/// The answer to `Pd::Members`, and the one question **every** member answers — an operator asks
+/// it exactly when the leader is the thing that is missing, so a version only the leader could
+/// answer would be useless at the moment it was wanted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PdMembership {
+    /// What identifies this group's traffic, as `esker_pd::MemberList::group_id` computes it.
+    /// Two members reporting different ones are two groups, which is a misconfiguration an
+    /// operator can see at a glance.
+    pub group_id: u64,
+    /// The member that answered.
+    pub this_id: u64,
+    /// The member it believes leads, or **zero** during an election. Zero is not a member id
+    /// anywhere in this codebase, which makes it the honest way to say "nobody, yet".
+    pub leader_id: u64,
+    /// The Raft term it is in. Two members far apart in term is a partition.
+    pub term: u64,
+    /// Every member, by id.
+    pub members: Vec<PdMemberInfo>,
+}
+
+/// A tick's worth of Raft messages between two **placement drivers**.
+///
+/// The placement driver replicates itself with `esker-raft`
+/// ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md)), so it needs a transport of its own —
+/// and it needs *less* than a store's. [`crate::RaftMessage`] wraps every message in a region id,
+/// an epoch and the store the sender is on, because a store holds many groups and a receiver has
+/// to know which. A placement driver holds exactly one group, and that group is not a region, so
+/// none of that routing exists to carry.
+///
+/// What replaces it is the **group id**, and it is not decoration. The cluster id of
+/// [ADR 0011](../../docs/adr/0011-pd-service-and-the-cluster-id.md) cannot guard this traffic,
+/// because the group has to elect a leader *before* `Bootstrap` — itself a log entry — has minted
+/// one. So the group is identified by the set of its members, and a member refuses a batch that
+/// does not carry its own: two clusters' placement drivers pointed at each other by a stale flag
+/// would otherwise form one group and replicate one cluster's routing table over the other's.
+///
+/// The messages are `esker_raft::Message` under the same codec `RaftBatch` uses, because ADR 0009
+/// decided the wire carries the real type and a second copy of thirty-odd fields is the mistake it
+/// was written about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PdRaftBatch {
+    /// Which placement-driver group this is, as `esker_pd::MemberList::group_id` computes it.
+    pub group_id: u64,
+    /// The member that sent it. Redundant with each message's own `from`, and worth the varint:
+    /// a batch that arrives at the wrong group is diagnosed from one field rather than from a
+    /// message body.
+    pub from: u64,
+    /// The messages. An empty batch is legal and means "nothing to say"; it is not sent, but
+    /// decoding one is not an error.
+    pub messages: Vec<Message>,
+}
+
+impl PdRaftBatch {
+    /// A batch from `from`, for the group `group_id`.
+    #[must_use]
+    pub fn new(group_id: u64, from: u64, messages: Vec<Message>) -> Self {
+        Self {
+            group_id,
+            from,
+            messages,
+        }
+    }
+
+    /// Whether there is nothing to send.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    fn encode(&self, out: &mut Encoder) {
+        out.put_u64(self.group_id);
+        out.put_varint(self.from);
+        out.put_varint(self.messages.len() as u64);
+        for message in &self.messages {
+            crate::raft::encode_message(message, out);
+        }
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let group_id = input.get_u64("pd.raft.group_id")?;
+        let from = input.get_varint("pd.raft.from")?;
+        let count = input.get_count("pd.raft.count")?;
+        let mut messages = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            messages.push(crate::raft::decode_message(input)?);
+        }
+        Ok(Self {
+            group_id,
+            from,
+            messages,
+        })
+    }
+}
+
 /// Anything a caller asks the placement driver.
 ///
 /// The heartbeat field sets are the ones `docs/plans/phase-4.md` §3.2 pins, so the store's
@@ -465,6 +572,15 @@ pub enum PdReq {
         /// The leader's apply index.
         applied_index: u64,
     },
+
+    /// Who is in this placement driver's group, and which member leads.
+    Members,
+
+    /// A tick's worth of this placement-driver group's own Raft messages.
+    ///
+    /// Not addressed to a cluster: it carries a [`PdRaftBatch::group_id`] instead, and the service
+    /// exempts it from the cluster check for the reason the batch's own documentation gives.
+    Raft(PdRaftBatch),
 
     /// Where a key lives.
     GetRegion {
@@ -565,6 +681,8 @@ impl PdReq {
             Self::ReportColumnar { .. } => Method::PdReportColumnar,
             Self::Status => Method::PdStatus,
             Self::ScanRegions { .. } => Method::PdScanRegions,
+            Self::Raft(_) => Method::PdRaft,
+            Self::Members => Method::PdMembers,
         }
     }
 
@@ -603,7 +721,8 @@ impl PdReq {
             Self::AllocId { count } => out.put_varint(*count),
             Self::Tso { count } => out.put_varint(u64::from(*count)),
             // No fields, so nothing to write. The method is the whole request, for both of these.
-            Self::SchemaLease | Self::Status => {}
+            Self::Raft(batch) => batch.encode(out),
+            Self::SchemaLease | Self::Status | Self::Members => {}
             Self::ScanRegions { start_key, limit } => {
                 out.put_bytes(start_key);
                 out.put_varint(u64::from(*limit));
@@ -650,6 +769,8 @@ impl PdReq {
             },
             Method::PdSchemaLease => Self::SchemaLease,
             Method::PdStatus => Self::Status,
+            Method::PdRaft => Self::Raft(PdRaftBatch::decode(input)?),
+            Method::PdMembers => Self::Members,
             Method::PdScanRegions => Self::ScanRegions {
                 start_key: Bytes::copy_from_slice(input.get_bytes("scan.start_key")?),
                 limit: input.get_varint_u32("scan.limit")?,
@@ -679,6 +800,18 @@ impl PdReq {
 /// Anything the placement driver answers with. Failures are `Error` frames instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PdResp {
+    /// Who is in the group, and which member leads.
+    Members(PdMembership),
+
+    /// A batch of the group's Raft messages was stepped, or refused.
+    ///
+    /// Empty, because Raft answers Raft: a follower's reply to an `AppendEntries` is a *message*
+    /// in a later batch of its own, not a value in this response. What this carries is the fact
+    /// that the frame arrived and the group id matched — a refusal comes back as
+    /// [`ProtoError::InvalidRequest`], which is what tells a misconfigured operator that two
+    /// groups are pointed at each other rather than leaving them to wonder.
+    Raft,
+
     /// The cluster this store now belongs to.
     Bootstrap {
         /// The cluster's id, to be sent on every later request.
@@ -800,6 +933,8 @@ impl PdResp {
             Self::ReportColumnar => Method::PdReportColumnar,
             Self::Status { .. } => Method::PdStatus,
             Self::ScanRegions { .. } => Method::PdScanRegions,
+            Self::Raft => Method::PdRaft,
+            Self::Members(_) => Method::PdMembers,
         }
     }
 
@@ -853,6 +988,18 @@ impl PdResp {
                     status.encode(out);
                 }
             }
+            Self::Raft => {}
+            Self::Members(membership) => {
+                out.put_u64(membership.group_id);
+                out.put_varint(membership.this_id);
+                out.put_varint(membership.leader_id);
+                out.put_varint(membership.term);
+                out.put_varint(membership.members.len() as u64);
+                for member in &membership.members {
+                    out.put_varint(member.id);
+                    out.put_str(&member.address);
+                }
+            }
             Self::ScanRegions { regions, stores } => {
                 out.put_varint(regions.len() as u64);
                 for region in regions {
@@ -902,6 +1049,28 @@ impl PdResp {
                 start_ts: input.get_varint("tso.start_ts")?,
                 count: input.get_varint_u32("tso.count")?,
             },
+            Method::PdRaft => Self::Raft,
+            Method::PdMembers => {
+                let group_id = input.get_u64("members.group_id")?;
+                let this_id = input.get_varint("members.this_id")?;
+                let leader_id = input.get_varint("members.leader_id")?;
+                let term = input.get_varint("members.term")?;
+                let count = input.get_count("members.count")?;
+                let mut members = Vec::with_capacity(count.min(16));
+                for _ in 0..count {
+                    members.push(PdMemberInfo {
+                        id: input.get_varint("members.id")?,
+                        address: input.get_str("members.address")?.to_owned(),
+                    });
+                }
+                Self::Members(PdMembership {
+                    group_id,
+                    this_id,
+                    leader_id,
+                    term,
+                    members,
+                })
+            }
             Method::PdScanRegions => {
                 let count = input.get_count("scan.regions")?;
                 let mut regions = Vec::with_capacity(count);

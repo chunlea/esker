@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, cf};
-use esker_proto::pd::ColumnarWish;
+use esker_proto::pd::{ColumnarWish, PdMemberInfo, PdMembership, PdRaftBatch};
 use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
 use esker_raft::{Config, NodeId, Term};
 
@@ -550,6 +550,84 @@ impl Pd {
         self.driver.leadership().serving
     }
 
+    /// Feeds a batch of this group's Raft messages in.
+    ///
+    /// **Not leader-only, and not cluster-checked.** Consensus is how a member becomes the
+    /// leader, so refusing this on a follower would refuse the only traffic that can end an
+    /// election; and the cluster id cannot guard it, because the group elects before `Bootstrap`
+    /// has minted one ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    ///
+    /// The **group id** is the guard instead, and it is the one this method exists to check. Two
+    /// clusters' placement drivers pointed at each other by a stale flag would otherwise form one
+    /// group and replicate one cluster's routing table over the other's, which is the mistake
+    /// [ADR 0011](../../../docs/adr/0011-pd-service-and-the-cluster-id.md) was written about with
+    /// a worse consequence.
+    pub fn step_raft(&self, batch: &PdRaftBatch) -> Result<()> {
+        let expected = self.members.group_id();
+        if batch.group_id != expected {
+            return Err(PdError::invalid(format!(
+                "a placement-driver batch from member {} is for group {:#018x}; this is group                  {expected:#018x} — check that every --pd-peers list names the same members",
+                batch.from, batch.group_id
+            )));
+        }
+        // A correct group id implies a member this list names, so this can only fire on a
+        // deliberate forgery or a hash collision. Refused rather than stepped: a message from
+        // outside the configuration is one the core would have to reason about.
+        if !self.members.contains(batch.from) {
+            return Err(PdError::invalid(format!(
+                "a placement-driver batch claims to come from member {}, which is not in this                  group",
+                batch.from
+            )));
+        }
+        for message in &batch.messages {
+            self.driver.step(message.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Who is in this member's group, and which member it believes leads.
+    ///
+    /// Answered by **any** member, and that is the decision rather than an oversight: an operator
+    /// asks this exactly when the leader is the thing that is missing, so a version only the
+    /// leader could answer would be useless at the moment it was wanted. It reads configuration
+    /// and this member's own belief, both of which every member has.
+    #[must_use]
+    pub fn membership(&self) -> PdMembership {
+        let office = self.driver.leadership();
+        PdMembership {
+            group_id: self.members.group_id(),
+            this_id: office.id,
+            leader_id: office.leader.unwrap_or(0),
+            term: office.term,
+            members: self
+                .members
+                .members()
+                .iter()
+                .map(|member| PdMemberInfo {
+                    id: member.id,
+                    address: member.address.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Waits until the group's Raft core has driven everything posted before this call.
+    ///
+    /// See [`crate::driver::PdDriver::settle`]. A barrier, for a caller that ticked or stepped and
+    /// needs to know what came of it.
+    pub fn settle(&self) -> Result<()> {
+        self.driver.settle()
+    }
+
+    /// One logical tick of the group's Raft core.
+    ///
+    /// Time enters here and nowhere else, sent by an interval at the service edge, so the core
+    /// still never reads a clock (`CLAUDE.md` invariant 4). A group of one needs none: it wins
+    /// with a quorum of itself inside [`Pd::open`] and has nothing to time out against.
+    pub fn tick(&self) -> Result<()> {
+        self.driver.tick()
+    }
+
     /// Refuses a request meant for another cluster.
     ///
     /// Called once at the top of every method except `Bootstrap` — which cannot carry a
@@ -834,7 +912,17 @@ impl Pd {
         // It runs **after** the apply and outside its lock, because it is leader-only memory that
         // no member replicates (ADR 0013) — and because a scheduler that ran while the driver was
         // waiting on this thread would be the deadlock this whole layout avoids.
-        let mut state = self.leading()?;
+        //
+        // Losing office in the gap costs the *operator*, not the beat. The record is committed and
+        // the sender has nothing to do differently, so answering an error here would refuse a
+        // heartbeat that plainly succeeded — and an operator is an optimisation a member that no
+        // longer leads has no business issuing anyway.
+        let Ok(mut state) = self.leading() else {
+            return Ok(Beat {
+                upsert,
+                operator: None,
+            });
+        };
         let operator = self.schedule(&mut state, &held, now_ms)?;
         Ok(Beat { upsert, operator })
     }
@@ -951,6 +1039,15 @@ impl Pd {
             office_clock(&office, self.clock.as_ref()),
             self.tso_save_interval_ms,
         );
+        // **A placement driver that has just taken office is, to the scheduler, one that
+        // restarted** (`docs/DESIGN.md` §7, ADR 0013), and this is the line that makes that
+        // literally true rather than nearly true. All three of these are leader-only memory about
+        // operators *this member* issued, and while it was not leading somebody else was: keeping
+        // them would mean acting on a plan formed for a cluster that has moved on. Re-deriving
+        // from the next round of heartbeats is the case phase 4 already tests.
+        state.in_flight.clear();
+        state.cooling.clear();
+        state.settling.clear();
         state.office_term = office.office_term;
         tracing::info!(
             id = office.id,

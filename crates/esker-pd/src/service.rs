@@ -10,6 +10,7 @@
 //! skips them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use esker_proto::pd::{PdReq, PdResp};
 use esker_proto::{BoxFuture, ProtoError, Reply, Request, Response, Service};
@@ -36,7 +37,47 @@ impl PdService {
     pub fn pd(&self) -> &Arc<Pd> {
         &self.pd
     }
+
+    /// Starts the interval that feeds the group's Raft core its ticks.
+    ///
+    /// **Time enters the placement driver here and nowhere else.** `esker-raft` counts ticks and
+    /// never reads a clock (`CLAUDE.md` invariant 4), and this is the one wall-clock timer that
+    /// turns into them — election timeouts are therefore ticks, not instants, whatever the
+    /// machine's clock does.
+    ///
+    /// `None` for a **group of one**, which has nothing to time out against: it won with a quorum
+    /// of itself inside `Pd::open`, has no peer to miss a heartbeat from, and would spend a
+    /// wake-up every hundred milliseconds proving it. Every test that opens a single durable PD
+    /// gets that saving, which is most of them.
+    ///
+    /// Must be called from inside a `tokio` runtime.
+    pub fn spawn_ticker(pd: &Arc<Pd>, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+        if pd.members().is_alone() {
+            return None;
+        }
+        let pd = Arc::clone(pd);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Delay rather than Burst: a process that was descheduled must not deliver the ticks
+            // it missed all at once, because a burst of them is an election timeout that fires
+            // early on every member together.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if pd.tick().is_err() {
+                    return;
+                }
+            }
+        }))
+    }
 }
+
+/// What one tick of the placement driver's Raft core is worth.
+///
+/// `esker_raft::TICK_MS`, and not a number of its own: the election-timeout constants are counted
+/// in ticks, so a placement driver that ticked at a different rate would have a different election
+/// timeout than the one `esker-raft`'s own tests reason about.
+pub const TICK: Duration = Duration::from_millis(esker_raft::TICK_MS);
 
 impl Service for PdService {
     fn call(&self, request: Request) -> BoxFuture<'_, Result<Reply, ProtoError>> {
@@ -65,6 +106,23 @@ impl Service for PdService {
                 }
             };
 
+            // **Two methods are answered on the reactor, and the first one has to be.**
+            //
+            // Everything else goes to a blocking thread because it may reach the engine or wait on
+            // a Raft commit. `Raft` must *not*: it validates a group id and posts to a channel,
+            // and it is what unblocks the proposals that are occupying those threads. On a busy
+            // group the blocking pool can fill with commands waiting to commit, and a step that
+            // had to queue behind them would be waiting for the message it is itself carrying.
+            //
+            // `Members` joins it because it costs the same nothing — a lock-free read of this
+            // member's own belief and a clone of its configuration — and because it is the one
+            // question an operator asks a placement driver that has stopped answering. `Status` is
+            // deliberately *not* here: it reads `Pd`'s state lock, which a proposer holds.
+            if matches!(request, PdReq::Raft(_) | PdReq::Members) {
+                return Ok(Reply::Unary(Response::Pd(serve(
+                    &pd, cluster_id, &request,
+                )?)));
+            }
             let response = blocking(move || serve(&pd, cluster_id, &request)).await?;
             Ok(Reply::Unary(Response::Pd(response)))
         })
@@ -94,7 +152,15 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
     // about **this process**. "Which member am I, and do I lead" is exactly what an operator asks
     // a placement driver that is not answering, and refusing it with "ask the leader" would answer
     // a question nobody asked.
-    if !matches!(request, PdReq::Status) && !pd.is_serving() {
+    //
+    // `Raft` is exempt too, and for the sharpest reason of all: consensus is *how* a member
+    // becomes the leader, so refusing it on a follower would refuse the only traffic that can end
+    // an election. Its guard is the group id, checked inside `Pd::step_raft`.
+    //
+    // `Members` is exempt for `Status`'s reason, sharpened: it is *the* question an operator asks
+    // a group that is not answering, so a version only the leader could answer would be useless
+    // at the moment it was wanted.
+    if !matches!(request, PdReq::Status | PdReq::Members | PdReq::Raft(_)) && !pd.is_serving() {
         return Err(pd.not_leading().into());
     }
 
@@ -109,6 +175,13 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
     match request {
         PdReq::Bootstrap { .. } if cluster_id == 0 => {}
         PdReq::Status => {}
+        // Configuration and this member's own belief, neither of which is cluster-scoped — and a
+        // group that has not bootstrapped is exactly when an operator wants to see it.
+        PdReq::Members => {}
+        // Not cluster-checked, because a placement-driver group elects a leader *before*
+        // `Bootstrap` has minted a cluster id at all. The group id it carries is the guard, and it
+        // rules out the same mistake one layer down ([`crate::member`]).
+        PdReq::Raft(_) => {}
         _ => pd.check_cluster(cluster_id)?,
     }
 
@@ -194,6 +267,11 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
             let (regions, stores) = pd.scan_regions(start_key, *limit)?;
             PdResp::ScanRegions { regions, stores }
         }
+        PdReq::Raft(batch) => {
+            pd.step_raft(batch)?;
+            PdResp::Raft
+        }
+        PdReq::Members => PdResp::Members(pd.membership()),
         PdReq::Status => {
             let (now_ms, operators) = pd.status()?;
             PdResp::Status { now_ms, operators }

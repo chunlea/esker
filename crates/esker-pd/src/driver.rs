@@ -145,12 +145,22 @@ enum DriverMsg {
     },
     /// Start an election now. Used once, by a single-member `Pd::open`.
     Campaign { notify: Sender<Result<()>> },
+    /// A barrier: answer once everything posted before it has been driven.
+    Settle { notify: Sender<()> },
 }
 
 struct Pending {
     index: Index,
     term: Term,
     notify: Sender<Result<Answer>>,
+}
+
+/// What one entry's apply produced, held between staging it and its batch being durable.
+struct Applying {
+    /// What to answer whoever proposed it.
+    outcome: Result<Answer>,
+    /// The command, when applying it may have been this member taking office.
+    took_office: Option<Command>,
 }
 
 /// The Raft core, the state machine, and the rules that join them.
@@ -220,6 +230,30 @@ impl PdCore {
             self.node
                 .storage_mut()
                 .stage_ready(&mut batch, ready.hard_state, &ready.entries);
+
+            // **When nobody is waiting on a message, the persist and the applies are one write.**
+            //
+            // The ordering rule is *persist before send*, and a `Ready` with no messages has no
+            // send to be before — so folding the applies into the same batch breaks nothing and
+            // halves the `fsync`s. It is not a micro-optimisation: a **group of one** commits its
+            // own proposal inside the call that made it and produces no messages at all, so this
+            // is the whole of the single durable placement driver's write path, and paying two
+            // `fsync`s where the phase-4 build paid one would have been a regression every test
+            // and every deployment felt.
+            //
+            // Atomic either way: a `WriteBatch` lands whole or not at all, so a crash mid-batch
+            // leaves an entry that never existed rather than one applied without being logged.
+            //
+            // With messages to send it stays two writes, deliberately. Delaying an
+            // `AppendEntries` until this member has finished applying would put one member's disk
+            // on the whole group's critical path.
+            let alone = ready.messages.is_empty();
+            let mut applied = Vec::new();
+            if alone {
+                for entry in &ready.committed_entries {
+                    applied.push(self.stage_apply(entry, &mut batch)?);
+                }
+            }
             self.write(batch)?;
             if let Some(snapshot) = installed {
                 // The in-memory mirrors are behind the engine until this runs, and every decision
@@ -238,9 +272,17 @@ impl PdCore {
                 self.transport.send(messages);
             }
 
-            // 3 and 4. Apply, in order, answering whoever proposed each entry.
-            for entry in &ready.committed_entries {
-                self.apply(entry)?;
+            // 3 and 4. Apply, in order, answering whoever proposed each entry. The answers wait
+            // for the write above either way: an id or a timestamp that left before its entry was
+            // durable is one a new leader would hand out again.
+            if alone {
+                for (entry, outcome) in ready.committed_entries.iter().zip(applied) {
+                    self.settle_apply(entry, outcome);
+                }
+            } else {
+                for entry in &ready.committed_entries {
+                    self.apply(entry)?;
+                }
             }
 
             // 5. Advance.
@@ -249,9 +291,20 @@ impl PdCore {
         Ok(())
     }
 
-    /// Applies one committed entry, with its apply index in the same batch.
+    /// Applies one committed entry in a batch of its own, with its apply index in it.
     fn apply(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = WriteBatch::new();
+        let outcome = self.stage_apply(entry, &mut batch)?;
+        self.write(batch)?;
+        self.settle_apply(entry, outcome);
+        Ok(())
+    }
+
+    /// Stages one committed entry's effects, and its apply index, into `batch`.
+    ///
+    /// Nothing observable happens here: the answer and the "this member is serving" flag are both
+    /// [`PdCore::settle_apply`]'s, which the caller runs **after** the batch is durable.
+    fn stage_apply(&mut self, entry: &Entry, batch: &mut WriteBatch) -> Result<Applying> {
         let mut took_office = None;
         let outcome = match entry.kind {
             // Nothing here proposes one. `esker-raft`'s own empty entry on taking office is an
@@ -269,22 +322,24 @@ impl PdCore {
                 // stops the member rather than skipping an entry its neighbours applied: a state
                 // machine that silently diverges is worse than one that halts.
                 let command = Command::decode(&entry.data)?;
-                let answer = self.machine.apply(&command, &mut batch);
+                let answer = self.machine.apply(&command, batch);
                 took_office = answer.is_ok().then_some(command);
                 answer
             }
         };
-        self.node
-            .storage_mut()
-            .stage_applied(&mut batch, entry.index);
-        self.write(batch)?;
-        // After the write, both of them: this member says it is serving, and answers a proposer,
-        // only once the entry and the fact that it applied are on disk together.
-        if let Some(command) = took_office {
+        self.node.storage_mut().stage_applied(batch, entry.index);
+        Ok(Applying {
+            outcome,
+            took_office,
+        })
+    }
+
+    /// What an applied entry changes **outside** the database, once its batch is durable.
+    fn settle_apply(&mut self, entry: &Entry, applying: Applying) {
+        if let Some(command) = applying.took_office {
             self.note_office(entry, &command);
         }
-        self.complete_proposal(entry, outcome);
-        Ok(())
+        self.complete_proposal(entry, applying.outcome);
     }
 
     /// Notices this member's own `TakeOffice` applying, which is when it may start serving.
@@ -603,13 +658,49 @@ impl PdDriver {
     }
 
     /// Feeds one message from another member in.
+    ///
+    /// **Never blocks.** A full queue drops the message and logs it, which is the rule the whole
+    /// Raft plumbing follows — Raft retries everything it sends, so a dropped message is
+    /// indistinguishable from a slow one. Here it is also what makes it safe to call this from the
+    /// reactor: a `step` that could block would eventually block behind a *proposal* waiting on the
+    /// very commit that this message carries.
     pub fn step(&self, message: Message) -> Result<()> {
-        self.post(DriverMsg::Step(Box::new(message)))
+        let Some(jobs) = self.jobs.as_ref() else {
+            return Err(PdError::internal("the placement driver is stopping"));
+        };
+        match jobs.try_send(DriverMsg::Step(Box::new(message))) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(
+                    id = self.id,
+                    "the placement driver's queue is full; a raft message was dropped"
+                );
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err(PdError::internal("the placement driver has stopped"))
+            }
+        }
     }
 
     /// One logical tick.
     pub fn tick(&self) -> Result<()> {
         self.post(DriverMsg::Tick)
+    }
+
+    /// Waits until everything posted before this call has been driven.
+    ///
+    /// A **barrier**, not a flush: it makes no request of its own and changes nothing. It exists
+    /// because [`PdDriver::tick`] and [`PdDriver::step`] return as soon as the message is queued —
+    /// which is what keeps a reactor off this thread's `fsync` — and a caller that needs to know
+    /// what those produced has no other way to ask. A deterministic test of an election is the
+    /// caller that needs it: tick every member, settle, deliver what they said, settle again.
+    pub fn settle(&self) -> Result<()> {
+        let (notify, answer) = channel();
+        self.post(DriverMsg::Settle { notify })?;
+        answer
+            .recv()
+            .map_err(|_| PdError::internal("the placement driver stopped before settling"))
     }
 
     /// Campaigns, and waits for the round to settle.
@@ -631,7 +722,8 @@ impl PdDriver {
         };
         match message {
             // A tick that cannot be queued is a tick the driver is too busy to need: dropping it
-            // is what a full queue means, and blocking the reactor on it would be worse.
+            // is what a full queue means, and blocking the reactor on it would be worse. The same
+            // rule applies to a stepped message, which has its own entry point above.
             DriverMsg::Tick => match jobs.try_send(DriverMsg::Tick) {
                 Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
                 Err(TrySendError::Disconnected(_)) => {
@@ -675,6 +767,17 @@ fn run(core: &mut PdCore, inbox: &Receiver<DriverMsg>) {
                 }
             }
             DriverMsg::Propose { command, notify } => core.propose(&command, notify),
+            DriverMsg::Settle { notify } => {
+                // Driven below like everything else, and answered after. The channel is FIFO, so
+                // an answer here means every earlier tick, message and proposal has been through
+                // a full `drive`.
+                if let Err(error) = core.drive() {
+                    tracing::error!(id = core.id, %error, "the placement driver failed; stopping");
+                    break;
+                }
+                let _ = notify.send(());
+                continue;
+            }
             DriverMsg::Campaign { notify } => {
                 let outcome = core.node.campaign().map_err(|error| {
                     PdError::internal(format!("the placement driver could not campaign: {error}"))

@@ -475,14 +475,54 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 
 ## 7. Placement driver (`esker-pd`)
 
-Single binary, state kept in its own `esker-engine` instance (default column family only); made highly
-available by running three PDs replicated with `esker-raft` — **deferred past v1 as a recorded
-milestone** (`docs/plans/phase-4.md` §15): phase 4 ships the single durable PD, which is a single
-point of failure by decision rather than by oversight, and which satisfies the one rule
-`prompts/04-multiraft-pd.md` refuses to bend — *never ship TSO without the persisted high-water
-mark*, which §7's oracle has had since 4a. What HA would add is replication of the state below,
-not a change to it: the routing table, the allocator and the mark move from one engine into a Raft
-log, PD elects a leader, and clients discover it.
+One binary; **a Raft group of up to three of them**, each with its own `esker-engine` instance
+([ADR 0058](adr/0058-pd-is-a-raft-group.md), `docs/plans/phase-15-pd-ha.md`). A group of one is
+what phase 4 shipped and is still the default: it wins with a quorum of itself, needs no ticks and
+no transport, and behaves exactly as the single durable PD did.
+
+Every rule below is unchanged by replication. **Only the meaning of "persisted" moved**, from one
+`fsync` to a Raft entry this member has applied:
+
+- **What goes in the log.** The four records that nothing can re-derive — the cluster's identity,
+  the routing table, the allocator's reserved end and the oracle's mark — become commands applied
+  by a deterministic state machine into the same key space, byte for byte. The log lives in the
+  `raft` column family of the same database, so an apply writes the record and the apply index in
+  **one atomic batch**.
+- **What stays out of it.** The in-flight operator set, the balance cooldowns and the settling load
+  deltas are memory, leader-only, re-derived from the next round of heartbeats
+  ([ADR 0013](adr/0013-repair-operators-are-requests-not-commands.md)). A PD that loses leadership
+  is, to the scheduler, a PD that restarted.
+- **The leader samples the clock; the state machine never does.** `apply` is a pure function of
+  `(applied state, command)`, so every `now_ms` travels *inside* the command. A member that read a
+  clock inside `apply` would diverge from its neighbours, and would be a second place in Esker that
+  orders on a wall clock (invariant 6).
+- **A new leader answers nothing until it has applied a `TakeOffice` entry of its own term.** Raft
+  promises a new leader's *log* holds every committed entry and says nothing about `applied`, and
+  the oracle is rebuilt out of applied state. Then, and only then, it reloads
+  `Allocator::load(allocated_end)` and `Oracle::load(high_water, now_ms)` — the same two
+  constructors a restart uses, because a failover is a restart that kept its socket.
+- **The mark is the lease, and the reservation is the same lease for ids.** A leader that has lost
+  its quorum and not noticed is confined *below* the mark: crossing it needs a commit its proposals
+  no longer earn, so the call fails rather than answering. A new leader begins at
+  `max(clock, mark)`, which is at or above it. Nothing in that argument needs either clock to be
+  right, or the two to agree — which is why PD needs no lease of its own.
+- **Only the leader serves; a follower answers `PdNotLeader` with an address.** A separate wire code
+  from the region-scoped `NotLeader`, because a client answers that one by repairing its region
+  cache and a PD redirect would poison an entry for a region that does not exist. Reads are
+  leader-only too — a follower would otherwise answer a routing question out of whatever it had
+  applied — with two exceptions that are questions about *this process* rather than about the
+  cluster: `Status` and `Members`.
+- **Reads do not take a `ReadIndex`.** A deposed leader can answer a routing question one entry
+  behind, which is exactly the staleness this section already designs for: a client's cache is a
+  hint the store checks against its epoch, so a stale route costs a redirect and never a wrong
+  answer (invariant 5). The two answers that *cannot* be stale — an id and a timestamp — are the
+  two that go through the log.
+- **Membership is configuration, not state.** The same `--peers` list on every member, and the
+  group's identity is `mix64` over it: a member refuses a Raft batch that does not carry its own
+  group id, so two clusters' placement drivers pointed at each other by a stale flag cannot form
+  one group and replicate one cluster's routing table over the other's. Dynamic membership is a
+  phase of its own and would have to mint that id into the log, as `Bootstrap` mints the cluster
+  id.
 
 - **State (*fixed*, version 1).** PD's own key space, under the `'m'` metadata prefix of §3, with ids
   big-endian so a scan runs in id order:
@@ -608,8 +648,13 @@ log, PD elects a leader, and clients discover it.
   one bounded record on disk, so `esker pd inspect` can say what PD asked a cluster to do after the
   process is gone. A debugging record only: no decision reads it, and losing it costs an explanation
   rather than a repair.
-- **Tools:** `esker pd serve --data-dir --listen` runs it; `esker pd inspect --data-dir` prints the whole
-  state above, including the range index beside the records it points at.
+- **Tools:** `esker pd serve --data-dir --listen` runs one; `--id` and `--peers` make it a member
+  of a group. `esker pd inspect --data-dir` prints the whole state above — including the range
+  index beside the records it points at, and the durable half of consensus — and it **creates
+  nothing**: opening a placement driver campaigns, and a campaign is a write, so the inspector is a
+  read-only view that names no column family and starts no driver. `esker pd members --pd` asks a
+  **running** member who is in its group and which one leads, and is answered by a follower too,
+  which is the point: it is what an operator reaches for when the leader is what is missing.
 
 ## 8. Transactions (`esker-txn`)
 
@@ -876,8 +921,13 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 ## 15. Open questions (turn into ADRs as they are decided)
 
 Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
-leader leases vs ReadIndex only · PD HA timing · secondary-index encoding for
-composite keys · how much Postgres surface for the first SQL milestone.
+leader leases vs ReadIndex only · **dynamic PD membership** (adding or removing a placement driver
+at run time, which needs the group id minted into the log — [ADR 0058](adr/0058-pd-is-a-raft-group.md))
+· secondary-index encoding for composite keys · how much Postgres surface for the first SQL
+milestone.
+
+*Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
+`esker-raft`, phase 15 ([ADR 0058](adr/0058-pd-is-a-raft-group.md), §7 above).
 
 ## 16. Columnar (`esker-columnar`)
 

@@ -111,6 +111,20 @@ impl StandIn {
                 regions: Vec::new(),
                 stores: Vec::new(),
             },
+            // Between two placement drivers, never between a store and one. A stand-in that
+            // answered it would be pretending to be a member of a group it is not in.
+            PdReq::Raft(_) => PdResp::Raft,
+            // An operator's question, not a store's, and this stand-in is a group of one.
+            PdReq::Members => PdResp::Members(esker_proto::PdMembership {
+                group_id: 1,
+                this_id: 1,
+                leader_id: 1,
+                term: 1,
+                members: vec![esker_proto::PdMemberInfo {
+                    id: 1,
+                    address: "127.0.0.1:2379".to_owned(),
+                }],
+            }),
         }
     }
 }

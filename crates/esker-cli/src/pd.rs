@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use esker_pd::{Pd, PdOptions, PdService};
+use esker_pd::{MemberList, Pd, PdInspector, PdMember, PdOptions, PdService, PdTcpTransport};
 use esker_proto::{Server, TransportConfig};
 
 /// Where `--listen` points when nothing says otherwise.
@@ -34,6 +34,24 @@ pub(crate) enum PdCommand {
     Inspect(InspectOptions),
     /// Ask a **running** PD what it is doing right now.
     Status(StatusOptions),
+    /// Ask a **running** PD who is in its group and which member leads.
+    Members(MembersOptions),
+}
+
+/// `esker pd members`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MembersOptions {
+    /// Any member of the group to ask. A follower answers this one, which is the point: it is
+    /// what an operator reaches for when the leader is the thing that is missing.
+    pub(crate) pd: String,
+}
+
+impl Default for MembersOptions {
+    fn default() -> Self {
+        Self {
+            pd: crate::region::DEFAULT_PD.to_owned(),
+        }
+    }
 }
 
 /// `esker pd status`.
@@ -58,6 +76,18 @@ pub(crate) struct ServeOptions {
     pub(crate) data_dir: PathBuf,
     /// The address to listen on.
     pub(crate) listen: String,
+    /// This placement driver's member id within its group.
+    ///
+    /// Defaults to 1, which with no `--peers` is the single durable placement driver of phase 4a
+    /// and is what every existing invocation gets.
+    pub(crate) id: u64,
+    /// The whole group, as `id@host:port` separated by commas — **this member included**.
+    ///
+    /// Empty means a group of one. Every member must be given the *same* list, in any order:
+    /// the group's identity is derived from it ([`esker_pd::MemberList`]), so two members given
+    /// different lists are two groups and will not talk to each other — which is a loud failure
+    /// rather than a quiet half-formed cluster.
+    pub(crate) peers: String,
 }
 
 impl Default for ServeOptions {
@@ -65,8 +95,35 @@ impl Default for ServeOptions {
         Self {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             listen: DEFAULT_LISTEN.to_owned(),
+            id: 1,
+            peers: String::new(),
         }
     }
+}
+
+/// Reads a `--peers` list: `id@host:port`, comma-separated, this member included.
+///
+/// The `id@` prefix is required rather than inferred from position, because a list whose meaning
+/// depends on its order is one that two operators will write differently — and two different
+/// orders would be two different groups if the id came from the position.
+pub(crate) fn parse_peers(raw: &str) -> Result<Vec<PdMember>, String> {
+    let mut members = Vec::new();
+    for part in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let Some((id, address)) = part.split_once('@') else {
+            return Err(format!(
+                "`{part}` is not a placement driver; write it as `id@host:port`"
+            ));
+        };
+        let id: u64 = id
+            .parse()
+            .map_err(|_| format!("`{id}` in `{part}` is not a member id"))?;
+        members.push(PdMember::new(id, address));
+    }
+    Ok(members)
 }
 
 /// `esker pd inspect`.
@@ -96,7 +153,76 @@ pub(crate) fn run(command: &PdCommand) -> Result<(), String> {
             let mut stdout = std::io::stdout().lock();
             status(options, &mut stdout)
         }
+        PdCommand::Members(options) => {
+            let mut stdout = std::io::stdout().lock();
+            members(options, &mut stdout)
+        }
     }
+}
+
+/// Asks a **running** placement driver who is in its group and which member leads.
+///
+/// Answered by any member, leader or not, which is the whole point: an operator reaches for this
+/// exactly when the leader is the thing that is missing, and a command that only the leader could
+/// answer would be useless then. It rides on `Pd::Status`, which is exempt from the leader check
+/// for the same reason ([`esker_pd::service`]).
+pub(crate) fn members(
+    options: &MembersOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let address: SocketAddr = options
+        .pd
+        .parse()
+        .map_err(|error| format!("`--pd {}` is not an address: {error}", options.pd))?;
+    let pd = crate::region::PdConn::connect(address)?;
+    let response = pd
+        .call(&esker_proto::PdReq::Members)
+        .map_err(|error| format!("asking the placement driver for its members: {error}"))?;
+    let esker_proto::PdResp::Members(membership) = response else {
+        return Err("the placement driver answered a different question".to_owned());
+    };
+    print_members(&membership, out)
+}
+
+fn print_members(
+    members: &esker_proto::PdMembership,
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let write = |error: std::io::Error| format!("writing: {error}");
+    writeln!(
+        out,
+        "group {:#018x}, term {}",
+        members.group_id, members.term
+    )
+    .map_err(write)?;
+    if members.members.is_empty() {
+        writeln!(out, "  (no members reported)").map_err(write)?;
+        return Ok(());
+    }
+    for member in &members.members {
+        let role = if member.id == members.leader_id {
+            "leader"
+        } else if member.id == members.this_id {
+            "follower (this one)"
+        } else {
+            "follower"
+        };
+        let here = if member.id == members.this_id {
+            " *"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "  {:>3}  {:<24} {role}{here}",
+            member.id, member.address
+        )
+        .map_err(write)?;
+    }
+    if members.leader_id == 0 {
+        writeln!(out, "  no leader: an election is in progress").map_err(write)?;
+    }
+    Ok(())
 }
 
 /// Asks a **running** placement driver what it has in flight.
@@ -174,15 +300,47 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
         .parse()
         .map_err(|error| format!("`--listen {}` is not an address: {error}", options.listen))?;
 
-    let pd = Pd::open(&options.data_dir, PdOptions::new())
-        .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
+    let peers = parse_peers(&options.peers)?;
+    let members = if peers.is_empty() {
+        MemberList::alone(options.id)
+    } else {
+        MemberList::new(peers).map_err(|error| format!("`--peers`: {error}"))?
+    };
+    if !members.contains(options.id) {
+        return Err(format!(
+            "`--id {}` is not in `--peers {}`; every member is given the same list, itself \
+             included",
+            options.id, options.peers
+        ));
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("building the runtime: {error}"))?;
 
+    // Inside the runtime, because the transport's delivery tasks live on it — and before
+    // `Pd::open`, because the driver it starts sends its first vote the moment it ticks.
+    let transport = runtime.block_on(async {
+        PdTcpTransport::spawn(options.id, &members, TransportConfig::new())
+            .map_err(|error| format!("connecting to the group: {error}"))
+    })?;
+
+    let alone = members.is_alone();
+    let pd = Pd::open(
+        &options.data_dir,
+        PdOptions {
+            id: options.id,
+            members,
+            transport: Some(transport),
+            ..PdOptions::new()
+        },
+    )
+    .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
+
     runtime.block_on(async move {
+        // Time enters here and nowhere else; a group of one gets none and needs none.
+        let _ticker = PdService::spawn_ticker(&pd, esker_pd::service::TICK);
         let server = Server::bind(
             address,
             PdService::new(Arc::clone(&pd)),
@@ -194,6 +352,15 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
             .local_addr()
             .map_err(|error| format!("reading the bound address: {error}"))?;
 
+        if !alone {
+            let membership = pd.membership();
+            println!(
+                "esker pd: member {} of group {:#018x} ({} members)",
+                membership.this_id,
+                membership.group_id,
+                membership.members.len()
+            );
+        }
         match pd.cluster() {
             Ok(Some(cluster)) => println!(
                 "esker pd: cluster {} listening on {bound}, data in {}",
@@ -230,7 +397,7 @@ async fn shutdown_signal() {
 /// The in-flight set is memory and is gone with the process
 /// (`docs/adr/0013-repair-operators-are-requests-not-commands.md`), so this ring is the only
 /// thing that can answer "why is my cluster shaped like this" after the fact.
-fn print_history(pd: &Pd, out: &mut impl std::io::Write) -> Result<(), String> {
+fn print_history(pd: &PdInspector, out: &mut impl std::io::Write) -> Result<(), String> {
     let write = |error: std::io::Error| format!("writing: {error}");
     let history = pd.history().map_err(|error| error.to_string())?;
     writeln!(out, "\noperator history ({})", history.len()).map_err(write)?;
@@ -259,20 +426,12 @@ pub(crate) fn inspect(
     options: &InspectOptions,
     out: &mut impl std::io::Write,
 ) -> Result<(), String> {
-    // An inspector must not create what it was asked to look at: a typo in a path should be an
-    // error, not an empty database that looks like a wiped cluster.
-    let engine = esker_engine::Options {
-        create_if_missing: false,
-        ..esker_engine::Options::default()
-    };
-    let pd = Pd::open(
-        &options.data_dir,
-        PdOptions {
-            engine,
-            ..PdOptions::new()
-        },
-    )
-    .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
+    // A **read-only** view, and its own type for a reason worth knowing: opening a placement
+    // driver now campaigns, and a campaign is a write ([`esker_pd::inspect`]). An inspector must
+    // not create or move what it was asked to look at — and a typo in a path should be an error,
+    // not an empty database that reads like a wiped cluster.
+    let pd = PdInspector::open(&options.data_dir, esker_engine::Options::default())
+        .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
 
     let write = |error: std::io::Error| format!("writing: {error}");
 
@@ -290,6 +449,46 @@ pub(crate) fn inspect(
         pd.tso_high_water_ms().map_err(|error| error.to_string())?
     )
     .map_err(write)?;
+    writeln!(
+        out,
+        "id reserved    {}",
+        pd.allocated_end().map_err(|error| error.to_string())?
+    )
+    .map_err(write)?;
+    // The durable half of consensus, and only that. Who leads *now* is a live fact that dies with
+    // the process, and `esker pd members` is what asks a running group for it.
+    match pd.raft() {
+        Some(raft) => {
+            writeln!(
+                out,
+                "raft           term {}  voted {}  commit {}  applied {}  log begins after {}",
+                raft.hard_state.term,
+                raft.hard_state
+                    .voted_for
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                raft.hard_state.commit,
+                raft.applied_index,
+                raft.truncated_index,
+            )
+            .map_err(write)?;
+            writeln!(
+                out,
+                "members        {}",
+                if raft.conf_state.voters.is_empty() {
+                    "(none recorded)".to_owned()
+                } else {
+                    raft.conf_state
+                        .voters
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            )
+            .map_err(write)?;
+        }
+        None => writeln!(out, "raft           (no consensus state on disk)").map_err(write)?,
+    }
 
     let stores = pd.stores().map_err(|error| error.to_string())?;
     writeln!(out, "\nstores ({})", stores.len()).map_err(write)?;

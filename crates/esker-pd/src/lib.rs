@@ -21,6 +21,7 @@
 //! | [`error`] | what PD refuses, and the wire error each refusal becomes |
 //! | [`clock`] | the one wall clock in the system, injected so tests can break it |
 //! | [`keys`] | PD's private key space, and how a key lookup becomes one seek |
+//! | [`inspect`] | a read-only view of a **stopped** placement driver's files |
 //! | [`command`] | what PD writes into its Raft log, one per durable write |
 //! | [`machine`] | `apply`: the only writer of the records, identical on every member |
 //! | [`member`] | who the placement drivers are, and what tells one group from another |
@@ -31,7 +32,8 @@
 //! | [`routing`] | the region table: epoch-guarded upserts, and where a key lives |
 //! | [`raft_log`] | PD's Raft log, on the engine's `raft` column family |
 //! | [`pd`] | the six operations, synchronous, over one database |
-//! | [`service`] | the async edge: PD behind `esker-proto`'s server |
+//! | [`transport`] | one connection per member pair, a batch per tick |
+//! | [`service`] | the async edge: PD behind `esker-proto`'s server, and the tick |
 //!
 //! PD is a **Raft group of up to three members** ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md),
 //! `docs/plans/phase-15-pd-ha.md`). Every durable write is a [`command`] proposed by the leader,
@@ -47,6 +49,7 @@ pub mod clock;
 pub mod command;
 pub mod driver;
 pub mod error;
+pub mod inspect;
 pub mod keys;
 pub mod machine;
 pub mod member;
@@ -57,6 +60,7 @@ pub mod record;
 pub mod routing;
 pub mod schedule;
 pub mod service;
+pub mod transport;
 pub mod tso;
 
 pub use balance::Balance;
@@ -64,6 +68,7 @@ pub use clock::{Clock, SystemClock};
 pub use command::Command;
 pub use driver::{Leadership, PdTransport};
 pub use error::{PdError, Result};
+pub use inspect::PdInspector;
 pub use machine::Machine;
 pub use member::{MemberList, PdMember};
 pub use operator::{Cancelled, InFlight, Observed, Progress};
@@ -72,6 +77,7 @@ pub use record::{ClusterRecord, RegionRecord, StoreRecord, StoreStats};
 pub use routing::{RegionBeat, StoreBeat, Upsert};
 pub use schedule::{Cluster, LoadDelta, Repair};
 pub use service::PdService;
+pub use transport::PdTcpTransport;
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
 /// (`docs/DESIGN.md` §7). Part of the wire format — every timestamp on disk uses it.
