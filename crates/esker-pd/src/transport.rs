@@ -224,6 +224,24 @@ impl PdTcpTransport {
 }
 
 impl PdTransport for PdTcpTransport {
+    /// The group changed; reach these members instead.
+    ///
+    /// **This is the method the driver calls**, and it has to be here rather than left to the
+    /// trait's default. `PdCore::learn_routes` reaches a transport through [`PdTransport`], so a
+    /// type that implemented only `send` would compile, pass every test of its own inherent
+    /// `reconfigure`, and silently never rewire — a member added at run time would be in the
+    /// configuration, in the log, and unreachable from every member that was already there.
+    ///
+    /// Infallible, like `send` and for the same reason. A failure costs reachability to one
+    /// member, which Raft keeps retrying and an operator can fix by restarting this one; it is not
+    /// a reason to fail an apply, because the log is the truth and this is a cache of where to
+    /// send it.
+    fn reconfigure(&self, members: &MemberList) {
+        if let Err(error) = PdTcpTransport::reconfigure(self, members) {
+            tracing::error!(id = self.id, %error, "could not rewire for the new group");
+        }
+    }
+
     fn send(&self, messages: Vec<Message>) {
         for message in messages {
             let to = message.recipient();
@@ -238,8 +256,10 @@ impl PdTransport for PdTcpTransport {
             }
             let peers = self.peers();
             let Ok(at) = peers.binary_search_by_key(&to, |peer| peer.id) else {
-                // Membership is static, so this is a configuration mistake rather than a race:
-                // the core is addressing a member this process was never told about.
+                // Either a configuration mistake, or the one-`Ready` window a membership change
+                // opens: a configuration is in force from the moment its entry is appended, and
+                // this transport learns the address from `reconfigure` in the same `Ready`. Raft
+                // retransmits, so the window costs a heartbeat rather than a member.
                 tracing::warn!(
                     id = self.id,
                     to,
@@ -408,6 +428,36 @@ mod tests {
     /// The assertion that matters is the last one: the queue for member 3 is the same channel it
     /// was before the change. A transport that rebuilt itself would pass every other assertion
     /// here and fail that one, and the cost — a reconnect and an election timeout of silence on a
+    /// **The path the driver actually takes.**
+    ///
+    /// `PdCore::learn_routes` reaches this through [`PdTransport`], not through the inherent
+    /// method above, and the trait's `reconfigure` has a **default no-op** — so a type that
+    /// implements only `send` compiles, passes every test of its inherent method, and silently
+    /// never rewires. The consequence is not subtle: a member added at run time is in the
+    /// configuration and in the log, and no existing member ever opens a connection to it.
+    #[tokio::test]
+    async fn the_trait_method_is_the_one_the_driver_calls_and_it_rewires() {
+        let transport = PdTcpTransport::spawn(2, &three(), TransportConfig::new()).unwrap();
+        assert_eq!(peer_ids(&transport), vec![1, 3]);
+
+        let four = MemberList::new(vec![
+            PdMember::new(1, "127.0.0.1:32379"),
+            PdMember::new(2, "127.0.0.1:32380"),
+            PdMember::new(3, "127.0.0.1:32381"),
+            PdMember::new(4, "127.0.0.1:32382"),
+        ])
+        .unwrap();
+        // Through the trait, exactly as the driver does — `PdTransport::reconfigure`, not
+        // `PdTcpTransport::reconfigure`.
+        PdTransport::reconfigure(&*transport, &four);
+        assert_eq!(
+            peer_ids(&transport),
+            vec![1, 3, 4],
+            "the trait's reconfigure did not reach the transport's; a member added at run time \
+             would be unreachable from here"
+        );
+    }
+
     /// link nobody touched — would show up only under a membership change in production.
     #[tokio::test]
     async fn reconfigure_keeps_the_links_that_did_not_change() {
