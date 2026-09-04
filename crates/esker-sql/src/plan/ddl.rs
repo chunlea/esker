@@ -633,6 +633,48 @@ pub struct CreateType {
     pub if_not_exists: bool,
 }
 
+/// `ALTER TYPE <name> …` — the three shapes `ActiveRecord`'s enum helpers send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterType {
+    /// The type's name, folded.
+    pub name: String,
+    /// What to do to it.
+    pub action: AlterTypeAction,
+}
+
+/// The three `ALTER TYPE` actions, which are `rename_enum`, `add_enum_value` and
+/// `rename_enum_value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTypeAction {
+    /// `RENAME TO <new>` — the type keeps its oid, so every column of it keeps working.
+    RenameTo(String),
+    /// `ADD VALUE [IF NOT EXISTS] '<label>' [BEFORE | AFTER '<other>']`.
+    AddValue {
+        /// The label being added.
+        label: String,
+        /// `IF NOT EXISTS`: a label that is already there is a **no-op**, not `42710`.
+        if_not_exists: bool,
+        /// Where it goes, or `None` for the end.
+        position: Option<AddValuePosition>,
+    },
+    /// `RENAME VALUE '<from>' TO '<to>'` — the label changes and the ordering does not.
+    RenameValue {
+        /// The label as it is now.
+        from: String,
+        /// What it becomes.
+        to: String,
+    },
+}
+
+/// `BEFORE '<label>'` or `AFTER '<label>'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddValuePosition {
+    /// Immediately before the named label.
+    Before(String),
+    /// Immediately after it.
+    After(String),
+}
+
 /// `DROP TYPE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropType {

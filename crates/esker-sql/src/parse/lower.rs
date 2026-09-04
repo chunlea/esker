@@ -678,6 +678,40 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
         // Everything downstream — the record, `pg_type`, the drop, the dependency check — is the
         // one path all four already take.
+        // `ALTER TYPE` — the three shapes `rename_enum`, `add_enum_value` and
+        // `rename_enum_value` send, and no others.
+        Statement::AlterType(alter) => {
+            use sqlparser::ast::{AlterTypeAddValuePosition, AlterTypeOperation};
+            let action = match &alter.operation {
+                AlterTypeOperation::Rename(rename) => {
+                    plan::AlterTypeAction::RenameTo(ident(&rename.new_name))
+                }
+                AlterTypeOperation::AddValue(add) => plan::AlterTypeAction::AddValue {
+                    // **A label, not an identifier**: it is written in single quotes and its case
+                    // is its own, so it is taken verbatim the way an enum's labels are at
+                    // `CREATE TYPE`.
+                    label: add.value.value.clone(),
+                    if_not_exists: add.if_not_exists,
+                    position: match &add.position {
+                        Some(AlterTypeAddValuePosition::Before(other)) => {
+                            Some(plan::AddValuePosition::Before(other.value.clone()))
+                        }
+                        Some(AlterTypeAddValuePosition::After(other)) => {
+                            Some(plan::AddValuePosition::After(other.value.clone()))
+                        }
+                        None => None,
+                    },
+                },
+                AlterTypeOperation::RenameValue(rename) => plan::AlterTypeAction::RenameValue {
+                    from: rename.from.value.clone(),
+                    to: rename.to.value.clone(),
+                },
+            };
+            Ok(plan::Statement::AlterType(plan::AlterType {
+                name: relation_name(&alter.name)?,
+                action,
+            }))
+        }
         Statement::CreateDomain(create) => {
             refuse_if(create.collation.is_some(), "CREATE DOMAIN ... COLLATE")?;
             let (base, typmod) = lower_type(&create.data_type)?;
@@ -6950,6 +6984,20 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
             Some(ty) => ty,
             None => return Err(SqlError::unsupported(format!("the type {other}"))),
         },
+        // **A type's *internal* name is a type name.** `bpchar` is what PostgreSQL calls
+        // `character(n)` in `pg_type`, and `'a'::bpchar`, `c bpchar` and `CREATE DOMAIN d AS
+        // bpchar` are all ordinary on a real server — the name is not a second-class spelling, it
+        // is the one the catalog itself reports. Anything not in the grammar arrives here as a
+        // custom name, so this is the one place the three paths meet; without it `bpchar` was a
+        // *user* type nobody had declared and the answer was `0A000 the type bpchar is not
+        // supported` about a type this node has.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.0.len() == 1
+                && let Ok(Some(ty)) = value::type_by_name(&name.to_string()) =>
+        {
+            ty
+        }
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
 }

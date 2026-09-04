@@ -19,7 +19,7 @@ use crate::backend::Txn;
 use crate::catalog::{self, TypeDef};
 use crate::error::{Result, SqlError};
 use crate::exec::{Executor, Outcome};
-use crate::plan::{CreateType, DropType};
+use crate::plan::{AddValuePosition, AlterType, AlterTypeAction, CreateType, DropType};
 
 /// `CREATE TYPE`.
 pub(super) fn create(
@@ -79,6 +79,221 @@ pub(super) fn create(
         },
     );
     Ok(Outcome::done("CREATE TYPE"))
+}
+
+/// `ALTER TYPE <name> RENAME TO … | ADD VALUE … | RENAME VALUE … TO …`.
+///
+/// The three shapes `ActiveRecord`'s `rename_enum`, `add_enum_value` and `rename_enum_value` send.
+///
+/// **`ADD VALUE` in the middle rewrites rows, where PostgreSQL does not**, and that difference is
+/// the whole of what this costs. A real server's `pg_enum.enumsortorder` is a **`real`**: inserting
+/// `angry` before `ok` gives it sort order **1.5** and moves nothing. This node stores an enum
+/// value as the *ordinal of its label's position* (ADR 0050), which is what gives ordering,
+/// grouping and indexing for free — and it means a label inserted before the end shifts every
+/// later label's ordinal, so every stored row holding one has to move with it. A node that skipped
+/// that would answer the *wrong label* for rows written before the `ALTER`, which is worse than
+/// slow: the representation ADR 0050 chose is exactly the one that cannot leave those rows alone.
+pub(super) fn alter(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    alter: &AlterType,
+) -> Result<Outcome> {
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, &alter.name)? else {
+        return Err(SqlError::UndefinedType(alter.name.clone()));
+    };
+    match &alter.action {
+        AlterTypeAction::RenameTo(to) => rename_type(executor, txn, &def, to)?,
+        AlterTypeAction::AddValue {
+            label,
+            if_not_exists,
+            position,
+        } => add_enum_value(
+            executor,
+            txn,
+            &def,
+            label,
+            *if_not_exists,
+            position.as_ref(),
+        )?,
+        AlterTypeAction::RenameValue { from, to } => {
+            rename_enum_value(executor, txn, &def, from, to)?;
+        }
+    }
+    executor.catalog_written = true;
+    Ok(Outcome::done("ALTER TYPE"))
+}
+
+/// `RENAME TO`: the record moves and **the oid does not**, so every column of it keeps working.
+fn rename_type(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, to: &str) -> Result<()> {
+    // The new name is qualified into the same schema the old one is in, so `ALTER TYPE s.t RENAME
+    // TO u` leaves it in `s` — which is what PostgreSQL does; `RENAME TO` does not move a type
+    // between schemas and has `SET SCHEMA` for that.
+    let (schema, _) = catalog::split_qualified(&def.name);
+    let stored = if schema == catalog::PUBLIC_SCHEMA {
+        to.to_owned()
+    } else {
+        catalog::qualify(schema, to)
+    };
+    if catalog::type_by_name(&*txn, executor.tenant, &stored)?.is_some() {
+        return Err(SqlError::DuplicateType(to.to_owned()));
+    }
+    catalog::drop_type(txn, executor.tenant, &def.name);
+    catalog::put_type(
+        txn,
+        executor.tenant,
+        &TypeDef {
+            name: stored,
+            oid: def.oid,
+            kind: def.kind.clone(),
+        },
+    );
+    Ok(())
+}
+
+/// `RENAME VALUE 'from' TO 'to'`: the label changes and its position does not, so no row moves.
+fn rename_enum_value(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    def: &TypeDef,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let catalog::TypeKind::Enum { labels } = &def.kind else {
+        return Err(SqlError::unsupported(format!(
+            "ALTER TYPE ... RENAME VALUE on the type {}",
+            catalog::display_name(&def.name)
+        )));
+    };
+    let mut labels = labels.clone();
+    // **Two different codes, measured**: a label that is not there is `22023` and one that is
+    // already taken is `42710`. The order matters — renaming `sad` to `happy` when both exist is
+    // the duplicate, not the missing one.
+    let Some(at) = labels.iter().position(|label| label == from) else {
+        return Err(SqlError::NotAnEnumLabel(from.to_owned()));
+    };
+    if labels.iter().any(|label| label == to) {
+        return Err(SqlError::DuplicateEnumLabel(to.to_owned()));
+    }
+    to.clone_into(&mut labels[at]);
+    put_labels(executor, txn, def, labels);
+    Ok(())
+}
+
+/// `ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'other']`.
+fn add_enum_value(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    def: &TypeDef,
+    label: &str,
+    if_not_exists: bool,
+    position: Option<&AddValuePosition>,
+) -> Result<()> {
+    let catalog::TypeKind::Enum { labels } = &def.kind else {
+        return Err(SqlError::unsupported(format!(
+            "ALTER TYPE ... ADD VALUE on the type {}",
+            catalog::display_name(&def.name)
+        )));
+    };
+    let mut labels = labels.clone();
+    if labels.iter().any(|seen| seen == label) {
+        // **A no-op, not a success that changes the order.** `IF NOT EXISTS` over a label that is
+        // there leaves the list exactly as it was, measured — including its position.
+        if if_not_exists {
+            return Ok(());
+        }
+        return Err(SqlError::DuplicateEnumLabel(label.to_owned()));
+    }
+    let at = match position {
+        None => labels.len(),
+        Some(AddValuePosition::Before(other) | AddValuePosition::After(other)) => {
+            let Some(found) = labels.iter().position(|seen| seen == other) else {
+                return Err(SqlError::NotAnEnumLabel(other.clone()));
+            };
+            match position {
+                Some(AddValuePosition::After(_)) => found + 1,
+                _ => found,
+            }
+        }
+    };
+    // **Every stored row at or after the insert moves up by one**, and it has to happen before the
+    // labels are written: the rows are read against the ordinals they were written with.
+    if at < labels.len() {
+        shift_enum_ordinals(executor, txn, def, at)?;
+    }
+    labels.insert(at, label.to_owned());
+    put_labels(executor, txn, def, labels);
+    Ok(())
+}
+
+/// Writes a type's labels back, keeping its oid.
+fn put_labels(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, labels: Vec<String>) {
+    catalog::put_type(
+        txn,
+        executor.tenant,
+        &TypeDef {
+            name: def.name.clone(),
+            oid: def.oid,
+            kind: catalog::TypeKind::Enum { labels },
+        },
+    );
+}
+
+/// Adds one to every stored ordinal at or after `at`, in every column declared as this enum.
+///
+/// The scan is paged the way every other whole-table rewrite in this crate is.
+fn shift_enum_ordinals(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    def: &TypeDef,
+    at: usize,
+) -> Result<()> {
+    let relations = catalog::pg_relations::Relations::read(&*txn, executor.tenant)?;
+    let mut wanted: Vec<(u64, Vec<usize>)> = Vec::new();
+    for table in relations.tables() {
+        let columns: Vec<usize> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.user_type == Some(def.oid))
+            .map(|(ordinal, _)| ordinal)
+            .collect();
+        if !columns.is_empty() {
+            wanted.push((table.id, columns));
+        }
+    }
+    // **The stored ordinal is the label's index plus one** (`catalog::enum_ordinal`), so a label
+    // inserted at index `at` moves every ordinal from `at + 1` up. Using the index here shifted
+    // every row including the ones before the insert, which turned `sad` into `angry`.
+    let floor = i16::try_from(at + 1).unwrap_or(i16::MAX);
+    for (table_id, columns) in wanted {
+        let table = executor.table_by_id(txn, table_id)?;
+        let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+        let schema = table.row_schema();
+        let mut rows: Vec<Vec<crate::value::Datum>> = Vec::new();
+        super::for_each_page(txn, &start, &end, |_, page| {
+            for (_, value) in page {
+                rows.push(crate::row::decode_row(&schema, value)?);
+            }
+            Ok(())
+        })?;
+        for row in rows {
+            let mut moved = row.clone();
+            let mut changed = false;
+            for &ordinal in &columns {
+                if let crate::value::Datum::Int2(held) = moved[ordinal]
+                    && held >= floor
+                {
+                    moved[ordinal] = crate::value::Datum::Int2(held.saturating_add(1));
+                    changed = true;
+                }
+            }
+            if changed {
+                let mut written = super::Written::default();
+                super::dml::rewrite_row(executor, txn, &table, &row, &moved, &mut written)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `2BP01` when a column is still declared as this type.
