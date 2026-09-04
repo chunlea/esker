@@ -1403,12 +1403,15 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
             Datum::Null,
             Datum::Null,
             Datum::Null,
-            Datum::Int8(
-                start_of
-                    .get(holder)
-                    .and_then(|ts| i64::try_from(*ts).ok())
-                    .unwrap_or(i64::MAX),
-            ),
+            // **`NULL` when the holder is not holding anything**, never a sentinel. This was
+            // `i64::MAX`, and run 78's capture read it as a transaction waiting on an id that can
+            // never commit or abort — a diagnostic inventing the thing it was asked to report.
+            // With the wait-for graph no longer leaking there should be no such row at all; if one
+            // appears, `NULL` says "this view does not know" rather than naming a transaction.
+            start_of
+                .get(holder)
+                .and_then(|ts| i64::try_from(*ts).ok())
+                .map_or(Datum::Null, Datum::Int8),
             Datum::Null,
             Datum::Null,
             Datum::Null,

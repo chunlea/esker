@@ -256,9 +256,8 @@ impl StoreTxn {
     /// a panic there while another thread already panicked holding the table would abort the
     /// process (`CLAUDE.md` invariant 9).
     fn release(&self) {
-        if self.held.is_empty() {
-            return;
-        }
+        // No early return on an empty list: a waiter that never acquired anything is still in the
+        // wait-for graph, and only this call takes it out.
         if let Ok(mut locks) = self.locks.lock() {
             locks.release(self.id, &self.held);
         }

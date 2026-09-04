@@ -652,9 +652,9 @@ impl MemoryTxn {
     /// that fails its own prewrite still has to release, or the next writer waits for a
     /// transaction that has already given up.
     fn release(&self) {
-        if self.held.is_empty() {
-            return;
-        }
+        // **No early return on an empty list.** A transaction that waited and never acquired
+        // anything holds nothing and is still *in the graph*, and skipping the call is what left it
+        // there for the life of the process (run 78).
         self.versions().row_locks.release(self.id, &self.held);
     }
 }
