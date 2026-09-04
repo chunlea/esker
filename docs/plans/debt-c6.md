@@ -835,3 +835,68 @@ A negative assertion needs evidence that the thing it denies had its chance to h
 assertion behind a wall clock fails loudly when the clock is short; a negative one passes quietly,
 and the arm-A form of the question — *cut the wait to zero and see whether it still passes* — is
 what tells the two apart in one run.
+
+## 12. `every_acknowledged_write_survives_a_kill_of_the_server`: a wall clock racing CPU-bound writes
+
+Found while triaging this wave's own gate (§7), unowned, and the one failure that the container
+namespace fix would **not** have touched: it reproduces 6 runs in 10 under twenty-four spinning
+threads **in a single container**, where no port collision is possible.
+
+### What it was
+
+The round killed the child after `sleep(15..250 ms)`. The writes that sleep is meant to interrupt
+are CPU-bound, and the sleep is not, so on a loaded box the kill landed before the writer had a
+single acknowledgement and the round had nothing to verify. It then failed at its own guard —
+`assert!(acked > 0, "round N acknowledged nothing, so it proved nothing")` — while the durability
+assertion never ran at all.
+
+That guard is right. A round that verified nothing must not count as a pass. The defect is that
+the round had no way to say it was starved.
+
+### The fix
+
+The kill point is counted in **acknowledged writes** rather than in milliseconds: wait for a
+random 1–8 acknowledgements, then a 0–15 ms offset, then kill. The cut still lands somewhere
+different each round — inside a write, between two, or with a response frame in flight, which was
+the point of randomising it — but the round now has something to verify by construction. The wait
+carries a 30 s bound that is a real assertion rather than a timeout: a writer that cannot get one
+acknowledgement in thirty seconds is a server not answering, and it says so.
+
+A side effect worth naming: the test went from ~4 s to ~0.26 s, because it no longer sleeps up to
+a quarter-second per round to wait for something that takes microseconds.
+
+### The mutation, and the one I got wrong first
+
+Showing the flake gone is not evidence: deleting the assertion would do that too. So the fixed test
+was run against a store that genuinely loses an acknowledged write.
+
+**First attempt, wrong.** The child was opened with `WalSyncMode::Never`, expecting lost writes. It
+passed, and it had to: `Never` skips the `fsync`, not the `write`. A `SIGKILL` ends the process,
+not the page cache, so the bytes are still in the file and nothing is lost. `docs` says so in as
+many words — *"v1 therefore targets process-crash (`kill -9`) durability"* — and this file's own
+header points at the same fact. The knob I reached for is the one both documents say is not
+load-bearing under a process kill.
+
+**Second attempt, right.** Drop the record from the log instead: `wal.writer.add_record(...)`
+removed, so an acknowledged write lives only in the memtable and a `SIGKILL` genuinely loses it.
+
+```
+FAIL  every_acknowledged_write_survives_a_kill_of_the_server
+assertion `left == right` failed: acknowledged write 0 did not survive the kill
+```
+
+The **durability** assertion fires, not the guard — which is the whole claim: the test still
+catches a lost acknowledged write, and now it reaches that question on a loaded box instead of
+dying before it.
+
+| | before | after |
+|---|---|---|
+| 10 runs under 24 spinners | 6 failed, all at the `acked > 0` guard | **10 passed** |
+| against a store that drops the WAL record | — | **red, at the durability assertion** |
+
+### The rule, which is §11's with the sign flipped
+
+A **positive** assertion behind a wall clock fails loudly when the clock is short, so it shows up
+as a flake and gets found. A **negative** one passes quietly (§11). Both are the same mistake —
+judging a process counted in progress by a budget spent in time — and the loud one is the lucky
+case.
