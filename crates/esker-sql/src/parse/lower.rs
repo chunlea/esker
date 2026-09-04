@@ -4462,29 +4462,6 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
     ))))
 }
 
-/// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
-///
-/// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
-/// at rung 2 for three scoreboard runs: `Quoting#lookup_cast_type` sends
-/// `SELECT 'integer'::regtype::oid` once per column type, and `pg_type` here already held the
-/// answer — what was missing was only the cast that asks it.
-///
-/// # Why the nested shape is matched rather than composed
-///
-/// A `regtype` is a real type on a real server, four bytes holding an OID that *print* as the
-/// type's name; `::oid` from one is then a free coercion. This node has no `regtype`, so
-/// `'x'::regtype` lowers to the **name**, as text — which makes `SELECT 'int4'::regtype` answer
-/// `integer`, exactly right, and leaves only `RowDescription`'s OID differing (`text` where a real
-/// server says `regtype`). It also means a composed `::oid` would be a text-to-oid cast, which a
-/// real server refuses: `'integer'::oid` is `22P02`, and this node answers that too.
-///
-/// So the pair is recognised together. That is not a shortcut around a missing type — it is the
-/// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per cast shape, and each arm is a measured answer; splitting it would \
-              hide which shapes are folded at plan time and which are not"
-)]
 /// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.
 ///
 /// PostgreSQL types a bare literal from its context, so `'true'` in a boolean position *is* a
@@ -4546,6 +4523,29 @@ fn lower_distinct(left: &Expr, right: &Expr, op: plan::BinaryOp) -> Result<plan:
     })
 }
 
+/// `'<name>'::regtype`, `'<name>'::regtype::oid` and `'<digits>'::oid`.
+///
+/// The three shapes `ActiveRecord` needs and no others. The middle one is what stopped the ladder
+/// at rung 2 for three scoreboard runs: `Quoting#lookup_cast_type` sends
+/// `SELECT 'integer'::regtype::oid` once per column type, and `pg_type` here already held the
+/// answer — what was missing was only the cast that asks it.
+///
+/// # Why the nested shape is matched rather than composed
+///
+/// A `regtype` is a real type on a real server, four bytes holding an OID that *print* as the
+/// type's name; `::oid` from one is then a free coercion. This node has no `regtype`, so
+/// `'x'::regtype` lowers to the **name**, as text — which makes `SELECT 'int4'::regtype` answer
+/// `integer`, exactly right, and leaves only `RowDescription`'s OID differing (`text` where a real
+/// server says `regtype`). It also means a composed `::oid` would be a text-to-oid cast, which a
+/// real server refuses: `'integer'::oid` is `22P02`, and this node answers that too.
+///
+/// So the pair is recognised together. That is not a shortcut around a missing type — it is the
+/// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per cast shape, and each arm is a measured answer; splitting it would \
+              hide which shapes are folded at plan time and which are not"
+)]
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
     // what the cast carries is the type, and everything downstream resolves against it — a
