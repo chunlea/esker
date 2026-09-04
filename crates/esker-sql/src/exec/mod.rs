@@ -1904,6 +1904,7 @@ impl Executor {
         self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.resolve_user_cast(txn, &mut statement)?;
+        self.resolve_user_functions(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
     }
@@ -2255,6 +2256,61 @@ impl Executor {
             }
         });
         match missing {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Replaces every call the catalog holds a function for with that function's **body**, and
+    /// raises the `0A000` lowering used to raise for every name nobody declared.
+    ///
+    /// **A `LANGUAGE sql` function whose body is a single `SELECT <expr>` is inlined**, which is
+    /// what PostgreSQL does with one too. There is no interpreter and no per-row call: after this
+    /// pass the statement holds the body's expression and nothing below can tell it from one the
+    /// user typed. A body of any other shape — a `FROM`, more than one statement, `plpgsql` —
+    /// keeps the refusal, by name, because inlining it is not a rewrite this can do.
+    fn resolve_user_functions(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{CatalogFunc, Expr, Literal};
+
+        let mut failure = None;
+        // **The output column keeps the function's name.** PostgreSQL names a target-list entry
+        // after the call — `SELECT r78g()` is a column called `r78g` — and inlining replaces the
+        // call with the body, whose name is the body's. Naming it here, before the substitution,
+        // is what keeps `?column?` out of an answer a client reads by name.
+        if let Statement::Select(select) = &mut *statement {
+            for item in &mut select.projection {
+                if let crate::plan::SelectItem::Expr { expr, alias } = item
+                    && alias.is_none()
+                    && let Expr::CatalogFunc(call) = expr
+                    && call.func == CatalogFunc::UserFunc
+                    && let Some(Expr::Literal(Literal::String(name))) = call.args.first()
+                {
+                    *alias = Some(name.clone());
+                }
+            }
+        }
+        let mut resolve = |expr: &mut Expr| {
+            if failure.is_some() {
+                return;
+            }
+            let Expr::CatalogFunc(call) = &*expr else {
+                return;
+            };
+            if call.func != CatalogFunc::UserFunc {
+                return;
+            }
+            let Some(Expr::Literal(Literal::String(name))) = call.args.first().cloned() else {
+                return;
+            };
+            match inline_user_function(txn, self.tenant, &name, &call.args[1..]) {
+                Ok(body) => *expr = body,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failure {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -3433,4 +3489,42 @@ impl Executor {
         };
         Ok(Described { parameters, fields })
     }
+}
+
+/// One stored function's body as an expression, or the `0A000` naming the call.
+///
+/// **A free function, because two callers need it and only one has an `Executor`**: the statement
+/// pass above, and `crate::exec::dml::column_default_value`, which parses a stored default per row
+/// and would otherwise reach the row evaluator with a call nothing had resolved.
+pub(super) fn inline_user_function(
+    txn: &dyn Txn,
+    tenant: u64,
+    name: &str,
+    args: &[crate::plan::Expr],
+) -> Result<crate::plan::Expr> {
+    let refuse = || SqlError::unsupported(format!("the function {name}"));
+    let Some(def) = crate::catalog::function(txn, tenant, name)? else {
+        return Err(refuse());
+    };
+    // **Only the shape the capture shows.** `plpgsql` has no evaluator here, and a function
+    // with parameters cannot be created yet — so a call with arguments has nothing to bind
+    // them to and keeps the refusal rather than dropping them.
+    if !def.language.eq_ignore_ascii_case("sql") || !args.is_empty() {
+        return Err(refuse());
+    }
+    let parsed = crate::parse::parse_statements(&def.body).map_err(|_| refuse())?;
+    let [statement] = parsed.as_slice() else {
+        return Err(refuse());
+    };
+    let Ok(Statement::Select(select)) = statement.lower() else {
+        return Err(refuse());
+    };
+    // A single expression and nothing else: no `FROM`, no `WHERE`, one item in the list.
+    if select.from.is_some() || !select.joins.is_empty() || select.filter.is_some() {
+        return Err(refuse());
+    }
+    let [crate::plan::SelectItem::Expr { expr, .. }] = select.projection.as_slice() else {
+        return Err(refuse());
+    };
+    Ok(expr.clone())
 }
