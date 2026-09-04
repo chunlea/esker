@@ -782,3 +782,51 @@ and what would have to change for that to stop being true.
 
 Count the shape to find candidates; count the *exposure* before changing any of them. Seven files
 matched a grep and one had the bug.
+
+## 11. `an_operator_against_a_stale_epoch_is_dropped`: a negative assertion behind a clock
+
+`crates/esker-store/tests/snapshot.rs`. Found while auditing §9's family, not assigned.
+
+The test issues an `AddPeer` carrying a stale epoch, slept 200 ms — *"long enough for several
+heartbeat rounds to have carried it"* — and then asserted the region still had one peer. A
+**negative** assertion behind a wall clock: the thing it proves is that nothing happened, and a
+store that has not yet *fetched* the operator also makes nothing happen.
+
+### The mutation test, and the answer it gave — which is not the one I predicted
+
+Three arms, against the same test:
+
+| arm | setup | result |
+|---|---|---|
+| A | the old form, sleep cut to **0 ms**, store healthy | **passed** |
+| B | the new form, store forced to ignore the stale epoch (`if false`) | **failed**, correctly |
+| C | the **old** form, against that same broken store | **failed** — it caught it |
+
+Arm A is the vacuity, exactly: with no wait at all the test passes over a working store, so the
+assertion on its own proves nothing and the sleep was carrying the entire weight.
+
+**Arm C is the correction.** I had recorded this in §9 as "silently vacuous" and said it would
+keep passing on the day the rejection broke. That is wrong, and the mutation is what says so: on a
+quiet box 200 ms *was* long enough, and the old test caught the break. The defect is **latent**,
+not active — the test is sound exactly while delivery fits inside the sleep, and goes quiet only
+where it does not. Worth stating plainly, because "this test never worked" and "this test stops
+working under load" call for the same fix and a very different level of alarm.
+
+### The fix
+
+Two tokens instead of a clock. `FakePd` hands an operator out **once**, removing it as it answers
+the heartbeat, so `operator_pending` going false is proof the store has *taken* it; and one
+further region heartbeat proves the iteration that ran it has finished, since `run_operator` is
+called in the same iteration as the beat that returned it. Both are facts about progress rather
+than about elapsed time, so the test is now sound at any speed.
+
+`FakePd::operator_pending` is the one new accessor, purely additive, inside the existing
+`#[cfg(any(test, feature = "testing"))] impl FakePd` block in `crates/esker-store/src/pd.rs` —
+the same place `FakePd` itself lives.
+
+### The rule
+
+A negative assertion needs evidence that the thing it denies had its chance to happen. A positive
+assertion behind a wall clock fails loudly when the clock is short; a negative one passes quietly,
+and the arm-A form of the question — *cut the wait to zero and see whether it still passes* — is
+what tells the two apart in one run.
