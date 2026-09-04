@@ -878,7 +878,9 @@ impl Transaction {
                     start_ts: locks[0].start_ts,
                 });
             }
-            self.resolve_all(&locks, round)?;
+            // The same rule on the prewrite path: the last look waits the lease out, so a
+            // `LockNotCleared` here is never reported about a lease that still had time.
+            self.resolve_all(&locks, round, round + 1 == self.max_lock_resolutions)?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -915,7 +917,7 @@ impl Transaction {
     /// one competitor holding several of the keys we want — which is then one call, not one per
     /// key. Every lock of one transaction names the same primary and the same `start_ts`, so
     /// one of them stands for the group when its owner has to be classified.
-    fn resolve_all(&self, locks: &[LockInfo], attempt: u32) -> Result<()> {
+    fn resolve_all(&self, locks: &[LockInfo], attempt: u32, last: bool) -> Result<()> {
         let mut by_txn: BTreeMap<u64, (LockInfo, Vec<Bytes>)> = BTreeMap::new();
         for lock in locks {
             by_txn
@@ -927,7 +929,7 @@ impl Transaction {
         let groups: Vec<(LockInfo, Vec<Bytes>)> = by_txn.into_values().collect();
         for outcome in fan_out(groups.len(), |index| {
             let (lock, keys) = &groups[index];
-            self.resolve(lock, keys.clone(), attempt)
+            self.resolve(lock, keys.clone(), attempt, last)
         }) {
             outcome?;
         }
@@ -1073,7 +1075,20 @@ impl Transaction {
                     start_ts: lock.start_ts,
                 });
             }
-            self.resolve(&lock, vec![lock.key.clone()], attempt)?;
+            // **The last look waits out the lease rather than one more backoff step.**
+            //
+            // The bound on *looks* is still a count — it has to be, or a heartbeating owner that
+            // keeps extending its lease would hold this loop for ever, which is the hang the
+            // refusal exists to avoid. What was wrong was the bound on *waiting*: eight
+            // exponential backoffs come to 2,550 ms against a three-second lease, so a reader
+            // meeting a lock younger than 450 ms reported it uncleared without having waited it
+            // out. `esker-sql`'s joint gate saw that twice as a panic on `txn.scan(..).unwrap()`.
+            //
+            // Spending the final look on the whole remaining lease makes the total cover the
+            // lease by construction, whatever the schedule adds up to and whatever the budget is
+            // set to — a deadline derived from the lease, with the count left to bound the looks.
+            let last = attempt + 1 == self.max_lock_resolutions;
+            self.resolve(&lock, vec![lock.key.clone()], attempt, last)?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -1094,7 +1109,7 @@ impl Transaction {
     ///
     /// The order is the mirror of the commit's, and for the same reason: **the primary is
     /// settled first**, and everything else follows the fact it leaves behind.
-    fn resolve(&self, lock: &LockInfo, keys: Vec<Bytes>, attempt: u32) -> Result<()> {
+    fn resolve(&self, lock: &LockInfo, keys: Vec<Bytes>, attempt: u32, last: bool) -> Result<()> {
         let verdict = match self.classify(lock)? {
             Classified::Settled(verdict) => verdict,
             // Its owner is inside its lease. Waiting is the whole answer: the caller retries,
@@ -1106,7 +1121,16 @@ impl Transaction {
             // had become settleable while this thread was asleep. The backoff is still the
             // ceiling — a long lease is waited on the way any other contended resource is.
             Classified::Alive { lease_ms } => {
-                let wait = backoff_ms(attempt).min(lease_ms).max(1);
+                // On the last look, the whole remaining lease: after it the lock is settleable,
+                // so the refusal above is only ever reported about a lease that has run out or
+                // an owner that extended it. Otherwise a backoff step, capped by the lease for
+                // the reason it always was — that instant is when the answer can change.
+                let wait = if last {
+                    lease_ms
+                } else {
+                    backoff_ms(attempt).min(lease_ms)
+                }
+                .max(1);
                 self.router.clock().sleep(Duration::from_millis(wait));
                 return Ok(());
             }

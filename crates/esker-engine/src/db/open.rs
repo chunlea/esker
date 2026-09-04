@@ -403,8 +403,13 @@ fn apply_to_memtables(
                 if entry.kind == crate::dbformat::EntryKind::DeleteRange {
                     mem.active.add_range(entry.seqno, entry.key, entry.value);
                 } else {
+                    // **Recovery fails rather than opens short.** An arena that refuses here
+                    // means this database cannot hold its own log, and an open that carried on
+                    // would present a database missing writes that were acknowledged before the
+                    // crash — the same silent loss as on the write path, arrived at from the
+                    // other direction (`docs/plans/debt-c6.md` §15).
                     mem.active
-                        .add(entry.seqno, entry.kind, entry.key, entry.value);
+                        .add(entry.seqno, entry.kind, entry.key, entry.value)?;
                 }
             }
             None => {

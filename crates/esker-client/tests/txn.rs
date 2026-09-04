@@ -44,6 +44,12 @@ const OTHER_DEAD_TS: u64 = at_ms(1_100);
 /// aborts a transaction that is still working.
 const LIVE_TS: u64 = at_ms(99_500);
 
+/// A lease **younger than the client's own backoff budget**, which is the case that used to be
+/// reported as unclearable before it could possibly clear. At `START_TS` this lock is 100 ms old,
+/// so 2,900 ms of its three-second lease are left — more than the 2,550 ms eight exponential
+/// backoffs add up to (`docs/plans/debt-c6.md` §14).
+const YOUNG_TS: u64 = at_ms(99_900);
+
 fn key(bytes: &'static [u8]) -> Bytes {
     Bytes::from_static(bytes)
 }
@@ -951,10 +957,86 @@ fn a_lock_inside_its_lease_is_waited_for_rather_than_settled() {
         !transport.methods().contains(&Method::TxnResolveLock),
         "nothing to resolve while the owner is inside its lease"
     );
+    // One backoff per look, growing, so a busy key is not spun on — and then the **last** look
+    // waits out what is left of the lease instead of taking one more step. That final wait is
+    // what makes the refusal honest: `LockNotCleared` now only ever describes a lease that has
+    // run out or an owner that extended it, never one that still had time
+    // (`a_reader_waits_out_the_lease_before_it_reports_a_lock_uncleared`). This assertion used to
+    // read `[10, 20, 40]`, which was the defect written down as an expectation.
+    let sleeps = clock.sleeps_ms();
     assert_eq!(
-        clock.sleeps_ms(),
-        vec![10, 20, 40],
-        "one backoff per look, growing, so a busy key is not spun on"
+        &sleeps[..2],
+        &[10, 20],
+        "the looks before the last back off, growing: {sleeps:?}"
+    );
+    let lease_left = esker_client::txn::LOCK_TTL_MS - 500;
+    assert!(
+        sleeps[2] >= lease_left,
+        "the last look must wait out the {lease_left} ms still on the lease, not back off \
+         again: {sleeps:?}"
+    );
+}
+
+/// **A reader may not give up on a lock before that lock could possibly have expired.**
+///
+/// The budget that decides when to stop was an *attempt count*, and the waits it spent were an
+/// exponential backoff: eight of them add to 2,550 ms against a three-second lease. So a reader
+/// meeting a lock younger than 450 ms reported `LockNotCleared` — "the owner is alive, give up" —
+/// for a lock it had not waited out. `esker-sql`'s joint gate saw it twice as a panic on
+/// `txn.scan(..).unwrap()`, which is why it looked like a cluster-read flake: it is arithmetic,
+/// and it bites only in the first 450 ms of a lease whose owner then dies.
+///
+/// The bound is now a **deadline derived from the lease** rather than a count of tries — the
+/// shape [ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+/// gave the SQL layer, and the same correction wave c3 made to the router's retry budget, which
+/// counted attempts against an epoch that kept moving.
+///
+/// The assertion is about **waiting**, not about the read succeeding, and that is deliberate:
+/// `CountingOracle` advances only the logical half of a timestamp, so a live lock in this file is
+/// immortal and no amount of waiting settles it. What can be checked without a wall clock is the
+/// invariant itself — that the client did not stop short of the lease it was told about.
+#[test]
+fn a_reader_waits_out_the_lease_before_it_reports_a_lock_uncleared() {
+    let transport = Arc::new(FakeTransport::new());
+    let clock = Arc::new(FakeClock::new());
+    transport.script(
+        Rule::new(
+            Matcher::Method(Method::TxnGet),
+            Outcome::locked(&a_lock(b"k", b"primary", YOUNG_TS)),
+        )
+        .forever(),
+    );
+    let router = Router::with_options(
+        Arc::clone(&transport) as _,
+        one_region() as Arc<dyn esker_client::RegionResolver>,
+        ClientOptions {
+            jitter_seed: Some(7),
+            ..ClientOptions::default()
+        },
+    )
+    .with_clock(Arc::clone(&clock) as Arc<dyn esker_client::clock::Clock>);
+    // The **shipped** budget, not a shortened one: this is about the default behaviour.
+    let client = TxnClient::on_router(
+        Arc::new(router),
+        Arc::new(CountingOracle::starting_at(START_TS)),
+    );
+
+    let txn = client.begin().unwrap();
+    let refusal = txn.get(b"k").unwrap_err();
+    assert!(
+        matches!(refusal, Error::LockNotCleared { .. }),
+        "expected the bounded refusal, got {refusal:?}"
+    );
+
+    // 100 ms old at `START_TS`, so this much of its lease was still to run when the client first
+    // saw it. Anything less than this is giving up on a lock that had not had its time.
+    let remaining = esker_client::txn::LOCK_TTL_MS - 100;
+    let waited: u64 = clock.sleeps_ms().iter().sum();
+    assert!(
+        waited >= remaining,
+        "waited {waited} ms before reporting the lock uncleared, but {remaining} ms of its lease \
+         were still to run: {:?}",
+        clock.sleeps_ms()
     );
 }
 
