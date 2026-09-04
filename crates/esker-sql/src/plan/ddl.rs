@@ -792,6 +792,25 @@ pub enum AlterTableAction {
     /// same index and only `IndexDef::constraint` tells them apart, which is what decides whether
     /// `DROP CONSTRAINT` or `DROP INDEX` can remove it.
     AddUnique(UniqueConstraint),
+    /// `RENAME COLUMN <from> TO <to>`, the one shape `rename_column` sends
+    /// (`abstract/schema_statements.rb:1923`).
+    ///
+    /// **A rename does not move the column.** Its ordinal is unchanged, so every index, constraint
+    /// and default keeps pointing at the same attribute and nothing needs rewriting — which is
+    /// exactly why this node can do it: those all reference a column by *position*, and only
+    /// `attname` is stored as text.
+    RenameColumn {
+        /// The column as it is now.
+        from: String,
+        /// What it becomes.
+        to: String,
+    },
+    /// `RENAME TO <name>` — the table itself, `rename_table`'s statement (`:459`) and this one's
+    /// neighbour in the same capture.
+    ///
+    /// **The sequence a `serial` column owns is not renamed with it**, measured, which is why
+    /// `ActiveRecord` follows this with an explicit `ALTER TABLE <seq> RENAME TO` (`:474`).
+    RenameTo(String),
     /// `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE|RESTRICT]`.
     ///
     /// **The one statement four `ActiveRecord` methods end in** — `remove_check_constraint`,
