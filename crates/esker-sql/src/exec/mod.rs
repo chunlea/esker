@@ -73,6 +73,15 @@ use crate::value::{PgDatum, PgType};
 pub struct Executor {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
+    /// This node's advisory locks, shared with every other session it serves.
+    ///
+    /// **A private table by default**, which is what a single-session test wants and what keeps
+    /// the corpus replay honest; `Executor::sharing_advisory_locks` joins the node's, and the
+    /// server's session factory is the one caller (`crate::advisory`).
+    locks: Arc<crate::advisory::Locks>,
+    /// Who this session is, in that table. Handed out once at construction and never reused, so a
+    /// lock released by one session cannot be mistaken for a later one's.
+    session: crate::advisory::Session,
 
     pub(crate) tenant: u64,
     /// The database this session is connected to, which is the tenant above under its name.
@@ -100,7 +109,11 @@ pub struct Executor {
     ///
     /// What actually leaves is filtered by `client_min_messages`
     /// ([`Executor::take_notices`]), which is the whole reason `ActiveRecord` sets it.
-    notices: Vec<SqlError>,
+    /// **Interior-mutable, because a notice is a side channel rather than state.** Statement
+    /// binding runs behind `&self` and is where `pg_advisory_unlock` decides it has nothing to
+    /// release — a `WARNING` PostgreSQL raises and `ActiveRecord` reads past. Threading `&mut`
+    /// through the whole bind path to carry one message would have been the tail wagging the dog.
+    notices: std::cell::RefCell<Vec<SqlError>>,
     /// Session parameters this session has set, by [`crate::parameter::Parameter::name`]. A
     /// parameter absent here reads back its boot value, which is what makes `RESET` a removal
     /// rather than a second assignment.
@@ -346,15 +359,19 @@ impl Executor {
     /// An executor over a store and a shared catalog cache.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, catalog: Arc<Catalog>, tenant: u64) -> Self {
+        let locks = Arc::new(crate::advisory::Locks::new());
+        let session = locks.session();
         Executor {
             backend,
             catalog,
+            locks,
+            session,
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
             open: None,
             written: Written::default(),
             constraints: std::cell::RefCell::default(),
-            notices: Vec::new(),
+            notices: std::cell::RefCell::new(Vec::new()),
             parameters: savepoint::Parameters::new(),
             block_parameters: None,
             row_ids: std::collections::BTreeMap::new(),
@@ -1392,8 +1409,8 @@ impl Executor {
     }
 
     /// Adds a notice for the session to send before this statement's `CommandComplete`.
-    fn notice(&mut self, notice: SqlError) {
-        self.notices.push(notice);
+    fn notice(&self, notice: SqlError) {
+        self.notices.borrow_mut().push(notice);
     }
 
     /// Reads every `$n` in a statement as the type its context gives it, and turns every
@@ -1413,9 +1430,23 @@ impl Executor {
         self.resolve_current_schema(txn, &mut statement)?;
         self.resolve_current_database(&mut statement);
         self.resolve_current_setting(&mut statement)?;
+        self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
+    }
+
+    /// Joins this node's advisory-lock table instead of the private one `new` made.
+    ///
+    /// The session factory calls it once per connection (`bin/esker-sql.rs`), which is what makes
+    /// two sessions on one node able to block each other — the whole point of the feature, and the
+    /// thing a private table per executor cannot do. Written as a builder because that is how the
+    /// other three node-wide handles reach an executor.
+    #[must_use]
+    pub fn sharing_advisory_locks(mut self, locks: Arc<crate::advisory::Locks>) -> Self {
+        self.session = locks.session();
+        self.locks = locks;
+        self
     }
 
     /// Folds every `current_database()` to the database this session is connected to.
@@ -1437,6 +1468,57 @@ impl Executor {
             }
         };
         bind::walk_mut(statement, &mut resolve);
+    }
+
+    /// Takes or releases every advisory lock the statement names, and folds each call to the
+    /// boolean it answered.
+    ///
+    /// **This is where "once per statement" is decided, and it is the whole reason a non-constant
+    /// argument is refused.** A real server evaluates `pg_try_advisory_lock(id)` once per row and
+    /// would take a lock per row; folding here would take one. Rather than silently differ, an
+    /// argument that is not a constant by this point is `0A000` naming the function — and by this
+    /// point a `$1` has already been substituted, so every shape `ActiveRecord` sends
+    /// (`postgresql_adapter.rb:474` interpolates the id into the text) is a constant.
+    ///
+    /// The lock **outlives the statement and the transaction**: it is released by an explicit
+    /// unlock or when the session ends, measured, which is why nothing here is staged in the
+    /// transaction's write set.
+    fn resolve_advisory(&self, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| matches!(expr, Expr::Advisory { .. })) {
+            return Ok(());
+        }
+        let mut failed = None;
+        let mut resolve = |expr: &mut Expr| {
+            let Expr::Advisory { call, args } = expr else {
+                return;
+            };
+            let (call, args) = (*call, std::mem::take(args));
+            let answered = match advisory_key(call, &args) {
+                Ok(key) => {
+                    if call.takes() {
+                        self.locks.try_lock(self.session, key, call.mode())
+                    } else {
+                        let released = self.locks.unlock(self.session, key, call.mode());
+                        if !released {
+                            // PostgreSQL's own sentence, and a `WARNING` rather than an error: the
+                            // caller gets `false` and carries on. `ActiveRecord` reads exactly this
+                            // to decide a migration lock was never held.
+                            self.notice(SqlError::LockNotHeld(call.mode().name()));
+                        }
+                        released
+                    }
+                }
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    false
+                }
+            };
+            *expr = Expr::Literal(Literal::Bool(answered));
+        };
+        bind::walk_mut(statement, &mut resolve);
+        failed.map_or(Ok(()), Err)
     }
 
     /// Folds every `current_setting(…)` to the value this session reports.
@@ -1748,6 +1830,55 @@ impl Executor {
     }
 }
 
+/// The lock a call names, or `0A000` for an argument that is not a constant by binding time.
+///
+/// Both arities, and the two are **different key spaces** rather than two spellings of one — the
+/// capture shows `pg_try_advisory_lock(42)` and `pg_try_advisory_lock(42, 7)` held at once, told
+/// apart by `pg_locks.objsubid`.
+fn advisory_key(
+    call: crate::plan::AdvisoryCall,
+    args: &[crate::plan::Expr],
+) -> Result<crate::advisory::Key> {
+    use crate::plan::{Expr, Literal};
+
+    let integer = |expr: &Expr| -> Option<i64> {
+        match expr {
+            Expr::Literal(Literal::Integer(value)) => Some(*value),
+            Expr::Literal(Literal::Typed(datum)) => match **datum {
+                Datum::Int8(value) => Some(value),
+                Datum::Int4(value) => Some(i64::from(value)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let constant = |expr: &Expr| {
+        integer(expr).ok_or_else(|| {
+            SqlError::unsupported(format!(
+                "{}() over a value that is not a constant, which a real server would evaluate \
+                 once per row",
+                call.name()
+            ))
+        })
+    };
+    match args {
+        [whole] => Ok(crate::advisory::Key::whole(constant(whole)?)),
+        [high, low] => {
+            let narrow = |value: i64| {
+                i32::try_from(value).map_err(|_| SqlError::IntegerOutOfRange {
+                    value: value.to_string(),
+                    ty: "integer",
+                })
+            };
+            Ok(crate::advisory::Key::pair(
+                narrow(constant(high)?)?,
+                narrow(constant(low)?)?,
+            ))
+        }
+        _ => Err(SqlError::UndefinedFunction(format!("{}()", call.name()))),
+    }
+}
+
 /// Keys read from the store in one round trip, by everything that walks a whole range.
 ///
 /// The same number [`cursor`] uses, and for the same reason: a range has to be read a page at a
@@ -1995,6 +2126,14 @@ fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
 }
 
 impl Execute for Executor {
+    /// Everything this session holds, released — what the end of a connection owes the node.
+    ///
+    /// A session's locks die with it on a real server and nothing else releases them: they survive
+    /// `ROLLBACK`, measured. So this is not tidying, it is the other half of the lifetime.
+    fn release_advisory_locks(&self) {
+        self.locks.unlock_all(self.session);
+    }
+
     /// What this session set, or the boot value — which is `0`, meaning no limit.
     ///
     /// Read through `Executor::parameter` — a private method, so this is a code span rather than
@@ -2129,7 +2268,7 @@ impl Execute for Executor {
         // Filtered here rather than where each notice is raised, because this is the one place
         // every notice this node produces passes through — and a suppressed one must still not be
         // left in the queue for the next statement to emit.
-        std::mem::take(&mut self.notices)
+        std::mem::take(self.notices.get_mut())
             .into_iter()
             .filter(|notice| self.reports(notice.severity()))
             .collect()

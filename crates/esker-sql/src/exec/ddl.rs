@@ -2421,6 +2421,10 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),
         Expr::CurrentSetting { name, missing_ok } => plan::current_setting_text(name, *missing_ok),
+        // Folded away in `Executor::bound` before anything prints one, so this is the shape a
+        // stored expression could never hold — printed rather than `unreachable!` because a
+        // `DEFAULT` is re-read from text and a panic there would be a crash on catalog data.
+        Expr::Advisory { call, .. } => format!("{}()", call.name()),
         Expr::Outer { at, .. } => format!("<outer {at}>"),
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => format!("{}()", call.func.name()),

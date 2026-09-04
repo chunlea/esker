@@ -1,0 +1,67 @@
+# Advisory locks — as a real PostgreSQL 19beta1 answers them.
+#
+# **99 tests over 8 files, and they are not a feature the suite uses — they are how it starts.**
+# `ActiveRecord::Migrator` wraps every migration in `with_advisory_lock`, so a node that cannot
+# answer `pg_try_advisory_lock` fails at the *first* migration of a file and takes the file with it
+# (`migration.rb:1610`, `postgresql_adapter.rb:474`).
+#
+# The adapter sends exactly two of these — `SELECT pg_try_advisory_lock(<bigint>)` and
+# `SELECT pg_advisory_unlock(<bigint>)` — and never the blocking `pg_advisory_lock`.
+# `adapters/postgresql/connection_test.rb:203` additionally reads them back out of `pg_locks` and
+# rebuilds the key as `(classid::bigint << 32) | objid::bigint`, which is what makes that column
+# pair part of the requirement rather than decoration.
+#
+# Captured in one session against `esker-pg19` on 127.0.0.1:55432, and it leaves the server as it
+# found it: the last line releases everything.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A session lock is not transactional.** `pg_try_advisory_lock(301)` taken inside `BEGIN`
+#     is **still held after `ROLLBACK`** — measured, both 300 and 301 survive. It is released by an
+#     explicit unlock or by the session ending, and by nothing else. (`pg_advisory_xact_lock` is
+#     the transactional one and is a different function.)
+#   * **The one-argument and two-argument forms are different key spaces**, not two spellings of
+#     one. `pg_try_advisory_lock(42)` and `pg_try_advisory_lock(42, 7)` are both held at once, and
+#     `pg_locks.objsubid` is what tells them apart: **1** for the `bigint` form, **2** for the pair.
+#   * **A lock is re-entrant and counted.** Taking it twice answers `t` twice and adds **no** second
+#     `pg_locks` row; it then takes **two** unlocks to release, and the third answers `f`.
+#   * **Releasing one you do not hold is `f` with a `WARNING`**, not an error:
+#     `WARNING: you don't own a lock of type ExclusiveLock` (`01000`). The same sentence covers a
+#     key nobody ever took and one already released. `pg_advisory_unlock_shared` says `ShareLock`.
+#   * **`pg_advisory_unlock_all()` returns `void`**, so `… IS NULL` is **`f`** — void is not NULL.
+#   * `pg_locks.classid` and `objid` are `oid`, and `objsubid` is `smallint`; the `bigint` key is
+#     split across the first two, high half in `classid`.
+SELECT 'r', pg_try_advisory_lock(5295901941911233559)	text,boolean	r|t
+SELECT 'r', locktype, classid, objid, objsubid, mode, granted FROM pg_locks WHERE locktype = 'advisory'	text,text,oid,oid,smallint,text,boolean	r|advisory|1233048257|3706430487|1|ExclusiveLock|t
+SELECT 'r', (classid::bigint << 32) | objid::bigint AS lock_id FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|5295901941911233559
+SELECT 'r', pg_try_advisory_lock(5295901941911233559)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|1
+SELECT 'r', pg_advisory_unlock(5295901941911233559)	text,boolean	r|t
+SELECT 'r', pg_advisory_unlock(5295901941911233559)	text,boolean	r|t
+SELECT 'r', pg_advisory_unlock(5295901941911233559)	text,boolean	r|f
+SELECT 'r', pg_advisory_unlock(2940075057017742022)	text,boolean	r|f
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+SELECT 'r', pg_try_advisory_lock(42, 7)	text,boolean	r|t
+SELECT 'r', classid, objid, objsubid FROM pg_locks WHERE locktype = 'advisory'	text,oid,oid,smallint	r|42|7|2
+SELECT 'r', pg_try_advisory_lock(42)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|2
+SELECT 'r', objsubid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objsubid	text,smallint	r|1 ; r|2
+SELECT 'r', pg_advisory_unlock(42, 7)	text,boolean	r|t
+SELECT 'r', pg_advisory_unlock(42)	text,boolean	r|t
+SELECT 'r', pg_try_advisory_lock_shared(200)	text,boolean	r|t
+SELECT 'r', mode FROM pg_locks WHERE locktype = 'advisory'	text,text	r|ShareLock
+SELECT 'r', pg_advisory_unlock_shared(200)	text,boolean	r|t
+SELECT 'r', pg_advisory_unlock_shared(200)	text,boolean	r|f
+SELECT 'r', pg_try_advisory_lock(300)	text,boolean	r|t
+BEGIN		-
+SELECT 'r', pg_try_advisory_lock(301)	text,boolean	r|t
+ROLLBACK		-
+SELECT 'r', objid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objid	text,oid	r|300 ; r|301
+SELECT 'r', pg_advisory_unlock_all() IS NULL	text,boolean	r|f
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+SELECT 'r', pg_typeof(pg_advisory_unlock_all())::text	text,text	r|void
+SELECT 'r', pg_typeof(pg_try_advisory_lock(1))::text	text,text	r|boolean
+SELECT 'r', pg_advisory_unlock_all() IS NULL	text,boolean	r|f

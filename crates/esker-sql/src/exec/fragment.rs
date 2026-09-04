@@ -507,7 +507,10 @@ fn push_filter(
         Expr::Column { .. } => return Err(refused("an unresolved column")),
         Expr::Outer { .. } => return Err(refused("a correlated column reference")),
         Expr::Parameter(_) => return Err(refused("a parameter inside a pushed-down filter")),
-        Expr::CurrentSchema { .. } | Expr::CurrentDatabase | Expr::CurrentSetting { .. } => {
+        Expr::CurrentSchema { .. }
+        | Expr::CurrentDatabase
+        | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. } => {
             return Err(refused("current_schema inside a pushed-down filter"));
         }
         Expr::Default | Expr::Sequence(_) | Expr::Aggregate(_) => {
@@ -801,6 +804,9 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
+        // Folded to a literal before a fragment is ever built, and its arguments are constants by
+        // then, so it names no column either.
+        | Expr::Advisory { .. }
         | Expr::Column { .. }
         // A position in a row **outside** this plan, so it names no column of the one being read.
         | Expr::Outer { .. }

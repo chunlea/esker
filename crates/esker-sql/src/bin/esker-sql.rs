@@ -30,6 +30,12 @@ const TENANT: u64 = 1;
 struct Sessions {
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
+    /// This node's advisory locks, shared by every session it serves.
+    ///
+    /// Beside the catalog cache because it has the same lifetime and the same scope: node-wide,
+    /// in memory, gone when the process is. A session that took one and never released it loses it
+    /// when its connection closes, which is what a real server does too (`esker_sql::advisory`).
+    locks: Arc<esker_sql::advisory::Locks>,
     /// Where an `ALTER ... SET (columnar_replicas = N)` reports to, on a node that has a PD.
     columnar: Option<Arc<dyn ColumnarReport>>,
     /// Where a plan fragment goes, on a node that can send one (ADR 0022 milestone 4).
@@ -51,7 +57,8 @@ impl Executors for Sessions {
         let _ = txn.rollback();
         let mut executor =
             Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), tenant)
-                .serving_database(database);
+                .serving_database(database)
+                .sharing_advisory_locks(Arc::clone(&self.locks));
         if let Some(report) = &self.columnar {
             executor = executor.reporting_columnar_to(Arc::clone(report));
         }
@@ -180,6 +187,7 @@ async fn main() -> std::io::Result<()> {
     let sessions = Sessions {
         backend,
         catalog,
+        locks: Arc::new(esker_sql::advisory::Locks::new()),
         columnar,
         fragments,
     };

@@ -3346,6 +3346,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))
