@@ -129,7 +129,8 @@ Two of the rows this lane owns were not.
 | 5 | "`crash_through_the_client` starves under load … the child is killed on a **wall clock**" | **Closed before the record was written.** `46166886`, *the crash loop kills after acknowledged writes, not after milliseconds*, landed 2026-09-04 06:45; the register was written at 09:48. The test kills after `1..8` acknowledged writes and has done since. Green at eighty busy threads in 3.5 s. |
 | 3 | "`Db::ingest` refuses any overlap, tombstones included … c6 verified this as the one item of eight that HEAD still owes" | **The widening landed nine hours before the record.** `616954e8`, *an ingest is refused for a shared key, not for a shared range*, 2026-09-04 00:41. The module header states the key rule and argues it against range-disjointness explicitly, and `tests/ingest_overlap.rs` property-tests it — including point tombstones and range deletes — against a rule computed from the inputs rather than from the code under test. The site the record cites, `DbInner::place`, is documented as *"placement, not permission"* and returns a level. |
 
-Refusing an ingest whose keys collide, tombstones included, is **correct and should not be widened**:
+**ADR 0066** now records the rule, which is what #3 actually still owed. Refusing an ingest whose
+keys collide, tombstones included, is **correct and should not be widened**:
 a point tombstone is an entry under its key, so a sequence number would still have to decide between
 the delete and the ingested value, and the two numberings are unrelated. What #3 still owes is the
 ADR, because the rule is a decision a future reader might reverse — range-disjointness is what the
@@ -154,3 +155,40 @@ boolean and which should report **how far the writer got** — the difference be
 The leadership churn in the history is worth its own look regardless of this test: `CLAUDE.md` lists
 predictable tail latency as a goal, and a region whose leadership moves eight times in one 64-event
 window is not that.
+
+## 6. The sixth sighting: `esker-sql::real_backend`, unreproduced, and why
+
+Relayed from the coordinator's gate of `c6fa73b9`: `a_scan_reads_every_row_a_real_store_holds`
+panicked on the `unwrap` of an `INSERT` of 250 rows into a real three-store cluster after 18.7 s,
+and passed 3/3 alone in 0.5 s. The test file is `esker-sql`'s and was not touched; the suspicion was
+a store or client budget, which is this lane's.
+
+Four load models, **44 runs, zero failures**:
+
+| model | runs | worst |
+|---|---:|---:|
+| 0 / 14 / 40 / 80 busy threads, one run each | 4 | 36.2 s at 80 |
+| 8 copies of the binary at once, two batches | 16 | 2.5 s |
+| 8 copies at once **plus** 60 busy threads, three batches | 24 | 9.8 s |
+
+The single-run curve is **monotone** — 0.88 / 3.71 / 5.25 / 36.2 s — which is the shape of a test
+that is merely slow, and a 41x rise is a lot of slow. But the run that took 36.2 s **passed**, and
+the sighting failed at 18.7 s, so "slower than some threshold" does not explain it either.
+
+**What stops the diagnosis is the capture, not the reproduction.** The gate log holds
+
+```
+thread 'a_scan_reads_every_row_a_real_store_holds' (29300) panicked at crates/esker-sql/tests/real_backend.rs:73:14:
+failures:
+```
+
+— the `panicked at` line, and then the *next* line is gone. libtest prints the message on the line
+after that one, and the log has no stdout/stderr blocks at all, so the capture is a whitelist filter
+that matched `panicked at` and not the message it introduces. Line 73 is
+`session.run(&format!("INSERT INTO t VALUES {}", …)).unwrap()`, so the discarded line is a
+`SqlError` carrying its sqlstate — which is exactly the thing that would say whether this is a lock
+wait, a commit budget or a transport timeout, and it is one line.
+
+So the ask is the capture: keep the gate's output unfiltered, or at minimum `grep -A 2 "panicked at"`.
+Until then a budget cannot be named honestly, and naming one from the timing alone would be a guess
+of the kind `debt-c6.md` §9 spent a unit refuting.
