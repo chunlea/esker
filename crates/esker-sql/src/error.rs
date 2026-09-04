@@ -1343,7 +1343,10 @@ pub enum SqlError {
     /// `DROP ... IF EXISTS` for something that is not there. Also a notice — and one that carries
     /// SQLSTATE `00000`, where the notice above carries `42P07`. The asymmetry is PostgreSQL's and
     /// was captured, not assumed.
-    #[error("{kind} \"{}\" does not exist, skipping", crate::catalog::display_name(name))]
+    #[error(
+        "{kind} \"{}\" does not exist, skipping",
+        crate::catalog::display_name(name)
+    )]
     DoesNotExistSkipping {
         /// The object word PostgreSQL uses here — `table`, `index`. Note that the *already
         /// exists* notice says `relation` for both.
