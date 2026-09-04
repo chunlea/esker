@@ -1,0 +1,61 @@
+crates/esker-keys/src/array.rs
+  s_6f7019c05b578b::t_b309871a5f853b 117-119,158-160
+crates/esker-keys/src/columnar.rs
+  s_6f7019c05b578b::t_cf33bee134a397 127-132,200-205
+crates/esker-keys/src/row.rs
+  s_6f7019c05b578b::t_24f0c3f7b56cc9 146-161,377-394,462-465,629-640,1065-1068,1073-1098,1888-1891,1956-1988
+crates/esker-keys/src/value.rs
+  s_6f7019c05b578b::t_d9484aefca43d5 230-250,383-388,396,457-462,526-544,644-661,739-742
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_e50cb6aaeb64e9 1740-1745,1832-1835,1849-1852,1863,1917-1920,1940-1942
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_8bd487bcb64534 291-296,383-388,499-504
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_76b43b30100169 551-556,2306,2504-2506
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_005e8fb61784a0 1187-1198
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_82e59e5f9c65d6 663-668,704-705
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_7e748600ab2b40 2811-2818
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_3175808add7f27 4787-4822,6444-6448
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_d77c3fbaa926f0 1713,1794,1869
+crates/esker-sql/src/row.rs
+  s_6f7019c05b578b::t_24027993ed8ec3 73-75,163-190
+crates/esker-sql/src/value/inet.rs
+  s_6f7019c05b578b::t_979463d5cf05d2 1-386
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_47493018bab028 43,547-549,566-570,676-678,707,822-827,910-915,974-977,995,1077-1090,1133-1137,1145-1155,1173-1175,1290-1292,1297-1298,1342-1344,1360-1362,1516-1534,1736-1738,2072
+crates/esker-sql/tests/corpus/pg19_inet.txt
+  s_6f7019c05b578b::t_efc72e3cdcbd0a 1-94
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_6f7019c05b578b::t_719e7ba5d8efae 87-96
+crates/esker-sql/tests/inet.rs
+  s_6f7019c05b578b::t_bb424cd83b9d59 1-78
+crates/esker-sql/tests/pg_catalog.rs
+  s_6f7019c05b578b::t_5bae64c1d31b5e 198-200,207-208,307-316,452-471
+crates/esker-sql/tests/row_order.rs
+  s_6f7019c05b578b::t_7bf5cabb8bf618 131-137
+crates/esker-store/src/columnar/decode.rs
+  s_6f7019c05b578b::t_d20383e7dc34a6 221-226,250-251
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_aa3fec49093573 1598
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c39d8caea5ac9a5b3727006c197a586ca58d26c3",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
