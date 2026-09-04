@@ -221,3 +221,36 @@ fn skip_locked_drops_the_held_row_and_the_limit_counts_the_rest() {
         "OFFSET counts from the rows that survived the skip too"
     );
 }
+
+/// **A locking clause *inside* a subquery or a derived table must not change what the subquery
+/// answers.**
+///
+/// The lock pass is a property of the statement the executor runs, and a sub-`SELECT`'s plan is
+/// used for its `node` alone — everything else the planner computed for it, the junk columns and
+/// the withheld `LIMIT` included, is dropped on the floor by `exec::subquery`. So a `FOR UPDATE`
+/// down there would have taken a `LIMIT` out of the plan and given it to nobody: this test's first
+/// assertion answered **three rows where one was asked for** before the sub-plan was told to leave
+/// the locking clause alone.
+///
+/// What it locks is nothing, which is a divergence and a declared one: PostgreSQL pushes the lock
+/// down to the base table. Nothing `ActiveRecord` sends writes a locking clause inside a subquery —
+/// `lock!` puts it on the statement — and answering the wrong number of rows to reach it would be
+/// the wrong trade.
+#[test]
+fn a_locking_clause_inside_a_subquery_leaves_the_answer_alone() {
+    let mut node = parity::Node::new(ROWS);
+    assert_eq!(
+        node.rows("SELECT id FROM (SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE) s"),
+        [["1"]],
+        "the LIMIT inside the subquery still applies"
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM (SELECT id FROM lk ORDER BY id FOR UPDATE) s ORDER BY id"),
+        [["1"], ["2"], ["3"]],
+        "and a derived table's rows are its own columns, junk included in none of them"
+    );
+    assert_eq!(
+        node.rows("SELECT count(*) FROM lk WHERE id IN (SELECT id FROM lk FOR UPDATE)"),
+        [["3"]]
+    );
+}

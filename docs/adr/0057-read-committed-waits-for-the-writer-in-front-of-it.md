@@ -309,7 +309,11 @@ user gave no key still has one, the hidden row id, and locks like any other.
   concurrency and never correctness. Two sessions that both take `FOR SHARE` on one row proceed on
   PostgreSQL and serialise here.
 * **A locking clause over a view or a derived table locks nothing**, where PostgreSQL pushes the
-  lock down to the base table.
+  lock down to the base table. The same for a clause *inside* a subquery or a derived table — and
+  that one had to be made true rather than being true already: a sub-`SELECT`'s plan is used for
+  its `node` alone, so the junk columns would have widened its rows and the withheld `LIMIT` would
+  have been given to nobody. `SELECT id FROM (SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE) s`
+  answered **three rows**. Sub-selects are planned with the clause cleared.
 * **`EXPLAIN ANALYZE` of a locking `SELECT` takes no locks** — that path holds `&dyn Txn` — where
   PostgreSQL takes them.
 * **`FOR UPDATE` with `UNION` is `0A000 UNION is not supported`**, not PostgreSQL's `0A000 FOR
