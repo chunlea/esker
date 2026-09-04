@@ -1,0 +1,14 @@
+CLAUDE.md
+  h_44076b318daf9c 86-87,93-96,100-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fb99dc6fedb66c67394bf9b5de103e7b74a4819b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
