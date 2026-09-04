@@ -64,19 +64,31 @@ fn every_schema_answer_is_postgresql_19_s() {
     );
 }
 
-/// **`CREATE SCHEMA` makes a real catalog object**, and `pg_namespace` reports it beside `public`.
+/// **`CREATE SCHEMA` makes a real catalog object**, and `pg_namespace` reports it beside the three
+/// that are properties of the build.
 #[test]
 fn a_created_schema_is_a_row_in_pg_namespace() {
     let mut node = parity::Node::new(&[]);
-    // `public` is not a record — it is a property of the build — and is there before anything is
-    // created.
-    assert_eq!(node.rows("SELECT nspname FROM pg_namespace"), [["public"]]);
+    // None of these three is a record. `public` is where a user's relations go; `pg_catalog` and
+    // `information_schema` are where the catalog's own live, and a real server reports all three
+    // before anybody has created anything.
+    assert_eq!(
+        node.rows("SELECT nspname FROM pg_namespace ORDER BY nspname"),
+        vec![
+            vec!["information_schema"],
+            vec!["pg_catalog"],
+            vec!["public"]
+        ]
+    );
     node.run("CREATE SCHEMA test_schema").unwrap();
     assert_eq!(
         node.rows("SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'test_schema'"),
         [["1"]]
     );
-    // `schema_names`, the statement that gates the whole adapter — and the `!~` in it now runs.
+    // `schema_names`, the statement that gates the whole adapter — and it is **unchanged** by the
+    // two arriving, which is the point of them: `ActiveRecord` filters out exactly `pg_%` and
+    // `information_schema`, so a node that reports them answers this the same as one that hides
+    // them, and answers `tables()` correctly instead of by accident.
     assert_eq!(
         node.rows(
             "SELECT nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN \
@@ -87,7 +99,7 @@ fn a_created_schema_is_a_row_in_pg_namespace() {
     // Every schema has its own oid, and they are distinct.
     assert_eq!(
         node.rows("SELECT count(DISTINCT oid) FROM pg_namespace"),
-        [["2"]]
+        [["4"]]
     );
 }
 

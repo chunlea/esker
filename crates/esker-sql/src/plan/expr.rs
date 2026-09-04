@@ -721,6 +721,22 @@ pub enum CatalogFunc {
     HstoreAvals,
     /// `hstore(k, v)` and `hstore(keys[], vals[])`: the two constructors the adapter reaches for.
     HstoreBuild,
+    /// `lower_inc(range)`, `upper_inc`, `lower_inf`, `upper_inf`: the four bracket questions.
+    ///
+    /// `lower`/`upper` are **not** here — they are the text functions of the same name, overloaded
+    /// on a range operand, which is how a real server spells them too.
+    RangeLowerInc,
+    /// See [`CatalogFunc::RangeLowerInc`].
+    RangeUpperInc,
+    /// See [`CatalogFunc::RangeLowerInc`]. **True for an absent bound, and that is the whole
+    /// distinction from `-infinity`**, which is a *value* and answers false.
+    RangeLowerInf,
+    /// See [`CatalogFunc::RangeLowerInc`].
+    RangeUpperInf,
+    /// `a @> b` and `b <@ a` over ranges: whether one contains the other, or a bare value.
+    RangeContains,
+    /// `tsrange(lower, upper)` and `tsrange(lower, upper, '[]')`.
+    RangeBuild,
     /// `pg_get_triggerdef(oid)`: a trigger's `CREATE TRIGGER`, re-printed.
     ///
     /// **It normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`**, so the text that comes out is
@@ -748,6 +764,28 @@ pub enum CatalogFunc {
     /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
     /// break a `LEFT JOIN` that legitimately has no match.
     RegClassName,
+    /// The inverse of `'x'::regtype`: an **oid**, read per row, answered as the type's printed
+    /// name. `ActiveRecord`'s array probe writes `t.typelem::regtype`, where the operand is a
+    /// catalog column and not a literal.
+    ///
+    /// The same three answers `RegClassName` gives, measured the same way: a type's name, `-` for
+    /// oid **0** — PostgreSQL's rendering of `InvalidOid`, which every non-array row of `pg_type`
+    /// has in `typelem` — and the number back for an oid this node does not know.
+    RegTypeName,
+    /// `'happy'::mood` — a cast to a **user-defined type**, which is a name until the catalog is
+    /// read.
+    ///
+    /// Two arguments: the type's name as a string literal, and the operand. Like
+    /// [`CatalogFunc::RegClass`] it is replaced before the plan is built and never reaches the row
+    /// evaluator — the catalog answer is the same for every row, and reading it per row is the
+    /// cost trap `::regclass` already paid for once
+    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    ///
+    /// What it is replaced *with* depends on where it sits, and that is what an enum is rather
+    /// than a special case: **the label** when it is a projection on its own, so
+    /// `SELECT 'happy'::mood` prints `happy`; **the ordinal** everywhere else, so
+    /// `'sad'::mood < 'happy'::mood` is `1 < 3` and is `t`.
+    UserCast,
     /// `to_regclass('name')`: the relation of that name, or **NULL** where a bare reference would
     /// raise `42P01`.
     ///
@@ -887,6 +925,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("isempty") => Some(CatalogFunc::IsEmpty),
             // The hstore functions. `hstore(…)` is two shapes of one name, told apart by whether
             // its arguments are arrays — an overload, the way a real server tells them apart.
+            () if name.eq_ignore_ascii_case("lower_inc") => Some(CatalogFunc::RangeLowerInc),
+            () if name.eq_ignore_ascii_case("upper_inc") => Some(CatalogFunc::RangeUpperInc),
+            () if name.eq_ignore_ascii_case("lower_inf") => Some(CatalogFunc::RangeLowerInf),
+            () if name.eq_ignore_ascii_case("upper_inf") => Some(CatalogFunc::RangeUpperInf),
+            () if name.eq_ignore_ascii_case("tsrange") => Some(CatalogFunc::RangeBuild),
             () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
             () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
             () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
@@ -942,15 +985,25 @@ impl CatalogFunc {
             CatalogFunc::DateRange => "daterange",
             CatalogFunc::IsEmpty => "isempty",
             CatalogFunc::RangeOverlaps => "&&",
+            CatalogFunc::RangeLowerInc => "lower_inc",
+            CatalogFunc::RangeUpperInc => "upper_inc",
+            CatalogFunc::RangeLowerInf => "lower_inf",
+            CatalogFunc::RangeUpperInf => "upper_inf",
+            CatalogFunc::RangeBuild => "tsrange",
             CatalogFunc::HstoreFetch => "->",
             CatalogFunc::HstoreHasKey => "?",
-            CatalogFunc::HstoreContains => "@>",
+            // One symbol, two containments — see `exec::cursor`, where the operand decides.
+            CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
             CatalogFunc::HstoreConcat => "||",
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
+            CatalogFunc::RegTypeName => "regtype",
+            // What a `42883` would call it, and nothing reaches one: the pass either
+            // resolves it or raises about the type by name.
+            CatalogFunc::UserCast => "cast",
             CatalogFunc::ArrayPosition => "array_position",
             CatalogFunc::ArrayLower => "array_lower",
             CatalogFunc::ArrayUpper => "array_upper",
@@ -983,27 +1036,37 @@ impl CatalogFunc {
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
             | CatalogFunc::ArrayPosition
+            // The type's name, then the operand.
+            | CatalogFunc::UserCast
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
             | CatalogFunc::ConvertTo
             | CatalogFunc::DateRange
             | CatalogFunc::RangeOverlaps
+            | CatalogFunc::RangeContains
             | CatalogFunc::HstoreFetch
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
             | CatalogFunc::HstoreBuild => &[2],
-            CatalogFunc::PgGetExpr => &[2, 3],
+            // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
+            // `pg_get_expr`'s two really are two forms as well.
+            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
             CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
-            CatalogFunc::HstoreAkeys
+            CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInf
+            | CatalogFunc::HstoreAkeys
             | CatalogFunc::HstoreAvals
             | CatalogFunc::PgEncodingToChar
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
+            | CatalogFunc::RegTypeName
             | CatalogFunc::ToRegClass
             | CatalogFunc::IsEmpty
             | CatalogFunc::Cardinality
@@ -1039,6 +1102,7 @@ impl CatalogFunc {
             // is what it prints as. The one place the difference shows is the declared type.
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
+            | CatalogFunc::RegTypeName
             | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
@@ -1048,6 +1112,10 @@ impl CatalogFunc {
             | CatalogFunc::HstoreFetch => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
+            // **The storage, which is what an enum's value is** (ADR 0050) — and the label
+            // the projection form is replaced by is a `text` literal by then, so nothing
+            // reads this for that shape.
+            CatalogFunc::UserCast => ColumnType::Int2,
 
             // Every one of the five answers `integer` on a real server, including `cardinality`,
             // which counts every element of every dimension where `array_length` counts one.
@@ -1060,12 +1128,18 @@ impl CatalogFunc {
             // `WHERE` without a comparison around it.
             CatalogFunc::IsEmpty
             | CatalogFunc::RangeOverlaps
+            | CatalogFunc::RangeContains
+            | CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInf
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains => ColumnType::Bool,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
+            CatalogFunc::RangeBuild => ColumnType::TsRange,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.
             CatalogFunc::Now
@@ -1541,7 +1615,12 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1612,11 +1691,36 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
             Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            // **An `ARRAY[…]`'s element type is settled by the column**, the way an integer
+            // literal's is one level down. `ARRAY[1,2,3]` is `integer[]` on a real server and
+            // `bigint[]` here — an integer literal is an `int8` in this crate until a column says
+            // otherwise, which is what `Literal::Integer` above does — and both servers write the
+            // same row into an `integer[]` column. Re-read through the array's own text, which is
+            // `array_in` doing the element conversion: `ARRAY[2147483648]` into an `integer[]`
+            // column then fails with `int4`'s own `22003` rather than with a type mismatch.
+            //
+            // A `Literal` is a constant in the statement, never a column reference, so this
+            // settles a *literal's* type and does not widen assignment between two columns:
+            // `int8[]` into an `integer[]` column is still `42804`, from `exec::assign`.
+            Literal::Typed(value)
+                if matches!(**value, Datum::Array(_))
+                    && esker_keys::array::ArrayValue::element_of(ty).is_some() =>
+            {
+                match value.to_text() {
+                    Some(text) => Datum::from_text(ty, &text),
+                    None => mismatch(),
+                }
+            }
             Literal::Typed(_) => mismatch(),
 
             Literal::Bool(value) => match ty {
@@ -1657,7 +1761,12 @@ impl Literal {
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
                 // A number or a boolean is not a citext literal either.
-                | ColumnType::Citext => mismatch(),
+                | ColumnType::Citext
+                // A number or a boolean is not a range literal either.
+                | ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
         }
     }

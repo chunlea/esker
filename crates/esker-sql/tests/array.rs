@@ -106,10 +106,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT array_to_string('{1,2,3}'::int[], ','), string_to_array('1,2,3', ',')",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
         ),
-        (
-            "SELECT '{1,2}'::int2[], '{1,2}'::numeric[], '{a}'::varchar[]",
-            "A cast of the `ARRAY[]` constructor, which needs the constructor. And `int2[]`, `varchar[]`: this node has four array types — over `int8`, `int4`, `numeric` and `text` — which are the ones `ActiveRecord`'s schemas declare. A fifth is a variant, a tag and an ordering fixture, and is added when a schema asks for one.",
-        ),
+        // **`'{a}'::varchar[]` used to be here** and the entry said a fifth array type would be
+        // "a variant, a tag and an ordering fixture, added when a schema asks for one". Sixteen
+        // of them were added at once instead: a `typarray` that names a `pg_type` row which is
+        // not there is what left `ActiveRecord` unable to quote *any* array, so the answer was
+        // every array type rather than the next one (`tests/array_type_map.rs`).
     ],
 };
 

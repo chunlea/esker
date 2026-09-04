@@ -19,7 +19,8 @@
 //! * **An empty range overlaps nothing, itself included.** A range whose start is not below its
 //!   end is `empty`, and `&&` against it is always false.
 
-use crate::value::{Datum, PgDatum};
+use crate::error::{Result, SqlError};
+use crate::value::{ColumnType, Datum, PgDatum};
 
 /// A `daterange`, as days from 2000-01-01 — the representation [`Datum::Date`] uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +100,7 @@ impl DateRange {
             if text.is_empty() {
                 return Some(None);
             }
-            match <Datum as PgDatum>::from_text(crate::value::ColumnType::Date, text) {
+            match <Datum as PgDatum>::from_text(ColumnType::Date, text) {
                 Ok(Datum::Date(day)) => Some(Some(day)),
                 _ => None,
             }
@@ -163,5 +164,338 @@ mod tests {
         let empty = DateRange::new(Some(5), Some(5));
         assert_eq!(empty.to_text(), "empty");
         assert!(DateRange::from_text("empty").is_some_and(|read| read.empty));
+    }
+}
+
+/// A range of any subtype, with its bounds' **inclusivity as data**.
+///
+/// [`DateRange`] above it is the half-open date range an `EXCLUDE` key needs and nothing more;
+/// this is what a `tsrange` column holds, and the difference is the whole reason both exist: a
+/// `tsrange` round-trips the exact characters `[`, `]`, `(`, `)` it was written with, so a type
+/// that assumed `[a,b)` would answer `["a","b")` for a value inserted as `["a","b"]`.
+///
+/// # What a reader would get wrong
+///
+/// * **A continuous subtype is not canonicalised.** `int4range '[1,10]'` comes back `[1,11)`
+///   because an integer has a successor; `tsrange '[a,b]'` comes back `["a","b"]` because a
+///   timestamp does not. An implementation that canonicalises everything or nothing is wrong
+///   either way, and `pg_range.rngcanonical` is `-` for `tsrange` and `int4range_canonical` for
+///   the other — measured.
+/// * **`-infinity` is a *value*, not an unbounded bound.** `'[-infinity, infinity]'::tsrange` has
+///   `lower_inf` and `upper_inf` both **false**, and prints with its brackets intact. Unbounded is
+///   the *absent* bound — `'[a,]'` prints `["a",)`, closing with a parenthesis because there is
+///   nothing there to include.
+/// * **A zero-width range collapses to `empty`**: `[a,a)` is `empty` and `[a,a]` is not.
+/// * **`empty` is a value and not NULL.** `isempty` is `t` for one and the whole value is NULL for
+///   the other, and `range_test.rb` asserts both separately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Range {
+    /// The empty range, which has no bounds at all and is not NULL.
+    pub empty: bool,
+    /// The lower bound, or `None` for unbounded below.
+    pub lower: Option<Datum>,
+    /// The upper bound, or `None` for unbounded above.
+    pub upper: Option<Datum>,
+    /// Whether the lower bound is included — the `[` or `(` as written, after canonicalisation.
+    pub lower_inc: bool,
+    /// Whether the upper bound is included.
+    pub upper_inc: bool,
+}
+
+impl Range {
+    /// The empty range.
+    #[must_use]
+    pub fn empty() -> Self {
+        Range {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+        }
+    }
+
+    /// The canonical text, which is what a client is sent and what the row holds.
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        if self.empty {
+            return "empty".to_owned();
+        }
+        let bound = |value: Option<&Datum>| match value.and_then(PgDatum::to_text) {
+            None => String::new(),
+            Some(text) => quote_bound(&text),
+        };
+        format!(
+            "{}{},{}{}",
+            if self.lower_inc { '[' } else { '(' },
+            bound(self.lower.as_ref()),
+            bound(self.upper.as_ref()),
+            if self.upper_inc { ']' } else { ')' },
+        )
+    }
+}
+
+/// Reads a range literal of `subtype`, or the error a real server gives for one it cannot.
+///
+/// **Three different SQLSTATEs, all measured**: a literal with no bracket is
+/// `22P02 malformed range literal … DETAIL: Missing left parenthesis or bracket.`, one that stops
+/// early is the same code with `DETAIL: Unexpected end of input.`, and bounds the wrong way round
+/// are `22000 range lower bound must be less than or equal to range upper bound` — a *data*
+/// exception rather than an input-syntax one, because the text parsed fine and the value is
+/// impossible.
+pub fn from_text(subtype: ColumnType, text: &str) -> Result<Range> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("empty") {
+        return Ok(Range::empty());
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let lower_inc = match chars.first() {
+        Some('[') => true,
+        Some('(') => false,
+        _ => return Err(malformed(text, "Missing left parenthesis or bracket.")),
+    };
+    let mut at = 1;
+    let lower = bound(&chars, &mut at, text)?;
+    if chars.get(at) != Some(&',') {
+        return Err(malformed(text, "Unexpected end of input."));
+    }
+    at += 1;
+    let upper = bound(&chars, &mut at, text)?;
+    let upper_inc = match chars.get(at) {
+        Some(']') => true,
+        Some(')') => false,
+        _ => return Err(malformed(text, "Unexpected end of input.")),
+    };
+    if at + 1 != chars.len() {
+        return Err(malformed(text, "Junk after right parenthesis or bracket."));
+    }
+    let read = |value: Option<String>| match value {
+        None => Ok(None),
+        Some(text) => Datum::from_text(subtype, &text).map(Some),
+    };
+    let mut range = Range {
+        empty: false,
+        lower: read(lower)?,
+        upper: read(upper)?,
+        lower_inc,
+        upper_inc,
+    };
+    canonicalise(subtype, &mut range)?;
+    Ok(range)
+}
+
+/// The bounds a **discrete** subtype normalises to, and the emptiness every subtype collapses to.
+///
+/// `int4range '[1,10]'` is `[1,11)`: an integer has a successor, so every range of them has one
+/// spelling. A timestamp has none, so a `tsrange` keeps the brackets it was given — which is why
+/// this takes the subtype rather than normalising unconditionally.
+fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
+    // **An absent bound is never inclusive**, whatever bracket was written beside it: `'[a,]'`
+    // prints `["a",)`, because there is nothing there to include. Measured, and it is why the
+    // bracket a client sees is not always the bracket it sent.
+    range.lower_inc &= range.lower.is_some();
+    range.upper_inc &= range.upper.is_some();
+    if matches!(subtype, ColumnType::Int4 | ColumnType::Int8) {
+        if let (Some(Datum::Int8(lower)), true) = (range.lower.clone(), !range.lower_inc) {
+            range.lower = Some(Datum::Int8(lower.saturating_add(1)));
+            range.lower_inc = true;
+        }
+        if let (Some(Datum::Int8(upper)), true) = (range.upper.clone(), range.upper_inc) {
+            range.upper = Some(Datum::Int8(upper.saturating_add(1)));
+            range.upper_inc = false;
+        }
+    }
+    if let (Some(lower), Some(upper)) = (&range.lower, &range.upper) {
+        match lower.pg_cmp(upper) {
+            std::cmp::Ordering::Greater => {
+                return Err(SqlError::RangeBoundsOutOfOrder);
+            }
+            // **A zero-width range collapses to `empty`** unless both ends are included: `[a,a)`
+            // is empty and `[a,a]` is the single point.
+            std::cmp::Ordering::Equal if !(range.lower_inc && range.upper_inc) => {
+                *range = Range::empty();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// One bound's text, or `None` for an absent one — which is *unbounded*, and not the same thing as
+/// an `-infinity` that happens to be written there.
+fn bound(chars: &[char], at: &mut usize, whole: &str) -> Result<Option<String>> {
+    if chars.get(*at) == Some(&'"') {
+        *at += 1;
+        let mut out = String::new();
+        while let Some(ch) = chars.get(*at) {
+            match ch {
+                '\\' if *at + 1 < chars.len() => {
+                    out.push(chars[*at + 1]);
+                    *at += 2;
+                }
+                '"' => {
+                    *at += 1;
+                    return Ok(Some(out));
+                }
+                other => {
+                    out.push(*other);
+                    *at += 1;
+                }
+            }
+        }
+        return Err(malformed(whole, "Unexpected end of input."));
+    }
+    let start = *at;
+    while let Some(ch) = chars.get(*at) {
+        if matches!(ch, ',' | ']' | ')') {
+            break;
+        }
+        *at += 1;
+    }
+    let text: String = chars[start..*at].iter().collect();
+    let text = text.trim().to_owned();
+    Ok((!text.is_empty()).then_some(text))
+}
+
+fn malformed(text: &str, detail: &'static str) -> SqlError {
+    SqlError::MalformedRangeLiteral {
+        value: text.to_owned(),
+        detail,
+    }
+}
+
+/// One bound, quoted only when it needs to be.
+///
+/// PostgreSQL quotes a bound that contains a character the literal grammar uses, and leaves the
+/// rest bare — which is why a timestamp comes back `"2010-01-01 14:30:00"` and `-infinity` does
+/// not. Quoting everything would round-trip and still print a value no real server prints.
+fn quote_bound(text: &str) -> String {
+    let needs = text.is_empty()
+        || text
+            .chars()
+            .any(|ch| matches!(ch, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || ch.is_whitespace());
+    if !needs {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod range_tests {
+    //! Every case is a row of `tests/corpus/pg19_tsrange.txt`, kept beside the code because the
+    //! corpus cannot run until a column can hold one and these can run now.
+
+    use super::{Range, from_text};
+    use crate::value::ColumnType;
+
+    fn round(subtype: ColumnType, text: &str) -> String {
+        from_text(subtype, text).unwrap().to_text()
+    }
+
+    /// **A continuous subtype keeps the brackets it was given**; a discrete one is normalised.
+    /// One rule would be wrong for one of these two lines.
+    #[test]
+    fn a_timestamp_range_is_not_canonicalised_and_an_integer_range_is() {
+        assert_eq!(
+            round(
+                ColumnType::Timestamp,
+                "[2010-01-01 14:30, 2011-01-01 14:30]"
+            ),
+            r#"["2010-01-01 14:30:00","2011-01-01 14:30:00"]"#
+        );
+        assert_eq!(round(ColumnType::Int8, "[1, 10]"), "[1,11)");
+        assert_eq!(round(ColumnType::Int8, "[1, 10)"), "[1,10)");
+    }
+
+    /// An **absent** bound is unbounded and closes with a parenthesis; `-infinity` is a *value*
+    /// and keeps its bracket.
+    #[test]
+    fn unbounded_is_absent_and_infinity_is_a_value() {
+        assert_eq!(
+            round(ColumnType::Timestamp, "[2010-01-01 14:30,]"),
+            r#"["2010-01-01 14:30:00",)"#
+        );
+        assert_eq!(round(ColumnType::Int8, "[1,]"), "[1,)");
+        assert_eq!(round(ColumnType::Int8, "[,]"), "(,)");
+        assert_eq!(
+            round(ColumnType::Timestamp, "[-infinity, infinity]"),
+            "[-infinity,infinity]"
+        );
+    }
+
+    /// `empty` is a value, and a zero-width range becomes one unless both ends are included.
+    #[test]
+    fn a_zero_width_range_collapses_to_empty() {
+        assert_eq!(round(ColumnType::Timestamp, "empty"), "empty");
+        assert_eq!(
+            round(
+                ColumnType::Timestamp,
+                "[2010-01-01 14:30, 2010-01-01 14:30)"
+            ),
+            "empty"
+        );
+        assert_eq!(
+            round(
+                ColumnType::Timestamp,
+                "[2010-01-01 14:30, 2010-01-01 14:30]"
+            ),
+            r#"["2010-01-01 14:30:00","2010-01-01 14:30:00"]"#
+        );
+        assert_eq!(Range::empty().to_text(), "empty");
+    }
+
+    /// A BC year survives, which is the whole of `test_escaped_tsrange`.
+    #[test]
+    fn a_bc_year_round_trips() {
+        assert_eq!(
+            round(
+                ColumnType::Timestamp,
+                "[1000-01-01 14:30:00 BC, 2020-02-02 14:30]"
+            ),
+            r#"["1000-01-01 14:30:00 BC","2020-02-02 14:30:00"]"#
+        );
+    }
+
+    /// **Three different SQLSTATEs**, and the reversed pair is the one that is not `22P02`.
+    #[test]
+    fn the_three_bad_literals_have_three_answers() {
+        let reversed = from_text(
+            ColumnType::Timestamp,
+            "[2011-01-01 14:30, 2010-01-01 14:30]",
+        )
+        .unwrap_err();
+        assert_eq!(reversed.sqlstate(), "22000");
+        assert_eq!(
+            reversed.to_string(),
+            "range lower bound must be less than or equal to range upper bound"
+        );
+
+        let truncated =
+            from_text(ColumnType::Timestamp, "[2010-01-01 14:30, 2011-01-01 14:30").unwrap_err();
+        assert_eq!(truncated.sqlstate(), "22P02");
+        assert_eq!(
+            truncated.detail().as_deref(),
+            Some("Unexpected end of input.")
+        );
+
+        let nonsense = from_text(ColumnType::Timestamp, "nonsense").unwrap_err();
+        assert_eq!(nonsense.sqlstate(), "22P02");
+        assert_eq!(
+            nonsense.to_string(),
+            "malformed range literal: \"nonsense\""
+        );
+        assert_eq!(
+            nonsense.detail().as_deref(),
+            Some("Missing left parenthesis or bracket.")
+        );
     }
 }

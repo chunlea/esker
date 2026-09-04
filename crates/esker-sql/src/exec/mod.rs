@@ -164,6 +164,15 @@ pub struct Executor {
     /// block may be read-only because the user asked, because the snapshot is historical, or both.
     block_read_only: bool,
     /// Where columnar placement is reported, on a node that has a placement driver.
+    /// The schema this session's **temporary** relations live in, once it has made one
+    /// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// `None` until the first `CREATE TEMP TABLE`, which is what keeps a session that makes none
+    /// from writing a schema record — and what keeps `pg_namespace` from growing a row per
+    /// connection. The name is `pg_temp_<n>` where `n` comes from the **tenant's** id allocator
+    /// rather than a process-local counter: two `esker-sql` nodes serve one tenant, and a
+    /// per-process number would hand `pg_temp_1` to a session on each of them.
+    temp_schema: Option<String>,
     columnar: Option<Arc<dyn crate::pd::ColumnarReport>>,
     /// Where this node sends fragments, or `None` for a node that cannot ask one.
     ///
@@ -193,6 +202,36 @@ struct ReadAsOf {
     retention_ms: u64,
     /// `SET LOCAL`: undone when the transaction ends, whichever way it ends.
     local: bool,
+}
+
+/// **A session takes its temporary relations with it**, which is the third of the four rules a
+/// temporary table is ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// Best effort, deliberately: this runs where a failure cannot be reported to anybody, so a
+/// backend that will not answer leaves the schema behind rather than panicking in a destructor.
+/// That is the same outcome an abrupt disconnect has, and the ADR says what it costs — the
+/// records and rows stay, unreachable, until the sweeper the session registry unblocks.
+///
+/// A session that made no temporary relation does nothing at all, which is almost every session:
+/// the field is `None` and there is no transaction to open.
+impl Drop for Executor {
+    fn drop(&mut self) {
+        let Some(schema) = self.temp_schema.take() else {
+            return;
+        };
+        // The open transaction goes first: a session that disconnects mid-block has its writes
+        // rolled back, and dropping the schema is a *new* transaction rather than a rider on one
+        // that is about to be abandoned.
+        if let Some(txn) = self.open.take() {
+            let _ = txn.rollback();
+        }
+        let Ok(mut txn) = self.backend.begin() else {
+            return;
+        };
+        if ddl::drop_temp_schema(self, &mut *txn, &schema).is_ok() {
+            let _ = txn.commit();
+        }
+    }
 }
 
 impl Executor {
@@ -286,7 +325,13 @@ impl Executor {
     ///
     /// A failed check leaves nothing committed: the transaction is rolled back, which is what a
     /// real server does and is visible afterwards as the rows not being there.
-    fn checked_and_committed(&mut self, txn: Box<dyn Txn>, written: &Written) -> Result<()> {
+    fn checked_and_committed(&mut self, mut txn: Box<dyn Txn>, written: &Written) -> Result<()> {
+        // **The implicit transaction ends here**, so this is where `ON COMMIT` fires for a
+        // statement outside a block — the half an implementation hooked to `COMMIT` alone misses.
+        if let Err(error) = ddl::run_on_commit(self, &mut *txn) {
+            let _ = txn.rollback();
+            return Err(error);
+        }
         let owed = self.constraints.borrow_mut().take();
         for check in &owed {
             if let Err(error) = check.verify(&*txn, self.tenant) {
@@ -392,6 +437,7 @@ impl Executor {
             read_as_of: None,
             open_used: false,
             block_read_only: false,
+            temp_schema: None,
             columnar: None,
             fragments: None,
             columnar_changed: false,
@@ -691,10 +737,28 @@ impl Executor {
                     self.currval_defined.clear();
                     self.last_sequence = None;
                 }
-                // `PLANS` caches nothing here and `TEMP` has nothing to drop
-                // (`CREATE TEMPORARY TABLE` is a named refusal), so both are honest no-ops for as
-                // long as those two facts hold. Each is declared in the corpus rather than left to
-                // be assumed.
+                // **`TEMP` drops this session's temporary relations**, which is what the target
+                // names — `ALL` includes it, and `PLANS` and `SEQUENCES` leave them alone
+                // (measured, one target at a time). It is the same walk a session end does; the
+                // session simply carries on afterwards with no temp schema, so the next
+                // `CREATE TEMP TABLE` allocates a fresh one.
+                if matches!(
+                    target,
+                    crate::plan::DiscardTarget::All | crate::plan::DiscardTarget::Temp
+                ) && let Some(schema) = self.temp_schema.take()
+                {
+                    let mut txn = self.backend.begin()?;
+                    match ddl::drop_temp_schema(self, &mut *txn, &schema) {
+                        Ok(()) => {
+                            txn.commit()?;
+                        }
+                        Err(error) => {
+                            let _ = txn.rollback();
+                            return Err(error);
+                        }
+                    }
+                }
+                // `PLANS` caches nothing here, so it is an honest no-op for as long as that holds.
                 Ok(Outcome::done(statement.tag()))
             }
             SessionStatement::SetParameter { name, value } => {
@@ -1500,6 +1564,7 @@ impl Executor {
         self.resolve_current_setting(&mut statement)?;
         self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
+        self.resolve_user_cast(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
     }
@@ -1652,6 +1717,80 @@ impl Executor {
         Ok(out)
     }
 
+    /// The path a **name** resolves along: this session's temp schema first, then the rest.
+    ///
+    /// **Not the same list as [`Executor::resolved_search_path`]**, and the difference is the whole
+    /// of how a temporary table hides. PostgreSQL keeps two: the *implicit* path
+    /// (`current_schemas(true)`) begins with the session's temp schema and `pg_catalog`, and the
+    /// *explicit* one (`current_schemas(false)`) has neither. A name resolves along the first; a
+    /// table list and a schema dump filter on the second. So a temp table shadows a permanent one
+    /// of the same name **and** is invisible to `ActiveRecord`'s `tables()`, with no rule anywhere
+    /// that says "hide temporary tables" — measured, the implicit path is 3 long and the explicit
+    /// path is 1 while a temp table exists.
+    pub(crate) fn resolution_path(&self, txn: &dyn Txn) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(temp) = &self.temp_schema {
+            out.push(temp.clone());
+        }
+        out.extend(self.resolved_search_path(txn)?);
+        Ok(out)
+    }
+
+    /// This session's temp schema, **creating it** if this is its first temporary relation.
+    ///
+    /// The schema is an ordinary schema record, so `pg_namespace` reports it, `DROP SCHEMA` is
+    /// what reclaims it, and it is transactional: a temp table made in a transaction that rolls
+    /// back takes its schema with it, and the next one allocates a fresh number. That last part is
+    /// a small waste of ids and the alternative — a schema that survives its own rollback — would
+    /// be a record no statement wrote.
+    pub(crate) fn ensure_temp_schema(&mut self, txn: &mut dyn Txn) -> Result<String> {
+        if let Some(temp) = &self.temp_schema
+            && crate::catalog::schema_exists(&*txn, self.tenant, temp)?
+        {
+            return Ok(temp.clone());
+        }
+        let id = crate::catalog::allocate_id(txn, self.tenant)?;
+        let name = format!("pg_temp_{id}");
+        crate::catalog::create_schema(txn, self.tenant, &name, id)?;
+        self.temp_schema = Some(name.clone());
+        Ok(name)
+    }
+
+    /// The stored name a **written** one names — `::regclass`'s input, and `to_regclass`'s.
+    ///
+    /// **The search path applies only when the name wrote no schema**, which is what tells
+    /// `'tt_temp'::regclass` from `'public.tt_temp'::regclass`: the first walks the path and finds
+    /// the session's temporary table, the second says `public` and must find nothing when the only
+    /// `tt_temp` is temporary. A lookup that walked the path for both answered about a relation the
+    /// caller did not name — measured, and the reason this is a function rather than one line.
+    fn stored_name_written(&self, txn: &dyn Txn, name: &str) -> Result<String> {
+        let written = crate::catalog::parse_qualified(name);
+        if let Some(rewritten) = self.named_pg_temp(&written) {
+            return Ok(rewritten);
+        }
+        if crate::catalog::reach_of(name) == crate::catalog::Reach::SearchPath {
+            return self.resolve_unqualified(txn, &written);
+        }
+        Ok(written)
+    }
+
+    /// A name qualified with the bare word `pg_temp`, rewritten to this session's own schema.
+    ///
+    /// `None` for every other name. A session that has made no temporary relation has no schema to
+    /// rewrite to, and the name is left as it was written — so `pg_temp.x` is `42P01` naming
+    /// `pg_temp.x`, which is what a real server says for a temp table that is not there.
+    fn named_pg_temp(&self, name: &str) -> Option<String> {
+        let bare = name
+            .strip_prefix(crate::catalog::PG_TEMP_ALIAS)?
+            .strip_prefix(crate::catalog::SCHEMA_SEPARATOR)?;
+        Some(crate::catalog::qualify(self.temp_schema.as_ref()?, bare))
+    }
+
+    /// This session's temp schema if it has one, without creating it.
+    pub(crate) fn temp_schema(&self) -> Option<&str> {
+        self.temp_schema.as_deref()
+    }
+
     /// The stored name an **unqualified** relation name resolves to.
     ///
     /// Each schema on the path in order, and the first that has it wins: with `sp_b, sp_a` a bare
@@ -1659,11 +1798,14 @@ impl Executor {
     /// measured. A name that is found nowhere comes back **unchanged**, so the `42P01` quotes the
     /// bare name the user wrote rather than a schema they did not.
     pub(crate) fn resolve_unqualified(&self, txn: &dyn Txn, name: &str) -> Result<String> {
+        if let Some(bare) = self.named_pg_temp(name) {
+            return Ok(bare);
+        }
         if name.contains(crate::catalog::SCHEMA_SEPARATOR) {
             return Ok(name.to_owned());
         }
         let view = self.catalog_view(txn)?;
-        for schema in self.resolved_search_path(txn)? {
+        for schema in self.resolution_path(txn)? {
             let candidate = crate::catalog::qualify(&schema, name);
             if view.relation(&candidate)?.is_some() {
                 return Ok(candidate);
@@ -1697,6 +1839,7 @@ impl Executor {
             return Ok(());
         }
         let path = self.resolved_search_path(txn)?;
+        let temp = self.temp_schema.clone();
         let mut resolve = |expr: &mut Expr| {
             let Expr::CurrentSchema { all } = expr else {
                 return;
@@ -1713,6 +1856,10 @@ impl Executor {
                 Some(implicit) => {
                     let mut all = Vec::new();
                     if *implicit {
+                        // **The temp schema is first, before `pg_catalog`** — measured: with a
+                        // temp table the implicit path is `{pg_temp_n,pg_catalog,public}`, which
+                        // is the order a name resolves in.
+                        all.extend(temp.iter().map(|name| Some(name.clone())));
                         all.push(Some("pg_catalog".to_owned()));
                     }
                     all.extend(path.iter().map(|name| Some(name.clone())));
@@ -1772,6 +1919,149 @@ impl Executor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// `'happy'::mood` — the label in a projection, the ordinal everywhere else.
+    ///
+    /// Resolved here rather than per row for the reason `::regclass` is: the catalog answer is the
+    /// same for every row, and reading it per row is the cost trap `08ff6a2` paid for once. What
+    /// it is replaced *with* depends on where it sits, which is not a special case but what an
+    /// enum is — a number that prints as a label
+    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    ///
+    /// **The projection is walked first**, because the general walk below rewrites every cast it
+    /// finds and would leave nothing to tell the two positions apart.
+    fn resolve_user_cast(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::Expr;
+
+        let mut failure = None;
+        // One catalog read for the whole statement, whatever it names.
+        let mut types = None;
+        if let Statement::Select(select) = statement {
+            for item in &mut select.projection {
+                let crate::plan::SelectItem::Expr { expr, .. } = item else {
+                    continue;
+                };
+                match self.user_cast(&mut types, txn, expr, true) {
+                    Ok(Some(resolved)) => *expr = resolved,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        let mut resolve = |expr: &mut Expr| match self.user_cast(&mut types, txn, expr, false) {
+            Ok(Some(resolved)) => *expr = resolved,
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
+    fn user_cast(
+        &self,
+        types: &mut Option<Vec<crate::catalog::TypeDef>>,
+        txn: &dyn Txn,
+        expr: &crate::plan::Expr,
+        printed: bool,
+    ) -> Result<Option<crate::plan::Expr>> {
+        use crate::plan::{Expr, Literal};
+
+        // **`'happy'::mood::text` is `happy`, not `3`.** A cast to `text` is the operand's output
+        // function, and an enum's output function is its label — the same rule
+        // `Expr::ToText::enum_labels` follows for a column. Answered here because the operand is
+        // already known to be a cast whose printed form is the label.
+        if let Expr::ToText { operand, .. } = expr
+            && matches!(&**operand, Expr::CatalogFunc(inner)
+                if inner.func == crate::plan::CatalogFunc::UserCast)
+        {
+            return self.user_cast(types, txn, operand, true);
+        }
+        let Expr::CatalogFunc(call) = expr else {
+            return Ok(None);
+        };
+        // **`pg_typeof('happy'::mood)` is `mood`**, and it is answered here because here is where
+        // the name is: the value below is an `int2` and `smallint` is the one thing a client must
+        // not be told about an enum (ADR 0031's worst class). The cast under it is still resolved
+        // first, so `pg_typeof('angry'::mood)` is the `22P02` the argument would have raised.
+        if call.func == crate::plan::CatalogFunc::PgTypeof
+            && let Some(inner) = call.args.first()
+            && matches!(inner, Expr::CatalogFunc(inner) if inner.func == crate::plan::CatalogFunc::UserCast)
+        {
+            let Expr::CatalogFunc(inner) = inner else {
+                return Ok(None);
+            };
+            let Some(Expr::Literal(Literal::String(name))) = inner.args.first().cloned() else {
+                return Ok(None);
+            };
+            self.user_cast(types, txn, &call.args[0].clone(), true)?;
+            return Ok(Some(Expr::Literal(Literal::String(name))));
+        }
+        if call.func != crate::plan::CatalogFunc::UserCast {
+            return Ok(None);
+        }
+        let (Some(Expr::Literal(Literal::String(name))), Some(operand)) =
+            (call.args.first(), call.args.get(1))
+        else {
+            return Err(SqlError::Internal(
+                "a cast to a user-defined type without its name".to_owned(),
+            ));
+        };
+        let known = match types {
+            Some(known) => known,
+            None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
+        };
+        let Some(def) = known.iter().find(|def| &def.name == name) else {
+            // **Not a type anybody declared**, which is where lowering's own refusal has been
+            // waiting for a catalog to confirm it: the same `0A000` naming the type that
+            // `lower_type` gave before this pass existed, and the same one a column of it gets.
+            return Err(SqlError::unsupported(format!("the type {name}")));
+        };
+        let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+            return Err(SqlError::unsupported(format!(
+                "a cast to the {} type {name}",
+                match def.kind {
+                    crate::catalog::TypeKind::Range { .. } => "range",
+                    _ => "composite",
+                }
+            )));
+        };
+        // **Only a literal.** A cast of a *column* to an enum happens per row and would need the
+        // labels in the row evaluator; nothing the suite sends writes one, and a `0A000` naming
+        // the type is the honest answer rather than a value read some other way.
+        let text = match operand {
+            Expr::Literal(Literal::String(text)) => text.clone(),
+            Expr::Literal(Literal::Typed(value)) => match &**value {
+                Datum::Text(text) => text.clone(),
+                _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+            },
+            // Nothing is still nothing, whatever type it is cast to.
+            Expr::Literal(Literal::Null | Literal::TypedNull(_)) => {
+                return Ok(Some(Expr::Literal(Literal::Null)));
+            }
+            _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+        };
+        let Some(ordinal) = crate::catalog::enum_ordinal(labels, &text) else {
+            return Err(SqlError::InvalidEnumValue {
+                ty: name.clone(),
+                value: text,
+            });
+        };
+        Ok(Some(if printed {
+            // Its output function, which is the label — and the label is what the text already
+            // is, now that the ordinal above has proved the type has it.
+            Expr::Literal(Literal::String(text))
+        } else {
+            Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal))))
+        }))
     }
 
     fn resolve_regclass(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
@@ -1841,10 +2131,16 @@ impl Executor {
         txn: &dyn Txn,
         name: &str,
     ) -> Result<Option<String>> {
-        if let Some(view) = crate::catalog::pg_catalog::view(name) {
+        let stored = self.stored_name_written(txn, name)?;
+        let reach = crate::catalog::reach_of(name);
+        if reach.catalog()
+            && let Some(view) = crate::catalog::pg_catalog::view(&stored)
+        {
             return Ok(Some(view.name().to_owned()));
         }
-        let stored = crate::catalog::parse_qualified(name);
+        if !reach.records() {
+            return Ok(None);
+        }
         let relations = match relations {
             Some(relations) => relations,
             slot => slot.insert(crate::catalog::pg_relations::Relations::read(
@@ -1868,13 +2164,23 @@ impl Executor {
         txn: &dyn Txn,
         name: &str,
     ) -> Result<i64> {
-        if let Some(view) = crate::catalog::pg_catalog::view(name) {
-            return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
-        }
         // **`::regclass` takes a name as a *string***, so a schema in it is a dot rather than the
         // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
-        // `se_idx`, and looking it up whole would find nothing.
-        let stored = crate::catalog::parse_qualified(name);
+        // `se_idx`, and looking it up whole would find nothing. It is also where the quoting is
+        // undone: `ActiveRecord` writes `'\"pg_type\"'::regclass`, which found nothing until the
+        // catalog was consulted with the *normalised* name rather than the written one.
+        let stored = self.stored_name_written(txn, name)?;
+        let reach = crate::catalog::reach_of(name);
+        if reach.catalog()
+            && let Some(view) = crate::catalog::pg_catalog::view(&stored)
+        {
+            return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
+        }
+        if !reach.records() {
+            return Err(SqlError::UndefinedTable(crate::catalog::written_display(
+                name,
+            )));
+        }
         // **Read once per statement, not once per literal.** The catalog scan is one pass over the
         // name records plus a point read per relation, so a statement with three `::regclass` casts
         // was three of those — and `ActiveRecord`'s schema dump writes several per statement
@@ -2378,6 +2684,17 @@ impl Execute for Executor {
         if let Err(error) = self.run_deferred_checks() {
             let _ = self.rollback();
             return Err(error);
+        }
+        // **The explicit end of a block**, the other half of the pair: the same actions the
+        // implicit commit runs, against the transaction that is about to close. Taken out and put
+        // back because they need the executor *and* the transaction, and one borrows the other.
+        if let Some(mut txn) = self.open.take() {
+            let outcome = ddl::run_on_commit(self, &mut *txn);
+            self.open = Some(txn);
+            if let Err(error) = outcome {
+                let _ = self.rollback();
+                return Err(error);
+            }
         }
         self.savepoints.clear();
         let written = std::mem::take(&mut self.written);

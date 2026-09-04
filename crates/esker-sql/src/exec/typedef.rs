@@ -33,6 +33,18 @@ pub(super) fn create(
         return Err(SqlError::DuplicateType(create.name.clone()));
     }
     let oid = catalog::allocate_id(txn, executor.tenant)?;
+    // **Two ids, and the second is the array type's.** A real server makes a type's array type
+    // when it makes the type, and `pg_type` here reports `typarray` as `oid + 1` and emits a row
+    // for it — so the id has to be *taken* and not merely named. With one id per type the second
+    // `CREATE TYPE` in a database was handed the first one's array oid, and `pg_type` had two
+    // rows claiming it: `ActiveRecord`'s `enum_types()` answered a phantom `_mood` carrying
+    // `tense`'s labels. Found by asking that query about two enums, which one enum cannot show.
+    let array = catalog::allocate_id(txn, executor.tenant)?;
+    debug_assert_eq!(
+        array,
+        oid + 1,
+        "the array type's id is the type's plus one, which is what `pg_type` reports"
+    );
     catalog::put_type(
         txn,
         executor.tenant,

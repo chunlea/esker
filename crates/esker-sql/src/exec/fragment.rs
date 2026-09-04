@@ -637,7 +637,27 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::TextArray
         | Row::Hstore
         | Row::HstoreArray
-        | Row::Citext => {
+        | Row::Citext
+        | Row::TsRange
+        | Row::TstzRange
+        | Row::Int4Range
+        | Row::TsRangeArray
+        | Row::BoolArray
+        | Row::ByteaArray
+        | Row::BpcharArray
+        | Row::VarcharArray
+        | Row::DateArray
+        | Row::TimeArray
+        | Row::TimestampArray
+        | Row::TimestampTzArray
+        | Row::IntervalArray
+        | Row::RealArray
+        | Row::DoubleArray
+        | Row::UuidArray
+        | Row::JsonArray
+        | Row::JsonbArray
+        | Row::OidArray
+        | Row::CitextArray => {
             return None;
         }
     })
@@ -652,7 +672,11 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // a wrong *answer* would be a filter that silently matched.
         // A citext never reaches this either — the column is refused above, for the same reason
         // an array is: this vocabulary has no way to carry a comparison that folds.
-        Datum::Null | Datum::Array(_) | Datum::Citext(_) | Datum::Hstore(_) => Value::Null,
+        Datum::Null
+        | Datum::Array(_)
+        | Datum::Citext(_)
+        | Datum::Hstore(_)
+        | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),

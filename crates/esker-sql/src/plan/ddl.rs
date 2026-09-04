@@ -34,6 +34,9 @@ pub struct CreateTable {
     /// `UNLOGGED`, re-attached the same way and for the same reason — the parser cannot read the
     /// keyword, so it is cut out of the source and put back here.
     pub persistence: crate::catalog::Persistence,
+    /// `ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP` — a temporary table's own clause, and
+    /// `42P16` on any other kind of table.
+    pub on_commit: crate::catalog::OnCommit,
     /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
     pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
     /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as

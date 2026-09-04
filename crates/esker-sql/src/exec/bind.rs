@@ -568,9 +568,21 @@ fn walk_select_mut(select: &mut crate::plan::Select, visit: &mut impl FnMut(&mut
 }
 
 /// A `FROM` entry: a derived table is a `SELECT`, walked as one.
+///
+/// **A `VALUES` list in a `FROM` is walked too**, and it was not: its rows are expressions in the
+/// same statement, numbered in the same `$n` sequence, and skipping them left a parameter in
+/// `SELECT v FROM (VALUES ($1)) t(v)` counted and never filled. Found by a cast to a user-defined
+/// type reaching the row evaluator unresolved (ADR 0053) — the same hole, one pass over.
 fn walk_table_ref_mut(table: &mut crate::plan::TableRef, visit: &mut impl FnMut(&mut Expr)) {
     if let Some(derived) = &mut table.derived {
         walk_select_mut(&mut derived.select, visit);
+    }
+    if let Some(values) = &mut table.values {
+        for row in &mut values.rows {
+            for expr in row {
+                walk_expr_mut(expr, visit);
+            }
+        }
     }
 }
 
@@ -612,6 +624,11 @@ fn for_each_in_select<'a>(select: &'a crate::plan::Select, each: &mut impl FnMut
 
 /// A `FROM` entry, for [`for_each_in_select`].
 fn for_each_in_table_ref<'a>(table: &'a crate::plan::TableRef, each: &mut impl FnMut(&'a Expr)) {
+    if let Some(values) = &table.values {
+        for row in &values.rows {
+            row.iter().for_each(&mut *each);
+        }
+    }
     if let Some(derived) = &table.derived {
         for_each_in_select(&derived.select, each);
     }
@@ -1098,7 +1115,24 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1118,6 +1152,15 @@ fn placeholder(ty: ColumnType) -> Datum {
             Datum::Text(String::new())
         }
         ColumnType::Citext => Datum::Citext(String::new()),
+        // The empty range, which is a real value and not a NULL.
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => Datum::Range {
+            subtype: Box::new(match ty {
+                ColumnType::TstzRange => ColumnType::TimestampTz,
+                ColumnType::Int4Range => ColumnType::Int8,
+                _ => ColumnType::Timestamp,
+            }),
+            text: "empty".to_owned(),
+        },
         // The empty string is not a document, so a `json` placeholder is the smallest one that
         // is. It only ever stands in for a type while a `Describe` is answered.
         ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),

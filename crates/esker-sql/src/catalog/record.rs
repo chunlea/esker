@@ -65,9 +65,9 @@ use esker_keys::{codec, prefix};
 
 use crate::catalog::{
     CheckDef, ColumnDef, ExcludeDef, ExprShape, ForeignKeyDef, FunctionDef, Identity, IndexDef,
-    IndexKey, KeyOrder, KeyPart, PartitionBound, PartitionKey, PartitionStrategy, Persistence,
-    RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef, TriggerDef,
-    TypeDef, TypeField, TypeKind, UniqueKind,
+    IndexKey, KeyOrder, KeyPart, OnCommit, PartitionBound, PartitionKey, PartitionStrategy,
+    Persistence, RangeBound, ReferentialAction, Relation, SchemaState, SequenceDef, TableDef,
+    TriggerDef, TypeDef, TypeField, TypeKind, UniqueKind,
 };
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, NO_TYPMOD};
@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 27;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 28;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -251,6 +251,32 @@ const TAG_HSTORE: u8 = 26;
 const TAG_HSTORE_ARRAY: u8 = 27;
 /// The `citext` extension's type. 28, checked against the constants above rather than counted.
 const TAG_CITEXT: u8 = 28;
+/// The range types. 29-32, checked against the constants above rather than counted — 25 was
+/// already `smallint[]` when `hstore` reached for "the next one".
+const TAG_TSRANGE: u8 = 29;
+const TAG_TSTZRANGE: u8 = 30;
+const TAG_INT4RANGE: u8 = 31;
+const TAG_TSRANGE_ARRAY: u8 = 32;
+/// The sixteen array types the rest of `pg_type` needed: every base type on a real server has
+/// an array, and a `typarray` naming a row that is not there is what left `ActiveRecord` unable
+/// to quote one. **33-48, read off the constants above rather than counted** — the list is not
+/// in numeric order and never has been.
+const TAG_BOOL_ARRAY: u8 = 33;
+const TAG_BYTEA_ARRAY: u8 = 34;
+const TAG_BPCHAR_ARRAY: u8 = 35;
+const TAG_VARCHAR_ARRAY: u8 = 36;
+const TAG_DATE_ARRAY: u8 = 37;
+const TAG_TIME_ARRAY: u8 = 38;
+const TAG_TIMESTAMP_ARRAY: u8 = 39;
+const TAG_TIMESTAMP_TZ_ARRAY: u8 = 40;
+const TAG_INTERVAL_ARRAY: u8 = 41;
+const TAG_REAL_ARRAY: u8 = 42;
+const TAG_DOUBLE_ARRAY: u8 = 43;
+const TAG_UUID_ARRAY: u8 = 44;
+const TAG_JSON_ARRAY: u8 = 45;
+const TAG_JSONB_ARRAY: u8 = 46;
+const TAG_OID_ARRAY: u8 = 47;
+const TAG_CITEXT_ARRAY: u8 = 48;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -303,6 +329,26 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Hstore => TAG_HSTORE,
         ColumnType::HstoreArray => TAG_HSTORE_ARRAY,
         ColumnType::Citext => TAG_CITEXT,
+        ColumnType::TsRange => TAG_TSRANGE,
+        ColumnType::TstzRange => TAG_TSTZRANGE,
+        ColumnType::Int4Range => TAG_INT4RANGE,
+        ColumnType::TsRangeArray => TAG_TSRANGE_ARRAY,
+        ColumnType::BoolArray => TAG_BOOL_ARRAY,
+        ColumnType::ByteaArray => TAG_BYTEA_ARRAY,
+        ColumnType::BpcharArray => TAG_BPCHAR_ARRAY,
+        ColumnType::VarcharArray => TAG_VARCHAR_ARRAY,
+        ColumnType::DateArray => TAG_DATE_ARRAY,
+        ColumnType::TimeArray => TAG_TIME_ARRAY,
+        ColumnType::TimestampArray => TAG_TIMESTAMP_ARRAY,
+        ColumnType::TimestampTzArray => TAG_TIMESTAMP_TZ_ARRAY,
+        ColumnType::IntervalArray => TAG_INTERVAL_ARRAY,
+        ColumnType::RealArray => TAG_REAL_ARRAY,
+        ColumnType::DoubleArray => TAG_DOUBLE_ARRAY,
+        ColumnType::UuidArray => TAG_UUID_ARRAY,
+        ColumnType::JsonArray => TAG_JSON_ARRAY,
+        ColumnType::JsonbArray => TAG_JSONB_ARRAY,
+        ColumnType::OidArray => TAG_OID_ARRAY,
+        ColumnType::CitextArray => TAG_CITEXT_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -379,6 +425,26 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_HSTORE => ColumnType::Hstore,
         TAG_HSTORE_ARRAY => ColumnType::HstoreArray,
         TAG_CITEXT => ColumnType::Citext,
+        TAG_TSRANGE => ColumnType::TsRange,
+        TAG_TSTZRANGE => ColumnType::TstzRange,
+        TAG_INT4RANGE => ColumnType::Int4Range,
+        TAG_TSRANGE_ARRAY => ColumnType::TsRangeArray,
+        TAG_BOOL_ARRAY => ColumnType::BoolArray,
+        TAG_BYTEA_ARRAY => ColumnType::ByteaArray,
+        TAG_BPCHAR_ARRAY => ColumnType::BpcharArray,
+        TAG_VARCHAR_ARRAY => ColumnType::VarcharArray,
+        TAG_DATE_ARRAY => ColumnType::DateArray,
+        TAG_TIME_ARRAY => ColumnType::TimeArray,
+        TAG_TIMESTAMP_ARRAY => ColumnType::TimestampArray,
+        TAG_TIMESTAMP_TZ_ARRAY => ColumnType::TimestampTzArray,
+        TAG_INTERVAL_ARRAY => ColumnType::IntervalArray,
+        TAG_REAL_ARRAY => ColumnType::RealArray,
+        TAG_DOUBLE_ARRAY => ColumnType::DoubleArray,
+        TAG_UUID_ARRAY => ColumnType::UuidArray,
+        TAG_JSON_ARRAY => ColumnType::JsonArray,
+        TAG_JSONB_ARRAY => ColumnType::JsonbArray,
+        TAG_OID_ARRAY => ColumnType::OidArray,
+        TAG_CITEXT_ARRAY => ColumnType::CitextArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,
@@ -1466,7 +1532,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         out.push(action_tag(key.on_update));
         out.push(action_tag(key.on_delete));
         out.push(u8::from(key.deferrable));
-        // Version 26: `NOT VALID`. It sits **beside** the key rather than at the end of the record
+        // Version 27: `NOT VALID`. It sits **beside** the key rather than at the end of the record
         // because a foreign key's fields are already a group and the reader walks them in one
         // loop; the version guard in `read_foreign_keys` is what keeps an older record readable.
         out.push(u8::from(key.validated));
@@ -1649,6 +1715,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     out.push(match table.persistence {
         Persistence::Permanent => 0,
         Persistence::Unlogged => 1,
+        Persistence::Temporary => 2,
     });
 
     // Version 24. The tombstoned columns, by ordinal, on the end for the twelfth time and the same
@@ -1678,7 +1745,34 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         varint::put_u64(column.user_type.unwrap_or(0), &mut out);
     }
 
+    // Version 26. One byte: what a **temporary** table does with its rows at every commit (ADR
+    // 0053). Fourteenth section, appended like every one before it. A table written before 26 has
+    // none and decodes `PreserveRows`, which is what a table with no `ON COMMIT` clause is — so
+    // every table ever written means exactly what it meant.
+    out.push(match table.on_commit {
+        OnCommit::PreserveRows => 0,
+        OnCommit::DeleteRows => 1,
+        OnCommit::Drop => 2,
+    });
+
     Ok(out)
+}
+
+/// The version 26 tail: a temporary table's `ON COMMIT` action.
+///
+/// Read **after** version 25's user types, because the sections come off in the order they went
+/// on. A table written before 26 answers `PreserveRows`, which is both the default clause and what
+/// every table had while `CREATE TEMPORARY TABLE` was `0A000`.
+fn read_on_commit(reader: &mut Reader<'_>) -> Result<OnCommit> {
+    if reader.version < 26 {
+        return Ok(OnCommit::PreserveRows);
+    }
+    match reader.byte()? {
+        0 => Ok(OnCommit::PreserveRows),
+        1 => Ok(OnCommit::DeleteRows),
+        2 => Ok(OnCommit::Drop),
+        other => Err(corrupt(format!("ON COMMIT byte {other}"))),
+    }
 }
 
 /// The version 25 tail: each column's user-defined type oid, or 0 for a column declared as one of
@@ -1712,6 +1806,10 @@ fn read_persistence(reader: &mut Reader<'_>) -> Result<Persistence> {
     match reader.byte()? {
         0 => Ok(Persistence::Permanent),
         1 => Ok(Persistence::Unlogged),
+        // Added by ADR 0054 to a byte version 23 already writes, which is why it needs no section
+        // of its own: an older reader never sees it, because a table written before 0053 cannot be
+        // temporary and one written after it lives in a schema an older node would not resolve.
+        2 => Ok(Persistence::Temporary),
         other => Err(corrupt(format!("relpersistence byte {other}"))),
     }
 }
@@ -1836,7 +1934,7 @@ fn action_of(tag: u8) -> Result<ReferentialAction> {
         ACTION_NO_ACTION => ReferentialAction::NoAction,
         ACTION_RESTRICT => ReferentialAction::Restrict,
         ACTION_CASCADE => ReferentialAction::Cascade,
-        // Version 26. An older record cannot hold either — both were `0A000` until then — so no
+        // Version 27. An older record cannot hold either — both were `0A000` until then — so no
         // version guard is needed here: the tag simply never appears in one.
         ACTION_SET_NULL => ReferentialAction::SetNull,
         ACTION_SET_DEFAULT => ReferentialAction::SetDefault,
@@ -1934,15 +2032,15 @@ fn read_foreign_keys(reader: &mut Reader<'_>, columns: usize) -> Result<Vec<Fore
             on_update: action_of(reader.byte()?)?,
             on_delete: action_of(reader.byte()?)?,
             deferrable: reader.flag()?,
-            // **Version 26 added `NOT VALID`.** Every foreign key written before it was checked
+            // **Version 27 added `NOT VALID`.** Every foreign key written before it was checked
             // against the rows already there when it was made, because there was no clause that
             // could skip that scan — so an older record's keys are validated, and reading them as
             // anything else would report a schema the node never had.
-            validated: reader.version < 26 || reader.flag()?,
-            // **Version 27 added deferred foreign keys.** Before it, `INITIALLY DEFERRED` was
+            validated: reader.version < 27 || reader.flag()?,
+            // **Version 28 added deferred foreign keys.** Before it, `INITIALLY DEFERRED` was
             // `0A000`, so nothing an older record holds can start deferred — and `deferrable`
             // alone meant `INITIALLY IMMEDIATE`, which is what reading `false` here gives.
-            initially_deferred: reader.version >= 27 && reader.flag()?,
+            initially_deferred: reader.version >= 28 && reader.flag()?,
         });
     }
     Ok(keys)
@@ -2278,9 +2376,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let persistence = read_persistence(&mut reader)?;
     read_dropped(&mut reader, &mut columns)?;
     read_user_types(&mut reader, &mut columns)?;
+    let on_commit = read_on_commit(&mut reader)?;
     reader.finish()?;
 
     Ok(TableDef {
+        on_commit,
         id,
         persistence,
         name,

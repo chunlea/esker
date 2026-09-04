@@ -29,6 +29,31 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          table_name = 'postgresql_enums' ORDER BY ordinal_position",
         "SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name \
          = 'postgresql_enums' AND column_name = 'good_mood'",
+        // **`ActiveRecord`'s own `enum_types()` query, and the rows agree now**: `pg_enum` is a
+        // view over the type records, so the labels come back in declaration order with
+        // `enumsortorder` 1, 2, 3. What is left is the same trade one line up — `typname` and
+        // `nspname` are `name` on a real server and `text` here, so `array_agg` of the labels is
+        // `name[]` there and `text[]` here, with the same three strings in it.
+        "SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY \
+         enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = \
+         enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY \
+         (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
+        // **The four `pg_enum` probes, and every row of every one of them agrees.** `typname`
+        // and `enumlabel` are `name` on a real server and `text` here — so `array_agg` of the
+        // labels is `name[]` there and `text[]` here — and `pg_typeof` answers a `regtype` there
+        // and `text` here, which is the trade `'x'::regtype` already makes. `enumsortorder` is a
+        // `real` on **both**, which is the one column of this view that had to be got right
+        // rather than traded: it is not the label's index.
+        "SELECT 'r', t.typname, e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON \
+         t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') ORDER BY t.typname, \
+         e.enumsortorder",
+        "SELECT 'r', t.typname, count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+         WHERE t.typname IN ('mood','tense','emptymood') GROUP BY t.typname ORDER BY t.typname",
+        "SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON \
+         t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder",
+        "SELECT 'r', t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e \
+         JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname IN ('mood','tense') GROUP BY \
+         t.typname ORDER BY t.typname",
     ],
     answers: &[
         // **`pg_type` holds this node's own types and the tenant's, and PostgreSQL's built-in
@@ -49,21 +74,41 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // is `0A000` naming the type, and the two that a real server *refuses* refuse here too, so
         // the divergence is the code and not the outcome. It is the next unit, with `::regtype`
         // below, because both are "a user type is a name you can write in an expression".
+        // **`||` over text is unbuilt for every type**, which is where this statement stops — the
+        // cast in front of it is right, and `'happy'::mood::text` on the line above proves it.
+        // `tests/citext.rs` declares the same operator for the same reason.
         (
-            "SELECT 'r', 'happy'::mood, pg_typeof('happy'::mood)",
-            "a cast to a user-defined type is not built",
+            "SELECT 'r', ('happy'::mood)::text || '!'",
+            "|| over text is not built for any type",
+        ),
+        // **A name that is nobody's type is `42704` there and `0A000` here**, and this is the one
+        // place the pass cannot do better: after the catalog says no, the name is either a type
+        // PostgreSQL has and this node has not built — `money`, `tsvector` — or a name that is no
+        // type at all, and nothing here can tell them apart. Naming the type in a `0A000` is the
+        // honest half; claiming it does not exist would be wrong for the first case, which is the
+        // commoner one.
+        (
+            "SELECT 'r', 'happy'::nosuchtype",
+            "a name the catalog does not have is either an unbuilt type or no type; 0A000 says \
+             which is not known",
+        ),
+        // **An enum value in a relation that is not a table has no column to carry its type.**
+        // ADR 0050 puts the identity on the `ColumnDef` and ADR 0053 keeps the label only where
+        // the cast *is* the projection; a `VALUES` list is neither, so these two print the
+        // ordinal. Every ordering in them is right — `min`/`max` are the first and last
+        // **declared** and `ORDER BY` sorts `sad, ok, happy` — which is the half that would be
+        // hard; what is missing is the rendering. The fix is the synthetic `TableDef` of ADR 0048
+        // carrying `user_type`, which is where a `VALUES` list's column types already come from,
+        // and it closes both lines at once.
+        (
+            "SELECT 'r', min(v), max(v) FROM (VALUES ('sad'::mood), ('happy'::mood), \
+             ('ok'::mood)) t(v)",
+            "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
         ),
         (
-            "SELECT 'r', 'happy'::text::mood",
-            "a cast to a user-defined type is not built",
-        ),
-        (
-            "SELECT 'r', 'sad'::mood < 'happy'::mood, 'happy'::mood < 'ok'::mood",
-            "a cast to a user-defined type is not built, so neither operand exists",
-        ),
-        (
-            "SELECT 'angry'::mood",
-            "a cast to a user-defined type is not built; both refuse and only the code differs",
+            "SELECT 'r', v FROM (VALUES ('happy'::mood), ('sad'::mood), ('ok'::mood)) t(v) ORDER \
+             BY v",
+            "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
         ),
         // **`'mood'::regtype` resolves against this node's own type names and not the catalog.**
         // The lowering answers `42704` for a name `crate::value::named_type` does not have, which
@@ -74,18 +119,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = \
              'mood'::regtype ORDER BY enumsortorder",
             "'x'::regtype does not resolve a user-defined type's name to its oid",
-        ),
-        // **`pg_enum` is a relation with no rows**, which is what it has been since `CREATE TYPE`
-        // landed: the labels live on the type record and nothing projects them as rows yet. This
-        // is `ActiveRecord`'s own `enum_types` query, and until it answers the schema dumper
-        // writes no `create_enum` line — the half of `test_schema_dump` that this unit does not
-        // reach. A row per label, keyed by the type's oid, and it needs no new storage.
-        (
-            "SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel \
-             ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON \
-             (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE \
-             n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
-            "pg_enum has no rows: a type's labels are on its record and are not projected yet",
         ),
         // **The standing constant-width divergence, in three sentences that are otherwise
         // identical**: a bare integer constant is `int8` here and `int4` there, so the type this

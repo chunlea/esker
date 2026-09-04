@@ -737,6 +737,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         dropped: false,
     };
     Arc::new(TableDef {
+        on_commit: OnCommit::default(),
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
         name: name.to_owned(),
         columns: vec![
@@ -865,6 +866,11 @@ pub struct TableDef {
     /// its table (`crate::catalog::pg_catalog`) is what makes both of those true at once, and it
     /// is the only arrangement in which they cannot disagree.
     pub persistence: Persistence,
+    /// What a **temporary** table does with its rows at every commit, and `PreserveRows` for
+    /// every other table — which is what a table with no clause is, so nothing written before
+    /// [ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)
+    /// changes meaning.
+    pub on_commit: OnCommit,
     /// Unique across the tenant.
     pub name: String,
     /// In declaration order, which is the order a row's values are encoded in.
@@ -1016,6 +1022,34 @@ pub enum Persistence {
     /// change (`CLAUDE.md` invariant 1) rather than a catalog one. What the suite needs is the
     /// statement to work and the column to be right; what it does not need is the data loss.
     Unlogged,
+    /// `t`. **A table in a schema that belongs to one session** — the whole of what makes it
+    /// temporary is where it lives, not how it is stored
+    /// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// Like [`Persistence::Unlogged`] it is recorded and not acted on by the engine: a temp
+    /// table's rows go through the WAL and Raft like anything else, so this node pays full write
+    /// cost for data defined to be throwaway. What a client can see is the column, the schema and
+    /// the lifetime, and all three are right.
+    Temporary,
+}
+
+/// What a temporary table does with its rows at the end of every transaction
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// **"Every transaction" includes the implicit one**, which is the fact easiest to get wrong: a
+/// plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero
+/// rows behind, because that statement's own commit fires the rule. Measured, and an
+/// implementation that only acted at an explicit `COMMIT` looks right inside a transaction and
+/// answers one where a real server answers none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCommit {
+    /// `ON COMMIT PRESERVE ROWS`, and what a temporary table is without the clause.
+    #[default]
+    PreserveRows,
+    /// `ON COMMIT DELETE ROWS`: the table is emptied, and stays.
+    DeleteRows,
+    /// `ON COMMIT DROP`: the table goes at the end of the transaction that made it.
+    Drop,
 }
 
 impl Persistence {
@@ -1025,6 +1059,7 @@ impl Persistence {
         match self {
             Persistence::Permanent => "p",
             Persistence::Unlogged => "u",
+            Persistence::Temporary => "t",
         }
     }
 }
@@ -2318,7 +2353,14 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // A relation id is never reused, so an orphan override could not be mistaken for another
     // table's -- but it would sit in the collector's scan of every override for ever.
     clear_table_retention(txn, tenant, table.id);
-    txn.delete(&record::row_id_key(tenant, table.id));
+    // **The row-id allocator's key is deliberately NOT deleted here**, and that is a correctness
+    // fix rather than an omission. The allocator is non-transactional on purpose — it reserves a
+    // batch in a short transaction of its own, the way a sequence does — so a *transactional*
+    // write to its key conflicts with any allocation made after this transaction's snapshot. That
+    // made `BEGIN; CREATE TABLE t; INSERT INTO t …; DROP TABLE t; COMMIT` answer `40001` where a
+    // real server commits: the `INSERT` allocated, and the `DROP` then wrote the key the
+    // allocation had written. Leaving it costs one 21-byte key per dropped table that had rows,
+    // and cannot be wrong: a relation id is never reused, so nothing can ever read it again.
     txn.delete(&record::name_key(tenant, &table.name));
     if !table.primary_key_name.is_empty() {
         txn.delete(&record::name_key(tenant, &table.primary_key_name));
@@ -2871,14 +2913,19 @@ pub fn schemas(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, u64)>> {
 /// `schema_names` report.
 pub fn schema_names(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, u64)>> {
     let mut out = vec![(PUBLIC_SCHEMA.to_owned(), PUBLIC_SCHEMA_ID)];
+    out.extend(
+        RESERVED_SCHEMAS
+            .iter()
+            .map(|(name, id)| ((*name).to_owned(), *id)),
+    );
     out.extend(schemas(txn, tenant)?);
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
-/// Whether a schema exists, `public` included.
+/// Whether a schema exists, `public` and the two the catalog lives in included.
 pub fn schema_exists(txn: &dyn Txn, tenant: u64, name: &str) -> Result<bool> {
-    if name == PUBLIC_SCHEMA {
+    if name == PUBLIC_SCHEMA || is_reserved_schema(name) {
         return Ok(true);
     }
     Ok(txn.get(&record::schema_key(tenant, name))?.is_some())
@@ -3290,6 +3337,105 @@ pub fn relations_in_schema(txn: &dyn Txn, tenant: u64, schema: &str) -> Result<V
 /// `public`'s oid, which a real server also fixes rather than allocating.
 pub const PUBLIC_SCHEMA_ID: u64 = 11;
 
+/// The two schemas the catalog itself lives in, and the oids `pg_class.relnamespace` points at.
+///
+/// **A real server's are fixed too** — 11 for `pg_catalog` and 13199 for `information_schema` on
+/// 19beta1 — and nothing here depends on the numbers matching, only on `relnamespace` equalling
+/// the `pg_namespace.oid` a client joins it to. They are reserved beside the view ids for the
+/// same reason those are: nothing a user creates can reach them.
+///
+/// These are not records. A schema a `CREATE SCHEMA` wrote is one; these are properties of the
+/// build, the way the relations in them are, which is what keeps `pg_namespace` a *view* over
+/// what exists rather than a second copy of it.
+pub const RESERVED_SCHEMAS: [(&str, u64); 2] = [("pg_catalog", 12), ("information_schema", 13)];
+
+/// The schema the catalog's own relations live in, and the one a name resolves in without a
+/// qualifier: `current_schemas(true)` is `{pg_catalog,public}` where `current_schemas(false)` is
+/// `{public}`, which is what makes `pg_class` reachable and invisible to a table list at once.
+pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
+
+/// `pg_temp` written with no number: **the asking session's own temporary schema**.
+///
+/// Not a schema and never a record — it is the word a client writes, resolved to `pg_temp_<n>`
+/// where the session is in reach. A relation stored under this qualifier cannot exist, which is
+/// what makes it safe to use as the marker
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+pub const PG_TEMP_ALIAS: &str = "pg_temp";
+
+/// The prefix every session-scoped temporary schema's name begins with.
+pub const PG_TEMP_PREFIX: &str = "pg_temp_";
+
+/// The schema the SQL-standard views live in. **Not** in the search path: a client has to qualify
+/// `information_schema.tables`, which is why its stored names carry the qualifier already.
+pub const INFORMATION_SCHEMA: &str = "information_schema";
+
+/// Whether a name is one of the two the catalog owns.
+#[must_use]
+pub fn is_reserved_schema(name: &str) -> bool {
+    RESERVED_SCHEMAS.iter().any(|(schema, _)| *schema == name)
+}
+
+/// Where a name **as a user wrote it** may resolve, given the schema it wrote.
+///
+/// Three answers, and the middle two are what this node used to get wrong by dropping every
+/// qualifier before it looked anything up: `public.pg_class` found the catalog's `pg_class` and
+/// `pg_catalog.books` found the user's `books`. A real server answers `42P01` to both — the
+/// qualifier is *where to look*, not decoration on a name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// No qualifier: the search path, which is `pg_catalog` and then `public`. So a bare
+    /// `pg_class` finds the catalog's and a bare `books` finds the user's, with no ambiguity —
+    /// nothing may be created under a catalog relation's name (`pg_catalog::refuse_write`).
+    SearchPath,
+    /// `pg_catalog.x` or `information_schema.x`: the catalog, and never a stored relation.
+    CatalogOnly,
+    /// Any other schema, **`public` included**: stored relations, and never the catalog.
+    RecordsOnly,
+}
+
+impl Reach {
+    /// Whether a catalog relation may answer to this name.
+    #[must_use]
+    pub fn catalog(self) -> bool {
+        self != Reach::RecordsOnly
+    }
+
+    /// Whether a stored relation may.
+    #[must_use]
+    pub fn records(self) -> bool {
+        self != Reach::CatalogOnly
+    }
+}
+
+/// [`Reach`] for a name written inside a string — `::regclass`'s input, and `to_regclass`'s.
+#[must_use]
+pub fn reach_of(written: &str) -> Reach {
+    reach_of_schema(written_schema(written).as_deref())
+}
+
+/// [`Reach`] for a schema already split out by the parser, or `None` for a bare name.
+#[must_use]
+pub fn reach_of_schema(schema: Option<&str>) -> Reach {
+    match schema {
+        None => Reach::SearchPath,
+        Some(schema) if is_reserved_schema(schema) => Reach::CatalogOnly,
+        Some(_) => Reach::RecordsOnly,
+    }
+}
+
+/// The schema a written name names, or `None` when it wrote none.
+///
+/// The same split [`parse_qualified`] makes, answering the half it throws away: more than two
+/// parts is `database.schema.relation`, so the **first** is the schema there as it is here.
+#[must_use]
+pub fn written_schema(written: &str) -> Option<String> {
+    let parts = written_parts(written);
+    match parts.as_slice() {
+        [schema, _, ..] => Some(schema.clone()),
+        _ => None,
+    }
+}
+
 /// Every stored function of one tenant, in name order.
 pub fn functions(txn: &dyn Txn, tenant: u64) -> Result<Vec<FunctionDef>> {
     let (start, end) = record::function_range(tenant);
@@ -3618,6 +3764,7 @@ mod tests {
 
     fn accounts(id: u64) -> TableDef {
         TableDef {
+            on_commit: super::OnCommit::default(),
             id,
             persistence: super::Persistence::Permanent,
             name: "accounts".into(),
@@ -3703,7 +3850,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1b",               // catalog format version
+                "1c",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3796,7 +3943,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1b",       // catalog format version
+                "1c",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3878,7 +4025,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1b",                 // catalog format version
+                "1c",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3968,6 +4115,10 @@ mod tests {
                 // own types" without a flag byte in front of it (ADR 0050).
                 "00", // `id` is an `int8`
                 "00", // `email` is a `text`
+                // Version 26. One byte: `ON COMMIT PRESERVE ROWS`, which is what a table with no
+                // clause is and what every table that is not temporary is (ADR 0054). So a table
+                // written before 26 decodes to exactly this and means what it always meant.
+                "00",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -5178,7 +5329,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "1b",               // catalog format version
+                "1c",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

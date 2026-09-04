@@ -210,6 +210,35 @@ pub enum SqlError {
     #[error("permission denied: \"{0}\" is a system catalog")]
     SystemCatalog(&'static str),
 
+    /// Creating a relation **in** `pg_catalog` or `information_schema`.
+    ///
+    /// A different sentence from [`SqlError::SystemCatalog`], and the difference is which half is
+    /// wrong: that one is a write to a relation that is a catalog, this one is a write to a
+    /// *schema* that is. Measured — `CREATE TABLE pg_catalog.mine` is `42501 permission denied to
+    /// create "pg_catalog.mine"`, the whole qualified name inside the quotes, with a DETAIL that
+    /// names the rule rather than the object.
+    #[error("permission denied to create \"{0}\"")]
+    CreateInSystemSchema(String),
+
+    /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
+    /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
+    /// relation that outlives the transaction. Measured.
+    #[error("ON COMMIT can only be used on temporary tables")]
+    OnCommitNotTemporary,
+
+    /// `DROP SCHEMA pg_catalog`. **`2BP01`, not `42501`** — the schema is not forbidden to you,
+    /// it is depended on, and the message says so in PostgreSQL's own words. The name is
+    /// **unquoted** here, unlike every other schema message; measured.
+    #[error("cannot drop schema {0} because it is required by the database system")]
+    RequiredSchema(String),
+
+    /// `CREATE SCHEMA pg_catalog`. **Not `42P06 already exists`**, even though it does: the name
+    /// is refused for its *prefix*, before anything looks to see whether it is taken, so
+    /// `CREATE SCHEMA pg_anything` is this too. `information_schema` has no such prefix and is
+    /// `42P06` — measured, both.
+    #[error("unacceptable schema name \"{0}\"")]
+    ReservedSchemaName(String),
+
     /// An aggregate whose argument has **no type**: `sum('lit')`, `array_agg(NULL)`.
     ///
     /// PostgreSQL has one candidate per input type and an `unknown` matches all of them, so the
@@ -362,6 +391,22 @@ pub enum SqlError {
         /// The text that could not be read.
         value: String,
     },
+
+    /// A range literal the range input function refuses: `22P02`, with the DETAIL naming what it
+    /// found. Measured — `'nonsense'::tsrange` is
+    /// `malformed range literal: "nonsense" DETAIL: Missing left parenthesis or bracket.`
+    #[error("malformed range literal: \"{value}\"")]
+    MalformedRangeLiteral {
+        /// The literal, quoted back.
+        value: String,
+        /// `Missing left parenthesis or bracket.` and the two others.
+        detail: &'static str,
+    },
+
+    /// A range whose lower bound is above its upper: **`22000`**, a data exception, not the
+    /// `22P02` a malformed literal gets — the text parsed and the value is impossible.
+    #[error("range lower bound must be less than or equal to range upper bound")]
+    RangeBoundsOutOfOrder,
 
     /// An `hstore` literal the extension's own input function refuses.
     ///
@@ -1990,7 +2035,10 @@ impl SqlError {
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
-            SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
+            SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
+                sqlstate::INSUFFICIENT_PRIVILEGE
+            }
+            SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
@@ -2001,7 +2049,9 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::PermanentReferencesUnlogged | SqlError::ColumnIsInPrimaryKey(_) => {
+            SqlError::PermanentReferencesUnlogged
+            | SqlError::OnCommitNotTemporary
+            | SqlError::ColumnIsInPrimaryKey(_) => {
                 sqlstate::INVALID_TABLE_DEFINITION
             }
             SqlError::UndefinedColumn(_)
@@ -2036,7 +2086,9 @@ impl SqlError {
             | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
-            SqlError::InvalidTextRepresentation { .. }
+            SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
+            SqlError::MalformedRangeLiteral { .. }
+            | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {
                 sqlstate::INVALID_TEXT_REPRESENTATION
@@ -2132,6 +2184,7 @@ impl SqlError {
             | SqlError::DependentType { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
+            | SqlError::RequiredSchema(_)
             | SqlError::DependentFunction { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
@@ -2210,8 +2263,17 @@ impl SqlError {
     /// It is the part of a `23505` a user actually reads — the constraint name says *which* rule
     /// was broken and the detail says *what broke it*.
     #[must_use]
+    // One arm per condition that has a detail, the same table `sqlstate` is and for the same
+    // reason: the sentence a client reads sits beside the variant it belongs to.
+    #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::CreateInSystemSchema(_) => {
+                Some("System catalog modifications are currently disallowed.".to_owned())
+            }
+            SqlError::ReservedSchemaName(_) => {
+                Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
+            }
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
@@ -2239,6 +2301,7 @@ impl SqlError {
             } => Some(format!(
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
+            SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
             SqlError::DependentType { detail, .. }
             | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }

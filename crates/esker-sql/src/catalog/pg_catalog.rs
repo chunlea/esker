@@ -174,8 +174,13 @@ pub enum CatalogView {
     /// **Not `last_value`**, which is state and lives in the sequence relation itself. Two
     /// different reads, and `reset_pk_sequence!` uses both.
     PgSequence,
-    /// The values of every enum type, which is **none**: `CREATE TYPE … AS ENUM` is `0A000`, so
-    /// nothing can put a row here. Empty on a real server too until somebody makes an enum.
+    /// One row per label of every enum type this tenant has declared.
+    ///
+    /// A **view over the type records**, the way `pg_class` is a view over the name records: the
+    /// labels live on the `TypeDef` that `CREATE TYPE` wrote, in declaration order, and this
+    /// projects them. There is no second copy and no way for the two to disagree — which matters
+    /// more here than elsewhere, because that order *is* the sort order of the type
+    /// (`enumsortorder`, and ADR 0050's never-reuse rule).
     PgEnum,
     /// What *could* be installed, which is not what is — and **not** [`CatalogView::PgExtension`].
     ///
@@ -266,6 +271,57 @@ impl CatalogView {
             CatalogView::InformationSchemaReferentialConstraints => {
                 "information_schema.referential_constraints"
             }
+        }
+    }
+
+    /// The schema it lives in: `pg_catalog`, or `information_schema` for the SQL-standard views.
+    ///
+    /// **This is what keeps the catalog out of a client's table list**, and it is the right thing
+    /// to keep it out with. `ActiveRecord`'s `tables()` filters `n.nspname = ANY
+    /// (current_schemas(false))`, which is `{public}`; `pg_catalog` is in the *implicit* path and
+    /// so resolves without a qualifier while never appearing in the list. Before this, every
+    /// catalog relation was reported in `public` and `relkind` `v` was doing the schema's job —
+    /// which worked, and was two wrong answers at once.
+    #[must_use]
+    pub fn schema(self) -> &'static str {
+        match self {
+            CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaColumns
+            | CatalogView::InformationSchemaTableConstraints
+            | CatalogView::InformationSchemaKeyColumnUsage
+            | CatalogView::InformationSchemaReferentialConstraints => super::INFORMATION_SCHEMA,
+            _ => super::PG_CATALOG_SCHEMA,
+        }
+    }
+
+    /// The bare name, without the schema its stored one may carry.
+    #[must_use]
+    pub fn relname(self) -> &'static str {
+        match self.name().split_once('.') {
+            Some((_, name)) => name,
+            None => self.name(),
+        }
+    }
+
+    /// Its `pg_class.relkind`, as PostgreSQL 19 reports it — **measured, one relation at a time**.
+    ///
+    /// Most of `pg_catalog` is ordinary tables (`r`); the five that are views are the ones a real
+    /// server defines *over* those tables. Guessing this from the name would get
+    /// `pg_partitioned_table` and `pg_available_extensions` the wrong way round, so the corpus
+    /// asks for all twenty-nine at once.
+    #[must_use]
+    pub fn relkind(self) -> &'static str {
+        match self {
+            CatalogView::PgIndexes
+            | CatalogView::PgViews
+            | CatalogView::PgStatActivity
+            | CatalogView::PgAvailableExtensions
+            | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaColumns
+            | CatalogView::InformationSchemaTableConstraints
+            | CatalogView::InformationSchemaKeyColumnUsage
+            | CatalogView::InformationSchemaReferentialConstraints => "v",
+            _ => "r",
         }
     }
 
@@ -596,6 +652,7 @@ impl CatalogView {
     pub fn rows_of(self, txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
+            CatalogView::PgEnum => pg_enum_rows(txn, tenant),
             CatalogView::PgDepend => pg_depend_rows(txn, tenant),
             CatalogView::PgSequence => pg_sequence_rows(txn, tenant),
             CatalogView::PgClass => pg_class_rows(txn, tenant),
@@ -785,6 +842,7 @@ impl CatalogView {
                     Arc::new(TableDef {
                         // Synthetic and never stored, so its persistence is the default.
                         persistence: crate::catalog::Persistence::Permanent,
+                        on_commit: super::OnCommit::default(),
                         id: view.id(),
                         name: view.name().to_owned(),
                         columns: view
@@ -835,12 +893,40 @@ impl CatalogView {
     }
 }
 
-/// The view a name is, if it is one.
+/// The view a **stored** name is, if it is one.
+///
+/// Two spellings reach here and both are the parser's output. A bare `pg_class` is the search
+/// path's answer — `pg_catalog` is in the implicit path, so a name with no qualifier finds the
+/// catalog before it finds anything else. A `pg_catalog`-qualified one carries the schema in the
+/// stored form (`super::SCHEMA_SEPARATOR`), and then only a relation *in* `pg_catalog` may answer:
+/// `pg_catalog.books` is `42P01` on a real server however many `books` there are in `public`.
+///
+/// `information_schema.tables` is its own third case and always has been: the qualifier is part
+/// of the name, because that schema is **not** in the search path and a client must write it.
 #[must_use]
 pub fn view(name: &str) -> Option<CatalogView> {
+    if let Some(bare) = name.strip_prefix(super::PG_CATALOG_SCHEMA)
+        && let Some(bare) = bare.strip_prefix(super::SCHEMA_SEPARATOR)
+    {
+        return CatalogView::ALL
+            .into_iter()
+            .find(|view| view.schema() == super::PG_CATALOG_SCHEMA && view.relname() == bare);
+    }
     CatalogView::ALL
         .into_iter()
         .find(|view| view.name() == name)
+}
+
+/// The view an **oid** is, if it is one — the inverse of the reserved ids `CatalogView::id`
+/// hands out, and what makes `<oid>::regclass` print a catalog relation's name.
+///
+/// The name is written plainly rather than linked: `id` is private, and a public item's doc may
+/// not link to one under `RUSTDOCFLAGS="-D warnings"`.
+#[must_use]
+pub fn view_by_oid(oid: i64) -> Option<CatalogView> {
+    CatalogView::ALL
+        .into_iter()
+        .find(|view| i64::try_from(view.id()).unwrap_or(i64::MAX) == oid)
 }
 
 /// The view a relation is, if it is one. By id, so a `TableDef` that has travelled does not have
@@ -1274,6 +1360,40 @@ fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Ve
     Ok(rows)
 }
 
+/// One `pg_enum` row per label of every enum type this tenant has declared.
+///
+/// **`enumsortorder` is a `real` and it is not the label's index** — it is what PostgreSQL wrote
+/// when the label was declared, and `ALTER TYPE … ADD VALUE … BEFORE` puts a new one *between* two
+/// existing numbers, which is why the column is a float and not an integer. This node appends only,
+/// so the numbers are 1, 2, 3 …, and the rule that matters is the one they encode: the order is the
+/// declaration order, never the alphabet, and a label's number is never reused (ADR 0050).
+///
+/// Rows are ordered by type oid and then by that number, which is the order a client reading them
+/// without an `ORDER BY` would find least surprising — and `ActiveRecord`'s own `enum_types` query
+/// sorts inside `array_agg` anyway, so it does not depend on this.
+fn pg_enum_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+    let mut rows = Vec::new();
+    for def in super::user_types(txn, tenant)? {
+        let super::TypeKind::Enum { labels } = &def.kind else {
+            continue;
+        };
+        let oid = super::pg_relations::as_oid(def.oid);
+        for (at, label) in labels.iter().enumerate() {
+            rows.push(vec![
+                Datum::Int8(oid),
+                Datum::Text(label.clone()),
+                // `at + 1`: a real server's first label is `1`, not `0`.
+                Datum::Real(f32::from(u16::try_from(at + 1).unwrap_or(u16::MAX))),
+            ]);
+        }
+    }
+    rows.sort_by_key(|row| match (row.first(), row.get(2)) {
+        (Some(Datum::Int8(oid)), Some(Datum::Real(order))) => (*oid, order.to_bits()),
+        _ => (0, 0),
+    });
+    Ok(rows)
+}
+
 /// Every `pg_type` row: the built-in types, then this tenant's own.
 ///
 /// The built-ins are derived from `ColumnType::ALL` rather than written out, so a type cannot be
@@ -1297,7 +1417,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 ),
                 Datum::Text(",".to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
-                Datum::Text("b".to_owned()),
+                Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
                 // No collation on any type here, which is what makes
                 // `a.attcollation <> t.typcollation` false for every column — the
@@ -1361,6 +1481,8 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
             Datum::Int8(oid),
             Datum::Text(",".to_owned()),
             Datum::Text("array_in".to_owned()),
+            // An array **of** a user-defined type is a base type: the `r`/`e` belongs to the type
+            // it is an array of, not to the array.
             Datum::Text("b".to_owned()),
             Datum::Int8(0),
             Datum::Int8(0),
@@ -1397,16 +1519,13 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
     // filter `relkind IN ('r', 'p')`, so these rows are invisible to them exactly as they should
     // be. The name is the unqualified one, which is what `relname` holds — the schema is a
     // separate column there and `information_schema.tables` is `tables` in `pg_class`.
+    let schemas = super::schema_names(txn, tenant)?;
     let views = CatalogView::ALL.into_iter().map(|view| {
         vec![
             Datum::Int8(i64::try_from(view.id()).unwrap_or(i64::MAX)),
-            Datum::Text(
-                view.name()
-                    .rsplit_once('.')
-                    .map_or_else(|| view.name().to_owned(), |(_, name)| name.to_owned()),
-            ),
-            Datum::Int8(PUBLIC_NAMESPACE_OID),
-            Datum::Text("v".to_owned()),
+            Datum::Text(view.relname().to_owned()),
+            Datum::Int8(namespace_oid(&schemas, view.schema())),
+            Datum::Text(view.relkind().to_owned()),
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Bool(false),
@@ -1416,7 +1535,6 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
         ]
     });
-    let schemas = super::schema_names(txn, tenant)?;
     Ok(relations
         .rows()
         .map(|relation| {
@@ -1546,6 +1664,26 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb",
         ColumnType::Hstore => "hstore",
         ColumnType::Citext => "citext",
+        ColumnType::TsRange => "tsrange",
+        ColumnType::TstzRange => "tstzrange",
+        ColumnType::Int4Range => "int4range",
+        ColumnType::TsRangeArray => "_tsrange",
+        ColumnType::BoolArray => "_bool",
+        ColumnType::ByteaArray => "_bytea",
+        ColumnType::BpcharArray => "_bpchar",
+        ColumnType::VarcharArray => "_varchar",
+        ColumnType::DateArray => "_date",
+        ColumnType::TimeArray => "_time",
+        ColumnType::TimestampArray => "_timestamp",
+        ColumnType::TimestampTzArray => "_timestamptz",
+        ColumnType::IntervalArray => "_interval",
+        ColumnType::RealArray => "_float4",
+        ColumnType::DoubleArray => "_float8",
+        ColumnType::UuidArray => "_uuid",
+        ColumnType::JsonArray => "_json",
+        ColumnType::JsonbArray => "_jsonb",
+        ColumnType::OidArray => "_oid",
+        ColumnType::CitextArray => "_citext",
         ColumnType::HstoreArray => "_hstore",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
@@ -1559,6 +1697,18 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Uuid => "uuid",
         ColumnType::Interval => "interval",
         ColumnType::Oid => "oid",
+    }
+}
+
+/// `pg_type.typtype`: **`r` for a range** and `b` for a base type.
+///
+/// Measured: `tsrange`, `tstzrange` and `int4range` are `r` while `_tsrange` — the array — is `b`,
+/// which is the pair a reader would get wrong. An enum's is `e` and lives on its `TypeDef`
+/// (ADR 0050); this is only the types the column vocabulary has.
+fn typtype(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "r",
+        _ => "b",
     }
 }
 
@@ -1601,7 +1751,10 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => "A",
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
+        // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "R",
     }
 }
 
@@ -1622,7 +1775,24 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::HstoreArray => "array_in",
+        | ColumnType::HstoreArray
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -1633,6 +1803,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
+        ColumnType::TsRange => "tsrange_in",
+        ColumnType::TstzRange => "tstzrange_in",
+        ColumnType::Int4Range => "int4range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

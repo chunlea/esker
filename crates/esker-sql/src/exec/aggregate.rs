@@ -176,9 +176,17 @@ impl Aggregation {
                 // capture rather than inferred — no `min` or `max` takes 2950. This is the
                 // finding ADR 0031 wrote down as a rule after `bool`: **the aggregate set is per
                 // type and cannot be derived from whether the type is ordered.**
-                ColumnType::Bool | ColumnType::Json | ColumnType::Jsonb | ColumnType::Uuid => {
-                    undefined()
-                }
+                // **`min`/`max` over a range does not exist on a real server either**, measured:
+                // `42883 function min(tsrange) does not exist`. Answering it would be this node
+                // answering where PostgreSQL raises, which ADR 0031 ranks as the worst class.
+                ColumnType::TsRange
+                | ColumnType::TstzRange
+                | ColumnType::Int4Range
+                | ColumnType::TsRangeArray
+                | ColumnType::Bool
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Uuid => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

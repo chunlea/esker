@@ -70,6 +70,13 @@ pub const DIVISION_BY_ZERO: &str = "22012";
 /// this is *not* `22P02`: the datetime types have their own condition, and a client that branches
 /// on the code would see the difference.
 pub const INVALID_DATETIME_FORMAT: &str = "22007";
+
+/// A value that is impossible rather than unreadable — the class's own catch-all.
+///
+/// **A range whose lower bound is above its upper is this and not `22P02`**: the literal parsed
+/// perfectly and what it describes cannot exist. Measured; a client branching on the code learns
+/// the difference between a typo and an impossible interval.
+pub const DATA_EXCEPTION: &str = "22000";
 /// A cast between two types that have none. Not a *failed* cast — that is the value's own error —
 /// but a pair for which no cast exists at all, which PostgreSQL decides before it reads a value.
 pub const CANNOT_COERCE: &str = "42846";
@@ -209,6 +216,11 @@ pub const CONNECTION_FAILURE: &str = "08006";
 /// `pg_catalog` relation. Measured on 19beta1, where `DROP TABLE pg_type` answers
 /// `permission denied: "pg_type" is a system catalog`.
 pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// `42939` — a name in the space a system reserves for itself. PostgreSQL raises it for a schema
+/// whose name begins `pg_`, which is a *different* answer from "already exists": the name is
+/// refused before anything looks to see whether it is taken.
+pub const RESERVED_NAME: &str = "42939";
 
 /// The statement is not valid SQL. Contract C1 says this must never be the answer to a statement
 /// PostgreSQL 19 would have accepted.
