@@ -201,8 +201,8 @@ impl TlsConfig {
 pub enum MaybeTlsStream<S> {
     /// The socket as it arrived.
     Plain(S),
-    /// The plaintext side of a TLS session. The ciphertext side is owned by the task
-    /// [`accept`] spawned, which is what talks to the socket from then on.
+    /// The plaintext side of a TLS session. The ciphertext side is owned by the task the
+    /// handshake spawned, which is what talks to the socket from then on.
     #[cfg(feature = "tls")]
     Tls(tokio::io::DuplexStream),
 }
