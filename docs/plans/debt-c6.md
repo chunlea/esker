@@ -726,13 +726,18 @@ once, on a quiet machine:
 |---|---|---|---|
 | `peer.rs`'s election pump (§6) | drives | tick iterations | flaky — **fixed** |
 | `sim_sweep.rs`'s watch window | leaderless rounds | 3 s | sound, margin now asserted |
-| `snapshot.rs:548` | heartbeat rounds | a 200 ms sleep | **silently vacuous** |
+| `snapshot.rs:548` | heartbeat rounds | a 200 ms sleep | latently vacuous — **fixed in §11** |
 
 The third is the one worth chasing next. `sleep(200ms)` then *"an operator from a stale epoch was
-applied"* is a **negative** assertion behind a wall clock: under load it does not go red, it goes
-green without the store having considered the operator at all. It fails only on the day the
-rejection breaks — and it will still pass. Not fixed here; it wants a wait on evidence that the
-operator was seen and refused, and that is its own unit.
+applied"* is a **negative** assertion behind a wall clock: what it proves is that nothing
+happened, and a store that has not yet *fetched* the operator also makes nothing happen, so where
+the sleep is too short it goes green rather than red.
+
+**Corrected in §11 by a mutation test, and the correction matters.** This paragraph originally
+said the test "fails only on the day the rejection breaks — and it will still pass". That is
+wrong: against a store forced to ignore the stale epoch, the 200 ms form **did** fail. On a quiet
+box the sleep was long enough and the test worked. The defect is *latent* — sound exactly while
+delivery fits inside the sleep — not a test that never worked.
 
 ## 10. The retry-helper audit: seven files carry the shape, none of them is exposed
 
