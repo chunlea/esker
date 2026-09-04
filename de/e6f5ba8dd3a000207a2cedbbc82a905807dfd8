@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_0ab7bef1cdae00 2052-2066,2068-2103
+crates/esker-sql/tests/prepared_join.rs
+  s_6f7019c05b578b::t_fe27ee382ffeb4 1-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "dee6f5ba8dd3a000207a2cedbbc82a905807dfd8",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
