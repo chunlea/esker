@@ -2913,6 +2913,12 @@ impl Store {
                 state.meta().check_range(&start, &end)?;
                 crate::txnkv::scan(&self.db, &start, &end, limit, ts, reverse)
             }
+            // **A read, and it is answered here for the same reason `Get` is**: it asks what the
+            // engine already knows and changes nothing (ADR 0066 §2).
+            TxnKvReq::LatestCommit { key } => {
+                state.meta().check_key(&key)?;
+                crate::txnkv::latest_commit(&self.db, &key)
+            }
             TxnKvReq::GcSafepoint { safepoint } => Ok(self.set_safepoint(safepoint)),
             // A write on a store with no peer for this region: no log to put it in, so it is
             // decided and applied here. The decision is the same one apply would make.

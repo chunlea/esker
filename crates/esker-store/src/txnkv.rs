@@ -150,6 +150,42 @@ impl TxnSnapshot for EngineSnapshot<'_> {
         self.walk(user_key, u64::MAX, ts.saturating_add(1), Some)
     }
 
+    /// Every `write` record in `[start, end)`, looking for one committed after `ts`.
+    ///
+    /// A scan of the `write` column family rather than a walk per key: the range is the unit, and
+    /// the answer is "somebody committed in here" rather than "which key". The bounds are the
+    /// *user* keys' prefixes, so a record for `end` itself is outside — a range is half-open here as
+    /// it is everywhere else.
+    fn newest_write_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        ts: u64,
+    ) -> esker_txn::Result<Option<Version>> {
+        if start >= end {
+            return Ok(None);
+        }
+        let mut iter = self
+            .db
+            .iter(cf::WRITE, &self.options)
+            .map_err(|error| storage(&error))?;
+        iter.seek(&key::prefix(start));
+        let upper = key::prefix(end);
+        while iter.valid() {
+            if iter.key() >= &upper[..] {
+                break;
+            }
+            let (_, commit_ts) = key::split(iter.key())?;
+            if commit_ts > ts {
+                let record = WriteRecord::decode(iter.value())?;
+                return Ok(Some(Version::new(commit_ts, record)));
+            }
+            iter.next();
+        }
+        iter.status().map_err(|error| storage(&error))?;
+        Ok(None)
+    }
+
     fn write_of_txn(&self, user_key: &[u8], start_ts: u64) -> esker_txn::Result<Option<Version>> {
         // Bounded below by `start_ts`: a transaction's own record is a commit above it or its
         // rollback marker exactly at it, so there is nothing to find further down.
@@ -182,6 +218,25 @@ fn cf_id(db: &Db, column: Cf) -> Result<u32, ProtoError> {
             column.name()
         ))
     })
+}
+
+/// **The newest `commit_ts` for one key, or `None`** — ADR 0066's read.
+///
+/// The question a waiter asks instead of guessing: a statement that took a row lock without waiting
+/// cannot tell from the lock alone whether the writer in front committed and released between its
+/// read and its lock. This is the same seek prewrite's own conflict check makes, without the write.
+///
+/// A rollback marker is **not** a commit and is skipped: it sits at `commit_ts == start_ts` and
+/// says a transaction gave up, so reporting it as the newest commit would tell a waiter its value
+/// is stale when nothing replaced it.
+pub(crate) fn latest_commit(db: &Db, key: &[u8]) -> Result<TxnKvResp, ProtoError> {
+    let snapshot = EngineSnapshot::new(db);
+    let newest = snapshot
+        .newest_write_after(key, 0)
+        .map_err(txn_to_proto)?
+        .filter(|version| version.record.kind != esker_txn::Kind::Rollback)
+        .map(|version| version.commit_ts);
+    Ok(TxnKvResp::LatestCommit { newest })
 }
 
 /// Reads one key at `ts` (`docs/txn-spec.md` §5.1).
@@ -324,22 +379,47 @@ pub fn prewrite(
     let mut refused = false;
 
     for mutation in mutations {
+        // **A range is validated rather than locked**, because there is no key to hold: a phantom
+        // is a row that does not exist yet (ADR 0066 §3). Anything committed inside the range since
+        // this transaction's snapshot refuses the whole prewrite, which is what makes the read set
+        // mean something; what it cannot do is stop an insert that lands *after* this check, and
+        // ADR 0062 declares that window.
+        if let TxnMutation::CheckRange { start, end } = mutation {
+            let winner = snapshot
+                .newest_write_in_range(start, end, start_ts)
+                .map_err(txn_to_proto)?;
+            match winner {
+                Some(version) => {
+                    refused = true;
+                    // The same status a key-level conflict answers, carrying the commit that won —
+                    // a client reads them the same way and the caller learns which moment beat it.
+                    statuses.push(TxnStatus::Conflict {
+                        commit_ts: version.commit_ts,
+                    });
+                }
+                None => statuses.push(TxnStatus::Ok),
+            }
+            continue;
+        }
         let request = Prewrite {
             key: mutation.key().clone(),
             primary: primary.clone(),
             start_ts,
             // **The snapshot the value was computed from**, and the transaction's own when the
-            // mutation does not say (ADR 0057 §4). Nothing says yet: the framing that would carry
-            // it is held for the human's ruling, so every prewrite validates exactly as it did.
+            // mutation does not say (ADR 0057 §4).
             read_ts: match mutation {
                 TxnMutation::Put { read_ts, .. } | TxnMutation::Delete { read_ts, .. } => {
                     read_ts.unwrap_or(start_ts)
                 }
+                // A check validates against the transaction's own snapshot: what it asserts is
+                // that the key it *read* has not moved since.
+                TxnMutation::Check { .. } | TxnMutation::CheckRange { .. } => start_ts,
             },
             ttl_ms,
             op: match mutation {
                 TxnMutation::Put { value, .. } => Op::Put(value.clone()),
                 TxnMutation::Delete { .. } => Op::Delete,
+                TxnMutation::Check { .. } | TxnMutation::CheckRange { .. } => Op::Check,
             },
         };
         let status = match esker_txn::check_prewrite(&snapshot, &request).map_err(txn_to_proto)? {

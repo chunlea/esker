@@ -41,6 +41,16 @@ pub enum Op {
     Put(Bytes),
     /// Remove the key.
     Delete,
+    /// **Verify and hold, without writing** — what a SERIALIZABLE transaction does to a key it
+    /// only *read*
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
+    /// [ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// It takes the same lock a write takes and stages no value, so the conflict check above it is
+    /// the *validation* — a key committed since this transaction's snapshot loses — and the lock is
+    /// what stops one landing between the check and the commit. It commits as [`Kind::Lock`], the
+    /// record kind this format has always reserved for a key held but not written.
+    Check,
 }
 
 impl Op {
@@ -50,6 +60,7 @@ impl Op {
         match self {
             Self::Put(_) => Kind::Put,
             Self::Delete => Kind::Delete,
+            Self::Check => Kind::Lock,
         }
     }
 

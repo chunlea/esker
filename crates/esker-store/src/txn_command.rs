@@ -68,6 +68,20 @@ pub enum TxnWrite {
         /// As [`TxnWrite::Put::read_ts`].
         read_ts: Option<u64>,
     },
+    /// **A key a SERIALIZABLE transaction read**, verified and locked but never written
+    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    Check {
+        /// The user key that was read.
+        key: Bytes,
+    },
+    /// **A range a SERIALIZABLE transaction scanned.** The phantom half: a row that did not exist
+    /// when the scan ran is in no read set, and only the range can name it.
+    CheckRange {
+        /// Inclusive lower bound.
+        start: Bytes,
+        /// Exclusive upper bound.
+        end: Bytes,
+    },
 }
 
 impl TxnWrite {
@@ -75,7 +89,9 @@ impl TxnWrite {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key, .. } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key } => key,
+            // A range is addressed by its lower bound, as every range request is.
+            Self::CheckRange { start, .. } => start,
         }
     }
 
@@ -95,6 +111,11 @@ impl TxnWrite {
             Self::Delete { key, read_ts } => TxnMutation::Delete {
                 key: key.clone(),
                 read_ts: *read_ts,
+            },
+            Self::Check { key } => TxnMutation::Check { key: key.clone() },
+            Self::CheckRange { start, end } => TxnMutation::CheckRange {
+                start: start.clone(),
+                end: end.clone(),
             },
         }
     }
@@ -154,8 +175,9 @@ pub enum TxnCommand {
 impl TxnCommand {
     /// The command a request becomes, or `None` for one that changes nothing.
     ///
-    /// `Get`, `Scan` and `GcSafepoint` answer `None`: the first two are reads and the third is
-    /// store-local (see this module's header).
+    /// `Get`, `Scan`, `LatestCommit` and `GcSafepoint` answer `None`: the first three are reads —
+    /// `LatestCommit` asks what the store already knows and takes no lock (ADR 0066 §2) — and the
+    /// fourth is store-local (see this module's header).
     #[must_use]
     pub fn from_request(request: &TxnKvReq) -> Option<Self> {
         match request {
@@ -183,6 +205,11 @@ impl TxnCommand {
                         TxnMutation::Delete { key, read_ts } => TxnWrite::Delete {
                             key: key.clone(),
                             read_ts: *read_ts,
+                        },
+                        TxnMutation::Check { key } => TxnWrite::Check { key: key.clone() },
+                        TxnMutation::CheckRange { start, end } => TxnWrite::CheckRange {
+                            start: start.clone(),
+                            end: end.clone(),
                         },
                     })
                     .collect(),
@@ -218,7 +245,10 @@ impl TxnCommand {
                 primary: primary.clone(),
                 ttl_ms: *ttl_ms,
             }),
-            TxnKvReq::Get { .. } | TxnKvReq::Scan { .. } | TxnKvReq::GcSafepoint { .. } => None,
+            TxnKvReq::Get { .. }
+            | TxnKvReq::Scan { .. }
+            | TxnKvReq::LatestCommit { .. }
+            | TxnKvReq::GcSafepoint { .. } => None,
         }
     }
 
@@ -295,6 +325,17 @@ impl TxnCommand {
                             out.put_u8(4);
                             out.put_bytes(key);
                             out.put_varint(*read_ts);
+                        }
+                        // Kinds 5 and 6, beside the four: a check carries no value and a range
+                        // carries two keys (ADR 0066 §1).
+                        TxnWrite::Check { key } => {
+                            out.put_u8(5);
+                            out.put_bytes(key);
+                        }
+                        TxnWrite::CheckRange { start, end } => {
+                            out.put_u8(6);
+                            out.put_bytes(start);
+                            out.put_bytes(end);
                         }
                     }
                 }
@@ -373,6 +414,13 @@ impl TxnCommand {
                         2 => TxnWrite::Delete {
                             key: bytes(input, "txn.write.key")?,
                             read_ts: None,
+                        },
+                        5 => TxnWrite::Check {
+                            key: bytes(input, "txn.write.key")?,
+                        },
+                        6 => TxnWrite::CheckRange {
+                            start: bytes(input, "txn.write.start")?,
+                            end: bytes(input, "txn.write.end")?,
                         },
                         other => {
                             return Err(ProtoError::corrupt(
