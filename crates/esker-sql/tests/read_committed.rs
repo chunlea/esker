@@ -20,59 +20,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::channel;
 use std::time::Duration;
-
-use esker_sql::backend::{Backend, MemoryBackend};
-use esker_sql::catalog::Catalog;
 
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// How long a test waits for the other session to reach its edge before calling it wedged. Long
-/// enough that a loaded container is not a failure, short enough that a genuine hang is one.
-const EDGE: Duration = Duration::from_secs(10);
-
-/// Two sessions on one store, and a channel each way to gate on their transactions' edges.
-struct Pair {
-    store: Arc<dyn Backend>,
-    catalog: Arc<Catalog>,
-}
-
-impl Pair {
-    fn new(fixture: &[&str]) -> Self {
-        let store: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let catalog = Arc::new(Catalog::new());
-        let mut setup = parity::Node::on(Arc::clone(&store), Arc::clone(&catalog), 1, "esker", &[]);
-        for statement in fixture {
-            setup.run(statement).unwrap();
-        }
-        Pair { store, catalog }
-    }
-
-    fn session(&self) -> parity::Node {
-        parity::Node::on(
-            Arc::clone(&self.store),
-            Arc::clone(&self.catalog),
-            1,
-            "esker",
-            &[],
-        )
-    }
-}
-
-/// Waits for the other session to say it has reached an edge, and fails rather than hanging.
-fn edge(from: &Receiver<&'static str>, what: &str) {
-    match from.recv_timeout(EDGE) {
-        Ok(_) => {}
-        Err(error) => panic!("the other session never reached `{what}`: {error}"),
-    }
-}
-
-fn reached(to: &Sender<&'static str>, what: &'static str) {
-    to.send(what).unwrap();
-}
+use parity::{Pair, edge, reached};
 
 /// **The red test for the whole unit.** A holds the row, B blocks, A commits, B proceeds on A's
 /// version — and B's own `COMMIT` succeeds.

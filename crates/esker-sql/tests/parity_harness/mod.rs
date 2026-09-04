@@ -40,6 +40,55 @@ use esker_sql::parse::{StatementClass, parse_statements};
 use esker_sql::pgwire::session::{Execute, Outcome, Params};
 use esker_sql::value::PgType;
 
+/// How long a test waits for the other session to reach its edge before calling it wedged. Long
+/// enough that a loaded container is not a failure, short enough that a genuine hang is one.
+pub(crate) const EDGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Two sessions on one store, for the half of a locking rule that only exists between two of them.
+///
+/// **Every gate a caller builds on this must be on a transaction's edge** — A's write is buffered,
+/// A has committed — and never on "the thread started". Every earlier racy test in this family was
+/// the second kind, and what these tests are about is precisely what happens *between* two edges.
+pub(crate) struct Pair {
+    store: Arc<dyn Backend>,
+    catalog: Arc<Catalog>,
+}
+
+impl Pair {
+    pub(crate) fn new(fixture: &[&str]) -> Self {
+        let store: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let catalog = Arc::new(Catalog::new());
+        let mut setup = Node::on(Arc::clone(&store), Arc::clone(&catalog), 1, "esker", &[]);
+        for statement in fixture {
+            setup.run(statement).unwrap();
+        }
+        Pair { store, catalog }
+    }
+
+    /// Another session against the same store and catalog.
+    pub(crate) fn session(&self) -> Node {
+        Node::on(
+            Arc::clone(&self.store),
+            Arc::clone(&self.catalog),
+            1,
+            "esker",
+            &[],
+        )
+    }
+}
+
+/// Waits for the other session to say it has reached an edge, and fails rather than hanging.
+pub(crate) fn edge(from: &std::sync::mpsc::Receiver<&'static str>, what: &str) {
+    match from.recv_timeout(EDGE) {
+        Ok(_) => {}
+        Err(error) => panic!("the other session never reached `{what}`: {error}"),
+    }
+}
+
+pub(crate) fn reached(to: &std::sync::mpsc::Sender<&'static str>, what: &'static str) {
+    to.send(what).unwrap();
+}
+
 /// What one statement answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Answer {

@@ -26,7 +26,7 @@ use crate::catalog::pg_catalog;
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::aggregate;
-use crate::plan::{BinaryOp, Expr, Literal, Node, Select, SelectItem, SortKey};
+use crate::plan::{BinaryOp, Expr, Literal, LockWait, Node, Select, SelectItem, SortKey};
 use crate::row::{self, RowSchema};
 use crate::value::PgType;
 use crate::value::{ColumnType, Datum};
@@ -196,6 +196,43 @@ impl<'a> Scope<'a> {
             start += table.columns.len();
         }
         None
+    }
+
+    /// The column a resolved position belongs to, or `None` for a position past the end.
+    pub(super) fn column_def(&self, at: usize) -> Option<&ColumnDef> {
+        let mut start = 0;
+        for table in &self.tables {
+            if at < start + table.columns.len() {
+                return table.columns.get(at - start);
+            }
+            start += table.columns.len();
+        }
+        None
+    }
+
+    /// Every relation a locking clause names, with its key columns as positions in this scope.
+    ///
+    /// `of` is `None` for a bare `FOR UPDATE`, which locks **every** relation in the statement.
+    ///
+    /// A relation with no primary key is not here, and that is the rule rather than a shortcut: a
+    /// derived table, a `VALUES` list, a set-returning function and a catalog view all carry an
+    /// empty key because their rows are computed rather than stored, and PostgreSQL **accepts** a
+    /// locking clause over each of them and locks nothing (measured, all five shapes). A table the
+    /// user gave no key still has one — the hidden row id — so it locks like any other.
+    pub(super) fn locked_relations(&self, of: Option<&str>) -> Vec<(&'a TableDef, Vec<usize>)> {
+        let mut start = 0;
+        let mut found = Vec::new();
+        for (index, table) in self.tables.iter().enumerate() {
+            let named = of.is_none_or(|want| self.names[index] == want);
+            if named && !table.primary_key.is_empty() {
+                found.push((
+                    *table,
+                    table.primary_key.iter().map(|at| start + at).collect(),
+                ));
+            }
+            start += table.columns.len();
+        }
+        found
     }
 
     /// The name a `42803` prints for a resolved position: `t.c`, qualified.
@@ -464,6 +501,36 @@ pub(super) struct Planned {
     /// one — a `SELECT` with no table, a catalog view. Filled in by `crate::exec::fragment::route`,
     /// which is the only thing that decides one.
     pub(super) engine: Option<crate::plan::routing::Decision>,
+    /// The rows to lock, one entry per relation a locking clause names (ADR 0057 §5). Empty for
+    /// every statement without one — and for a locking clause over a relation with no stored
+    /// identity, which PostgreSQL accepts and locks nothing for (measured: a derived table, a
+    /// `VALUES` list, a set-returning function, a `CTE` and a catalog relation all answer rows).
+    pub(super) locks: Vec<LockTarget>,
+    /// The junk columns [`Planned::locks`] reads its keys from: how many trailing columns of a row
+    /// the client must never see.
+    pub(super) junk: usize,
+    /// `(offset, limit)`, **withheld from the plan** when there is something to lock.
+    ///
+    /// PostgreSQL puts `Limit` *above* `LockRows`, and the difference is observable: with the
+    /// first row held by somebody else, `LIMIT 1 … SKIP LOCKED` answers the *second* row, where a
+    /// limit applied before the skip answers nothing at all. Measured against PG 19 with two
+    /// sessions — and it is the case a queue is written for, so the order is the feature.
+    pub(super) limit: Option<(usize, Option<usize>)>,
+}
+
+/// One relation a `SELECT … FOR UPDATE` locks, and where its key is in the row.
+#[derive(Debug, Clone)]
+pub(super) struct LockTarget {
+    /// The table's **own** name, which is what PostgreSQL's `55P03` prints — not the alias the
+    /// query used, measured: `could not obtain lock on row in relation "lk"` for
+    /// `SELECT … FROM lk l … FOR UPDATE OF l NOWAIT`.
+    pub(super) relation: String,
+    /// The table, for the key encoding.
+    pub(super) table_id: u64,
+    /// Where the key columns are in the projected row: the junk columns, in key order.
+    pub(super) key_at: Vec<usize>,
+    /// What to do when the row is held.
+    pub(super) wait: LockWait,
 }
 
 /// The access path and filter for every row of `table` a predicate matches — the half of a plan
@@ -701,7 +768,10 @@ fn finish_plan(
     }
 
     let columns = output_columns(select, scope, aggregation.as_ref())?;
-    let exprs = projection_exprs(select, scope, aggregation.as_ref())?;
+    let mut exprs = projection_exprs(select, scope, aggregation.as_ref())?;
+    // The junk columns go on the end of the target list, so every position above — sort keys,
+    // `DISTINCT`, the output columns — is the position it was before.
+    let (locks, junk) = lock_targets(select, scope, &mut exprs);
 
     // The sort goes *below* the projection, so it can order on a column the target list does not
     // return -- `SELECT n FROM s1 ORDER BY id` is ordinary SQL, and a sort above the projection
@@ -758,11 +828,16 @@ fn finish_plan(
         }
     }
 
-    if select.limit.is_some() || select.offset.is_some() {
+    let offset = count(select.offset.as_ref(), "OFFSET")?.unwrap_or(0);
+    let limit = count(select.limit.as_ref(), "LIMIT")?;
+    // **Withheld when there is something to lock**, and applied by the executor after the lock
+    // pass — see [`Planned::limit`]. A statement that locks nothing keeps the node, so nothing
+    // about an ordinary `LIMIT` moves.
+    if (select.limit.is_some() || select.offset.is_some()) && locks.is_empty() {
         node = Node::Limit {
             input: Box::new(node),
-            offset: count(select.offset.as_ref(), "OFFSET")?.unwrap_or(0),
-            limit: count(select.limit.as_ref(), "LIMIT")?,
+            offset,
+            limit,
         };
     }
 
@@ -772,7 +847,83 @@ fn finish_plan(
         table: outer_table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
         column_names: scope_column_names(scope),
         engine: None,
+        junk,
+        limit: if locks.is_empty() {
+            None
+        } else {
+            Some((offset, limit))
+        },
+        locks,
     })
+}
+
+/// The key columns each locking clause needs, appended to the target list as **junk columns**.
+///
+/// PostgreSQL's own arrangement, and for the same reason: the key is not necessarily in the target
+/// list — `SELECT n FROM lk FOR UPDATE` returns no `id` and still locks by `id` — so the projection
+/// carries it and the executor drops it before the client sees a row.
+///
+/// Two clauses naming one relation lock it once, with the stricter wait winning: `NOWAIT` before
+/// `SKIP LOCKED` before waiting, which is the order that never invents an answer.
+fn lock_targets(
+    select: &Select,
+    scope: &Scope<'_>,
+    exprs: &mut Vec<Expr>,
+) -> (Vec<LockTarget>, usize) {
+    let mut targets: Vec<LockTarget> = Vec::new();
+    let visible = exprs.len();
+    for lock in &select.locking {
+        for (table, key) in scope.locked_relations(lock.of.as_deref()) {
+            if let Some(existing) = targets
+                .iter_mut()
+                .find(|target| target.table_id == table.id)
+            {
+                existing.wait = stricter(existing.wait, lock.wait);
+                continue;
+            }
+            let key_at = key
+                .iter()
+                .map(|&at| {
+                    let ty = column_at(scope, at);
+                    let position = exprs.len();
+                    exprs.push(Expr::Ordinal {
+                        at,
+                        ty: ty.0,
+                        typmod: ty.1,
+                    });
+                    position
+                })
+                .collect();
+            targets.push(LockTarget {
+                relation: table.name.clone(),
+                table_id: table.id,
+                key_at,
+                wait: lock.wait,
+            });
+        }
+    }
+    (targets, exprs.len() - visible)
+}
+
+/// The type and typmod of a scope position, for a junk column that reads it.
+fn column_at(scope: &Scope<'_>, at: usize) -> (ColumnType, i32) {
+    scope
+        .column_def(at)
+        .map_or((ColumnType::Int8, crate::value::NO_TYPMOD), |column| {
+            (column.ty, column.typmod)
+        })
+}
+
+/// Which of two waits decides, when two clauses name one relation.
+///
+/// `NOWAIT` first, then `SKIP LOCKED`, then waiting. Both of the first two are promises about a
+/// held row, so the one that refuses to invent an answer wins.
+fn stricter(left: LockWait, right: LockWait) -> LockWait {
+    match (left, right) {
+        (LockWait::NoWait, _) | (_, LockWait::NoWait) => LockWait::NoWait,
+        (LockWait::SkipLocked, _) | (_, LockWait::SkipLocked) => LockWait::SkipLocked,
+        _ => LockWait::Wait,
+    }
 }
 
 /// `0A000` for an `ORDER BY` over a `json` or `jsonb` column.

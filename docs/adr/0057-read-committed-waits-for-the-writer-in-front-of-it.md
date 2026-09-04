@@ -244,24 +244,101 @@ lose an update.
 Everything above this line was built first and independently, and the field itself was **held in its
 own commit at the end of the branch** until the ruling.
 
-## 5. `SELECT … FOR UPDATE` locks nothing today, and must
+## 5. `SELECT … FOR UPDATE` locked nothing, and now locks — built, unit 5
 
-`plan::Locking` is lowered and then **dropped** — `exec/query.rs:932` builds `locking: Vec::new()`.
-So `FOR UPDATE` parses, is accepted, and takes nothing. Rails' pessimistic tests (`lock!`,
-`with_lock`) do `FOR UPDATE` and then `UPDATE`; with no eager lock two sessions both proceed and
-one dies at prewrite — the same failure this whole ADR is about, arriving by a second road.
+`plan::Locking` was lowered, validated and then never read. **The line this section first named —
+`exec/query.rs:932` — was wrong and the conclusion was right**: that line is a *synthetic* `Select`
+built for a `RETURNING` list, which correctly locks nothing. The real state was stronger than the
+claim: no executor path read `Select::locking` at all.
 
-**The same mechanism answers it.** A row a `FOR UPDATE` selects is written with a **no-op
-mutation** — `Op::Lock`: a lock record now, and at commit a `write` record that changes no value.
-TiKV has exactly this op. Then a concurrent writer meets a live lock and waits, and this
-transaction's prewrite validates the key at that statement's `read_ts` (§4), which is what makes
-`lock!`-then-update commit rather than conflict with the transaction it just waited for.
+So `FOR UPDATE` parsed, was accepted, and took nothing. Rails' pessimistic tests (`lock!`,
+`with_lock`) do `FOR UPDATE` and then `UPDATE`; with no eager lock two sessions both proceed and one
+dies at prewrite — the same failure this whole ADR is about, arriving by a second road.
 
-It also makes two refusals stop being true. `NOWAIT` and `SKIP LOCKED` are refused today "on a node
-whose transactions do not block"; with `Op::Lock` they become `55P03 could not obtain lock on row in
-relation "x"` on a `Locked` decision, and a skip, respectively — both measured in the contract
-table. `FOR SHARE` is served as `FOR UPDATE` for now, declared: it is stricter than the standard
-asks for, which costs concurrency and never correctness.
+**The same mechanism answers it.** A row a `FOR UPDATE` selects takes the row lock unit 1 built —
+`Txn::lock`, which is `Op::Lock` by another name: a lock record now, and at commit a `write` record
+that changes no value. Then a concurrent writer meets a live lock and waits, and this transaction's
+prewrite validates the key at that statement's `read_ts` (§4), which is what makes `lock!`-then-update
+commit rather than conflict with the transaction it just waited for.
+
+### Where the lock pass had to go, and why it is not in the pipeline
+
+Two facts in the code decided the shape, and neither is negotiable:
+
+* a `Cursor` holds `&dyn Txn` — an **immutable** borrow — so nothing inside the row pipeline can
+  take a lock;
+* a `SELECT` already materialises every row into a `Vec` before it answers, so a second pass over
+  them costs nothing that was not already spent.
+
+Hence PostgreSQL's own arrangement, `LockRows`, in the only place this node can put it:
+
+1. the planner appends the locked relation's key columns to the target list as **junk columns**
+   (PostgreSQL's junk attributes). The key is not necessarily in the target list — `SELECT n FROM lk
+   FOR UPDATE` returns no `id` and still locks by `id` — so the projection carries it;
+2. the executor takes one lock per row per locked relation, and drops the junk before the client
+   sees a row;
+3. **`OFFSET` and `LIMIT` are withheld from the plan and applied after the pass.**
+
+That third step is the one a plan gets wrong while every single-session test passes, and it is
+measured rather than reasoned: with row 1 held by another session, `SELECT id FROM lk ORDER BY id
+LIMIT 1 FOR UPDATE SKIP LOCKED` answers **`2`**, and `LIMIT 1 OFFSET 1` answers **`3`**. A limit
+applied before the skip answers *nothing at all* — under exactly the contention a queue is written
+for. PostgreSQL puts `Limit` above `LockRows`; so does this.
+
+### What the modifiers do now
+
+`NOWAIT` and `SKIP LOCKED` were refused by name for as long as there was no row lock to see, because
+each promises something a client can check and answering every row would have been a wrong answer
+rather than a missing feature. Both run now: `NOWAIT` is `55P03 could not obtain lock on row in
+relation "x"` — the relation is the **table's own name**, not the alias, measured — and `SKIP
+LOCKED` leaves the row out. Two clauses naming one relation lock it once, with the stricter wait
+winning (`NOWAIT` before `SKIP LOCKED` before waiting).
+
+### What is locked, and what is accepted and locks nothing
+
+A relation with no stored identity is not locked, and **PostgreSQL accepts every one of those**
+rather than refusing — measured, all of: a derived table, a `VALUES` list, a set-returning function,
+a `CTE`, a view (whose base table PostgreSQL locks and this node does not) and a catalog relation.
+The rule that produces this is one line — a relation with an empty primary key is not a lock target
+— and it is exactly the set of relations whose rows are computed rather than stored. A table the
+user gave no key still has one, the hidden row id, and locks like any other.
+
+### The divergences this unit declares
+
+* **`FOR SHARE` is served as `FOR UPDATE`.** Stricter than the standard asks for: it costs
+  concurrency and never correctness. Two sessions that both take `FOR SHARE` on one row proceed on
+  PostgreSQL and serialise here.
+* **A locking clause over a view or a derived table locks nothing**, where PostgreSQL pushes the
+  lock down to the base table.
+* **`EXPLAIN ANALYZE` of a locking `SELECT` takes no locks** — that path holds `&dyn Txn` — where
+  PostgreSQL takes them.
+* **`FOR UPDATE` with `UNION` is `0A000 UNION is not supported`**, not PostgreSQL's `0A000 FOR
+  UPDATE is not allowed with UNION/INTERSECT/EXCEPT`: this node has no `UNION` at all, so the more
+  specific sentence names a rule it cannot reach. It becomes reachable the day `UNION` lands.
+
+### Where this is implemented, and where it is not yet
+
+**`MemoryBackend` only.** `StoreTxn` takes the trait's defaults — `lock` answers `Taken`,
+`begin_statement` and `restart_statement` do nothing — so against a **real cluster** the wait, the
+statement snapshot and the row lock are all inert. That is the honest default the trait was written
+with rather than an oversight ("it keeps a backend that has not been taught this honest rather than
+silently blocking"), and it is why nothing here changes a cluster's behaviour before the store
+learns `Op::Lock` on the wire.
+
+It is also why the measure is unaffected: the Rails scoreboard runs `esker-sql --release` on the
+**in-process backend** (`docs/bench/rails-scoreboard.md`), which is the one this unit implements.
+Teaching `StoreTxn` to lock is a wire operation of its own and belongs with the store's `Op::Lock`
+apply path, not here.
+
+### The gap unit 5 found in units 1–4
+
+The restart loop lives in the **open-block** branch, and every test in the family sent a `BEGIN`
+before the statement that waited. `ActiveRecord` does not: `update_attribute`, `increment!` and
+`touch` are single statements in autocommit. An autocommit writer that waited got
+`SqlError::StatementMustRestart` itself, as `XX000` — the signal, whose own comment says it "reaches
+a client only if something forgot to catch it". The implicit path was what forgot. It has the same
+bounded loop now, and its restart is a **whole new transaction**, which is not a shortcut: an
+implicit transaction is one statement long, so a fresh one *is* the re-run.
 
 ## 6. What the row lock strengthened, found while building unit 1
 

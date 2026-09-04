@@ -1219,9 +1219,20 @@ impl Executor {
         // come from **outside** this transaction, because a sequence is not transactional and a
         // read through the statement's own snapshot would report the sequence as of `BEGIN`.
         self.fill_sequence_reads(&mut planned.node)?;
-        let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
+        let mut raw = Vec::new();
+        {
+            let mut cursor = cursor::Cursor::open(&*txn, self.tenant, &planned.node)?;
+            while let Some(row) = cursor.next()? {
+                raw.push(row);
+            }
+        }
+        // **The lock pass, and it is here because it cannot be anywhere lower**: a `Cursor` holds
+        // `&dyn Txn` and a lock needs `&mut`, and a `SELECT` materialises its rows anyway, so the
+        // second pass costs nothing that was not already spent (ADR 0057 §5).
+        let raw = self.lock_rows(txn, &planned, raw)?;
         let mut rows = Vec::new();
-        while let Some(row) = cursor.next()? {
+        for row in raw {
+            let row = &row[..row.len() - planned.junk];
             rows.push(
                 row.iter()
                     .enumerate()
@@ -1251,6 +1262,67 @@ impl Executor {
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
+    }
+
+    /// Takes the row locks a `SELECT … FOR UPDATE` asked for, and answers the rows that survive.
+    ///
+    /// **PostgreSQL's `LockRows`, in the one place this node can put it.** Each row's key is read
+    /// from the junk columns the planner appended, and what happens to a row somebody else holds is
+    /// the whole content of the modifiers:
+    ///
+    /// * bare — wait for the holder, then re-run the statement, which is ADR 0057's mechanism and
+    ///   not a second one. The row this statement read may have changed while it waited, so
+    ///   answering the version it already has would be answering a row that no longer exists.
+    /// * `NOWAIT` — `55P03` at once, naming the relation.
+    /// * `SKIP LOCKED` — the row leaves the answer and nothing is said about it.
+    ///
+    /// Then `OFFSET` and `LIMIT`, **after** the skipping: `LIMIT 1 … SKIP LOCKED` over a held first
+    /// row answers the second row, measured, and a limit applied before the skip would answer
+    /// nothing at all.
+    fn lock_rows(
+        &self,
+        txn: &mut dyn Txn,
+        planned: &query::Planned,
+        rows: Vec<Vec<Datum>>,
+    ) -> Result<Vec<Vec<Datum>>> {
+        if planned.locks.is_empty() {
+            return Ok(rows);
+        }
+        let mut kept = Vec::with_capacity(rows.len());
+        'row: for row in rows {
+            for target in &planned.locks {
+                let key: Vec<Datum> = target.key_at.iter().map(|&at| row[at].clone()).collect();
+                // A key column that is NULL belongs to a row that is not there: the nullable side
+                // of an outer join, which the lowering already refuses to lock, or a row a
+                // `LEFT JOIN` did not match. There is nothing to hold.
+                if key.iter().any(|value| matches!(value, Datum::Null)) {
+                    continue;
+                }
+                let key = crate::row::row_key(self.tenant, target.table_id, &key)?;
+                match txn.lock(&key)? {
+                    crate::backend::Lock::Taken => {}
+                    crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
+                    crate::backend::Lock::Held { .. } => match target.wait {
+                        crate::plan::LockWait::SkipLocked => continue 'row,
+                        crate::plan::LockWait::NoWait => {
+                            return Err(SqlError::LockNotAvailable(target.relation.clone()));
+                        }
+                        // The wait, and then the whole statement again: the same loop an `UPDATE`
+                        // behind a lock goes through.
+                        crate::plan::LockWait::Wait => wait_for_row(self, txn, &key)?,
+                    },
+                }
+            }
+            kept.push(row);
+        }
+        let Some((offset, limit)) = planned.limit else {
+            return Ok(kept);
+        };
+        let kept = kept.into_iter().skip(offset);
+        Ok(match limit {
+            Some(limit) => kept.take(limit).collect(),
+            None => kept.collect(),
+        })
     }
 
     /// Runs every sequence function in a target list and puts its value back in its place.
