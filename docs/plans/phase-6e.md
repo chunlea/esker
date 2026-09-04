@@ -1,6 +1,6 @@
 # Phase 6e plan — online schema change
 
-Status: **complete**, units 0–7 — written before implementation; §9 records progress and §10
+Status: **complete**, units 0–8 — written before implementation; §9 records progress and §10
 what changed.
 Design: [ADR 0020](../adr/0020-online-schema-change.md), resting on
 [ADR 0019](../adr/0019-a-row-says-how-many-columns-it-has.md) (the row format) and
@@ -67,9 +67,14 @@ right owner and this phase makes it one, but it is an addition rather than a fac
 ## 2. What is staged first, and what stays refused
 
 **`CREATE INDEX` on a populated table** — ADR 0020's own worked example, and the one that closes
-`exec::ddl::backfill`'s `TODO(post-v1)`. `DROP COLUMN` stays `0A000`: it needs a row format that
-carries column *identity* rather than a count (ADR 0019 Decision 3, a future version 3), and that
-is explicitly out. `ALTER COLUMN TYPE` stays `0A000`.
+`exec::ddl::backfill`'s `TODO(post-v1)`. Two sentences here scoped work **out** of this phase and both have since been done, by later
+units rather than by this one — recorded so a reader does not take them as current:
+`DROP COLUMN` was "`0A000`: it needs a row format that carries column *identity* rather than a
+count", and it landed instead as a **tombstone** that keeps the slot, which needs no new row format
+at all ([ADR 0051](../adr/0051-a-dropped-column-keeps-its-slot.md)). `ALTER COLUMN TYPE` was to
+"stay `0A000`" and now rewrites the table's rows in the statement's own transaction
+([ADR 0060](../adr/0060-a-using-clause-is-a-licence-not-an-expression.md)); neither is staged
+through this phase's schema-change machinery, which is the part of the scoping that held.
 
 `DROP INDEX` runs the states backwards and is the natural second. **Built, as unit 8** — the
 removal direction is what makes the safepoint term live, which is why it got a unit rather than a
