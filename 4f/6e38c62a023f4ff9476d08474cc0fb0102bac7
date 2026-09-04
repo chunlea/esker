@@ -1,0 +1,19 @@
+docs/adr/0056-read-committed-waits-for-the-writer-in-front-of-it.md
+  s_b20cd111ee22fe::t_863119b2176aa4 1-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4f6e38c62a023f4ff9476d08474cc0fb0102bac7",
+  "prompts": {},
+  "sessions": {
+    "s_b20cd111ee22fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d47fb1f-9385-4f6f-88a7-2a1d2aaf1b64",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
