@@ -524,10 +524,34 @@ so the message carries no id and the store needs no session state. A repeated re
 already reclaimed finds no record, creates one, finds no hosted region overlapping it, and answers
 `finished: true` — which is the idempotence the caller needs and costs one pass with no writes.
 
-### The one thing still to decide, which is why this waits on a ruling
+### Region-addressed, ruled
 
-Whether a reclaim is **addressed to one region** (routed like any other `TxnKv` request, the caller
-walking the range region by region) or **broadcast to every store** (one call per store, each
-clearing what it hosts). The sketch above is the first: it needs no new routing, reuses the epoch
-check, and makes the caller's loop the same shape as a scan. The second is fewer round trips and
-needs a way to address a store rather than a region, which `TxnKv` does not have today.
+A reclaim is **addressed to one region**, like every other request in this service, and not
+broadcast to a store. Two reasons and they are the same reason: invariant 5 — every request carries
+a region epoch — and a range that spans regions is the *driver's* job to split, which
+`reclaim::next_chunk` already does one hosted region at a time. A store-addressed broadcast would be
+fewer round trips and would need a way to address a store rather than a region, which `TxnKv` does
+not have and should not grow for this.
+
+### Three things the tree decided for us, found while staging it
+
+* **`0x020A` is forced, not chosen.** `every_service_numbers_its_methods_without_a_gap` collects each
+  service's method numbers and asserts they are exactly `1..=count`. Any code but the next one fails
+  it — so the number is not a preference and cannot collide with a lane that picks differently.
+* **The golden rows are additive by construction.** `golden()` finds a line by its
+  `"{kind} {name} "` prefix, so two appended lines change nothing that already exists. That is worth
+  stating rather than hoping: a format change to an existing row is the thing `CLAUDE.md` says to
+  stop and ask about, and this is not one.
+* **The older-peer refusal is already tested, and adding a method erodes it.**
+  `an_unknown_method_is_an_error_not_a_skipped_frame` walks a list of unused codes and asserts a
+  peer refuses them rather than mis-parsing. `0x020A` was one of the boundaries that list stood on,
+  so it gains `0x020B` — the next code this service has not issued. Keeping the first *unused* code
+  in that list is what makes it a test about an older peer meeting a newer method, rather than a
+  test about four numbers that were free the day it was written.
+
+The bytes above were **derived from the code and cross-checked**, not remembered: a request body is
+`method:u16` little-endian ++ header ++ fields (a response has no header), `header()` is
+`RequestHeader::new(1, Epoch::new(2, 3), 4)` → `01 02 03 04`, and the layout was verified against the
+existing `txn-get` row before the new one was written. `esker-base`'s own test asserts
+`encode(300) == [0xAC, 0x02]`. Mint by running `golden_request_bodies` once — it prints both sides on
+drift, so a derivation error arrives as a diff rather than as a silent pass.
