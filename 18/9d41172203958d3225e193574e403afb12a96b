@@ -1,0 +1,16 @@
+crates/esker-engine/src/memtable/differential.rs
+  h_44076b318daf9c 315-335,337
+docs/bench/skiplist.md
+  h_44076b318daf9c 175,180-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "189d41172203958d3225e193574e403afb12a96b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
