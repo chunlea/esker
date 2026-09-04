@@ -80,3 +80,7 @@ float8[]	{}	{-1}	{0}	{1}	{1,2}	{Infinity}	{NaN}	{NULL}
 uuid[]	{}	{00000000-0000-0000-0000-000000000000}	{11111111-1111-1111-1111-111111111111}	{ffffffff-ffff-ffff-ffff-ffffffffffff}	{NULL}
 oid[]	{}	{0}	{1}	{1,2}	{4294967295}	{NULL}
 citext		_a	A	a	a b	AB	ab	B	b	~	É	é
+# `money` is cents in an `i64`, so its order is the integer's — both ends of the range are
+# in the fixture because both are values a client can write. Captured with lc_monetary = 'C'.
+money	-$92,233,720,368,547,758.08	-$1.00	-$0.01	$0.00	$0.01	$1.00	$123.45	$1,234.56	$92,233,720,368,547,758.07
+money[]	{}	{-$1.00}	{$0.00}	{$1.00}	{$1.00,$2.00}	{NULL}

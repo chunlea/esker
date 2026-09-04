@@ -215,6 +215,22 @@ pub enum ColumnType {
     Point,
     /// `point[]`. `geometric_test.rb` declares one (`t.point :array_of_points, array: true`).
     PointArray,
+    /// PostgreSQL's `money`: **a count of cents in an `i64`**, and nothing else.
+    ///
+    /// `typlen` is 8 and `typstorage` is `p` — plain, not a varlena — so the range is exactly
+    /// `i64`'s in hundredths: `92233720368547758.07` is the top and `.08` is `22003`. That is the
+    /// whole type, and it is why it is not a `numeric`: a `numeric` has unbounded digits and a
+    /// scale that travels with the value, where every `money` has scale 2 and a fixed width.
+    ///
+    /// **Its comparison is the integer's** and it shares that with nothing: `money = numeric` is
+    /// `42883` on a real server, as is `money + 1`. ADR 0042's rule is met by keeping the
+    /// representation to itself — `Datum::Money` — rather than by storing cents in an `Int8`,
+    /// which would answer `bigint` to `pg_typeof` and admit every integer operator.
+    Money,
+    /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
+    /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
+    /// `can't quote Array` tests.
+    MoneyArray,
     /// `tsrange[]`, which `range_test.rb` declares as `t.tsrange :ts_ranges, array: true`.
     TsRangeArray,
     /// The `citext` extension's type: text whose **comparison folds case**.
@@ -350,7 +366,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 58] = [
+    pub const ALL: [ColumnType; 60] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -409,6 +425,8 @@ impl ColumnType {
         ColumnType::Int8RangeArray,
         ColumnType::Point,
         ColumnType::PointArray,
+        ColumnType::Money,
+        ColumnType::MoneyArray,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in
@@ -472,6 +490,16 @@ pub enum Datum {
         /// The canonical text, which is what `crate::value::range` renders.
         text: String,
     },
+    /// [`ColumnType::Money`]: **cents**, as an `i64`.
+    ///
+    /// A variant of its own rather than an `Int8` under a different column type, for the reason
+    /// [`Datum::Citext`] is one: the difference is in what the value *is*, and a comparison sees
+    /// only the values. Storing cents in an `Int8` would make `pg_typeof` answer `bigint` and
+    /// would let `money + 1` through, which is `42883` on a real server.
+    ///
+    /// The scale is not stored because it is not a property of the value: every `money` has two
+    /// decimal places, which is what makes the whole type an integer.
+    Money(i64),
     /// [`ColumnType::Citext`]: the text **as it was written**, compared **folded**.
     ///
     /// A variant of its own rather than a `Text` under a different column type, because the
@@ -554,7 +582,12 @@ impl PartialEq for Datum {
             // the number is compared.
             (Datum::Numeric(a), Datum::Numeric(b)) => a == b,
             (Datum::Int2(a), Datum::Int2(b)) => a == b,
-            (Datum::Timestamp(a), Datum::Timestamp(b)) | (Datum::Time(a), Datum::Time(b)) => a == b,
+            // **A money joins the two `i64` clocks**: for all three, representation equality *is*
+            // value equality — a count of cents has exactly one spelling, which is not true of
+            // the `numeric` two arms up.
+            (Datum::Money(a), Datum::Money(b))
+            | (Datum::Timestamp(a), Datum::Timestamp(b))
+            | (Datum::Time(a), Datum::Time(b)) => a == b,
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
             (Datum::Oid(a), Datum::Oid(b)) => a == b,
             // Representation equality, element by element: two arrays that print the same are
@@ -632,6 +665,7 @@ impl Datum {
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Citext(_) => ColumnType::Citext,
             Datum::Point { .. } => ColumnType::Point,
+            Datum::Money(_) => ColumnType::Money,
             Datum::Hstore(_) => ColumnType::Hstore,
             // **The inverse of `crate::row::range_subtype`, and it is not total.** `int4range`
             // and `int8range` are both ranges *of* an `int8` here — an `int4` is read as one

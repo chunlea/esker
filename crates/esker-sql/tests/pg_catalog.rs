@@ -197,6 +197,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
+            // **`money` is in the adapter's own list** and was one of the names it asked about
+            // and got nothing back for. `cash_in`, not `money_in`: the input function is named
+            // for the C type behind it.
+            vec!["790", "money", "0", ",", "cash_in", "\\N", "b", "0"],
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
             vec!["1042", "bpchar", "0", ",", "bpcharin", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
@@ -289,6 +293,18 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "199".to_owned(),
                 "_json".to_owned(),
                 "114".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            // `_money`, which a real server makes with the type — the adapter's list has had
+            // `790` in it all along and got nothing back for it until now.
+            vec![
+                "791".to_owned(),
+                "_money".to_owned(),
+                "790".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

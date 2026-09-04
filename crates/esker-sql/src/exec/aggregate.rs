@@ -160,6 +160,11 @@ impl Aggregation {
             // cannot overflow on a real server — and a `numeric` sums to `numeric`. A `float8`
             // stays itself.
             AggregateFunc::Sum => match arg {
+                // **The one `sum` that stays its argument's type and can overflow.** An `int8`
+                // widens to `numeric` on a real server precisely so that it cannot; a money has
+                // nowhere wider to go, so `sum(money)` past the range is `22003 money out of
+                // range` there and here.
+                ColumnType::Money => Ok(ColumnType::Money),
                 ColumnType::Int2 | ColumnType::Int4 => Ok(ColumnType::Int8),
                 ColumnType::Int8 | ColumnType::Numeric => Ok(ColumnType::Numeric),
                 ColumnType::Double => Ok(arg),
@@ -834,6 +839,9 @@ enum State {
     AvgFloat { sum: f64, seen: i64 },
     /// `sum(int2)` and `sum(int4)`, which widen to an `int8` and cannot overflow it.
     SumWide(Option<i64>),
+    /// `sum(money)`, which stays a money and therefore **can** overflow — cents in an `i64` with
+    /// nothing wider to widen to.
+    SumMoney(Option<i64>),
     /// `sum(int8)` and `sum(numeric)`, both of which answer a `numeric`.
     SumNumeric(Option<esker_keys::numeric::Numeric>),
     /// `avg` over any exact type: the running sum as a decimal, and the count to divide it by.
@@ -947,6 +955,7 @@ impl Accumulator {
     pub(super) fn new(spec: &AggregateSpec) -> Self {
         let state = match (spec.func, spec.arg_type) {
             (AggregateFunc::Count, _) => State::Count(0),
+            (AggregateFunc::Sum, Some(ColumnType::Money)) => State::SumMoney(None),
             (AggregateFunc::Sum, Some(ColumnType::Int2 | ColumnType::Int4)) => State::SumWide(None),
             (AggregateFunc::Sum, Some(ColumnType::Int8 | ColumnType::Numeric)) => {
                 State::SumNumeric(None)
@@ -1000,6 +1009,10 @@ impl Accumulator {
             (State::Count(count), _) => *count += 1,
             // `int2` and `int4` widen into an `int8`, which their sum cannot overflow: the
             // widest sum of `i32`s is bounded by the row count, and the group table is bounded.
+            (State::SumMoney(total), Datum::Money(value)) => {
+                let sum = total.unwrap_or(0);
+                *total = Some(sum.checked_add(*value).ok_or(SqlError::MoneyOutOfRange)?);
+            }
             (State::SumWide(total), Datum::Int2(value)) => {
                 *total = Some(total.unwrap_or(0) + i64::from(*value));
             }
@@ -1082,6 +1095,7 @@ impl Accumulator {
         match &self.state {
             State::Count(count) => Datum::Int8(*count),
             State::SumWide(total) => total.map_or(Datum::Null, Datum::Int8),
+            State::SumMoney(total) => total.map_or(Datum::Null, Datum::Money),
             State::SumNumeric(total) => total.clone().map_or(Datum::Null, Datum::Numeric),
             // A sum over no rows is NULL, and so is an average over none — the same rule, and
             // the reason the divisor is never zero below.

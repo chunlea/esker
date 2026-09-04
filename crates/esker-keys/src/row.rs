@@ -126,7 +126,13 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
             out.extend_from_slice(&x.to_le_bytes());
             out.extend_from_slice(&y.to_le_bytes());
         }
-        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
+        // **A money is its cents**, so it is written as the `i64` it is — eight bytes and no
+        // scale, because every `money` has the same one.
+        Datum::Int8(v)
+        | Datum::TimestampTz(v)
+        | Datum::Timestamp(v)
+        | Datum::Time(v)
+        | Datum::Money(v) => {
             out.extend_from_slice(&v.to_le_bytes());
         }
         // Four bytes, not eight. Nothing written before `int4` existed has a column of this type,
@@ -337,12 +343,17 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
-        ColumnType::Int8 | ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Double => {
+        ColumnType::Int8
+        | ColumnType::TimestampTz
+        | ColumnType::Timestamp
+        | ColumnType::Money
+        | ColumnType::Double => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
             let value = match ty {
                 ColumnType::Int8 => Datum::Int8(i64::from_le_bytes(*head)),
                 ColumnType::TimestampTz => Datum::TimestampTz(i64::from_le_bytes(*head)),
                 ColumnType::Timestamp => Datum::Timestamp(i64::from_le_bytes(*head)),
+                ColumnType::Money => Datum::Money(i64::from_le_bytes(*head)),
                 _ => Datum::Double(f64::from_le_bytes(*head)),
             };
             (value, rest)
@@ -413,7 +424,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::OidArray
-        | ColumnType::CitextArray => return decode_array(ty, bytes),
+        | ColumnType::CitextArray
+        | ColumnType::MoneyArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -570,7 +582,11 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // needs an order the type does not have. The column type is refused in
         // `decode_key_column`, which is where the error a caller sees comes from.
         Datum::Null | Datum::Point { .. } => {}
-        Datum::Int8(v) | Datum::TimestampTz(v) | Datum::Timestamp(v) | Datum::Time(v) => {
+        Datum::Int8(v)
+        | Datum::TimestampTz(v)
+        | Datum::Timestamp(v)
+        | Datum::Time(v)
+        | Datum::Money(v) => {
             codec::encode_i64(*v, out);
         }
         // Widened to the `i64` encoding rather than given one of its own: an index key has to sort
@@ -996,10 +1012,18 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::DoubleArray
         | ColumnType::UuidArray
         | ColumnType::OidArray
-        | ColumnType::CitextArray => return decode_key_array(ty, bytes),
+        | ColumnType::CitextArray
+        | ColumnType::MoneyArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
+        }
+        // **A money is an index key**, unlike every other type added since `point`: `CREATE INDEX`
+        // on one succeeds on a real server, and cents in an `i64` have exactly the order the key
+        // encoding gives them.
+        ColumnType::Money => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            (Datum::Money(value), rest)
         }
         // Read back **normalised**, which is what was written: an index key holds the number and
         // the row holds the scale it was spelled with. A decoder that claimed otherwise would be
@@ -1782,7 +1806,8 @@ mod tests {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
-            | ColumnType::CitextArray => {
+            | ColumnType::CitextArray
+            | ColumnType::MoneyArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 (
                     proptest::collection::vec(
@@ -1844,6 +1869,9 @@ mod tests {
             ColumnType::Citext => ".*"
                 .prop_map(|text: String| Datum::Citext(text.to_lowercase()))
                 .boxed(),
+            // The whole `i64`, because that is the whole type: `money`'s range is `i64` cents and
+            // both ends of it are real values a client can write.
+            ColumnType::Money => proptest::num::i64::ANY.prop_map(Datum::Money).boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",

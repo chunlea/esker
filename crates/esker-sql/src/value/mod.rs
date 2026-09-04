@@ -42,6 +42,7 @@ pub(crate) mod float;
 pub mod hstore;
 pub mod interval;
 pub(crate) mod json;
+pub mod money;
 pub mod numeric;
 pub mod oid;
 pub mod point;
@@ -516,6 +517,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
+        | ColumnType::MoneyArray
         // **And a user range**, which has no array type here: a real server builds `_floatrange`
         // with the type and `range_test.rb` never declares a column of one, so this is a named
         // gap rather than a guess at an oid that is allocated per database anyway.
@@ -530,6 +532,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::DateRange => 3913,
         ColumnType::NumRange => 3907,
         ColumnType::Int8Range => 3927,
+        // `_money`, measured beside the type it is over.
+        ColumnType::Money => 791,
         ColumnType::Point => 1017,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
@@ -631,7 +635,11 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // name resolves; what the mask would restrict is declared in `tests/interval.rs`.
         | ColumnType::Interval
         | ColumnType::Numeric => true,
-        ColumnType::Int8
+        // **A `money` has scale 2 and does not take one.** `information_schema` reports both
+        // `numeric_precision` and `numeric_scale` as NULL for a money column, measured — the
+        // `scale: 2` `ActiveRecord`'s schema dumper prints is the adapter's own constant.
+        ColumnType::Money
+        | ColumnType::Int8
         | ColumnType::Int4
         | ColumnType::Int2
         | ColumnType::Text
@@ -658,7 +666,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                        | ColumnType::FloatRange | ColumnType::VarcharRange
+                        | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
         | ColumnType::Point
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => false,
     }
@@ -770,6 +778,9 @@ impl PgType for ColumnType {
             ColumnType::DateRange => 3912,
             ColumnType::NumRange => 3906,
             ColumnType::Int8Range => 3926,
+            // **Not an extension's**: `money` is built in, so its oid is fixed like a range's.
+            ColumnType::Money => 790,
+            ColumnType::MoneyArray => 791,
             ColumnType::Point => 600,
             ColumnType::TsRangeArray => TSRANGE_ARRAY_OID,
             ColumnType::HstoreArray => HSTORE_ARRAY_OID,
@@ -850,6 +861,8 @@ impl PgType for ColumnType {
             ColumnType::VarcharRange => "varcharrange",
             ColumnType::Point => "point",
             ColumnType::PointArray => "point[]",
+            ColumnType::Money => "money",
+            ColumnType::MoneyArray => "money[]",
             ColumnType::TstzRangeArray => "tstzrange[]",
             ColumnType::Int4RangeArray => "int4range[]",
             ColumnType::DateRangeArray => "daterange[]",
@@ -912,6 +925,9 @@ impl PgType for ColumnType {
             | ColumnType::TimestampTz
             | ColumnType::Timestamp
             | ColumnType::Time
+            // **Eight, and `typstorage` `p`.** A `money` is a count of cents in an `i64` and not
+            // a varlena, which is exactly what bounds the type at `$92,233,720,368,547,758.07`.
+            | ColumnType::Money
             | ColumnType::Double => 8,
             // Variable length, which `pg_type.typlen` spells `-1` — measured for hstore in the
             // adapter's own boot query.
@@ -921,7 +937,7 @@ impl PgType for ColumnType {
             | ColumnType::TsRange
             | ColumnType::TstzRange
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                        | ColumnType::FloatRange | ColumnType::VarcharRange
+                        | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
             | ColumnType::Text
             | ColumnType::Varchar
@@ -1002,6 +1018,7 @@ impl PgDatum for Datum {
             Datum::Null => return None,
             Datum::Array(value) => array::to_text(value),
             Datum::Point { x, y } => point::to_text(*x, *y),
+            Datum::Money(cents) => money::to_text(*cents),
             Datum::Int8(v) => v.to_string(),
             Datum::Int4(v) => v.to_string(),
             Datum::Int2(v) => v.to_string(),
@@ -1050,6 +1067,7 @@ impl PgDatum for Datum {
                 let (x, y) = point::from_text(text)?;
                 Datum::Point { x, y }
             }
+            ColumnType::Money => Datum::Money(money::from_text(text)?),
             // The literal's *shape* is read here and each element by its own type's input
             // function, which is what makes `'{1,x}'::int[]` `int4`'s error and `'{a,,b}'` the
             // array's (`crate::value::array`).
@@ -1066,6 +1084,7 @@ impl PgDatum for Datum {
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
+            | ColumnType::MoneyArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1176,7 +1195,15 @@ impl PgDatum for Datum {
             // **A point joins them.** `point_send` writes the two coordinates big-endian and
             // nothing here has ever been asked for that shape — the suite reads a point as
             // text — so it is refused rather than guessed, exactly as the other three are.
-            Datum::Null | Datum::Numeric(_) | Datum::Array(_) | Datum::Point { .. } => {
+            //
+            // **And a money**, for the same reason and with the same shape unmeasured:
+            // `cash_send` writes the cents as eight big-endian bytes, which is easy to guess and
+            // has not been probed, and a guess here is a wrong parse of every value in a column.
+            Datum::Null
+            | Datum::Numeric(_)
+            | Datum::Array(_)
+            | Datum::Point { .. }
+            | Datum::Money(_) => {
                 return None;
             }
             // A `time` joins them: `time_send` is the microsecond count as eight big-endian
@@ -1215,10 +1242,11 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
-            // The mirror of `to_binary`: neither `point_recv`'s pair of coordinates nor
-            // `array_recv`'s shape has ever been read here, so a client that sends one is told
-            // so rather than given a value built from a guess.
-            ColumnType::Point
+            // The mirror of `to_binary`: neither `point_recv`'s pair of coordinates, nor
+            // `cash_recv`'s cents, nor `array_recv`'s shape has ever been read here, so a client
+            // that sends one is told so rather than given a value built from a guess.
+            ColumnType::Money
+            | ColumnType::Point
             | ColumnType::Int8Array
             | ColumnType::Int4Array
             | ColumnType::Int2Array
@@ -1232,6 +1260,7 @@ impl PgDatum for Datum {
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
+            | ColumnType::MoneyArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -1389,6 +1418,10 @@ impl PgDatum for Datum {
             // Plain integer order, and only against another `time`: this type compares with
             // nothing else, so there is no promotion arm to write beside it.
             | (Datum::Time(a), Datum::Time(b))
+            // **A money is the same shape**: cents in an `i64`, compared with cents and with
+            // nothing else — `money = numeric` and `money = bigint` are each `42883` on a real
+            // server, and `same_family` refuses the pair before this is reached.
+            | (Datum::Money(a), Datum::Money(b))
             // **The two timestamps compare across the zone as well as within it**, because
             // PostgreSQL has a `timestamp = timestamptz` operator and
             // `created_at = transaction_timestamp()` over a `timestamp` column is `t`. The
@@ -1578,6 +1611,10 @@ fn variant_rank(value: &Datum) -> u8 {
         // no rank would sort as some other type's.
         Datum::Array(_) | Datum::Point { .. } => 20,
         Datum::Bool(_) => 0,
+        // **Its own rank**, above every number: a money never meets one in a comparison a schema
+        // can produce (`same_family` refuses the pair), and a value with no rank of its own would
+        // sort as some other type's.
+        Datum::Money(_) => 22,
         // The two integer widths share a rank: they are one type to a comparison, and `pg_cmp`
         // answers the pair above rather than falling through to here.
         // An `oid` shares the integers' rank: it is one, and `pg_cmp` answers every pairing
@@ -1910,7 +1947,7 @@ mod tests {
                         | ColumnType::TsRange
                         | ColumnType::TstzRange
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                        | ColumnType::FloatRange | ColumnType::VarcharRange
+                        | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value

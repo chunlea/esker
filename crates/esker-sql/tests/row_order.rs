@@ -125,6 +125,10 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
 fn column_type(name: &str) -> ColumnType {
     match name {
         "int8" => ColumnType::Int8,
+        // Cents in an `i64`, so the order is the integer's — and both ends of the range are in
+        // the fixture, because a `money` really can hold either.
+        "money" => ColumnType::Money,
+        "money[]" => ColumnType::MoneyArray,
         "citext" => ColumnType::Citext,
         "int4" => ColumnType::Int4,
         "int2" => ColumnType::Int2,

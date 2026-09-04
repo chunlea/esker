@@ -1178,6 +1178,11 @@ fn placeholder(ty: ColumnType) -> Datum {
         // The origin, which is a point like any other: what stands in is never read, only its
         // type is.
         ColumnType::Point => Datum::Point { x: 0.0, y: 0.0 },
+        // Nothing, which is a money like any other: what stands in is never read, only its type.
+        ColumnType::Money => Datum::Money(0),
+        ColumnType::MoneyArray => {
+            Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::Money))
+        }
         // An empty array of the right element type: the shape a parameter takes before its value
         // arrives, and one that answers `column_type` correctly while it stands in.
         ColumnType::Int8Array

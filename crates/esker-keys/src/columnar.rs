@@ -122,6 +122,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::PointArray => 59,
         ColumnType::FloatRange => 60,
         ColumnType::VarcharRange => 61,
+        ColumnType::Money => 62,
+        ColumnType::MoneyArray => 63,
     }
 }
 
@@ -187,6 +189,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         59 => ColumnType::PointArray,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
+        62 => ColumnType::Money,
+        63 => ColumnType::MoneyArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

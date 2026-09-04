@@ -69,6 +69,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::CitextArray
+            | ColumnType::MoneyArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
@@ -153,6 +154,9 @@ mod tests {
             ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
             // A range's stored form is its canonical text; `empty` is the one value every subtype
             // has, which is enough to state the ordering property these tests are for.
+            // Cents, the whole `i64` of them: both ends of the range are values a client can
+            // write, and the ordering property is exactly the integer's.
+            ColumnType::Money => proptest::num::i64::ANY.prop_map(Datum::Money).boxed(),
             ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
             | ColumnType::FloatRange | ColumnType::VarcharRange => {
                 Just(Datum::Range {
