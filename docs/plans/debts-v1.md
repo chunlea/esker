@@ -3,7 +3,9 @@
 **Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
 list — three items that were reported as open turned out to be closed, and two that were not on the
 list are open (#5 and #8). Two more were opened and closed within a wave and are gone from this
-table; §2 records both. Each row names its site, a size, and who it belongs to.
+table, and **#7 has since been diagnosed and closed out of it**; §2 records all three. The numbers
+are quoted across lanes, so a closed row leaves a gap rather than renumbering the rows after it.
+Each row names its site, a size, and who it belongs to.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -20,7 +22,6 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 | 4 | **Cross-node deadlock detection.** The wait-for graph is node-local, which covers every deadlock two sessions of one `esker-sql` process can make. A cycle *across* nodes needs a graph both can see. Named in the code as a follow-on, and PD's job. | `crates/esker-sql/src/backend/locks.rs:46` | large — needs a PD-held graph | PD / pdha |
 | 5 | **`crash_through_the_client` starves under load.** Fails 6 runs in 10 under 24 spinning threads **in one container**, so it is not the network-namespace contention the harness fix addressed. It is **not a durability failure**: the round's own guard `acked > 0` fires, and the durability assertion at `:311` fired in none of the six. The child is killed on a **wall clock** while the writes it should interrupt are CPU-bound. | `crates/esker-client/tests/crash_through_the_client.rs:331` (c6's record says `:305`; the file has moved) | small — measure the kill point in acknowledged writes, or retry a round that acked none | client |
 | 6 | **`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`.** Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it as a standing flake with an owner and treats the exclusive pass as evidence it is the same contention rather than a defect of its own. | `crates/esker-cli/tests/cluster_start.rs` | small, and may be closed by the per-container network namespaces | cli |
-| 7 | **`esker-sql::join_cost::a_materialised_join_costs_what_it_pairs_and_not_the_cross_product`.** One failure in a full 3,281-test parallel run; 3/3 in isolation and green on the next two full runs. A timing-**ratio** test with a control, so load-sensitive by construction. Unexplained, not diagnosed. | `crates/esker-sql/tests/join_cost.rs` | small to diagnose; unknown to fix | h1 (join cost) |
 | 8 | **The Miri gate needs `-Zmiri-disable-isolation`, which the code could make unnecessary.** proptest's default `FileFailurePersistence` calls `std::env::current_dir` to place a `.proptest-regressions` file, and Miri refuses `getcwd` under isolation, so the run aborts with 22 tests unrun. Setting `failure_persistence: None` under `cfg(miri)` in the memtable's `ProptestConfig` would make the plain documented command true — and matters because the failure looks like the gate *failing* rather than the gate *not running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state the flag. | `crates/esker-engine/src/memtable/differential.rs:316` (`ProptestConfig::with_cases`) | ~3 lines | engine |
 
 ## 2. Reported as open, and closed on inspection
@@ -54,6 +55,28 @@ keystroke — an alias — changes the answer, which is what makes an enum the s
 Only a projection whose derived name is not its own column's is substituted, which is the whole of
 what differs and leaves every aggregated query on the path it was already taking.
 `tests/order_by_output_column.rs`.
+
+### #7 `join_cost` — **closed by c7's diagnosis and a change to the test's shape**
+
+Recorded as "unexplained, not diagnosed": one failure in a full parallel run, 3/3 in isolation.
+`docs/plans/debt-c7.md` §7 made it deterministic instead of counting runs — green at load 0, **red
+at 14**, green again at 40 and 80. Non-monotonic, so a race in the *measurement*, and the cost
+model was never in question.
+
+The test took its four cells strictly in sequence — subject small, subject large, then control
+small, control large — so **the control was measured after the subject rather than beside it**, and
+load arriving or departing between the arms moved `growth` and `control` independently. Cancelling
+load common to both arms is the one thing a control is for. The middle of the load curve is the
+danger zone precisely because at eighty threads both arms are slow together and the ratio is stable
+again.
+
+The arms are now interleaved: each round takes the subject and its control adjacently at each size,
+so the asserted figure is `(subject ÷ control at LARGE) ÷ (subject ÷ control at SMALL)` — the same
+growth-against-growth number, arranged so every division sits between two measurements taken next
+to each other. Five rounds, the **median** asserted, a discarded warm-up round, and the small case
+lifted from 250 rows to 1,000 because its 1.6 ms sample was the ratio's denominator and one
+preemption of a few milliseconds was an error of over 100% in it. The fixture inserts in batches,
+which is what pays for the larger sizes. `tests/join_cost.rs`.
 
 ## 3. ADR numbering
 

@@ -30,6 +30,26 @@
 //!
 //! The control is a statement over the same table that *must* grow with it, so a slow machine or a
 //! busy container moves both numbers and the comparison still says what it says.
+//!
+//! # The shape of the measurement, which was the bug
+//!
+//! This test was red on a loaded machine and green on an idle one, and `docs/plans/debt-c7.md` §7
+//! made it deterministic: green at load 0, **red at load 14**, green again at 40 and 80.
+//! Non-monotonic, so a race in the measurement rather than a slow test. It took all four cells in
+//! sequence — subject small, subject large, *then* control small, control large — so **the control
+//! was measured after the subject rather than beside it**, and load that arrived or departed
+//! between the arms moved them apart. Cancelling load common to both arms is the one thing a
+//! control is for.
+//!
+//! So the arms are interleaved: each round takes the subject and its control **adjacently at each
+//! size**, and the reported figure is `(subject ÷ control at LARGE) ÷ (subject ÷ control at
+//! SMALL)` — algebraically the same growth-against-growth number, arranged so each division is
+//! between two measurements taken next to each other. A burst during either pair is in that pair's
+//! numerator and denominator both. Rounds are repeated and the **median** is asserted, so a round
+//! that catches a preemption is outvoted rather than averaged in.
+//!
+//! And the small case is lifted off the noise floor. At 250 rows the denominator was a 1.6 ms
+//! sample, where one scheduler preemption of a few milliseconds is an error of over 100%.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -49,48 +69,99 @@ const CONTROL: &str = "SELECT count(*) FROM \"citations\"";
 
 /// The suite's fixture in miniature: `citation_id` is never set, so the self-join matches nothing
 /// and the answer is every row — which is exactly the case that pairs everything to find out.
+///
+/// The rows arrive in batches: the fixture is not what is being measured, and one `INSERT` per row
+/// was most of this file's wall clock once the sizes went up.
 fn node_of(rows: usize) -> parity::Node {
+    const PER_STATEMENT: usize = 500;
     let mut fixture =
         vec!["CREATE TABLE citations (id bigserial primary key, citation_id bigint)".to_owned()];
-    for _ in 0..rows {
-        fixture.push("INSERT INTO citations (citation_id) VALUES (NULL)".to_owned());
+    let mut written = 0;
+    while written < rows {
+        let batch = PER_STATEMENT.min(rows - written);
+        let values = vec!["(NULL)"; batch].join(", ");
+        fixture.push(format!(
+            "INSERT INTO citations (citation_id) VALUES {values}"
+        ));
+        written += batch;
     }
     let refs: Vec<&str> = fixture.iter().map(String::as_str).collect();
     parity::Node::new(&refs)
 }
 
-fn cost(rows: usize, sql: &str) -> (Duration, usize) {
-    let mut node = node_of(rows);
+/// The small case. Big enough that the subject takes tens of milliseconds, because it is the
+/// denominator of the ratio and at 250 rows it was a 1.6 ms sample.
+const SMALL: usize = 1_000;
+
+/// **Eight times `SMALL`**, which is the whole question: eight times the work, or sixty-four.
+const LARGE: usize = 8 * SMALL;
+
+/// How many times the four cells are taken. The median of the per-round figures is what is
+/// asserted, so one preempted round is outvoted.
+const ROUNDS: usize = 5;
+
+fn elapsed(node: &mut parity::Node, sql: &str) -> (Duration, usize) {
     let start = Instant::now();
     let answer = node.rows(sql);
     (start.elapsed(), answer.len())
 }
 
+/// Guards the division, and nothing more: a duration this small is a measurement that did not
+/// happen.
+fn seconds(of: Duration) -> f64 {
+    of.as_secs_f64().max(1e-6)
+}
+
+fn median(mut of: Vec<f64>) -> f64 {
+    of.sort_by(f64::total_cmp);
+    of[of.len() / 2]
+}
+
 /// **Eight times the rows must not be sixty-four times the work.**
 #[test]
 fn a_materialised_join_costs_what_it_pairs_and_not_the_cross_product() {
-    let (small, small_rows) = cost(250, JOIN);
-    let (large, large_rows) = cost(2_000, JOIN);
-    let (small_control, _) = cost(250, CONTROL);
-    let (large_control, _) = cost(2_000, CONTROL);
+    let mut small_node = node_of(SMALL);
+    let mut large_node = node_of(LARGE);
 
-    // The answer first: a cheap plan that is wrong is not the thing being asked for.
-    assert_eq!(small_rows, 250);
-    assert_eq!(large_rows, 2_000);
+    // The answer first: a cheap plan that is wrong is not the thing being asked for. This is also
+    // the warm-up — its timings are thrown away, because the first statement against a fresh node
+    // pays for state every later one finds already built.
+    assert_eq!(elapsed(&mut small_node, JOIN).1, SMALL);
+    assert_eq!(elapsed(&mut large_node, JOIN).1, LARGE);
+    elapsed(&mut small_node, CONTROL);
+    elapsed(&mut large_node, CONTROL);
 
-    let growth = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-    let control = (large_control.as_secs_f64() / small_control.as_secs_f64().max(1e-6)).max(1.0);
-    // **Against the control's growth, not scaled by it.** The control grows with the rows too —
-    // that is what makes it a control — so it measures the same eight-fold this join should show:
-    // a plan that pairs what matches lands near `1.0` here and one that pairs everything near
-    // `8.0`. Multiplying the bound by the control instead of dividing by it was this test's own
-    // first bug, and it let the unfixed executor pass.
-    let relative = growth / control;
+    let mut rounds = Vec::with_capacity(ROUNDS);
+    let mut witness = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        // Subject and control adjacent at each size. `small_cost` and `large_cost` are each a
+        // division between two measurements taken next to each other, so load that arrives during
+        // a pair lands in both halves of it.
+        let (small, _) = elapsed(&mut small_node, JOIN);
+        let (small_control, _) = elapsed(&mut small_node, CONTROL);
+        let (large, _) = elapsed(&mut large_node, JOIN);
+        let (large_control, _) = elapsed(&mut large_node, CONTROL);
+
+        let small_cost = seconds(small) / seconds(small_control);
+        let large_cost = seconds(large) / seconds(large_control);
+        // **Against the control's growth, not scaled by it.** The control grows with the rows too
+        // — that is what makes it a control — so it measures the same eight-fold this join should
+        // show: a plan that pairs what matches lands near `1.0` here and one that pairs everything
+        // near `8.0`. Multiplying the bound by the control instead of dividing by it was this
+        // test's own first bug, and it let the unfixed executor pass.
+        rounds.push(large_cost / small_cost);
+        witness.push(format!(
+            "{small:?}/{small_control:?} then {large:?}/{large_control:?}"
+        ));
+    }
+
+    let relative = median(rounds.clone());
     assert!(
         relative < 3.0,
-        "8x the rows cost {growth:.1}x the time where the control cost {control:.1}x \
-         ({relative:.1}x as much growth): {small:?} at 250 rows, {large:?} at 2000. \
-         A cross product grows about eight times faster than the control, not once."
+        "8x the rows cost {relative:.1}x as much work relative to the control (median of \
+         {rounds:.1?}). A cross product grows about eight times faster than the control, not \
+         once. Each round, as subject/control at {SMALL} rows then at {LARGE}: {}",
+        witness.join("; ")
     );
 }
 
