@@ -1,0 +1,21 @@
+crates/esker-proto/src/transport/tls.rs
+  s_49075263d2b3e7::t_041a40289bf559 572-575
+crates/esker-sql/src/pgwire/server.rs
+  s_49075263d2b3e7::t_3a5f9fd95c4fc1 581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fb8fcc022fe809cd38e434f9bd4472b83fa7bc96",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
