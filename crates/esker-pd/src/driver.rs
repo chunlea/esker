@@ -44,12 +44,14 @@ use std::sync::{Arc, RwLock};
 
 use esker_engine::{WriteBatch, WriteOptions};
 use esker_raft::{
-    Config, Entry, EntryKind, Index, LogStorage, Message, NodeId, RawNode, Role, Snapshot, Term,
+    ConfChange, ConfChangeKind, Config, Entry, EntryKind, Index, LogStorage, Message, NodeId,
+    RawNode, Role, Snapshot, Term,
 };
 
 use crate::command::Command;
 use crate::error::{PdError, Result};
 use crate::machine::{Answer, Machine};
+use crate::member::{MemberList, PdMember};
 use crate::raft_log::PdLogStorage;
 
 /// Messages the driver thread may queue before a sender starts blocking.
@@ -77,6 +79,42 @@ pub trait PdTransport: Send + Sync + fmt::Debug {
     /// Sends a tick's worth of messages. A failure is a dropped message and a log line, never an
     /// error the consensus layer has to reason about.
     fn send(&self, messages: Vec<Message>);
+
+    /// The group has changed; reach these members instead.
+    ///
+    /// Called from the driver thread at **append**, before the messages of the same `Ready` go out,
+    /// because a configuration is in force from the moment its entry is on disk (dissertation
+    /// §4.1) — so the member it adds has to be addressable *now*. This is
+    /// `esker_store::peer::learn_routes`' rule, and it exists there because the alternative was a
+    /// leader unable to address the peer it had just added.
+    ///
+    /// Infallible for [`PdTransport::send`]'s reason, and a **no-op by default** because most
+    /// implementations have nothing to do: a transport with a fixed peer set ignores it, and one
+    /// that resolves its target per message has already followed the change.
+    fn reconfigure(&self, _members: &MemberList) {}
+}
+
+/// The address a conf change carries, as UTF-8, or empty when it carries none.
+///
+/// `esker-raft` treats a change's context as opaque bytes — "a store id, a peer address", says the
+/// type — so this is the whole of the convention: the bytes *are* the address. Not length-prefixed
+/// and not versioned, because there is exactly one field and a second would be a different
+/// decision to write down.
+///
+/// Bytes that are not UTF-8 read as no address, which is the safe direction: the member keeps
+/// whatever address it already had rather than adopting a mangled one.
+fn address_in(change: &ConfChange) -> String {
+    String::from_utf8(change.context.to_vec()).unwrap_or_default()
+}
+
+/// A conf change that carries `address` for the member it names.
+#[must_use]
+pub fn conf_change_with_address(kind: ConfChangeKind, node: NodeId, address: &str) -> ConfChange {
+    ConfChange {
+        kind,
+        node,
+        context: bytes::Bytes::copy_from_slice(address.as_bytes()),
+    }
 }
 
 /// A transport for a group of one, which has nobody to talk to.
@@ -143,10 +181,23 @@ enum DriverMsg {
         command: Box<Command>,
         notify: Sender<Result<Answer>>,
     },
+    /// A membership change to propose; the answer comes back when it **applies**.
+    ProposeConfChange {
+        change: Box<ConfChange>,
+        notify: Sender<Result<Answer>>,
+    },
     /// Start an election now. Used once, by a single-member `Pd::open`.
     Campaign { notify: Sender<Result<()>> },
     /// A barrier: answer once everything posted before it has been driven.
     Settle { notify: Sender<()> },
+    /// How far each member has got, as only a leader can say.
+    Progress {
+        notify: Sender<Option<(Index, Vec<esker_raft::PeerProgress>)>>,
+    },
+    /// The membership in force.
+    ConfState {
+        notify: Sender<esker_raft::ConfState>,
+    },
 }
 
 struct Pending {
@@ -169,6 +220,12 @@ struct PdCore {
     machine: Arc<Machine>,
     transport: Arc<dyn PdTransport>,
     leadership: Arc<RwLock<Leadership>>,
+    /// The group this member believes it is in, shared with [`crate::pd::Pd`].
+    ///
+    /// Written **here**, at append, and read everywhere. A conf change is in force from the moment
+    /// its entry is on disk, so the address it carries has to be usable in the same `Ready`
+    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    members: Arc<RwLock<MemberList>>,
     id: NodeId,
     /// Proposals appended and not yet applied. Only ever populated on a leader.
     pending: Vec<Pending>,
@@ -231,6 +288,13 @@ impl PdCore {
                 .storage_mut()
                 .stage_ready(&mut batch, ready.hard_state, &ready.entries);
 
+            // **Route before send.** A configuration is in force from the moment its entry is on
+            // disk, so the member it adds has to be addressable *now* — the same `Ready` that
+            // carries the entry can carry the first message to that member. Staged into the same
+            // batch as the entry, so a restart never has a voting set its address book has not
+            // caught up with.
+            let rewired = self.learn_routes(&ready.entries, &mut batch)?;
+
             // **When nobody is waiting on a message, the persist and the applies are one write.**
             //
             // The ordering rule is *persist before send*, and a `Ready` with no messages has no
@@ -266,6 +330,13 @@ impl PdCore {
                 );
             }
 
+            // The transport is told after the write, not before: until the entry is durable this
+            // member has not agreed to anything, and a connection opened on an entry that is then
+            // truncated is a connection to a member of a group that never existed.
+            if let Some(members) = rewired {
+                self.transport.reconfigure(&members);
+            }
+
             // 2. Send. Taken rather than cloned: a `Ready`'s messages are moved out by design.
             let messages = std::mem::take(&mut ready.messages);
             if !messages.is_empty() {
@@ -291,6 +362,69 @@ impl PdCore {
         Ok(())
     }
 
+    /// Folds every conf change in `entries` into the address book, staging the record into `batch`.
+    ///
+    /// Returns the new membership when it moved, so the caller can tell the transport **after** the
+    /// batch is durable. `None` when nothing changed, which is the ordinary case and also the
+    /// replay case: a restart re-reads every conf change its log holds, and each one is already in
+    /// the record it is being folded into.
+    fn learn_routes(
+        &mut self,
+        entries: &[Entry],
+        batch: &mut WriteBatch,
+    ) -> Result<Option<MemberList>> {
+        if !entries
+            .iter()
+            .any(|entry| entry.kind == EntryKind::ConfChange)
+        {
+            return Ok(None);
+        }
+        let mut members = self.members()?;
+        let before = members.clone();
+        for entry in entries {
+            if entry.kind != EntryKind::ConfChange {
+                continue;
+            }
+            let change = ConfChange::decode(&entry.data).map_err(|error| {
+                PdError::corrupt("conf change", format!("at index {}: {error}", entry.index))
+            })?;
+            members = match change.kind {
+                // The address is in the change's own context, which is where `esker-raft` invites
+                // a caller to put exactly this. An `AddVoter` that is a *promotion* carries none,
+                // and then the address already held is the right one.
+                ConfChangeKind::AddVoter | ConfChangeKind::AddLearner => {
+                    let address = address_in(&change);
+                    if address.is_empty() && members.contains(change.node) {
+                        members
+                    } else {
+                        members.with(PdMember::new(change.node, address))?
+                    }
+                }
+                ConfChangeKind::Remove => members.without(change.node)?,
+            };
+        }
+        if members == before {
+            return Ok(None);
+        }
+        self.node
+            .storage_mut()
+            .stage_group(batch, members.group_id(), members.members())?;
+        *self
+            .members
+            .write()
+            .map_err(|_| PdError::internal("the placement driver's member lock is poisoned"))? =
+            members.clone();
+        Ok(Some(members))
+    }
+
+    fn members(&self) -> Result<MemberList> {
+        Ok(self
+            .members
+            .read()
+            .map_err(|_| PdError::internal("the placement driver's member lock is poisoned"))?
+            .clone())
+    }
+
     /// Applies one committed entry in a batch of its own, with its apply index in it.
     fn apply(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = WriteBatch::new();
@@ -307,13 +441,24 @@ impl PdCore {
     fn stage_apply(&mut self, entry: &Entry, batch: &mut WriteBatch) -> Result<Applying> {
         let mut took_office = None;
         let outcome = match entry.kind {
-            // Nothing here proposes one. `esker-raft`'s own empty entry on taking office is an
-            // `EntryKind::Normal` with no data, which decodes to nothing and applies to nothing.
+            // The state machine holds no membership, so there is nothing here to write: the
+            // voting set moved in the core when this entry was **appended**, and the address book
+            // moved beside it in `learn_routes`. What applying it means is that the change is now
+            // committed, which is what the operator waiting on it wanted to hear.
             EntryKind::ConfChange => {
-                tracing::warn!(
-                    index = entry.index,
-                    "a configuration change applied; placement-driver membership is static"
-                );
+                match ConfChange::decode(&entry.data) {
+                    Ok(change) => tracing::info!(
+                        index = entry.index,
+                        node = change.node,
+                        kind = ?change.kind,
+                        "a placement-driver membership change committed"
+                    ),
+                    Err(error) => tracing::error!(
+                        index = entry.index,
+                        %error,
+                        "a committed conf change will not decode"
+                    ),
+                }
                 Ok(Answer::Done)
             }
             EntryKind::Normal if entry.data.is_empty() => Ok(Answer::Done),
@@ -491,6 +636,39 @@ impl PdCore {
         });
     }
 
+    /// Proposes a membership change, tracked like any other proposal: the answer comes back when
+    /// the entry **applies**, not when it is accepted.
+    ///
+    /// `esker-raft` refuses one while another is appended and uncommitted, which is what keeps two
+    /// single-server changes from producing two disjoint majorities (dissertation §4.1). That
+    /// refusal reaches the operator as a busy error, and the command that got it is safe to run
+    /// again — it is a reconciliation ([`crate::pd::Pd::add_member`]).
+    fn propose_conf_change(&mut self, change: ConfChange, notify: Sender<Result<Answer>>) {
+        if self.node.role() != Role::Leader {
+            let _ = notify.send(Err(self.not_leader()));
+            return;
+        }
+        let before = self.node.status().last_index;
+        if let Err(error) = self.node.propose_conf_change(change) {
+            let _ = notify.send(Err(PdError::invalid(format!(
+                "the placement driver could not change its membership: {error}"
+            ))));
+            return;
+        }
+        let status = self.node.status();
+        if status.last_index == before {
+            let _ = notify.send(Err(PdError::internal(
+                "the membership change appended no entry",
+            )));
+            return;
+        }
+        self.pending.push(Pending {
+            index: status.last_index,
+            term: status.term,
+            notify,
+        });
+    }
+
     /// Installs a snapshot: the state machine's contents, and the log position they stand for.
     fn install(&mut self, snapshot: &Snapshot, batch: &mut WriteBatch) -> Result<()> {
         self.machine.install(&snapshot.data, batch)?;
@@ -594,6 +772,7 @@ impl PdDriver {
         storage: PdLogStorage,
         machine: Arc<Machine>,
         transport: Arc<dyn PdTransport>,
+        members: Arc<RwLock<MemberList>>,
     ) -> Result<Self> {
         let id = config.id;
         let node = RawNode::new(config, storage)
@@ -605,6 +784,7 @@ impl PdDriver {
             machine,
             transport,
             leadership: Arc::clone(&leadership),
+            members,
             id,
             pending: Vec::new(),
             taking_office: None,
@@ -688,6 +868,40 @@ impl PdDriver {
         self.post(DriverMsg::Tick)
     }
 
+    /// Proposes a membership change and waits for it to **apply**.
+    pub fn propose_conf_change(&self, change: ConfChange) -> Result<Answer> {
+        let (notify, answer) = channel();
+        self.post(DriverMsg::ProposeConfChange {
+            change: Box::new(change),
+            notify,
+        })?;
+        answer
+            .recv()
+            .map_err(|_| PdError::internal("the placement driver stopped before answering"))?
+    }
+
+    /// How far behind the leader each member is, and what this member has committed.
+    ///
+    /// `None` anywhere but a leader: `progress` is a leader's view of its followers and is empty
+    /// on everyone else. A caller that read an empty list as "everybody is caught up" would promote
+    /// a learner that had received nothing.
+    pub fn progress(&self) -> Result<Option<(Index, Vec<esker_raft::PeerProgress>)>> {
+        let (notify, answer) = channel();
+        self.post(DriverMsg::Progress { notify })?;
+        answer
+            .recv()
+            .map_err(|_| PdError::internal("the placement driver stopped before answering"))
+    }
+
+    /// The membership in force — the latest in the log, committed or not.
+    pub fn conf_state(&self) -> Result<esker_raft::ConfState> {
+        let (notify, answer) = channel();
+        self.post(DriverMsg::ConfState { notify })?;
+        answer
+            .recv()
+            .map_err(|_| PdError::internal("the placement driver stopped before answering"))
+    }
+
     /// Waits until everything posted before this call has been driven.
     ///
     /// A **barrier**, not a flush: it makes no request of its own and changes nothing. It exists
@@ -767,6 +981,19 @@ fn run(core: &mut PdCore, inbox: &Receiver<DriverMsg>) {
                 }
             }
             DriverMsg::Propose { command, notify } => core.propose(&command, notify),
+            DriverMsg::ProposeConfChange { change, notify } => {
+                core.propose_conf_change(*change, notify);
+            }
+            DriverMsg::Progress { notify } => {
+                let progress = (core.node.role() == Role::Leader)
+                    .then(|| (core.node.commit_index(), core.node.progress()));
+                let _ = notify.send(progress);
+                continue;
+            }
+            DriverMsg::ConfState { notify } => {
+                let _ = notify.send(core.node.conf_state());
+                continue;
+            }
             DriverMsg::Settle { notify } => {
                 // Driven below like everything else, and answered after. The channel is FIFO, so
                 // an answer here means every earlier tick, message and proposal has been through
@@ -812,7 +1039,7 @@ mod tests {
     use crate::{Clock, PdError};
     use esker_engine::{Db, Options, WalSyncMode, cf};
     use esker_raft::{ConfState, Config, Message, NodeId, Role};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
 
     /// A transport that keeps what it was handed, so a test can look at a group of three without
     /// a socket.
@@ -854,8 +1081,14 @@ mod tests {
         let machine = Arc::new(Machine::load(Arc::clone(&db), cf, clock).unwrap());
         let log = PdLogStorage::open(db, ConfState::from_voters(members.ids())).unwrap();
         let config = Config::new(id, members.ids(), 7);
-        let driver =
-            PdDriver::start(config, log, Arc::clone(&machine), transport).expect("the driver");
+        let driver = PdDriver::start(
+            config,
+            log,
+            Arc::clone(&machine),
+            transport,
+            Arc::new(RwLock::new(members.clone())),
+        )
+        .expect("the driver");
         Member {
             driver,
             machine,

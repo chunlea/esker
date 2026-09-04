@@ -264,6 +264,117 @@ impl Group {
         }
     }
 
+    /// Opens a member that was **not** in the founding group, as `esker pd serve --join` does.
+    ///
+    /// Its database is empty and its configuration is empty: it is a member of nothing until the
+    /// group tells it otherwise. What it is *told* is the group's id and its members, which is
+    /// exactly what `Pd::Members` answers and what
+    /// [ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// says a joining member is given.
+    fn admit(&mut self, id: NodeId, address: &str) -> Arc<Pd> {
+        let group_id = self
+            .at(self.leader().expect("a leader to join"))
+            .membership()
+            .group_id;
+        let joining = MemberList::joining(
+            self.members
+                .members()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(PdMember::new(id, address)))
+                .collect(),
+            group_id,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(self.clocks[0].now_ms()));
+        let pd = open(id, &joining, dir.path(), &clock, &self.wire);
+        self.wire.join(id, &pd);
+        self.pds.push(Arc::clone(&pd));
+        self.clocks.push(clock);
+        self.dirs.push(dir);
+        self.members = joining;
+        pd
+    }
+
+    /// Runs a blocking placement-driver call while ticking the group, and **fails** rather than
+    /// hanging.
+    ///
+    /// Every operator call on a group of more than one blocks: it is answered when its entry
+    /// *applies*, and applying may need the ticks this loop produces — a member noticed as gone, a
+    /// leader deposed. Calling one inline would be the module header's mistake one level up, the
+    /// test holding the thread that has to unblock it.
+    ///
+    /// A hang is the worst kind of red. It says nothing, it wedges whatever else is sharing the
+    /// machine, and it has to be read with a debugger instead of off the failure.
+    fn run<T: Send>(&self, what: &str, call: impl FnOnce() -> T + Send) -> T {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let flag = Arc::clone(&done);
+            let worker = scope.spawn(move || {
+                let outcome = call();
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                outcome
+            });
+            for _ in 0..(ELECTION_BUDGET * 4) {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                self.round();
+            }
+            assert!(
+                worker.is_finished(),
+                "{what} never returned, and joining it now would hang; the members believe {:?}",
+                self.beliefs()
+            );
+            worker.join().expect("the worker thread")
+        })
+    }
+
+    /// Runs `step` until it answers `true`. Each attempt goes through [`Group::run`].
+    fn until(&self, what: &str, step: impl Fn() -> esker_pd::Result<bool> + Sync) {
+        for _ in 0..ELECTION_BUDGET {
+            match self.run(what, &step) {
+                Ok(true) => return,
+                Ok(false) => self.round(),
+                Err(error) => panic!("{what}: {error}; the members believe {:?}", self.beliefs()),
+            }
+        }
+        panic!(
+            "{what} never answered done; the members believe {:?}",
+            self.beliefs()
+        );
+    }
+
+    /// Ticks until the serving member has stopped hearing from `id`.
+    ///
+    /// **Cutting a member off is not the same as the group knowing it is gone**, and the gap is a
+    /// whole election timeout: `recent_active` is reset on every one, so a member that died a tick
+    /// ago still reads as alive — honestly, because a tick ago it was. An operator removing a
+    /// member removes one that has been down for a while; a test that asked one tick after the cut
+    /// would be testing a question nobody asks.
+    fn wait_until_noticed(&self, id: NodeId) {
+        for _ in 0..(ELECTION_BUDGET * 2) {
+            let leader = self.leader().expect("a leader to notice with");
+            let seen = self
+                .at(leader)
+                .driver_progress()
+                .unwrap()
+                .and_then(|(_, progress)| {
+                    progress
+                        .iter()
+                        .find(|peer| peer.id == id)
+                        .map(|peer| peer.recent_active)
+                })
+                .unwrap_or(false);
+            if !seen {
+                return;
+            }
+            self.round();
+        }
+        panic!("member {id} was cut off and the group never noticed");
+    }
+
     /// Re-opens a member over the same directory.
     ///
     /// A **crash**, not a pause: it loses every scrap of memory it held — its allocator's position
@@ -878,6 +989,179 @@ fn a_new_leader_inherits_no_operator_and_re_derives_from_a_heartbeat() {
         "the new leader neither inherited an operator nor derived one, so the region is stuck"
     );
     assert_eq!(group.at(second).in_flight().unwrap().len(), 1);
+}
+
+/// **The recovery path the brief asks for: two of three, back to three of three.**
+///
+/// The order is the whole test. A learner does not count towards a quorum, so it can be added while
+/// a member is down; a voter cannot, because the configuration is in force from the moment its
+/// entry is appended and the entry that made the quorum three would need three to commit. So:
+/// add a learner, let it catch up, promote it, and only then remove the dead one — the same
+/// add-before-remove ADR 0013 states for region replicas, for the same arithmetic
+/// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md) §11.4).
+#[test]
+fn a_group_of_three_with_one_gone_recovers_to_three_of_three() {
+    let mut group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    let cluster_id = group
+        .at(leader)
+        .bootstrap(1, "127.0.0.1:20160")
+        .unwrap()
+        .cluster_id;
+    let before = group.at(leader).alloc_id(1).unwrap();
+
+    // One member goes, and stays gone. Two live of three: alive, and one failure from dead.
+    let dead = (1..=3).find(|id| *id != leader).unwrap();
+    group.wire.cut_off(dead);
+    let leader = group.elect_without(dead);
+
+    // A fourth joins. It is told the group's name, because it cannot derive one that would match.
+    let joiner = group.admit(4, "127.0.0.1:32382");
+    assert_eq!(
+        joiner.membership().group_id,
+        group.at(leader).membership().group_id,
+        "the joining member named a different group"
+    );
+
+    // Add, catch up, promote — one command, run until it says it is done.
+    group.until("adding member 4", || {
+        group.at(leader).add_member(4, "127.0.0.1:32382")
+    });
+    group.settle();
+
+    // It is a voter now, and it holds what the group holds.
+    let conf = group.at(leader).conf_state().unwrap();
+    assert!(conf.voters.contains(&4), "member 4 was never promoted");
+    assert!(conf.learners.is_empty(), "member 4 is still a learner");
+    assert_eq!(
+        joiner.cluster().unwrap().map(|cluster| cluster.cluster_id),
+        Some(cluster_id),
+        "the new member did not catch up on the state machine"
+    );
+
+    // And only now the dead one goes.
+    let remover = Arc::clone(group.at(leader));
+    group.until("removing the dead member", || remover.remove_member(dead));
+    group.settle();
+    let conf = group.at(leader).conf_state().unwrap();
+    assert!(
+        !conf.voters.contains(&dead),
+        "the dead member is still a voter"
+    );
+    assert_eq!(conf.voters.len(), 3, "the group did not settle at three");
+
+    // Three of three, and it still allocates above what it had handed out before any of this.
+    let after = group.at(leader).alloc_id(1).unwrap();
+    assert!(after > before, "an id went backwards across the recovery");
+    assert_eq!(group.at(leader).cluster_id().unwrap(), cluster_id);
+}
+
+/// **Killed mid-change.** The three proposals an add is made of are three places for a `kill -9`,
+/// and an operator who reruns the command must not be told the member already exists.
+///
+/// Here the kill is the member that *issued* it losing office — which is strictly harder than a
+/// crash, because a different member has to finish what this one started, from the log alone.
+#[test]
+fn an_add_interrupted_halfway_is_finished_by_whoever_is_leading_next() {
+    let mut group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    group.at(leader).bootstrap(1, "127.0.0.1:20160").unwrap();
+    group.admit(4, "127.0.0.1:32382");
+
+    // One step only: member 4 is a learner and nothing more.
+    assert!(
+        !group.at(leader).add_member(4, "127.0.0.1:32382").unwrap(),
+        "one step should not have finished the add"
+    );
+    group.settle();
+    let conf = group.at(leader).conf_state().unwrap();
+    assert!(conf.learners.contains(&4), "member 4 is not a learner");
+    assert!(!conf.voters.contains(&4));
+
+    // And now the member that asked for it is gone.
+    group.wire.cut_off(leader);
+    let next = group.elect_without(leader);
+    assert_ne!(next, leader);
+
+    // The successor finishes it, from what the log says rather than from anything it was told.
+    let adder = Arc::clone(group.at(next));
+    group.until("finishing the add", || {
+        adder.add_member(4, "127.0.0.1:32382")
+    });
+    group.settle();
+    assert!(
+        group.at(next).conf_state().unwrap().voters.contains(&4),
+        "the successor did not finish the add"
+    );
+
+    // Idempotent: running it again on a member that is already a voter answers done and proposes
+    // nothing, which is what makes it safe for an operator to retry after any failure.
+    let term = group.at(next).leadership().term;
+    assert!(group.at(next).add_member(4, "127.0.0.1:32382").unwrap());
+    assert_eq!(group.at(next).leadership().term, term);
+    assert_eq!(group.at(next).conf_state().unwrap().voters.len(), 4);
+}
+
+/// A placement driver may not remove its way out of a quorum, because undoing that needs the
+/// quorum it just lost.
+///
+/// The group is given time to **notice** the member is gone first, which is both what an operator
+/// would do and what makes the question meaningful: `recent_active` is reset every election
+/// timeout, so one tick after a member dies it still reads as alive — and PD saying "everybody is
+/// here" a tick after a death is honest rather than wrong.
+#[test]
+fn a_removal_that_would_lose_the_quorum_is_refused() {
+    let group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    group
+        .run("bootstrapping", || {
+            group.at(leader).bootstrap(1, "127.0.0.1:20160")
+        })
+        .unwrap();
+
+    // One member down: two live of three, quorum two.
+    let dead = (1..=3).find(|id| *id != leader).unwrap();
+    group.wire.cut_off(dead);
+    let leader = group.elect_without(dead);
+    group.wait_until_noticed(dead);
+    let other = (1..=3).find(|id| *id != leader && *id != dead).unwrap();
+
+    // Removing the live one would leave one live of two, which is not a quorum.
+    let refused = group.run("removing the live peer", || {
+        group.at(leader).remove_member(other)
+    });
+    assert!(
+        matches!(refused, Err(PdError::Invalid { .. })),
+        "removing the last live peer was allowed: {refused:?}"
+    );
+    assert_eq!(
+        group.at(leader).conf_state().unwrap().voters.len(),
+        3,
+        "the refusal still changed the membership"
+    );
+
+    // Removing the member that is *already* gone is the right move, and is allowed.
+    group.until("removing the dead member", || {
+        group.at(leader).remove_member(dead)
+    });
+    group.settle();
+    let conf = group.at(leader).conf_state().unwrap();
+    assert_eq!(conf.voters.len(), 2);
+    assert!(!conf.voters.contains(&dead));
+}
+
+/// The last member cannot remove itself: a group with no placement driver is not a smaller group.
+#[test]
+fn the_last_member_cannot_remove_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::new(1_700_000_000_000));
+    let pd = Pd::open(
+        dir.path(),
+        PdOptions::with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+    )
+    .unwrap();
+    assert!(matches!(pd.remove_member(1), Err(PdError::Invalid { .. })));
+    assert!(pd.is_serving(), "the refusal cost it its office");
 }
 
 /// A group of one is what every other test in this crate builds, and it must not need any of the
