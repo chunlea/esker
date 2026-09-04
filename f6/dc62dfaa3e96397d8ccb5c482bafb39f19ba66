@@ -1,0 +1,27 @@
+crates/esker-sql/tests/fixtures/README.md
+  s_2bed4ac2b1c944::t_ddee0d33fd0e04 1-29
+crates/esker-sql/tests/fixtures/ca-cert.pem
+  s_2bed4ac2b1c944::t_2ae547789c0f1d 1-11
+crates/esker-sql/tests/fixtures/localhost-test-cert.pem
+  s_2bed4ac2b1c944::t_81b97c11201dad 1-12
+crates/esker-sql/tests/fixtures/localhost-test-key.pem
+  s_2bed4ac2b1c944::t_3978f31bc4efaa 1-5
+crates/esker-sql/tests/pgwire_tls.rs
+  s_2bed4ac2b1c944::t_713ab3410af788 1-505
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f6dc62dfaa3e96397d8ccb5c482bafb39f19ba66",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
