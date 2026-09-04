@@ -2654,19 +2654,15 @@ fn array_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
     })
 }
 
-/// One operand of `AND`/`OR` as a three-valued boolean, or PostgreSQL's `42804`.
+/// One operand of `AND`/`OR` as a three-valued boolean, or PostgreSQL's `42804`, naming the
+/// construct the condition belongs to.
 ///
 /// **The message names the type and never the value.** It was built from the datum a row happened
 /// to hold — `not Text("one")` — which leaks a user's row into an error and gives one query a
 /// different message per row. A real server says `argument of AND must be type boolean, not type
-/// character varying`, with the word `type` twice, and the operand named singly rather than as the
+/// character varying`, with the word `type` twice, and names the one construct rather than the
 /// pair `AND/OR`: measured, along with `argument of CASE/WHEN` for the other place a condition is
 /// read.
-fn truth(value: &Datum) -> Result<Option<bool>> {
-    truth_of(value, "AND/OR")
-}
-
-/// [`truth`], naming the construct the condition belongs to — `AND`, `OR` or `CASE/WHEN`.
 fn truth_of(value: &Datum, construct: &'static str) -> Result<Option<bool>> {
     match value {
         Datum::Bool(value) => Ok(Some(*value)),

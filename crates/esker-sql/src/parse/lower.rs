@@ -4474,7 +4474,7 @@ fn lower_condition(expr: &Expr, boolean: bool) -> Result<plan::Expr> {
         && let Value::SingleQuotedString(text) = &value.value
     {
         return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-            <Datum as crate::value::PgDatum>::from_text(ColumnType::Bool, text)?,
+            <Datum as PgDatum>::from_text(ColumnType::Bool, text)?,
         ))));
     }
     lower_expr(expr)

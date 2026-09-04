@@ -603,8 +603,8 @@ pub(super) fn ordinal(position: i64, select: &Select, clause: &str) -> Result<Ex
 /// in both — measured, `GROUP BY f.id HAVING f.name = 'one'` runs.
 fn widen_for_dependencies(
     keys: &mut Vec<Expr>,
-    key_types: &mut Vec<crate::value::ColumnType>,
-    select: &crate::plan::Select,
+    key_types: &mut Vec<ColumnType>,
+    select: &Select,
     scope: &Scope<'_>,
 ) -> Result<()> {
     if keys.is_empty() {
@@ -639,7 +639,7 @@ fn widen_for_dependencies(
         Ok(())
     };
     for item in &select.projection {
-        if let crate::plan::SelectItem::Expr { expr, .. } = item {
+        if let SelectItem::Expr { expr, .. } = item {
             consider(expr)?;
         }
     }

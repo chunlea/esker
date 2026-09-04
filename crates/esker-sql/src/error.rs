@@ -2071,7 +2071,6 @@ impl SqlError {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
-            SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
@@ -2246,7 +2245,11 @@ impl SqlError {
             | SqlError::ParameterOutOfRange { .. }
             | SqlError::InvalidDestinationEncoding(_)
             | SqlError::ZeroStep
-            | SqlError::InvalidCreateDatabaseStrategy(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::InvalidCreateDatabaseStrategy(_)
+            // **`22023`, not the `42704` the identical sentence takes for `CREATE DATABASE … OWNER`.**
+            // PostgreSQL reads an authorization name as a *parameter value* and an owner as an
+            // object reference. Measured, both.
+            | SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
