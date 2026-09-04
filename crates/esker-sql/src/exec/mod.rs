@@ -269,11 +269,25 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
             // PostgreSQL's `EvalPlanQual`, and without it a single `UPDATE … SET n = n + 1` under
             // three writers raised `40001` a hundred times in twelve hundred transactions.
             crate::backend::Lock::Taken if waited == 0 => {
-                if waits && txn.changed_since_statement(key)? {
+                if !txn.changed_since_statement(key)? {
+                    return Ok(());
+                }
+                // **The row moved under this statement, and what to do about it is the level.**
+                if waits {
+                    // READ COMMITTED may take a newer snapshot, so it re-runs on what is there.
                     txn.restart_statement()?;
                     return Err(SqlError::StatementMustRestart);
                 }
-                return Ok(());
+                // REPEATABLE READ and SERIALIZABLE keep one snapshot for their whole life, so
+                // there is no re-read available to them and the write cannot be placed: `40001`
+                // **from the statement**, which is where PostgreSQL raises it. Deferring it to the
+                // commit finds the same conflict with the same code, one statement too late — and
+                // a client that wrapped the statement in `assert_raises` has already moved on.
+                // `transaction_nested_test.rb` is exactly that client.
+                return Err(SqlError::SerializationFailure {
+                    message: "a key was written after this transaction's snapshot".to_owned(),
+                    key: Some(key.to_vec()),
+                });
             }
             crate::backend::Lock::Taken => {
                 txn.restart_statement()?;
