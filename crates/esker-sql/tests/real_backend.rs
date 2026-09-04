@@ -413,3 +413,114 @@ fn a_diff_across_a_checkpoint_runs_against_real_stores() {
     );
     other.run("ROLLBACK").unwrap();
 }
+
+/// A re-created table's `bigserial` starts at **1**, on the connection that dropped the old one.
+///
+/// `range_test.rb` is what asks: every one of its 46 tests drops `postgresql_ranges`, re-creates
+/// it, loads fixtures with **explicit** ids 101-105, and one of them then `create!`s a row and
+/// reads `PostgresqlRange.first` — `ORDER BY id ASC LIMIT 1`. On a real server the new row's id is
+/// 1, below every fixture, so `.first` is the row the test just wrote. Run 72's capture shows this
+/// node handing out **705** there, so `.first` returned fixture 101 and the test read a value it
+/// had not written. It passes alone and fails in the file, which is the shape of a counter that
+/// remembers something across the drop.
+///
+/// **Explicitly on the real backend and on one session**, because that is where the two things
+/// that could remember live: a sequence's stored counter is a key in the catalog region, and the
+/// reserved block ([`esker_sql::catalog::SEQUENCE_BATCH`]) is in the `Executor` that a connection
+/// owns. `MemoryBackend` answers 1 for this shape, so a green in-process test would have proved
+/// nothing about either.
+#[test]
+fn a_re_created_serial_starts_at_one_on_the_session_that_dropped_it() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+
+    // Five rounds, because the capture's ids step by whole blocks of 32 rather than by one: a
+    // counter that survives one drop survives all of them, and a single round would only catch a
+    // remembered *value* and not a remembered *block*.
+    for round in 1..=5 {
+        // The capture's own DDL, `UNLOGGED` and the two `ALTER`s included, because the question is
+        // what a re-created table's sequence remembers and every one of those touches the catalog.
+        session
+            .run(
+                "CREATE UNLOGGED TABLE pr (id bigserial PRIMARY KEY, note text, \
+                 int4_range int4range, int8_range int8range)",
+            )
+            .unwrap();
+        session.run("ALTER TABLE pr ADD ts_range tsrange").unwrap();
+        // The fixtures, with their ids written out — which is what leaves a real server's sequence
+        // untouched and is why its next value is 1.
+        for id in 101..=105 {
+            session
+                .run(&format!(
+                    "INSERT INTO pr (id, note) VALUES ({id}, 'fixture')"
+                ))
+                .unwrap();
+        }
+        session
+            .run("INSERT INTO pr (note) VALUES ('created')")
+            .unwrap();
+        assert_eq!(
+            session.rows("SELECT id, note FROM pr ORDER BY id ASC LIMIT 1"),
+            [[Some("1".to_owned()), Some("created".to_owned())]],
+            "round {round}: the created row is the first row, as it is on a real server"
+        );
+        session.run("DROP TABLE pr").unwrap();
+        // **The reserved block goes with the sequence.** A session takes
+        // `catalog::SEQUENCE_BATCH` values at a time and serves them from memory, keyed by the
+        // sequence's id; nothing was forgetting them, so a connection that created and dropped
+        // tables collected one entry per drop for its whole life — which is what the Rails
+        // harness's connection is. It cannot hand out a wrong value, because
+        // `catalog::allocate_id` never reuses an id and a re-created sequence is a different
+        // sequence, so this is a leak and the round above is what proves the values are right.
+        assert_eq!(
+            session.executor.held_sequence_blocks(),
+            0,
+            "round {round}: the dropped table's sequence block is still held"
+        );
+    }
+}
+
+/// The same question with a **connection pool**, which is what `ActiveRecord` has.
+///
+/// A session reserves [`esker_sql::catalog::SEQUENCE_BATCH`] values and serves them from memory,
+/// so two connections on one sequence take two blocks and the second one's first value is 33 —
+/// the declared `CACHE 32` divergence, and PostgreSQL with `CACHE 32` would do the same. What must
+/// **not** survive is the block outliving the sequence: after the table is dropped and re-created,
+/// every connection has to see a sequence that starts at 1 again.
+#[test]
+fn a_pool_of_connections_sees_a_re_created_sequence_start_over() {
+    let cluster = Cluster::start();
+    let mut ddl = cluster.session();
+    let mut writers: Vec<_> = (0..3).map(|_| cluster.session()).collect();
+
+    for round in 1..=3 {
+        ddl.run("CREATE TABLE pp (id bigserial PRIMARY KEY, note text)")
+            .unwrap();
+        for id in 101..=105 {
+            ddl.run(&format!(
+                "INSERT INTO pp (id, note) VALUES ({id}, 'fixture')"
+            ))
+            .unwrap();
+        }
+        // Every writer takes its own block, so the ids differ; what they share is that all of them
+        // are **below the fixtures**, which is what `.first` reads.
+        for (at, writer) in writers.iter_mut().enumerate() {
+            writer
+                .run(&format!("INSERT INTO pp (note) VALUES ('w{at}')"))
+                .unwrap();
+        }
+        let first = ddl.rows("SELECT id FROM pp ORDER BY id ASC LIMIT 1");
+        assert_eq!(
+            first,
+            [[Some("1".to_owned())]],
+            "round {round}: the lowest id is a created row's, not a fixture's"
+        );
+        let created = ddl.rows("SELECT count(*) FROM pp WHERE id < 101");
+        assert_eq!(
+            created,
+            [[Some("3".to_owned())]],
+            "round {round}: all three writers' rows are below the fixtures"
+        );
+        ddl.run("DROP TABLE pp").unwrap();
+    }
+}
