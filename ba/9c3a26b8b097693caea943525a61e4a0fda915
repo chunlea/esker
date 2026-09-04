@@ -1,0 +1,25 @@
+crates/esker-pd/src/member.rs
+  s_49075263d2b3e7::t_cb0e37e3243574 34-39,74-85,94-114,118-146,192-195,245-269,273,362-424,427-431
+crates/esker-pd/src/pd/mod.rs
+  s_49075263d2b3e7::t_78444f4bea93a8 36,38,327-334,444,448-452,455,457,467,496,552-555,557-567,589-590,600,621,623,627,1101,1162-1224
+crates/esker-pd/src/raft_log.rs
+  s_49075263d2b3e7::t_7f39c6c04d61d6 49,51-62,177-190,215-221,232,235-237,257-272,287-288,413-455,649,652,765-769,779,782-834
+crates/esker-pd/tests/membership.rs
+  s_49075263d2b3e7::t_6cf2dbe9409c97 1-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ba9c3a26b8b097693caea943525a61e4a0fda915",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
