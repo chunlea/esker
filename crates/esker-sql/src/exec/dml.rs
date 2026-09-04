@@ -175,6 +175,15 @@ pub(super) fn column_default_value(
     // (`fill_generated`), and the same failure is the same `Internal`: text this node wrote and
     // can no longer read is a broken catalog, not a bad statement.
     let parsed = crate::parse::parse_stored_expr(expr).map_err(|error| {
+        // **A user's function is the one failure here that is not a broken catalog.** A default
+        // may name a function this node stored and cannot run, and `CREATE TABLE` accepted it
+        // because the catalog has it (`crate::exec::ddl::refuse_unknown_default_function`). So
+        // that one keeps its own `0A000` naming the function, at the point of use — where a real
+        // server evaluates it — and everything else stays `XX000`, which says *this server has a
+        // bug* and must not be said about a statement a user can write.
+        if crate::parse::lower::unsupported_function_name(&error).is_some() {
+            return error;
+        }
         SqlError::Internal(format!(
             "the stored default of {}.{} no longer parses: {error}",
             table.name, column.name
@@ -316,6 +325,40 @@ fn refuse_matview_write(table: &TableDef, named: &str) -> Result<()> {
     Ok(())
 }
 
+/// A new row with every column at its default — except the ones this statement supplies.
+///
+/// **A column the statement supplies does not have its default evaluated.** It would be overwritten
+/// by the value, and evaluating it is not free of consequence: a default that cannot be evaluated
+/// refused the whole row — `INSERT INTO t (id, …) VALUES (…)` into a table whose `id` defaults to a
+/// function this node stores and cannot run was `0A000` for a row that never needed the function.
+///
+/// `DEFAULT` written for a column is **not** supplying it — that spelling asks for the default — so
+/// it is not in this set, and the row keeps the value computed here including its sequence.
+fn row_at_defaults(
+    table: &TableDef,
+    targets: &[usize],
+    values: &[crate::plan::Expr],
+    txn: &dyn Txn,
+) -> Result<Vec<Datum>> {
+    let supplied: std::collections::BTreeSet<usize> = targets
+        .iter()
+        .zip(values)
+        .filter(|(_, expr)| !matches!(expr, crate::plan::Expr::Default))
+        .map(|(target, _)| *target)
+        .collect();
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(at, column)| {
+            if supplied.contains(&at) {
+                return Ok(Datum::Null);
+            }
+            column_default_value(table, column, txn)
+        })
+        .collect()
+}
+
 pub(super) fn insert(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -352,11 +395,14 @@ pub(super) fn insert(
         // The default and the *missing* value are different fields and this is the one that reads
         // the default (`crate::catalog::ColumnDef`). A row written now is written at full width,
         // so nothing about it is missing; the other field answers for rows that predate the column.
-        let mut row: Vec<Datum> = table
-            .columns
-            .iter()
-            .map(|column| column_default_value(&table, column, &*txn))
-            .collect::<Result<_>>()?;
+        //
+        // **A column the statement supplies does not have its default evaluated.** It would be
+        // overwritten on the next line, and evaluating it is not free of consequence: a default
+        // that cannot be evaluated refused the whole row — `INSERT INTO t (id, …) VALUES (…)`
+        // into a table whose `id` defaults to a function this node stores and cannot run was
+        // `0A000` for a row that never needed the function. `DEFAULT` written for a column is not
+        // supplying it — that spelling *asks* for the default — so it is not in this set.
+        let mut row = row_at_defaults(&table, &targets, values, &*txn)?;
         for (target, expr) in targets.iter().zip(values) {
             let column = &table.columns[*target];
             // `DEFAULT` written for a column is the column keeping its own default, which is what

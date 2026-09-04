@@ -1403,8 +1403,28 @@ pub(super) fn column_default(
     // does not have refused when the table is created** rather than when the first row is written,
     // which is where a real server raises it — and it is also what refuses `random() * 100` by
     // naming the operator, since this node has no arithmetic at all.
-    lower_expr(expr)?;
+    //
+    // **A name the vocabulary lacks is the one thing lowering cannot decide**, because a user may
+    // have declared a function of that name and only the catalog knows. So it is carried out
+    // rather than refused, and `crate::exec::ddl` — which can see the catalog — refuses the ones
+    // nobody declared. Everything else about the expression is still refused here.
+    if let Err(error) = lower_expr(expr)
+        && unsupported_function_name(&error).is_none()
+    {
+        return Err(error);
+    }
     Ok((None, Some(expr.to_string())))
+}
+
+/// The function name out of the `0A000` this module raises for one it does not have.
+///
+/// **Lives beside the two places that build that message**, so the two cannot drift apart
+/// unnoticed: it is a reading of this module's own sentence and not of PostgreSQL's.
+pub(crate) fn unsupported_function_name(error: &SqlError) -> Option<&str> {
+    match error {
+        SqlError::FeatureNotSupported(text) => text.strip_prefix("the function "),
+        _ => None,
+    }
 }
 
 /// How a real server prints a literal that was written with a cast: `(0)::bigint`, `'x'::text`.
