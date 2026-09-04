@@ -1,0 +1,14 @@
+crates/esker-engine/src/memtable/skiplist.rs
+  h_44076b318daf9c 461-476
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6c43619b040a3884c9e4d745777f5d3290b24f5f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
