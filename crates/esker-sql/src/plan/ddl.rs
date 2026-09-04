@@ -859,7 +859,7 @@ pub enum AlterTableAction {
         /// The column, folded.
         column: String,
         /// The target type.
-        ty: crate::value::ColumnType,
+        ty: ColumnType,
         /// Its `atttypmod`, or `-1`.
         typmod: i32,
         /// The type a `USING` casts this column to, when the statement wrote one.
@@ -867,7 +867,7 @@ pub enum AlterTableAction {
         /// **Not necessarily the target type.** `ALTER COLUMN s TYPE character varying USING
         /// s::text` casts to `text` and lands in `varchar`, which PostgreSQL takes because the
         /// second hop is an assignment cast — so both hops are checked rather than one.
-        using: Option<crate::value::ColumnType>,
+        using: Option<ColumnType>,
     },
     /// `VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
     ///

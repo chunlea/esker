@@ -662,16 +662,14 @@ fn converts_implicitly(from: ColumnType, to: ColumnType) -> bool {
     if string(from) && string(to) {
         return true;
     }
-    // Widening within the integers, and every integer to text.
+    // The two timestamps are one representation under two labels, and the integers convert **both
+    // directions** — measured: a narrowing is implicit too, and a value that no longer fits is
+    // that row's error rather than the statement's. Assuming "widening only" refused
+    // `bigint -> integer`, which PostgreSQL takes.
     matches!(
         (from, to),
-        (Timestamp, TimestampTz)
-            | (TimestampTz, Timestamp)
-            // **Both directions**, measured: a narrowing is implicit too, and a value that no
-            // longer fits is that row's error rather than the statement's. Assuming "widening
-            // only" refused `bigint -> integer`, which PostgreSQL takes.
-            | (Int2 | Int4 | Int8, Int2 | Int4 | Int8)
-            | (Int8 | Int4 | Int2, Text | Varchar)
+        (Timestamp | TimestampTz, Timestamp | TimestampTz)
+            | (Int2 | Int4 | Int8, Int2 | Int4 | Int8 | Text | Varchar)
     ) || matches!(
         (from, to),
         // The array pairs whose element pair is itself implicit. Written out rather than derived:
@@ -817,16 +815,21 @@ fn set_column_type(
         Ok(())
     })?;
 
-    let mut converted = updated.clone();
-    converted.columns[at].ty = ty;
-    converted.columns[at].typmod = typmod;
-    if let Some(default) = updated.columns[at].default.clone() {
-        converted.columns[at].default = Some(convert_datum(from, ty, &default)?);
-    }
-    if let Some(missing) = updated.columns[at].missing.clone() {
-        converted.columns[at].missing = Some(convert_datum(from, ty, &missing)?);
-    }
-    let types = converted.column_types();
+    // The column's own values move with it: a default and a missing value are stored as data and
+    // would otherwise be read back under the new type without ever having been converted.
+    let default = match &updated.columns[at].default {
+        Some(value) => Some(convert_datum(from, ty, value)?),
+        None => None,
+    };
+    let missing = match &updated.columns[at].missing {
+        Some(value) => Some(convert_datum(from, ty, value)?),
+        None => None,
+    };
+    updated.columns[at].ty = ty;
+    updated.columns[at].typmod = typmod;
+    updated.columns[at].default = default;
+    updated.columns[at].missing = missing;
+    let types = updated.column_types();
     for (key, mut row) in rows {
         // The typmod is applied per row and not compared once: `varchar(5)` over a nineteen
         // character value is `22001`, and which row raises it depends on the data. `fit_to_typmod`
@@ -834,10 +837,6 @@ fn set_column_type(
         row[at] = crate::value::fit_to_typmod(convert_datum(from, ty, &row[at])?, ty, typmod)?;
         txn.put(&key, &crate::row::encode_row(&types, &row)?);
     }
-    updated.columns[at].ty = ty;
-    updated.columns[at].typmod = typmod;
-    updated.columns[at].default = converted.columns[at].default.clone();
-    updated.columns[at].missing = converted.columns[at].missing.clone();
     Ok(())
 }
 
@@ -3718,11 +3717,12 @@ fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
             | AlterTableAction::AddUnique(_),
         ) => "ADD CONSTRAINT",
         Some(AlterTableAction::DropConstraint { .. }) => "DROP CONSTRAINT",
-        Some(AlterTableAction::SetDefault { .. } | AlterTableAction::SetNotNull { .. }) => {
-            "ALTER COLUMN"
-        }
+        Some(
+            AlterTableAction::SetDefault { .. }
+            | AlterTableAction::SetNotNull { .. }
+            | AlterTableAction::SetColumnType { .. },
+        ) => "ALTER COLUMN",
         Some(AlterTableAction::ValidateConstraint(_)) => "VALIDATE CONSTRAINT",
-        Some(AlterTableAction::SetColumnType { .. }) => "ALTER COLUMN",
         Some(_) => "ALTER",
     }
 }

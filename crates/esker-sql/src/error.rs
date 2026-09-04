@@ -2126,8 +2126,6 @@ impl SqlError {
                 Severity::Warning => sqlstate::WARNING,
                 _ => sqlstate::SUCCESSFUL_COMPLETION,
             },
-            SqlError::CannotCastColumnAutomatically { .. }
-            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
             SqlError::PermanentReferencesUnlogged
             | SqlError::OnCommitNotTemporary
             | SqlError::ColumnIsInPrimaryKey(_) => {
@@ -2141,7 +2139,9 @@ impl SqlError {
             | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. }
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
-            SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
+            SqlError::ColumnTypeConflict { .. }
+            | SqlError::CannotCastColumnAutomatically { .. }
+            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
 
