@@ -399,6 +399,7 @@ async fn commit_one(
             mutations: vec![TxnMutation::Put {
                 key: key.clone(),
                 value: Bytes::from_static(value),
+                read_ts: None,
             }],
         },
         TxnKvReq::Commit {

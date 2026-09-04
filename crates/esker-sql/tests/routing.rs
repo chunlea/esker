@@ -656,7 +656,12 @@ fn ready(node: &mut Executor) {
 fn run(node: &mut Executor, sql: &str) -> esker_sql::Result<()> {
     for parsed in parse_statements(sql)? {
         match parsed.class() {
-            StatementClass::Begin => node.begin(parsed.begins_read_only())?,
+            StatementClass::Begin => {
+                node.begin(parsed.begins_read_only())?;
+                if let Some(level) = parsed.begins_isolation() {
+                    node.set_isolation(level)?;
+                }
+            }
             StatementClass::Commit => node.commit()?,
             StatementClass::Rollback => node.rollback()?,
             _ => {

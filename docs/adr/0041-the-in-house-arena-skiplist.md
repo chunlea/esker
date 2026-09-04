@@ -1,24 +1,83 @@
 # 0041 — The in-house arena skiplist
 
-Status: **proposed, and not being built.** Put to the maintainer at the close of phase 11 and
-declined, for three reasons worth keeping next to the design rather than in a plan file nobody
-reads twice:
+Status: **accepted, 2026-09-03.** Proposed at the close of phase 11 and declined then, for three
+reasons kept below because they are the ones that would justify reversing this: it was not a
+profiled bottleneck, the risk is silent, and the B wave had a caller waiting. The maintainer has
+since asked for it to be built, which answers the third and accepts the first two as a deliberate
+trade — the mitigations the design already named (the red-first ordering test, Miri as a gate) are
+what carry the second.
+
+The original decline, kept verbatim so a future reader can see what was traded away:
 
 * **It is not a bottleneck.** Nothing has profiled the memtable cursor as the thing in the way.
   The costs below are real and measured in complexity, not in a flame graph — `CLAUDE.md` says to
   optimise after a profile, and this ADR is an argument from reading the code.
 * **The risk is silent.** The gain is a faster scan and three fewer crates; the exposure is
   `unsafe` in the one place where getting it wrong produces a suite that passes on x86 for a year
-  and corrupts a memtable on ARM under load. That is a bad trade to take unprompted.
+  and corrupts a memtable on ARM under load.
 * **The B wave comes first.** There is queued work with a caller waiting on it.
 
-The design stands as written and needs no revision to be picked up. What would change the answer
-is a profile that names `MemTableIter` — the shape to look for is a scan-heavy workload whose time
-sits in `re-find the key` rather than in I/O.
+It replaces the one bought piece of concurrent code named in `CLAUDE.md`'s dependency policy and in
+`docs/DESIGN.md` §4.4, and closes the `TODO(post-v1)` at `crates/esker-engine/src/memtable.rs:273`.
+Both change with it.
 
-It would replace the one bought piece of concurrent code named in `CLAUDE.md`'s dependency policy
-and in `docs/DESIGN.md` §4.4, and close the `TODO(post-v1)` at
-`crates/esker-engine/src/memtable.rs:273`. Both stay as they are.
+## What changed since proposed
+
+The design below was written from a reading of the code and stands, with five corrections that
+only came out of building it. Each is a place where the ADR as proposed would have produced
+something wrong or unsound, so each is stated here rather than silently fixed in the code.
+
+**1. "A `Vec<u8>` grown in blocks" has to mean blocks, not `Vec::reserve`.** The ADR argues that a
+`u32` offset "stays valid when the arena's backing `Vec` is reallocated, so growth needs no
+fix-up pass". That is true of the *offset* and false of everything the offset is for. The point of
+the change is that `MemTableIter::key` and `value` stop copying and start returning a `&[u8]` into
+the arena; a slice handed out from a backing buffer that is then reallocated is a use-after-free,
+and no amount of offset-stability fixes it. So the arena is **a list of chunks that are allocated
+once, never moved and never freed until the table is dropped**, and the offset addresses
+`(chunk, offset within chunk)`. Growth adds a chunk; every existing byte keeps both its offset
+*and* its address. That is what makes the borrow in the cursor real rather than asserted.
+
+**2. Writers are serialised, and the memtable's own API still cannot rely on it.** The claim in
+"The concurrency this memtable actually needs" is correct and now has a citation:
+`db/write.rs` makes a writer the leader only when `!queue.writing`, sets `queue.writing = true`
+under the queue lock before releasing it, and clears it under the lock after `commit_group`
+returns — so at most one thread is ever inside `commit_group`, and `commit_group` holds the only
+call to `MemTable::add` on the write path. WAL replay (`db/open.rs`) inserts single-threaded before
+the database is published, and `roll_log_and_switch` takes `write_lock(&cf.mem)` against
+`commit_group`'s `read_lock`, so a switch never overlaps an insert.
+
+But `MemTable::add` takes `&self`, is `pub`, and the memtable's *own* test
+`readers_and_writers_run_concurrently` inserts from four threads at once. A structure whose
+soundness rests on a discipline its signature does not express is the shape this project's
+invariant 8 exists to refuse. So the skiplist takes a **writer-only mutex**: one uncontended lock
+per insert, never taken by a reader, never held across anything but the insert itself. Group
+commit means it is uncontended in the engine; a caller who ignores the discipline gets correctness
+instead of a data race; and the existing four-writer test keeps its shape and its assertions.
+
+**3. Two arenas, so that `Node::next` is safe code.** The ADR's node layout puts the forward
+pointers in the byte buffer, which means conjuring a `&AtomicU32` out of a byte address — an
+alignment obligation on every allocation and a provenance question on every load. Instead the
+arena has two chunk lists: `Chunks<u8>` for key and value bytes, and `Chunks<AtomicU32>` for node
+headers and forward pointers. A `Box<[AtomicU32]>` is aligned by construction, so a forward
+pointer is an ordinary `&AtomicU32` obtained by indexing a slice. The consequence is that the
+`unsafe` moves out of the skiplist entirely: `Node::next` and `Node::set_next` in the table below
+are **safe** functions over the arena, and the whole unsafe surface is the arena's chunk
+addressing plus its `Drop`.
+
+**4. Equal internal keys.** `SkipMap::insert` replaces on an equal key; an append-only structure
+cannot, because overwriting a published node's bytes is the one thing the publication rule
+forbids. So equal keys are allowed and the newest sorts **first**, which is what makes
+`get` — "the first entry at or after `(user_key, snapshot)`" — give the same answer replacement
+would have. The visible difference is `len()`, which counts nodes: a key written twice at the same
+sequence number *and* kind counts twice. Nothing in the engine can produce that pair, because
+sequence numbers come from one `fetch_add`; only a direct `MemTable::add` in a test can.
+
+**5. The seed does not come from `Options`.** The plan was to seed the per-table PCG32 from the
+memtable's options, but `MemTable::new(comparator)` is called from `db/mod.rs` and `db/flush.rs`
+and `Options` is not in this change's reach. `new` keeps its signature and a fixed, documented
+default seed — deterministic, which is all a replay needs — and `MemTable::with_seed` is the way a
+simulator or a failing test passes its own. Threading a seed from `Options` is a two-line change in
+those two callers whenever someone wants it.
 
 ## Context
 
@@ -85,7 +144,7 @@ is precisely LevelDB's, and LevelDB's is about 350 lines.
    nothing the engine can use — writers are serialised by group commit and would stay serialised.
    Refused as scope.
 
-## Decision (proposed)
+## Decision
 
 **Option 3.** `esker_engine::memtable::skiplist`, behind the existing `MemTable` surface, so
 nothing above `memtable.rs` changes except that `MemTableIter` gets faster.
@@ -213,13 +272,43 @@ Item 3's red-first requirement is the mitigation and is not negotiable.
 format, and it does not touch anything above `memtable.rs`. If a later phase wants multi-writer
 memtables, that is a different ADR and it starts by changing group commit.
 
+## The outcome, measured
+
+`docs/bench/skiplist.md` has the numbers and the method. In one paragraph:
+
+**The bench plan in this ADR could not answer its own question, and that is the first finding.**
+`crates/esker-cli/src/bench.rs` flushes the memtable before the measured phase of every read
+workload, so `readseq` and `scanrange` — the two this document said would make "the whole scan the
+memtable cursor" — run against an empty memtable whatever `--write-buffer-size` says. Run anyway,
+the whole plan is flat: 0.98× to 1.05×, against a **5% noise floor measured from a control that
+never touches the engine**. That is the "equal or faster" the removal of `crossbeam-skiplist` was
+gated on, and it is why unit 6 went ahead.
+
+**On its own the structure is much faster to scan and slower to fill.** A full scan of a 100 k
+memtable is 26.14 ms against **1.41 ms**, eighteen-fold, and that is the cost paid on every flush,
+because `db/flush.rs`'s `build_table` walks an immutable memtable end to end to build its SST. A
+short scan is 6.7× cheaper and every other read is between 1.06× and 1.31× cheaper. An insert is
+**1.2× to 1.8× dearer** — 181 ns against 317 ns sequentially — which is what addressing an arena
+by offset costs against dereferencing a pointer, and it is the thing left on the table. Two
+resolutions per key comparison is the floor for a separate byte arena and word arena; below it is
+`LevelDB`'s layout, with the key bytes inside the node's own allocation, which is a redesign.
+
+**The `unsafe` is checked, and it could not have been before.** Miri passes over the arena, the
+skiplist and the concurrency test, and against a deliberately `Relaxed` publishing store it
+reports the data race that a missing `Release` is — item 3's red-first requirement, discharged.
+What was not expected: the memtable's tests could never have been run under Miri at all while
+`crossbeam-skiplist` was in the graph. Stacked Borrows rejects `crossbeam-epoch`'s `&*local_ptr`
+and Tree Borrows rejects `crossbeam-skiplist`'s own `dealloc`, so the run aborts inside a
+dependency before reaching any code of ours. Item 5 was unpassable as written, and nobody had
+tried it.
+
 ## Status of this ADR
 
-Design only, and staying that way for now — see the status line at the top for the three reasons.
-`docs/plans/phase-11-engine.md` §6 records that the lane stopped at the ADR deliberately and did
-not write a line of the code.
+Accepted, built and measured. `docs/plans/phase-11-engine.md` §6 records that the lane which wrote this ADR
+stopped here deliberately and did not write a line of the code; the code arrived later, and the
+five corrections above are what the writing of it found.
 
-Nothing here rots if it sits: the memtable's surface is unchanged, and the argument that makes the
-job small — writers serialised by group commit, an append-only structure, reclamation already
-owned by an `Arc` one level up — is a property of `db/write.rs` and `memtable.rs` as they stand.
-If either changes, this ADR is the thing to re-read first.
+The argument that makes the job small — writers serialised by group commit, an append-only
+structure, reclamation already owned by an `Arc` one level up — is still a property of
+`db/write.rs` and `memtable.rs` rather than of this ADR. If either changes, this is the thing to
+re-read first, and correction 2 above is the one that decides how much the change costs.

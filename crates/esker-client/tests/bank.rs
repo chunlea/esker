@@ -486,6 +486,7 @@ fn crashed_transfer(
             mutations: vec![TxnMutation::Put {
                 key: Bytes::copy_from_slice(key),
                 value: value_for(key),
+                read_ts: None,
             }],
         };
         match router.call(&Body::Txn(request)).ok()?.into_txn_kv() {

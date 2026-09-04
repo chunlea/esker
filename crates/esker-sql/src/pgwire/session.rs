@@ -175,6 +175,16 @@ pub trait Execute {
         Ok(())
     }
 
+    /// The isolation level this transaction runs at, from a `BEGIN ISOLATION LEVEL …`.
+    ///
+    /// Called **after** `begin`, because the block's parameters are saved there and a level named
+    /// on the `BEGIN` belongs inside the block it starts — so it is restored when the block ends,
+    /// which is what a real server does (ADR 0057).
+    fn set_isolation(&mut self, level: crate::parameter::Isolation) -> Result<()> {
+        let _ = level;
+        Ok(())
+    }
+
     /// Commits the open transaction.
     fn commit(&mut self) -> Result<()> {
         Ok(())
@@ -367,6 +377,9 @@ impl Session {
             return Ok(Outcome::done("BEGIN"));
         }
         executor.begin(parsed.begins_read_only())?;
+        if let Some(level) = parsed.begins_isolation() {
+            executor.set_isolation(level)?;
+        }
         self.status = TransactionStatus::InTransaction;
         Ok(Outcome::done("BEGIN"))
     }

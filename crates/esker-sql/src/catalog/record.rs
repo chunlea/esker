@@ -287,6 +287,9 @@ const TAG_INT4_RANGE_ARRAY: u8 = 53;
 const TAG_DATE_RANGE_ARRAY: u8 = 54;
 const TAG_NUM_RANGE_ARRAY: u8 = 55;
 const TAG_INT8_RANGE_ARRAY: u8 = 56;
+/// `point` and `point[]` — 57 and 58, read off the constants above rather than counted.
+const TAG_POINT: u8 = 57;
+const TAG_POINT_ARRAY: u8 = 58;
 
 /// Tags for [`SchemaState`] as stored. Ours, and they must never move: an index read as the wrong
 /// state is an index a node writes when it should not, which is the whole failure ADR 0020 is about.
@@ -367,6 +370,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::DateRangeArray => TAG_DATE_RANGE_ARRAY,
         ColumnType::NumRangeArray => TAG_NUM_RANGE_ARRAY,
         ColumnType::Int8RangeArray => TAG_INT8_RANGE_ARRAY,
+        ColumnType::Point => TAG_POINT,
+        ColumnType::PointArray => TAG_POINT_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -471,6 +476,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_DATE_RANGE_ARRAY => ColumnType::DateRangeArray,
         TAG_NUM_RANGE_ARRAY => ColumnType::NumRangeArray,
         TAG_INT8_RANGE_ARRAY => ColumnType::Int8RangeArray,
+        TAG_POINT => ColumnType::Point,
+        TAG_POINT_ARRAY => ColumnType::PointArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,

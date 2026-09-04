@@ -835,3 +835,129 @@ A negative assertion needs evidence that the thing it denies had its chance to h
 assertion behind a wall clock fails loudly when the clock is short; a negative one passes quietly,
 and the arm-A form of the question — *cut the wait to zero and see whether it still passes* — is
 what tells the two apart in one run.
+
+## 12. `every_acknowledged_write_survives_a_kill_of_the_server`: a wall clock racing CPU-bound writes
+
+Found while triaging this wave's own gate (§7), unowned, and the one failure that the container
+namespace fix would **not** have touched: it reproduces 6 runs in 10 under twenty-four spinning
+threads **in a single container**, where no port collision is possible.
+
+### What it was
+
+The round killed the child after `sleep(15..250 ms)`. The writes that sleep is meant to interrupt
+are CPU-bound, and the sleep is not, so on a loaded box the kill landed before the writer had a
+single acknowledgement and the round had nothing to verify. It then failed at its own guard —
+`assert!(acked > 0, "round N acknowledged nothing, so it proved nothing")` — while the durability
+assertion never ran at all.
+
+That guard is right. A round that verified nothing must not count as a pass. The defect is that
+the round had no way to say it was starved.
+
+### The fix
+
+The kill point is counted in **acknowledged writes** rather than in milliseconds: wait for a
+random 1–8 acknowledgements, then a 0–15 ms offset, then kill. The cut still lands somewhere
+different each round — inside a write, between two, or with a response frame in flight, which was
+the point of randomising it — but the round now has something to verify by construction. The wait
+carries a 30 s bound that is a real assertion rather than a timeout: a writer that cannot get one
+acknowledgement in thirty seconds is a server not answering, and it says so.
+
+A side effect worth naming: the test went from ~4 s to ~0.26 s, because it no longer sleeps up to
+a quarter-second per round to wait for something that takes microseconds.
+
+### The mutation, and the one I got wrong first
+
+Showing the flake gone is not evidence: deleting the assertion would do that too. So the fixed test
+was run against a store that genuinely loses an acknowledged write.
+
+**First attempt, wrong.** The child was opened with `WalSyncMode::Never`, expecting lost writes. It
+passed, and it had to: `Never` skips the `fsync`, not the `write`. A `SIGKILL` ends the process,
+not the page cache, so the bytes are still in the file and nothing is lost. `docs` says so in as
+many words — *"v1 therefore targets process-crash (`kill -9`) durability"* — and this file's own
+header points at the same fact. The knob I reached for is the one both documents say is not
+load-bearing under a process kill.
+
+**Second attempt, right.** Drop the record from the log instead: `wal.writer.add_record(...)`
+removed, so an acknowledged write lives only in the memtable and a `SIGKILL` genuinely loses it.
+
+```
+FAIL  every_acknowledged_write_survives_a_kill_of_the_server
+assertion `left == right` failed: acknowledged write 0 did not survive the kill
+```
+
+The **durability** assertion fires, not the guard — which is the whole claim: the test still
+catches a lost acknowledged write, and now it reaches that question on a loaded box instead of
+dying before it.
+
+| | before | after |
+|---|---|---|
+| 10 runs under 24 spinners | 6 failed, all at the `acked > 0` guard | **10 passed** |
+| against a store that drops the WAL record | — | **red, at the durability assertion** |
+
+### The rule, which is §11's with the sign flipped
+
+A **positive** assertion behind a wall clock fails loudly when the clock is short, so it shows up
+as a flake and gets found. A **negative** one passes quietly (§11). Both are the same mistake —
+judging a process counted in progress by a budget spent in time — and the loud one is the lucky
+case.
+
+## 13. `esker-client::time_machine`: a third hypothesis, refuted before it was written into code
+
+Recorded 2026-09-03 as *"failed once in g1's workspace gate on 7ec5928 (0.02 s), passed alone —
+watch"*. The binary is named; the test is not.
+
+### What pointed at a candidate
+
+Twenty milliseconds is the useful datum. These are in-process clusters that settle in
+milliseconds, so a whole test starting a cluster, taking two timestamps and asserting fits inside
+0.02 s — and exactly one test in the file has that shape,
+`a_timestamp_from_a_duration_comes_from_the_oracle`:
+
+```rust
+let now = cluster.oracle().tso_one();
+let ago = client.ts_ago(Duration::from_millis(500)).unwrap();
+let gap = physical_ms(now).saturating_sub(physical_ms(ago));
+assert!((400..=500).contains(&gap), …);
+```
+
+`ts_ago` takes its **own** TSO read, after `now`, so `gap = 500 − (second read − now)`. The 500
+ceiling is provably right and the file already explains why a previous fix moved it there. The 400
+floor is what remained: a **100 ms budget on how long two adjacent TSO reads may take**, which is
+a wall-clock tolerance over a scheduling-dependent gap — §11 and §12's family exactly.
+
+### The measurement, which says no
+
+| | runs | gap |
+|---|---|---|
+| quiet | 5 | **500 ms, every one** |
+| 64 spinning threads | 10 | **500 ms, every one** |
+
+The two reads land in the same millisecond every time, so the floor's hundred milliseconds is
+slack that has never been touched — the range is `== 500` in practice. It did not reproduce
+either: 5 quiet and 12 loaded runs, all green.
+
+**So nothing was changed.** The tolerance is not the mechanism, the test is not fragile in the way
+the family made it look, and widening or tightening it would have been a change justified by a
+story that measurement had already refuted. The numbers are recorded in the test's own comment so
+the next reader of that carefully-argued paragraph does not have to re-derive them.
+
+### The sighting, left open
+
+Unreproduced, and the failing test within the binary is not recorded, so there is not even a
+specific assertion to defend. What is eliminated: the one test whose shape fits a 0.02 s failure,
+on the one tolerance it carries.
+
+### The tally this wave leaves on flake work
+
+Five hypotheses, measured rather than argued:
+
+| | outcome |
+|---|---|
+| `peer.rs` election pump (§6) | real, reproduced 3/10, fixed, now deterministic |
+| the two `snapshot.rs:228` sightings (§8) | mechanism real and fixed; attribution unproven |
+| `snapshot.rs:548` stale epoch (§11) | real but *latent*, not active — my own claim corrected |
+| `sim_sweep` window and waits (§9) | **refuted by measurement**, unchanged |
+| `time_machine` gap (§13) | **refuted by measurement**, unchanged |
+
+Two fixes, one correction of my own overstatement, two hypotheses killed. The two that were killed
+cost one container run each and would have cost a wrong change apiece.

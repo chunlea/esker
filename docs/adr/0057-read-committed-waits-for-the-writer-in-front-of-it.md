@@ -1,14 +1,21 @@
 # ADR 0057 — READ COMMITTED waits for the writer in front of it
 
-Status: accepted (the wire change alone is held for the human) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
+Status: accepted, the two format changes included (approved 2026-09-04) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
 
 ## Context
 
-Run 54 measured **74 of 120 tests** in the transaction and locking family stopping on
-`40001 could not serialize access due to concurrent update` where PostgreSQL simply waits and
-proceeds: `locking_test.rb`, `transactions_test.rb`, `transaction_isolation_test.rb`, pessimistic
-locking, counter caches, optimistic locking. It is the largest Rails-facing item left, and it is
-not a missing feature — it is the wrong *isolation level*.
+Run 54's concurrency probe — three writers contending for one row — measured **74 of 120 attempts**
+raising `40001 could not serialize access due to concurrent update` where PostgreSQL simply waits
+and proceeds. That is the shape of the problem; it is **not** a test count, and the difference
+matters to anyone reading this to decide whether the unit is worth its cost. The suite-visible
+number is smaller: run 59's locking family is **261 runs, 5 failures, 4 errors**, and about nine of
+those are this — `test_transaction_per_thread`, `test_transaction_isolation__read_committed`, the
+deadlock and serialization cases in `transaction_nested_test`, and `FOR SHARE NOWAIT` in
+`locking_test.rb`.
+
+So the honest framing is two numbers, not one. The suite moves by ~9 tests; the *probe* moves from
+74/120 to 0/120, and it is the probe that says whether an application under real contention can use
+this node at all. It is not a missing feature — it is the wrong *isolation level*.
 
 This node is Percolator: optimistic, snapshot-isolated, first-committer-wins. A writer that meets
 another writer's lock backs off while the lock is alive, and when its budget runs out it answers
@@ -202,20 +209,40 @@ Why that is sound rather than a weakening:
 
 This is TiDB's `for_update_ts` without the pessimistic lock.
 
-### The wire change, and the question for the human
+### The two format changes, and the ruling
 
-`Prewrite` gains a per-key read timestamp, which is an `esker-proto` message with a golden test —
-so per `CLAUDE.md` it needs a ruling before it lands. **The question, in one sentence: may
-`TxnKvReq::Prewrite` gain an optional per-key `read_ts` (absent means "the transaction's
-`start_ts`", so every existing golden stays byte-identical and an old client keeps working), or
-would you rather it were a new request variant that leaves `Prewrite` untouched?**
+**Approved by the human on 2026-09-04**, in the shape below, which is *not* the one this section
+first proposed. Landed as the branch's last commit.
 
-The additive form is the one this ADR proposes, and the reason is the goldens: an optional field
-written only when it differs from `start_ts` means every frame this node writes today is the frame
-it writes tomorrow, and the format-version byte does not move. A new variant costs a second apply
-path in the store for the lifetime of the old one. Everything above this line is built first and
-independently; the field itself is **held in its own commit at the end of the branch**, so the rest
-lands whatever the ruling is.
+There are **two** formats, not one. `TxnMutation` is the wire message, and `TxnWrite` is the
+**Raft log** — `TxnCommand::Prewrite` is a replicated command with its own encoding — so a per-key
+read timestamp is a wire change and a log change together, and per `CLAUDE.md` both needed a yes.
+The question as it was actually put: *may a mutation that says which snapshot its value was computed
+from take a tag of its own — 3 and 4 beside the existing 1 and 2 — in both the wire message and the
+log entry?*
+
+A **new tag** rather than an optional field on the existing one, because:
+
+* **Every existing golden stays byte-identical, and not by accident.** A mutation whose value came
+  from the transaction's own snapshot — every mutation this node has ever made, and every one a
+  statement that never waited makes now — is still tag 1 or 2 and still encodes exactly the bytes it
+  encoded before. The format-version byte does not move, and every log entry ever written still
+  decodes.
+* **An older peer refuses rather than misreads.** An unknown tag is a decode error; a longer message
+  under a *known* tag would be read as a short one with trailing bytes, which is the one thing a
+  framing change must never do. The same argument holds for a node replaying a log written by a
+  newer one.
+* The cost is two arms in each encoder and two in each decoder, against a second apply path in the
+  store for the lifetime of the old message — which is what a new *request* variant would have cost.
+
+The alternative this section originally floated — an optional field on `Prewrite` itself — was not
+taken, because the timestamp is **per key**: a transaction whose first statement wrote row 1 and
+whose second waited on row 2 carries two different stamps in one prewrite, and a request-level field
+cannot say that. That per-key-ness is the half of §4 that stops a fresh timestamp being a licence to
+lose an update.
+
+Everything above this line was built first and independently, and the field itself was **held in its
+own commit at the end of the branch** until the ruling.
 
 ## 5. `SELECT … FOR UPDATE` locks nothing today, and must
 
@@ -235,6 +262,23 @@ whose transactions do not block"; with `Op::Lock` they become `55P03 could not o
 relation "x"` on a `Locked` decision, and a skip, respectively — both measured in the contract
 table. `FOR SHARE` is served as `FOR UPDATE` for now, declared: it is stricter than the standard
 asks for, which costs concurrency and never correctness.
+
+## 6. What the row lock strengthened, found while building unit 1
+
+§4 asks for a per-key read timestamp partly to stop a fresh timestamp becoming a licence to lose an
+update: a transaction writes row 1, waits on row 2, re-runs, and a third transaction commits row 1
+in the middle. The per-key rule answers that — row 1 keeps its own, older stamp.
+
+**With the row lock taken at the *statement* (unit 1), that situation cannot arise at all.** Row 1
+is locked from the moment it is written until the transaction ends, so nobody else can commit it in
+the middle; a third session that tries waits. The per-key stamp is still what makes the *waiter's
+own* key commit rather than conflict, which is its whole job, but the earlier statement's keys are
+protected by something stronger than a timestamp comparison.
+
+It is recorded here as a **strengthening rather than a gap**, because the difference matters to
+whoever reads the test list: the test §4 asked for is unreachable, and writing it as described
+hangs — the third session waits for a lock it cannot have, which is the guarantee. What is asserted
+instead is the lock's (`tests/read_committed.rs`).
 
 ## The file list
 
@@ -288,7 +332,22 @@ Docs: this ADR, `docs/DESIGN.md` §8, `docs/plans/phase-9-rails.md`.
 
 ## The measure
 
-Run 54: **74 of 120** tests in the locking family stopped on `40001`. r1 re-runs the family after
-unit 4 and the number goes in `docs/plans/phase-9-rails.md` beside the before. A unit that moves it
-by less than it costs in blocked threads is a unit to reconsider, and the plan row will say which
-it was.
+**Two numbers, and both go in `docs/plans/phase-9-rails.md` beside their before.**
+
+* **The suite**: run 59's locking family is 261 runs / 5 failures / 4 errors. About nine tests are
+  this unit's — `test_transaction_per_thread`, `test_transaction_isolation__read_committed`, the
+  deadlock and serialization cases in `transaction_nested_test`, `FOR SHARE NOWAIT` in
+  `locking_test.rb`. **Two of them will stay red on purpose**: the `test_*Serialization*` cases in
+  `transaction_nested_test` need real serializability, and SERIALIZABLE is served as snapshot
+  isolation here (declared above). A measure that counted them as failures of this unit would be
+  measuring the wrong thing.
+* **The probe**: run 54's three-writers-one-row contention, 74 of 120 attempts raising `40001`,
+  should be 0 of 120. This is the number that says whether an application under real contention can
+  use this node, and it is the one worth the unit.
+
+r1 runs both after unit 5. The probe needs a **two-session instrument** — `two-server-replay.rb` is
+single-session — so that is a request to make of r1 through the coordinator when unit 6 is reached,
+not something to discover then.
+
+A unit that moves neither by more than it costs in blocked threads is a unit to reconsider, and the
+plan row will say which it was.

@@ -83,18 +83,24 @@ The project is **100% Rust**. No crate that compiles C/C++/assembly (`*-sys` cra
 `cc` crate or a `links` key) may appear anywhere in the dependency graph, including transitively. CI
 enforces this with `cargo deny` (`deny.toml` bans `*-sys`, `cc`, `openssl*`, `ring`, `aws-lc-*`,
 `libz*`, `zstd*`) plus a test that fails if the number of transitive **runtime** crates in the workspace
-exceeds the budget in `deny.toml` (start at 40; lowering it is welcome, raising it needs an ADR).
+exceeds the budget in `deny.toml` (40 at the start, **37** since the memtable stopped buying its
+skiplist; lowering it is welcome, raising it needs an ADR).
 
 Build it ourselves by default. Anything that is a few hundred lines and part of what we are learning is
 written in-house with tests: CRC32C (table-based; `std::arch` SSE4.2/ARM intrinsics behind `cfg`, no
 crates), varints and all on-disk and wire framing, bloom filters, hashing for caches (a small
 xxhash/FNV-style function), the sharded LRU block cache, the memcomparable codec, the seeded RNG for
-the simulator (xorshift/PCG), the Raft implementation, the RPC framing, the Postgres wire protocol.
+the simulator (xorshift/PCG), the Raft implementation, the RPC framing, the Postgres wire protocol,
+and **the memtable's arena skiplist** ([ADR 0041](docs/adr/0041-the-in-house-arena-skiplist.md)) —
+single-writer, append-only, `u32` offsets into chunks that never move, and the last thing on this
+list to stop being bought.
 
 Runtime allowlist (each already justified in `docs/adr/0003-dependencies.md`; add to it only via ADR):
 `tokio` (network runtime only), `bytes`, `thiserror`, `tracing` + `tracing-subscriber`, `lz4_flex`
-(pure-Rust LZ4, the only compression), `crossbeam-skiplist` (memtable; replaceable by an in-house
-skiplist later — it is the one piece of concurrent unsafe code we buy rather than write). Dev-only
+(pure-Rust LZ4, the only compression). The list once ended with `crossbeam-skiplist` — "the one
+piece of concurrent unsafe code we buy rather than write" — and ADR 0041 replaced it, so
+**every piece of concurrent code in the engine is now code in this repository with a test in this
+repository**. `tokio` stays the bought concurrency, and only at the network edge. Dev-only
 allowlist: `proptest`, `criterion`, `stateright`, `tempfile`, `sqllogictest` (phase 6).
 Explicitly **not** used: `tonic`/`prost` (RPC is hand-rolled framing over TCP, see DESIGN.md §9),
 `serde` (no on-disk or wire use), `zstd`/`snap`, `crc32c`/`crc32fast`, `rand`, `lru`, `pgwire`.

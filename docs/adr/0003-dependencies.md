@@ -27,7 +27,16 @@ independent mechanisms enforce that.
 | `tracing` | Structured spans per request, carrying region and peer ids. Log lines without those are unusable in a distributed system. | An in-house span-and-event facade. Doable; the collector ecosystem is the reason not to. |
 | `tracing-subscriber` | Turns those spans into output, with `RUST_LOG`-style filtering. | A hand-written subscriber; `tracing` is the trait, this is one implementation. |
 | `lz4_flex` | Pure-Rust LZ4 for SST block compression — the **only** compression codec. `zstd` and `snap` are banned because both are C. | An in-house LZ4 decoder (the format is simple) plus an encoder (harder to make fast). Or no compression, which costs disk. |
-| `crossbeam-skiplist` | The memtable: a concurrent lock-free skiplist. **This is the one piece of concurrent unsafe code we buy rather than write**, and it is deliberate — a subtly wrong lock-free skiplist would corrupt data in ways the test suite would find slowly and painfully. | An in-house arena skiplist behind the same `MemTable` trait. Planned as a post-v1 exercise, when there is a test suite good enough to trust the swap. |
+
+`crossbeam-skiplist` used to be the last row of that table — "the one piece of concurrent unsafe
+code we buy rather than write" — and it is gone. The memtable is an in-house arena skiplist as of
+[ADR 0041](0041-the-in-house-arena-skiplist.md), and with it went `crossbeam-epoch` and
+`crossbeam-utils`: three runtime crates, and the budget below came down from 40 to 37 in the same
+change. Nothing else in the workspace depended on any of them.
+
+After it, **every piece of concurrent code in the engine is code in this repository with a test in
+this repository** — which also means the memtable's tests can be run under Miri, which they could
+not while `crossbeam-epoch` was in the graph (`docs/bench/skiplist.md` §3).
 
 ### The TLS exception, behind a default-off feature
 
@@ -126,7 +135,7 @@ Two mechanisms, because they fail differently.
    `cargo metadata` and checks names against the *patterns* — `*-sys`, `openssl*`, `aws-lc-*` —
    that a list of exact names cannot express. It also counts the graph.
 
-**The budget is 40 transitive runtime crates**, recorded in a marked comment in `deny.toml` so
+**The budget is 37 transitive runtime crates**, recorded in a marked comment in `deny.toml` so
 that both mechanisms read the same number. At the end of phase 0 the count is **7**: `bytes`,
 `thiserror` and `thiserror-impl` with their proc-macro chain (`proc-macro2`, `quote`, `syn`,
 `unicode-ident`). Lowering the budget is welcome; raising it needs an ADR.
@@ -139,5 +148,5 @@ that both mechanisms read the same number. At the end of phase 0 the count is **
 * Build times stay short and the binary stays small, which makes the crash-test loops in later
   phases cheap enough to run often.
 * When `tokio` arrives in phase 2 the count will jump — `mio`, `libc`, `socket2`,
-  `pin-project-lite` and the macro chain. It should stay well inside 40; if it does not, the
-  first move is to trim `tokio`'s feature list, not to raise the budget.
+  `pin-project-lite` and the macro chain. It should stay well inside the budget; if it does not,
+  the first move is to trim `tokio`'s feature list, not to raise it.

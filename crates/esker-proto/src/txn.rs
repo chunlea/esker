@@ -252,11 +252,23 @@ pub enum TxnMutation {
         key: Bytes,
         /// The value.
         value: Bytes,
+        /// **The snapshot this value was computed from**, or `None` for "the transaction's own"
+        /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+        /// §4).
+        ///
+        /// `None` on the wire today: the encoding is unchanged until the human rules on it, so
+        /// every golden stays byte-identical and this field is carried in memory only. What it is
+        /// *for* is a READ COMMITTED waiter — a statement that waited for another transaction and
+        /// re-read at a fresh timestamp computed its value from that transaction's commit, so that
+        /// commit is its input rather than its conflict.
+        read_ts: Option<u64>,
     },
     /// Remove `key`.
     Delete {
         /// The user key.
         key: Bytes,
+        /// As [`TxnMutation::Put::read_ts`].
+        read_ts: Option<u64>,
     },
 }
 
@@ -265,27 +277,48 @@ impl TxnMutation {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } => key,
         }
     }
 
     /// The tag on the wire. Zero is not a tag, as everywhere else
     /// (`docs/DESIGN.md` §4.3, §9).
+    /// **Four tags, and the first two are unchanged.** A mutation whose value came from the
+    /// transaction's own snapshot — every mutation this node made before ADR 0057, and every one a
+    /// statement that never waited makes now — is tag 1 or 2 and encodes exactly the bytes it
+    /// always did, so every golden stays byte-identical and a peer that has never heard of this
+    /// reads them. A mutation that says which snapshot it read at takes a tag of its own, which an
+    /// older peer refuses as unknown rather than misreading as a shorter message: the one thing a
+    /// framing change must never do is decode wrongly.
     fn tag(&self) -> u8 {
         match self {
-            Self::Put { .. } => 1,
-            Self::Delete { .. } => 2,
+            Self::Put { read_ts: None, .. } => 1,
+            Self::Delete { read_ts: None, .. } => 2,
+            Self::Put { .. } => 3,
+            Self::Delete { .. } => 4,
         }
     }
 
     fn encode(&self, out: &mut Encoder) {
         out.put_u8(self.tag());
         match self {
-            Self::Put { key, value } => {
+            Self::Put {
+                key,
+                value,
+                read_ts,
+            } => {
                 out.put_bytes(key);
                 out.put_bytes(value);
+                if let Some(read_ts) = read_ts {
+                    out.put_varint(*read_ts);
+                }
             }
-            Self::Delete { key } => out.put_bytes(key),
+            Self::Delete { key, read_ts } => {
+                out.put_bytes(key);
+                if let Some(read_ts) = read_ts {
+                    out.put_varint(*read_ts);
+                }
+            }
         }
     }
 
@@ -294,9 +327,20 @@ impl TxnMutation {
             1 => Ok(Self::Put {
                 key: take(input, "mutation.key")?,
                 value: take(input, "mutation.value")?,
+                read_ts: None,
             }),
             2 => Ok(Self::Delete {
                 key: take(input, "mutation.key")?,
+                read_ts: None,
+            }),
+            3 => Ok(Self::Put {
+                key: take(input, "mutation.key")?,
+                value: take(input, "mutation.value")?,
+                read_ts: Some(input.get_varint("mutation.read_ts")?),
+            }),
+            4 => Ok(Self::Delete {
+                key: take(input, "mutation.key")?,
+                read_ts: Some(input.get_varint("mutation.read_ts")?),
             }),
             tag => Err(DecodeError::invalid(
                 "mutation.tag",
@@ -871,7 +915,8 @@ mod tests {
                 primary: Bytes::from_static(b"p"),
                 ttl_ms: 1,
                 mutations: vec![TxnMutation::Delete {
-                    key: Bytes::from_static(b"a")
+                    key: Bytes::from_static(b"a"),
+                    read_ts: None,
                 }],
             }
             .routing_key(),
