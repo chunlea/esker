@@ -1294,7 +1294,7 @@ fn range_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datu
                     other.column_type().map_or("unknown", PgType::name)
                 ))),
             };
-            Datum::Text(range::DateRange::new(day(args.first())?, day(args.get(1))?).to_text())
+            Datum::Text(range::DateRange::new(day(args.first())?, day(args.get(1))?)?.to_text())
         }
         CatalogFunc::IsEmpty => match range_argument(args.first())? {
             None => Datum::Null,
@@ -1376,19 +1376,41 @@ fn range_value_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
                 _ => "[)".to_owned(),
             };
             let mut chars = bounds.chars();
-            let range = range::Range {
+            // **A bare `'2026-01-01'` is an *unknown* literal**, which a real server reads at the
+            // subtype rather than keeping as text — so the range prints
+            // `["2026-01-01 00:00:00",…)` and not `[2026-01-01,…)`. Reading it here is what makes
+            // the bound a value that can be compared, rather than characters that sort like one.
+            let subtype = args
+                .iter()
+                .find_map(|arg| match arg {
+                    Datum::Text(_) | Datum::Null => None,
+                    other => other.column_type(),
+                })
+                .unwrap_or(ColumnType::Timestamp);
+            let bound = |value: Option<&Datum>| -> Result<Option<Datum>> {
+                match value {
+                    None | Some(Datum::Null) => Ok(None),
+                    Some(Datum::Text(text)) => {
+                        Ok(Some(<Datum as PgDatum>::from_text(subtype, text)?))
+                    }
+                    Some(other) => Ok(Some(other.clone())),
+                }
+            };
+            let mut range = range::Range {
                 empty: false,
-                lower: args.first().filter(|v| **v != Datum::Null).cloned(),
-                upper: args.get(1).filter(|v| **v != Datum::Null).cloned(),
+                lower: bound(args.first())?,
+                upper: bound(args.get(1))?,
                 lower_inc: chars.next() == Some('['),
                 upper_inc: chars.next() == Some(']'),
             };
+            // **The same normalisation the literal takes**, which is what makes the two spellings
+            // one value: `tsrange(hi, lo)` is `22000 range lower bound must be less than or equal
+            // to range upper bound` exactly as `'[hi,lo)'::tsrange` is, and a zero-width range
+            // collapses to `empty` on both roads. Building the value without it answered an
+            // impossible range object for one spelling and `22000` for the other.
+            range::canonicalise(subtype, &mut range)?;
             Datum::Range {
-                subtype: Box::new(
-                    args.first()
-                        .and_then(Datum::column_type)
-                        .unwrap_or(ColumnType::Timestamp),
-                ),
+                subtype: Box::new(subtype),
                 text: range.to_text(),
             }
         }

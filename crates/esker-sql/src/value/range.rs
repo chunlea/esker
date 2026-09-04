@@ -36,11 +36,16 @@ pub struct DateRange {
 impl DateRange {
     /// `daterange(a, b)` — the constructor, with PostgreSQL's own emptiness rule.
     #[must_use]
-    pub fn new(start: Option<i32>, end: Option<i32>) -> Self {
-        // Empty when the bounds meet or cross: `[x,x)` contains nothing, and it is the case the
-        // suite's `isempty` line pins.
+    pub fn new(start: Option<i32>, end: Option<i32>) -> Result<Self> {
+        // **Meeting is empty; crossing is an error.** `[x,x)` contains nothing and is the case the
+        // suite's `isempty` line pins; `[y,x)` with `y > x` is `22000` on a real server, and
+        // answering `empty` for it was the worse of the two wrong answers this sweep found — a
+        // query that filters nothing and reports nothing wrong.
+        if matches!((start, end), (Some(low), Some(high)) if low > high) {
+            return Err(SqlError::RangeBoundsOutOfOrder);
+        }
         let empty = matches!((start, end), (Some(low), Some(high)) if low >= high);
-        DateRange { start, end, empty }
+        Ok(DateRange { start, end, empty })
     }
 
     /// Whether two ranges share any day.
@@ -105,7 +110,10 @@ impl DateRange {
                 _ => None,
             }
         };
-        Some(DateRange::new(day(low)?, day(high)?))
+        // A stored range came from a `new` that already checked its bounds, so a crossed pair
+        // here is corruption rather than user input — `None` is this function's answer to
+        // anything it cannot read, and that is what one is.
+        DateRange::new(day(low)?, day(high)?).ok()
     }
 }
 
@@ -116,31 +124,31 @@ mod tests {
     /// **Half-open**: touching ranges are disjoint, which is what admits the suite's second row.
     #[test]
     fn touching_ranges_do_not_overlap() {
-        let first = DateRange::new(Some(0), Some(31));
-        let second = DateRange::new(Some(31), Some(59));
+        let first = DateRange::new(Some(0), Some(31)).unwrap();
+        let second = DateRange::new(Some(31), Some(59)).unwrap();
         assert!(!first.overlaps(second));
         assert!(!second.overlaps(first));
-        assert!(first.overlaps(DateRange::new(Some(14), Some(45))));
+        assert!(first.overlaps(DateRange::new(Some(14), Some(45)).unwrap()));
     }
 
     /// An empty range overlaps nothing, **including itself**.
     #[test]
     fn an_empty_range_overlaps_nothing() {
-        let empty = DateRange::new(Some(10), Some(10));
+        let empty = DateRange::new(Some(10), Some(10)).unwrap();
         assert!(empty.empty);
         assert!(!empty.overlaps(empty));
-        assert!(!empty.overlaps(DateRange::new(Some(0), Some(31))));
+        assert!(!empty.overlaps(DateRange::new(Some(0), Some(31)).unwrap()));
         assert_eq!(empty.to_text(), "empty");
     }
 
     /// An unbounded end is not a NULL: it overlaps everything on that side.
     #[test]
     fn an_unbounded_end_overlaps_everything_beyond_it() {
-        let all = DateRange::new(None, None);
-        assert!(all.overlaps(DateRange::new(Some(0), Some(31))));
-        let below = DateRange::new(None, Some(31));
-        assert!(below.overlaps(DateRange::new(Some(0), Some(31))));
-        assert!(!below.overlaps(DateRange::new(Some(31), Some(59))));
+        let all = DateRange::new(None, None).unwrap();
+        assert!(all.overlaps(DateRange::new(Some(0), Some(31)).unwrap()));
+        let below = DateRange::new(None, Some(31)).unwrap();
+        assert!(below.overlaps(DateRange::new(Some(0), Some(31)).unwrap()));
+        assert!(!below.overlaps(DateRange::new(Some(31), Some(59)).unwrap()));
         // And the round bracket the missing bound takes.
         assert!(below.to_text().starts_with('('));
     }
@@ -153,15 +161,15 @@ mod tests {
     #[test]
     fn the_text_form_round_trips() {
         for range in [
-            DateRange::new(Some(0), Some(31)),
-            DateRange::new(None, Some(31)),
-            DateRange::new(Some(0), None),
-            DateRange::new(None, None),
+            DateRange::new(Some(0), Some(31)).unwrap(),
+            DateRange::new(None, Some(31)).unwrap(),
+            DateRange::new(Some(0), None).unwrap(),
+            DateRange::new(None, None).unwrap(),
         ] {
             let text = range.to_text();
             assert_eq!(DateRange::from_text(&text), Some(range), "{text}");
         }
-        let empty = DateRange::new(Some(5), Some(5));
+        let empty = DateRange::new(Some(5), Some(5)).unwrap();
         assert_eq!(empty.to_text(), "empty");
         assert!(DateRange::from_text("empty").is_some_and(|read| read.empty));
     }
@@ -286,10 +294,15 @@ pub fn from_text(subtype: ColumnType, text: &str) -> Result<Range> {
 
 /// The bounds a **discrete** subtype normalises to, and the emptiness every subtype collapses to.
 ///
+/// **Every way of making a range goes through here**, which is the point of it being public: the
+/// literal `'[3,1)'::tsrange` and the constructor `tsrange(hi, lo)` are two spellings of one value
+/// and must answer alike. They did not — the literal was `22000` and the constructor built an
+/// impossible range object, or, for `daterange`, quietly answered `empty`.
+///
 /// `int4range '[1,10]'` is `[1,11)`: an integer has a successor, so every range of them has one
 /// spelling. A timestamp has none, so a `tsrange` keeps the brackets it was given — which is why
 /// this takes the subtype rather than normalising unconditionally.
-fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
+pub fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
     // **An absent bound is never inclusive**, whatever bracket was written beside it: `'[a,]'`
     // prints `["a",)`, because there is nothing there to include. Measured, and it is why the
     // bracket a client sees is not always the bracket it sent.
