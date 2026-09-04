@@ -234,6 +234,83 @@ impl Drop for Executor {
     }
 }
 
+/// Waits until no other transaction holds the row, or gives up the way a real server does
+/// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+///
+/// **This is the whole of unit 1**, and it is short because the two hard parts are elsewhere: the
+/// lock itself is [`crate::backend::Txn::lock`] — taken at the *statement*, since a lock taken at
+/// commit is nothing to wait for — and what makes the wait *useful* is the per-key read timestamp
+/// that stops the waiter dying at its own prewrite.
+///
+/// Measured on PostgreSQL 19: B's `UPDATE` returned 1.74 s after it was sent, once A committed.
+///
+/// **A waiter never resolves a live lock.** `Lock::Held` carries what is left of the holder's
+/// lease and this loop only ever sleeps; taking a row from an owner still inside its lease is a
+/// lost update wearing a successful commit, which is the one failure in this design that destroys
+/// data rather than answering wrongly.
+pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -> Result<()> {
+    // A read-only transaction writes nothing and waits for nobody; a plain `SELECT` never blocks
+    // on a real server either, measured.
+    if txn.is_read_only() {
+        return Ok(());
+    }
+    // **The level decides whether there is a wait at all.** `REPEATABLE READ` and `SERIALIZABLE`
+    // keep the transaction's snapshot, so a row another transaction holds is a conflict rather
+    // than something to wait for — which is what this node answered for every transaction before
+    // ADR 0057, and is why the levels that already worked cannot regress.
+    let waits = executor.isolation().waits();
+    let deadline = executor.lock_deadline();
+    let mut waited = 0_u64;
+    loop {
+        match txn.lock(key)? {
+            // **Only a wait costs a restart.** A lock taken at once means nothing changed under
+            // this statement, so what it read is still what is there.
+            crate::backend::Lock::Taken if waited == 0 => return Ok(()),
+            crate::backend::Lock::Taken => {
+                txn.restart_statement()?;
+                return Err(SqlError::StatementMustRestart);
+            }
+            crate::backend::Lock::Deadlock => {
+                // **The victim gives its rows back at once.** PostgreSQL ends the loser's
+                // transaction with the `40P01`, so the survivor stops waiting immediately;
+                // holding them until this block's `ROLLBACK` would make the survivor deadlock
+                // too, against a transaction that is already dead. What this does *not* copy is
+                // a real server's lock lifetime under `ROLLBACK TO SAVEPOINT` recovery — declared.
+                txn.abandon_locks();
+                return Err(SqlError::Deadlock);
+            }
+            crate::backend::Lock::Held { .. } if !waits => {
+                return Err(SqlError::SerializationFailure {
+                    message: "a key was written after this transaction's snapshot".to_owned(),
+                    key: Some(key.to_vec()),
+                });
+            }
+            crate::backend::Lock::Held { by, .. } => {
+                if let Some(limit) = deadline
+                    && waited >= limit
+                {
+                    return Err(SqlError::LockTimeout);
+                }
+                let _ = by;
+                // A fixed step rather than an exponential one: the thing being waited for is
+                // another transaction's commit, which is not a contended resource that a longer
+                // back-off relieves — it is an event, and the only cost of asking again is a lock
+                // on a map.
+                std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
+                waited += WAIT_STEP_MS;
+            }
+        }
+    }
+}
+
+/// How long a waiter sleeps between attempts.
+const WAIT_STEP_MS: u64 = 2;
+
+/// How many times one statement may be undone and re-run before this is a livelock rather than a
+/// wait. Each restart means another transaction committed the row *while this one waited*, so a
+/// statement that reaches the ceiling is behind a queue that keeps refilling.
+const MAX_STATEMENT_RESTARTS: u32 = 32;
+
 impl Executor {
     /// The table as an `Arc`, for a deferred check that outlives the statement.
     ///
@@ -551,15 +628,41 @@ impl Executor {
             // key's pre-image on the way past. That is what makes "every write is undoable" a fact
             // about the type the executor was handed rather than a rule every call site follows.
             let outcome = self.bound(&*txn, statement, params).and_then(|statement| {
-                if savepoints.recording() {
-                    let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
-                    let outcome = self.run_recording(&mut recording, &statement, &mut written);
-                    // A pre-image that could not be read is reported here, at the first place that
-                    // can say anything: `put` and `delete` return nothing by contract.
-                    recording.finish().and(outcome)
-                } else {
-                    self.run_recording(&mut *txn, &statement, &mut written)
+                // **An implicit savepoint per statement, and it is only paid for on a restart.**
+                // A statement that waited for a row lock read a version somebody else has since
+                // replaced, so it is undone and re-run at a fresh timestamp (ADR 0057). The undo
+                // is the machinery an explicit `SAVEPOINT` already uses, under a name no user can
+                // type — an unquoted identifier cannot contain a space.
+                for attempt in 0..=MAX_STATEMENT_RESTARTS {
+                    // **A statement-level snapshot, which is what READ COMMITTED *is*.** Measured:
+                    // two `SELECT`s in one transaction across another's commit answer `10` then
+                    // `99` under READ COMMITTED and `10` then `10` under REPEATABLE READ. It also
+                    // resets the per-statement undo, which a restart needs to be about this
+                    // statement and not the ones before it (ADR 0057).
+                    if self.isolation().waits() {
+                        txn.begin_statement()?;
+                    }
+                    let outcome = if savepoints.recording() {
+                        let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
+                        let outcome = self.run_recording(&mut recording, &statement, &mut written);
+                        // A pre-image that could not be read is reported here, at the first place
+                        // that can say anything: `put` and `delete` return nothing by contract.
+                        recording.finish().and(outcome)
+                    } else {
+                        self.run_recording(&mut *txn, &statement, &mut written)
+                    };
+                    match outcome {
+                        // **The undo is already done**: `Txn::restart_statement` put the buffer
+                        // back to what it was before this statement, which is what a re-read needs
+                        // and what a savepoint's value-restore would have shadowed.
+                        Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                        }
+                        other => return other,
+                    }
                 }
+                // A statement that restarted this many times is waiting behind a queue that keeps
+                // refilling, which is the shape of a livelock rather than of a wait.
+                Err(SqlError::LockTimeout)
             });
             self.open = Some(txn);
             self.written = written;
@@ -815,6 +918,34 @@ impl Executor {
     }
 
     /// What this session reports for a parameter: what it set, or the boot value.
+    /// How long a row wait may last, in milliseconds, or `None` for "as long as it takes".
+    ///
+    /// `lock_timeout` first and `statement_timeout` behind it, which is the order PostgreSQL
+    /// applies them in — measured: with both set, the lock timeout is the one that fires. Zero
+    /// means no limit for both, which is what a real server's default is and what this node
+    /// already reported.
+    /// The level this transaction is running at.
+    fn isolation(&self) -> crate::parameter::Isolation {
+        crate::parameter::Isolation::named(
+            &self.parameter(crate::parameter::transaction_isolation()),
+        )
+    }
+
+    fn lock_deadline(&self) -> Option<u64> {
+        for parameter in [
+            crate::parameter::lock_timeout(),
+            crate::parameter::statement_timeout(),
+        ] {
+            let value = self.parameter(parameter);
+            if let Some(ms) = crate::parameter::timeout_ms(&value)
+                && ms > 0
+            {
+                return Some(ms);
+            }
+        }
+        None
+    }
+
     fn parameter(&self, parameter: &crate::parameter::Parameter) -> String {
         self.parameters
             .get(parameter.name)
@@ -1024,6 +1155,15 @@ impl Executor {
         self.open_used = false;
         self.block_parameters = None;
         self.block_read_only = false;
+        // **The level is the transaction's**, so it goes back to the session's default when the
+        // transaction ends — which is what makes `SET TRANSACTION ISOLATION LEVEL` different from
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION …`, the one that changes the default itself.
+        // Measured (ADR 0057).
+        let default = self.parameter(crate::parameter::default_transaction_isolation());
+        let _ = self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(&default),
+        );
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
         }
@@ -2656,12 +2796,31 @@ impl Execute for Executor {
         // and leaves the block alone.
         self.savepoints.clear();
         self.block_parameters = Some(self.parameters.clone());
+        // **Each transaction starts at the session's default**, which is what
+        // `default_transaction_isolation` means; a `BEGIN ISOLATION LEVEL …` then overrides it
+        // inside the block the line above has just saved (ADR 0057).
+        let default = self.parameter(crate::parameter::default_transaction_isolation());
+        self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(&default),
+        )?;
         self.block_read_only = read_only;
         self.open = Some(self.open_txn()?);
         self.open_used = false;
         self.written = Written::default();
         self.catalog_written = false;
         Ok(())
+    }
+
+    fn set_isolation(&mut self, level: crate::parameter::Isolation) -> Result<()> {
+        self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(match level {
+                crate::parameter::Isolation::ReadCommitted => "read committed",
+                crate::parameter::Isolation::RepeatableRead => "repeatable read",
+                crate::parameter::Isolation::Serializable => "serializable",
+            }),
+        )
     }
 
     fn savepoint(&mut self, name: &str) -> Result<()> {

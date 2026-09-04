@@ -220,6 +220,35 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// A row wait that ran out of `lock_timeout`.
+    ///
+    /// **`55P03`, and PostgreSQL's own sentence** — the same code `FOR UPDATE NOWAIT` answers and
+    /// a *different* sentence, measured: `NOWAIT` says `could not obtain lock on row in relation
+    /// "x"` and a timeout says this. One code, two conditions, two messages.
+    #[error("canceling statement due to lock timeout")]
+    LockTimeout,
+
+    /// Two transactions waiting for each other's rows. **`40P01`**, and exactly one of them gets
+    /// it — measured on PostgreSQL 19, where the survivor's *both* updates landed.
+    ///
+    /// PostgreSQL's `DETAIL` names the two backend processes and the two transactions; this node
+    /// says the sentence and not the detail, which is declared rather than invented.
+    #[error("deadlock detected")]
+    Deadlock,
+
+    /// **Not an answer — a signal**, caught at the statement boundary and never seen by a client.
+    ///
+    /// A writer that had to wait for the row in front of it has, by the time it gets the lock,
+    /// already read a version somebody else has replaced. `n + 100` over a row that moved from 10
+    /// to 11 while this statement waited is **111** on a real server, and applying the value this
+    /// statement already computed would answer 110 — a lost update wearing a successful commit.
+    /// So the statement is undone to its implicit savepoint and re-run at a fresh read timestamp
+    /// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    ///
+    /// It reaches a client only if something forgot to catch it, which is why it says so.
+    #[error("a statement that waited for a row lock was not restarted")]
+    StatementMustRestart,
+
     /// `SET SESSION AUTHORIZATION <name>` on a node that has no roles.
     ///
     /// **`22023`, not `42704`** — measured, and it is not the class the same condition takes
@@ -2145,6 +2174,8 @@ impl SqlError {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
+            SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
+            SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
@@ -2350,7 +2381,9 @@ impl SqlError {
             SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
             SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
-            SqlError::Internal(_) => sqlstate::INTERNAL_ERROR,
+            // `StatementMustRestart` is a signal, not an answer — it reaches a client only if
+            // something forgot to catch it, which is exactly an internal error.
+            SqlError::Internal(_) | SqlError::StatementMustRestart => sqlstate::INTERNAL_ERROR,
         }
     }
 

@@ -328,6 +328,14 @@ pub fn prewrite(
             key: mutation.key().clone(),
             primary: primary.clone(),
             start_ts,
+            // **The snapshot the value was computed from**, and the transaction's own when the
+            // mutation does not say (ADR 0057 §4). Nothing says yet: the framing that would carry
+            // it is held for the human's ruling, so every prewrite validates exactly as it did.
+            read_ts: match mutation {
+                TxnMutation::Put { read_ts, .. } | TxnMutation::Delete { read_ts, .. } => {
+                    read_ts.unwrap_or(start_ts)
+                }
+            },
             ttl_ms,
             op: match mutation {
                 TxnMutation::Put { value, .. } => Op::Put(value.clone()),
