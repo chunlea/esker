@@ -900,3 +900,64 @@ A **positive** assertion behind a wall clock fails loudly when the clock is shor
 as a flake and gets found. A **negative** one passes quietly (§11). Both are the same mistake —
 judging a process counted in progress by a budget spent in time — and the loud one is the lucky
 case.
+
+## 13. `esker-client::time_machine`: a third hypothesis, refuted before it was written into code
+
+Recorded 2026-09-03 as *"failed once in g1's workspace gate on 7ec5928 (0.02 s), passed alone —
+watch"*. The binary is named; the test is not.
+
+### What pointed at a candidate
+
+Twenty milliseconds is the useful datum. These are in-process clusters that settle in
+milliseconds, so a whole test starting a cluster, taking two timestamps and asserting fits inside
+0.02 s — and exactly one test in the file has that shape,
+`a_timestamp_from_a_duration_comes_from_the_oracle`:
+
+```rust
+let now = cluster.oracle().tso_one();
+let ago = client.ts_ago(Duration::from_millis(500)).unwrap();
+let gap = physical_ms(now).saturating_sub(physical_ms(ago));
+assert!((400..=500).contains(&gap), …);
+```
+
+`ts_ago` takes its **own** TSO read, after `now`, so `gap = 500 − (second read − now)`. The 500
+ceiling is provably right and the file already explains why a previous fix moved it there. The 400
+floor is what remained: a **100 ms budget on how long two adjacent TSO reads may take**, which is
+a wall-clock tolerance over a scheduling-dependent gap — §11 and §12's family exactly.
+
+### The measurement, which says no
+
+| | runs | gap |
+|---|---|---|
+| quiet | 5 | **500 ms, every one** |
+| 64 spinning threads | 10 | **500 ms, every one** |
+
+The two reads land in the same millisecond every time, so the floor's hundred milliseconds is
+slack that has never been touched — the range is `== 500` in practice. It did not reproduce
+either: 5 quiet and 12 loaded runs, all green.
+
+**So nothing was changed.** The tolerance is not the mechanism, the test is not fragile in the way
+the family made it look, and widening or tightening it would have been a change justified by a
+story that measurement had already refuted. The numbers are recorded in the test's own comment so
+the next reader of that carefully-argued paragraph does not have to re-derive them.
+
+### The sighting, left open
+
+Unreproduced, and the failing test within the binary is not recorded, so there is not even a
+specific assertion to defend. What is eliminated: the one test whose shape fits a 0.02 s failure,
+on the one tolerance it carries.
+
+### The tally this wave leaves on flake work
+
+Five hypotheses, measured rather than argued:
+
+| | outcome |
+|---|---|
+| `peer.rs` election pump (§6) | real, reproduced 3/10, fixed, now deterministic |
+| the two `snapshot.rs:228` sightings (§8) | mechanism real and fixed; attribution unproven |
+| `snapshot.rs:548` stale epoch (§11) | real but *latent*, not active — my own claim corrected |
+| `sim_sweep` window and waits (§9) | **refuted by measurement**, unchanged |
+| `time_machine` gap (§13) | **refuted by measurement**, unchanged |
+
+Two fixes, one correction of my own overstatement, two hypotheses killed. The two that were killed
+cost one container run each and would have cost a wrong change apiece.

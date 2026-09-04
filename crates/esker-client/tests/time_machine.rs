@@ -412,6 +412,12 @@ fn a_timestamp_from_a_duration_comes_from_the_oracle() {
     // fails on any machine slow enough to cross a millisecond boundary between two TSO reads,
     // which is not load-sensitivity to be waited out: it is the assertion asking for a value the
     // code cannot produce.
+    //
+    // **Measured at exactly 500, fifteen runs, quiet and under sixty-four spinning threads.** The
+    // two TSO reads always land in the same millisecond, so the 400 floor is a hundred
+    // milliseconds of slack that has never been touched: this range is `== 500` in practice, and
+    // the floor is there for the boundary crossing the paragraph above describes rather than for
+    // anything observed (`docs/plans/debt-c6.md` §13).
     let gap = physical_ms(now).saturating_sub(physical_ms(ago));
     assert!(
         (400..=500).contains(&gap),
