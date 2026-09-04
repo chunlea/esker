@@ -1,0 +1,87 @@
+# `point` — run 58's tier-3 row, 15 tests in `adapters/postgresql/geometric_test.rb`.
+#
+# That file declares seven point columns and one **`point[]`** (`:23-30`), two of them with a
+# default written as a Ruby array (`[12.2, 13.3]`) and two as a string (`"(14.4,15.5)"`), and it
+# reads all four back out of the schema dumper. So the type has to store, print, default and
+# array, and the name has to survive `format_type` and `information_schema`.
+#
+# **The fact that decides its shape: a `point` has no equality and no ordering at all.**
+# `point = point` and `point < point` are each `42883 operator does not exist` — only `~=`
+# (same-as) and `<->` (distance) exist — and `CREATE INDEX` on one is `42704 data type point has
+# no default operator class for access method "btree"`. Under ADR 0042's rule (a type may share
+# another's representation only if it shares its comparison) that makes it a **not-an-index-key**
+# type, the same standing `json` has, and for a sharper reason: `json` has no equality either, and
+# a point does not even have one with itself.
+#
+# Other things reasoning would get wrong:
+#
+# * **The input is looser than the output.** `'( 1 , 2 )'` and a bare `'1,2'` are both accepted
+#   and all three print `(1,2)` — the parentheses are the output function's, not the parser's.
+# * **The coordinates print as `float8` does**, so `1e10` is `10000000000` and `2e-10` stays
+#   `2e-10`. A formatter of its own would get one of those two wrong.
+# * **A subscript is a `double precision` and is zero-based** — `p[0]` and `p[1]`, not `p[1]` and
+#   `p[2]`.
+# * `typlen` is **16**, not -1: two `float8`s and no length header.
+# * The category is **`G`** for geometric, which is neither `U` nor `S`.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`, error probes in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the rollback proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+SAVEPOINT p1		-
+SELECT 'r', '(1,2)'::point, '( 1 , 2 )'::point, '1,2'::point	text,point,point,point	r|(1,2)|(1,2)|(1,2)
+ROLLBACK TO SAVEPOINT p1		-
+SAVEPOINT p2		-
+SELECT 'r', '(12.2,13.3)'::point, '(14.4,15.5)'::point, '(-1.5,-2.5)'::point	text,point,point,point	r|(12.2,13.3)|(14.4,15.5)|(-1.5,-2.5)
+ROLLBACK TO SAVEPOINT p2		-
+SAVEPOINT p3		-
+SELECT 'r', '(1e10,2e-10)'::point, '(0,0)'::point	text,point,point	r|(10000000000,2e-10)|(0,0)
+ROLLBACK TO SAVEPOINT p3		-
+SAVEPOINT p4		-
+SELECT 'r', pg_typeof('(1,2)'::point), '(1,2)'::point::text	text,regtype,text	r|point|(1,2)
+ROLLBACK TO SAVEPOINT p4		-
+SAVEPOINT p5		-
+SELECT 'r', ('(1.5,2.5)'::point)[0], ('(1.5,2.5)'::point)[1], pg_typeof(('(1,2)'::point)[0])	text,double precision,double precision,regtype	r|1.5|2.5|double precision
+ROLLBACK TO SAVEPOINT p5		-
+SAVEPOINT p6		-
+SELECT 'r', '(1,2)'::point = '(1,2)'::point	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT p6		-
+SAVEPOINT p7		-
+SELECT 'r', '(1,2)'::point ~= '(1,2)'::point, '(1,2)'::point <-> '(4,6)'::point	text,boolean,double precision	r|t|5
+ROLLBACK TO SAVEPOINT p7		-
+SAVEPOINT p8		-
+SELECT 'r', '(1,2)'::point < '(3,4)'::point	!42883 operator does not exist: point < point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT p8		-
+SAVEPOINT p9		-
+SELECT 'r', 'x'::point	!22P02 invalid input syntax for type point: "x"
+ROLLBACK TO SAVEPOINT p9		-
+SAVEPOINT p10		-
+SELECT 'r', '(1)'::point	!22P02 invalid input syntax for type point: "(1)"
+ROLLBACK TO SAVEPOINT p10		-
+SAVEPOINT p11		-
+SELECT 'r', '(1,2,3)'::point	!22P02 invalid input syntax for type point: "(1,2,3)"
+ROLLBACK TO SAVEPOINT p11		-
+SAVEPOINT p12		-
+SELECT 'r', ARRAY['(1,2)'::point, '(3,4)'::point], pg_typeof(ARRAY['(1,2)'::point])	text,point[],regtype	r|{"(1,2)","(3,4)"}|point[]
+ROLLBACK TO SAVEPOINT p12		-
+SAVEPOINT p13		-
+SELECT 'r', '{"(1,2)","(3,4)"}'::point[], array_length('{"(1,2)"}'::point[], 1)	text,point[],integer	r|{"(1,2)","(3,4)"}|1
+ROLLBACK TO SAVEPOINT p13		-
+SAVEPOINT p14		-
+SELECT 'r', t.typname, t.oid, t.typarray, t.typlen, t.typcategory, t.typinput FROM pg_type t WHERE t.typname IN ('point','_point') ORDER BY t.typname	text,name,oid,oid,smallint,"char",regproc	r|_point|1017|0|-1|A|array_in ; r|point|600|1017|16|G|point_in
+ROLLBACK TO SAVEPOINT p14		-
+SAVEPOINT tbl		-
+CREATE TABLE postgresql_points (id serial primary key, x point, y point DEFAULT '(12.2,13.3)', z point DEFAULT '(14.4,15.5)', array_of_points point[])		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"postgresql_points"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|x|point ; r|y|point ; r|z|point ; r|array_of_points|point[]
+SELECT 'r', column_name, column_default, data_type, udt_name FROM information_schema.columns WHERE table_name = 'postgresql_points' ORDER BY ordinal_position	text,name,character varying,character varying,name	r|id|nextval('postgresql_points_id_seq'::regclass)|integer|int4 ; r|x|\N|point|point ; r|y|'(12.2,13.3)'::point|point|point ; r|z|'(14.4,15.5)'::point|point|point ; r|array_of_points|\N|ARRAY|_point
+INSERT INTO postgresql_points (x, array_of_points) VALUES ('(1,2)', ARRAY['(3,4)'::point, '(5,6)'::point])		-
+SELECT 'r', x, y, z, array_of_points FROM postgresql_points		r|(1,2)|(12.2,13.3)|(14.4,15.5)|{"(3,4)","(5,6)"}
+SELECT 'r', x IS NULL, array_length(array_of_points, 1) FROM postgresql_points		r|f|2
+ROLLBACK TO SAVEPOINT tbl		-
+SAVEPOINT ix		-
+CREATE TABLE pp2 (p point)		-
+CREATE INDEX pp2_p ON pp2 (p)	!42704 data type point has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+ROLLBACK TO SAVEPOINT ix		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('postgresql_points','pp2')	bigint	0

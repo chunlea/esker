@@ -1175,6 +1175,9 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
 
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
+        // The origin, which is a point like any other: what stands in is never read, only its
+        // type is.
+        ColumnType::Point => Datum::Point { x: 0.0, y: 0.0 },
         // An empty array of the right element type: the shape a parameter takes before its value
         // arrives, and one that answers `column_type` correctly while it stands in.
         ColumnType::Int8Array
@@ -1189,6 +1192,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::DateRangeArray
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
+        | ColumnType::PointArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray

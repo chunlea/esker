@@ -93,8 +93,21 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::DateRangeArray
                 | ColumnType::NumRangeArray
                 | ColumnType::Int8RangeArray
+                | ColumnType::PointArray
                 | ColumnType::JsonArray
                 | ColumnType::JsonbArray
+                // **And `point`, with the sharpest reason of the four.** `json` has no equality
+                // with another type; a point has none *with itself* — `point = point` is `42883`
+                // on a real server, and `CREATE INDEX` on one is `42704 data type point has no
+                // default operator class for access method "btree"`, which this node now answers
+                // too. There is no order for a fixture to check.
+                //
+                // `point[]` is excluded for a **different** reason and it is a gap rather than a
+                // rule: a real server *can* index one (measured — `point[]`, `json[]` and every
+                // other array have a default btree opclass there), and this node cannot, because
+                // an array key is built out of its element's key encoding and a point has none.
+                | ColumnType::Point
+                | ColumnType::PointArray
         ) {
             assert!(
                 !types_seen.contains(&ty),

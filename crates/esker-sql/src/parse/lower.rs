@@ -6234,7 +6234,8 @@ fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<St
 /// Whether a custom type name is one of the `serial` spellings, which are integers plus a sequence
 /// and never a user-defined type — a table with a column called `serial` would otherwise resolve
 /// against the catalog and get a worse error than the one [`lower_type`] already gives it.
-/// The range column type one of PostgreSQL's built-in range names spells, or `None`.
+/// The column type one of PostgreSQL's built-in names spells, where `sqlparser` has no
+/// variant of its own for it — the six ranges and `point`.
 fn range_type_name(name: &str) -> Option<ColumnType> {
     match name.to_ascii_lowercase().as_str() {
         "tsrange" => Some(ColumnType::TsRange),
@@ -6243,6 +6244,10 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "daterange" => Some(ColumnType::DateRange),
         "numrange" => Some(ColumnType::NumRange),
         "int8range" => Some(ColumnType::Int8Range),
+        // **`point` arrives the same way**: `sqlparser` has no variant for it either, so a
+        // geometric name is a `Custom` one exactly as a range name is, and this is the
+        // table that says which `Custom` names are types this node has.
+        "point" => Some(ColumnType::Point),
         _ => None,
     }
 }

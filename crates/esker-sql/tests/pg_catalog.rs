@@ -191,6 +191,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["26", "oid", "0", ",", "oidin", "\\N", "b", "0"],
             // Tier 2's first pair, and `ActiveRecord`'s list of forty names holds both.
             vec!["114", "json", "0", ",", "json_in", "\\N", "b", "0"],
+            // **`point` is one of the forty names this query asks for**, and it answers now: a
+            // geometric type is a `b`ase type like any other, and its `typelem` is 0 because a
+            // point is not an array of its coordinates.
+            vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
@@ -365,6 +369,19 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1016".to_owned(),
                 "_int8".to_owned(),
                 "20".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            // `_point` joins them: its element `point` is in the adapter's list, so a
+            // `t.point :array_of_points, array: true` column decodes instead of coming back as a
+            // string. Ordered by oid, which puts it just before `_float4`.
+            vec![
+                "1017".to_owned(),
+                "_point".to_owned(),
+                "600".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),
