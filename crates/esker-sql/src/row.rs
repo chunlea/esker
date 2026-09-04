@@ -48,7 +48,24 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
-            | ColumnType::TsRangeArray => {
+            | ColumnType::TsRangeArray
+            | ColumnType::BoolArray
+            | ColumnType::ByteaArray
+            | ColumnType::BpcharArray
+            | ColumnType::VarcharArray
+            | ColumnType::DateArray
+            | ColumnType::TimeArray
+            | ColumnType::TimestampArray
+            | ColumnType::TimestampTzArray
+            | ColumnType::IntervalArray
+            | ColumnType::RealArray
+            | ColumnType::DoubleArray
+            | ColumnType::UuidArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::OidArray
+            | ColumnType::CitextArray
+            => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
                 (

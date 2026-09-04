@@ -1079,7 +1079,23 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),

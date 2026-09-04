@@ -58,6 +58,30 @@ pub(super) fn into_column(
 /// session zone means anything else, this is one of the places that has to learn about it — and
 /// `crate::value::PgDatum::pg_cmp`'s arm for the same pair is the other.
 fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
+    // **An array's cast is its element's cast**, which is PostgreSQL's own rule and the reason
+    // this is one arm rather than sixteen: `ARRAY['one','two']` is a `text[]` and a
+    // `character varying(255)[]` column takes it, exactly as a bare `'one'` goes into a
+    // `varchar` one. The rebuilt value carries the **column's** element type, which is what makes
+    // `pg_typeof(tags)` answer `character varying[]` afterwards rather than `text[]`.
+    if let (Datum::Array(array), Some(want)) =
+        (value, esker_keys::array::ArrayValue::element_of(ty))
+    {
+        if array.element == want {
+            return None;
+        }
+        let mut coerced = array.clone();
+        coerced.element = want;
+        for element in &mut coerced.values {
+            if let Some(datum) = element.take() {
+                *element = Some(if datum.fits(want) {
+                    datum
+                } else {
+                    coerce(&datum, want)?
+                });
+            }
+        }
+        return Some(Datum::Array(coerced));
+    }
     Some(match (value, ty) {
         (Datum::TimestampTz(micros), ColumnType::Timestamp) => Datum::Timestamp(*micros),
         (Datum::Timestamp(micros), ColumnType::TimestampTz) => Datum::TimestampTz(*micros),

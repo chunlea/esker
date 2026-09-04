@@ -252,11 +252,48 @@ pub enum ColumnType {
     /// wraps rather than refusing — and `4294967296` is `22003`. It is the type every catalog
     /// identifier really has.
     Oid,
+    /// `boolean[]`. **The sixteen below are not sixteen features.** Every base type on a real
+    /// server has an array type, and `pg_type.typarray` points at it; a `typarray` naming a row
+    /// that is not there is worse than a zero, because a client walks the link in both directions
+    /// and finds half of it. `ActiveRecord` registers an array decoder **by the element type's
+    /// `typarray`**, so a dangling one leaves the column looking scalar and quoting a Ruby array
+    /// for it raises `TypeError: can't quote Array` client-side, before a statement is sent.
+    BoolArray,
+    /// `bytea[]`.
+    ByteaArray,
+    /// `character[]`.
+    BpcharArray,
+    /// `character varying[]`.
+    VarcharArray,
+    /// `date[]`.
+    DateArray,
+    /// `time without time zone[]`.
+    TimeArray,
+    /// `timestamp without time zone[]`.
+    TimestampArray,
+    /// `timestamp with time zone[]`.
+    TimestampTzArray,
+    /// `interval[]`.
+    IntervalArray,
+    /// `real[]`.
+    RealArray,
+    /// `double precision[]`.
+    DoubleArray,
+    /// `uuid[]`.
+    UuidArray,
+    /// `json[]`.
+    JsonArray,
+    /// `jsonb[]`.
+    JsonbArray,
+    /// `oid[]`.
+    OidArray,
+    /// `citext[]`.
+    CitextArray,
 }
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 32] = [
+    pub const ALL: [ColumnType; 48] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -289,6 +326,22 @@ impl ColumnType {
         ColumnType::Int2Array,
         ColumnType::NumericArray,
         ColumnType::TextArray,
+        ColumnType::BoolArray,
+        ColumnType::ByteaArray,
+        ColumnType::BpcharArray,
+        ColumnType::VarcharArray,
+        ColumnType::DateArray,
+        ColumnType::TimeArray,
+        ColumnType::TimestampArray,
+        ColumnType::TimestampTzArray,
+        ColumnType::IntervalArray,
+        ColumnType::RealArray,
+        ColumnType::DoubleArray,
+        ColumnType::UuidArray,
+        ColumnType::JsonArray,
+        ColumnType::JsonbArray,
+        ColumnType::OidArray,
+        ColumnType::CitextArray,
     ];
 }
 
@@ -510,25 +563,43 @@ impl Datum {
     /// Whether this value fits a column of `ty`. NULL fits every type.
     #[must_use]
     pub fn fits(&self, ty: ColumnType) -> bool {
-        match (self.column_type(), ty) {
-            // NULL fits every column; and `text` fits `varchar` and `bpchar` as well as `text`,
-            // because they are **one representation and three types**. [`Datum`] has no `Varchar`
-            // or `Bpchar` variant, since there would be nothing in one that a `Text` does not
-            // already hold — what differs is the column's declared type, which comes from the
-            // schema and not from the value. A `bpchar`'s padding is part of its *value*: it is
-            // applied before the datum is built, not carried beside it.
-            (None, _)
-            | (
-                Some(ColumnType::Text),
-                ColumnType::Text
-                | ColumnType::Varchar
-                | ColumnType::Bpchar
-                | ColumnType::Json
-                | ColumnType::Jsonb,
-            ) => true,
-            (Some(actual), wanted) => actual == wanted,
+        // NULL fits every column.
+        let Some(actual) = self.column_type() else {
+            return true;
+        };
+        if actual == ty || one_representation(actual, ty) {
+            return true;
+        }
+        // **The same question one level up.** An array fits an array column exactly when its
+        // element fits that column's element: `ARRAY['one','two']` is a `text[]` and a
+        // `character varying(255)[]` column takes it, for the reason a bare `'one'` goes into a
+        // `varchar` one. It is not a wider rule than the scalar one — `int4[]` still does not fit
+        // an `int8[]` column, because an `int4` does not fit an `int8` one.
+        match (
+            crate::array::ArrayValue::element_of(actual),
+            crate::array::ArrayValue::element_of(ty),
+        ) {
+            (Some(held), Some(wanted)) => held == wanted || one_representation(held, wanted),
+            _ => false,
         }
     }
+}
+
+/// Whether a value of `held` is already a value of `wanted`, with no conversion at all.
+///
+/// `text` fits `varchar` and `bpchar` as well as `text`, because they are **one representation and
+/// three types**. [`Datum`] has no `Varchar` or `Bpchar` variant, since there would be nothing in
+/// one that a `Text` does not already hold — what differs is the column's declared type, which
+/// comes from the schema and not from the value. A `bpchar`'s padding is part of its *value*: it
+/// is applied before the datum is built, not carried beside it.
+fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
+    matches!(
+        (held, wanted),
+        (
+            ColumnType::Text,
+            ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Json | ColumnType::Jsonb
+        )
+    )
 }
 
 /// The sign bit of an IEEE-754 binary64.

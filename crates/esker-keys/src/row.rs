@@ -311,6 +311,11 @@ impl RowSchema {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and the array half is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere else"
+)]
 fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let truncated = || corrupt(format!("a {ty:?} is truncated"));
     Ok(match ty {
@@ -368,7 +373,23 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray => return decode_array(ty, bytes),
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -859,7 +880,21 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
-        | ColumnType::TsRangeArray => return decode_key_array(ty, bytes),
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
@@ -967,6 +1002,8 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Jsonb
         | ColumnType::Hstore
         | ColumnType::HstoreArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
         | ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range => Err(not_a_key())?,
@@ -1605,7 +1642,23 @@ mod tests {
             | ColumnType::NumericArray
             | ColumnType::TextArray
             | ColumnType::HstoreArray
-            | ColumnType::TsRangeArray => {
+            | ColumnType::TsRangeArray
+            | ColumnType::BoolArray
+            | ColumnType::ByteaArray
+            | ColumnType::BpcharArray
+            | ColumnType::VarcharArray
+            | ColumnType::DateArray
+            | ColumnType::TimeArray
+            | ColumnType::TimestampArray
+            | ColumnType::TimestampTzArray
+            | ColumnType::IntervalArray
+            | ColumnType::RealArray
+            | ColumnType::DoubleArray
+            | ColumnType::UuidArray
+            | ColumnType::JsonArray
+            | ColumnType::JsonbArray
+            | ColumnType::OidArray
+            | ColumnType::CitextArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 (
                     proptest::collection::vec(

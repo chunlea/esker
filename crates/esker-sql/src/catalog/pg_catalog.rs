@@ -1408,6 +1408,22 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::TstzRange => "tstzrange",
         ColumnType::Int4Range => "int4range",
         ColumnType::TsRangeArray => "_tsrange",
+        ColumnType::BoolArray => "_bool",
+        ColumnType::ByteaArray => "_bytea",
+        ColumnType::BpcharArray => "_bpchar",
+        ColumnType::VarcharArray => "_varchar",
+        ColumnType::DateArray => "_date",
+        ColumnType::TimeArray => "_time",
+        ColumnType::TimestampArray => "_timestamp",
+        ColumnType::TimestampTzArray => "_timestamptz",
+        ColumnType::IntervalArray => "_interval",
+        ColumnType::RealArray => "_float4",
+        ColumnType::DoubleArray => "_float8",
+        ColumnType::UuidArray => "_uuid",
+        ColumnType::JsonArray => "_json",
+        ColumnType::JsonbArray => "_jsonb",
+        ColumnType::OidArray => "_oid",
+        ColumnType::CitextArray => "_citext",
         ColumnType::HstoreArray => "_hstore",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
@@ -1476,7 +1492,7 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "R",
     }
@@ -1500,7 +1516,23 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray => "array_in",
+        | ColumnType::TsRangeArray
+        | ColumnType::BoolArray
+        | ColumnType::ByteaArray
+        | ColumnType::BpcharArray
+        | ColumnType::VarcharArray
+        | ColumnType::DateArray
+        | ColumnType::TimeArray
+        | ColumnType::TimestampArray
+        | ColumnType::TimestampTzArray
+        | ColumnType::IntervalArray
+        | ColumnType::RealArray
+        | ColumnType::DoubleArray
+        | ColumnType::UuidArray
+        | ColumnType::JsonArray
+        | ColumnType::JsonbArray
+        | ColumnType::OidArray
+        | ColumnType::CitextArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",

@@ -2275,6 +2275,18 @@ fn catalog_function(
                 None => Datum::Text(oid.to_string()),
             },
         },
+        // **The inverse of `'x'::regtype`, and per row**, with the three answers `RegClassName`
+        // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
+        // every non-array row of `pg_type` holds in `typelem` — and the number back for an oid
+        // this node has no type for.
+        CatalogFunc::RegTypeName => match oid_argument(args.first())? {
+            None => Datum::Null,
+            Some(oid) => match u32::try_from(oid).ok().and_then(crate::value::type_by_oid) {
+                Some(ty) => Datum::Text(crate::value::Named::Scalar(ty).printed()),
+                None if oid == 0 => Datum::Text("-".to_owned()),
+                None => Datum::Text(oid.to_string()),
+            },
+        },
         // The one encoding this node speaks. Anything else is the empty string, which is what a
         // real server answers for a number that names no encoding.
         CatalogFunc::PgEncodingToChar => match oid_argument(args.first())? {
@@ -2429,6 +2441,8 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int8(oid)) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
+        // An `oid` is what a catalog column really holds; `23::oid::regtype` sends one.
+        Some(Datum::Oid(oid)) => Some(i64::from(*oid)),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "an oid is an integer, not {other:?}"

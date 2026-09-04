@@ -258,11 +258,14 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **This one answers now**: the four array
-    // types report their element's OID in `typelem`, which is how `ActiveRecord` finds them, and
-    // `typinput` is `array_in`, which is how it decides a column is an array at all. It returned
-    // nothing while this node had no arrays; a row per array type is the whole point of the unit
-    // that gave it them.
+    // 9 — array types, found by their element type. **Twenty-one rows**, which is every array
+    // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
+    // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
+    // is an array at all. It answered nothing while this node had no arrays and five rows while
+    // it had five; sixteen more arrived with the unit that made every `typarray` name a row that
+    // exists, which is what `TypeError: can't quote Array` was. `_hstore` and `_citext` are not
+    // here and are not missing: an extension's element oid is above 16384 and is not in the
+    // adapter's fixed list at all.
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
@@ -273,12 +276,36 @@ fn activerecord_s_four_type_map_queries_answer() {
              13369, 3904, 3906, 3908, 3910, 3912, 3926) ORDER BY t.oid"
         ),
         vec![
-            // `_int2` is 1005 over `int2` 21, `_int4` 1007 over 23, `_text` 1009 over 25 — the
-            // numbers are not derivable from the element's and each is a measurement
-            // (`crate::value::array_oid`). `rngsubtype` is NULL because no array is a range.
-            // `_int2` arrived with the unit that made `pg_constraint.conkey` a real `smallint[]`:
-            // the array type is derived from the element, so a new element type brings its array
-            // with it and this row appeared without anyone writing it.
+            vec![
+                "199".to_owned(),
+                "_json".to_owned(),
+                "114".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1000".to_owned(),
+                "_bool".to_owned(),
+                "16".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1001".to_owned(),
+                "_bytea".to_owned(),
+                "17".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "1005".to_owned(),
                 "_int2".to_owned(),
@@ -310,9 +337,109 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "0".to_owned(),
             ],
             vec![
+                "1014".to_owned(),
+                "_bpchar".to_owned(),
+                "1042".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1015".to_owned(),
+                "_varchar".to_owned(),
+                "1043".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
                 "1016".to_owned(),
                 "_int8".to_owned(),
                 "20".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1021".to_owned(),
+                "_float4".to_owned(),
+                "700".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1022".to_owned(),
+                "_float8".to_owned(),
+                "701".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1028".to_owned(),
+                "_oid".to_owned(),
+                "26".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1115".to_owned(),
+                "_timestamp".to_owned(),
+                "1114".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1182".to_owned(),
+                "_date".to_owned(),
+                "1082".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1183".to_owned(),
+                "_time".to_owned(),
+                "1083".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1185".to_owned(),
+                "_timestamptz".to_owned(),
+                "1184".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1187".to_owned(),
+                "_interval".to_owned(),
+                "1186".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),
@@ -329,9 +456,26 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
-            // `_tsrange` joins them because its element `tsrange` is in the adapter's list: an
-            // array is found by its element's oid, and this is the row that makes
-            // `t.tsrange :ranges, array: true` decode instead of coming back as a string.
+            vec![
+                "2951".to_owned(),
+                "_uuid".to_owned(),
+                "2950".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3807".to_owned(),
+                "_jsonb".to_owned(),
+                "3802".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "3909".to_owned(),
                 "_tsrange".to_owned(),

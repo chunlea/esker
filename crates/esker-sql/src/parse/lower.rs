@@ -3808,27 +3808,22 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
     let mut texts: Vec<Option<String>> = Vec::with_capacity(elements.len());
     let mut element = None;
     for expr in elements {
-        // **An `'…'::hstore` or `'…'::tsrange` element is a constant too.** Both suites write it —
-        // `t.hstore "payload", array: true` and `t.tsrange :ts_ranges, array: true` — and a cast of
-        // a string constant folds here exactly as the string would. Named types rather than every
-        // type, because a cast to any other one is a declared divergence and widening it would
-        // move answers these units did not measure.
+        // **A cast of a string constant is a constant too, whatever it casts to.** A cast is how
+        // an element type is written down at all — `ARRAY['2010-01-01'::date]` is a `date[]` and
+        // `ARRAY['2010-01-01']` is a `text[]` — and the type the cast names *is* the array's, so
+        // this arm both folds the value and settles the element type. It was two named types
+        // while only `hstore` and `tsrange` had been measured this way; every one of them is
+        // measured now, from `ARRAY['{"a":1}'::jsonb]` to `ARRAY['ABC'::citext]`.
         if let Expr::Cast {
             expr: inner,
             data_type,
             ..
         } = strip_nesting(expr)
-            && matches!(
-                lower_type(data_type),
-                Ok((ColumnType::Hstore | ColumnType::TsRange, _))
-            )
+            && let Ok((cast_to, NO_TYPMOD)) = lower_type(data_type)
             && let Expr::Value(value) = strip_nesting(inner)
             && let Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) = &value.value
         {
-            element = Some(match lower_type(data_type) {
-                Ok((ty, _)) => ty,
-                Err(_) => ColumnType::Hstore,
-            });
+            element = Some(cast_to);
             texts.push(Some(text.clone()));
             continue;
         }
@@ -3848,6 +3843,13 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
                 (Some(text.clone()), Some(ColumnType::Text))
             }
+            // **`ARRAY[true,false]` is a `boolean[]`**, and the keyword is the value: a boolean
+            // literal is not an `unknown` string that happens to read as one, which is why it
+            // does not widen to `text` beside a string the way a number does not either.
+            Value::Boolean(value) => (
+                Some(if *value { "true" } else { "false" }.to_owned()),
+                Some(ColumnType::Bool),
+            ),
             other => {
                 return Err(SqlError::unsupported(format!(
                     "an ARRAY constructor holding {other}"
@@ -4351,6 +4353,15 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             func: plan::CatalogFunc::RegClassName,
             args: vec![lower_expr(expr)?],
         }))),
+        // **The inverse, and per row**: an oid rather than a name. `t.typelem::regtype` is how
+        // `ActiveRecord` reads what an array type is over, and its operand is a catalog column.
+        // `23::regtype` is `integer` on a real server too, so a number goes this way as well.
+        (CastTarget::RegType, _) if !is_string_literal(expr) => {
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegTypeName,
+                args: vec![lower_expr(expr)?],
+            })))
+        }
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
@@ -5701,21 +5712,19 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     match data_type {
-        // **`int8[]` is a column type**, over one of the four element types this node has an
-        // array of. The element's own declaration is read first, so `numeric(10,2)[]` is refused
-        // by naming the typmod rather than by silently dropping it — an array takes none here.
+        // **`int8[]` is a column type**, over every element type this node has. The element's own
+        // declaration is read first and **its typmod is the array's**: `character varying(255)[]`
+        // and `numeric(10,2)[]` are real declarations that `ActiveRecord` writes, the length
+        // belongs to the element, and `format_type` prints it back inside the element's name.
         DataType::Array(inner) => {
             let Some(element) = array_element(inner) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
-            if typmod != NO_TYPMOD {
-                return Err(SqlError::unsupported(format!("the type {data_type}")));
-            }
             let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
-            plain(array)
+            Ok((array, typmod))
         }
         // The three that take a number. Each is checked against PostgreSQL's own limit, because a
         // length this node accepted and a real server refused would be a table that exists here

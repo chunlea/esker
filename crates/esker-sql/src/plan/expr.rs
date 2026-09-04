@@ -764,6 +764,14 @@ pub enum CatalogFunc {
     /// PostgreSQL's rendering of `InvalidOid`. Measured, both; an implementation that raised would
     /// break a `LEFT JOIN` that legitimately has no match.
     RegClassName,
+    /// The inverse of `'x'::regtype`: an **oid**, read per row, answered as the type's printed
+    /// name. `ActiveRecord`'s array probe writes `t.typelem::regtype`, where the operand is a
+    /// catalog column and not a literal.
+    ///
+    /// The same three answers `RegClassName` gives, measured the same way: a type's name, `-` for
+    /// oid **0** — PostgreSQL's rendering of `InvalidOid`, which every non-array row of `pg_type`
+    /// has in `typelem` — and the number back for an oid this node does not know.
+    RegTypeName,
     /// `pg_typeof(x)`: the name of the type `x` has.
     ///
     /// **Read from the value, not from the plan.** A real server answers the *static* type, and
@@ -963,6 +971,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreBuild => "hstore",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
+            CatalogFunc::RegTypeName => "regtype",
             CatalogFunc::ArrayPosition => "array_position",
             CatalogFunc::ArrayLower => "array_lower",
             CatalogFunc::ArrayUpper => "array_upper",
@@ -1022,6 +1031,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
+            | CatalogFunc::RegTypeName
             | CatalogFunc::IsEmpty
             | CatalogFunc::Cardinality
             | CatalogFunc::PgTypeof => &[1],
@@ -1056,6 +1066,7 @@ impl CatalogFunc {
             // is what it prints as. The one place the difference shows is the declared type.
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
+            | CatalogFunc::RegTypeName
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
@@ -1568,7 +1579,7 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range
-                | ColumnType::TsRangeArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1644,11 +1655,31 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range
-                | ColumnType::TsRangeArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
             Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            // **An `ARRAY[…]`'s element type is settled by the column**, the way an integer
+            // literal's is one level down. `ARRAY[1,2,3]` is `integer[]` on a real server and
+            // `bigint[]` here — an integer literal is an `int8` in this crate until a column says
+            // otherwise, which is what `Literal::Integer` above does — and both servers write the
+            // same row into an `integer[]` column. Re-read through the array's own text, which is
+            // `array_in` doing the element conversion: `ARRAY[2147483648]` into an `integer[]`
+            // column then fails with `int4`'s own `22003` rather than with a type mismatch.
+            //
+            // A `Literal` is a constant in the statement, never a column reference, so this
+            // settles a *literal's* type and does not widen assignment between two columns:
+            // `int8[]` into an `integer[]` column is still `42804`, from `exec::assign`.
+            Literal::Typed(value)
+                if matches!(**value, Datum::Array(_))
+                    && esker_keys::array::ArrayValue::element_of(ty).is_some() =>
+            {
+                match value.to_text() {
+                    Some(text) => Datum::from_text(ty, &text),
+                    None => mismatch(),
+                }
+            }
             Literal::Typed(_) => mismatch(),
 
             Literal::Bool(value) => match ty {
@@ -1694,7 +1725,7 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range
-                | ColumnType::TsRangeArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
         }
     }

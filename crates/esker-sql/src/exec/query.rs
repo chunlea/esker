@@ -2548,6 +2548,27 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::TstzRange => 30,
             ColumnType::Int4Range => 31,
             ColumnType::TsRangeArray => 32,
+            // **Measured, one pairing at a time**: `text[] = varchar[]`, `date[] =
+            // timestamp[]`, `int4[] = int8[]` and `bpchar[] = text[]` are every one of them
+            // `42883` on a real server — even where the *element* types compare. So the rule
+            // above holds for all sixteen: an array's comparison is its element type's, and
+            // two element types are two operators.
+            ColumnType::BoolArray => 33,
+            ColumnType::ByteaArray => 34,
+            ColumnType::BpcharArray => 35,
+            ColumnType::VarcharArray => 36,
+            ColumnType::DateArray => 37,
+            ColumnType::TimeArray => 38,
+            ColumnType::TimestampArray => 39,
+            ColumnType::TimestampTzArray => 40,
+            ColumnType::IntervalArray => 41,
+            ColumnType::RealArray => 42,
+            ColumnType::DoubleArray => 43,
+            ColumnType::UuidArray => 44,
+            ColumnType::JsonArray => 45,
+            ColumnType::JsonbArray => 46,
+            ColumnType::OidArray => 47,
+            ColumnType::CitextArray => 48,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
@@ -2565,7 +2586,13 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Json => 9,
         }
     }
-    if matches!(left, ColumnType::Json) || matches!(right, ColumnType::Json) {
+    // **And `json[]` with it.** `ARRAY['{"a":1}'::json] = ARRAY['{"a":1}'::json]` is
+    // `42883 could not identify an equality operator for type json` — a different sentence
+    // from the one above and the same reason: an array's equality is its element's, and
+    // `json` has none to lend.
+    if matches!(left, ColumnType::Json | ColumnType::JsonArray)
+        || matches!(right, ColumnType::Json | ColumnType::JsonArray)
+    {
         return false;
     }
     family(left) == family(right)

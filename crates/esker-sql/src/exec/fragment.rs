@@ -641,7 +641,23 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::TsRange
         | Row::TstzRange
         | Row::Int4Range
-        | Row::TsRangeArray => {
+        | Row::TsRangeArray
+        | Row::BoolArray
+        | Row::ByteaArray
+        | Row::BpcharArray
+        | Row::VarcharArray
+        | Row::DateArray
+        | Row::TimeArray
+        | Row::TimestampArray
+        | Row::TimestampTzArray
+        | Row::IntervalArray
+        | Row::RealArray
+        | Row::DoubleArray
+        | Row::UuidArray
+        | Row::JsonArray
+        | Row::JsonbArray
+        | Row::OidArray
+        | Row::CitextArray => {
             return None;
         }
     })
