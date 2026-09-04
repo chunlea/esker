@@ -29,7 +29,18 @@ tracing.workspace = true
 # break things. Enable it from a dev-dependency, never from a runtime one.
 testing = []
 
+[[bench]]
+name = "memtable"
+harness = false
+# Not a test target. `cargo test` runs bench targets by default, and a criterion binary in test
+# mode is a slow no-op that `cargo nextest` cannot enumerate. `cargo clippy --all-targets` still
+# lints it, which is the part that has to stay in the gate.
+test = false
+
 [dev-dependencies]
+# ADR 0041's bench plan. Dev-only, so `deny.toml`'s `exclude-dev` keeps it off the runtime
+# budget; CLAUDE.md's dev allowlist already names it.
+criterion.workspace = true
 # The crate's own test harness, enabled for its tests only. An integration test links the
 # library as an ordinary dependency, so `#[cfg(test)]` does not reach it and the feature is
 # the only way in (see src/testing/mod.rs).

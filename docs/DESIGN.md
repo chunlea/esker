@@ -142,14 +142,24 @@ record of the **last** segment (normal), fail on corruption anywhere else unless
 
 ### 4.4 Memtable
 
-`crossbeam-skiplist` (the one bought piece of concurrent code; an in-house arena skiplist is a
-post-v1 replacement behind the same `MemTable` trait) keyed by internal key
-`user_key ++ tag:u64` little-endian with `tag = (seqno << 8) | kind` (LevelDB layout, so the kind byte
+An **in-house arena skiplist** ([ADR 0041](adr/0041-the-in-house-arena-skiplist.md)) keyed by internal
+key `user_key ++ tag:u64` little-endian with `tag = (seqno << 8) | kind` (LevelDB layout, so the kind byte
 physically precedes the 56-bit sequence number), ordered by user key ascending then tag **descending** so
 the newest version of a key sorts first. One
 active + a bounded queue of immutable memtables per CF. Flush when active reaches
 `write_buffer_size` (64 MiB *default*). Stall policy: slow down at `max_immutable = 2`, stop at 4 — and
 expose both as metrics so the stall is visible, never mysterious.
+
+`crossbeam-skiplist` held this place until phase 11's debt was cleared, and was the last piece of
+concurrent code the project bought rather than wrote. Both implementations are compiled and both are
+held to the same differential; one `type Selected = …` line in `memtable.rs` says which the engine uses.
+The structure is single-writer (group commit serialises inserts, §4.2), multi-reader, and **append-only**
+— nothing is ever removed, so no node is freed until the last `Arc<MemTable>` drops and the reclamation
+question a lock-free map has to answer never arises. Key and value bytes and the node's forward pointers
+live in an arena of chunks that are allocated once and never moved, addressed by `u32` offsets, so a
+cursor is a node offset and `next` is a pointer hop into a borrow rather than a re-find of the
+remembered key and a copy of the entry. Node heights come from a seeded PCG32 held on the table, so a
+memtable's shape is a function of its seed and a failing test replays from one.
 
 ### 4.5 SST format (*fixed*, version 1)
 
