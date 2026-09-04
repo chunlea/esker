@@ -88,6 +88,10 @@ pub enum CatalogView {
     /// schema because a bare `tables` is `42P01` on a real server
     /// ([`crate::catalog::information_schema`]).
     InformationSchemaTables,
+    /// `information_schema.views`: one row per view, with the standard's `is_updatable`.
+    ///
+    /// **`YES`/`NO` text, not a boolean** — the standard spells these `character varying(3)`, and
+    /// a client comparing against the string would read a boolean as neither.
     InformationSchemaViews,
     /// `information_schema.columns`.
     InformationSchemaColumns,
