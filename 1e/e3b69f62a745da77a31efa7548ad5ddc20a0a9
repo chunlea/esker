@@ -1,0 +1,21 @@
+docs/DESIGN.md
+  s_49075263d2b3e7::t_8d9d3a74867511 762-776
+docs/adr/0055-the-tls-options-across-three-surfaces-measured.md
+  s_49075263d2b3e7::t_0ee817a76e4ca2 3-7,367-418
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1ee3b69f62a745da77a31efa7548ad5ddc20a0a9",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
