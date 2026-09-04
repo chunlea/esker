@@ -1,0 +1,23 @@
+crates/esker-sql/src/advisory.rs
+  s_2bed4ac2b1c944::t_3d63901b6ec227 1-371
+crates/esker-sql/src/lib.rs
+  s_2bed4ac2b1c944::t_b9ae84489fa75c 46
+crates/esker-sql/tests/corpus/pg19_advisory_lock.txt
+  s_2bed4ac2b1c944::t_fd5aba2aacca8d 1-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7518184b04b66d86218492a7cd00e6e5c578186a",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
