@@ -139,7 +139,7 @@ fn inspect(pd_dir: &Path) -> String {
 /// on a warm binary the driver binds in a few milliseconds and the stores would very likely have
 /// won anyway. It says that a start which announces four nodes has four; the deterministic half of
 /// the pair is [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`], which removes the
-/// timing from the question entirely, and the unit tests on `wait_until_listening`.
+/// timing from the question entirely, and the unit tests on `wait_until_the_driver_answers`.
 #[test]
 fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     let _ports = PORTS
