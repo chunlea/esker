@@ -220,6 +220,24 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// A condition that is not a boolean: `WHERE name AND true`, `CASE WHEN name THEN …`.
+    ///
+    /// **The type, never the value.** PostgreSQL says `argument of AND must be type boolean, not
+    /// type character varying` — the word `type` twice — and names the one construct rather than
+    /// the pair, `CASE/WHEN` included. A message built from the datum a row happened to hold leaks
+    /// that row into an error and differs per row of one query.
+    ///
+    /// A *literal* is not this: an untyped `'true'` takes the type its context wants, so
+    /// `WHERE 'true' AND true` runs and `WHERE 'text' AND true` is `22P02` — a value error, not a
+    /// type one. Only something that already has a type reaches here. Measured, all four.
+    #[error("argument of {construct} must be type boolean, not type {found}")]
+    NonBooleanArgument {
+        /// `AND`, `OR` or `CASE/WHEN`.
+        construct: &'static str,
+        /// The type the operand actually has, as `format_type` prints it.
+        found: String,
+    },
+
     /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
     /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
     /// relation that outlives the transaction. Measured.
@@ -2099,7 +2117,9 @@ impl SqlError {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            SqlError::DatatypeMismatch(_) | SqlError::DatatypeMismatchInColumn { .. } => {
+            SqlError::DatatypeMismatch(_)
+            | SqlError::NonBooleanArgument { .. }
+            | SqlError::DatatypeMismatchInColumn { .. } => {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,

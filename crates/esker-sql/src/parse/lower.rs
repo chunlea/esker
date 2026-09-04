@@ -2944,16 +2944,12 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
         // unknown is unknown and `NOT (NULL = NULL)` is therefore NULL where
         // `NULL IS DISTINCT FROM NULL` is `false`.
-        Expr::IsDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::Distinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
-        Expr::IsNotDistinctFrom(left, right) => Ok(plan::Expr::Binary {
-            op: plan::BinaryOp::NotDistinct,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-        }),
+        Expr::IsDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::Distinct)
+        }
+        Expr::IsNotDistinctFrom(left, right) => {
+            lower_distinct(left, right, plan::BinaryOp::NotDistinct)
+        }
         // **`a BETWEEN x AND y` is `a >= x AND a <= y`**, and the rewrite is the whole feature:
         // every rule a corpus can ask about falls out of it rather than needing one of its own.
         // The ends are inclusive because `>=` and `<=` are; reversed bounds match nothing because
@@ -3116,10 +3112,18 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     return Err(SqlError::unsupported(format!("the operator {other}")));
                 }
             };
+            // **An untyped string literal in a boolean context is *read* as a boolean**, not
+            // refused: `WHERE 'true' AND true` runs on a real server and `WHERE 'text' AND
+            // true` is `22P02 invalid input syntax for type boolean: "text"` — a *value* error
+            // rather than a type one, because an unadorned literal takes the type its context
+            // wants and only then fails to be read as one. A `character varying` **column**
+            // cannot: it already has a type, and that is the `42804` next door. Measured, all
+            // three.
+            let boolean = matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or);
             Ok(plan::Expr::Binary {
                 op,
-                left: Box::new(lower_expr(left)?),
-                right: Box::new(lower_expr(right)?),
+                left: Box::new(lower_condition(left, boolean)?),
+                right: Box::new(lower_condition(right, boolean)?),
             })
         }
         Expr::InList {
@@ -4428,6 +4432,67 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
     reason = "one arm per cast shape, and each arm is a measured answer; splitting it would \
               hide which shapes are folded at plan time and which are not"
 )]
+/// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.
+///
+/// PostgreSQL types a bare literal from its context, so `'true'` in a boolean position *is* a
+/// boolean and `'text'` is `22P02` — the value could not be read as one, which is a different
+/// answer from a column whose declared type is wrong (`42804`). `boolean` is false everywhere
+/// else, and then this is [`lower_expr`].
+fn lower_condition(expr: &Expr, boolean: bool) -> Result<plan::Expr> {
+    if boolean
+        && let Expr::Value(value) = expr
+        && let Value::SingleQuotedString(text) = &value.value
+    {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            <Datum as crate::value::PgDatum>::from_text(ColumnType::Bool, text)?,
+        ))));
+    }
+    lower_expr(expr)
+}
+
+/// `IS [NOT] DISTINCT FROM`, **re-associated around an `AND` or `OR` the parser swallowed**.
+///
+/// `sqlparser` 0.62.0 reads the right operand of these two with a precedence *below* `AND` and
+/// `OR`, so `a IS NOT DISTINCT FROM b AND c IS NOT DISTINCT FROM d` arrives as
+/// `a IS NOT DISTINCT FROM (b AND c IS NOT DISTINCT FROM d)` — one comparison swallowing a whole
+/// conjunction. PostgreSQL's grammar puts `IS` above `NOT`, `AND` and `OR` and below everything
+/// else, so the fix is a rotation and not a guess: the swallowed operator moves out and the
+/// comparison closes over the operand it should have had.
+///
+/// **Only `AND` and `OR` move.** Every other binary operator — `=`, `<`, `+`, `||` — binds
+/// *tighter* than `IS` on a real server, so a right operand that is one of those was parsed
+/// correctly and must stay where it is.
+///
+/// The shape is what `ActiveRecord`'s `upsert_all` writes (`postgresql_adapter.rb:675`), which is
+/// how it was found: seven tests answering `42804 argument of AND/OR must be type boolean` because
+/// the `AND`'s left operand was a *column's value* rather than a comparison.
+fn lower_distinct(left: &Expr, right: &Expr, op: plan::BinaryOp) -> Result<plan::Expr> {
+    if let Expr::BinaryOp {
+        left: inner_left,
+        op: inner_op,
+        right: inner_right,
+    } = right
+    {
+        let boolean = match inner_op {
+            BinaryOperator::And => Some(plan::BinaryOp::And),
+            BinaryOperator::Or => Some(plan::BinaryOp::Or),
+            _ => None,
+        };
+        if let Some(boolean) = boolean {
+            return Ok(plan::Expr::Binary {
+                op: boolean,
+                left: Box::new(lower_distinct(left, inner_left, op)?),
+                right: Box::new(lower_expr(inner_right)?),
+            });
+        }
+    }
+    Ok(plan::Expr::Binary {
+        op,
+        left: Box::new(lower_expr(left)?),
+        right: Box::new(lower_expr(right)?),
+    })
+}
+
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
     // what the cast carries is the type, and everything downstream resolves against it — a
