@@ -297,7 +297,8 @@ impl Parsed {
         self.do_guarded
     }
 
-    /// The `RAISE` this `DO` block was, if it was one ([`strip_do_raise`]).
+    /// The `RAISE` this `DO` block was, if it was one — recognised by `strip_do_raise`, which
+    /// is private, so this names it rather than linking to it.
     #[must_use]
     pub fn raised(&self) -> Option<&(String, crate::error::Severity)> {
         self.raise.as_ref()
@@ -589,6 +590,182 @@ fn do_words_match(tokens: &[(DoToken<'_>, usize, usize)], at: usize, words: &[&s
 /// when the caller named no schema and on the literal when it did, and in both cases the guard and
 /// the `CREATE` agree by construction; what decides where the type lands is the `CREATE`, and the
 /// executor's own "does this name exist here" is the same question the guard asks.
+/// Whether the token at `at` is exactly `want`, comparing words case-insensitively.
+fn do_token_is(tokens: &[(DoToken<'_>, usize, usize)], at: usize, want: &DoToken<'_>) -> bool {
+    match (tokens.get(at).map(|(token, _, _)| token), want) {
+        (Some(DoToken::Word(seen)), DoToken::Word(expected)) => seen.eq_ignore_ascii_case(expected),
+        (Some(seen), expected) => seen == expected,
+        (None, _) => false,
+    }
+}
+
+/// Walks `wants` from `at`, returning the index after them or `None` at the first mismatch.
+fn do_expect(
+    tokens: &[(DoToken<'_>, usize, usize)],
+    mut at: usize,
+    wants: &[DoToken<'_>],
+) -> Option<usize> {
+    for want in wants {
+        if !do_token_is(tokens, at, want) {
+            return None;
+        }
+        at += 1;
+    }
+    Some(at)
+}
+
+/// The guard half of `create_enum`'s block: `BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type … )`.
+///
+/// Returns the type name it tests for and the index just past the closing parenthesis. The
+/// **schema** predicate is accepted in either of the two forms `create_enum` writes and is not
+/// otherwise read: it guards on the search path when the caller named no schema and on the literal
+/// when it did, so in both cases it asks the same question the `CREATE` half answers.
+fn match_do_enum_guard<'a>(tokens: &'a [(DoToken<'a>, usize, usize)]) -> Option<(&'a str, usize)> {
+    use DoToken::{Punct, Text, Word};
+    let at = do_expect(
+        tokens,
+        0,
+        &[
+            Word("BEGIN"),
+            Word("IF"),
+            Word("NOT"),
+            Word("EXISTS"),
+            Punct('('),
+            Word("SELECT"),
+            Word("1"),
+            Word("FROM"),
+            Word("pg_type"),
+            Word("t"),
+            Word("JOIN"),
+            Word("pg_namespace"),
+            Word("n"),
+            Word("ON"),
+            Word("t"),
+            Punct('.'),
+            Word("typnamespace"),
+            Punct('='),
+            Word("n"),
+            Punct('.'),
+            Word("oid"),
+            Word("WHERE"),
+            Word("t"),
+            Punct('.'),
+            Word("typname"),
+            Punct('='),
+        ],
+    )?;
+    let Some((Text(guarded), _, _)) = tokens.get(at) else {
+        return None;
+    };
+    let at = do_expect(
+        tokens,
+        at + 1,
+        &[
+            Word("AND"),
+            Word("n"),
+            Punct('.'),
+            Word("nspname"),
+            Punct('='),
+        ],
+    )?;
+    let at = match tokens.get(at) {
+        // `n.nspname = 'test_schema'` — the caller named a schema.
+        Some((Text(_), _, _)) => at + 1,
+        // `n.nspname = ANY (current_schemas(false))` — the search path.
+        Some((Word(word), _, _)) if word.eq_ignore_ascii_case("ANY") => do_expect(
+            tokens,
+            at,
+            &[
+                Word("ANY"),
+                Punct('('),
+                Word("current_schemas"),
+                Punct('('),
+                Word("false"),
+                Punct(')'),
+                Punct(')'),
+            ],
+        )?,
+        _ => return None,
+    };
+    Some((guarded, do_expect(tokens, at, &[Punct(')')])?))
+}
+
+/// The guarded half: `THEN CREATE TYPE <name> AS ENUM (…); END IF; END`.
+///
+/// Returns the byte range of the `CREATE TYPE …` itself, which is what replaces the whole
+/// statement. The created name must be the one the guard tested — a block that tested one name and
+/// created another would be idempotent in the wrong direction, and nothing generated writes one.
+fn match_do_enum_create(
+    tokens: &[(DoToken<'_>, usize, usize)],
+    at: usize,
+    guarded: &str,
+) -> Option<(usize, usize)> {
+    use DoToken::{Punct, Quoted, Text, Word};
+    let from = tokens.get(at + 1)?.1;
+    let mut at = do_expect(tokens, at, &[Word("THEN"), Word("CREATE"), Word("TYPE")])?;
+
+    // `<name>` or `<schema> . <name>`; the bare name is the one that has to match the guard.
+    let (Quoted(name) | Word(name), _, _) = tokens.get(at)? else {
+        return None;
+    };
+    at += 1;
+    let created = if do_token_is(tokens, at, &Punct('.')) {
+        let (Quoted(inner) | Word(inner), _, _) = tokens.get(at + 1)? else {
+            return None;
+        };
+        at += 2;
+        *inner
+    } else {
+        *name
+    };
+    if created != guarded {
+        return None;
+    }
+
+    // `AS ENUM ('<label>', …)` — the list may be empty, which `schema_test.rb` sends.
+    at = do_expect(tokens, at, &[Word("AS"), Word("ENUM"), Punct('(')])?;
+    while matches!(tokens.get(at), Some((Text(_), _, _))) {
+        at += 1;
+        if do_token_is(tokens, at, &Punct(',')) {
+            at += 1;
+        }
+    }
+    let to = tokens.get(at)?.2;
+    at = do_expect(
+        tokens,
+        at,
+        &[
+            Punct(')'),
+            Punct(';'),
+            Word("END"),
+            Word("IF"),
+            Punct(';'),
+            Word("END"),
+        ],
+    )?;
+    // A trailing `;` inside the body is optional; anything after it is not this template.
+    if do_token_is(tokens, at, &Punct(';')) {
+        at += 1;
+    }
+    (at == tokens.len()).then_some((from, to))
+}
+
+/// The `create_enum` block, rewritten into the `CREATE TYPE` it guards — or `None` for any other
+/// body, which then reaches the refusal table and is named there.
+///
+/// **This is the only `DO` body the suite sends for a type.** Thirty-six `DO` statements were
+/// logged running the five files that need one against PostgreSQL 19, and every one is:
+///
+/// ```text
+/// DO $$ BEGIN IF NOT EXISTS (
+///          SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+///          WHERE t.typname = '<name>' AND n.nspname = <ANY (current_schemas(false)) | '<schema>'>
+///        ) THEN CREATE TYPE <name> AS ENUM (<labels>); END IF; END $$
+/// ```
+///
+/// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, which is why `create_enum` writes a block at
+/// all; the guard is the whole of what the block does, so running the template is running the
+/// `CREATE TYPE` **only when the type is not already there** ([`Parsed::is_do_guarded`]).
 fn strip_do_create_enum(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let [first, ..] = scanned.words.as_slice() else {
         return None;
@@ -598,181 +775,9 @@ fn strip_do_create_enum(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     }
     let body = do_body(sql)?;
     let tokens = tokenize_do_body(body)?;
-
-    // BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON
-    //   t . typnamespace = n . oid WHERE t . typname =
-    if !do_words_match(&tokens, 0, &["BEGIN", "IF", "NOT", "EXISTS"]) {
-        return None;
-    }
-    let mut at = 4;
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct('(')) {
-        return None;
-    }
-    at += 1;
-    if !do_words_match(&tokens, at, &["SELECT"]) {
-        return None;
-    }
-    at += 1;
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Word("1")) {
-        return None;
-    }
-    at += 1;
-    for want in [
-        "FROM",
-        "pg_type",
-        "t",
-        "JOIN",
-        "pg_namespace",
-        "n",
-        "ON",
-        "t",
-        ".",
-        "typnamespace",
-        "=",
-        "n",
-        ".",
-        "oid",
-        "WHERE",
-        "t",
-        ".",
-        "typname",
-        "=",
-    ] {
-        let ok = match want {
-            "." => tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct('.')),
-            "=" => tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct('=')),
-            word => do_words_match(&tokens, at, &[word]),
-        };
-        if !ok {
-            return None;
-        }
-        at += 1;
-    }
-    let Some((DoToken::Text(guard_name), _, _)) = tokens.get(at) else {
-        return None;
-    };
-    at += 1;
-
-    // AND n . nspname = <ANY ( current_schemas ( false ) ) | '<schema>'> )
-    for want in ["AND", "n", ".", "nspname", "="] {
-        let ok = match want {
-            "." => tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct('.')),
-            "=" => tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct('=')),
-            word => do_words_match(&tokens, at, &[word]),
-        };
-        if !ok {
-            return None;
-        }
-        at += 1;
-    }
-    at += match tokens.get(at) {
-        // `n.nspname = 'test_schema'` — the caller named a schema.
-        Some((DoToken::Text(_), _, _)) => 1,
-        // `n.nspname = ANY (current_schemas(false))` — the search path.
-        Some((DoToken::Word(word), _, _)) if word.eq_ignore_ascii_case("ANY") => {
-            if !do_words_match(&tokens, at + 2, &["current_schemas"]) {
-                return None;
-            }
-            let shape = [
-                DoToken::Punct('('),
-                DoToken::Punct('('),
-                DoToken::Word("false"),
-                DoToken::Punct(')'),
-                DoToken::Punct(')'),
-            ];
-            let at_shape = [at + 1, at + 3, at + 4, at + 5, at + 6];
-            for (want, index) in shape.iter().zip(at_shape) {
-                let seen = tokens.get(index).map(|(token, _, _)| token);
-                let same = match (want, seen) {
-                    (DoToken::Word(a), Some(DoToken::Word(b))) => a.eq_ignore_ascii_case(b),
-                    (a, Some(b)) => a == b,
-                    _ => false,
-                };
-                if !same {
-                    return None;
-                }
-            }
-            7
-        }
-        _ => return None,
-    };
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct(')')) {
-        return None;
-    }
-    at += 1;
-    if !do_words_match(&tokens, at, &["THEN", "CREATE", "TYPE"]) {
-        return None;
-    }
-    let create_from = tokens.get(at + 1)?.1;
-    at += 3;
-
-    // <name> | <schema> . <name>, and the created name has to be the guarded one.
-    let created = match tokens.get(at) {
-        Some((DoToken::Quoted(name) | DoToken::Word(name), _, _)) => *name,
-        _ => return None,
-    };
-    at += 1;
-    let created = if tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct('.')) {
-        at += 1;
-        let inner = match tokens.get(at) {
-            Some((DoToken::Quoted(name) | DoToken::Word(name), _, _)) => *name,
-            _ => return None,
-        };
-        at += 1;
-        inner
-    } else {
-        created
-    };
-    if created != *guard_name {
-        return None;
-    }
-
-    // AS ENUM ( '<label>', … ) — the list may be empty, which `schema_test.rb` sends.
-    if !do_words_match(&tokens, at, &["AS", "ENUM"]) {
-        return None;
-    }
-    at += 2;
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct('(')) {
-        return None;
-    }
-    at += 1;
-    while matches!(tokens.get(at), Some((DoToken::Text(_), _, _))) {
-        at += 1;
-        if tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct(',')) {
-            at += 1;
-        }
-    }
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct(')')) {
-        return None;
-    }
-    let create_to = tokens.get(at)?.2;
-    at += 1;
-
-    // ; END IF ; END — and nothing after it.
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct(';')) {
-        return None;
-    }
-    at += 1;
-    if !do_words_match(&tokens, at, &["END", "IF"]) {
-        return None;
-    }
-    at += 2;
-    if tokens.get(at).map(|(token, _, _)| token) != Some(&DoToken::Punct(';')) {
-        return None;
-    }
-    at += 1;
-    if !do_words_match(&tokens, at, &["END"]) {
-        return None;
-    }
-    // A trailing `;` inside the body is optional; anything else is not this template.
-    at += 1;
-    if tokens.get(at).map(|(token, _, _)| token) == Some(&DoToken::Punct(';')) {
-        at += 1;
-    }
-    if at != tokens.len() {
-        return None;
-    }
-    Some(body.get(create_from..create_to)?.to_owned())
+    let (guarded, at) = match_do_enum_guard(&tokens)?;
+    let (from, to) = match_do_enum_create(&tokens, at, guarded)?;
+    Some(body.get(from..to)?.to_owned())
 }
 
 /// `CREATE UNLOGGED TABLE …` with the keyword removed, or `None` for anything else.

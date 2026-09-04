@@ -206,9 +206,6 @@ impl Statement {
     #[must_use]
     pub fn write_command(&self) -> Option<&'static str> {
         match self {
-            // A `RAISE` writes nothing: it is allowed in a read-only transaction and against the
-            // past, exactly as `SELECT` is.
-            Statement::Raise { .. } => None,
             Statement::Insert(_) => Some("INSERT"),
             Statement::Update(_) => Some("UPDATE"),
             Statement::Delete(_) => Some("DELETE"),
@@ -251,7 +248,10 @@ impl Statement {
             // snapshot it is refused like any other. Flashing back while reading the past would be
             // writing the present from a transaction that may not write.
             Statement::TimeMachine(TimeMachineVerb::Flashback { .. }) => Some("esker_flashback"),
-            Statement::TimeMachine(_)
+            // A `RAISE` writes nothing: it is allowed in a read-only transaction and against the
+            // past, exactly as `SELECT` is.
+            Statement::Raise { .. }
+            | Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(..)
             | Statement::Session(_) => None,
