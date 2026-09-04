@@ -813,6 +813,45 @@ fn verb_arguments(function: &sqlparser::ast::Function) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The isolation level a `SET TRANSACTION` names, or `None` for one that names none.
+fn named_isolation(modes: &[sqlparser::ast::TransactionMode]) -> Option<&'static str> {
+    use sqlparser::ast::{TransactionIsolationLevel, TransactionMode};
+
+    modes.iter().find_map(|mode| match mode {
+        TransactionMode::IsolationLevel(TransactionIsolationLevel::RepeatableRead) => {
+            Some("repeatable read")
+        }
+        TransactionMode::IsolationLevel(TransactionIsolationLevel::Serializable) => {
+            Some("serializable")
+        }
+        // `READ UNCOMMITTED` is `READ COMMITTED` on a real server: there is no weaker level.
+        TransactionMode::IsolationLevel(_) => Some("read committed"),
+        TransactionMode::AccessMode(_) => None,
+    })
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL x` and `SET SESSION CHARACTERISTICS AS TRANSACTION …`.
+///
+/// **One value under four spellings** (ADR 0057), so both become a `SET` of the parameter that
+/// holds it — `SHOW transaction_isolation` then answers without a rule of its own, and the
+/// transaction-scoped one goes back to the session's default when the block ends. The `SESSION`
+/// form is the one that changes the default itself.
+fn lower_set_isolation(
+    modes: &[sqlparser::ast::TransactionMode],
+    session: bool,
+) -> plan::Statement {
+    let value = named_isolation(modes).unwrap_or("read committed");
+    let name = if session {
+        crate::parameter::default_transaction_isolation().name
+    } else {
+        crate::parameter::transaction_isolation().name
+    };
+    plan::Statement::Session(plan::SessionStatement::SetParameter {
+        name: name.to_owned(),
+        value: Some(value.to_owned()),
+    })
+}
+
 /// `SET`, of which this node executes two spellings and refuses the rest by name.
 ///
 /// The two are PostgreSQL's own (`docs/plans/phase-6d.md` §1): a namespaced custom GUC, which a
@@ -894,6 +933,12 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 },
             ))
         }
+        // **`SET TRANSACTION ISOLATION LEVEL x`, and its `SESSION CHARACTERISTICS` form.**
+        Set::SetTransaction {
+            modes,
+            snapshot: None,
+            session,
+        } if named_isolation(modes).is_some() => Ok(lower_set_isolation(modes, *session)),
         Set::SetTransaction {
             modes,
             snapshot: Some(snapshot),

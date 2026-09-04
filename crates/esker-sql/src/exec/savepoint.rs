@@ -227,6 +227,14 @@ impl Txn for Recording<'_> {
         self.inner.restart_statement()
     }
 
+    fn abandon_locks(&mut self) {
+        self.inner.abandon_locks();
+    }
+
+    fn begin_statement(&mut self) -> Result<()> {
+        self.inner.begin_statement()
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) {
         if self.failed.is_none() {
             let before = self.before(key);

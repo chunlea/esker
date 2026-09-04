@@ -129,6 +129,10 @@ impl Session {
                     self.in_block = true;
                     self.executor
                         .begin(parsed.begins_read_only())
+                        .and_then(|()| match parsed.begins_isolation() {
+                            Some(level) => self.executor.set_isolation(level),
+                            None => Ok(()),
+                        })
                         .map(|()| Outcome::done("BEGIN"))
                 }
                 StatementClass::Commit if self.failed => {
@@ -573,7 +577,15 @@ fn two_writers_to_one_row_both_proceed_and_the_loser_fails_at_commit() {
     // duplicate for a column it never touched. The race is gone — the second writer waits now —
     // so the lesson is asserted where a conflict still happens: a transaction whose snapshot
     // predates a committed write it did not wait for.
-    cluster.session('A').run("BEGIN").unwrap();
+    // **At `REPEATABLE READ`, because that is the level a write-write conflict still exists at.**
+    // Under `READ COMMITTED` A's `UPDATE` would take a fresh statement snapshot, see B's committed
+    // row, and have nothing to conflict with — which is the point of the unit and is asserted in
+    // `tests/read_committed.rs`. What this test is for is the *shape of the error* when there is
+    // one, and that needs a level that keeps its snapshot.
+    cluster
+        .session('A')
+        .run("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     cluster
         .session('A')
         .rows("SELECT n FROM tt_rows WHERE id = 2");

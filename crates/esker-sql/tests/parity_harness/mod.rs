@@ -157,7 +157,18 @@ impl Node {
             let outcome = match &class {
                 StatementClass::Begin => {
                     self.in_block = true;
-                    self.executor.begin(false).map(|()| Outcome::done("BEGIN"))
+                    self.executor
+                        .begin(parsed.begins_read_only())
+                        .and_then(|()| {
+                            // `BEGIN ISOLATION LEVEL …` names the level *inside* the block it starts,
+                            // so it is applied after `begin` has saved the block's parameters — the
+                            // same order `pgwire::session` uses (ADR 0057).
+                            match parsed.begins_isolation() {
+                                Some(level) => self.executor.set_isolation(level),
+                                None => Ok(()),
+                            }
+                        })?;
+                    Ok(Outcome::done("BEGIN"))
                 }
                 // A `COMMIT` on a **failed** block rolls it back and says so, which is
                 // PostgreSQL's own answer and the reason the tag is `ROLLBACK`.

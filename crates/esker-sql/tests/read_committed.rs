@@ -268,3 +268,127 @@ fn a_key_an_earlier_statement_wrote_is_held_until_the_transaction_ends() {
         "B's value stands: C never got the row"
     );
 }
+
+/// **`REPEATABLE READ` does not wait: it answers `40001`.** The level that already worked before
+/// ADR 0057 keeps working, which is the half of the change that cannot regress.
+#[test]
+fn a_repeatable_read_writer_does_not_wait_it_conflicts() {
+    let pair = Pair::new(&[
+        "CREATE TABLE rc (id bigint primary key, n bigint)",
+        "INSERT INTO rc (id, n) VALUES (1, 10)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A's write is buffered");
+        b.run("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+        reached(&b_says, "B is about to write");
+        let update = b.run("UPDATE rc SET n = n + 100 WHERE id = 1");
+        let _ = b.run("ROLLBACK");
+        update
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE rc SET n = n + 1 WHERE id = 1").unwrap();
+    reached(&a_says, "A's write is buffered");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("COMMIT").unwrap();
+
+    let error = waiter
+        .join()
+        .unwrap()
+        .expect_err("a repeatable-read writer meets a lock and loses rather than waiting");
+    assert_eq!(error.sqlstate(), "40001", "{error}");
+}
+
+/// **Each statement re-snapshots under `READ COMMITTED` and the transaction's is fixed under
+/// `REPEATABLE READ`.** Measured on PostgreSQL 19 as `10` then `99`, and `10` then `10`.
+///
+/// This is the half of READ COMMITTED that is about *reads* rather than about waiting, and the two
+/// levels are asserted side by side because a node that got only one of them right would look
+/// correct in whichever test was written first.
+#[test]
+fn a_statement_re_snapshots_under_read_committed_and_not_under_repeatable_read() {
+    for (level, expected) in [
+        ("BEGIN", "99"),
+        ("BEGIN ISOLATION LEVEL REPEATABLE READ", "10"),
+    ] {
+        let pair = Pair::new(&[
+            "CREATE TABLE rc (id bigint primary key, n bigint)",
+            "INSERT INTO rc (id, n) VALUES (1, 10)",
+        ]);
+        let mut reader = pair.session();
+        reader.run(level).unwrap();
+        assert_eq!(
+            reader.rows("SELECT n FROM rc WHERE id = 1"),
+            [["10"]],
+            "before, at {level}"
+        );
+
+        let mut writer = pair.session();
+        writer.run("UPDATE rc SET n = 99 WHERE id = 1").unwrap();
+
+        assert_eq!(
+            reader.rows("SELECT n FROM rc WHERE id = 1"),
+            [[expected]],
+            "after another session committed, at {level}"
+        );
+        reader.run("COMMIT").unwrap();
+    }
+}
+
+/// **The level is a session setting under four spellings**, and they agree.
+#[test]
+fn the_isolation_level_is_a_session_setting() {
+    let pair = Pair::new(&[]);
+    let mut node = pair.session();
+
+    // PostgreSQL's own default, and this node's.
+    assert_eq!(
+        node.rows("SHOW transaction_isolation"),
+        [["read committed"]]
+    );
+    assert_eq!(
+        node.rows("SHOW default_transaction_isolation"),
+        [["read committed"]]
+    );
+
+    // `SET TRANSACTION ISOLATION LEVEL` inside a block, undone when the block ends — which is what
+    // makes it the *transaction's* and not the session's.
+    node.run("BEGIN").unwrap();
+    node.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    assert_eq!(node.rows("SHOW transaction_isolation"), [["serializable"]]);
+    node.run("COMMIT").unwrap();
+    assert_eq!(
+        node.rows("SHOW transaction_isolation"),
+        [["read committed"]],
+        "a level set inside a block ends with it"
+    );
+
+    // The session default seeds each new transaction.
+    node.run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    node.run("BEGIN").unwrap();
+    assert_eq!(
+        node.rows("SHOW transaction_isolation"),
+        [["repeatable read"]],
+        "default_transaction_isolation is where a transaction starts"
+    );
+    node.run("COMMIT").unwrap();
+
+    // And `READ UNCOMMITTED` is `READ COMMITTED`, as it is on a real server: there is no weaker
+    // level to give it.
+    node.run("SET default_transaction_isolation = 'read uncommitted'")
+        .unwrap();
+    node.run("BEGIN").unwrap();
+    assert!(matches!(
+        node.rows("SHOW transaction_isolation")[0][0].as_str(),
+        "read uncommitted" | "read committed"
+    ));
+    node.run("COMMIT").unwrap();
+}

@@ -243,6 +243,23 @@ relation "x"` on a `Locked` decision, and a skip, respectively — both measured
 table. `FOR SHARE` is served as `FOR UPDATE` for now, declared: it is stricter than the standard
 asks for, which costs concurrency and never correctness.
 
+## 6. What the row lock strengthened, found while building unit 1
+
+§4 asks for a per-key read timestamp partly to stop a fresh timestamp becoming a licence to lose an
+update: a transaction writes row 1, waits on row 2, re-runs, and a third transaction commits row 1
+in the middle. The per-key rule answers that — row 1 keeps its own, older stamp.
+
+**With the row lock taken at the *statement* (unit 1), that situation cannot arise at all.** Row 1
+is locked from the moment it is written until the transaction ends, so nobody else can commit it in
+the middle; a third session that tries waits. The per-key stamp is still what makes the *waiter's
+own* key commit rather than conflict, which is its whole job, but the earlier statement's keys are
+protected by something stronger than a timestamp comparison.
+
+It is recorded here as a **strengthening rather than a gap**, because the difference matters to
+whoever reads the test list: the test §4 asked for is unreachable, and writing it as described
+hangs — the third session waits for a lock it cannot have, which is the guarantee. What is asserted
+instead is the lock's (`tests/read_committed.rs`).
+
 ## The file list
 
 `crates/esker-txn/`: `percolator.rs` (the decision function — given a `Locked` and an isolation

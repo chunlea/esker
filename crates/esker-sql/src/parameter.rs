@@ -179,6 +179,38 @@ pub const PARAMETERS: &[Parameter] = &[
     // node ever needs self-protection from an unbounded wait it belongs in a setting of its own,
     // named as esker's and off by default, never in the default of a parameter a client already
     // knows the meaning of.
+    // **The isolation level, as a parameter rather than as a field.** `SHOW transaction_isolation`,
+    // `SET TRANSACTION ISOLATION LEVEL`, `BEGIN ISOLATION LEVEL …` and the session default are
+    // four spellings of one value, and modelling it here gives all four the same machinery — the
+    // block's save-and-restore included, so a level set inside a transaction ends with it, which
+    // is what a real server does ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    //
+    // `read uncommitted` is accepted and served as `read committed`, which is what PostgreSQL
+    // itself does — it has no weaker level.
+    Parameter {
+        name: "transaction_isolation",
+        reported: "transaction_isolation",
+        boot: "read committed",
+        values: Values::Enum(&[
+            "read uncommitted",
+            "read committed",
+            "repeatable read",
+            "serializable",
+        ]),
+        read_only: false,
+    },
+    Parameter {
+        name: "default_transaction_isolation",
+        reported: "default_transaction_isolation",
+        boot: "read committed",
+        values: Values::Enum(&[
+            "read uncommitted",
+            "read committed",
+            "repeatable read",
+            "serializable",
+        ]),
+        read_only: false,
+    },
     Parameter {
         name: "lock_timeout",
         reported: "lock_timeout",
@@ -514,6 +546,64 @@ fn is_utc(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "utc" | "etc/utc" | "universal" | "zulu" | "z" | "+00:00" | "utc+0" | "utc-0"
     )
+}
+
+/// What a transaction promises about what it can see, and what it does about a conflict.
+///
+/// **Two behaviours under three names.** `READ COMMITTED` waits for the writer in front of it and
+/// re-runs the statement; `REPEATABLE READ` and `SERIALIZABLE` keep the transaction's snapshot and
+/// answer `40001`, which is what this node did for every transaction before ADR 0057. So the
+/// level that already worked keeps working and the change cannot regress it.
+///
+/// `SERIALIZABLE` being snapshot isolation is a **declared divergence**: SI admits write skew and
+/// a real server's SSI does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// PostgreSQL's default, and this node's: statement-level snapshots, and a writer waits.
+    #[default]
+    ReadCommitted,
+    /// The transaction's snapshot, and `40001` rather than a wait.
+    RepeatableRead,
+    /// Served as [`Isolation::RepeatableRead`], declared.
+    Serializable,
+}
+
+impl Isolation {
+    /// The level a parameter's value names. Anything unrecognised is the default, which the
+    /// parameter's own `Values::Enum` has already refused — so this is total rather than lossy.
+    #[must_use]
+    pub fn named(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "repeatable read" => Isolation::RepeatableRead,
+            "serializable" => Isolation::Serializable,
+            // `read uncommitted` is `read committed` on a real server too: there is no weaker one.
+            _ => Isolation::ReadCommitted,
+        }
+    }
+
+    /// Whether a writer at this level **waits** for the row in front of it.
+    #[must_use]
+    pub fn waits(self) -> bool {
+        self == Isolation::ReadCommitted
+    }
+}
+
+/// `transaction_isolation`, the level this transaction is running at.
+#[must_use]
+pub fn transaction_isolation() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "transaction_isolation")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// `default_transaction_isolation`, the level each new transaction starts at.
+#[must_use]
+pub fn default_transaction_isolation() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "default_transaction_isolation")
+        .unwrap_or(&PARAMETERS[0])
 }
 
 /// `lock_timeout`, which bounds how long a writer waits for the row in front of it (ADR 0057).

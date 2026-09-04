@@ -254,6 +254,11 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     if txn.is_read_only() {
         return Ok(());
     }
+    // **The level decides whether there is a wait at all.** `REPEATABLE READ` and `SERIALIZABLE`
+    // keep the transaction's snapshot, so a row another transaction holds is a conflict rather
+    // than something to wait for — which is what this node answered for every transaction before
+    // ADR 0057, and is why the levels that already worked cannot regress.
+    let waits = executor.isolation().waits();
     let deadline = executor.lock_deadline();
     let mut waited = 0_u64;
     loop {
@@ -265,7 +270,21 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 txn.restart_statement()?;
                 return Err(SqlError::StatementMustRestart);
             }
-            crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
+            crate::backend::Lock::Deadlock => {
+                // **The victim gives its rows back at once.** PostgreSQL ends the loser's
+                // transaction with the `40P01`, so the survivor stops waiting immediately;
+                // holding them until this block's `ROLLBACK` would make the survivor deadlock
+                // too, against a transaction that is already dead. What this does *not* copy is
+                // a real server's lock lifetime under `ROLLBACK TO SAVEPOINT` recovery — declared.
+                txn.abandon_locks();
+                return Err(SqlError::Deadlock);
+            }
+            crate::backend::Lock::Held { .. } if !waits => {
+                return Err(SqlError::SerializationFailure {
+                    message: "a key was written after this transaction's snapshot".to_owned(),
+                    key: Some(key.to_vec()),
+                });
+            }
             crate::backend::Lock::Held { by, .. } => {
                 if let Some(limit) = deadline
                     && waited >= limit
@@ -615,6 +634,14 @@ impl Executor {
                 // is the machinery an explicit `SAVEPOINT` already uses, under a name no user can
                 // type — an unquoted identifier cannot contain a space.
                 for attempt in 0..=MAX_STATEMENT_RESTARTS {
+                    // **A statement-level snapshot, which is what READ COMMITTED *is*.** Measured:
+                    // two `SELECT`s in one transaction across another's commit answer `10` then
+                    // `99` under READ COMMITTED and `10` then `10` under REPEATABLE READ. It also
+                    // resets the per-statement undo, which a restart needs to be about this
+                    // statement and not the ones before it (ADR 0057).
+                    if self.isolation().waits() {
+                        txn.begin_statement()?;
+                    }
                     let outcome = if savepoints.recording() {
                         let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
                         let outcome = self.run_recording(&mut recording, &statement, &mut written);
@@ -888,6 +915,13 @@ impl Executor {
     /// applies them in — measured: with both set, the lock timeout is the one that fires. Zero
     /// means no limit for both, which is what a real server's default is and what this node
     /// already reported.
+    /// The level this transaction is running at.
+    fn isolation(&self) -> crate::parameter::Isolation {
+        crate::parameter::Isolation::named(
+            &self.parameter(crate::parameter::transaction_isolation()),
+        )
+    }
+
     fn lock_deadline(&self) -> Option<u64> {
         for parameter in [
             crate::parameter::lock_timeout(),
@@ -1112,6 +1146,15 @@ impl Executor {
         self.open_used = false;
         self.block_parameters = None;
         self.block_read_only = false;
+        // **The level is the transaction's**, so it goes back to the session's default when the
+        // transaction ends — which is what makes `SET TRANSACTION ISOLATION LEVEL` different from
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION …`, the one that changes the default itself.
+        // Measured (ADR 0057).
+        let default = self.parameter(crate::parameter::default_transaction_isolation());
+        let _ = self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(&default),
+        );
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
         }
@@ -2743,12 +2786,31 @@ impl Execute for Executor {
         // and leaves the block alone.
         self.savepoints.clear();
         self.block_parameters = Some(self.parameters.clone());
+        // **Each transaction starts at the session's default**, which is what
+        // `default_transaction_isolation` means; a `BEGIN ISOLATION LEVEL …` then overrides it
+        // inside the block the line above has just saved (ADR 0057).
+        let default = self.parameter(crate::parameter::default_transaction_isolation());
+        self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(&default),
+        )?;
         self.block_read_only = read_only;
         self.open = Some(self.open_txn()?);
         self.open_used = false;
         self.written = Written::default();
         self.catalog_written = false;
         Ok(())
+    }
+
+    fn set_isolation(&mut self, level: crate::parameter::Isolation) -> Result<()> {
+        self.set_parameter(
+            crate::parameter::transaction_isolation().name,
+            Some(match level {
+                crate::parameter::Isolation::ReadCommitted => "read committed",
+                crate::parameter::Isolation::RepeatableRead => "repeatable read",
+                crate::parameter::Isolation::Serializable => "serializable",
+            }),
+        )
     }
 
     fn savepoint(&mut self, name: &str) -> Result<()> {

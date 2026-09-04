@@ -202,6 +202,28 @@ pub trait Txn: fmt::Debug + Send {
         Ok(())
     }
 
+    /// Begins a statement: a fresh read timestamp, and the previous statement's undo **discarded**
+    /// rather than applied.
+    ///
+    /// The pair to [`Txn::restart_statement`], and the difference is the whole of why they are two
+    /// methods: a statement that ends normally keeps its writes, and one that has to be re-run
+    /// gives them back. Calling the restart at a statement's *start* undoes the statement before
+    /// it, which is how these came to be separate.
+    ///
+    /// The fresh timestamp is what READ COMMITTED means for reads: each statement sees what was
+    /// committed when it began. A transaction at a level that keeps its snapshot never calls this.
+    fn begin_statement(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Gives back every row lock this transaction holds, without ending it.
+    ///
+    /// **One caller: the deadlock victim.** A real server ends the loser's transaction with the
+    /// `40P01`, so its rows are free the instant the survivor asks again; keeping them until this
+    /// block's `ROLLBACK` would deadlock the survivor against a transaction that is already dead.
+    /// The default does nothing, which is right for a backend that takes no locks.
+    fn abandon_locks(&mut self) {}
+
     /// Buffers a write. Nothing can fail here — the conflict, if there is one, comes from
     /// [`Txn::commit`].
     fn put(&mut self, key: &[u8], value: &[u8]);
@@ -649,6 +671,23 @@ impl Txn for MemoryTxn {
         } else {
             rows.take(limit as usize).collect()
         })
+    }
+
+    fn begin_statement(&mut self) -> Result<()> {
+        self.statement_undo.clear();
+        // **A read-only transaction never moves.** `begin_at` is the time machine: its whole
+        // purpose is a fixed instant, and advancing it would read the present through a statement
+        // that asked for the past.
+        if !self.read_only {
+            let clock = self.versions().clock;
+            self.statement_ts = clock;
+        }
+        Ok(())
+    }
+
+    fn abandon_locks(&mut self) {
+        self.release();
+        self.held.clear();
     }
 
     fn restart_statement(&mut self) -> Result<()> {
