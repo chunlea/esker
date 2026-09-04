@@ -1907,6 +1907,22 @@ fn domain_name_of<'a>(table: &'a TableDef, column: &crate::catalog::ColumnDef) -
         .map_or("", |def| crate::catalog::split_qualified(&def.name).1)
 }
 
+/// Renames the `VALUE` a domain's `CHECK` is written against to the column holding it.
+///
+/// **A whole identifier, matched without case** — `VALUE`, `value` and `Value` are one name, and
+/// PostgreSQL takes all three. A qualified reference is left alone: `t.value` is a column of `t`
+/// and not the domain's value.
+fn bind_domain_value(expr: &mut crate::plan::Expr, column: &str) {
+    let _ = super::subquery::walk_mut(expr, &mut |expr| {
+        if let crate::plan::Expr::Column { table: None, name } = expr
+            && name.eq_ignore_ascii_case("value")
+        {
+            column.clone_into(name);
+        }
+        Ok(())
+    });
+}
+
 /// Every **domain** `CHECK` a row's columns are subject to.
 ///
 /// **`VALUE` is the column**, which is the whole of the rewrite: a domain's constraint is written
@@ -1933,12 +1949,18 @@ fn check_domain_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
             continue;
         }
         let name = crate::catalog::split_qualified(&def.name).1;
-        let text = expr.replace("VALUE", &format!("\"{}\"", column.name));
-        let parsed = crate::parse::parse_stored_expr(&text).map_err(|error| {
+        let mut parsed = crate::parse::parse_stored_expr(expr).map_err(|error| {
             SqlError::Internal(format!(
                 "the stored CHECK of domain {name} no longer parses: {error}"
             ))
         })?;
+        // **`VALUE` is renamed in the parsed tree, not in the text.** Nothing treats it as a
+        // keyword, so it arrives as an ordinary column reference and this is a rename of an
+        // identifier. Doing it on the string was wrong twice over: it was case-sensitive, so
+        // `check (value > 0)` left the name alone and **every** insert into the column then
+        // failed with `column "value" does not exist`; and it would have rewritten the four
+        // letters inside a string literal or a longer name.
+        bind_domain_value(&mut parsed, &column.name);
         let scope = query::Scope::single(table);
         let resolved = query::resolve(&parsed, &scope)?;
         if matches!(cursor::evaluate(&resolved, row)?, Datum::Bool(false)) {

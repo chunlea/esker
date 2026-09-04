@@ -233,6 +233,12 @@ impl Relations {
         self.view_definitions.get(&oid).map(String::as_str)
     }
 
+    /// Every user-defined type this tenant has, in oid order — for the views whose rows come from
+    /// a type rather than from a relation, which `pg_constraint`'s domain checks are the first of.
+    pub fn user_types(&self) -> impl Iterator<Item = &super::TypeDef> {
+        self.user_types.values()
+    }
+
     /// The columns a view publishes, by oid, or `None` when the oid is not a view's.
     ///
     /// **`Some(&[])` and `None` are different answers.** An empty slice is a view stored before

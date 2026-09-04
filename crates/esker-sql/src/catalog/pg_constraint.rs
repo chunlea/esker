@@ -250,8 +250,49 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                     Some(foreign) => attnum_array(&foreign.confkey),
                     None => Datum::Null,
                 },
+                // A constraint on a relation belongs to no type.
+                Datum::Int8(0),
             ]);
         }
+    }
+    rows.extend(domain_constraint_rows(relations));
+    rows
+}
+
+/// One `pg_constraint` row per **domain** `CHECK`.
+///
+/// **A domain's constraint is a constraint**, and PostgreSQL puts it here with `conrelid` 0 and
+/// `contypid` naming the domain — measured, `ds_ci_check|c`. Without a row the constraint existed
+/// and was enforced and could not be found in the catalog, which is the state a schema dumper
+/// reads as "no constraint".
+fn domain_constraint_rows(relations: &Relations) -> Vec<Vec<Datum>> {
+    let mut rows = Vec::new();
+    for def in relations.user_types() {
+        let super::TypeKind::Domain { check: Some(_), .. } = &def.kind else {
+            continue;
+        };
+        let oid = pg_relations::as_oid(def.oid);
+        let bare = super::split_qualified(&def.name).1;
+        rows.push(vec![
+            // The constraint's own oid is the domain's: a domain holds at most one `CHECK` here,
+            // so the two cannot collide, and it is the arrangement a primary key already has.
+            Datum::Int8(oid),
+            Datum::Text(format!("{bare}_check")),
+            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            Datum::Text("c".to_owned()),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Bool(true),
+            // No relation: this constraint is the type's.
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Text(NO_FOREIGN_ACTION.to_owned()),
+            Datum::Text(NO_FOREIGN_ACTION.to_owned()),
+            Datum::Null,
+            Datum::Null,
+            Datum::Int8(oid),
+        ]);
     }
     rows
 }
@@ -713,4 +754,9 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
     // `tests/corpus/pg19_catalog_vectors.txt` is the file that keeps them apart.
     ("conkey", ColumnType::Int2Array),
     ("confkey", ColumnType::Int2Array),
+    // **Last**, the rule every column list in this crate follows: `SELECT *` expands in declared
+    // order. The **domain** a constraint belongs to, and 0 for one on a table — a `CHECK` written
+    // on a domain has a `pg_constraint` row of its own there, with `conrelid` 0 and this set
+    // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
+    ("contypid", ColumnType::Int8),
 ];

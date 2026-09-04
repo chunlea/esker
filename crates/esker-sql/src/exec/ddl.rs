@@ -2342,6 +2342,27 @@ fn references_a_key(parent: &TableDef, columns: &[usize]) -> bool {
 /// key declared on it, and the sequence it owned. Only a dependent living on another object
 /// raises `2BP01`, and here that is another table's foreign key referencing the column. All
 /// measured against 19beta1.
+/// Drops one column and writes the table back, for a `CASCADE` that reaches it from elsewhere.
+///
+/// `DROP TYPE … CASCADE` takes the columns declared as the type
+/// ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)),
+/// and it arrives with a table rather than an `ALTER TABLE` statement — so this is the same
+/// [`drop_column`] the statement uses, with the write around it.
+pub(super) fn drop_column_cascading(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    column: &str,
+) -> Result<()> {
+    let mut updated = (*table).clone();
+    let name = table.name.clone();
+    if drop_column(txn, executor, &mut updated, &name, column, false, true)? {
+        catalog::replace_table(txn, executor.tenant, table, &updated)?;
+        executor.catalog_written = true;
+    }
+    Ok(())
+}
+
 fn drop_column(
     txn: &mut dyn Txn,
     executor: &mut Executor,
@@ -3640,13 +3661,36 @@ pub(super) fn drop_schema(
         // with an inheriting child is — and `CASCADE` takes the relations with it instead.
         // `IF EXISTS` does not excuse this: the clause covers absence, not dependence. Measured.
         let held = catalog::relations_in_schema(&*txn, executor.tenant, name)?;
-        if let Some(first) = held.first()
-            && !drop.cascade
+        // **A type in the schema is a dependent too**, and it is the one nothing here could see: a
+        // type is not a name record, so `relations_in_schema` never returned one. A schema holding
+        // only a domain dropped **silently**, and the domain survived with a record key naming a
+        // schema that was gone — visible in `pg_type` under `public`, not resolvable by name, and
+        // not droppable. Measured on PostgreSQL: `2BP01 … DETAIL: type ds_s.ds depends on schema
+        // ds_s`, with the type named the way a table is.
+        let types: Vec<String> = catalog::user_types(&*txn, executor.tenant)?
+            .into_iter()
+            .map(|def| def.name)
+            .filter(|stored| catalog::split_qualified(stored).0 == name)
+            .collect();
+        if !drop.cascade
+            // **A type is named before a table**, measured: a schema holding both reports the
+            // type. PostgreSQL names one dependent of many and this is the one it picks.
+            && let Some(detail) = types
+                .first()
+                .map(|first| {
+                    let bare = catalog::split_qualified(first).1;
+                    format!("type {name}.{bare} depends on schema {name}")
+                })
+                .or_else(|| {
+                    held.first().map(|first| {
+                        let bare = catalog::split_qualified(first).1;
+                        format!("table {name}.{bare} depends on schema {name}")
+                    })
+                })
         {
-            let bare = catalog::split_qualified(first).1;
             return Err(SqlError::DependentSchema {
                 schema: name.clone(),
-                detail: format!("table {name}.{bare} depends on schema {name}"),
+                detail,
             });
         }
         // Only the **tables** are dropped, and each takes its own indexes, sequences and primary
@@ -3659,6 +3703,11 @@ pub(super) fn drop_schema(
                 let table = executor.table_by_id(txn, table_id)?;
                 drop_one_table(executor, txn, &table)?;
             }
+        }
+        // The types go too, and after the tables: a column declared as one of them has already
+        // gone with its table, so nothing is left pointing at a type this removes.
+        for stored in &types {
+            catalog::drop_type(txn, executor.tenant, stored);
         }
         catalog::drop_schema(txn, executor.tenant, name)?;
     }
