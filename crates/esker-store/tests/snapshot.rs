@@ -201,9 +201,14 @@ fn raw(user_key: &[u8]) -> Bytes {
 /// Retrying is the honest reading of a retryable error, and a non-retryable one still fails the
 /// test on the spot. The epoch is re-read each time round, because the reason to retry is that
 /// something moved.
-async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
+async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let mut attempts = 0u32;
+    let mut at = 0usize;
     loop {
+        attempts += 1;
+        let store = group[at % group.len()];
         // The region as it stands now, not as the caller last saw it.
         let epoch = store
             .regions()
@@ -227,12 +232,150 @@ async fn put(store: &Arc<Store>, region: &Region, key: Bytes, value: &[u8]) {
                 assert!(error.is_retryable(), "writing {key:?}: {error}");
                 assert!(
                     Instant::now() < deadline,
-                    "writing {key:?} never succeeded; last answer {error}"
+                    "writing {key:?} never succeeded after {attempts} attempts in {:?}; \
+                     last answer {error}; last asked store {}, whose peer says leader={:?}",
+                    started.elapsed(),
+                    store.store_id(),
+                    store.peer_of(region.id).map(|peer| peer.leader())
                 );
+                // **Follow the hint, or this is a livelock rather than a retry.** An election
+                // moves no epoch, so re-sending to the peer that just disclaimed leadership at
+                // the same epoch asks a question already answered, and in a two-voter group the
+                // office does not come back on its own. `NotLeader` names the peer that has it;
+                // anything else advances round the group, because a store that cannot answer is
+                // not made able to by being asked again.
+                if let esker_proto::ProtoError::NotLeader {
+                    leader_hint: Some(peer_id),
+                    ..
+                } = &error
+                    && let Some(next) = group.iter().position(|candidate| {
+                        candidate.regions().get(region.id).is_some_and(|state| {
+                            state.region().peers.iter().any(|peer| {
+                                peer.peer_id == *peer_id && peer.store_id == candidate.store_id()
+                            })
+                        })
+                    })
+                {
+                    at = next;
+                } else {
+                    at += 1;
+                }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
     }
+}
+
+/// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
+///
+/// The mechanism behind two recorded sightings of `snapshot.rs:228`
+/// (`a_region_reaches_a_store_that_never_had_it`,
+/// `a_snapshot_replacing_a_held_region_routes_through_a_retire`), driven rather than waited for.
+/// Neither reproduced under load — not under twenty-four spinning threads, 8 runs each, nor under
+/// six full runs of this crate's 305 tests — because both need an *election*, and an election
+/// needs a peer starved for the 250-500 ms this file's tick budget allows. Moving the office on
+/// purpose reaches the same state in a second and always.
+///
+/// [`put`] retries what the store tells it to retry, which is right, and re-reads the region's
+/// epoch each time round, which is also right and is not enough: **an election moves no epoch**.
+/// So a `NotLeader` is re-sent to the peer that just disclaimed leadership, at the same epoch,
+/// until the deadline — and in a two-voter group the office does not come back on its own. That is
+/// a livelock, not a slow write, and thirty seconds of it is indistinguishable from a hang.
+///
+/// The fix is to follow the hint the refusal already carries, which is what a real client does
+/// (`esker-client`'s router, `docs/DESIGN.md` §10). This test is red without it: it fails at
+/// [`put`]'s deadline having spent thirty seconds re-asking a follower.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_follows_the_office_when_it_moves() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = first.store.regions().regions()[0].clone();
+    put(&[&first.store], &region, key(0), b"before").await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers, LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+    pd.issue(Operator::AddPeer {
+        region_id: 1,
+        epoch: first.store.regions().regions()[0].epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+    wait_for("the second store to become a voter", || {
+        first.store.regions().get(1).is_some_and(|state| {
+            state
+                .region()
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == 2 && peer.role == PeerRole::Voter)
+        })
+    })
+    .await;
+
+    // The office moves, deliberately. Everything above is setup; this is the state the two
+    // sightings arrive at by being unlucky.
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::TransferLeader {
+        region_id: 1,
+        epoch,
+        to_peer_id: 2,
+    });
+    wait_for("the second store to lead", || {
+        second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    assert!(
+        !first.store.peer_of(1).is_some_and(|peer| peer.is_leader()),
+        "the first store still leads, so the office did not move and this proves nothing"
+    );
+
+    // Aimed at the store that has *stopped* leading, which is exactly what the sightings do.
+    // Without following the hint this spends the whole deadline and fails.
+    let region = first.store.regions().regions()[0].clone();
+    put(&[&first.store, &second.store], &region, key(1), b"after").await;
+
+    let header = RequestHeader::new(region.id, second.store.regions().regions()[0].epoch, 0);
+    assert_eq!(
+        within(
+            "the new leader to answer",
+            second.store.serve(header, RawKvReq::get(key(1)))
+        )
+        .await
+        .unwrap(),
+        esker_proto::RawKvResp::Get {
+            value: Some(Bytes::from_static(b"after"))
+        },
+        "the write did not reach the store that now leads"
+    );
+
+    first.stop().await;
+    second.stop().await;
 }
 
 /// Commits one key through Percolator on `store`, as a client would: prewrite, then commit.
@@ -471,7 +614,7 @@ async fn a_region_reaches_a_store_that_never_had_it() {
 
     let region = first.store.regions().regions()[0].clone();
     for n in 0..40 {
-        put(&first.store, &region, key(n), b"value").await;
+        put(&[&first.store], &region, key(n), b"value").await;
     }
 
     // The second store is told the cluster already exists, so it hosts nothing of its own.
@@ -503,10 +646,12 @@ async fn a_region_reaches_a_store_that_never_had_it() {
     .await;
 
     // Keep writing, so the leader's log compacts past the learner and a snapshot becomes the only
-    // way to catch it up.
+    // way to catch it up. **Both stores**, because the learner is promotable from here and a
+    // two-voter group can move the office mid-batch; aiming at `first` alone is the livelock this
+    // file's `a_write_follows_the_office_when_it_moves` pins.
     for n in 40..120 {
         let region = first.store.regions().regions()[0].clone();
-        put(&first.store, &region, key(n), b"value").await;
+        put(&[&first.store, &second.store], &region, key(n), b"value").await;
     }
 
     wait_for("the region to arrive on the second store", || {
@@ -601,7 +746,7 @@ async fn a_region_arrives_with_its_transactional_records() {
         )
         .await;
     }
-    put(&first.store, &region, key(100), b"raw").await;
+    put(&[&first.store], &region, key(100), b"raw").await;
 
     let second = open(
         second_address_listener,
@@ -750,10 +895,10 @@ async fn a_voter_caught_up_by_snapshot_can_lead_and_answer_an_old_row() {
     });
 
     // Keep writing, so the leader's log compacts past the new peer and the snapshot is what
-    // catches it up rather than the entries.
+    // catches it up rather than the entries. Both stores, for the reason above.
     for n in 1..80 {
         let region = first.store.regions().regions()[0].clone();
-        put(&first.store, &region, key(n), b"value").await;
+        put(&[&first.store, &second.store], &region, key(n), b"value").await;
     }
     wait_for("the second store to hold the region", || {
         second.store.regions().get(1).is_some()
@@ -957,7 +1102,7 @@ async fn announce_until_retired(
     while Instant::now() < deadline {
         for n in 40..120 {
             let region = first.store.regions().regions()[0].clone();
-            put(&first.store, &region, key(n), b"value").await;
+            put(&[&first.store, &second.store], &region, key(n), b"value").await;
         }
         let leader = first.store.peer_of(1).expect("the leader");
         let Some(state) = second.store.regions().get(1) else {
@@ -1045,7 +1190,7 @@ async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
     .await;
     let region = first.store.regions().regions()[0].clone();
     for n in 0..40 {
-        put(&first.store, &region, key(n), b"value").await;
+        put(&[&first.store], &region, key(n), b"value").await;
     }
 
     let second = open(
@@ -1158,7 +1303,7 @@ async fn a_store_outside_the_region_is_refused_a_copy() {
     })
     .await;
     let region = node.store.regions().regions()[0].clone();
-    put(&node.store, &region, key(0), b"v").await;
+    put(&[&node.store], &region, key(0), b"v").await;
 
     let connection = esker_proto::TcpTransport::connect(address).await.unwrap();
     assert!(
@@ -1243,7 +1388,7 @@ async fn a_peer_the_core_has_and_the_log_has_not_committed_is_waited_for_and_the
     })
     .await;
     let region = node.store.regions().regions()[0].clone();
-    put(&node.store, &region, key(0), b"v").await;
+    put(&[&node.store], &region, key(0), b"v").await;
 
     let peer = node.store.peer_of(1).unwrap();
     // Never awaited: this proposal is one the group cannot commit, which is the whole point.

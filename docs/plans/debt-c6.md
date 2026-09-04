@@ -569,3 +569,73 @@ The lane rule is one container at a time. Implemented as *empty → sleep 30 →
 container that arrives inside the window and exits before the second check slips through. Looping
 back to the wait instead fired twice on one gate ("a container appeared during the settle; waiting
 again") before a slot was genuinely clear at 110 s. The check has to re-arm, not re-check.
+
+## 8. The two `snapshot.rs:228` sightings: a retry that never changed its mind
+
+Assigned as load-sensitive flakes: `esker-store::snapshot a_region_reaches_a_store_that_never_had_it`
+and `a_snapshot_replacing_a_held_region_routes_through_a_retire`, both panicking at
+`tests/snapshot.rs:228`.
+
+### Neither reproduced under load, and that is a result
+
+| stressor | outcome |
+|---|---|
+| 24 spinning threads, 8 runs each | 8/8 pass, both tests |
+| six full runs of this crate's 305 tests | 305/305 each, 0 hits |
+
+Both tests need an **election**, and an election needs a peer starved for the 250–500 ms this
+file's tick budget allows (25 ms ticks, 10–20 of them). Spinning threads preempt in far shorter
+slices, and three hundred concurrent tests do not reliably hold one thread off the CPU that long.
+More load would have been guessing at a bigger number.
+
+### What it is, found by reading and then driven
+
+`put` retries what the store tells it to retry — right — and re-reads the region's epoch each time
+round — also right, and not enough. **An election moves no epoch.** So a `NotLeader` is re-sent to
+the peer that just disclaimed leadership, at the same epoch, until the 30 s deadline; and in a
+two-voter group the office does not come back on its own. That is a livelock, and thirty seconds
+of it is indistinguishable from a hang.
+
+Both tests reach it after `AddPeer`, because `promote_caught_up_learners` makes the learner a
+voter and an election possible: `a_region_reaches_a_store_that_never_had_it` in its second write
+batch, and `a_snapshot_replacing_a_held_region_routes_through_a_retire` in the burst inside
+`announce_until_retired`. The batches that run while store 1 is the sole voter are innocent — a
+single voter cannot lose an election — which is why they keep the single-store form.
+
+The helper's own documentation had already recorded the symptom, and answered it with the retry:
+*"a two-voter group on a box that will not schedule its threads legitimately elects the other
+one… fifteen times in twenty runs."* Retrying is the honest reading of a retryable error. It was
+the right verb aimed at the wrong destination.
+
+### The deterministic test
+
+`a_write_follows_the_office_when_it_moves` drives the state instead of waiting for it: two voters,
+`TransferLeader`, assert the office actually moved, then write to the store that **stopped**
+leading. Red without the fix, in the words of the instrumentation:
+
+```
+writing b"k00001" never succeeded after 6711 attempts in 30.000960487s;
+last answer peer is not the leader of region 1;
+last asked store 1, whose peer says leader=Some(Some(2))
+```
+
+Six thousand seven hundred and eleven attempts, all to store 1, whose own peer knew the leader was
+peer 2. The caller never asked it. Green with the fix, and the whole file runs 13/13 in 1.2 s
+against 30.6 s to fail.
+
+### The honest limit of this unit
+
+The driven test proves the mechanism and the fix. It does **not** prove that this mechanism is
+what produced the two recorded sightings, because neither reproduced: the diagnosis fits their
+panic line, their timing and their position after `AddPeer`, and it remains an inference. If either
+recurs, the instrumentation now names the store asked, the attempts, the elapsed time and the
+leader the asked store believed in — enough to confirm or refute it from one red run.
+
+### The wider shape, recorded not fixed
+
+Seven of nine `esker-store` test files carry a retry helper of their own and only `cluster.rs`
+looks at a leader hint at all — `balance.rs`, `retire.rs`, `server.rs`, `sim_snapshot_ask.rs`,
+`sim_sweep.rs`, `split.rs`. Most write while a single voter leads and cannot hit this, but the
+shape is one bug per file rather than one bug, and it is the "count the parsers before fixing the
+caller" lesson in test code. Not swept here: each needs its own judgement about whether a second
+voter can exist at the moment it writes.
