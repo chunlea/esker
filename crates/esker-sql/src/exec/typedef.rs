@@ -109,6 +109,37 @@ fn refuse_if_a_column_depends(executor: &Executor, txn: &dyn Txn, name: &str) ->
     Ok(())
 }
 
+/// Drops every column declared as this type, which is what `CASCADE` means here.
+///
+/// Measured: after `DROP DOMAIN ds_dep CASCADE` the type is gone **and so is the column** —
+/// `information_schema.columns` has no row for it. A cascade that dropped the type and left the
+/// column would leave a column whose declared type is not in the catalog, which is the shape that
+/// makes a later statement fail with a message about neither.
+fn drop_columns_of_type(executor: &mut Executor, txn: &mut dyn Txn, name: &str) -> Result<()> {
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+        return Ok(());
+    };
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let mut wanted: Vec<(u64, Vec<String>)> = Vec::new();
+    for table in relations.tables() {
+        let columns: Vec<String> = table
+            .user_columns()
+            .filter(|(_, column)| column.user_type == Some(def.oid))
+            .map(|(_, column)| column.name.clone())
+            .collect();
+        if !columns.is_empty() {
+            wanted.push((table.id, columns));
+        }
+    }
+    for (table_id, columns) in wanted {
+        for column in columns {
+            let table = executor.table_by_id(txn, table_id)?;
+            super::ddl::drop_column_cascading(executor, txn, &table, &column)?;
+        }
+    }
+    Ok(())
+}
+
 /// `DROP TYPE [IF EXISTS] <name> [, …]`.
 pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) -> Result<Outcome> {
     for name in &drop.names {
@@ -122,7 +153,14 @@ pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) 
             }
             return Err(SqlError::UndefinedType(name.clone()));
         }
-        refuse_if_a_column_depends(executor, txn, name)?;
+        // **`CASCADE` takes the dependent columns with it**, and without it the refusal names
+        // one. It used to refuse either way, which meant `DROP DOMAIN d CASCADE` answered with
+        // the hint telling you to write the clause you had just written.
+        if drop.cascade {
+            drop_columns_of_type(executor, txn, name)?;
+        } else {
+            refuse_if_a_column_depends(executor, txn, name)?;
+        }
         catalog::drop_type(txn, executor.tenant, name);
     }
     Ok(Outcome::done("DROP TYPE"))

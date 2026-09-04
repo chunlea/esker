@@ -562,8 +562,56 @@ fn add_check(
     }
     updated.checks.push(check.clone());
     validate_checks(updated)?;
+    // **The rows already there are checked, unless `NOT VALID` says not to** — the same rule the
+    // foreign-key path follows, and it was missing here entirely: a `CHECK` added over a row that
+    // violates it was accepted silently, leaving a table whose rows contradict a constraint it
+    // advertises as validated. Measured: `23514 check constraint "q_plain" of relation "nv_t" is
+    // violated by some row`, a different sentence from the one an `INSERT` gets.
+    if check.validated {
+        validate_check_rows(txn, executor, updated, check)?;
+    }
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// Scans the table for a row the check refuses, and names the constraint if it finds one.
+///
+/// The scan is paged for the reason [`backfill`]'s is: a table that does not fit in memory is a
+/// table this must still be able to check.
+fn validate_check_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    check: &CheckDef,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut violated = false;
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            if violated {
+                return Ok(());
+            }
+            let row = crate::row::decode_row(&schema, value)?;
+            let parsed = crate::parse::parse_stored_expr(&check.expr)?;
+            let scope = super::query::Scope::single(table);
+            let resolved = super::query::resolve(&parsed, &scope)?;
+            // Only `false` violates: NULL is unknown and passes, which is the rule every other
+            // reader of a `CHECK` in this crate follows.
+            violated = matches!(
+                super::cursor::evaluate(&resolved, &row)?,
+                Datum::Bool(false)
+            );
+        }
+        Ok(())
+    })?;
+    if violated {
+        return Err(SqlError::CheckViolatedByRow {
+            constraint: check.name.clone(),
+            relation: table.name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
@@ -1133,6 +1181,18 @@ fn validate_constraint(
     updated: &mut TableDef,
     name: &str,
 ) -> Result<()> {
+    // **A check is validated by name too**, and it is looked for first because the two namespaces
+    // are one: `ALTER TABLE … VALIDATE CONSTRAINT` takes any constraint's name and a table cannot
+    // hold two of one name.
+    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+        if updated.checks[at].validated {
+            return Ok(());
+        }
+        let check = updated.checks[at].clone();
+        validate_check_rows(txn, executor, updated, &check)?;
+        updated.checks[at].validated = true;
+        return Ok(());
+    }
     let at = updated
         .foreign_keys
         .iter()
@@ -2282,6 +2342,27 @@ fn references_a_key(parent: &TableDef, columns: &[usize]) -> bool {
 /// key declared on it, and the sequence it owned. Only a dependent living on another object
 /// raises `2BP01`, and here that is another table's foreign key referencing the column. All
 /// measured against 19beta1.
+/// Drops one column and writes the table back, for a `CASCADE` that reaches it from elsewhere.
+///
+/// `DROP TYPE … CASCADE` takes the columns declared as the type
+/// ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)),
+/// and it arrives with a table rather than an `ALTER TABLE` statement — so this is the same
+/// [`drop_column`] the statement uses, with the write around it.
+pub(super) fn drop_column_cascading(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    column: &str,
+) -> Result<()> {
+    let mut updated = (*table).clone();
+    let name = table.name.clone();
+    if drop_column(txn, executor, &mut updated, &name, column, false, true)? {
+        catalog::replace_table(txn, executor.tenant, table, &updated)?;
+        executor.catalog_written = true;
+    }
+    Ok(())
+}
+
 fn drop_column(
     txn: &mut dyn Txn,
     executor: &mut Executor,
@@ -3580,13 +3661,36 @@ pub(super) fn drop_schema(
         // with an inheriting child is — and `CASCADE` takes the relations with it instead.
         // `IF EXISTS` does not excuse this: the clause covers absence, not dependence. Measured.
         let held = catalog::relations_in_schema(&*txn, executor.tenant, name)?;
-        if let Some(first) = held.first()
-            && !drop.cascade
+        // **A type in the schema is a dependent too**, and it is the one nothing here could see: a
+        // type is not a name record, so `relations_in_schema` never returned one. A schema holding
+        // only a domain dropped **silently**, and the domain survived with a record key naming a
+        // schema that was gone — visible in `pg_type` under `public`, not resolvable by name, and
+        // not droppable. Measured on PostgreSQL: `2BP01 … DETAIL: type ds_s.ds depends on schema
+        // ds_s`, with the type named the way a table is.
+        let types: Vec<String> = catalog::user_types(&*txn, executor.tenant)?
+            .into_iter()
+            .map(|def| def.name)
+            .filter(|stored| catalog::split_qualified(stored).0 == name)
+            .collect();
+        if !drop.cascade
+            // **A type is named before a table**, measured: a schema holding both reports the
+            // type. PostgreSQL names one dependent of many and this is the one it picks.
+            && let Some(detail) = types
+                .first()
+                .map(|first| {
+                    let bare = catalog::split_qualified(first).1;
+                    format!("type {name}.{bare} depends on schema {name}")
+                })
+                .or_else(|| {
+                    held.first().map(|first| {
+                        let bare = catalog::split_qualified(first).1;
+                        format!("table {name}.{bare} depends on schema {name}")
+                    })
+                })
         {
-            let bare = catalog::split_qualified(first).1;
             return Err(SqlError::DependentSchema {
                 schema: name.clone(),
-                detail: format!("table {name}.{bare} depends on schema {name}"),
+                detail,
             });
         }
         // Only the **tables** are dropped, and each takes its own indexes, sequences and primary
@@ -3599,6 +3703,11 @@ pub(super) fn drop_schema(
                 let table = executor.table_by_id(txn, table_id)?;
                 drop_one_table(executor, txn, &table)?;
             }
+        }
+        // The types go too, and after the tables: a column declared as one of them has already
+        // gone with its table, so nothing is left pointing at a type this removes.
+        for stored in &types {
+            catalog::drop_type(txn, executor.tenant, stored);
         }
         catalog::drop_schema(txn, executor.tenant, name)?;
     }

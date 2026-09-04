@@ -2308,7 +2308,11 @@ fn catalog_function(
                     if printed == crate::catalog::def_functions::UNKNOWN_TYPE =>
                 {
                     match env.relations()?.user_type_name(oid) {
-                        Some(name) => Datum::Text(name.to_owned()),
+                        // **`schema.name`, not the stored bytes.** A type in a schema is stored
+                        // `schema ++ NUL ++ name` (`catalog::SCHEMA_SEPARATOR`), and printing it
+                        // raw put a NUL on the wire where PostgreSQL writes a dot — measured,
+                        // `ds_s.ds`.
+                        Some(name) => Datum::Text(crate::catalog::display_name(name)),
                         None => built_in,
                     }
                 }
