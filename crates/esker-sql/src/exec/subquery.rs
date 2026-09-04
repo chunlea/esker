@@ -429,6 +429,12 @@ pub(super) fn relation_of(
             SqlError::UndefinedTable(name) if entry.hidden_cte => {
                 SqlError::ForwardCteReference(name)
             }
+            // **The qualifier the user wrote, back inside the quotes.** `public.` is dropped on
+            // the way to the catalog because a relation there is stored bare, so the stored name
+            // this error carries has already forgotten it; PostgreSQL has not.
+            SqlError::UndefinedTable(name) => {
+                SqlError::UndefinedTable(entry.written.clone().unwrap_or(name))
+            }
             other => other,
         }),
         Some(derived) => derived.def.clone().ok_or_else(|| {

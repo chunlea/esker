@@ -65,6 +65,7 @@ pub fn inline(select: &mut Select, name: &str, body: &Select, columns: &[String]
             ))),
             function: None,
             hidden_cte: false,
+            written: None,
         };
     });
     referenced

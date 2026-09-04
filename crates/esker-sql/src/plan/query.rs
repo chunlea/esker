@@ -86,6 +86,17 @@ pub struct TableRef {
     /// exist` sends a reader looking for a missing table when what is wrong is the order of two
     /// things they wrote.
     pub hidden_cte: bool,
+    /// The name **as the user wrote it**, when that is not the name the catalog is asked for.
+    ///
+    /// One case, and it is the only schema that has it: `public` is stored as no qualifier at all
+    /// (`catalog::SCHEMA_SEPARATOR`), so `FROM public.nosuch` looks up `nosuch` and a `42P01` built
+    /// from the stored name says `relation "nosuch" does not exist` where PostgreSQL says
+    /// `relation "public.nosuch" does not exist` — the qualifier inside the quotes, whole, and not
+    /// `"public"."nosuch"`. Measured.
+    ///
+    /// Like [`TableRef::hidden_cte`] it changes the message and nothing else, and only when the
+    /// lookup fails: resolution never reads it, because a name that resolves is never quoted back.
+    pub written: Option<String>,
 }
 
 impl TableRef {
@@ -99,6 +110,7 @@ impl TableRef {
             derived: None,
             function: None,
             hidden_cte: false,
+            written: None,
         }
     }
 

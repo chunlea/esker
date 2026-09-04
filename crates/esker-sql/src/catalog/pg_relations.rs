@@ -76,6 +76,13 @@ pub enum RelKind {
     PrimaryKey,
     /// A sequence: `relkind` `S`.
     Sequence,
+    /// A view: `relkind` `v`.
+    ///
+    /// **The one-letter difference `ActiveRecord` branches on.** Its `table_exists?` asks for
+    /// `relkind IN ('r','p')` and its `data_source_exists?` for `('r','v','m','p','f')`, so a view
+    /// reported as a table makes `table_exists?` true where a real server says false — measured in
+    /// `tests/corpus/pg19_view.txt`, which asserts both counts.
+    View,
     /// The index behind an `EXCLUDE` constraint: `relkind` `i`, and `pg_am` says `gist`.
     ///
     /// **Synthesised, not stored.** Every other relation here comes from a name record; this one
@@ -98,6 +105,7 @@ impl RelKind {
             RelKind::Table => "r",
             RelKind::Index | RelKind::PrimaryKey | RelKind::Exclusion => "i",
             RelKind::Sequence => "S",
+            RelKind::View => "v",
         }
     }
 }
@@ -257,7 +265,8 @@ impl Relations {
             RelKind::Index => table.indexes.get(row.index_at?)?.comment.as_deref(),
             // An `EXCLUDE` constraint's index is synthesised from the constraint and has no record
             // to keep a comment in; a sequence's record has no field for one either.
-            RelKind::Exclusion | RelKind::Sequence => None,
+            // A view's record has no field for a comment either.
+            RelKind::Exclusion | RelKind::Sequence | RelKind::View => None,
         }
     }
 
@@ -322,6 +331,19 @@ fn row_of(
                 column: None,
             }
         }
+        // **A view has no table behind it**, so there is nothing to load and no columns to
+        // report from a `TableDef`: `pg_attribute`'s rows for a view come from the shape its
+        // definition produces, which the expansion works out where the view is read.
+        Relation::View { view_id } => RelationRow {
+            oid: as_oid(view_id),
+            name: name.clone(),
+            schema: schema.clone(),
+            kind: RelKind::View,
+            table_id: view_id,
+            index_at: None,
+            exclude_at: None,
+            column: None,
+        },
         Relation::Index { table_id, index_id } => {
             let table = load_table(txn, tenant, table_id, tables)?;
             let index_at = table.indexes.iter().position(|index| index.id == index_id);

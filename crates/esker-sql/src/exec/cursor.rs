@@ -2201,10 +2201,11 @@ fn catalog_function(
         }
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
-        CatalogFunc::RegClass => {
-            return Err(SqlError::Internal(
-                "a ::regclass reached the row evaluator unresolved".to_owned(),
-            ));
+        CatalogFunc::RegClass | CatalogFunc::ToRegClass => {
+            return Err(SqlError::Internal(format!(
+                "{}() reached the row evaluator unresolved",
+                call.func.name()
+            )));
         }
     })
 }

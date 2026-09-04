@@ -444,6 +444,34 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 template: None,
             }))
         }
+        // `CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT …`.
+        Statement::CreateView(create) => {
+            refuse_if(create.materialized, "CREATE MATERIALIZED VIEW")?;
+            refuse_if(create.temporary, "CREATE TEMPORARY VIEW")?;
+            refuse_if(create.or_alter, "CREATE OR ALTER VIEW")?;
+            refuse_if(create.secure, "CREATE SECURE VIEW")?;
+            refuse_if(create.if_not_exists, "CREATE VIEW IF NOT EXISTS")?;
+            refuse_if(create.with_no_schema_binding, "WITH NO SCHEMA BINDING")?;
+            refuse_if(create.to.is_some(), "CREATE VIEW ... TO")?;
+            refuse_if(create.params.is_some(), "CREATE VIEW with view parameters")?;
+            refuse_if(!create.cluster_by.is_empty(), "CREATE VIEW ... CLUSTER BY")?;
+            // A column list on the view names its columns; a *type* on one is not PostgreSQL's
+            // grammar, and an option list on a column is nobody's.
+            for column in &create.columns {
+                refuse_if(column.data_type.is_some(), "a type on a view column")?;
+                refuse_if(column.options.is_some(), "an option on a view column")?;
+            }
+            Ok(plan::Statement::CreateView(plan::CreateView {
+                name: object_name(&create.name)?,
+                columns: create.columns.iter().map(|c| ident(&c.name)).collect(),
+                // **Rendered back rather than kept verbatim**, because the parser is what this
+                // node re-reads it with: a definition that round-trips through `sqlparser`'s own
+                // rendering is one it can certainly parse again, where the user's text may carry
+                // comments and line breaks that no catalog needs.
+                definition: create.query.to_string(),
+                or_replace: create.or_replace,
+            }))
+        }
         Statement::AlterSchema(alter) => {
             use sqlparser::ast::AlterSchemaOperation;
             refuse_if(alter.if_exists, "ALTER SCHEMA IF EXISTS")?;
@@ -503,6 +531,16 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                // **`CASCADE` on a `DROP VIEW` is refused rather than ignored**: nothing here
+                // depends on a view yet, but a clause that silently did nothing would be a
+                // promise broken the day something does.
+                ObjectType::View => {
+                    refuse_if(*cascade, "DROP VIEW ... CASCADE")?;
+                    plan::Statement::DropView(plan::DropView {
+                        names,
+                        if_exists: *if_exists,
+                    })
+                }
                 ObjectType::Schema => plan::Statement::DropSchema(plan::DropSchema {
                     names,
                     if_exists: *if_exists,
@@ -5066,6 +5104,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
                     derived: None,
                     function: None,
                     hidden_cte: false,
+                    written: None,
                 }),
                 joins: Vec::new(),
                 filter: None,
@@ -5350,6 +5389,7 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
             ))),
             function: None,
             hidden_cte: false,
+            written: None,
         });
     }
     Ok(())
@@ -5469,6 +5509,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     def: None,
                 })),
                 hidden_cte: false,
+                written: None,
             })
         }
         TableFactor::Table {
@@ -5524,6 +5565,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                         def: None,
                     })),
                     hidden_cte: false,
+                    written: None,
                 });
             }
             refuse_if(args.is_some(), "a table function")?;
@@ -5544,6 +5586,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 derived: None,
                 function: None,
                 hidden_cte: false,
+                written: dropped_qualifier(name),
             })
         }
         // `FROM (SELECT …) AS t` — a **derived table**. The alias is optional on PostgreSQL 19
@@ -5582,6 +5625,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                     derived: None,
                     function: None,
                     hidden_cte: false,
+                    written: None,
                 });
             }
             Ok(plan::TableRef {
@@ -5594,6 +5638,7 @@ fn table_reference(factor: &TableFactor) -> Result<plan::TableRef> {
                 ))),
                 function: None,
                 hidden_cte: false,
+                written: None,
             })
         }
         other => Err(SqlError::unsupported(format!("the FROM item {other}"))),
@@ -6271,6 +6316,30 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
 /// would answer `0A000` and skip the guard that stops a client dropping a catalog relation
 /// (`catalog::pg_catalog::refuse_write`). Measured, and `CREATE TABLE pg_catalog.pg_type`
 /// is `42P07` there for the same reason.
+/// The name as written, when [`relation_name`] threw a qualifier away.
+///
+/// **Only `public.`**, because it is the only schema this node spells *out* of a stored name: a
+/// relation there is stored bare (`catalog::SCHEMA_SEPARATOR`), so the qualifier is gone by the
+/// time anything can fail to find it. Every other schema is part of the stored name and quotes
+/// itself back for free — `relation "nosuchschema.sometable" does not exist` was already right.
+///
+/// `pg_catalog.` is left alone deliberately: nothing measured says what a `42P01` naming it looks
+/// like, and a rule invented for it would be a message nobody captured
+/// ([ADR 0031](../../docs/adr/0031-rails-compatibility-is-measured.md)).
+fn dropped_qualifier(name: &ObjectName) -> Option<String> {
+    let parts: Option<Vec<&str>> = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect();
+    let [schema, relation] = parts.as_deref()? else {
+        return None;
+    };
+    schema
+        .eq_ignore_ascii_case(PUBLIC_SCHEMA)
+        .then(|| format!("{PUBLIC_SCHEMA}.{}", fold_identifier(relation, false).0))
+}
+
 fn relation_name(name: &ObjectName) -> Result<String> {
     let parts: Option<Vec<&str>> = name
         .0

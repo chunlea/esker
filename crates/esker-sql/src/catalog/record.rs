@@ -13,6 +13,7 @@
 //! 'm' ++ "sql" ++ 'f' ++ tenant:u64 ++ id:u64  a flashback in progress, and how far it got
 //! 'm' ++ "sql" ++ 'q' ++ tenant:u64 ++ table:u64 ++ column:u64   a sequence, by the column it fills
 //! 'm' ++ "sql" ++ 'e' ++ tenant:u64 ++ seq:u64  that sequence's next unhanded-out value
+//! 'm' ++ "sql" ++ 'w' ++ tenant:u64 ++ name  a view: the SELECT it stands for, and its columns
 //! 'm' ++ "sql" ++ 'D' ++ name                  a database: the name, and the tenant it is
 //! 'm' ++ "sql" ++ 'C'                          the next database id, one counter for the cluster
 //! ```
@@ -179,6 +180,9 @@ const KIND_TYPE: u8 = b'y';
 /// A **schema**, keyed by name. `public` is not stored: it is a property of the build, the way the
 /// available extensions are, and a tenant that has created nothing still has it.
 const KIND_SCHEMA: u8 = b'g';
+
+/// A view: its name, and the `SELECT` it stands for.
+const KIND_VIEW: u8 = b'w';
 
 /// A database, keyed by its name and holding the tenant id it is.
 ///
@@ -720,6 +724,69 @@ pub(super) fn decode_schema(bytes: &[u8]) -> Result<u64> {
     let id = reader.u64_le()?;
     reader.finish()?;
     Ok(id)
+}
+
+/// `'m' ++ "sql" ++ 'w' ++ tenant ++ name`. The name is the whole tail, the property every other
+/// name key here relies on.
+#[must_use]
+pub(super) fn view_key(tenant: u64, name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_VIEW]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every view of one tenant: the range [`view_key`] writes into.
+#[must_use]
+pub(super) fn view_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_VIEW]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// The view name out of a key [`view_key`] wrote.
+pub(super) fn view_name_of(tenant: u64, key: &[u8]) -> Result<String> {
+    let prefix = view_key(tenant, "");
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a view key outside this tenant's range"))?;
+    String::from_utf8(tail.to_vec()).map_err(|_| corrupt("a view name that is not UTF-8"))
+}
+
+/// A view record: its id, the `SELECT` text it stands for, and the column names it was declared
+/// with — empty when it takes them from the query.
+///
+/// **The definition is stored as text and re-lowered when the view is read**, which is the trade
+/// `check_constraints` and the generated-column expressions already make: a lowered plan would
+/// have to be invalidated with the `TableDef` that caches it, and re-lowering a short `SELECT` per
+/// statement is the cheaper mistake. It is also what `pg_get_viewdef` has to print back.
+#[must_use]
+pub(super) fn encode_view(id: u64, definition: &str, columns: &[String]) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    out.extend_from_slice(&id.to_le_bytes());
+    put_str(definition, &mut out);
+    varint::put_u64(columns.len() as u64, &mut out);
+    for column in columns {
+        put_str(column, &mut out);
+    }
+    out
+}
+
+/// Reads one back.
+pub(super) fn decode_view(bytes: &[u8]) -> Result<(u64, String, Vec<String>)> {
+    let mut reader = Reader::at_least(bytes, OLDEST_SCHEMA_VERSION)?;
+    let id = reader.u64_le()?;
+    let definition = reader.string()?;
+    let count = reader.varint()?;
+    let mut columns = Vec::new();
+    for _ in 0..count {
+        columns.push(reader.string()?);
+    }
+    reader.finish()?;
+    Ok((id, definition, columns))
 }
 
 /// `'m' ++ "sql" ++ 'D' ++ name`. The name is the whole rest of the key, so it needs no length and
@@ -2237,6 +2304,10 @@ pub(super) fn encode_relation(relation: &Relation) -> Vec<u8> {
             out.push(KIND_PRIMARY_KEY);
             out.extend_from_slice(&table_id.to_le_bytes());
         }
+        Relation::View { view_id } => {
+            out.push(KIND_VIEW);
+            out.extend_from_slice(&view_id.to_le_bytes());
+        }
         // A sequence's name resolves to the column it fills rather than to an id of its own,
         // because that is the key its record lives under.
         Relation::Sequence {
@@ -2261,6 +2332,9 @@ pub(super) fn decode_relation(bytes: &[u8]) -> Result<Relation> {
         KIND_INDEX => Relation::Index {
             table_id: reader.u64_le()?,
             index_id: reader.u64_le()?,
+        },
+        KIND_VIEW => Relation::View {
+            view_id: reader.u64_le()?,
         },
         KIND_PRIMARY_KEY => Relation::PrimaryKey {
             table_id: reader.u64_le()?,
