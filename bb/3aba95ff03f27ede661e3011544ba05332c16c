@@ -1,0 +1,19 @@
+crates/esker-sql/src/parse/lower.rs
+  s_49075263d2b3e7::t_0524cb36c896d5 4526-4548
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bb3aba95ff03f27ede661e3011544ba05332c16c",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
