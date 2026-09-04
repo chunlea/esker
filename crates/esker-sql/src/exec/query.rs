@@ -2803,6 +2803,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
             ColumnType::FloatRange => 59,
             ColumnType::VarcharRange => 60,
+            // **A family of its own, and the point of the type.** `money = numeric`,
+            // `money = bigint` and `money + 1` are each `42883` on a real server: cents in an
+            // `i64` compare with cents and with nothing else.
+            ColumnType::Money => 61,
+            ColumnType::MoneyArray => 62,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

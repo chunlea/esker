@@ -45,6 +45,12 @@ pub fn result_type(op: ArithOp, left: ColumnType, right: ColumnType) -> Result<C
     if temporal_type(left) || temporal_type(right) {
         return super::temporal::result_type(op, left, right).map_or_else(undefined, Ok);
     }
+    // **And `money` has its own**, for the same reason and with a sharper edge: the operators are
+    // not a promotion — `money * 2` is a money, `money * money` is `42883`, and `money / money`
+    // is a `double precision`. A ladder cannot express any of those three.
+    if left == ColumnType::Money || right == ColumnType::Money {
+        return super::money::result_type(op, left, right).map_or_else(undefined, Ok);
+    }
     if !numeric_type(left) || !numeric_type(right) {
         return undefined();
     }
@@ -118,6 +124,11 @@ pub fn apply(op: ArithOp, ty: ColumnType, left: &Datum, right: &Datum) -> Result
     // An `unknown` reaches here as text — `'5' + 1` is 6 on a real server — and is read by the
     // result type's own input function, so `'a' + 1` is that function's `22P02` and not a
     // `42883` about an operator on `text`.
+    // Before the coercion, because the operands keep their **own** types: a money and an `int8`
+    // are two types on either side of one operator, not two spellings of one.
+    if matches!(left, Datum::Money(_)) || matches!(right, Datum::Money(_)) {
+        return super::money::apply(op, left, right);
+    }
     let (left, right) = (&coerce(left, ty)?, &coerce(right, ty)?);
     if temporal_type(ty)
         || matches!(

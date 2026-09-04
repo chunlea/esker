@@ -84,7 +84,9 @@ ROLLBACK TO s7		-
 SAVEPOINT s8		-
 CREATE TYPE norange AS RANGE (subtype = nosuchtype)	!42704 type "nosuchtype" does not exist
 ROLLBACK TO s8		-
+SAVEPOINT w1		-
 CREATE INDEX fr_range_idx ON fr (float_range)		-
+ROLLBACK TO SAVEPOINT w1		-
 UPDATE fr SET float_range = '[1.5, 2.5)' WHERE id = 101		-
 SELECT 'r', id, float_range FROM fr WHERE id = 101		r|101|[1.5,2.5)
 DELETE FROM fr WHERE id = 109		-

@@ -1,0 +1,117 @@
+# `money` — cents in an `i64`, against PostgreSQL 19beta1 with `lc_monetary = 'C'`.
+#
+# **Run 59's tier-3 row: 12 tests in `adapters/postgresql/money_test.rb`**, whose `setup` sets
+# `lc_monetary` and declares `t.money "wealth"` and `t.money "depth", default: "150.55"`.
+#
+# Things reasoning would get wrong:
+#
+# * **The type is an integer.** `typlen` is 8 and `typstorage` is `p` — plain, not a varlena — so
+#   the range is exactly `i64`'s in hundredths: `$92,233,720,368,547,758.07` is the top and one
+#   cent more is `22003`. Both ends are in the corpus.
+# * **The input is far looser than the output.** `$`, thousands separators and *brackets* are all
+#   accepted — `(1.00)` is `-$1.00`, the accountants' minus — and `.12` is `$0.12` while `1` is
+#   `$1.00`. What comes back is always `$`, separators and two decimals.
+# * **Input rounding is half away from zero**, and it takes four consecutive half-cents to say so:
+#   `.855` → `.86`, `.865` → `.87`, `.875` → `.88`, `.885` → `.89`. Half-to-even would give two of
+#   those differently.
+# * **Arithmetic rounds the other way.** `money * float`, `money * numeric`, `money / float` and
+#   `money / numeric` all round **half to even** — `$0.05 * 0.5` is `$0.02` and `$0.15 * 0.5` is
+#   `$0.08` — while **`money / integer` truncates**: `$2.00 / 3` is `$0.66`, where `$2.00 /
+#   3::numeric` is `$0.67`. Three rules, each probed four times.
+# * **The operator set is not a promotion ladder.** `money * 2` is a money, `money * money` is
+#   `42883`, `money / money` is a **`double precision`**, `3 * money` works and `3 / money` does
+#   not, and `money + 1`, `money = 1.00` and `avg(money)` are each `42883`.
+# * **`sum(money)` stays a money** and is the one `sum` that can overflow: an `int8` widens to
+#   `numeric` on a real server precisely so that it cannot.
+# * **The casts are asymmetric.** `numeric::money` and `int::money` work, `money::numeric` works,
+#   and `float8::money`, `money::float8` and `money::int8` are each `42846`. A value that is cents
+#   does not travel through a float in either direction.
+# * **`information_schema` reports no precision and no scale.** Both are NULL for a money column;
+#   the `scale: 2` `ActiveRecord`'s schema dumper prints is the adapter's own constant. The default
+#   comes back as `'$150.55'::money`, symbol and cast included, which is what that dumper reads.
+#
+BEGIN		-
+SET lc_monetary = 'C'		-
+SELECT 'r', typname, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('money','_money') ORDER BY typname	text,name,smallint,"char",regproc	r|_money|-1|A|array_in ; r|money|8|N|cash_in
+CREATE TABLE m (id int8 primary key, wealth money, depth money DEFAULT '150.55')		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"m"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|wealth|money ; r|depth|money
+SELECT 'r', column_name, data_type, udt_name, numeric_precision, numeric_scale, column_default FROM information_schema.columns WHERE table_name = 'm' ORDER BY ordinal_position	text,name,character varying,name,integer,integer,character varying	r|id|bigint|int8|64|0|\N ; r|wealth|money|money|\N|\N|\N ; r|depth|money|money|\N|\N|'$150.55'::money
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid = '"m"'::regclass		r|'$150.55'::money
+INSERT INTO m (id, wealth) VALUES (1, '567.89'::money)		-
+INSERT INTO m (id, wealth) VALUES (2, '-567.89'::money)		-
+INSERT INTO m (id, wealth) VALUES (3, '0'::money)		-
+INSERT INTO m (id) VALUES (4)		-
+INSERT INTO m (id, wealth) VALUES (5, 123.45)		-
+INSERT INTO m (id, wealth) VALUES (6, 123)		-
+SELECT 'r', id, wealth, depth FROM m ORDER BY id		r|1|$567.89|$150.55 ; r|2|-$567.89|$150.55 ; r|3|$0.00|$150.55 ; r|4|\N|$150.55 ; r|5|$123.45|$150.55 ; r|6|$123.00|$150.55
+SELECT 'r', '567.89'::money, '$567.89'::money, '-567.89'::money, '-$567.89'::money	text,money,money,money,money	r|$567.89|$567.89|-$567.89|-$567.89
+SELECT 'r', '1,234.56'::money, '$1,234.56'::money, '(1.00)'::money, '($1.00)'::money	text,money,money,money,money	r|$1,234.56|$1,234.56|-$1.00|-$1.00
+SELECT 'r', '12345678.12'::money, '0.12'::money, '.12'::money, '1'::money	text,money,money,money,money	r|$12,345,678.12|$0.12|$0.12|$1.00
+SELECT 'r', '567.855'::money, '567.865'::money, '567.875'::money, '567.885'::money	text,money,money,money,money	r|$567.86|$567.87|$567.88|$567.89
+SELECT 'r', '92233720368547758.07'::money, '-92233720368547758.08'::money	text,money,money	r|$92,233,720,368,547,758.07|-$92,233,720,368,547,758.08
+SELECT 'r', '150.55'::money::text, pg_typeof('150.55'::money)	text,text,regtype	r|$150.55|money
+SELECT 'r', id * wealth FROM m WHERE id = 1		r|$567.89
+SELECT 'r', sum(wealth), min(wealth), max(wealth), count(wealth) FROM m		r|$246.45|-$567.89|$567.89|5
+SELECT 'r', sum(id * wealth) FROM m		r|$787.36
+SELECT 'r', pg_typeof(sum(wealth)), pg_typeof(min(wealth)), pg_typeof(count(wealth)) FROM m		r|money|money|bigint
+SELECT 'r', '1.00'::money + '2.00'::money, '3.00'::money - '1.00'::money, '2.00'::money * 3, '6.00'::money / 2	text,money,money,money,money	r|$3.00|$2.00|$6.00|$3.00
+SELECT 'r', '6.00'::money / '2.00'::money, pg_typeof('6.00'::money / '2.00'::money)	text,double precision,regtype	r|3|double precision
+SELECT 'r', '2.00'::money * 2.5::float8, 3 * '2.00'::money, '1.00'::money * 2.5::numeric	text,money,money,money	r|$5.00|$6.00|$2.50
+SELECT 'r', '1.00'::money / 3, '2.00'::money / 3, '0.05'::money / 2, '0.15'::money / 2	text,money,money,money,money	r|$0.33|$0.66|$0.02|$0.07
+SELECT 'r', '0.05'::money * 0.5::float8, '0.15'::money * 0.5::float8, '0.25'::money * 0.5::float8, '0.35'::money * 0.5::float8	text,money,money,money,money	r|$0.02|$0.08|$0.12|$0.18
+SELECT 'r', '1.00'::money = '1.00'::money, '1.00'::money < '2.00'::money, '1.00'::money > '2.00'::money	text,boolean,boolean,boolean	r|t|t|f
+SELECT 'r', id, wealth FROM m WHERE wealth IS NOT NULL ORDER BY wealth		r|2|-$567.89 ; r|3|$0.00 ; r|6|$123.00 ; r|5|$123.45 ; r|1|$567.89
+SELECT 'r', count(DISTINCT wealth) FROM m		r|5
+SELECT 'r', wealth, count(*) FROM m GROUP BY wealth ORDER BY wealth		r|-$567.89|1 ; r|$0.00|1 ; r|$123.00|1 ; r|$123.45|1 ; r|$567.89|1 ; r|\N|1
+SELECT 'r', '567.89'::money::numeric, pg_typeof('567.89'::money::numeric)	text,numeric,regtype	r|567.89|numeric
+SELECT 'r', 567.89::numeric::money, 12345::int8::money, 12345::int4::money	text,money,money,money	r|$567.89|$12,345.00|$12,345.00
+SELECT 'r', '{1.00,2.00}'::money[], pg_typeof('{1.00,2.00}'::money[])	text,money[],regtype	r|{$1.00,$2.00}|money[]
+SAVEPOINT w1		-
+SELECT 'r', '1.00'::money || 'x'	text,text	r|$1.00x
+ROLLBACK TO SAVEPOINT w1		-
+CREATE INDEX m_wealth_idx ON m (wealth)		-
+SELECT 'r', id FROM m WHERE wealth = '567.89'::money		r|1
+UPDATE m SET wealth = '987.65' WHERE id = 4		-
+SELECT 'r', id, wealth FROM m WHERE id = 4		r|4|$987.65
+SAVEPOINT s1		-
+SELECT 'r', 'abc'::money	!22P02 invalid input syntax for type money: "abc"
+ROLLBACK TO SAVEPOINT s1		-
+SAVEPOINT s2		-
+SELECT 'r', '92233720368547758.08'::money	!22003 value "92233720368547758.08" is out of range for type money
+ROLLBACK TO SAVEPOINT s2		-
+SAVEPOINT s3		-
+SELECT 'r', '92233720368547758.07'::money + '0.01'::money	!22003 money out of range
+ROLLBACK TO SAVEPOINT s3		-
+SAVEPOINT s4		-
+SELECT 'r', '1.00'::money / 0	!22012 division by zero
+ROLLBACK TO SAVEPOINT s4		-
+SAVEPOINT s5		-
+SELECT 'r', '1.00'::money / '0.00'::money	!22012 division by zero
+ROLLBACK TO SAVEPOINT s5		-
+SAVEPOINT s6		-
+SELECT 'r', '1.00'::money + 1	!42883 operator does not exist: money + integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s6		-
+SAVEPOINT s7		-
+SELECT 'r', '1.00'::money = 1.00	!42883 operator does not exist: money = numeric DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s7		-
+SAVEPOINT s8		-
+SELECT 'r', '1.00'::money * '2.00'::money	!42883 operator does not exist: money * money DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s8		-
+SAVEPOINT s9		-
+SELECT 'r', 6 / '2.00'::money	!42883 operator does not exist: integer / money DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s9		-
+SAVEPOINT s10		-
+SELECT 'r', avg(wealth) FROM m	!42883 function avg(money) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s10		-
+SAVEPOINT s11		-
+SELECT 'r', '567.89'::float8::money	!42846 cannot cast type double precision to money
+ROLLBACK TO SAVEPOINT s11		-
+SAVEPOINT s12		-
+SELECT 'r', '567.89'::money::float8	!42846 cannot cast type money to double precision
+ROLLBACK TO SAVEPOINT s12		-
+SAVEPOINT s13		-
+SELECT 'r', '567.89'::money::int8	!42846 cannot cast type money to bigint
+ROLLBACK TO SAVEPOINT s13		-
+DROP TABLE m		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'm'	text,bigint	r|0

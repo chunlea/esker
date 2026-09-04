@@ -4784,6 +4784,20 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::Bytea(bytes.to_vec()),
             ))));
         }
+        // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
+        // output function writes `$567.89` and `numeric`'s input function refuses it, so the
+        // ordinary text path made a conversion a real server performs into a `22P02` about the
+        // dollar sign. The other direction needs nothing: `567.89` and `12345` are both spellings
+        // `cash_in` reads.
+        if source_type(expr)? == Some(ColumnType::Money)
+            && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Numeric)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            let cents = value::money::from_text(&text)?;
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::from_text(ColumnType::Numeric, &value::money::to_numeric_text(cents))?,
+            ))));
+        }
         if source_type(expr)? == Some(ColumnType::Numeric)
             && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
             && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
@@ -5000,6 +5014,11 @@ fn numeric_to_integer(text: &str, to: ColumnType) -> Result<Datum> {
 /// Only the pairs a `date` is one half of, because it is the only type here that PostgreSQL
 /// refuses to cast to a number: every other pair in this crate either has a cast or fails on the
 /// value. Both directions, measured — `'2020-01-01'::date::int` and `1::date`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of the pairs with no cast at all; splitting it would hide which pairs \
+              those are, which is the only thing this function says"
+)]
 fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
     let target = lower_type(data_type).ok().map(|(ty, _)| ty);
     let source = source_type(expr)?;
@@ -5048,6 +5067,35 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
         )
     };
     Ok(match (source, target) {
+        // **A money casts to `numeric` and to a string, and takes `numeric` and the integers.**
+        // Measured one target at a time, and the asymmetry is the point: `567.89::numeric::money`
+        // and `12345::int8::money` both work, and `'567.89'::float8::money`,
+        // `money::float8` and `money::int8` are each `42846`. A type whose value is cents does not
+        // travel through a float, in either direction.
+        (Some(ColumnType::Money), Some(to))
+            if !stringy(to) && !matches!(to, ColumnType::Numeric | ColumnType::Money) =>
+        {
+            Some(SqlError::CannotCast {
+                from: ColumnType::Money.name(),
+                to: to.name(),
+            })
+        }
+        (Some(from), Some(ColumnType::Money))
+            if !stringy(from)
+                && !matches!(
+                    from,
+                    ColumnType::Numeric
+                        | ColumnType::Int2
+                        | ColumnType::Int4
+                        | ColumnType::Int8
+                        | ColumnType::Money
+                ) =>
+        {
+            Some(SqlError::CannotCast {
+                from: from.name(),
+                to: ColumnType::Money.name(),
+            })
+        }
         (Some(ColumnType::Date), Some(to)) if numeric(to) => Some(SqlError::CannotCast {
             from: ColumnType::Date.name(),
             to: to.name(),
@@ -6353,6 +6401,10 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         // geometric name is a `Custom` one exactly as a range name is, and this is the
         // table that says which `Custom` names are types this node has.
         "point" => Some(ColumnType::Point),
+        // **And `money`**, which `sqlparser` does have a variant for on some dialects and not
+        // this one — a `Custom` name here like the rest. `money_test.rb` writes `t.money`, which
+        // the adapter sends as the bare word.
+        "money" => Some(ColumnType::Money),
         _ => None,
     }
 }

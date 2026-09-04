@@ -654,6 +654,12 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::Int8RangeArray
         | Row::Point
         | Row::PointArray
+        // **A money is refused here and is an index key**, which is not a contradiction: the row
+        // codec knows it is cents in an `i64` and this vocabulary has no way to carry a *type*
+        // that shares its bits with `int8` — `value_to_datum` reads a wire value with no column
+        // type in hand, so a money pushed down would come back a `bigint`.
+        | Row::Money
+        | Row::MoneyArray
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray
@@ -688,6 +694,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // a citext's is refused — this vocabulary has no way to carry a type with no
         // comparison at all.
         Datum::Point { .. }
+        | Datum::Money(_)
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)

@@ -113,6 +113,7 @@ impl ArrayValue {
             ColumnType::Jsonb => ColumnType::JsonbArray,
             ColumnType::Oid => ColumnType::OidArray,
             ColumnType::Citext => ColumnType::CitextArray,
+            ColumnType::Money => ColumnType::MoneyArray,
             _ => return None,
         })
     }
@@ -150,6 +151,7 @@ impl ArrayValue {
             ColumnType::JsonbArray => ColumnType::Jsonb,
             ColumnType::OidArray => ColumnType::Oid,
             ColumnType::CitextArray => ColumnType::Citext,
+            ColumnType::MoneyArray => ColumnType::Money,
             _ => return None,
         })
     }

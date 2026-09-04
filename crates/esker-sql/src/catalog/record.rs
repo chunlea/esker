@@ -288,6 +288,8 @@ const TAG_DATE_RANGE_ARRAY: u8 = 54;
 const TAG_NUM_RANGE_ARRAY: u8 = 55;
 const TAG_INT8_RANGE_ARRAY: u8 = 56;
 /// `point` and `point[]` — 57 and 58, read off the constants above rather than counted.
+const TAG_MONEY: u8 = 61;
+const TAG_MONEY_ARRAY: u8 = 62;
 const TAG_FLOAT_RANGE: u8 = 59;
 const TAG_VARCHAR_RANGE: u8 = 60;
 const TAG_POINT: u8 = 57;
@@ -372,6 +374,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::DateRangeArray => TAG_DATE_RANGE_ARRAY,
         ColumnType::NumRangeArray => TAG_NUM_RANGE_ARRAY,
         ColumnType::Int8RangeArray => TAG_INT8_RANGE_ARRAY,
+        ColumnType::Money => TAG_MONEY,
+        ColumnType::MoneyArray => TAG_MONEY_ARRAY,
         ColumnType::FloatRange => TAG_FLOAT_RANGE,
         ColumnType::VarcharRange => TAG_VARCHAR_RANGE,
         ColumnType::Point => TAG_POINT,
@@ -480,6 +484,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_DATE_RANGE_ARRAY => ColumnType::DateRangeArray,
         TAG_NUM_RANGE_ARRAY => ColumnType::NumRangeArray,
         TAG_INT8_RANGE_ARRAY => ColumnType::Int8RangeArray,
+        TAG_MONEY => ColumnType::Money,
+        TAG_MONEY_ARRAY => ColumnType::MoneyArray,
         TAG_FLOAT_RANGE => ColumnType::FloatRange,
         TAG_VARCHAR_RANGE => ColumnType::VarcharRange,
         TAG_POINT => ColumnType::Point,

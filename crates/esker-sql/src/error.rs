@@ -548,6 +548,11 @@ pub enum SqlError {
     #[error("you don't own a lock of type {0}")]
     LockNotHeld(&'static str),
 
+    /// `money` overflowing, which is its own sentence: PostgreSQL quotes no value in it, unlike
+    /// every other overflow message. Measured — `'92233720368547758.07'::money + '0.01'::money`.
+    #[error("money out of range")]
+    MoneyOutOfRange,
+
     /// An integer literal is well-formed and too big. PostgreSQL phrases the two numeric ranges
     /// differently — this one leads with `value` and [`SqlError::FloatOutOfRange`] does not — and
     /// both are copied verbatim because a client may be matching on either.
@@ -2297,7 +2302,8 @@ impl SqlError {
             | SqlError::InvalidByteaFormat => {
                 sqlstate::INVALID_TEXT_REPRESENTATION
             }
-            SqlError::IntegerOutOfRange { .. }
+            SqlError::MoneyOutOfRange
+            | SqlError::IntegerOutOfRange { .. }
             | SqlError::FloatOutOfRange { .. }
             | SqlError::IntegerLiteralOutOfRange(_)
             | SqlError::BigintOutOfRange

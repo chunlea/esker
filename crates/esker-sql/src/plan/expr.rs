@@ -1637,6 +1637,13 @@ impl Literal {
 
             Literal::Integer(value) => match ty {
                 ColumnType::Int8 => Ok(Datum::Int8(*value)),
+                // **A whole number of currency units, not of cents.** `VALUES (123)` into a
+                // money column is `$123.00` on a real server, which is the assignment cast
+                // `int8 -> money` and not a reinterpretation of the bits.
+                ColumnType::Money => value
+                    .checked_mul(100)
+                    .map(Datum::Money)
+                    .ok_or_else(|| SqlError::IntegerLiteralOutOfRange(ColumnType::Money.name())),
                 // The range check is the type: a constant a real server refuses with `22003`
                 // must not be quietly accepted here, which is the whole argument ADR 0033 made
                 // for a distinct `int4` rather than an alias.
@@ -1702,11 +1709,14 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                | ColumnType::FloatRange | ColumnType::VarcharRange
+                | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
+                // The same assignment cast one arm up, and the digits are already the spelling
+                // `money`'s input function reads: `VALUES (123.45)` is `$123.45`.
+                ColumnType::Money => Datum::from_text(ColumnType::Money, digits),
                 // **The digits as written, trailing zeros and all.** This is the assignment the
                 // type exists for: `1.000` into a `numeric` column is `1.000`, where the same
                 // literal into a `double precision` one is `1`. No rounding and no widening —
@@ -1779,7 +1789,7 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                | ColumnType::FloatRange | ColumnType::VarcharRange
+                | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
 
@@ -1813,7 +1823,10 @@ impl Literal {
                 ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => Ok(Datum::Text(
                     if *value { "true" } else { "false" }.to_owned(),
                 )),
-                ColumnType::Int8
+                // A boolean is not a number, so it is not a money either: `money` takes the
+                // two numeric assignment casts above and nothing else.
+                ColumnType::Money
+                | ColumnType::Int8
                 | ColumnType::Int4
                 | ColumnType::Int2
                 | ColumnType::Bytea
@@ -1850,7 +1863,7 @@ impl Literal {
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
-                | ColumnType::FloatRange | ColumnType::VarcharRange
+                | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                 | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point => mismatch(),
             },
         }

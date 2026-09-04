@@ -115,6 +115,78 @@ pub(crate) fn reached(to: &std::sync::mpsc::Sender<&'static str>, what: &'static
     to.send(what).unwrap();
 }
 
+/// The listed divergences that **currently swallow the rest of their corpus**, and may.
+///
+/// Rule 3 below says a declared divergence may not be a refusal that aborts the transaction: every
+/// statement after it comes back `25P02` and is counted as swallowed rather than compared, so the
+/// entry that was meant to declare one difference quietly stops the file being checked at all.
+/// `pg19_tsrange.txt` was doing that to **84 of its 96 statements**, green, for ten rounds.
+///
+/// These 34 statements across 19 corpora were found the moment the rule was armed and are written
+/// down rather than silenced: each needs a `SAVEPOINT` / `ROLLBACK TO` around the probe in its
+/// capture, and each will surface whatever the rest of its file has not been comparing — three
+/// divergences appeared in `pg19_tsrange.txt` alone, and three more in `pg19_money.txt`. Every one
+/// of these files belongs to a feature lane rather than to the type surface, which is why they are
+/// listed here instead of fixed in the commit that found them.
+///
+/// **This list may only shrink.** A statement not on it that swallows its file fails the test on
+/// the spot; one on it that has been guarded is dead weight and should be deleted.
+const SWALLOWING_DEBT: &[&str] = &[
+    // `tests/alter_column_type.rs`
+    "ALTER TABLE \"pg_arrays\" ALTER COLUMN \"snippets\" TYPE text[] USING string_to_array(\"snippets\", ','), ALTER COLUMN \"snippets\" SET DEFAULT '{}';",
+    // `tests/alter_index.rs`
+    "ALTER INDEX \"ai\" RENAME TO \"ai_renamed\"",
+    // `tests/array_subquery.rs`
+    "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
+    // `tests/assignment_cast_date.rs`
+    "SET TimeZone = 'Pacific/Auckland'",
+    // `tests/create_schema_elements.rs`
+    "CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())",
+    "CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one",
+    // `tests/do_block.rs`
+    "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;",
+    // `tests/drop_extension.rs`
+    "CREATE EXTENSION IF NOT EXISTS \"ltree\"",
+    "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\" SCHEMA extschema",
+    // `tests/include_index.rs`
+    "SELECT 'r', pg_get_indexdef('companies_u_include'::regclass)",
+    // `tests/lateral.rs`
+    "SELECT 'r', s.x FROM lt l, LATERAL (SELECT l.id AS x) s ORDER BY s.x",
+    // `tests/partition.rs`
+    "SELECT 'r', tableoid::regclass::text, city_id, logdate, peaktemp FROM \"measurements\" ORDER BY city_id",
+    "ALTER TABLE \"measurements\" DETACH PARTITION \"measurements_concepcion\"",
+    "ALTER TABLE \"measurements\" ATTACH PARTITION \"measurements_concepcion\" FOR VALUES IN (2)",
+    // `tests/regex_match.rs`
+    "SELECT 'r', E'a\\nb' ~ 'a.b', E'a\\nb' ~ '^a.b$'",
+    "SELECT 'r', 'abc' ~ '(?i)ABC'",
+    "SELECT 'r', 'aab' ~ '^(a)\\1b$'",
+    // `tests/rename_column.rs`
+    "SELECT 'r', count(*) FROM rc_view",
+    // `tests/set_parameters.rs`
+    "SET TIME ZONE 'America/New_York'",
+    "SHOW lc_monetary",
+    "SHOW lc_monetary",
+    "SHOW lc_monetary",
+    "SHOW lc_monetary",
+    // `tests/set_session.rs`
+    "SET LOCAL search_path TO 'ss_two'",
+    "SET SESSION AUTHORIZATION esker",
+    "SET LOCAL SESSION AUTHORIZATION esker",
+    // `tests/trigger_function.rs`
+    "SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, provolatile FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE proname = 'populate_column'",
+    // `tests/update_from.rs`
+    "UPDATE vl_comments a SET body = c.body || '!' FROM vl_comments c WHERE c.id = a.id",
+    "DELETE FROM vl_comments a USING vl_posts p WHERE p.id = a.vl_post_id AND p.title = 'x'",
+    // `tests/values_catalog_function.rs`
+    "SELECT 'r', pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), pg_typeof(CURRENT_DATE), pg_typeof(CURRENT_TIME)",
+    "INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('bad', nosuchfunction(), CURRENT_TIMESTAMP)",
+    // `tests/view.rs`
+    "INSERT INTO ebooks_plain (name, cover, status, format) VALUES ('Written Through', 'hard', 0, 'ebook')",
+    "REFRESH MATERIALIZED VIEW ebooks_mat",
+    // `tests/view_debts.rs`
+    "CREATE VIEW v_union AS SELECT id, a FROM vb UNION SELECT id, c FROM vb2;",
+];
+
 /// What one statement answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
@@ -385,6 +457,11 @@ pub(crate) fn replay(corpus: &str, fixture: &[&str], divergences: &Divergences) 
 }
 
 /// [`replay`], answering the swallowed count as well — for a corpus that has one and says so.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the corpus with the three ratchet rules in it; splitting it would \
+              put a rule somewhere other than beside the comparison it is about"
+)]
 pub(crate) fn replay_reporting(
     corpus: &str,
     fixture: &[&str],
@@ -404,6 +481,12 @@ pub(crate) fn replay_reporting(
     // entry fails only when **every** occurrence agreed. `(entry, line, statement)`.
     let mut listed_agreements: Vec<(usize, usize, String)> = Vec::new();
     let mut listed_seen: Vec<usize> = Vec::new();
+    // The last **listed** divergence this node answered with a refusal, and therefore the
+    // candidate for having aborted the transaction. See `swallowers` below.
+    let mut last_listed_refusal: Option<(String, String)> = None;
+    // Listed divergences that were followed by a cascade — each one is an entry that silently
+    // stops the rest of the file being compared at all.
+    let mut swallowers: Vec<String> = Vec::new();
 
     for (line_number, statement, expected) in parse(corpus) {
         let listed = divergences
@@ -418,9 +501,27 @@ pub(crate) fn replay_reporting(
             if actual == expected {
                 listed_agreements.push((entry, line_number, statement.clone()));
             }
+            // **A listed divergence that is a *refusal* can abort the transaction**, and then
+            // every statement after it is `25P02` and counted as swallowed — so the entry that
+            // was supposed to declare one difference quietly stops the file being compared at
+            // all. Remembered here and reported below if a cascade follows.
+            last_listed_refusal = matches!(actual, Answer::Refused(_)).then(|| {
+                (
+                    format!("line {line_number}: {statement}"),
+                    statement.clone(),
+                )
+            });
             continue;
         }
 
+        // **A statement that answered clears the suspicion.** `last_listed_refusal` names the
+        // most recent listed refusal *with nothing successful since*: a `ROLLBACK TO SAVEPOINT`
+        // that works proves the transaction is usable again, so the refusal before it swallowed
+        // nothing. Without this the memory went stale and blamed whichever listed refusal came
+        // last, wherever the cascade actually started.
+        if !matches!(actual, Answer::Refused(_)) {
+            last_listed_refusal = None;
+        }
         match (&expected, &actual) {
             (
                 Answer::Rows { types, rows },
@@ -463,6 +564,11 @@ pub(crate) fn replay_reporting(
                 // it was itself swallowed by the abort, so the `ROLLBACK TO` has nothing to return
                 // to. Counted with the rest rather than reported as a divergence of its own.
                 cascaded += 1;
+                if let Some((culprit, sql)) = last_listed_refusal.take()
+                    && !SWALLOWING_DEBT.contains(&sql.as_str())
+                {
+                    swallowers.push(format!("{culprit}  [cascade at line {line_number}]"));
+                }
             }
             _ => mismatched.push(format!(
                 "line {line_number}: {statement}\n  PostgreSQL: {expected}\n  Esker:      {actual}"
@@ -477,6 +583,20 @@ pub(crate) fn replay_reporting(
          counted):\n\n{}",
         mismatched.len(),
         mismatched.join("\n\n")
+    );
+    // **Rule 3: a listed divergence may not swallow the file.** `pg19_tsrange.txt` declared
+    // `current_setting('DateStyle')` as a difference, this node refuses it, and the refusal
+    // aborted the transaction — so 84 of that corpus's 96 statements came back `25P02` and were
+    // counted as swallowed rather than compared. The entry was doing its job and the corpus was
+    // asserting almost nothing, for ten rounds, with a green test. The fix in the corpus is a
+    // `SAVEPOINT` around the probe; the fix here is that nobody has to notice on their own.
+    assert!(
+        swallowers.is_empty(),
+        "{} declared divergence(s) are refusals that aborted the transaction, so every statement \
+         after each of them was swallowed rather than compared — guard the probe with a \
+         SAVEPOINT / ROLLBACK TO in the capture:\n\n{}",
+        swallowers.len(),
+        swallowers.join("\n")
     );
     assert!(
         type_mismatched.is_empty(),
