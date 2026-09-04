@@ -220,6 +220,12 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// `ON COMMIT` on a table that is not temporary. **`42P16`, an invalid table definition** —
+    /// not a syntax error and not a refusal: the clause is understood, and it is meaningless on a
+    /// relation that outlives the transaction. Measured.
+    #[error("ON COMMIT can only be used on temporary tables")]
+    OnCommitNotTemporary,
+
     /// `DROP SCHEMA pg_catalog`. **`2BP01`, not `42501`** — the schema is not forbidden to you,
     /// it is depended on, and the message says so in PostgreSQL's own words. The name is
     /// **unquoted** here, unlike every other schema message; measured.
@@ -662,6 +668,25 @@ pub enum SqlError {
         /// values joined with `, ` and `null` for a NULL, with no quoting.
         row: Option<String>,
     },
+
+    /// `ALTER COLUMN … SET NOT NULL` over a column that already holds one: `23502`.
+    ///
+    /// **A different sentence from the one an offending `INSERT` gets**, and deliberately: there
+    /// is no constraint to name yet, so PostgreSQL reports the column and the relation and stops.
+    #[error("column \"{column}\" of relation \"{relation}\" contains null values")]
+    ColumnContainsNulls {
+        /// The column the scan found a NULL in.
+        column: String,
+        /// The table it belongs to.
+        relation: String,
+    },
+
+    /// `ALTER COLUMN … DROP NOT NULL` on a column the primary key is built from: `42P16`.
+    ///
+    /// The `NOT NULL` is the primary key's, not the column's, so there is nothing to drop — and
+    /// dropping it would leave a key that could hold a NULL.
+    #[error("column \"{0}\" is in a primary key")]
+    ColumnIsInPrimaryKey(String),
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
@@ -2024,7 +2049,11 @@ impl SqlError {
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.
             | SqlError::CannotDropTemplateDatabase => sqlstate::WRONG_OBJECT_TYPE,
-            SqlError::PermanentReferencesUnlogged => sqlstate::INVALID_TABLE_DEFINITION,
+            SqlError::PermanentReferencesUnlogged
+            | SqlError::OnCommitNotTemporary
+            | SqlError::ColumnIsInPrimaryKey(_) => {
+                sqlstate::INVALID_TABLE_DEFINITION
+            }
             SqlError::UndefinedColumn(_)
             | SqlError::UndefinedColumnInForeignKey(_)
             | SqlError::UndefinedColumnInKey(_)
@@ -2052,7 +2081,9 @@ impl SqlError {
             | SqlError::DuplicateColumnInRelation { .. }
             | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
             SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
-            SqlError::NotNullViolation(_) | SqlError::NotNullViolationInRelation { .. } => {
+            SqlError::ColumnContainsNulls { .. }
+            | SqlError::NotNullViolation(_)
+            | SqlError::NotNullViolationInRelation { .. } => {
                 sqlstate::NOT_NULL_VIOLATION
             }
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,

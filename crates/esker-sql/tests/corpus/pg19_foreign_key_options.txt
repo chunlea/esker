@@ -1,0 +1,124 @@
+# The four foreign-key/column options `migration/foreign_key_test.rb` needs — captured from the
+# statements PostgreSQL 19 actually logged while running that file green (88 runs, 0 errors).
+#
+# **Run 56: the file is 88 runs / 3 failures / 79 errors.** 69 of those errors were the renamed-index
+# name leak and closed with `00203bf`; measured at that commit the file is 6 failures / 10 errors,
+# and what is left is exactly four things, all in this capture:
+#
+# * `ALTER TABLE … ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL` — 3 tests. AR's
+#   `change_column_null`.
+# * `FOREIGN KEY … DEFERRABLE INITIALLY DEFERRED` — 3 tests. Refused by name because every check
+#   here is immediate, and accepting it would refuse a transaction PostgreSQL commits.
+# * `ON DELETE SET NULL` / `ON UPDATE SET NULL` — 3 tests.
+# * `NOT VALID` + `ALTER TABLE … VALIDATE CONSTRAINT` — 1 error, and **5 failures that are a wrong
+#   answer rather than a refusal**: `convalidated` is hardcoded true, so a constraint added
+#   `NOT VALID` reports itself validated and AR's `validate: false` schema dump is wrong (ADR 0031
+#   rule 3 — a wrong answer is a bug, not an exclusion).
+#
+# Things reasoning would get wrong:
+#
+# * **`NOT VALID` does not mean "unchecked from now on".** New rows are checked from the moment the
+#   constraint exists; what `NOT VALID` skips is the scan of the rows already there. So an insert
+#   that violates it fails immediately even while `convalidated` is false.
+# * **`VALIDATE CONSTRAINT` on an already-valid constraint is a success, not an error**, and it is
+#   also a success on a constraint that was never `NOT VALID`.
+# * **`SET NOT NULL` scans**: it fails `23502` if a row already holds NULL, and the message names
+#   the *column and relation*, not the constraint.
+# * **`ON DELETE SET NULL` writes the NULL into the referencing column**, so it needs the column to
+#   be nullable — combining it with `NOT NULL` is accepted at DDL time and fails at delete time.
+# * **`condeferred` and `condeferrable` are two different booleans**: `DEFERRABLE INITIALLY
+#   IMMEDIATE` is deferrable and not deferred.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+
+BEGIN;		-
+
+CREATE TABLE fko_parent (id bigserial primary key, name character varying);		-
+CREATE TABLE fko_child (id bigserial primary key, name character varying, parent_id bigint);		-
+
+-- ---------------------------------------------------------------- SET / DROP NOT NULL		-
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'fko_parent'::regclass AND attname = 'name';		name|f
+ALTER TABLE "fko_parent" ALTER COLUMN "name" SET NOT NULL;		-
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'fko_parent'::regclass AND attname = 'name';		name|t
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fko_parent'::regclass AND contype = 'n' ORDER BY conname;		fko_parent_id_not_null|n|NOT NULL id ; fko_parent_name_not_null|n|NOT NULL name
+SAVEPOINT s1;		-
+INSERT INTO fko_parent (name) VALUES (NULL);	!23502 null value in column "name" of relation "fko_parent" violates not-null constraint DETAIL: Failing row contains (1, null).
+ROLLBACK TO s1;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "name" DROP NOT NULL;		-
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'fko_parent'::regclass AND attname = 'name';		name|f
+INSERT INTO fko_parent (name) VALUES (NULL);		-
+SAVEPOINT s2;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "name" SET NOT NULL;	!23502 column "name" of relation "fko_parent" contains null values
+ROLLBACK TO s2;		-
+DELETE FROM fko_parent WHERE name IS NULL;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "name" SET NOT NULL;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "name" DROP NOT NULL;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "name" DROP NOT NULL;		-
+SAVEPOINT s3;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "nosuch" SET NOT NULL;	!42703 column "nosuch" of relation "fko_parent" does not exist
+ROLLBACK TO s3;		-
+SAVEPOINT s4;		-
+ALTER TABLE "fko_parent" ALTER COLUMN "id" DROP NOT NULL;	!42P16 column "id" is in a primary key
+ROLLBACK TO s4;		-
+
+INSERT INTO fko_parent (id, name) VALUES (1, 'one'), (2, 'two');		-
+
+-- ---------------------------------------------------------------- NOT VALID / VALIDATE CONSTRAINT		-
+INSERT INTO fko_child (id, name, parent_id) VALUES (1, 'orphan', 999);		-
+SAVEPOINT s5;		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_plain" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id");	!23503 insert or update on table "fko_child" violates foreign key constraint "fk_plain" DETAIL: Key (parent_id)=(999) is not present in table "fko_parent".
+ROLLBACK TO s5;		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_notvalid" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") NOT VALID;		-
+SELECT conname, convalidated, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fko_child'::regclass AND contype = 'f' ORDER BY conname;		fk_notvalid|f|f|f|FOREIGN KEY (parent_id) REFERENCES fko_parent(id) NOT VALID
+SAVEPOINT s6;		-
+INSERT INTO fko_child (id, name, parent_id) VALUES (2, 'second orphan', 998);	!23503 insert or update on table "fko_child" violates foreign key constraint "fk_notvalid" DETAIL: Key (parent_id)=(998) is not present in table "fko_parent".
+ROLLBACK TO s6;		-
+SAVEPOINT s7;		-
+ALTER TABLE "fko_child" VALIDATE CONSTRAINT "fk_notvalid";	!23503 insert or update on table "fko_child" violates foreign key constraint "fk_notvalid" DETAIL: Key (parent_id)=(999) is not present in table "fko_parent".
+ROLLBACK TO s7;		-
+DELETE FROM fko_child WHERE parent_id = 999;		-
+ALTER TABLE "fko_child" VALIDATE CONSTRAINT "fk_notvalid";		-
+SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_notvalid';	name,boolean,text	fk_notvalid|t|FOREIGN KEY (parent_id) REFERENCES fko_parent(id)
+ALTER TABLE "fko_child" VALIDATE CONSTRAINT "fk_notvalid";		-
+SAVEPOINT s8;		-
+ALTER TABLE "fko_child" VALIDATE CONSTRAINT "nosuch";	!42704 constraint "nosuch" of relation "fko_child" does not exist
+ROLLBACK TO s8;		-
+ALTER TABLE "fko_child" DROP CONSTRAINT "fk_notvalid";		-
+
+-- ---------------------------------------------------------------- ON DELETE / ON UPDATE SET NULL		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_setnull" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") ON DELETE SET NULL;		-
+SELECT conname, confdeltype, confupdtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_setnull';	name,"char","char",text	fk_setnull|n|a|FOREIGN KEY (parent_id) REFERENCES fko_parent(id) ON DELETE SET NULL
+INSERT INTO fko_child (id, name, parent_id) VALUES (10, 'kept', 1);		-
+DELETE FROM fko_parent WHERE id = 1;		-
+SELECT id, name, parent_id FROM fko_child WHERE id = 10;		10|kept|\N
+ALTER TABLE "fko_child" DROP CONSTRAINT "fk_setnull";		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_setnull_u" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") ON UPDATE SET NULL ON DELETE SET DEFAULT;		-
+SELECT conname, confdeltype, confupdtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_setnull_u';	name,"char","char",text	fk_setnull_u|d|n|FOREIGN KEY (parent_id) REFERENCES fko_parent(id) ON UPDATE SET NULL ON DELETE SET DEFAULT
+UPDATE fko_child SET parent_id = 2 WHERE id = 10;		-
+UPDATE fko_parent SET id = 20 WHERE id = 2;		-
+SELECT id, parent_id FROM fko_child WHERE id = 10;		10|\N
+ALTER TABLE "fko_child" DROP CONSTRAINT "fk_setnull_u";		-
+
+-- ---------------------------------------------------------------- DEFERRABLE INITIALLY DEFERRED		-
+DELETE FROM fko_child;		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_deferred" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") DEFERRABLE INITIALLY DEFERRED;		-
+SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_deferred';	name,boolean,boolean,text	fk_deferred|t|t|FOREIGN KEY (parent_id) REFERENCES fko_parent(id) DEFERRABLE INITIALLY DEFERRED
+SAVEPOINT s9;		-
+INSERT INTO fko_child (id, name, parent_id) VALUES (11, 'deferred orphan', 777);		-
+SELECT id, parent_id FROM fko_child WHERE id = 11;		11|777
+ROLLBACK TO s9;		-
+ALTER TABLE "fko_child" DROP CONSTRAINT "fk_deferred";		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_immediate" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") DEFERRABLE INITIALLY IMMEDIATE;		-
+SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_immediate';	name,boolean,boolean,text	fk_immediate|t|f|FOREIGN KEY (parent_id) REFERENCES fko_parent(id) DEFERRABLE
+SAVEPOINT s10;		-
+INSERT INTO fko_child (id, name, parent_id) VALUES (12, 'immediate orphan', 776);	!23503 insert or update on table "fko_child" violates foreign key constraint "fk_immediate" DETAIL: Key (parent_id)=(776) is not present in table "fko_parent".
+ROLLBACK TO s10;		-
+
+-- ---------------------------------------------------------------- what ActiveRecord reads back		-
+ALTER TABLE "fko_child" DROP CONSTRAINT "fk_immediate";		-
+ALTER TABLE "fko_child" ADD CONSTRAINT "fk_ar" FOREIGN KEY ("parent_id") REFERENCES "fko_parent" ("id") ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED NOT VALID;		-
+SELECT t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys JOIN pg_attribute a ON a.attrelid = t1.oid AND a.attnum = indexed_conkeys.conkey_elem ) AS conkey_names, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.confkey[idx] AS confkey_elem FROM generate_subscripts(c.confkey, 1) AS idx ) indexed_confkeys JOIN pg_attribute a ON a.attrelid = t2.oid AND a.attnum = indexed_confkeys.confkey_elem ) AS confkey_names FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'fko_child' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname;	text,name,"char","char",boolean,boolean,boolean,name[],name[]	fko_parent|fk_ar|a|n|f|t|t|{parent_id}|{id}
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'fko\_%';	bigint	0

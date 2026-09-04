@@ -1,0 +1,113 @@
+# `CREATE TEMPORARY TABLE` — a relation in a schema that belongs to one session (ADR 0054).
+#
+# **Run 56 stops exactly one test on it**, `UnloggedTablesTest#test_gracefully_handles_temporary_tables`,
+# which asserts `pg_class.relpersistence` is `t`. The reason to build it is the other measure:
+# `tests/relation_resolution.rs` asserts that **20 statements** of `pg19_relation_resolution.txt`
+# are swallowed by the transaction this refusal aborts, so a third of that capture has never been
+# compared with anything. That number falls to zero when this lands.
+#
+# Things reasoning would get wrong:
+#
+# * **A temp table is `relkind` `r` and `relpersistence` `t`.** It is a *table* — `table_exists?`
+#   finds it — and what makes it temporary is the persistence column and the schema, not the kind.
+# * **The search path does the whole of the shadowing**, and PostgreSQL's two spellings of it split
+#   exactly where they need to: with a temp table the **implicit** path (`current_schemas(true)`) is
+#   three long and starts with `pg_temp%`, and the **explicit** one (`current_schemas(false)`) is
+#   one long and does not contain it. So a bare name finds the temp relation, `public.x` finds the
+#   permanent one, and a table list — which filters `nspname = ANY (current_schemas(false))` — sees
+#   neither the temp table nor its schema. There is no rule here that says "hide temp tables".
+# * **`current_schema()` is still `public`.** The temp schema is first for *resolution* and is not
+#   where an unqualified `CREATE TABLE` goes.
+# * **A `serial` on a temp table makes a temp sequence, and an index on it is temp too** — both in
+#   the temp schema, both `relpersistence` `t`. The property is inherited by everything the table
+#   owns rather than being a property of the table alone.
+# * **A permanent table may be created with the name a temp table already has.** They are in
+#   different schemas, so `42P07` is only for a second *temp* table of that name.
+# * **`ON COMMIT DELETE ROWS` fires on the implicit commit too.** A plain `INSERT` outside a
+#   transaction block leaves **zero** rows behind, which is the fact this file exists to pin: an
+#   implementation that only emptied the table at an explicit `COMMIT` would look right in a
+#   transaction and lose every autocommitted row's visibility.
+# * **`ON COMMIT DROP` outside a transaction block drops the table immediately**, for the same
+#   reason.
+# * **`ON COMMIT` on a permanent table is `42P16`**, and `CREATE TEMPORARY UNLOGGED TABLE` is a
+#   **syntax error on a real server** — the two words cannot be combined, which is what
+#   `UnloggedTablesTest` is checking that `ActiveRecord` never sends.
+#
+# The name of a temp schema carries the session's own number, so it is session state and can never
+# be in a corpus. Every probe below asks `nspname LIKE 'pg_temp%'` instead.
+#
+# The first capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE tt_things (id serial primary key, name character varying(255))		-
+INSERT INTO tt_things (name) VALUES ('permanent')		-
+SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_things' AND relpersistence = 'p'	text,"char"	r|p
+CREATE TEMPORARY TABLE tt_temp (id serial primary key, note text)		-
+SELECT 'r', count(*) AS one_temp_relation FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp' AND n.nspname LIKE 'pg_temp%'	text,bigint	r|1
+SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_temp'	text,"char"	r|t
+SELECT 'r', relkind FROM pg_class WHERE relname = 'tt_temp'	text,"char"	r|r
+SELECT 'r', count(*) AS temp_namespace_rows FROM pg_namespace WHERE nspname LIKE 'pg_temp%' AND nspname = ANY (current_schemas(true))	text,bigint	r|1
+SELECT 'r', (current_schemas(true))[1] LIKE 'pg_temp%' AS temp_is_first, (current_schemas(false))[1] LIKE 'pg_temp%' AS temp_is_in_the_explicit_path	text,boolean,boolean	r|t|f
+SELECT 'r', array_length(current_schemas(true), 1) AS implicit_path_length, array_length(current_schemas(false), 1) AS explicit_path_length	text,integer,integer	r|3|1
+SELECT 'r', current_schema() AS current_schema_is_still_public	text,name	r|public
+INSERT INTO tt_temp (note) VALUES ('one')		-
+SELECT 'r', id, note FROM tt_temp		r|1|one
+SELECT 'r', count(*) FROM pg_temp.tt_temp		r|1
+SELECT 'r', to_regclass('tt_temp') IS NOT NULL AS reachable_unqualified, to_regclass('pg_temp.tt_temp') IS NOT NULL AS reachable_qualified, to_regclass('public.tt_temp') IS NULL AS not_in_public	text,boolean,boolean,boolean	r|t|t|t
+# ---- a temp table shadows a permanent one of the same name ----
+CREATE TEMPORARY TABLE tt_things (id int)		-
+INSERT INTO tt_things (id) VALUES (99)		-
+SELECT 'r', count(*) AS the_temp_one FROM tt_things		r|1
+SELECT 'r', count(*) AS the_permanent_one FROM public.tt_things		r|1
+SELECT 'r', (n.nspname LIKE 'pg_temp%') AS in_a_temp_schema, c.relname, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_things' ORDER BY in_a_temp_schema	text,boolean,name,"char"	r|f|tt_things|p ; r|t|tt_things|t
+SELECT 'r', to_regclass('tt_things')::text AS unqualified_resolves_to	text,text	r|tt_things
+# ---- what a table list and a schema dump see ----
+SELECT 'r', count(*) AS temp_in_the_table_list FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+SELECT 'r', count(*) AS temp_schema_in_schema_names FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') AND nspname LIKE 'pg_temp%'	text,bigint	r|0
+SELECT 'r', table_schema LIKE 'pg_temp%' AS listed_under_its_temp_schema FROM information_schema.tables WHERE table_name = 'tt_temp'	text,boolean	r|t
+# ---- indexes, keys and a sequence on a temp table ----
+SELECT 'r', a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'tt_temp'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)		r|id
+SELECT 'r', (n.nspname LIKE 'pg_temp%') AS sequence_is_temp_too, c.relkind, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_id_seq'	text,boolean,"char","char"	r|t|S|t
+CREATE INDEX tt_temp_note_idx ON tt_temp (note)		-
+SELECT 'r', (n.nspname LIKE 'pg_temp%') AS index_is_temp_too, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_note_idx'	text,boolean,"char"	r|t|t
+# ---- the name is taken, in the temp schema ----
+SAVEPOINT t1		-
+CREATE TEMPORARY TABLE tt_temp (id int)	!42P07 relation "tt_temp" already exists
+ROLLBACK TO t1		-
+SAVEPOINT t2		-
+CREATE TABLE tt_temp (id int)		-
+ROLLBACK TO t2		-
+# ---- a temp table a savepoint rolled back is gone ----
+SAVEPOINT t3		-
+CREATE TEMPORARY TABLE tt_rolled (id int)		-
+ROLLBACK TO t3		-
+SELECT 'r', to_regclass('tt_rolled') IS NULL AS gone_with_the_savepoint	text,boolean	r|t
+# ---- ON COMMIT is declared here and observed in the second capture ----
+CREATE TEMPORARY TABLE tt_preserve (id int) ON COMMIT PRESERVE ROWS		-
+CREATE TEMPORARY TABLE tt_delete (id int) ON COMMIT DELETE ROWS		-
+CREATE TEMPORARY TABLE tt_drop (id int) ON COMMIT DROP		-
+SELECT 'r', count(*) AS all_three_are_relations FROM pg_class WHERE relname IN ('tt_preserve','tt_delete','tt_drop')	text,bigint	r|3
+# ---- TEMP and TEMPORARY are the same word, and UNLOGGED is a different one ----
+CREATE TEMP TABLE tt_short (id int)		-
+SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_short'	text,"char"	r|t
+SAVEPOINT t4		-
+CREATE TEMPORARY UNLOGGED TABLE tt_both (id int)	!42601 syntax error at or near "UNLOGGED"
+ROLLBACK TO t4		-
+# ---- dropping ----
+DROP TABLE tt_short		-
+SELECT 'r', to_regclass('tt_short') IS NULL AS dropped	text,boolean	r|t
+DROP TABLE pg_temp.tt_temp		-
+SELECT 'r', to_regclass('tt_temp') IS NULL AS dropped_by_its_qualified_name	text,boolean	r|t
+SAVEPOINT t5		-
+DROP TABLE tt_temp	!42P01 table "tt_temp" does not exist
+ROLLBACK TO t5		-
+DROP TABLE tt_things		-
+SELECT 'r', count(*) AS the_permanent_one_is_uncovered FROM tt_things		r|1
+DROP TABLE tt_preserve		-
+DROP TABLE tt_delete		-
+DROP TABLE tt_drop		-
+DROP TABLE tt_things		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('tt_things','tt_temp','tt_short','tt_rolled','tt_preserve','tt_delete','tt_drop','tt_temp_id_seq','tt_temp_note_idx')	bigint	0

@@ -24,6 +24,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          ('unlogged_probe_pkey','logged_probe_pkey','unlogged_probe_id_seq','logged_probe_id_seq') \
          ORDER BY relname",
         "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'unlogged_probe'",
+        "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'temp_probe'",
         "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'fk_unlogged_to_unlogged'",
         // `information_schema`'s own domains again: `name` and `character varying` where this node
         // says `text`, with identical characters.
@@ -31,20 +32,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          ('unlogged_probe','logged_probe') ORDER BY table_name",
     ],
     answers: &[
-        // **A temporary table is a different feature, not a kind of unlogged one.** `t` is its own
-        // `relpersistence` and `CREATE TEMPORARY TABLE` is refused by name here, so this line and
-        // the two that read the table it makes are the capture proving the three values are three
-        // things. Nothing in the suite's `create_unlogged_tables = true` path needs a temp table.
-        (
-            "CREATE TEMP TABLE \"temp_probe\" (\"a\" integer)",
-            "`CREATE TEMPORARY TABLE` is `0A000` by name; a temp table is session-scoped storage \
-             this node does not have, and `t` is not a variety of `u`.",
-        ),
-        (
-            "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'temp_probe'",
-            "No row, because the table above was refused. The cascade of that divergence rather \
-             than one of its own.",
-        ),
+        // **A temporary table is a different feature, not a kind of unlogged one**, and this file
+        // is where the capture proves the three `relpersistence` values are three things. Both
+        // `CREATE TEMP TABLE` and the row that reads it back agree outright since ADR 0054 — the
+        // two entries that stood here are gone, deleted because the harness failed this test when
+        // they started agreeing.
         (
             "ALTER TABLE \"temp_probe\" SET LOGGED",
             "A real server refuses this `42P16 cannot change logged status of table \"temp_probe\" \

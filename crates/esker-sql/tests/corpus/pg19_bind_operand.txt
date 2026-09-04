@@ -1,0 +1,51 @@
+# A **bind parameter as an operand of `=`** — the statements behind run 57's
+# `operator does not exist: <type> = text`.
+#
+# 34 raises in run 57, in three spellings: `integer = text` (17), `bigint = text` (10),
+# `boolean = text` (7). r1 traced them live out of the failing files with the runner's SQL hook,
+# and the pattern is one line: every raise is a parameter on one side of `=` whose type this node
+# resolved to `text` instead of taking it from the other side. The counter-cache
+# `COALESCE(...) + $1` of `pg19_integer_plus_text.txt` is the same family, one operator along.
+#
+# `\bind` is what captured these: Parse/Bind/Execute with **untyped** parameters, which is where
+# `ActiveRecord` is and where the resolution under test happens. `PREPARE` would type them from the
+# DDL and there would be nothing to measure.
+#
+# Two things a probe gets wrong, and both are why this survived one:
+#
+# * **Every traced statement is aliased** — `INNER JOIN "categories" "group"`, `r.favorite`,
+#   `rl.last_read` — and the qualifier was matched against each relation's *own* name, so an alias
+#   found nothing and the parameter kept the `text` fallback. A probe written without an alias
+#   passes against the bug.
+# * **`(1 = $3)` has no column in it at all.** An integer literal on the left types the parameter
+#   on the right, and five characters in the middle of a long statement refused the whole of it.
+#   `('a' = $1)` is the other half of that rule and types nothing: two `unknown`s are both `text`
+#   on a real server, which is why it still answers.
+CREATE TABLE bo_people (id bigserial primary key, name character varying(255))	[]		-
+CREATE TABLE bo_refs (id bigserial primary key, favorite boolean, person_id bigint)	[]		-
+CREATE TABLE bo_friendships (id bigserial primary key, friend_id bigint)	[]		-
+CREATE TABLE bo_cats (id bigserial primary key, name character varying(255))	[]		-
+CREATE TABLE bo_cats_posts (id bigserial primary key, category_id bigint)	[]		-
+CREATE TABLE bo_books (id bigserial primary key, last_read integer)	[]		-
+CREATE TABLE bo_companies (id bigserial primary key, type character varying(255))	[]		-
+INSERT INTO bo_people (name) VALUES ('David')	[]		-
+INSERT INTO bo_refs (favorite, person_id) VALUES (true, 1)	[]		-
+INSERT INTO bo_friendships (friend_id) VALUES (1)	[]		-
+INSERT INTO bo_cats (name) VALUES ('group')	[]		-
+INSERT INTO bo_cats_posts (category_id) VALUES (1)	[]		-
+INSERT INTO bo_books (last_read) VALUES (1)	[]		-
+INSERT INTO bo_companies (type) VALUES ('Firm')	[]		-
+SELECT 'r', 1 WHERE (1 = $1)	[1]	text,integer	r|1
+SELECT 'r', 1 WHERE ($1 = 1)	[1]	text,integer	r|1
+SELECT 'r', 1 WHERE (1 = $1)	[2]	text,integer	-
+SELECT 'r', 1 WHERE ('a' = $1)	["a"]	text,integer	r|1
+SELECT 'r', 1 WHERE (true = $1)	[true]	text,integer	r|1
+SELECT 'r', f.id FROM bo_friendships f INNER JOIN bo_people p ON p.id = f.friend_id INNER JOIN bo_refs r ON r.favorite = $1 AND r.person_id = p.id	[true]	text,bigint	r|1
+SELECT 'r', cp.id FROM bo_cats_posts cp INNER JOIN bo_cats "group" ON "group".id = cp.category_id WHERE "group".id = $1	[1]	text,bigint	r|1
+SELECT 'r', a.id FROM bo_people a INNER JOIN bo_books rl ON rl.last_read = $1 AND rl.last_read = a.id WHERE rl.id IS NOT NULL	[1]	text,bigint	r|1
+SELECT 'r', c.id FROM bo_companies c WHERE c.type IN ($1, $2) AND (1 = $3) AND c.id IN ($4, $5, $6)	["Firm","Agency",1,1,2,3]	text,bigint	r|1
+SELECT 'r', p.id FROM bo_people p INNER JOIN bo_refs r ON r.favorite = $1 AND r.person_id = p.id WHERE p.id = $2	[true,1]	text,bigint	r|1
+SELECT 'r', id FROM bo_people WHERE id = $1	[1]	text,bigint	r|1
+SELECT 'r', id FROM bo_refs WHERE favorite = $1	[true]	text,bigint	r|1
+SELECT 'r', id FROM bo_people p2 WHERE p2.id = $1	[1]	text,bigint	r|1
+SELECT 'r', id FROM bo_people WHERE name = $1	["David"]	text,bigint	r|1

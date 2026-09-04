@@ -102,13 +102,15 @@ fn a_partial_unique_index_is_not_a_key_to_reference() {
     assert_eq!(error.sqlstate(), "42830");
 }
 
-/// `INITIALLY DEFERRED` is refused by name, and `DEFERRABLE INITIALLY IMMEDIATE` is not.
+/// The two deferrable forms are **two different flags**, and each prints itself.
 ///
-/// The one form that would change an answer rather than nothing: a transaction that violates the
-/// constraint in the middle and repairs it before `COMMIT` succeeds on a real server, and every
-/// check here is immediate. `ActiveRecord` writes only the immediate form.
+/// This test asserted that `INITIALLY DEFERRED` was refused by name, which was the honest answer
+/// while every check here was immediate: accepting the clause and checking at the statement would
+/// have refused a transaction PostgreSQL commits. It now waits, so what is asserted is the pair of
+/// catalog flags and the definition each renders — the behaviour is
+/// `foreign_key_options::a_deferred_foreign_key_is_checked_at_commit`.
 #[test]
-fn initially_deferred_is_refused_and_initially_immediate_is_not() {
+fn the_two_deferrable_forms_are_two_flags() {
     let mut node = parity::Node::new(&[]);
     for statement in [
         "CREATE TABLE fp (id int8 PRIMARY KEY)",
@@ -117,24 +119,32 @@ fn initially_deferred_is_refused_and_initially_immediate_is_not() {
     ] {
         node.run(statement).unwrap();
     }
-    let error = node
-        .run(
-            "ALTER TABLE fc ADD CONSTRAINT fc_no FOREIGN KEY (p) REFERENCES fp (id) DEFERRABLE \
-             INITIALLY DEFERRED",
-        )
-        .unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
-    assert!(
-        error.to_string().contains("INITIALLY DEFERRED"),
-        "the refusal names itself: {error}"
-    );
-    // The accepted one is `condeferrable = t`, `condeferred = f`, and prints `DEFERRABLE`.
+    node.run(
+        "ALTER TABLE fc ADD CONSTRAINT fc_def FOREIGN KEY (p) REFERENCES fp (id) DEFERRABLE \
+         INITIALLY DEFERRED",
+    )
+    .unwrap();
+    // `condeferrable` says it **may** be deferred and `condeferred` says it **starts** there, and
+    // only the second one changes when the check runs.
     assert_eq!(
         node.rows(
-            "SELECT condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint \
-             WHERE contype = 'f'"
+            "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
+             pg_constraint WHERE contype = 'f' ORDER BY conname"
         ),
-        [["t", "f", "FOREIGN KEY (p) REFERENCES fp(id) DEFERRABLE"]]
+        [
+            [
+                "fc_def",
+                "t",
+                "t",
+                "FOREIGN KEY (p) REFERENCES fp(id) DEFERRABLE INITIALLY DEFERRED"
+            ],
+            [
+                "fc_ok",
+                "t",
+                "f",
+                "FOREIGN KEY (p) REFERENCES fp(id) DEFERRABLE"
+            ]
+        ]
     );
 }
 

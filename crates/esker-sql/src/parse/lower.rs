@@ -1764,7 +1764,6 @@ fn lower_retention(value: &Expr) -> Result<Option<u64>> {
 /// function stops being read and starts being skimmed.
 fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<()> {
     refuse_if(create.or_replace, "CREATE OR REPLACE TABLE")?;
-    refuse_if(create.temporary, "CREATE TEMPORARY TABLE")?;
     refuse_if(create.external, "CREATE EXTERNAL TABLE")?;
     refuse_if(create.global.is_some(), "CREATE GLOBAL/LOCAL TABLE")?;
     refuse_if(create.transient, "CREATE TRANSIENT TABLE")?;
@@ -1774,7 +1773,6 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
 
-    refuse_if(create.on_commit.is_some(), "CREATE TABLE ... ON COMMIT")?;
     refuse_if(create.without_rowid, "CREATE TABLE ... WITHOUT ROWID")?;
     refuse_if(create.strict, "CREATE TABLE ... STRICT")?;
     refuse_if(create.comment.is_some(), "CREATE TABLE ... COMMENT")?;
@@ -1909,9 +1907,35 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         &mut foreign_keys,
     )?;
 
+    // **`TEMPORARY` and `TEMP` are one keyword** and `sqlparser` folds them into one flag, so
+    // there is nothing to tell apart here. `UNLOGGED` reaches this crate through the source
+    // rewrite instead (`crate::parse::strip_unlogged`), and the two are set in different places —
+    // which is what makes `CREATE TEMPORARY UNLOGGED TABLE` a *syntax error* here as it is on a
+    // real server, rather than a table that is quietly one of the two.
+    let persistence = if create.temporary {
+        catalog::Persistence::Temporary
+    } else {
+        catalog::Persistence::Permanent
+    };
+    // **No clause is `PRESERVE ROWS`**, which is why the two share an arm: PostgreSQL's default is
+    // the clause spelled out, not a fourth state.
+    let on_commit = match create.on_commit {
+        None | Some(sqlparser::ast::OnCommit::PreserveRows) => catalog::OnCommit::PreserveRows,
+        Some(sqlparser::ast::OnCommit::DeleteRows) => catalog::OnCommit::DeleteRows,
+        Some(sqlparser::ast::OnCommit::Drop) => catalog::OnCommit::Drop,
+    };
+    // **`ON COMMIT` is a temporary table's clause and nothing else's**, and PostgreSQL says so in
+    // its own class: `42P16`, an invalid *table definition*, rather than a syntax error or a
+    // refusal. Measured.
+    if create.on_commit.is_some() && !create.temporary {
+        return Err(SqlError::OnCommitNotTemporary);
+    }
+
     Ok(plan::CreateTable {
-        // Overridden in `Parsed::lower`, which is where the stripped keyword is in reach.
-        persistence: catalog::Persistence::Permanent,
+        // `UNLOGGED` is overridden in `Parsed::lower`, which is where the stripped keyword is in
+        // reach; `TEMPORARY` is a flag the parser does read, so it is decided here.
+        persistence,
+        on_commit,
         name,
         checks,
         foreign_keys,
@@ -1960,8 +1984,21 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_storage_parameters(options)?);
             continue;
         }
-        if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
-            actions.push(lower_added_constraint(&table_name, constraint)?);
+        if let AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } = operation
+        {
+            let mut lowered = lower_added_constraint(&table_name, constraint)?;
+            // **`NOT VALID` is only a foreign key's here.** PostgreSQL takes it on `CHECK` too,
+            // and refusing it there by name is the honest answer while nothing skips that scan.
+            if *not_valid {
+                match &mut lowered {
+                    plan::AlterTableAction::AddForeignKey(key) => key.validated = false,
+                    _ => return Err(SqlError::unsupported("ADD CONSTRAINT ... NOT VALID")),
+                }
+            }
+            actions.push(lowered);
             continue;
         }
         if let AlterTableOperation::DisableTrigger { name }
@@ -1971,11 +2008,27 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             actions.push(lower_trigger_state(&table_name, name, disabled)?);
             continue;
         }
+        if let AlterTableOperation::ValidateConstraint { name } = operation {
+            actions.push(plan::AlterTableAction::ValidateConstraint(ident(name)));
+            continue;
+        }
         // `ALTER COLUMN c SET DEFAULT <expr>` and `DROP DEFAULT`. The **type is not known here** —
         // a plan is lowered without the catalog — so a literal is not folded until the executor
         // has the column, which is also where `22P02` for one the type will not take comes from.
         if let AlterTableOperation::AlterColumn { column_name, op } = operation {
             use sqlparser::ast::AlterColumnOperation;
+            // `SET NOT NULL` / `DROP NOT NULL` are their own action: they change a column's
+            // nullability rather than its default, and the executor has to scan for the first.
+            if matches!(
+                op,
+                AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull
+            ) {
+                actions.push(plan::AlterTableAction::SetNotNull {
+                    column: ident(column_name),
+                    not_null: matches!(op, AlterColumnOperation::SetNotNull),
+                });
+                continue;
+            }
             let default = match op {
                 AlterColumnOperation::DropDefault => None,
                 AlterColumnOperation::SetDefault { value } => Some(lower_set_default(value)?),
@@ -2392,23 +2445,23 @@ fn lower_foreign_key(
             format!("FOREIGN KEY ... MATCH {kind}"),
         )?;
     }
-    let deferrable = match &key.characteristics {
-        None => false,
+    // **`INITIALLY DEFERRED` really waits**, the way a deferrable `UNIQUE` already does
+    // (`crate::exec::deferred`): the check is registered against the transaction and re-examined
+    // at `COMMIT`. It was refused by name until the transaction could owe one — accepting the
+    // clause while checking at the statement would refuse a transaction PostgreSQL commits, which
+    // is a wrong answer rather than a gap.
+    let (deferrable, initially_deferred) = match &key.characteristics {
+        None => (false, false),
         Some(characteristics) => {
-            // `INITIALLY DEFERRED` is the one form that would **change an answer**: a transaction
-            // that violates the constraint in the middle and repairs it before `COMMIT` succeeds
-            // on a real server and would be refused here, because every check in this crate is
-            // immediate. Refused by name rather than accepted, which is contract C2's whole rule.
-            // `ActiveRecord` writes `DEFERRABLE INITIALLY IMMEDIATE` and never this one.
-            refuse_if(
-                characteristics.initially == Some(DeferrableInitial::Deferred),
-                "FOREIGN KEY ... INITIALLY DEFERRED",
-            )?;
             refuse_if(
                 characteristics.enforced.is_some(),
                 "FOREIGN KEY ... ENFORCED, which is MySQL's",
             )?;
-            characteristics.deferrable.unwrap_or(false)
+            let deferred = characteristics.initially == Some(DeferrableInitial::Deferred);
+            (
+                characteristics.deferrable.unwrap_or(false) || deferred,
+                deferred,
+            )
         }
     };
     let columns: Vec<String> = key.columns.iter().map(ident).collect();
@@ -2420,28 +2473,34 @@ fn lower_foreign_key(
         columns,
         parent: relation_name(&key.foreign_table)?,
         parent_columns: key.referred_columns.iter().map(ident).collect(),
-        on_update: referential_action(key.on_update.as_ref())?,
-        on_delete: referential_action(key.on_delete.as_ref())?,
+        on_update: referential_action(key.on_update.as_ref()),
+        on_delete: referential_action(key.on_delete.as_ref()),
+        // The `NOT VALID` that may follow belongs to the `ALTER TABLE ... ADD CONSTRAINT` and not
+        // to the constraint's own grammar, so it is applied by the caller that can see it.
+        validated: true,
         deferrable,
+        initially_deferred,
     })
 }
 
 /// `ON UPDATE`/`ON DELETE`, defaulting to `NO ACTION` the way a real server does.
 ///
-/// `SET NULL` and `SET DEFAULT` are refused by name: each writes a value into the child's columns
-/// rather than refusing or removing, and neither appears in anything `ActiveRecord` emits.
+/// All five, including the two that **write** into the child rather than refusing or removing.
+///
+/// PostgreSQL 15 added a column list — `SET NULL (a, b)` — narrowing which columns are cleared.
+/// The parser this crate uses has no variant for it, so it does not reach here; nothing
+/// `ActiveRecord` writes uses it, and the whole clause is one `Option` away when something does.
 fn referential_action(
     action: Option<&sqlparser::ast::ReferentialAction>,
-) -> Result<catalog::ReferentialAction> {
+) -> catalog::ReferentialAction {
     use sqlparser::ast::ReferentialAction as Written;
-    Ok(match action {
+    match action {
         None | Some(Written::NoAction) => catalog::ReferentialAction::NoAction,
         Some(Written::Restrict) => catalog::ReferentialAction::Restrict,
         Some(Written::Cascade) => catalog::ReferentialAction::Cascade,
-        Some(other) => {
-            return Err(SqlError::unsupported(format!("ON DELETE/UPDATE {other}")));
-        }
-    })
+        Some(Written::SetNull) => catalog::ReferentialAction::SetNull,
+        Some(Written::SetDefault) => catalog::ReferentialAction::SetDefault,
+    }
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {
@@ -6514,6 +6573,16 @@ fn relation_name(name: &ObjectName) -> Result<String> {
         // `relation "nosuch" does not exist` where PostgreSQL quotes the qualifier back.
         // Nothing is ever *written* under this prefix — creating in it is `42501` — so it is a
         // lookup key and never a record's name.
+        // **`pg_temp` with no number is the session's own**, and the session is not in reach
+        // here — so it is stored as the bare word and rewritten to `pg_temp_<n>` where the name is
+        // resolved (`crate::exec::Executor::resolve_unqualified`). The same shape the qualifier
+        // below takes, and for the same reason: a qualifier is where to look.
+        if schema.eq_ignore_ascii_case(catalog::PG_TEMP_ALIAS) {
+            return Ok(catalog::qualify(
+                catalog::PG_TEMP_ALIAS,
+                &fold_identifier(relation, false).0,
+            ));
+        }
         if schema.eq_ignore_ascii_case(catalog::PG_CATALOG_SCHEMA) {
             return Ok(catalog::qualify(
                 catalog::PG_CATALOG_SCHEMA,

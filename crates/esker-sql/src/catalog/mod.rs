@@ -737,6 +737,7 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         dropped: false,
     };
     Arc::new(TableDef {
+        on_commit: OnCommit::default(),
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
         name: name.to_owned(),
         columns: vec![
@@ -865,6 +866,11 @@ pub struct TableDef {
     /// its table (`crate::catalog::pg_catalog`) is what makes both of those true at once, and it
     /// is the only arrangement in which they cannot disagree.
     pub persistence: Persistence,
+    /// What a **temporary** table does with its rows at every commit, and `PreserveRows` for
+    /// every other table — which is what a table with no clause is, so nothing written before
+    /// [ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)
+    /// changes meaning.
+    pub on_commit: OnCommit,
     /// Unique across the tenant.
     pub name: String,
     /// In declaration order, which is the order a row's values are encoded in.
@@ -1016,6 +1022,34 @@ pub enum Persistence {
     /// change (`CLAUDE.md` invariant 1) rather than a catalog one. What the suite needs is the
     /// statement to work and the column to be right; what it does not need is the data loss.
     Unlogged,
+    /// `t`. **A table in a schema that belongs to one session** — the whole of what makes it
+    /// temporary is where it lives, not how it is stored
+    /// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// Like [`Persistence::Unlogged`] it is recorded and not acted on by the engine: a temp
+    /// table's rows go through the WAL and Raft like anything else, so this node pays full write
+    /// cost for data defined to be throwaway. What a client can see is the column, the schema and
+    /// the lifetime, and all three are right.
+    Temporary,
+}
+
+/// What a temporary table does with its rows at the end of every transaction
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+///
+/// **"Every transaction" includes the implicit one**, which is the fact easiest to get wrong: a
+/// plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero
+/// rows behind, because that statement's own commit fires the rule. Measured, and an
+/// implementation that only acted at an explicit `COMMIT` looks right inside a transaction and
+/// answers one where a real server answers none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCommit {
+    /// `ON COMMIT PRESERVE ROWS`, and what a temporary table is without the clause.
+    #[default]
+    PreserveRows,
+    /// `ON COMMIT DELETE ROWS`: the table is emptied, and stays.
+    DeleteRows,
+    /// `ON COMMIT DROP`: the table goes at the end of the transaction that made it.
+    Drop,
 }
 
 impl Persistence {
@@ -1025,6 +1059,7 @@ impl Persistence {
         match self {
             Persistence::Permanent => "p",
             Persistence::Unlogged => "u",
+            Persistence::Temporary => "t",
         }
     }
 }
@@ -1411,18 +1446,29 @@ pub struct ForeignKeyDef {
     pub on_update: ReferentialAction,
     /// `ON DELETE …`: `confdeltype`.
     pub on_delete: ReferentialAction,
-    /// `DEFERRABLE`, which is recorded and **changes nothing**: every check here is immediate,
-    /// and `DEFERRABLE INITIALLY IMMEDIATE` — the only deferrable form `ActiveRecord` writes — is
-    /// immediate on a real server too. `INITIALLY DEFERRED` is `0A000` naming itself, because
-    /// accepting it and checking immediately would refuse a transaction PostgreSQL commits.
+    /// `convalidated`: whether the rows already in the table were checked.
+    ///
+    /// **`NOT VALID` does not mean "unchecked from now on".** New rows are checked from the moment
+    /// the constraint exists; what the clause skips is the scan of the rows already there. So this
+    /// flag governs one scan and one catalog column, and never the writes.
+    pub validated: bool,
+    /// `DEFERRABLE`: whether the check **may** be moved to `COMMIT`, by declaration or by
+    /// `SET CONSTRAINTS`. `condeferrable`.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: whether it **starts** deferred. `condeferred`.
+    ///
+    /// Never true without [`Self::deferrable`] — `INITIALLY DEFERRED` implies `DEFERRABLE` in the
+    /// grammar. The pair says when the check runs, and `SET CONSTRAINTS` moves it either way
+    /// (`crate::exec::deferred`).
+    pub initially_deferred: bool,
 }
 
 /// What a `FOREIGN KEY` does when the row it points at is deleted or its key is changed.
 ///
-/// `SET NULL` and `SET DEFAULT` are PostgreSQL's other two and are `0A000` naming themselves:
-/// nothing `ActiveRecord` writes uses them, and each would need a rule about which columns it
-/// touches that this crate has nowhere to put yet.
+/// All five of PostgreSQL's, and the two that write rather than refuse are the reason this is an
+/// enum rather than a flag: `SET NULL` and `SET DEFAULT` put a value into the **child's**
+/// referencing columns when the parent goes, so they need the child's rows rewritten where
+/// `NO ACTION` and `RESTRICT` only need a question answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferentialAction {
     /// `NO ACTION`, the default — refuse. On a real server this one is deferrable to the end of
@@ -1434,6 +1480,16 @@ pub enum ReferentialAction {
     Restrict,
     /// `CASCADE` — delete the referencing rows, or rewrite their key to follow the parent's.
     Cascade,
+    /// `SET NULL` — write NULL into the child's referencing columns and keep the row.
+    ///
+    /// It needs the columns to be nullable, and PostgreSQL does **not** check that at DDL time:
+    /// the constraint is accepted and the `DELETE` that fires it is what fails, `23502`.
+    SetNull,
+    /// `SET DEFAULT` — write each referencing column's default, and keep the row.
+    ///
+    /// The default has to name a row that exists, or the same `DELETE` fails `23503` on the way
+    /// back out: the rewritten row is checked against the constraint like any other.
+    SetDefault,
 }
 
 impl ReferentialAction {
@@ -1444,6 +1500,8 @@ impl ReferentialAction {
             ReferentialAction::NoAction => "a",
             ReferentialAction::Restrict => "r",
             ReferentialAction::Cascade => "c",
+            ReferentialAction::SetNull => "n",
+            ReferentialAction::SetDefault => "d",
         }
     }
 
@@ -1455,6 +1513,8 @@ impl ReferentialAction {
             ReferentialAction::NoAction => "",
             ReferentialAction::Restrict => "RESTRICT",
             ReferentialAction::Cascade => "CASCADE",
+            ReferentialAction::SetNull => "SET NULL",
+            ReferentialAction::SetDefault => "SET DEFAULT",
         }
     }
 
@@ -2293,7 +2353,14 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // A relation id is never reused, so an orphan override could not be mistaken for another
     // table's -- but it would sit in the collector's scan of every override for ever.
     clear_table_retention(txn, tenant, table.id);
-    txn.delete(&record::row_id_key(tenant, table.id));
+    // **The row-id allocator's key is deliberately NOT deleted here**, and that is a correctness
+    // fix rather than an omission. The allocator is non-transactional on purpose — it reserves a
+    // batch in a short transaction of its own, the way a sequence does — so a *transactional*
+    // write to its key conflicts with any allocation made after this transaction's snapshot. That
+    // made `BEGIN; CREATE TABLE t; INSERT INTO t …; DROP TABLE t; COMMIT` answer `40001` where a
+    // real server commits: the `INSERT` allocated, and the `DROP` then wrote the key the
+    // allocation had written. Leaving it costs one 21-byte key per dropped table that had rows,
+    // and cannot be wrong: a relation id is never reused, so nothing can ever read it again.
     txn.delete(&record::name_key(tenant, &table.name));
     if !table.primary_key_name.is_empty() {
         txn.delete(&record::name_key(tenant, &table.primary_key_name));
@@ -3287,6 +3354,17 @@ pub const RESERVED_SCHEMAS: [(&str, u64); 2] = [("pg_catalog", 12), ("informatio
 /// `{public}`, which is what makes `pg_class` reachable and invisible to a table list at once.
 pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
+/// `pg_temp` written with no number: **the asking session's own temporary schema**.
+///
+/// Not a schema and never a record — it is the word a client writes, resolved to `pg_temp_<n>`
+/// where the session is in reach. A relation stored under this qualifier cannot exist, which is
+/// what makes it safe to use as the marker
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+pub const PG_TEMP_ALIAS: &str = "pg_temp";
+
+/// The prefix every session-scoped temporary schema's name begins with.
+pub const PG_TEMP_PREFIX: &str = "pg_temp_";
+
 /// The schema the SQL-standard views live in. **Not** in the search path: a client has to qualify
 /// `information_schema.tables`, which is why its stored names carry the qualifier already.
 pub const INFORMATION_SCHEMA: &str = "information_schema";
@@ -3686,6 +3764,7 @@ mod tests {
 
     fn accounts(id: u64) -> TableDef {
         TableDef {
+            on_commit: super::OnCommit::default(),
             id,
             persistence: super::Persistence::Permanent,
             name: "accounts".into(),
@@ -3771,7 +3850,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",               // catalog format version
+                "1c",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3864,7 +3943,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",       // catalog format version
+                "1c",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3946,7 +4025,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",                 // catalog format version
+                "1c",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4036,6 +4115,10 @@ mod tests {
                 // own types" without a flag byte in front of it (ADR 0050).
                 "00", // `id` is an `int8`
                 "00", // `email` is a `text`
+                // Version 26. One byte: `ON COMMIT PRESERVE ROWS`, which is what a table with no
+                // clause is and what every table that is not temporary is (ADR 0054). So a table
+                // written before 26 decodes to exactly this and means what it always meant.
+                "00",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -5246,7 +5329,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "19",               // catalog format version
+                "1c",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

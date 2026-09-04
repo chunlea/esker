@@ -34,6 +34,9 @@ pub struct CreateTable {
     /// `UNLOGGED`, re-attached the same way and for the same reason — the parser cannot read the
     /// keyword, so it is cut out of the source and put back here.
     pub persistence: crate::catalog::Persistence,
+    /// `ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP` — a temporary table's own clause, and
+    /// `42P16` on any other kind of table.
+    pub on_commit: crate::catalog::OnCommit,
     /// `PARTITION BY LIST (col, …)` — the strategy and the key columns' names, unresolved.
     pub partition_by: Option<(crate::catalog::PartitionStrategy, Vec<String>)>,
     /// `PARTITION OF parent FOR VALUES IN (…)` / `… DEFAULT` — the parent's name and the bound as
@@ -538,8 +541,12 @@ pub struct ForeignKey {
     pub on_update: ReferentialAction,
     /// `ON DELETE …`.
     pub on_delete: ReferentialAction,
-    /// `DEFERRABLE`, which is recorded and changes nothing here.
+    /// `NOT VALID`: skip the scan of the rows already there. New rows are checked either way.
+    pub validated: bool,
+    /// `DEFERRABLE`: the check may move to `COMMIT`.
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: it starts there.
+    pub initially_deferred: bool,
 }
 
 /// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
@@ -833,6 +840,26 @@ pub enum AlterTableAction {
         /// measured. What `CASCADE` buys is a view over the column, or another table's foreign key
         /// referencing it; without it those are `2BP01`.
         cascade: bool,
+    },
+    /// `VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
+    ///
+    /// It scans the rows the `ADD` skipped and, if they all satisfy the constraint, marks it
+    /// validated. **On an already-valid constraint it is a success, not an error**, and so it is
+    /// on one that was never `NOT VALID`; a name the table does not have is `42704`.
+    ValidateConstraint(String),
+    /// `ALTER COLUMN <name> SET NOT NULL` / `DROP NOT NULL`, which is what `change_column_null`
+    /// sends (`abstract/schema_statements.rb`).
+    ///
+    /// **`SET NOT NULL` scans the table.** PostgreSQL refuses it with `23502 column "c" of
+    /// relation "t" contains null values` if a row already holds one — a different message from
+    /// the `23502` an offending *insert* gets, and it names no constraint because the constraint
+    /// does not exist yet. Adding the flag without the scan would leave a table whose rows
+    /// contradict its own catalog.
+    SetNotNull {
+        /// The column, folded.
+        column: String,
+        /// `SET` (true) or `DROP` (false).
+        not_null: bool,
     },
     /// `ADD CONSTRAINT <name> UNIQUE (…)`, which is what `add_unique_constraint` sends — and the
     /// setup every `remove_unique_constraint` test needs before it can remove one.

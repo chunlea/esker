@@ -108,9 +108,11 @@ pub enum DiscardTarget {
     /// `DISCARD SEQUENCES`: this session's `currval` values, which become *undefined* again rather
     /// than stale — `55000` on the next `currval`, the same answer as a fresh connection.
     Sequences,
-    /// `DISCARD TEMP` / `DISCARD TEMPORARY`: this session's temporary tables. There are none here
-    /// (`CREATE TEMPORARY TABLE` is a named refusal), so it is a no-op that stays honest as long
-    /// as that is true.
+    /// `DISCARD TEMP` / `DISCARD TEMPORARY`: this session's temporary tables, dropped —
+    /// records, rows and the schema they live in ([ADR 0054]). The session carries on with no
+    /// temp schema, so the next `CREATE TEMP TABLE` allocates a fresh one.
+    ///
+    /// [ADR 0054]: ../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
     Temp,
 }
 
