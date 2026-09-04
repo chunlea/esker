@@ -1,0 +1,32 @@
+docs/bench/skiplist.md
+  s_2d916f5f540186::t_a899bca3c96e4f 162,173-185
+docs/acceptance/v1.md
+  s_2bed4ac2b1c944::t_f6100516ed6cee 3-5,7-9
+  s_2d916f5f540186::t_d7f3b5905b6bf7 23,29-36
+docs/plans/debts-v1.md
+  s_2d916f5f540186::t_41bdced74adf66 4-5,23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cfafe7b518ede4837efd7ff94b330c01a89125f0",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
