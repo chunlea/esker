@@ -6239,6 +6239,9 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         "tsrange" => Some(ColumnType::TsRange),
         "tstzrange" => Some(ColumnType::TstzRange),
         "int4range" => Some(ColumnType::Int4Range),
+        "daterange" => Some(ColumnType::DateRange),
+        "numrange" => Some(ColumnType::NumRange),
+        "int8range" => Some(ColumnType::Int8Range),
         _ => None,
     }
 }

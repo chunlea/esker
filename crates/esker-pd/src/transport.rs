@@ -24,9 +24,10 @@
 //! exists when there is something to say.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use esker_proto::pd::{PdRaftBatch, PdReq};
+use esker_proto::transport::RpcTls;
 use esker_proto::{Request, TcpTransport, Transport, TransportConfig};
 use esker_raft::{Message, NodeId};
 use tokio::sync::mpsc;
@@ -42,15 +43,40 @@ use crate::member::MemberList;
 /// slack nobody asked for. Two hundred is a hundred ticks' worth of heartbeats.
 pub const MEMBER_SEND_QUEUE: usize = 256;
 
-/// One connection per member pair.
+/// One connection per member pair, and the membership may move under it.
 #[derive(Debug)]
 pub struct PdTcpTransport {
     id: NodeId,
     group_id: u64,
-    /// One queue per other member, sorted by id — a `Vec` rather than a map because this is on a
+    /// One entry per other member, sorted by id — a `Vec` rather than a map because this is on a
     /// decision path and its iteration order should be defined.
-    peers: Vec<(NodeId, mpsc::Sender<Message>)>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    ///
+    /// Behind a lock because [`PdTcpTransport::reconfigure`] adds and drops entries while
+    /// [`PdTransport::send`] is reading them. A `Mutex` rather than an `RwLock`: the critical
+    /// section is a binary search over at most a handful of members, and a writer is an operator
+    /// action rather than anything on a hot path.
+    peers: Mutex<Vec<Peer>>,
+    /// How connections are built, kept so a member added later gets the same ones.
+    config: TransportConfig,
+    /// The TLS a new member's link uses, kept for the same reason.
+    tls: RpcTls,
+    /// Where a new member's delivery task is spawned.
+    ///
+    /// **Held rather than taken from the ambient runtime**, because `reconfigure` is called from
+    /// the *driver thread* — a plain OS thread with no runtime, where `tokio::spawn` is a panic.
+    /// `spawn` captures the handle while it still has one.
+    runtime: tokio::runtime::Handle,
+}
+
+/// One member's queue, and what it was built from.
+#[derive(Debug)]
+struct Peer {
+    id: NodeId,
+    /// The address its task is connected to. Kept so that a member whose *address* moved is
+    /// noticed: the id alone would call that "unchanged" and leave a task dialling the old host.
+    address: SocketAddr,
+    queue: mpsc::Sender<Message>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl PdTcpTransport {
@@ -59,29 +85,120 @@ impl PdTcpTransport {
     /// Must be called from inside a `tokio` runtime: the tasks are where the async lives, and the
     /// driver thread that feeds them is deliberately not async at all.
     pub fn spawn(id: NodeId, members: &MemberList, config: TransportConfig) -> Result<Arc<Self>> {
+        Self::spawn_with_tls(id, members, config, &RpcTls::disabled())
+    }
+
+    /// [`PdTcpTransport::spawn`], with the TLS every member link uses.
+    ///
+    /// A placement-driver group is the clearest case for mTLS in this project: every end is ours,
+    /// the membership is static, and the traffic is the Raft log that decides where every region
+    /// lives. A `tls` that is disabled connects in the clear, exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// A member address that is not an address, as [`PdTcpTransport::spawn`].
+    pub fn spawn_with_tls(
+        id: NodeId,
+        members: &MemberList,
+        config: TransportConfig,
+        tls: &RpcTls,
+    ) -> Result<Arc<Self>> {
         let group_id = members.group_id();
-        let mut peers = Vec::new();
-        let mut tasks = Vec::new();
-        for member in members.members().iter().filter(|member| member.id != id) {
+        let transport = Self {
+            id,
+            group_id,
+            peers: Mutex::new(Vec::new()),
+            config,
+            tls: tls.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        transport.reconfigure(members)?;
+        Ok(Arc::new(transport))
+    }
+
+    /// Moves the connections to match `members`, keeping every link that did not change.
+    ///
+    /// **Add and drop, never rebuild.** A membership change touches one member; dropping the other
+    /// connections with it would cost a reconnect and an election timeout's worth of silence on
+    /// links nobody asked about. A member is "unchanged" only if both its id *and* its address are
+    /// — an address that moved is a new link, because the old task is dialling the old host.
+    ///
+    /// Safe to call from the driver thread, which is where a configuration change is applied and
+    /// which has no runtime of its own: the handle captured at [`PdTcpTransport::spawn`] is what
+    /// the new tasks are spawned on.
+    ///
+    /// # Errors
+    ///
+    /// A member address that is not an address. The transport is left as it was: the addresses are
+    /// parsed before anything is added or dropped, so a bad configuration cannot half-apply.
+    pub fn reconfigure(&self, members: &MemberList) -> Result<()> {
+        // Parsed first, so a bad address is an error rather than a transport with some of the
+        // change applied. This is the whole reason the loop below cannot fail.
+        let mut wanted = Vec::new();
+        for member in members
+            .members()
+            .iter()
+            .filter(|member| member.id != self.id)
+        {
             let address: SocketAddr = member.address.parse().map_err(|error| {
                 PdError::invalid(format!(
                     "placement driver {}'s address `{}` is not an address: {error}",
                     member.id, member.address
                 ))
             })?;
-            let (sender, receiver) = mpsc::channel(MEMBER_SEND_QUEUE);
-            peers.push((member.id, sender));
-            tasks.push(tokio::spawn(deliver_to(
-                member.id, address, group_id, id, receiver, config,
-            )));
+            wanted.push((member.id, address));
         }
-        peers.sort_by_key(|(id, _)| *id);
-        Ok(Arc::new(Self {
-            id,
-            group_id,
-            peers,
-            tasks,
-        }))
+        wanted.sort_by_key(|(id, _)| *id);
+
+        let mut peers = self.peers();
+        // Anything no longer wanted, or wanted at a different address, goes: dropping the sender
+        // ends the task's loop, and the abort is for a task parked mid-connect.
+        peers.retain(|peer| {
+            let keep = wanted
+                .iter()
+                .any(|(id, address)| *id == peer.id && *address == peer.address);
+            if !keep {
+                peer.task.abort();
+                tracing::debug!(
+                    id = self.id,
+                    to = peer.id,
+                    "dropped a placement-driver link"
+                );
+            }
+            keep
+        });
+
+        for (id, address) in wanted {
+            if peers.iter().any(|peer| peer.id == id) {
+                continue;
+            }
+            let (queue, receiver) = mpsc::channel(MEMBER_SEND_QUEUE);
+            let task = self.runtime.spawn(deliver_to(
+                id,
+                address,
+                self.group_id,
+                self.id,
+                receiver,
+                self.config,
+                self.tls.clone(),
+            ));
+            peers.push(Peer {
+                id,
+                address,
+                queue,
+                task,
+            });
+            tracing::debug!(id = self.id, to = id, %address, "added a placement-driver link");
+        }
+        peers.sort_by_key(|peer| peer.id);
+        Ok(())
+    }
+
+    /// The peer table.
+    fn peers(&self) -> std::sync::MutexGuard<'_, Vec<Peer>> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// This member's id.
@@ -98,9 +215,11 @@ impl PdTcpTransport {
 
     /// Stops the delivery tasks. Idempotent, and called on drop.
     pub fn shutdown(&self) {
-        for task in &self.tasks {
-            task.abort();
+        let mut peers = self.peers();
+        for peer in peers.iter() {
+            peer.task.abort();
         }
+        peers.clear();
     }
 }
 
@@ -117,7 +236,8 @@ impl PdTransport for PdTcpTransport {
                 );
                 continue;
             }
-            let Ok(at) = self.peers.binary_search_by_key(&to, |(id, _)| *id) else {
+            let peers = self.peers();
+            let Ok(at) = peers.binary_search_by_key(&to, |peer| peer.id) else {
                 // Membership is static, so this is a configuration mistake rather than a race:
                 // the core is addressing a member this process was never told about.
                 tracing::warn!(
@@ -127,7 +247,7 @@ impl PdTransport for PdTcpTransport {
                 );
                 continue;
             };
-            if self.peers[at].1.try_send(message).is_err() {
+            if peers[at].queue.try_send(message).is_err() {
                 // Full or closed. Dropping is the honest outcome and Raft will resend; blocking
                 // the driver thread on a slow socket would stall the whole group.
                 tracing::debug!(
@@ -154,6 +274,7 @@ async fn deliver_to(
     from: NodeId,
     mut queue: mpsc::Receiver<Message>,
     config: TransportConfig,
+    tls: RpcTls,
 ) {
     let mut connection: Option<TcpTransport> = None;
     while let Some(first) = queue.recv().await {
@@ -169,7 +290,9 @@ async fn deliver_to(
             connection = None;
         }
         if connection.is_none() {
-            match TcpTransport::connect_with(address, config).await {
+            // The peer is verified against its configured address, which is what a member list of
+            // addresses can offer; a certificate for a placement driver therefore carries its IP.
+            match TcpTransport::connect_with_tls(address, config, &tls, None).await {
                 Ok(transport) => connection = Some(transport),
                 Err(error) => {
                     tracing::debug!(
@@ -211,6 +334,11 @@ mod tests {
     use esker_proto::TransportConfig;
     use esker_raft::Message;
 
+    /// The members this transport currently holds a queue for.
+    fn peer_ids(transport: &PdTcpTransport) -> Vec<esker_raft::NodeId> {
+        transport.peers().iter().map(|peer| peer.id).collect()
+    }
+
     fn three() -> MemberList {
         MemberList::new(vec![
             PdMember::new(1, "127.0.0.1:32379"),
@@ -226,14 +354,7 @@ mod tests {
     async fn a_member_holds_a_queue_for_every_member_but_itself() {
         let transport = PdTcpTransport::spawn(2, &three(), TransportConfig::new()).unwrap();
         assert_eq!(transport.id(), 2);
-        assert_eq!(
-            transport
-                .peers
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
+        assert_eq!(peer_ids(&transport), vec![1, 3]);
         assert_eq!(transport.group_id(), three().group_id());
     }
 
@@ -279,6 +400,109 @@ mod tests {
     async fn a_group_of_one_has_no_peers() {
         let transport =
             PdTcpTransport::spawn(1, &MemberList::alone(1), TransportConfig::new()).unwrap();
-        assert!(transport.peers.is_empty());
+        assert!(peer_ids(&transport).is_empty());
+    }
+
+    /// A membership change adds and drops one link and **leaves the rest connected**.
+    ///
+    /// The assertion that matters is the last one: the queue for member 3 is the same channel it
+    /// was before the change. A transport that rebuilt itself would pass every other assertion
+    /// here and fail that one, and the cost — a reconnect and an election timeout of silence on a
+    /// link nobody touched — would show up only under a membership change in production.
+    #[tokio::test]
+    async fn reconfigure_keeps_the_links_that_did_not_change() {
+        let transport = PdTcpTransport::spawn(2, &three(), TransportConfig::new()).unwrap();
+        let kept = transport
+            .peers()
+            .iter()
+            .find(|peer| peer.id == 3)
+            .map(|peer| peer.queue.clone())
+            .expect("member 3 has a queue");
+
+        let four = MemberList::new(vec![
+            PdMember::new(1, "127.0.0.1:32379"),
+            PdMember::new(2, "127.0.0.1:32380"),
+            PdMember::new(3, "127.0.0.1:32381"),
+            PdMember::new(4, "127.0.0.1:32382"),
+        ])
+        .unwrap();
+        transport.reconfigure(&four).unwrap();
+        assert_eq!(peer_ids(&transport), vec![1, 3, 4], "4 was added");
+
+        let two = MemberList::new(vec![
+            PdMember::new(2, "127.0.0.1:32380"),
+            PdMember::new(3, "127.0.0.1:32381"),
+        ])
+        .unwrap();
+        transport.reconfigure(&two).unwrap();
+        assert_eq!(peer_ids(&transport), vec![3], "1 and 4 were dropped");
+
+        let still = transport
+            .peers()
+            .iter()
+            .find(|peer| peer.id == 3)
+            .map(|peer| peer.queue.clone())
+            .expect("member 3 still has one");
+        assert!(
+            kept.same_channel(&still),
+            "member 3's link survived two changes it was not part of"
+        );
+    }
+
+    /// A member whose **address** moved is a new link, not an unchanged one.
+    ///
+    /// Comparing ids alone would call this unchanged and leave a task dialling the old host for
+    /// ever — the failure would look like one member being unreachable for no reason.
+    #[tokio::test]
+    async fn a_member_that_moved_gets_a_new_link() {
+        let transport = PdTcpTransport::spawn(2, &three(), TransportConfig::new()).unwrap();
+        let before = transport
+            .peers()
+            .iter()
+            .find(|peer| peer.id == 3)
+            .map(|peer| peer.queue.clone())
+            .unwrap();
+
+        let moved = MemberList::new(vec![
+            PdMember::new(1, "127.0.0.1:32379"),
+            PdMember::new(2, "127.0.0.1:32380"),
+            PdMember::new(3, "127.0.0.1:42381"),
+        ])
+        .unwrap();
+        transport.reconfigure(&moved).unwrap();
+
+        let after = transport
+            .peers()
+            .iter()
+            .find(|peer| peer.id == 3)
+            .map(|peer| peer.queue.clone())
+            .unwrap();
+        assert!(
+            !before.same_channel(&after),
+            "an address change must replace the link, not keep it"
+        );
+        assert_eq!(peer_ids(&transport), vec![1, 3]);
+    }
+
+    /// A bad address cannot reach `reconfigure` at all — `MemberList` refuses to hold one.
+    ///
+    /// Which is where that guarantee belongs, and worth pinning: the parse inside `reconfigure` is
+    /// therefore belt-and-braces rather than the check. It stays because the invariant lives in
+    /// another module and a `Result` is what lets it stay honest if that ever changes; this test
+    /// says why it is never seen.
+    #[tokio::test]
+    async fn a_bad_address_never_reaches_the_transport() {
+        assert!(
+            MemberList::new(vec![
+                PdMember::new(2, "127.0.0.1:32380"),
+                PdMember::new(3, "not-an-address"),
+            ])
+            .is_err(),
+            "the member list is where an address is validated"
+        );
+
+        // And the transport it did build is untouched by the attempt.
+        let transport = PdTcpTransport::spawn(2, &three(), TransportConfig::new()).unwrap();
+        assert_eq!(peer_ids(&transport), vec![1, 3]);
     }
 }

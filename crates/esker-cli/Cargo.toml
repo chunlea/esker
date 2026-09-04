@@ -8,6 +8,15 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# RPC and S3 TLS, forwarded to the crates that implement them (ADR 0055). The PostgreSQL port
+# is `esker-sql`'s own feature and this binary does not link that crate.
+#
+# Off by default. `just check` builds `--all-features`, so the gated paths are what CI compiles;
+# this exists so that a *production* build of this binary alone can turn them on, which no
+# amount of workspace feature unification does for you.
+tls = ["esker-proto/tls", "esker-s3/tls"]
+
 [dependencies]
 # `sst-dump` reads real tables through the engine's own reader, so the tool and the
 # engine can never disagree about the format (docs/DESIGN.md §12).

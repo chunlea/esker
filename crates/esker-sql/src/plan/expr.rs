@@ -454,6 +454,31 @@ pub enum UuidFunc {
     /// `42883 function uuid_generate_v4() does not exist` until that extension is installed, and
     /// again as soon as the transaction that installed it rolls back. Measured, both directions.
     UuidGenerateV4,
+    /// `uuid_generate_v1()` — a **timestamp, a clock sequence and a node id**, where v4 is
+    /// sixteen random bytes. `uuid-ossp`'s, like v4, and `42883` until that extension is there.
+    ///
+    /// `uuid_test.rb` writes it as a column default and reads it back out of the schema dumper,
+    /// which is why the name has to survive `pg_get_expr` unchanged as well as evaluate.
+    UuidGenerateV1,
+    /// `uuid_generate_v1mc()` — the same, with a **fresh random multicast node id per call**
+    /// where the plain form keeps one. Measured: its node bytes differ between two calls and the
+    /// plain form's do not.
+    UuidGenerateV1Mc,
+    /// `uuid_nil()` — the all-zero UUID, and a constant.
+    UuidNil,
+    /// `uuid_ns_dns()` — RFC 4122's DNS namespace, a constant.
+    ///
+    /// The four namespace constants are here and `uuid_generate_v3`/`v5` are not: those two hash
+    /// a namespace and a name with **MD5** and **SHA-1**, which this project would write itself
+    /// (no crate compiles C here) and which is a unit of its own. The constants cost nothing and
+    /// are what that unit would need first.
+    UuidNsDns,
+    /// `uuid_ns_url()` — RFC 4122's URL namespace, a constant.
+    UuidNsUrl,
+    /// `uuid_ns_oid()` — RFC 4122's ISO OID namespace, a constant.
+    UuidNsOid,
+    /// `uuid_ns_x500()` — RFC 4122's X.500 DN namespace, a constant.
+    UuidNsX500,
 }
 
 impl UuidFunc {
@@ -463,6 +488,13 @@ impl UuidFunc {
         match self {
             UuidFunc::GenRandomUuid => "gen_random_uuid",
             UuidFunc::UuidGenerateV4 => "uuid_generate_v4",
+            UuidFunc::UuidGenerateV1 => "uuid_generate_v1",
+            UuidFunc::UuidGenerateV1Mc => "uuid_generate_v1mc",
+            UuidFunc::UuidNil => "uuid_nil",
+            UuidFunc::UuidNsDns => "uuid_ns_dns",
+            UuidFunc::UuidNsUrl => "uuid_ns_url",
+            UuidFunc::UuidNsOid => "uuid_ns_oid",
+            UuidFunc::UuidNsX500 => "uuid_ns_x500",
         }
     }
 
@@ -472,6 +504,13 @@ impl UuidFunc {
         match name.to_ascii_lowercase().as_str() {
             "gen_random_uuid" => Some(UuidFunc::GenRandomUuid),
             "uuid_generate_v4" => Some(UuidFunc::UuidGenerateV4),
+            "uuid_generate_v1" => Some(UuidFunc::UuidGenerateV1),
+            "uuid_generate_v1mc" => Some(UuidFunc::UuidGenerateV1Mc),
+            "uuid_nil" => Some(UuidFunc::UuidNil),
+            "uuid_ns_dns" => Some(UuidFunc::UuidNsDns),
+            "uuid_ns_url" => Some(UuidFunc::UuidNsUrl),
+            "uuid_ns_oid" => Some(UuidFunc::UuidNsOid),
+            "uuid_ns_x500" => Some(UuidFunc::UuidNsX500),
             _ => None,
         }
     }
@@ -482,7 +521,16 @@ impl UuidFunc {
     pub fn requires(self) -> Option<&'static str> {
         match self {
             UuidFunc::GenRandomUuid => None,
-            UuidFunc::UuidGenerateV4 => Some("uuid-ossp"),
+            // Every other name in this enum is `uuid-ossp`'s, the constants included:
+            // `uuid_nil()` is `42883` on a real server until the extension is installed.
+            UuidFunc::UuidGenerateV4
+            | UuidFunc::UuidGenerateV1
+            | UuidFunc::UuidGenerateV1Mc
+            | UuidFunc::UuidNil
+            | UuidFunc::UuidNsDns
+            | UuidFunc::UuidNsUrl
+            | UuidFunc::UuidNsOid
+            | UuidFunc::UuidNsX500 => Some("uuid-ossp"),
         }
     }
 }
@@ -1634,8 +1682,8 @@ impl Literal {
                 // A number or a boolean is not a range literal either.
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
-                | ColumnType::Int4Range
-                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
+                | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1710,8 +1758,8 @@ impl Literal {
                 // A number or a boolean is not a range literal either.
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
-                | ColumnType::Int4Range
-                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
+                | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1780,8 +1828,8 @@ impl Literal {
                 // A number or a boolean is not a range literal either.
                 | ColumnType::TsRange
                 | ColumnType::TstzRange
-                | ColumnType::Int4Range
-                | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
+                | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => mismatch(),
             },
         }
     }
