@@ -900,6 +900,13 @@ pub enum CatalogFunc {
     /// carries its own type and answers for itself, arrays included: an `ARRAY(SELECT 1)` is an
     /// `integer[]` because that is what the value is.
     PgTypeof,
+    /// `nlevel(path)`: how many labels the path has, and `0` for the empty one.
+    LtreeNlevel,
+    /// `ltree2text(path)` and `text2ltree(text)`: the two casts under their function names. The
+    /// second **validates** — `text2ltree('a..b')` is `ltree`'s own syntax error.
+    LtreeToText,
+    /// See [`CatalogFunc::LtreeToText`].
+    TextToLtree,
     /// `now()`, and `CURRENT_TIMESTAMP` which is the same function under a keyword spelling.
     ///
     /// **The transaction's instant, not the statement's.** Two calls in one transaction are equal
@@ -1027,6 +1034,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
             () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
             () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
+            // The three `ltree` functions the corpus asks for. `nlevel('')` is 0, which is what
+            // makes the empty path a value rather than a hole.
+            () if name.eq_ignore_ascii_case("nlevel") => Some(CatalogFunc::LtreeNlevel),
+            () if name.eq_ignore_ascii_case("ltree2text") => Some(CatalogFunc::LtreeToText),
+            () if name.eq_ignore_ascii_case("text2ltree") => Some(CatalogFunc::TextToLtree),
             () if name.eq_ignore_ascii_case("pg_get_triggerdef") => {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
@@ -1096,6 +1108,9 @@ impl CatalogFunc {
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
+            CatalogFunc::LtreeNlevel => "nlevel",
+            CatalogFunc::LtreeToText => "ltree2text",
+            CatalogFunc::TextToLtree => "text2ltree",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
             // Both halves of a `regtype` are called that: one reads an oid and prints a name,
@@ -1180,7 +1195,10 @@ impl CatalogFunc {
             | CatalogFunc::PathIsOpen
             | CatalogFunc::PathIsClosed
             | CatalogFunc::Cardinality
-            | CatalogFunc::PgTypeof => &[1],
+            | CatalogFunc::PgTypeof
+            | CatalogFunc::LtreeNlevel
+            | CatalogFunc::LtreeToText
+            | CatalogFunc::TextToLtree => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
@@ -1220,7 +1238,8 @@ impl CatalogFunc {
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
             // this node has no `regtype`, and what it prints is the name either way.
             | CatalogFunc::PgTypeof
-            | CatalogFunc::HstoreFetch => ColumnType::Text,
+            | CatalogFunc::HstoreFetch
+            | CatalogFunc::LtreeToText => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
             // **The storage, which is what an enum's value is** (ADR 0050) — and the label
@@ -1239,7 +1258,8 @@ impl CatalogFunc {
             | CatalogFunc::ArrayLower
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
-            | CatalogFunc::Cardinality => ColumnType::Int4,
+            | CatalogFunc::Cardinality
+            | CatalogFunc::LtreeNlevel => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
             CatalogFunc::PathIsOpen
@@ -1253,6 +1273,7 @@ impl CatalogFunc {
             | CatalogFunc::RangeUpperInf
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains => ColumnType::Bool,
+            CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
@@ -1749,7 +1770,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
             },
 
             Literal::Decimal(digits) => match ty {
@@ -1832,7 +1853,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -1924,7 +1945,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
             },
         }
     }

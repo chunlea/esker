@@ -680,6 +680,11 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // vocabulary has a `Json` and no `Xml`, and adding one is a unit in `esker-columnar`.
         | Row::Xml
         | Row::XmlArray
+        // Not columnar for `citext`'s reason: an ltree's comparison is not its bytes', so a
+        // columnar run could not sort or filter one without a vocabulary for that order.
+        | Row::Ltree
+        | Row::LtreeArray
+        | Row::LQuery
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray
@@ -722,6 +727,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)
+        | Datum::Ltree(_)
         | Datum::Hstore(_)
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),

@@ -45,6 +45,7 @@ pub mod hstore;
 pub mod inet;
 pub mod interval;
 pub(crate) mod json;
+pub mod ltree;
 pub mod money;
 pub mod numeric;
 pub mod oid;
@@ -102,6 +103,7 @@ fn binary_text(ty: ColumnType, bytes: &[u8]) -> Result<Datum> {
     })?;
     Ok(match ty {
         ColumnType::Citext => Datum::Citext(text),
+        ColumnType::Ltree => Datum::Ltree(ltree::from_text(&text)?),
         _ => Datum::Text(text),
     })
 }
@@ -120,6 +122,14 @@ pub const HSTORE_ARRAY_OID: u32 = 16401;
 pub const CITEXT_OID: u32 = 16402;
 /// See [`CITEXT_OID`].
 pub const CITEXT_ARRAY_OID: u32 = 16403;
+/// `ltree`'s oid and its array's, in the same user range and for the same reason. See
+/// [`HSTORE_OID`] — `ActiveRecord` finds this type by `typname` too.
+pub const LTREE_OID: u32 = 16404;
+/// See [`LTREE_OID`].
+pub const LTREE_ARRAY_OID: u32 = 16405;
+/// `lquery`'s oid. It has no array here — no column is a pattern — which is the same named gap
+/// the six geometric shapes have.
+pub const LQUERY_OID: u32 = 16406;
 /// The subtype a range column's bounds are, which the column type names.
 ///
 /// `int4range`'s is `Int8` and not `Int4`, because a bare integer constant is an `int8` here — the
@@ -637,7 +647,9 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::Polygon
         | ColumnType::Circle
         | ColumnType::Line
-        | ColumnType::XmlArray => 0,
+        | ColumnType::XmlArray
+        | ColumnType::LtreeArray
+        | ColumnType::LQuery => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -687,6 +699,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // `0` would be a wrong answer there. `CITEXT_ARRAY_OID` is reserved and reported, and the
         // array type itself is not built.
         ColumnType::Citext => CITEXT_ARRAY_OID,
+        ColumnType::Ltree => LTREE_ARRAY_OID,
         ColumnType::TsRange => TSRANGE_ARRAY_OID,
         ColumnType::Jsonb => 3807,
     }
@@ -775,6 +788,9 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // `xml` takes no typmod: there is no `xml(n)`, and `XMLSERIALIZE`'s type modifiers are a
         // function's arguments rather than the type's.
         | ColumnType::Xml
+        // Nor does `ltree`: a path has no declared depth.
+        | ColumnType::Ltree
+        | ColumnType::LQuery
         | ColumnType::Money
         | ColumnType::Inet
         | ColumnType::Cidr
@@ -809,7 +825,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -924,6 +940,8 @@ impl PgType for ColumnType {
             ColumnType::Jsonb => 3802,
             ColumnType::Hstore => HSTORE_OID,
             ColumnType::Citext => CITEXT_OID,
+            ColumnType::Ltree => LTREE_OID,
+            ColumnType::LQuery => LQUERY_OID,
             // PostgreSQL's own, and fixed: unlike an extension's, a range type is built in.
             ColumnType::TsRange => 3908,
             ColumnType::TstzRange => 3910,
@@ -994,6 +1012,7 @@ impl PgType for ColumnType {
             | ColumnType::OidArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
+            | ColumnType::LtreeArray
             | ColumnType::TstzRangeArray
             | ColumnType::Int4RangeArray
             | ColumnType::DateRangeArray
@@ -1075,6 +1094,9 @@ impl PgType for ColumnType {
             ColumnType::CitextArray => "citext[]",
             ColumnType::Xml => "xml",
             ColumnType::XmlArray => "xml[]",
+            ColumnType::Ltree => "ltree",
+            ColumnType::LtreeArray => "ltree[]",
+            ColumnType::LQuery => "lquery",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::Int8 => "bigint",
             ColumnType::Int4 => "integer",
@@ -1138,13 +1160,15 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Xml
+            | ColumnType::Ltree
+            | ColumnType::LQuery
             | ColumnType::Numeric
             | ColumnType::Bytea
             // However many elements it has, which is the definition of a varlena.
@@ -1241,9 +1265,11 @@ impl PgDatum for Datum {
             Datum::Int2(v) => v.to_string(),
             // **As written**: what a client is sent is the spelling that was stored, never the
             // folded form the key holds.
-            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
-                v.clone()
-            }
+            Datum::Text(v)
+            | Datum::Citext(v)
+            | Datum::Ltree(v)
+            | Datum::Hstore(v)
+            | Datum::Range { text: v, .. } => v.clone(),
             // One character. See the module note: the `::text` cast says `true`, the output
             // function says `t`, and the wire carries the output function.
             Datum::Bool(v) => (if *v { "t" } else { "f" }).to_string(),
@@ -1355,7 +1381,8 @@ impl PgDatum for Datum {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::CitextArray
-            | ColumnType::XmlArray => {
+            | ColumnType::XmlArray
+            | ColumnType::LtreeArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -1387,6 +1414,13 @@ impl PgDatum for Datum {
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
             // **As written.** The folding is the comparison's, so nothing here touches the case.
             ColumnType::Citext => Datum::Citext(text.to_owned()),
+            // **As written too**, once the labels are known to be labels. Nothing is normalised —
+            // `a.b.c` comes back exactly as it went in — so equality is the text's and only the
+            // *order* is the type's own (`crate::value::ltree`).
+            ColumnType::Ltree => Datum::Ltree(ltree::from_text(text)?),
+            // A pattern is its characters once it parses, which is `json`'s road: nothing is
+            // built from it here, and `lquery::compile` is what reads it at match time.
+            ColumnType::LQuery => Datum::Text(ltree::lquery_checked(text)?),
             // Parsed and rendered back **canonical**, which is what makes equality and grouping the
             // text's — the same road `hstore` and `jsonb` take.
             ColumnType::TsRange
@@ -1491,7 +1525,11 @@ impl PgDatum for Datum {
             Datum::Bool(v) => vec![u8::from(*v)],
             Datum::Double(v) => v.to_be_bytes().to_vec(),
             Datum::Real(v) => v.to_be_bytes().to_vec(),
-            Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+            Datum::Text(v)
+            | Datum::Citext(v)
+            | Datum::Ltree(v)
+            | Datum::Hstore(v)
+            | Datum::Range { text: v, .. } => {
                 v.as_bytes().to_vec()
             }
             Datum::Bytea(v) => v.clone(),
@@ -1525,6 +1563,7 @@ impl PgDatum for Datum {
             | ColumnType::Bit
             | ColumnType::VarBit
             | ColumnType::Xml
+            | ColumnType::LQuery
             | ColumnType::Lseg
             | ColumnType::Box
             | ColumnType::Path
@@ -1567,7 +1606,8 @@ impl PgDatum for Datum {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::CitextArray
-            | ColumnType::XmlArray => {
+            | ColumnType::XmlArray
+            | ColumnType::LtreeArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -1663,9 +1703,14 @@ impl PgDatum for Datum {
             }
             // A citext arrives as its own text and keeps its spelling, the same as from the text
             // format; only the comparison folds.
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
-                binary_text(ty, bytes)?
-            }
+            // An ltree the same way, and **validated**: a binary parameter is still the path's
+            // characters, so a client that sends `a..b` gets `ltree`'s own syntax error rather
+            // than a row holding something that is not a path.
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Citext
+            | ColumnType::Ltree => binary_text(ty, bytes)?,
             ColumnType::Bytea => Datum::Bytea(bytes.to_vec()),
         })
     }
@@ -1872,6 +1917,14 @@ impl PgDatum for Datum {
             // measured, `'Ä'::citext = 'ä'::citext` is `t` on a real server, and an ASCII-only
             // fold answers `f` there and is wrong for every non-English application.
             (Datum::Citext(a), Datum::Citext(b)) => a.to_lowercase().cmp(&b.to_lowercase()),
+            // **Label by label, not byte by byte** — `'a.b' < 'a-b'` is true as an ltree and
+            // false as bytes, which is the whole of why this type has a `Datum` of its own
+            // (`crate::value::ltree`). An `unknown` literal on one side takes the ltree's
+            // comparison, as a citext's does, because that is how the operator resolves.
+            (Datum::Ltree(a), Datum::Ltree(b)) => ltree::cmp(a, b),
+            (Datum::Ltree(a), Datum::Text(b)) | (Datum::Text(b), Datum::Ltree(a)) => {
+                ltree::cmp(a, b)
+            }
             // An `unknown` literal on one side, which is what `cival = 'cased text'` is after
             // lowering: it takes the citext's comparison rather than text's, exactly as a real
             // server resolves the operator to `citext = citext`.
@@ -1954,7 +2007,7 @@ fn variant_rank(value: &Datum) -> u8 {
         // nothing else, so this rank exists to give the cross-type order a total answer rather
         // than to describe an operator a real server has.
         Datum::Time(_) => 8,
-        Datum::Text(_) | Datum::Citext(_) | Datum::Hstore(_) => 4,
+        Datum::Text(_) | Datum::Citext(_) | Datum::Ltree(_) | Datum::Hstore(_) => 4,
         // Its own rank in the cross-type total order, above every scalar's text.
         Datum::Range { .. } => 21,
         Datum::Bytea(_) => 5,
@@ -2266,6 +2319,8 @@ mod tests {
                         | ColumnType::Json
                         | ColumnType::Jsonb
                         | ColumnType::Xml
+                        | ColumnType::Ltree
+                        | ColumnType::LQuery
                         | ColumnType::Hstore
                         | ColumnType::HstoreArray
                         | ColumnType::Citext
@@ -2276,6 +2331,7 @@ mod tests {
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray
                         | ColumnType::XmlArray
+                        | ColumnType::LtreeArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

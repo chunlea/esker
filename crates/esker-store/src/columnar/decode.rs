@@ -238,6 +238,11 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // `ColumnType` has a `Json` and no `Xml`, and teaching it one is that crate's unit.
         | StoredType::Xml
         | StoredType::XmlArray
+        // Nor is `ltree`, for `citext`'s reason exactly: its comparison is not its bytes', and
+        // this vocabulary has no way to carry the one it has.
+        | StoredType::Ltree
+        | StoredType::LtreeArray
+        | StoredType::LQuery
         | StoredType::FloatRange
         | StoredType::VarcharRange
         | StoredType::TstzRangeArray
@@ -265,6 +270,7 @@ fn value_of(datum: &Datum) -> Value {
         | Datum::MacAddr(_)
         | Datum::Bit { .. }
         | Datum::Geometry { .. }
+        | Datum::Ltree(_)
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)

@@ -2881,6 +2881,12 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Unreachable for the same reason, both of them: `xml` is `json`'s shape and has no
             // equality operator either.
             ColumnType::Xml | ColumnType::XmlArray => 77,
+            // **Its own family**: `ltree = text` is `42883` on a real server, and an ltree
+            // compares with another ltree and with nothing else.
+            ColumnType::Ltree => 78,
+            ColumnType::LtreeArray => 79,
+            // A pattern compares with nothing, including another pattern.
+            ColumnType::LQuery => 80,
         }
     }
     // **And `json[]` with it.** `ARRAY['{"a":1}'::json] = ARRAY['{"a":1}'::json]` is
@@ -3714,12 +3720,18 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
         Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::HstoreConcat => {
-            let hstore = call
-                .args
-                .iter()
-                .any(|arg| matches!(expr_type(arg, scope), Ok(ColumnType::Hstore)));
-            if hstore {
+            // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
+            // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
+            // one is enough. Three spellings of one symbol now, and each answers its own type.
+            let of = |want: ColumnType| {
+                call.args
+                    .iter()
+                    .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
+            };
+            if of(ColumnType::Hstore) {
                 ColumnType::Hstore
+            } else if of(ColumnType::Ltree) {
+                ColumnType::Ltree
             } else {
                 ColumnType::Text
             }

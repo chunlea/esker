@@ -29,7 +29,7 @@ use crate::value::{ColumnType, Datum};
 /// Rows read from the store in one round trip. Shared with everything else that walks a range
 /// ([`crate::exec::for_each_page`]).
 use crate::exec::SCAN_CHUNK;
-use crate::value::{PgDatum, PgType, range};
+use crate::value::{PgDatum, PgType, ltree, range};
 
 /// The most rows a `Sort` will hold. Past it, `53400` rather than an unbounded allocation.
 pub(super) const SORT_LIMIT: usize = 1_000_000;
@@ -1148,6 +1148,28 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
                 .map_or("unknown", PgType::name)
         ))
     };
+    // **An `ltree` on either side takes this operator away from `hstore`.** `@>`, `<@` and `||`
+    // are spelled the same for both, and the operand is the only place that can decide — the rule
+    // the `||` regression taught, one type later. A bare `Datum::Text` beside an ltree is the
+    // `unknown` literal, which is what `'a.b'::ltree || 'c'::text` is.
+    if args.iter().any(|value| matches!(value, Datum::Ltree(_))) {
+        let path = |value: Option<&Datum>| match value {
+            Some(Datum::Ltree(text)) => Ok(Some(text.clone())),
+            Some(Datum::Text(text)) => ltree::from_text(text).map(Some),
+            Some(Datum::Null) | None => Ok(None),
+            other => Err(wrong_type(other)),
+        };
+        return Ok(match (func, path(args.first())?, path(args.get(1))?) {
+            (CatalogFunc::HstoreContains, Some(outer), Some(inner)) => {
+                Datum::Bool(ltree::contains(&outer, &inner))
+            }
+            (CatalogFunc::HstoreConcat, Some(left), Some(right)) => {
+                Datum::Ltree(ltree::concat(&left, &right))
+            }
+            (CatalogFunc::HstoreContains | CatalogFunc::HstoreConcat, _, _) => Datum::Null,
+            _ => return Err(wrong_type(args.first())),
+        });
+    }
     // **At least one operand has to be a real hstore.** A `Datum::Text` is accepted only as the
     // `unknown` literal beside one — `h @> 'a=>b'` is how the suite writes containment — and never
     // on its own: `||` is spelled the same for text, and reading *both* sides as hstores turned
@@ -1366,6 +1388,12 @@ fn range_value_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
         // `a @> b`, and `b <@ a` is the same question with the arguments the other way round —
         // the lowering swaps them so there is one rule here. The right side may be a bare value
         // rather than a range, which is what `ts_range @> '…'::timestamp` sends.
+        // **`a <@ b` over two ltrees arrives here**, because the lowering sends `<@` to the range
+        // containment with its arguments swapped and `@>` to the hstore one. One symbol, three
+        // types, and the operand is the only place that can tell them apart.
+        CatalogFunc::RangeContains if args.iter().any(|value| matches!(value, Datum::Ltree(_))) => {
+            hstore_function(CatalogFunc::HstoreContains, args)?
+        }
         CatalogFunc::RangeContains => match (stored(args.first())?, args.get(1)) {
             (Some(outer), Some(inner)) => match inner {
                 Datum::Null => Datum::Null,
@@ -1728,6 +1756,17 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         } => {
             let subject = evaluate_in(operand, row, env)?;
             let pattern_value = evaluate_in(pattern, row, env)?;
+            // **`~` over an `ltree` is a *pattern* match and not a regular expression.** One
+            // symbol, two languages, and the left operand is the only place that can tell them
+            // apart — the rule `||` and `@>` already follow, a third time. `path ~ 'a.*'` is an
+            // `lquery` and `title ~ 'a.*'` is POSIX, and the two answer differently for the same
+            // characters.
+            if let Datum::Ltree(path) = &subject {
+                return Ok(match regex_text(&pattern_value, "~")? {
+                    Some(pattern) => Datum::Bool(ltree::matches(path, &pattern)? != *negated),
+                    None => Datum::Null,
+                });
+            }
             let operator = if *case_insensitive { "~*" } else { "~" };
             match (
                 regex_text(&subject, operator)?,
@@ -2468,6 +2507,21 @@ fn catalog_function(
         | CatalogFunc::HstoreAkeys
         | CatalogFunc::HstoreAvals
         | CatalogFunc::HstoreBuild => hstore_function(call.func, &args)?,
+        // **Strict, each of them**, and `text2ltree` validates: a path that is not a path is
+        // `ltree`'s own `42601` here exactly as it is through the cast.
+        CatalogFunc::LtreeNlevel => match args.first() {
+            Some(Datum::Ltree(path)) => Datum::Int4(ltree::nlevel(path)),
+            Some(Datum::Text(path)) => Datum::Int4(ltree::nlevel(&ltree::from_text(path)?)),
+            _ => Datum::Null,
+        },
+        CatalogFunc::LtreeToText => match args.first() {
+            Some(Datum::Ltree(path)) => Datum::Text(path.clone()),
+            _ => Datum::Null,
+        },
+        CatalogFunc::TextToLtree => match args.first() {
+            Some(Datum::Text(path) | Datum::Ltree(path)) => Datum::Ltree(ltree::from_text(path)?),
+            _ => Datum::Null,
+        },
         CatalogFunc::RangeLowerInc
         | CatalogFunc::RangeUpperInc
         | CatalogFunc::RangeLowerInf

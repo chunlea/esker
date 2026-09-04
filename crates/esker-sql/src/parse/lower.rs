@@ -6631,6 +6631,11 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         // **And `xml`**, which `sqlparser` has no variant for either. `xml_test.rb` writes
         // `t.xml "payload"`, which the adapter sends as the bare word.
         "xml" => Some(ColumnType::Xml),
+        // **And `ltree`**, the third extension type to reach a column, by the road `hstore` and
+        // `citext` take: `sqlparser` has no variant, so it is a `Custom` name here.
+        "ltree" => Some(ColumnType::Ltree),
+        // **A pattern, not a path** — see [`crate::value::ltree`]'s `matches`.
+        "lquery" => Some(ColumnType::LQuery),
         // **`"bit"` quoted is not `bit` bare, and the difference is a typmod.** The keyword in a
         // cast is the grammar's `bit(1)` — `'101'::bit` is `1`, truncated — while the *quoted*
         // name is the type with no length, so `'101'::"bit"` is `101`. Measured, and it is why a

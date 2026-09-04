@@ -76,6 +76,7 @@ mod tests {
             | ColumnType::BitArray
             | ColumnType::VarBitArray
             | ColumnType::XmlArray
+            | ColumnType::LtreeArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
@@ -223,6 +224,16 @@ mod tests {
                 .boxed(),
             // Well-formed content, kept **unchanged**: there is no canonical form to normalise
             // towards, so what a round trip has to reproduce is the characters as written.
+            // The key rewrite's own fixtures: a dot beside a `-` is what makes the order differ
+            // from the bytes', and the ordering property here is the one that would catch it.
+            ColumnType::Ltree => proptest::sample::select(vec![
+                "a.b", "a-b", "ab", "a", "a.a", "b", "A", "a.B", "1.2.3", "",
+            ])
+            .prop_map(|text| Datum::Ltree(text.to_owned()))
+            .boxed(),
+            ColumnType::LQuery => proptest::sample::select(vec!["a.*", "*", "a|b", "!a", "a@"])
+                .prop_map(|text| Datum::Text(text.to_owned()))
+                .boxed(),
             ColumnType::Xml => proptest::sample::select(vec![
                 "<foo>bar</foo>",
                 "  <a/>  ",

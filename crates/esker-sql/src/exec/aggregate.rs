@@ -213,7 +213,13 @@ impl Aggregation {
                 // exist` — the eighth member of that list, and the one that could not have been
                 // guessed from `json` being in it, since `json` has no ordering at all and this
                 // refusal is about the aggregate rather than the order.
-                | ColumnType::Xml => undefined(),
+                | ColumnType::Xml
+                // **And an `ltree`**, which is the sharpest of the list: the type is fully
+                // ordered *and* indexable on a real server — `ORDER BY path` and `CREATE INDEX`
+                // both work — and `min(ltree)` is still `42883 function min(ltree) does not
+                // exist`. Nothing about the ordering implies the aggregate; ADR 0031's rule, one
+                // type longer.
+                | ColumnType::Ltree => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

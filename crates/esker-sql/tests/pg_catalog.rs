@@ -269,6 +269,10 @@ fn activerecord_s_four_type_map_queries_answer() {
             // are what a real server's are.
             vec!["16400", "hstore", "0", ",", "hstore_in", "\\N", "b", "0"],
             vec!["16402", "citext", "0", ",", "citextin", "\\N", "b", "0"],
+            // **`ltree` is one of the forty names too**, and had been answering nothing. An
+            // extension's oid is above 16384 and differs per database on a real server, which is
+            // why the adapter reads this row by `typname` and why the number here is ours.
+            vec!["16404", "ltree", "0", ",", "ltree_in", "\\N", "b", "0"],
         ]
     );
 

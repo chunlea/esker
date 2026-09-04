@@ -184,6 +184,9 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // value's, so the row keeps the user's capitals and only the key below is folded.
         Datum::Text(v)
         | Datum::Citext(v)
+        // **An ltree is stored as it was written** for the same reason a citext is: what differs
+        // from `text` is the *comparison*, and the row keeps the value.
+        | Datum::Ltree(v)
         | Datum::Hstore(v)
         | Datum::Range { text: v, .. }
         | Datum::Geometry { text: v, .. } => {
@@ -477,7 +480,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
         | ColumnType::VarBitArray
-        | ColumnType::XmlArray => return decode_array(ty, bytes),
+        | ColumnType::XmlArray
+        | ColumnType::LtreeArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -502,6 +506,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Xml
+        | ColumnType::Ltree
+        | ColumnType::LQuery
         | ColumnType::Hstore
         | ColumnType::Citext
         | ColumnType::TsRange
@@ -702,6 +708,13 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // equality, and a unique index therefore refuses two rows differing only in case — which
         // is what `validates_uniqueness_of` is enforced by. The *row* still holds the spelling.
         Datum::Citext(v) => codec::encode_bytes(v.to_lowercase().as_bytes(), out),
+        // **The separator, lowered below every byte a label can hold.** ltree compares label by
+        // label, so `'a.b' < 'a-b'` is true — where the same two strings compare the other way as
+        // bytes, because `.` is 0x2E and `-` is 0x2D. A label is `A-Za-z0-9_-` or a non-ASCII
+        // letter, so `-` at 0x2D is the lowest byte one can start with, and rewriting `.` to
+        // [`LTREE_KEY_SEPARATOR`] makes plain byte order reproduce PostgreSQL's exactly. Unlike
+        // citext's fold it is **reversible**, so an ltree key decodes to the value it came from.
+        Datum::Ltree(v) => codec::encode_bytes(v.replace('.', LTREE_KEY_SEPARATOR).as_bytes(), out),
         Datum::Bytea(v) => codec::encode_bytes(v, out),
         // **The one encoding here that normalises**, and it has to: `1.0` and `1.00` are
         // different values of this type that *compare equal*, and an index key whose bytes
@@ -821,6 +834,7 @@ const NOT_A_KEY: &str = "an index key column of type json, jsonb, hstore or a ra
 fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
     Ok(match ty {
         ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
+        ColumnType::Ltree => Datum::Ltree(text_from_utf8(body)?),
         ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
         // **The kind comes from the column**, which is where it is known: the bytes are only the
         // canonical text, exactly as a range's are.
@@ -861,6 +875,8 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Jsonb
+        // A pattern is a validated string, which is `json`'s shape.
+        | ColumnType::LQuery
         | ColumnType::Xml => Datum::Text(text_from_utf8(body)?),
         _ => Datum::Bytea(body.to_vec()),
     })
@@ -895,12 +911,22 @@ pub fn range_subtype(ty: ColumnType) -> ColumnType {
 /// unique index over one refuse two rows differing in case, and why an index is not where a citext
 /// *value* is read back from; the row is. `Datum::Citext` says which of the two a caller has, so
 /// confusing them is a type error rather than a wrong spelling.
+/// The byte an ltree index key uses where the value has a `.`.
+///
+/// Any byte below `-` (0x2D) would do — that is the lowest a label can start with — and `\x01` is
+/// chosen because no ltree label can contain it at all, which is what makes the rewrite a
+/// bijection rather than a fold.
+const LTREE_KEY_SEPARATOR: &str = "\u{1}";
+
 fn decode_key_text(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let (body, rest) = codec::decode_bytes(bytes)
         .map_err(|error| corrupt(format!("index key column: {error}")))?;
     let text = text_from_utf8(&body)?;
     Ok(match ty {
         ColumnType::Citext => (Datum::Citext(text), rest),
+        // The rewrite above, undone: the key is the value with its separators lowered, and
+        // nothing else, so the value comes straight back out of it.
+        ColumnType::Ltree => (Datum::Ltree(text.replace(LTREE_KEY_SEPARATOR, ".")), rest),
         _ => (Datum::Text(text), rest),
     })
 }
@@ -1064,6 +1090,13 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Jsonb
             | ColumnType::Xml
             | ColumnType::XmlArray
+            // **`ltree[]` is not a key and `ltree` is.** An array key is built out of its
+            // element's key encoding, and the element's here is the separator rewrite — which is
+            // right for one path and has nowhere to put the array's own delimiters.
+            | ColumnType::LtreeArray
+            // **A pattern is not a key**: it has no comparison at all, which is `json`'s reason
+            // and the reason a column is never declared one.
+            | ColumnType::LQuery
             | ColumnType::Point
             | ColumnType::Hstore
             | ColumnType::HstoreArray
@@ -1281,6 +1314,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // of its own, so there is no comparison for a byte-ordered key to reproduce.
         | ColumnType::Xml
         | ColumnType::XmlArray
+        // `ltree[]` for the array half of that: see `is_index_key`.
+        | ColumnType::LtreeArray
+        | ColumnType::LQuery
         // **A point joins them with the sharpest reason of the four**: `json` has no equality
         // with another type, an hstore's *order* is not its text's, a range's order is not its
         // canonical text's — and a point has no equality even with itself, so there is no order
@@ -1306,7 +1342,11 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Polygon
         | ColumnType::Circle
         | ColumnType::Line => Err(not_a_key())?,
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Citext
+        | ColumnType::Ltree => {
             return decode_key_text(ty, bytes);
         }
 
@@ -1975,6 +2015,7 @@ mod tests {
             | ColumnType::CidrArray
             | ColumnType::MacAddrArray
             | ColumnType::XmlArray
+            | ColumnType::LtreeArray
             | ColumnType::BitArray
             | ColumnType::VarBitArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
@@ -2096,6 +2137,16 @@ mod tests {
                 .boxed(),
             // Well-formed content, and each of these round-trips **unchanged**: the type has no
             // canonical form to normalise towards, so the encoding is all there is to check.
+            // **Every shape the key rewrite has to survive**: a dot, a `-` that must sort above
+            // it, a prefix pair, and the empty path.
+            ColumnType::Ltree => proptest::sample::select(vec![
+                "a.b", "a-b", "ab", "a", "a.a", "b", "A", "a.B", "1.2.3", "",
+            ])
+            .prop_map(|text: &str| Datum::Ltree(text.to_owned()))
+            .boxed(),
+            ColumnType::LQuery => proptest::sample::select(vec!["a.*", "*", "a|b", "!a", "a@"])
+                .prop_map(|text: &str| Datum::Text(text.to_owned()))
+                .boxed(),
             ColumnType::Xml => proptest::sample::select(vec![
                 "<foo>bar</foo>",
                 "  <a/>  ",

@@ -1089,9 +1089,12 @@ fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
 /// lowering, which has no catalog to ask (`crate::parse::lower`), and every statement the suite
 /// sends installs the extension first — so it is a gap nothing measured reaches, recorded here
 /// rather than in a divergence nothing would exercise.
-const AVAILABLE_EXTENSIONS: [(&str, &str); 5] = [
+const AVAILABLE_EXTENSIONS: [(&str, &str); 6] = [
     ("citext", "1.8"),
     ("hstore", "1.8"),
+    // Measured on the oracle, like the rest: `ltree` is at **1.3** where the two string
+    // extensions are at 1.8.
+    ("ltree", "1.3"),
     ("pgcrypto", "1.4"),
     ("plpgsql", "1.0"),
     ("uuid-ossp", "1.1"),
@@ -1108,6 +1111,7 @@ pub fn extension_types(extension: &str) -> &'static [ColumnType] {
     match extension {
         "citext" => &[ColumnType::Citext],
         "hstore" => &[ColumnType::Hstore, ColumnType::HstoreArray],
+        "ltree" => &[ColumnType::Ltree, ColumnType::LtreeArray],
         _ => &[],
     }
 }
@@ -1874,6 +1878,9 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Jsonb => "jsonb",
         ColumnType::Xml => "xml",
         ColumnType::XmlArray => "_xml",
+        ColumnType::Ltree => "ltree",
+        ColumnType::LtreeArray => "_ltree",
+        ColumnType::LQuery => "lquery",
         ColumnType::Hstore => "hstore",
         ColumnType::Citext => "citext",
         ColumnType::TsRange => "tsrange",
@@ -2011,6 +2018,11 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         // **And an `xml`**, which is `U` and not `S`: it is a string to a reader and a
         // user-defined type to `pg_type`. Measured.
         | ColumnType::Xml
+        // **`U` for `ltree` too**, measured — an extension type is "user" rather than "string",
+        // the same answer `hstore` gets and the one the adapter's boot query reads.
+        | ColumnType::Ltree
+        // `U` too, measured beside `ltree`'s.
+        | ColumnType::LQuery
         | ColumnType::Hstore
         | ColumnType::Uuid
         // **And a `macaddr`**, which a real server groups with them rather than with the two
@@ -2026,7 +2038,7 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`, all seven.
@@ -2110,7 +2122,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
         | ColumnType::VarBitArray
-        | ColumnType::XmlArray => "array_in",
+        | ColumnType::XmlArray
+        | ColumnType::LtreeArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -2120,6 +2133,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",
         ColumnType::Xml => "xml_in",
+        // `ltree_in`, the name the adapter reads to decide the type is an ltree.
+        ColumnType::Ltree => "ltree_in",
+        ColumnType::LQuery => "lquery_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
         ColumnType::TsRange => "tsrange_in",
