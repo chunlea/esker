@@ -1,0 +1,16 @@
+crates/esker-sim/src/mech/sweep.rs
+  h_44076b318daf9c 223-235,238-242,345-367
+crates/esker-store/tests/sim_sweep.rs
+  h_44076b318daf9c 35,301-373,465,482-483,498-501,562-565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ea1135fb50e1ae72c10f1494a777304e236eb63d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
