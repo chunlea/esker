@@ -3585,22 +3585,22 @@ fn lower_sequence_function(
     Ok(plan::Expr::Sequence(Box::new(call)))
 }
 
-/// A sequence's name, as it is written inside `nextval`'s string argument.
+/// A sequence's name, as it is written inside `nextval`'s string argument — **carried, not
+/// parsed**.
 ///
-/// Read as an identifier, because that is what it is: unquoted text folds to lower case and text
-/// inside double quotes does not. A schema qualifier is dropped rather than refused —
-/// `pg_get_serial_sequence` answers `public.t_id_seq` and clients pass that straight back, so
-/// refusing it would break the round trip a real server supports; there is one schema here, so
-/// `public.` names it.
+/// It used to be read here: a literal `public.` prefix stripped, one pair of surrounding quotes
+/// taken off the whole string, and the rest folded. That is a name parser, and it was the third in
+/// this crate — `catalog::parse_qualified` is the one `::regclass` uses and it handles the same
+/// input. Two parsers of one grammar disagree eventually, and this pair disagreed on the spelling
+/// `ActiveRecord` sends more than any other: `"public"."accounts_id_seq"` has no `public.` prefix
+/// to strip and is not one quoted identifier, so it came out as the nonsense `public"."accounts_id_seq`
+/// and every fixture load in run 50 failed on it — 4,873 tests in 93 files.
+///
+/// So the text travels whole and `crate::exec::Executor::require_sequence` resolves it, which is
+/// also the only place that *can* resolve it: a schema qualifier now names a real schema, and
+/// picking the right one needs the catalog and the `search_path` that a lowering does not have.
 fn sequence_reference(text: &str) -> String {
-    let bare = text.strip_prefix("public.").unwrap_or(text);
-    match bare
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    {
-        Some(quoted) => fold_identifier(quoted, true).0,
-        None => fold_identifier(bare, false).0,
-    }
+    text.to_owned()
 }
 
 /// `ARRAY[…]` as a **value**, folded where every element is a constant.

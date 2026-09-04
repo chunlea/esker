@@ -1,0 +1,79 @@
+# A **schema-qualified sequence name**, as a real PostgreSQL 19beta1 resolves it.
+#
+# Run 50's top regression: **4,873 tests in 93 files**, every one of them
+# `PG::UndefinedTable: relation "public"."accounts_id_seq" does not exist`, raised out of
+# `ActiveRecord::FixtureSet.insert` — which is to say out of `reset_pk_sequence!`, which every
+# fixture load calls.
+#
+# The adapter's `pk_and_sequence_for` builds the sequence's name from `pg_namespace.nspname` and
+# `pg_class.relname` and hands it to `Utils.extract_schema_qualified_name`, so once this node
+# started answering that query with a namespace the name came back **qualified**. `quote_table_name`
+# then makes it `"public"."accounts_id_seq"` and `reset_pk_sequence!` passes that string to
+# `::regclass` and to `setval`:
+#
+#     SELECT seqmin FROM pg_sequence WHERE seqrelid = '"public"."accounts_id_seq"'::regclass
+#     SELECT setval('"public"."accounts_id_seq"', 1, false)
+#
+# Both take a *string* holding a qualified, quoted name and resolve it as a relation. Nothing was
+# wrong with the adapter's new name: what was missing here is that a quoted qualified name resolves
+# at all.
+#
+# Captured in one session against the `esker-pg19` container, inside `BEGIN … ROLLBACK`, error
+# probes in `SAVEPOINT` / `ROLLBACK TO`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Four spellings name one sequence**, and all four must resolve: `cap_id_seq`,
+#     `"cap_id_seq"`, `public.cap_id_seq` and `"public"."cap_id_seq"`. `setval` counts up through
+#     all four here, which is what proves they are the same object rather than four that happen to
+#     answer.
+#   * **A quoted part keeps its case and an unquoted one folds.** `'"PUBLIC"."cap_id_seq"'` is
+#     `42P01` on a server where `PUBLIC.cap_id_seq` would resolve — the quotes are the whole
+#     difference, and a resolver that strips them without folding the rest gets it backwards.
+#   * **The error prints the name with its quotes gone and its parts joined by a dot**:
+#     `relation "PUBLIC.cap_id_seq" does not exist`, not `"PUBLIC"."cap_id_seq"`. So the message is
+#     about the name *as resolved*, not as written.
+#   * **A relation of the wrong kind is `42809` and names it BARE**: `nextval('"public"."cap"')` is
+#     `"cap" is not a sequence`, unqualified, because by then the name has resolved and what is
+#     being reported is the relation.
+#   * **`pg_get_serial_sequence` answers unquoted** — `public.cap_id_seq` — which is the form that
+#     goes back out to `setval` after `quote_table_name` has put the quotes on.
+#   * A bare name resolves along the `search_path` and nowhere else: `other_id_seq` lives in
+#     `capsch` and is `42P01` from `public`.
+BEGIN		-
+CREATE TABLE cap (id bigserial primary key, n text)		-
+CREATE SCHEMA capsch		-
+CREATE TABLE capsch.other (id bigserial primary key)		-
+SELECT 'a', pg_get_serial_sequence('cap','id'), pg_get_serial_sequence('capsch.other','id')		a|public.cap_id_seq|capsch.other_id_seq
+SELECT 'b', setval('cap_id_seq', 5, true)		b|5
+SELECT 'c', setval('"cap_id_seq"', 6, true)		c|6
+SELECT 'd', setval('public.cap_id_seq', 7, true)		d|7
+SELECT 'e', setval('"public"."cap_id_seq"', 8, true)		e|8
+SELECT 'f', nextval('"public"."cap_id_seq"')		f|9
+SELECT 'g', currval('"public"."cap_id_seq"')		g|9
+SELECT 'h', '"public"."cap_id_seq"'::regclass::oid = 'cap_id_seq'::regclass::oid		h|t
+SELECT 'i', 'public.cap_id_seq'::regclass::oid = 'cap_id_seq'::regclass::oid		i|t
+SELECT 'j', seqmin FROM pg_sequence WHERE seqrelid = '"public"."cap_id_seq"'::regclass		j|1
+SELECT 'k', setval('"capsch"."other_id_seq"', 3, true)		k|3
+SELECT 'l', nextval('capsch.other_id_seq')		l|4
+SAVEPOINT s1		-
+SELECT nextval('"PUBLIC"."cap_id_seq"')	!42P01 relation "PUBLIC.cap_id_seq" does not exist
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT nextval('nosuchschema.cap_id_seq')	!42P01 relation "nosuchschema.cap_id_seq" does not exist
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT nextval('"public"."nosuch_seq"')	!42P01 relation "public.nosuch_seq" does not exist
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT nextval('"public"."cap"')	!42809 "cap" is not a sequence
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SELECT nextval('other_id_seq')	!42P01 relation "other_id_seq" does not exist
+ROLLBACK TO s5		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'cap%'	bigint	0
