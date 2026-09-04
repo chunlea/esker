@@ -1,0 +1,19 @@
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_01f6267d2811cb 2597-2601
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ba560bd409a988ad1aebd46e412337f2f95ea0cd",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
