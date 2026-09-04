@@ -1,0 +1,23 @@
+crates/esker-pd/tests/failover.rs
+  s_6f7019c05b578b::t_c8aeefc6fea303 1105-1166
+docs/DESIGN.md
+  s_6f7019c05b578b::t_c6099386a3c456 535-563,690-692,995-998,1001-1004
+docs/plans/phase-15-pd-ha.md
+  s_6f7019c05b578b::t_85579260d10256 588-637
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b066370474cf55e49db2141e018f711233a5facc",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
