@@ -172,17 +172,31 @@ the arena skiplist's `unsafe` could never have been checked by the tool the ADR 
 the run would abort inside a dependency before reaching any of it. With the dependency gone,
 
 ```
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p esker-engine --lib -- memtable
+cargo +nightly miri test -p esker-engine --lib -- memtable
 ```
 
 runs the module through, which is what the gate should have been all along.
 
-**`-Zmiri-disable-isolation` is part of the command, not a convenience.** Without it the run aborts
-at `the_skiplist_answers_what_a_sorted_map_would`: proptest's default `FileFailurePersistence` wants
-to write a `.proptest-regressions` file beside the source, so it calls `std::env::current_dir`, and
-Miri refuses `getcwd` under isolation. The harness dies there with 22 tests unrun — a *failure to
-run the gate*, which is easy to mistake for the gate failing. The ignored test in the count is
-`relaxed_publication_is_a_data_race`, the red-first control below, which is meant to fail.
+**That command used to need `MIRIFLAGS=-Zmiri-disable-isolation`, and the code now makes the flag
+unnecessary.** Without it the run aborted at `the_skiplist_answers_what_a_sorted_map_would`:
+proptest's default `FileFailurePersistence` wants to write a `.proptest-regressions` file beside
+the source, so it calls `std::env::current_dir`, and Miri refuses `getcwd` under isolation. The
+harness died there with the rest of the module unrun — a *failure to run the gate*, which is easy
+to mistake for the gate failing, and which is why this was worth three lines of code rather than a
+sentence of documentation (`docs/plans/debts-v1.md` #8, closed in `docs/plans/debt-c7.md`).
+`differential.rs`'s `config()` sets `failure_persistence: None` under `cfg(miri)` and nothing else;
+the native run of the same property keeps its 256 cases and still records what it finds, because a
+Miri run is a gate rather than the place a counterexample is first met.
+
+Both arms measured at that change, on the same machine within a few minutes of each other:
+
+| `cargo +nightly miri test -p esker-engine --lib -- memtable` | result |
+|---|---|
+| without the fix | aborts inside `proptest`'s `test_runner/failure_persistence/file.rs:89`, `error: aborting due to 1 previous error` |
+| with the fix | **36 passed, 1 ignored, 0 failed**, 117.9 s |
+
+The ignored test in the count is `relaxed_publication_is_a_data_race`, the red-first control below,
+which is meant to fail.
 
 One thing had to change for that to be true, and it was a test rather than the code:
 `readers_and_writers_run_concurrently` ran four readers over a two-thousand-entry list five

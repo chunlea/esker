@@ -2,8 +2,8 @@
 
 **Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
 list — three items that were reported as open turned out to be closed, and two that were not on the
-list are open (#5 and #8). #9 was opened and closed in the same wave and is gone from this table;
-§2 records it. Each row names its site, a size, and who it belongs to.
+list are open (#5 and #8). Two more were opened and closed within a wave and are gone from this
+table; §2 records both. Each row names its site, a size, and who it belongs to.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -41,6 +41,19 @@ PostgreSQL 19 returns the row. `expand_views` walked `FROM` and the joins and `e
 with it, so neither saw a name that appears only inside a `WHERE` — the cheap check reported no view
 and the expansion was therefore never run. Both now recurse through expression subqueries, reusing
 `exec::subquery`'s existing walks rather than adding a third. `tests/describe_over_a_view.rs`.
+
+### `ORDER BY <name>` preferring an output column — **closed the unit after it was opened**
+
+`order_keys` implemented the narrow half of PostgreSQL's rule (two output columns of one name are
+`42702`) and its own comment said the *preference* would be invented because nothing had measured
+it. An `ALTER TYPE` capture measured it by accident: the corpus wrote `SELECT m::text FROM t ORDER
+BY m`, and the two servers disagreed about the **ordering** rather than about the enum, because
+`m::text` is *named* `m` and PostgreSQL resolves `ORDER BY` against the select list first. One
+keystroke — an alias — changes the answer, which is what makes an enum the sharpest way to see it.
+
+Only a projection whose derived name is not its own column's is substituted, which is the whole of
+what differs and leaves every aggregated query on the path it was already taking.
+`tests/order_by_output_column.rs`.
 
 ## 3. ADR numbering
 

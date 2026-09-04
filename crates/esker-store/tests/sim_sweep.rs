@@ -32,7 +32,7 @@ use esker_proto::{
     Operator, Peer, PeerRole, RawKvReq, Region, RequestHeader, Server, ServerHandle, Service,
     TransportConfig, TxnKvReq, TxnMutation,
 };
-use esker_sim::mech::sweep::{Case, Expected, Observed, PdAnswer, cases, check};
+use esker_sim::mech::sweep::{Case, Expected, Observed, PdAnswer, RegionSpan, cases, check};
 use esker_store::pd::{FakePd, PdClient};
 use esker_store::server::RaftOptions;
 use esker_store::split::SplitOptions;
@@ -298,6 +298,79 @@ async fn seed_all_three_families(store: &Arc<Store>, region: &Region) {
 /// is not about. That is the exact shape this lane exists to avoid, and it is cheaper to assert
 /// than to reason about — it is what turned the "PD has never heard of the range" case from a
 /// green test into a documented skip.
+/// The precondition the whole table rests on, asserted on the store the value is read from.
+///
+/// The wait in [`observe`] used to watch the **first** store's view of peer 2's role — which
+/// proves the conf change committed on the leader, not that it applied here — while `hosted` is
+/// read from the **second**. Under load the two diverged: the leader was at `conf_ver` 3 while
+/// this store still held 2, and every case in the table is a relation measured against *this*
+/// store's number.
+///
+/// [`rebase`] makes a lagging base harmless, so this is the precondition rather than the fix. It
+/// is here so that a wait which goes back to watching a peer that is not the one under test fails
+/// by name, instead of quietly running four cases about a learner.
+fn a_voter_here_and_not_only_on_the_leader(hosted: &Region) {
+    assert!(
+        hosted
+            .peers
+            .iter()
+            .any(|peer| peer.peer_id == 2 && peer.role == PeerRole::Voter),
+        "this store hosts {:?}, and every case is about a voter that was removed rather than a \
+         learner that never arrived",
+        hosted.peers
+    );
+}
+
+/// The `conf_ver` the case table is written against.
+///
+/// One rather than zero, and that is the whole of the third defect below: `cases` builds its
+/// "older" case with `hosted_conf_ver.saturating_sub(1)`, so a table generated at **zero** has an
+/// "older" record of zero — byte for byte the same record as the "same membership" case. The case
+/// named *an older membership than this store's* had therefore never once put an older record in
+/// front of the sweep, at any load, in any run. Measured, not deduced: the two cases printed
+/// `answer_conf_ver=3` alike.
+const TABLE_BASE: u64 = 1;
+
+/// Puts a case written against [`TABLE_BASE`] onto the `conf_ver` the cluster actually reached.
+///
+/// # The base is a fact of the run, and it used to be a constant
+///
+/// This file used to re-express the table by hard-coding `hosted.conf_ver = 3` and shifting PD's
+/// answer by `+3`, with a comment saying *"`AddPeer` plus the promotion move it to 3"*. That is a
+/// number reality supplies, written down as though the test controlled it, and the model's whole
+/// meaning rests on it: every case is a *relation* — newer, same, older — between PD's record and
+/// this store's, and the relation is only what the table says while the two are measured from the
+/// same base.
+///
+/// When the store's real `conf_ver` was 2 and the table assumed 3, the case named *the same
+/// membership this store already has* placed a record that was a `conf_ver` **newer** than the store
+/// and did not name it — which is positive evidence of a removal and exactly what ADR 0034 says to
+/// reclaim on. The test then failed with `ReclaimedWrongly` against a store that had done the
+/// right thing. Reading the base rather than assuming it is what makes the case names true.
+fn rebase(case: &Case, real_base: u64) -> Case {
+    assert!(
+        real_base >= TABLE_BASE,
+        "case {:?}: the cluster reached conf_ver {real_base}, below the table's base of \
+         {TABLE_BASE}, so the \"older\" case cannot be expressed",
+        case.name
+    );
+    let shift = |conf_ver: u64| conf_ver + real_base - TABLE_BASE;
+    Case {
+        hosted: RegionSpan {
+            conf_ver: shift(case.hosted.conf_ver),
+            ..case.hosted.clone()
+        },
+        answer: match &case.answer {
+            PdAnswer::Silent => PdAnswer::Silent,
+            PdAnswer::Holds(record) => PdAnswer::Holds(RegionSpan {
+                conf_ver: shift(record.conf_ver),
+                ..record.clone()
+            }),
+        },
+        ..case.clone()
+    }
+}
+
 fn place_and_verify(pd: &Arc<FakePd>, case: &Case, hosted: &Region) {
     let PdAnswer::Holds(record) = &case.answer else {
         unreachable!("the run loop skips the silent case; see the comment there")
@@ -389,7 +462,7 @@ async fn observe(case: &Case) -> Observed {
     })
     .await;
     wait_for("the second store's peer to become a voter", || {
-        first.store.regions().get(1).is_some_and(|state| {
+        second.store.regions().get(1).is_some_and(|state| {
             state
                 .region()
                 .peers
@@ -406,6 +479,8 @@ async fn observe(case: &Case) -> Observed {
     let hosted = second.store.regions().get(1).unwrap().region().clone();
     let keys_before = keys_held(&second.store);
 
+    a_voter_here_and_not_only_on_the_leader(&hosted);
+
     // **The removed peer's state, without the removal.** Stopping the first store leaves the
     // second's peer leaderless against a group of two it cannot reach, which is what a peer the
     // cluster has replaced is permanently — and what the probe counts rounds of. Doing it this
@@ -420,6 +495,10 @@ async fn observe(case: &Case) -> Observed {
     })
     .await;
 
+    // **The case is put onto the conf_ver this cluster actually reached**, rather than the one the
+    // table guessed. Every case is a relation between PD's record and this store's, and a relation
+    // measured from two different bases is a different case from the one the name claims.
+    let case = &rebase(case, hosted.epoch.conf_ver);
     place_and_verify(&pd, case, &hosted);
 
     // Long enough for the throttle (50 leaderless rounds at a 5 ms tick) several times over, so a
@@ -480,24 +559,10 @@ async fn the_sweep_reclaims_on_evidence_and_never_otherwise() {
     let mut ran = 0;
     let mut reclaimed = 0;
     let mut skipped: Vec<&'static str> = Vec::new();
-    for case in cases(2, 1, 0) {
-        // The hosted conf_ver is whatever the cluster reached by the time the case runs, so the
-        // table's relative values are re-expressed against it inside `observe`. `AddPeer` plus the
-        // promotion move it to 3.
-        let case = Case {
-            hosted: esker_sim::mech::sweep::RegionSpan {
-                conf_ver: 3,
-                ..case.hosted
-            },
-            answer: match case.answer {
-                PdAnswer::Silent => PdAnswer::Silent,
-                PdAnswer::Holds(record) => PdAnswer::Holds(esker_sim::mech::sweep::RegionSpan {
-                    conf_ver: record.conf_ver + 3,
-                    ..record
-                }),
-            },
-            ..case
-        };
+    for case in cases(2, 1, TABLE_BASE) {
+        // The table is written against `TABLE_BASE`; `observe` puts it onto the conf_ver the
+        // cluster actually reached, because that is a fact of the run and not a constant. It used
+        // to be re-expressed here against a hard-coded 3, which is the defect `rebase` describes.
         if case.overlapping_hosted {
             // Two overlapping regions cannot both be in one store's `RegionMap`, so this state
             // only arises from a *stale* record — a parent narrowed by a split, retiring against
