@@ -1260,7 +1260,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::OidArray
-        | ColumnType::CitextArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::CitextArray
+        | ColumnType::XmlArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
@@ -1295,6 +1296,10 @@ fn placeholder(ty: ColumnType) -> Datum {
         // The empty string is not a document, so a `json` placeholder is the smallest one that
         // is. It only ever stands in for a type while a `Describe` is answered.
         ColumnType::Json | ColumnType::Jsonb => Datum::Text("null".to_owned()),
+        // The empty string *is* well-formed XML content, so an `xml` placeholder can be the
+        // smallest thing there is. It only ever stands in for a type while a `Describe` is
+        // answered.
+        ColumnType::Xml => Datum::Text(String::new()),
         ColumnType::Bool => Datum::Bool(false),
         ColumnType::Bytea => Datum::Bytea(Vec::new()),
         ColumnType::TimestampTz => Datum::TimestampTz(0),

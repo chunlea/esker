@@ -281,6 +281,17 @@ pub enum ColumnType {
     Circle,
     /// See [`ColumnType::Lseg`]. `{A,B,C}`, and `A` and `B` may not both be zero.
     Line,
+    /// PostgreSQL's `xml`: **`json`'s shape with a different validator**.
+    ///
+    /// A string stored exactly as it was sent — `'  <a/>  '` keeps its spaces and `'<a></a>'` does
+    /// not become `'<a/>'` — once it is known to be well-formed XML *content*, which may be a bare
+    /// text run and not only a document. Like `json` it has no equality operator at all, so it is
+    /// not an index key, cannot be `DISTINCT`ed and cannot be ordered
+    /// ([ADR 0042](../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+    Xml,
+    /// `xml[]`. `xml_test.rb` declares no array; the type exists because a real server's `xml` has
+    /// `typarray = 143`, and a base type whose `typarray` is `0` is what cost run 53 its 43 tests.
+    XmlArray,
     /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
     /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
     /// `can't quote Array` tests.
@@ -426,7 +437,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 76] = [
+    pub const ALL: [ColumnType; 78] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -503,6 +514,8 @@ impl ColumnType {
         ColumnType::Polygon,
         ColumnType::Circle,
         ColumnType::Line,
+        ColumnType::Xml,
+        ColumnType::XmlArray,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in
@@ -911,7 +924,11 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
         (held, wanted),
         (
             ColumnType::Text,
-            ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Json | ColumnType::Jsonb
+            ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Xml
         )
     )
 }

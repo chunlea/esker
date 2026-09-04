@@ -75,6 +75,7 @@ mod tests {
             | ColumnType::MacAddrArray
             | ColumnType::BitArray
             | ColumnType::VarBitArray
+            | ColumnType::XmlArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
@@ -220,6 +221,17 @@ mod tests {
             ColumnType::Citext => ".*"
                 .prop_map(|text: String| Datum::Citext(text.to_lowercase()))
                 .boxed(),
+            // Well-formed content, kept **unchanged**: there is no canonical form to normalise
+            // towards, so what a round trip has to reproduce is the characters as written.
+            ColumnType::Xml => proptest::sample::select(vec![
+                "<foo>bar</foo>",
+                "  <a/>  ",
+                "<a></a>",
+                "plain text",
+                "",
+            ])
+            .prop_map(|text| Datum::Text(text.to_owned()))
+            .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",
