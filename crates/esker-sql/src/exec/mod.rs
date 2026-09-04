@@ -3248,7 +3248,23 @@ impl Executor {
                 view.columns.iter().map(|c| c.name.clone()).collect(),
             )));
         }
-        Ok(())
+        // **And every `FROM` inside an expression subquery**, which is a relation list of its own:
+        // `WHERE id IN (SELECT id FROM v)` names a view where no `FROM` walk reaches it. Recursive
+        // rather than one level down, because a subquery may hold another one — and it runs after
+        // the `FROM` entries above so that a view *and* a subquery in one statement both expand.
+        let mut nested = Ok(());
+        subquery::for_each_written_expr_mut(select, &mut |expr| {
+            if nested.is_err() {
+                return;
+            }
+            nested = subquery::walk_mut(expr, &mut |expr| {
+                if let crate::plan::Expr::Subquery(sub) = expr {
+                    self.expand_views(txn, &mut sub.select)?;
+                }
+                Ok(())
+            });
+        });
+        nested
     }
 
     /// A view's stored `SELECT`, parsed and lowered.
@@ -3285,7 +3301,22 @@ impl Executor {
                 each(&entry.name)?;
             }
         }
-        Ok(())
+        // **And the ones named only inside an expression**: `WHERE id IN (SELECT id FROM v)` puts
+        // a relation name nowhere near the `FROM`, and a walk that stopped at the `FROM` reported
+        // no view for a statement that names one — so `expand_views` was never called and the
+        // name reached the planner as a table that does not exist.
+        let mut nested = Ok(());
+        subquery::for_each_written_expr(select, &mut |expr| {
+            subquery::walk(expr, &mut |expr| {
+                if nested.is_err() {
+                    return;
+                }
+                if let crate::plan::Expr::Subquery(sub) = expr {
+                    nested = Self::each_relation_name(&sub.select, each);
+                }
+            });
+        });
+        nested
     }
 
     /// What a `Describe` answers, read through one transaction.

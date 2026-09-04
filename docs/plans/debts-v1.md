@@ -1,8 +1,9 @@
 # Debts still open at v1
 
 **Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
-list — three items that were reported as open turned out to be closed, and three that were not on
-the list are open (#5, #8 and #9). Each row names its site, a size, and who it belongs to.
+list — three items that were reported as open turned out to be closed, and two that were not on the
+list are open (#5 and #8). #9 was opened and closed in the same wave and is gone from this table;
+§2 records it. Each row names its site, a size, and who it belongs to.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -21,7 +22,6 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 | 6 | **`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`.** Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it as a standing flake with an owner and treats the exclusive pass as evidence it is the same contention rather than a defect of its own. | `crates/esker-cli/tests/cluster_start.rs` | small, and may be closed by the per-container network namespaces | cli |
 | 7 | **`esker-sql::join_cost::a_materialised_join_costs_what_it_pairs_and_not_the_cross_product`.** One failure in a full 3,281-test parallel run; 3/3 in isolation and green on the next two full runs. A timing-**ratio** test with a control, so load-sensitive by construction. Unexplained, not diagnosed. | `crates/esker-sql/tests/join_cost.rs` | small to diagnose; unknown to fix | h1 (join cost) |
 | 8 | **The Miri gate needs `-Zmiri-disable-isolation`, which the code could make unnecessary.** proptest's default `FileFailurePersistence` calls `std::env::current_dir` to place a `.proptest-regressions` file, and Miri refuses `getcwd` under isolation, so the run aborts with 22 tests unrun. Setting `failure_persistence: None` under `cfg(miri)` in the memtable's `ProptestConfig` would make the plain documented command true — and matters because the failure looks like the gate *failing* rather than the gate *not running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state the flag. | `crates/esker-engine/src/memtable/differential.rs:316` (`ProptestConfig::with_cases`) | ~3 lines | engine |
-| 9 | **A view named inside an *expression* subquery is not expanded.** `SELECT id FROM t WHERE id IN (SELECT id FROM v)` is `42P01` where PostgreSQL 19 returns the row — measured on both protocols, so it is not a describe gap. `expand_views` walks `FROM` and the joins and `each_relation_name` with it, so neither sees a name that appears only in a `WHERE`. Found while closing `view_test.rb`, which never reaches it. | `crates/esker-sql/src/exec/mod.rs` (`expand_views`, `each_relation_name`) | medium — the walk has to reach expression subqueries, and `plan_subqueries` runs after it | esker-sql |
 
 ## 2. Reported as open, and closed on inspection
 
@@ -32,6 +32,15 @@ Recorded because the next reader will be handed the same list.
 | **promotion under load** | **Closed.** `promotion.rs` reports *"20 of 20 runs green now"*, after six defects each found by reading a trace and pinned by a unit test — "none was found by counting runs". The `#[ignore]` in that file is in prose describing how it was kept failing during the investigation, not an attribute on the test. |
 | **SERIALIZABLE range validation deferred by h1** | **Closed.** Ranges are recorded and validated: `read_ranges` and `record_range` in `crates/esker-sql/src/backend/mod.rs:569,628`, and `serializable.rs` has a phantom test (`a_phantom_in_a_range_two_transactions_read_is_a_conflict`) plus one asserting a savepoint does not lose the check. ADR 0062 §"Phantoms" marks it caught. |
 | **`esker-s3`'s duplicate TLS client** | **Not found as a duplicate.** `tls.rs` (597 lines) is the second implementor of the transport trait ADR 0025 designed for, with its own keep-alive pool — `client.rs` (923 lines) is the S3 protocol above it, not a second copy of it. If the sighting meant the *pool* logic specifically, name the two functions and it can be re-checked; nothing in the tree today reads as a duplicated client. |
+
+### A view named inside an expression subquery — **closed the round after it was opened**
+
+Opened as #9 while `view_test.rb` was being closed, and fixed in the next unit rather than carried:
+`SELECT id FROM t WHERE id IN (SELECT id FROM v)` was `42P01` on **both** protocols, where
+PostgreSQL 19 returns the row. `expand_views` walked `FROM` and the joins and `each_relation_name`
+with it, so neither saw a name that appears only inside a `WHERE` — the cheap check reported no view
+and the expansion was therefore never run. Both now recurse through expression subqueries, reusing
+`exec::subquery`'s existing walks rather than adding a third. `tests/describe_over_a_view.rs`.
 
 ## 3. ADR numbering
 

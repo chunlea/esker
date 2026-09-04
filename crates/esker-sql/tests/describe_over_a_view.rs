@@ -19,13 +19,12 @@
 //! `relation_of` as a table that does not exist. That is the same shape as the derived-table bug
 //! the same function already carries a comment about: a step planning does, and describing did not.
 //!
-//! **What is deliberately not tested here**: a view named inside an *expression* subquery —
-//! `SELECT id FROM t WHERE id IN (SELECT id FROM v)`. `expand_views` walks `FROM` and the joins,
-//! and `each_relation_name` with it, so neither sees a name that only appears inside a `WHERE`.
-//! That is a gap in **both** paths, measured — the simple protocol answers `42P01` for it exactly
-//! as the prepared one does, where PostgreSQL 19 returns the row — so it is not a describe bug and
-//! a test of it belongs with whatever fixes the expansion, not here. `view_test.rb` does not reach
-//! it; it is recorded in `docs/plans/debts-v1.md`.
+//! **A view named inside an *expression* subquery is expanded here too**, and it was not when this
+//! file was first written: `expand_views` walked `FROM` and the joins, and `each_relation_name`
+//! with it, so neither saw a name that appears only inside a `WHERE`. That was a gap in **both**
+//! paths — the simple protocol answered `42P01` for it exactly as the prepared one did, where
+//! PostgreSQL 19 returns the row — so the tests below check both, and the simple-protocol one is
+//! the one that would have caught it first.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -103,4 +102,77 @@ fn describe_and_execute_agree_about_a_view() {
         rows.first().expect("one row").len(),
         "describe promised {described_width} columns and execute sent a different number"
     );
+}
+
+/// **The four-line reproduction.** Measured against PostgreSQL 19, which returns the row.
+///
+/// This is the *simple* protocol, not `Describe` — the gap was in the expansion itself, which both
+/// paths reach, and a test that only asked `Describe` would have called a planner bug a protocol
+/// one.
+#[test]
+fn a_view_inside_an_expression_subquery_is_expanded() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE sq_inner (id bigserial primary key, n int)")
+        .unwrap();
+    node.run("INSERT INTO sq_inner (n) VALUES (5)").unwrap();
+    node.run("CREATE VIEW sq_small AS SELECT id, n FROM sq_inner WHERE n < 10")
+        .unwrap();
+
+    let rows = node.rows("SELECT id FROM sq_inner WHERE id IN (SELECT id FROM sq_small)");
+    assert_eq!(rows.len(), 1, "the row the view admits should come back");
+}
+
+/// And `Describe` answers its shape, which is the half this file is named for.
+#[test]
+fn describe_expands_a_view_named_inside_a_subquery() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE dv_inner (id bigserial primary key, n int)")
+        .unwrap();
+    node.run("CREATE VIEW dv_small AS SELECT id, n FROM dv_inner WHERE n < 10")
+        .unwrap();
+
+    let parsed =
+        parse_statements("SELECT id FROM dv_inner WHERE id IN (SELECT id FROM dv_small)").unwrap();
+    let described = node.executor.describe(&parsed[0], &[]).unwrap();
+    assert_eq!(
+        described
+            .fields
+            .expect("a SELECT returns rows")
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["id"]
+    );
+}
+
+/// **A view inside a subquery inside a subquery**, because the fix is a recursion and a one-level
+/// walk would pass the test above and still be wrong.
+#[test]
+fn a_view_two_subqueries_deep_is_expanded() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE dq_base (id bigserial primary key, n int)")
+        .unwrap();
+    node.run("INSERT INTO dq_base (n) VALUES (3)").unwrap();
+    node.run("CREATE VIEW dq_view AS SELECT id, n FROM dq_base WHERE n < 10")
+        .unwrap();
+
+    let rows = node.rows(
+        "SELECT id FROM dq_base WHERE id IN (SELECT id FROM dq_base WHERE id IN (SELECT id FROM dq_view))",
+    );
+    assert_eq!(rows.len(), 1, "the nested view should be expanded too");
+}
+
+/// **A view named only in an `EXISTS`**, which carries no operand — a walk that looked only at the
+/// left-hand side of an `IN` would miss it.
+#[test]
+fn a_view_inside_an_exists_is_expanded() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE ex_base (id bigserial primary key, n int)")
+        .unwrap();
+    node.run("INSERT INTO ex_base (n) VALUES (7)").unwrap();
+    node.run("CREATE VIEW ex_view AS SELECT id FROM ex_base WHERE n = 7")
+        .unwrap();
+
+    let rows = node.rows("SELECT id FROM ex_base WHERE EXISTS (SELECT 1 FROM ex_view)");
+    assert_eq!(rows.len(), 1, "a view named only in an EXISTS is a view");
 }
