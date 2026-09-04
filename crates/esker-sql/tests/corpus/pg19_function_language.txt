@@ -1,0 +1,41 @@
+BEGIN		-
+SELECT 'r', lanname, lanpltrusted FROM pg_language ORDER BY lanname	text,name,boolean	r|c|f ; r|internal|f ; r|plpgsql|t ; r|sql|t
+CREATE OR REPLACE FUNCTION fl_gen() RETURNS uuid AS $$ SELECT '00000000-0000-0000-0000-000000000009'::uuid $$ LANGUAGE SQL VOLATILE		-
+SELECT 'r', p.proname, l.lanname FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.proname = 'fl_gen'	text,name,name	r|fl_gen|sql
+SAVEPOINT c1		-
+SELECT 'r', fl_gen()::text AS called		r|00000000-0000-0000-0000-000000000009
+ROLLBACK TO c1		-
+CREATE TABLE fl_t (id uuid DEFAULT fl_gen(), name text)		-
+SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name = 'fl_t' AND column_name = 'id'	text,name,character varying	r|id|fl_gen()
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'fl_t'::regclass AND a.attname = 'id'		r|fl_gen()
+SAVEPOINT c2		-
+INSERT INTO fl_t (name) VALUES ('a')		-
+ROLLBACK TO c2		-
+SAVEPOINT c2b		-
+INSERT INTO fl_t (id, name) VALUES ('00000000-0000-0000-0000-000000000009', 'a')		-
+SELECT 'r', id::text, name FROM fl_t		r|00000000-0000-0000-0000-000000000009|a
+ROLLBACK TO c2b		-
+SAVEPOINT c3		-
+CREATE OR REPLACE FUNCTION fl_plain(a integer) RETURNS integer AS $$ SELECT a + 1 $$ LANGUAGE SQL		-
+ROLLBACK TO c3		-
+CREATE OR REPLACE FUNCTION fl_pl() RETURNS integer AS $$ BEGIN RETURN 7; END $$ LANGUAGE plpgsql		-
+SELECT 'r', proname FROM pg_proc WHERE proname = 'fl_pl'	text,name	r|fl_pl
+SAVEPOINT f1		-
+CREATE FUNCTION fl_bad() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE nosuchlang	!42704 language "nosuchlang" does not exist
+ROLLBACK TO f1		-
+SAVEPOINT f2		-
+CREATE FUNCTION fl_c() RETURNS integer AS 'x', 'y' LANGUAGE c	!58P01 could not access file "x": No such file or directory
+ROLLBACK TO f2		-
+DROP FUNCTION IF EXISTS fl_nosuch()		-
+SAVEPOINT f3		-
+DROP FUNCTION fl_nosuch()	!42883 function fl_nosuch() does not exist
+ROLLBACK TO f3		-
+SAVEPOINT f4		-
+DROP FUNCTION fl_gen()	!2BP01 cannot drop function fl_gen() because other objects depend on it DETAIL: default value for column id of table fl_t depends on function fl_gen() HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO f4		-
+DROP TABLE fl_t		-
+DROP FUNCTION fl_gen()		-
+DROP FUNCTION fl_pl()		-
+SELECT 'r', count(*) AS left_over FROM pg_proc WHERE proname IN ('fl_gen','fl_plain','fl_pl')	text,bigint	r|0
+ROLLBACK		-
+SELECT count(*) FROM pg_proc WHERE proname IN ('fl_gen','fl_plain','fl_pl')	bigint	0

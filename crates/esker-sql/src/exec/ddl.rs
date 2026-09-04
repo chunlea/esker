@@ -312,9 +312,40 @@ fn declared_columns(
         {
             kept.default = fold_user_default(kept.default.as_ref(), ty, &def, &kept)?;
         }
+        refuse_unknown_default_function(txn, executor, &kept)?;
         columns.push(kept);
     }
     Ok(columns)
+}
+
+/// Refuses a column `DEFAULT` that calls a function **nobody declared**.
+///
+/// Lowering carries the name out instead of raising, because a name its vocabulary lacks may be a
+/// user's function and only the catalog knows (`crate::parse::lower::column_default`). This is
+/// where that is decided: a declared function is accepted, and anything else gets the same
+/// `0A000 the function <name>` it always got, at the same moment — when the table is created.
+///
+/// **`uuid_test.rb` is the file that needs this**: it defines `my_uuid_generator()` and then
+/// creates a table defaulting to it, and it never inserts a row — the eight tests read the
+/// *schema*, so the name has to survive into `pg_attrdef` and out through the dumper.
+fn refuse_unknown_default_function(
+    txn: &dyn Txn,
+    executor: &Executor,
+    column: &ColumnDef,
+) -> Result<()> {
+    let Some(text) = &column.default_expr else {
+        return Ok(());
+    };
+    let Err(error) = crate::parse::parse_stored_expr(text) else {
+        return Ok(());
+    };
+    let Some(name) = crate::parse::lower::unsupported_function_name(&error) else {
+        return Err(error);
+    };
+    if catalog::function(txn, executor.tenant, name)?.is_some() {
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// The `TypeKind` of a column's user type when it is a **domain**, and `None` otherwise.
@@ -1647,9 +1678,19 @@ pub(super) fn create_function(
     txn: &mut dyn Txn,
     create: &plan::CreateFunction,
 ) -> Result<Outcome> {
-    // The only procedural language this node knows the name of. It knows nothing else about it —
-    // and that is the point: a body it cannot run is still a body it can keep.
-    if !create.language.eq_ignore_ascii_case("plpgsql") {
+    // **The two trusted languages a real server has**, measured: `pg_language` holds `c`,
+    // `internal`, `plpgsql` and `sql`, and only the last two are `lanpltrusted`. The other two
+    // name a shared object or a built-in symbol, neither of which exists here, so a function in
+    // one has nothing to be — `42704` for those is a truer answer than storing a body that names
+    // a file this node will never open.
+    //
+    // It knows nothing else about either, and that is the point: a body it cannot run is still a
+    // body it can keep, and `uuid_test.rb` needs exactly that — a `LANGUAGE SQL` function whose
+    // name has to survive into a column default the schema dumper prints back.
+    if !matches!(
+        create.language.to_ascii_lowercase().as_str(),
+        "plpgsql" | "sql"
+    ) {
         return Err(SqlError::UndefinedLanguage(create.language.clone()));
     }
     let id = match catalog::function(txn, executor.tenant, &create.name)? {
@@ -1792,6 +1833,34 @@ fn built_in_signature(name: &str, args: &[&str]) -> String {
     format!("{name}({})", args.join(","))
 }
 
+/// The first column whose `DEFAULT` names this function, with the table it is on.
+///
+/// **Read out of the stored text**, the same way `dependent_views` reads a view's body: a default
+/// is kept as the expression `pg_get_expr` prints, and the name is in it. A function call is the
+/// only shape that can name one, so the parse is what finds it rather than a substring match — a
+/// column defaulting to `'my_uuid_generator()'::text` names nothing.
+fn default_naming(
+    executor: &Executor,
+    txn: &dyn Txn,
+    function: &str,
+) -> Result<Option<(String, String)>> {
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    for table in relations.tables() {
+        for column in table.user_columns().map(|(_, column)| column) {
+            let Some(text) = &column.default_expr else {
+                continue;
+            };
+            let Err(error) = crate::parse::parse_stored_expr(text) else {
+                continue;
+            };
+            if crate::parse::lower::unsupported_function_name(&error) == Some(function) {
+                return Ok(Some((column.name.clone(), table.name.clone())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
 ///
 /// **Not a no-op, even though nothing here can create a function.** Three outcomes, and `IF EXISTS`
@@ -1824,6 +1893,20 @@ pub(super) fn drop_function(
         // A **stored** function: this node has those now, and dropping one is ordinary — unless a
         // trigger still names it, which is `2BP01` with the trigger and its table in the DETAIL.
         if let Some(stored) = catalog::function(txn, executor.tenant, name)? {
+            // **A column default is a dependency too**, and it is the one this node could
+            // acquire without noticing: a default that names a function is stored as *text*, so
+            // dropping the function leaves a table whose every insert then fails. Measured —
+            // `2BP01`, with the column and its table in the `DETAIL`, exactly as the trigger edge
+            // below reports the trigger and its table.
+            if let Some((column, table)) = default_naming(executor, txn, name)? {
+                return Err(SqlError::DependentFunction {
+                    function: format!("{name}()"),
+                    detail: format!(
+                        "default value for column {column} of table {table} depends on function \
+                         {name}()"
+                    ),
+                });
+            }
             if let Some((trigger, table)) = trigger_naming(executor, txn, name)? {
                 return Err(SqlError::DependentFunction {
                     function: format!("{name}()"),

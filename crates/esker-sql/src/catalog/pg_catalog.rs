@@ -549,7 +549,11 @@ impl CatalogView {
                 ("pronargs", ColumnType::Int2),
                 ("provolatile", ColumnType::Text),
                 ("prosrc", ColumnType::Text),
-                ("prolang", ColumnType::Text),
+                // **An oid, not the name.** `pg_language.oid = pg_proc.prolang` is the join
+                // every client writes to learn a function's language, and a `text` here made it
+                // `42883 operator does not exist: bigint = text` — a join that reads as a type
+                // error about a catalog rather than as a missing column.
+                ("prolang", ColumnType::Int8),
             ],
             // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
             // DDL used.
@@ -763,14 +767,25 @@ impl CatalogView {
             view if view.schema() == super::INFORMATION_SCHEMA => {
                 Self::information_schema_rows(view, txn, tenant)
             }
-            // **Trusted**, which is what `lanpltrusted` says of `plpgsql` on a real server: a
-            // non-superuser may write a function in it. Nothing here acts on the flag; it is
-            // reported because a client reads it before defining one.
-            CatalogView::PgLanguage => Ok(vec![vec![
-                Datum::Int8(PLPGSQL_LANGUAGE_OID),
-                Datum::Text("plpgsql".to_owned()),
-                Datum::Bool(true),
-            ]]),
+            // **The four a real server has**, measured: `c`, `internal`, `plpgsql` and `sql`,
+            // with only the last two `lanpltrusted` — a non-superuser may write a function in
+            // those and not in the other two. Nothing here acts on the flag; it is reported
+            // because a client reads it before defining one.
+            //
+            // All four are listed even though only two can hold a function here, because this is
+            // the catalog a client *reads*: a language missing from it is a language that does not
+            // exist, and `c` and `internal` do exist on the server this node answers as. What
+            // happens when a function is actually written in one is `crate::exec::ddl`'s answer.
+            CatalogView::PgLanguage => Ok(LANGUAGES
+                .iter()
+                .map(|(oid, name, trusted)| {
+                    vec![
+                        Datum::Int8(*oid),
+                        Datum::Text((*name).to_owned()),
+                        Datum::Bool(*trusted),
+                    ]
+                })
+                .collect()),
             // `amtype` `i` — an index method, which is what both of these are. A real server's
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
@@ -1046,8 +1061,29 @@ pub fn refuse_write(name: &str) -> Result<()> {
 /// reserved beside the view ids for the same reason they are — nothing a user creates can reach
 /// it. What has to be true is only that `relnamespace` equals `pg_namespace.oid`, which is the
 /// join `ActiveRecord` writes.
+/// The languages `pg_language` reports, and the oids `pg_proc.prolang` points at.
+///
+/// **Ours rather than a real server's**, the same choice every reserved id in this module makes:
+/// what has to be true is that the two catalogs agree with each other, which is the join a client
+/// writes.
+const LANGUAGES: &[(i64, &str, bool)] = &[
+    (13, "c", false),
+    (12, "internal", false),
+    (PLPGSQL_LANGUAGE_OID, "plpgsql", true),
+    (14, "sql", true),
+];
+
 /// The oid `pg_language` reports for `plpgsql`, and what a `pg_proc.prolang` would point at.
 const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
+
+/// One language's oid by name, for `pg_proc.prolang`. Zero for a name that is not a language,
+/// which no stored function has: `crate::exec::ddl::create_function` refuses one first.
+fn language_oid(name: &str) -> i64 {
+    LANGUAGES
+        .iter()
+        .find(|(_, known, _)| known.eq_ignore_ascii_case(name))
+        .map_or(0, |(oid, _, _)| *oid)
+}
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
 
@@ -1179,7 +1215,7 @@ fn proc_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum
                 // `v` for volatile, which is the default and what a trigger function is.
                 Datum::Text("v".to_owned()),
                 Datum::Text(function.body),
-                Datum::Text(function.language),
+                Datum::Int8(language_oid(&function.language)),
             ]
         })
         .collect())
