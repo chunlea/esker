@@ -583,6 +583,12 @@ pub enum SqlError {
     #[error("invalid line specification: A and B cannot both be zero")]
     InvalidLineSpecification,
 
+    /// `'(2,3),(2,3)'::line`: the two-point form given one point twice. The **other** invalid line
+    /// specification, and a different sentence — measured beside the one above, because a reader
+    /// would expect the type to have only one.
+    #[error("invalid line specification: must be two distinct points")]
+    LineNeedsTwoPoints,
+
     /// `'FF'::bit(8)`: a character that is not a binary digit. **The message names the
     /// character**, not the type, which is its own sentence and not the
     /// `invalid input syntax for type …` every other type gives. Measured, `0x` included:
@@ -2440,6 +2446,7 @@ impl SqlError {
             | SqlError::InvalidBinaryDigit(_)
             | SqlError::InvalidHexadecimalDigit(_)
             | SqlError::InvalidLineSpecification
+            | SqlError::LineNeedsTwoPoints
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {

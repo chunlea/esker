@@ -42,6 +42,31 @@ SELECT 'r', pg_typeof('(2,3),(5.5,7)'::lseg), pg_typeof('2,3,5.5,7'::box), pg_ty
 CREATE TABLE l (id int8 primary key, a_line line)		-
 INSERT INTO l VALUES (1, '{2.0, 3, 5.5}')		-
 SELECT 'r', id, a_line FROM l ORDER BY id		r|1|{2,3,5.5}
+# --- **A `line` reads two *points* as well as three coefficients**, and writes only the
+# coefficients: `'(2,3),(4,6)'::line` is `{1.5,-1,0}`. Run 75's surviving `geometric_test` item,
+# and the only shape whose output spelling is a different shape from its input. A vertical line is
+# `{-1,0,x}`; one point named twice is `22P02 invalid line specification: must be two distinct
+# points`, a *different* sentence from `{0,0,0}`'s.
+SELECT 'r', '{1.5,-1,0}'::line, '(2,3),(4,6)'::line, '[(2,3),(4,6)]'::line	text,line,line,line	r|{1.5,-1,0}|{1.5,-1,0}|{1.5,-1,0}
+SELECT 'r', '((2,3),(4,6))'::line, '2,3,4,6'::line, ' (2,3) , (4,6) '::line	text,line,line,line	r|{1.5,-1,0}|{1.5,-1,0}|{1.5,-1,0}
+SELECT 'r', '(0,0),(1,0)'::line, '(0,5),(3,5)'::line	text,line,line	r|{0,-1,0}|{0,-1,5}
+SELECT 'r', '(0,0),(0,1)'::line, '(5,0),(5,3)'::line, '(-5,0),(-5,3)'::line	text,line,line,line	r|{-1,0,0}|{-1,0,5}|{-1,0,-5}
+SELECT 'r', '(-1,-2),(3,4)'::line, '(0.5,0.25),(1.5,2.75)'::line	text,line,line	r|{1.5,-1,-0.5}|{2.5,-1,-1}
+SELECT 'r', '(0,1),(1,0)'::line, '(1,-1),(2,-2)'::line, '(3,4),(1,2)'::line	text,line,line,line	r|{-1,-1,1}|{-1,-1,0}|{1,-1,1}
+SELECT 'r', '(0,0),(1,3)'::line, '(1,3),(0,0)'::line	text,line,line	r|{3,-1,0}|{3,-1,0}
+SELECT 'r', '(0,-0),(1,-0)'::line	text,line	r|{0,-1,-0}
+SELECT 'r', '(1e10,1),(2e10,3)'::line	text,line	r|{2e-10,-1,-1}
+SELECT 'r', '[(2,3),(4,6)]'::line = '(2,3),(4,6)'::line	text,boolean	r|t
+SELECT 'r', '(2,3),(2,3)'::line	!22P02 invalid line specification: must be two distinct points
+SELECT 'r', '{1,2}'::line	!22P02 invalid input syntax for type line: "{1,2}"
+SELECT 'r', '{1,2,3,4}'::line	!22P02 invalid input syntax for type line: "{1,2,3,4}"
+SELECT 'r', '(2,3)'::line	!22P02 invalid input syntax for type line: "(2,3)"
+SELECT 'r', '[(2,3)]'::line	!22P02 invalid input syntax for type line: "[(2,3)]"
+SELECT 'r', 'nonsense'::line	!22P02 invalid input syntax for type line: "nonsense"
+SELECT 'r', ''::line	!22P02 invalid input syntax for type line: ""
+INSERT INTO l (id, a_line) VALUES (2, '(2,3),(4,6)'), (3, '(0,0),(0,1)')		-
+SELECT 'r', id, a_line FROM l ORDER BY id		r|1|{2,3,5.5} ; r|2|{1.5,-1,0} ; r|3|{-1,0,0}
+DELETE FROM l WHERE id > 1		-
 SELECT 'r', '[(0,0),(1,1)]'::path, '((0,0),(1,1))'::path, '(0,0),(1,1)'::path	text,path,path,path	r|[(0,0),(1,1)]|((0,0),(1,1))|((0,0),(1,1))
 SAVEPOINT s1		-
 SELECT 'r', '(2,3),(5.5,7)'::lseg = '(2,3),(5.5,7)'::lseg	text,boolean	r|t

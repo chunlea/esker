@@ -78,19 +78,51 @@ pub fn from_text(kind: Kind, text: &str) -> Result<String> {
     let body = text.trim();
     match kind {
         Kind::Line => {
-            let inner = body
-                .strip_prefix('{')
-                .and_then(|rest| rest.strip_suffix('}'))
-                .ok_or_else(invalid)?;
-            let parts = numbers(inner).ok_or_else(invalid)?;
-            let [a, b, c] = parts[..] else {
+            // **`{A,B,C}` is one of four input forms and the only output one.** The other three
+            // are two *points* — `(x1,y1),(x2,y2)`, `[(x1,y1),(x2,y2)]` and the bare
+            // `x1,y1,x2,y2` — which a real server converts to coefficients on the way in, so
+            // `'(2,3),(4,6)'::line` prints `{1.5,-1,0}`. Measured, and the whole reason this arm
+            // is not `Lseg`'s: a `line` is the only shape whose *output* spelling is a different
+            // shape from its input.
+            if let Some(inner) = trim_pair(body, '{', '}') {
+                let parts = numbers(inner).ok_or_else(invalid)?;
+                let [a, b, c] = parts[..] else {
+                    return Err(invalid());
+                };
+                // **`A` and `B` cannot both be zero**, which is its own sentence and its own
+                // check: `Ax + By + C = 0` names no line when both are.
+                if a == 0.0 && b == 0.0 {
+                    return Err(SqlError::InvalidLineSpecification);
+                }
+                return Ok(format!("{{{},{},{}}}", num(a), num(b), num(c)));
+            }
+            let parts = numbers(body).ok_or_else(invalid)?;
+            let [x1, y1, x2, y2] = parts[..] else {
                 return Err(invalid());
             };
-            // **`A` and `B` cannot both be zero**, which is its own sentence and its own check:
-            // `Ax + By + C = 0` names no line when both are.
-            if a == 0.0 && b == 0.0 {
-                return Err(SqlError::InvalidLineSpecification);
+            // One point named twice is no line, and it has a sentence of its own — a *different*
+            // one from the flat `{0,0,0}` above, measured beside it.
+            //
+            // `clippy::float_cmp` wants a tolerance and there is none to have: PostgreSQL's own
+            // check is `==`, so `(0,0),(1e-300,0)` is a line there and would not be one here if
+            // this compared within a margin. Exactness is the behaviour, not an oversight.
+            #[expect(
+                clippy::float_cmp,
+                reason = "PostgreSQL's own check is exact; see above"
+            )]
+            if x1 == x2 && y1 == y2 {
+                return Err(SqlError::LineNeedsTwoPoints);
             }
+            // **A vertical line is `{-1,0,x}`** and every other is `{m,-1,y1 - m·x1}`, where the
+            // `C` keeps the sign of its zero: `'(0,-0),(1,-0)'::line` is `{0,-1,-0}` on a real
+            // server, not `{0,-1,0}`.
+            #[expect(clippy::float_cmp, reason = "a vertical line is x1 == x2 exactly")]
+            let (a, b, c) = if x1 == x2 {
+                (-1.0, 0.0, x1)
+            } else {
+                let slope = (y2 - y1) / (x2 - x1);
+                (slope, -1.0, y1 - slope * x1)
+            };
             Ok(format!("{{{},{},{}}}", num(a), num(b), num(c)))
         }
         Kind::Circle => {
@@ -242,6 +274,52 @@ mod tests {
             "invalid input syntax for type lseg: \"nonsense\""
         );
         assert!(from_text(Kind::Line, "{1,2}").is_err());
+        assert!(from_text(Kind::Line, "{1,2,3,4}").is_err());
+        // **The three two-point spellings, all converted to coefficients** — measured on
+        // 19beta1, one row at a time, because nothing about the output form suggests them.
+        for (written, want) in [
+            ("(2,3),(4,6)", "{1.5,-1,0}"),
+            ("[(2,3),(4,6)]", "{1.5,-1,0}"),
+            ("((2,3),(4,6))", "{1.5,-1,0}"),
+            ("2,3,4,6", "{1.5,-1,0}"),
+            (" (2,3) , (4,6) ", "{1.5,-1,0}"),
+            // Horizontal, vertical, and a vertical at a negative x — the vertical form is
+            // `{-1,0,x}` and its `C` is the *coordinate*, not its negation.
+            ("(0,0),(1,0)", "{0,-1,0}"),
+            ("(0,5),(3,5)", "{0,-1,5}"),
+            ("(0,0),(0,1)", "{-1,0,0}"),
+            ("(5,0),(5,3)", "{-1,0,5}"),
+            ("(-5,0),(-5,3)", "{-1,0,-5}"),
+            ("(-1,-2),(3,4)", "{1.5,-1,-0.5}"),
+            ("(0.5,0.25),(1.5,2.75)", "{2.5,-1,-1}"),
+            ("(0,1),(1,0)", "{-1,-1,1}"),
+            ("(1,-1),(2,-2)", "{-1,-1,0}"),
+            ("(3,4),(1,2)", "{1,-1,1}"),
+            // **The order of the two points does not matter**, which the slope makes true and
+            // the capture confirms.
+            ("(0,0),(1,3)", "{3,-1,0}"),
+            ("(1,3),(0,0)", "{3,-1,0}"),
+            // **`C` keeps the sign of its zero**: a real server prints `-0` here.
+            ("(0,-0),(1,-0)", "{0,-1,-0}"),
+        ] {
+            assert_eq!(from_text(Kind::Line, written).unwrap(), want, "{written}");
+        }
+        // One point named twice is its own sentence, and not the `{0,0,0}` one below it.
+        let same = from_text(Kind::Line, "(2,3),(2,3)").unwrap_err();
+        assert_eq!(same.sqlstate(), "22P02");
+        assert_eq!(
+            same.to_string(),
+            "invalid line specification: must be two distinct points"
+        );
+        for wrong in ["(2,3)", "[(2,3)]", "nonsense", ""] {
+            let refused = from_text(Kind::Line, wrong).unwrap_err();
+            assert_eq!(refused.sqlstate(), "22P02", "{wrong}");
+            assert_eq!(
+                refused.to_string(),
+                format!("invalid input syntax for type line: \"{wrong}\""),
+                "{wrong}"
+            );
+        }
         let flat = from_text(Kind::Line, "{0,0,0}").unwrap_err();
         assert_eq!(flat.sqlstate(), "22P02");
         assert_eq!(
