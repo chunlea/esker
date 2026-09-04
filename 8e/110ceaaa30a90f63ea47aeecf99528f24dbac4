@@ -1,0 +1,89 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_2bed4ac2b1c944::t_e74100bc02b320 55-58,60
+crates/esker-sql/src/catalog/mod.rs
+  s_2bed4ac2b1c944::t_446ff3169e8dae 740,869-873,1025-1052,1062,1449-1456,1458-1463,1468-1471,1483-1492,1503-1504,1516-1517,2356-2363,3357-3367,3767,3853,3946,4028,4118-4121,5332
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_d843cc7ee95461 845
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_2bed4ac2b1c944::t_bcf3fd80bee240 219-222,354-356,386-389,410,429,444,472-473,499,519,618-625
+crates/esker-sql/src/catalog/record.rs
+  s_2bed4ac2b1c944::t_5bd601f5875a36 68-70,106,1535-1539,1718,1748-1757,1761-1777,1809-1812,1919-1920,1927-1928,1937-1940,2035-2043,2379,2383
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_2d1647f10df8fa 223-228,672-690,2052-2056,2084-2086
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_3de958905908d9 191,195,201,206,243-298,307,317,325,359,361-362,369,371,379-386,389,412-426,440-441,457-458,461-462,478,484-485,492,495-497,503,505,514,524,561,569,571-572
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_94685fcf503dd6 56-90,92,95,176,394-399,646-720,1716,1718,2844-2916,3523-3526,3631-3640
+crates/esker-sql/src/exec/deferred.rs
+  s_2bed4ac2b1c944::t_bd2182b51a3962 73-89,105-108,158-181
+crates/esker-sql/src/exec/dml.rs
+  s_2bed4ac2b1c944::t_c66f5e7c75556e 163
+crates/esker-sql/src/exec/foreign_key.rs
+  s_2bed4ac2b1c944::t_e5968260cf1e21 71,76-88,96-139,217-222,269-289,300-337,422-424,430,448,456,489
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_8e19ff1cd55618 167-175,207-236,328-334,440,740-761,1720-1793,1801-1803,1808,1842,1859-1862,2134,2172,2688-2698
+crates/esker-sql/src/exec/subquery.rs
+  s_2bed4ac2b1c944::t_057bb885e8ca4b 204,340
+crates/esker-sql/src/exec/values.rs
+  s_2bed4ac2b1c944::t_504a389f2a41c2 57
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_d97f88664f86cd 1910-1933,1935-1938,1987-2001,2011-2014,2020-2031,2448-2454,2460-2464,2476-2480,2482,2488-2492,2495,2497,2501-2503,6576-6585
+crates/esker-sql/src/plan/ddl.rs
+  s_2bed4ac2b1c944::t_d5407d3798675d 37-39,544-546,548-549,844-863
+crates/esker-sql/src/plan/session.rs
+  s_2bed4ac2b1c944::t_3756f6aa0d5d6c 111-115
+crates/esker-sql/tests/bind_operand.rs
+  s_2bed4ac2b1c944::t_80391ee5745665 1-35
+crates/esker-sql/tests/corpus/pg19_bind_operand.txt
+  s_2bed4ac2b1c944::t_fb5afdf1309540 1-51
+crates/esker-sql/tests/corpus/pg19_foreign_key_options.txt
+  s_2bed4ac2b1c944::t_b3101a2cfc776a 1-124
+crates/esker-sql/tests/corpus/pg19_temp_on_commit.txt
+  s_2bed4ac2b1c944::t_682d4ed17a0a22 1-48
+crates/esker-sql/tests/corpus/pg19_temp_table.txt
+  s_2bed4ac2b1c944::t_b551a82077ff6e 1-113
+crates/esker-sql/tests/discard_all.rs
+  s_2bed4ac2b1c944::t_63f0f7ac920065 26-30
+crates/esker-sql/tests/drop_constraint.rs
+  s_2bed4ac2b1c944::t_a33f8d8ceacf6e 28-30
+crates/esker-sql/tests/foreign_key.rs
+  s_2bed4ac2b1c944::t_cad0b92451fb15 105,107-111,113,122-128,131-132,134-147
+crates/esker-sql/tests/foreign_key_drop_cycle.rs
+  s_2bed4ac2b1c944::t_f0c6c3fb823225 1-55
+crates/esker-sql/tests/foreign_key_options.rs
+  s_2bed4ac2b1c944::t_808d4ee1c70fbb 1-94
+crates/esker-sql/tests/lowering.rs
+  s_2bed4ac2b1c944::t_4d9c524c49cbf8 8,10-14,416-419,421
+crates/esker-sql/tests/relation_resolution.rs
+  s_2bed4ac2b1c944::t_2441a642aa39b3 37-39,95-100,102-103
+crates/esker-sql/tests/slt/unsupported.slt
+  s_2bed4ac2b1c944::t_607381ca2d0acf 48-50
+crates/esker-sql/tests/temp_table.rs
+  s_2bed4ac2b1c944::t_fd4238e457edc1 1-127
+crates/esker-sql/tests/unlogged_table.rs
+  s_2bed4ac2b1c944::t_40d5bb3941dd9c 27,35-39
+docs/DESIGN.md
+  s_2bed4ac2b1c944::t_ad815fa8a2ef38 792-802
+docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
+  s_2bed4ac2b1c944::t_09461fac5a0b47 1-113
+docs/adr/0055-the-tls-options-across-three-surfaces-measured.md
+  s_2bed4ac2b1c944::t_5070de9ce06bba 1-288
+docs/plans/phase-9-rails.md
+  s_2bed4ac2b1c944::t_86593afec1a04d 1319-1322,1583,1585-1589
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8e110ceaaa30a90f63ea47aeecf99528f24dbac4",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
