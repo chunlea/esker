@@ -1,0 +1,55 @@
+crates/esker-sql/src/advisory.rs
+  s_6f7019c05b578b::t_298c38dd5911c5 105-107,117,123,188-199,201-204,206-209,216-223,233-236,258-261,273-276,287,332-338,340-347
+crates/esker-sql/src/bin/esker-sql.rs
+  s_6f7019c05b578b::t_9ad5247d18b37f 33-38,60-61,190
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_d4e5d07aab8da2 385-395,1990,2021-2022
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_84499e3fd37e01 1392-1395
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_a242749e65e988 2424-2427
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_163d0346ef603f 510-513,799-801
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_2fd51f728f6c75 76-84,112-116,362-363,367-368,374,1412-1413,1433,1439-1451,1473-1523,1833-1881,2129-2136,2232
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_5e53fa4387002d 3330
+crates/esker-sql/src/exec/subquery.rs
+  s_6f7019c05b578b::t_238afc435a1ccb 730,1207,1295
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_3e24457f3c6c04 2135-2151,3125-3153
+crates/esker-sql/src/pgwire/server.rs
+  s_6f7019c05b578b::t_0846b0715bde32 198,206-209,223
+crates/esker-sql/src/pgwire/session.rs
+  s_6f7019c05b578b::t_4c52968bc2066e 188-198
+crates/esker-sql/src/plan/cte.rs
+  s_6f7019c05b578b::t_effc7dc56772ce 232
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_afd391337d22a9 256-269,1651,1674-1722
+crates/esker-sql/src/plan/mod.rs
+  s_6f7019c05b578b::t_66bdf3a9e7a8b8 43-45
+crates/esker-sql/src/plan/query.rs
+  s_6f7019c05b578b::t_b04b5d3692ab1d 957
+crates/esker-sql/src/sqlstate.rs
+  s_6f7019c05b578b::t_316b74f8879e9e 25-32,298
+crates/esker-sql/tests/advisory_lock.rs
+  s_6f7019c05b578b::t_c51840a226610d 1-178
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_834f69b9de4980 1265,1530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9a0f5e16706cddcbd57ea35bf5d9804f318bb004",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
