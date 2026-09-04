@@ -777,6 +777,60 @@ fn a_bench_is_refused_by_an_unclaimed_prefix_and_adopts_it_when_asked() {
     );
 }
 
+/// The four calls against a **TLS** object store, when one is pointed at.
+///
+/// There is no TLS `MinIO` in this project's harness — the container serves plain HTTP on :9000 —
+/// so this **skips** unless `ESKER_S3_ENDPOINT` names an `https://` endpoint. It exists so that the
+/// day there is one, running it is a matter of two variables and not of writing a test:
+///
+/// ```text
+/// ESKER_S3_ENDPOINT=https://minio.example:9000 \
+/// ESKER_S3_CA_CERT=/path/to/ca.pem \
+///   cargo test -p esker-cli --features esker-s3/tls --test tier_acceptance -- --ignored https
+/// ```
+///
+/// `ESKER_S3_CA_CERT` is only needed for a self-signed endpoint; without it the host's own CA
+/// bundle is used. On a build **without** the `tls` feature this cannot even parse the endpoint —
+/// `Endpoint::parse` refuses `https://` naming the feature — which is the refusal this whole
+/// surface is built around and is asserted in `esker-s3`'s own tests.
+#[test]
+#[ignore = "needs a TLS-terminating S3 endpoint; see the doc comment"]
+fn the_tier_speaks_https_when_the_endpoint_does() {
+    let endpoint_url = env_or("ESKER_S3_ENDPOINT", "http://localhost:19000");
+    if !endpoint_url.starts_with("https://") {
+        eprintln!(
+            "skipped: ESKER_S3_ENDPOINT is {endpoint_url}, which is not https. \
+             Point it at a TLS endpoint to run this."
+        );
+        return;
+    }
+
+    let store_url = format!(
+        "s3://{}/https-acceptance",
+        env_or("ESKER_S3_BUCKET", "esker")
+    );
+    let (store, prefix) = plain_store(&store_url);
+    let key = format!("{prefix}000042.sst");
+    let body = b"an sst that travelled over TLS".to_vec();
+
+    store.put(&key, &body).expect("PutObject over TLS");
+    let got = store.get(&key).expect("GetObject over TLS");
+    assert_eq!(got.body, body, "the object came back byte for byte");
+
+    let listed = store.list(&prefix).expect("ListObjectsV2 over TLS");
+    assert!(
+        listed.iter().any(|summary| summary.key == key),
+        "the listing names what was just written: {listed:?}"
+    );
+
+    let ranged = store
+        .get_range(&key, 3, 4, None)
+        .expect("a ranged GetObject over TLS");
+    assert_eq!(ranged.body, &body[3..7], "the range is the range asked for");
+
+    store.delete(&key).expect("DeleteObject over TLS");
+}
+
 /// An `ObjectStore` for a whole `s3://bucket/prefix`, and the key prefix it resolves to.
 ///
 /// The prefix comes back because [`ObjectStore`] keys are **whole** keys: the client does not
@@ -785,7 +839,7 @@ fn a_bench_is_refused_by_an_unclaimed_prefix_and_adopts_it_when_asked() {
 fn plain_store(store_url: &str) -> (Arc<dyn ObjectStore>, String) {
     let endpoint =
         esker_s3::Endpoint::parse(&env_or("ESKER_S3_ENDPOINT", "http://localhost:19000")).unwrap();
-    let config = esker_s3::Config::from_store_url(
+    let mut config = esker_s3::Config::from_store_url(
         store_url,
         endpoint,
         env_or("ESKER_S3_REGION", "us-east-1"),
@@ -796,7 +850,13 @@ fn plain_store(store_url: &str) -> (Arc<dyn ObjectStore>, String) {
     )
     .unwrap();
     let prefix = config.prefix.clone();
-    (Arc::new(esker_s3::S3Client::new(config)), prefix)
+    // The CA an `https://` endpoint is verified against, when one is named. Ignored for the plain
+    // endpoint every other test in this file uses.
+    if let Some(ca) = std::env::var_os("ESKER_S3_CA_CERT") {
+        config.tls_roots = esker_s3::TlsRoots::File(ca.into());
+    }
+    let client = esker_s3::S3Client::open(config).expect("the object store client");
+    (Arc::new(client), prefix)
 }
 
 /// **A reserved port run has to still be ours when the child processes bind it.**

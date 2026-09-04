@@ -178,6 +178,20 @@ impl TcpTransport {
 
     /// Opens and configures a fresh connection.
     fn connect(&self, host: &str, port: u16) -> Result<TcpStream> {
+        let stream = dial(host, port, self.timeouts)?;
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        Ok(stream)
+    }
+}
+
+/// Opens one configured TCP connection to `host:port`.
+///
+/// Free rather than a method because [`crate::tls`] needs exactly this and then wraps the result
+/// in a TLS session: resolution, the connect timeout, the read/write timeouts and `TCP_NODELAY`
+/// are the same requirements whichever protocol runs on top, and having two copies of them is how
+/// one of them quietly loses a timeout.
+pub(crate) fn dial(host: &str, port: u16, timeouts: Timeouts) -> Result<TcpStream> {
+    {
         let target = (host, port);
         // Resolution can return several addresses — a host with both an A and a AAAA record is
         // ordinary — and connecting to the first one that answers is the whole of our
@@ -195,7 +209,7 @@ impl TcpTransport {
         let mut last = None;
         let mut stream = None;
         for address in &addresses {
-            match TcpStream::connect_timeout(address, self.timeouts.connect) {
+            match TcpStream::connect_timeout(address, timeouts.connect) {
                 Ok(connected) => {
                     stream = Some(connected);
                     break;
@@ -211,13 +225,12 @@ impl TcpTransport {
         };
 
         stream
-            .set_read_timeout(Some(self.timeouts.io))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeouts.io)))
+            .set_read_timeout(Some(timeouts.io))
+            .and_then(|()| stream.set_write_timeout(Some(timeouts.io)))
             // Small writes are the request head; a delayed ACK plus Nagle would add 40 ms to
             // every call for no benefit, since we write the whole request in one go anyway.
             .and_then(|()| stream.set_nodelay(true))
             .map_err(|source| Error::io("configuring the connection", source))?;
-        self.opened.fetch_add(1, Ordering::Relaxed);
         Ok(stream)
     }
 }
