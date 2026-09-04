@@ -1,0 +1,19 @@
+crates/esker-cli/src/sst_store.rs
+  s_49075263d2b3e7::t_a108f52c8f3555 199-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "049509fe09b55d98c955a98dfc7483a654dd0632",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
