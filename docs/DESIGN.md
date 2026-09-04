@@ -711,6 +711,16 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
 
 Percolator, optimistic, snapshot isolation (the TiKV model). Three CFs:
 
+**Three isolation levels, not one** ([ADR 0057](adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md), [ADR 0062](adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)):
+`REPEATABLE READ` is the snapshot this section describes, and `READ COMMITTED` — PostgreSQL's
+default, and so the one `ActiveRecord` runs in — takes a **new** snapshot per statement and *waits*
+for the writer in front of it rather than answering `40001`. The three CFs and the protocol below
+are the same either way; what the level changes is which snapshot a statement reads at and what a
+conflict does. `SERIALIZABLE` is the third: snapshot isolation **plus a validated read set**, so a
+transaction that read a row another transaction then wrote is refused at `COMMIT` rather than
+committing on a snapshot that never existed as a serial order.
+
+
 | CF | key | value |
 |---|---|---|
 | `default` | `'x' ++ enc(user_key) ++ enc_ts(start_ts)` | value (when > 255 bytes) |
@@ -884,7 +894,13 @@ seed; every seed is reproducible.
 pending compaction bytes, raft proposal latency, apply lag, region count, TSO rate); `esker-cli` commands:
 `sst-dump`, `wal-dump`, `manifest-dump`, `region ls`, `region split`, `region transfer-leader`, `bench`.
 
-## 13. Roadmap hooks for SQL and serverless
+## 13. The SQL surface, and the serverless hooks still open
+
+**Three of the five below are built and two are hooks**, which the section title used to hide: SST
+tiering, TLS and `esker-sql` describe what exists and are maintained against the code; scale-to-zero
+and per-tenant quotas are the roadmap this section was originally all of. Each bullet says which it
+is in its first sentence.
+
 
 - **SST tiering — built (phase 6b).** All SST reads go through the `FileSystem` trait; `LocalFileSystem`
   and `fs::tier::TieredFileSystem` are the two implementations. The tiered one routes by file *kind*:
@@ -933,8 +949,8 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   **The RPC layer (§9) is what is left.** It carries no TLS and no peer authentication, and ADR 0055
   says why the second is the larger half of that work: mTLS makes a peer identity available, and
   nothing in `esker-pd` yet decides what a given identity is *allowed* to be.
-- **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
-  extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
+- **Stateless SQL nodes (`esker-sql`) — built (phase 6).** In-house PostgreSQL wire protocol v3 (startup, simple and
+  extended query, `psql` compatibility — ~3.5k lines across five modules, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
   planner/executor over `esker-client` transactions, using the `'t'` key layout from §3. Postgres
   compatibility is a surface, not a storage format.
@@ -949,9 +965,10 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   return the same rows, measured. Every one of them is bounded where `Sort` is (`53400`), and none of
   them routes to the columnar engine.
   **`pg_catalog` and `information_schema` are computed relations**
-  ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)): fourteen
-  views over the same `'m'`-space records the planner already reads, materialised per query, with no
-  second store to keep in step. Their oids are the ids those records already carry — a table's, an
+  ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)): **thirty**
+  views — twenty-four in `pg_catalog` and six in `information_schema` — over the same `'m'`-space
+  records the planner already reads, materialised per query, with no second store to keep in step.
+  The count is `CatalogView::ALL`, which a test walks so that none is added without one. Their oids are the ids those records already carry — a table's, an
   index's, a sequence's — from **one** snapshot read once per statement and bounded like every other
   scan (`53400`), because every statement a schema dump sends is an oid join and two views computing
   one independently is how they silently stop joining. The two relations with no record of their own,
@@ -960,6 +977,20 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   built, `pg_get_indexdef(d.indexrelid)` per row against a snapshot the cursor holds. Every write is
   `42501`, and a type this node has no value for is provided where the client reads it as text
   (`pg_index.indkey`) and refused where the client subscripts it (`pg_constraint.conkey`).
+  **The catalog record is a versioned on-disk format** like every other byte this system writes
+  (invariant 2): `catalog::record::CATALOG_FORMAT_VERSION` is **29**, a record carries it in its
+  first byte, and every field added since version 2 is read behind a `reader.version >= N` guard so
+  an older record still decodes. Goldens in `catalog::tests` pin the bytes. A field is appended —
+  at the end of the record, or beside the item it belongs to when the reader already walks that
+  list — and a version is claimed by the lane that takes it, out loud, because two lanes have
+  collided on the number twice.
+  **The DDL surface is wider than the planner's**, and three decisions in it are worth following
+  from here: a dropped column keeps its slot because a row is decoded by position
+  ([ADR 0051](adr/0051-a-dropped-column-keeps-its-slot.md)); `DO` is two recognised templates and
+  not a PL/pgSQL engine ([ADR 0058](adr/0058-a-do-block-is-two-templates-not-a-language.md)); and a
+  `USING` clause on `ALTER COLUMN … TYPE` is a **licence** rather than an expression to evaluate,
+  because there is no per-row evaluator to run one with
+  ([ADR 0060](adr/0060-a-using-clause-is-a-licence-not-an-expression.md)).
 - **Scale-to-zero:** because SQL nodes are stateless and SSTs can live in object storage, an idle tenant
   costs only its Raft metadata; PD may later hibernate cold regions (ADR).
 - **Multi-tenancy:** tenant id is the first field of every SQL key; RawKV/TxnKV users may adopt the same

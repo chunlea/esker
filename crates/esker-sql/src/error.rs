@@ -220,6 +220,21 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// A SERIALIZABLE transaction whose **read set** was written by somebody else
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
+    ///
+    /// **`40001`, and PostgreSQL's own sentence for this cause rather than for the other one.** A
+    /// write-write conflict is `could not serialize access due to concurrent update`; this is the
+    /// read/write dependency a real server's SSI reports, and the two are different messages under
+    /// one code, measured (`tests/corpus/pg19_transaction_timeouts.txt`).
+    ///
+    /// What is **not** copied is PostgreSQL's `DETAIL: Reason code: Canceled on identification as a
+    /// pivot, during commit attempt`. That names a step in SSI's dangerous-structure detection —
+    /// finding a pivot transaction — and this node reaches the same conclusion by validating a read
+    /// set instead. Repeating the sentence would be describing machinery that is not here.
+    #[error("could not serialize access due to read/write dependencies among transactions")]
+    ReadWriteDependency,
+
     /// `NOWAIT` over a row another transaction holds.
     ///
     /// **`55P03`, and PostgreSQL's own sentence**, measured with two sessions: the relation is the
@@ -830,6 +845,20 @@ pub enum SqlError {
         index: String,
         /// `Key (a)=(5) is duplicated.` — the first duplicate found, for the `DETAIL` field.
         detail: String,
+    },
+
+    /// `TRUNCATE` of a table another table's foreign key points at: `0A000`, unless `CASCADE`.
+    ///
+    /// **`0A000`, not `2BP01`** — measured, and it is the one refusal in this family PostgreSQL
+    /// spells as a missing feature rather than a dependency: a `DROP` of the same table is
+    /// `2BP01`. Both carry the `CASCADE` hint.
+    #[error("cannot truncate a table referenced in a foreign key constraint")]
+    CannotTruncateReferenced {
+        /// The table being truncated.
+        relation: String,
+        /// The child whose foreign key points at it — it appears in **both** the `DETAIL` and the
+        /// `HINT`, and the hint's advice is to name it in the same statement.
+        child: String,
     },
 
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
@@ -2120,7 +2149,10 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            SqlError::FeatureNotSupported(_)
+            // **`0A000`, not `2BP01`** — measured. A `DROP` of the same table is a dependency
+            // error; PostgreSQL spells the truncate refusal as a missing feature.
+            SqlError::CannotTruncateReferenced { .. }
+            | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference
             | SqlError::DefaultSubquery
             | SqlError::DefaultSetReturning
@@ -2332,7 +2364,9 @@ impl SqlError {
             }
             SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-            SqlError::SerializationFailure { .. } => sqlstate::SERIALIZATION_FAILURE,
+            SqlError::SerializationFailure { .. } | SqlError::ReadWriteDependency => {
+                sqlstate::SERIALIZATION_FAILURE
+            }
             SqlError::OutcomeUnknown(_) => sqlstate::STATEMENT_COMPLETION_UNKNOWN,
             SqlError::StoreUnavailable(_) => sqlstate::CONNECTION_FAILURE,
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
@@ -2491,6 +2525,9 @@ impl SqlError {
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
+            SqlError::CannotTruncateReferenced { relation, child } => {
+                Some(format!("Table \"{child}\" references \"{relation}\"."))
+            }
             SqlError::CouldNotCreateUniqueIndex { detail, .. }
             | SqlError::ViewDependsOnRelation { detail, .. }
             | SqlError::DependentType { detail, .. }
@@ -2580,6 +2617,11 @@ impl SqlError {
     /// do instead, and PostgreSQL answers it in the same message. Only the conditions where a real
     /// server was seen to send one have one here.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per condition PostgreSQL was seen to hint on, like `sqlstate` and \
+                  `detail` beside it; splitting it would scatter the vocabulary across functions"
+    )]
     pub fn hint(&self) -> Option<String> {
         match self {
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
@@ -2602,6 +2644,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, and true here for the same reason it is true there: the conflict is
+            // with a transaction that has now finished, so the retry reads a settled state.
+            SqlError::ReadWriteDependency => {
+                Some("The transaction might succeed if retried.".to_owned())
+            }
             // PostgreSQL's own, and the reason this error is worth more than a refusal:
             // `change_column` reads the sentence and re-sends the statement with that `USING`.
             SqlError::CannotCastColumnAutomatically { using, .. } => {
@@ -2649,6 +2696,12 @@ impl SqlError {
             | SqlError::ViewDependsOnRelation { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
+            // PostgreSQL's own for this one, and it names the **child** — the advice is to
+            // truncate it in the same statement, which is why a table named alongside is not a
+            // reason to refuse at all.
+            SqlError::CannotTruncateReferenced { child, .. } => Some(format!(
+                "Truncate table \"{child}\" at the same time, or use TRUNCATE ... CASCADE."
+            )),
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),
             // PostgreSQL's own, and it names the **constraint** — measured for both the primary
             // key and a `UNIQUE` constraint, which give the identical sentence. The hint here used

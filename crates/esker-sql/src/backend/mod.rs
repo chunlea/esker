@@ -186,6 +186,20 @@ pub trait Txn: fmt::Debug + Send {
         Ok(Lock::Taken)
     }
 
+    /// Records what this transaction reads, so that its commit can be validated
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
+    ///
+    /// **Only SERIALIZABLE asks for this**, and the cost is why: a read set is memory per
+    /// transaction and a check per key at commit. The other two levels are snapshot isolation and
+    /// pay nothing.
+    ///
+    /// Turning it on is one-way within a transaction. A transaction that has already recorded reads
+    /// cannot un-record them, and a level that moved under it would otherwise validate half of what
+    /// it read — which is not a weaker guarantee, it is an arbitrary one.
+    fn validate_reads(&mut self, on: bool) {
+        let _ = on;
+    }
+
     /// Whether `key` has a committed version this statement's snapshot does not include.
     ///
     /// **PostgreSQL's `EvalPlanQual` question**, and the reason a lock taken without waiting is
@@ -349,6 +363,20 @@ impl Versions {
             .and_then(|(_, value)| value.clone())
     }
 
+    /// Whether **anything in `[lo, hi)`** gained a version after `ts` — the phantom test.
+    ///
+    /// A key that did not exist when a transaction scanned the range is in no read set, so the
+    /// range is what names it. `BTreeMap::range` makes this two seeks rather than a walk of the
+    /// store, and an empty or crossed range is no rows rather than a panic (invariant 9).
+    fn range_written_since(&self, lo: &[u8], hi: &[u8], ts: u64) -> bool {
+        if lo >= hi {
+            return false;
+        }
+        self.keys
+            .range(lo.to_vec()..hi.to_vec())
+            .any(|(_, versions)| versions.iter().any(|(commit_ts, _)| *commit_ts > ts))
+    }
+
     /// Whether `key` gained a version after `ts` — the write-write conflict Percolator's prewrite
     /// detects by checking the `write` column family for a commit newer than the snapshot.
     fn written_since(&self, key: &[u8], ts: u64) -> bool {
@@ -448,6 +476,9 @@ impl Backend for MemoryBackend {
             statement_ts: start_ts,
             max_scan: self.max_scan,
             read_only: false,
+            validating: false,
+            read_keys: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            read_ranges: std::cell::RefCell::new(Vec::new()),
         }))
     }
 
@@ -470,6 +501,9 @@ impl Backend for MemoryBackend {
             statement_ts: start_ts,
             max_scan: self.max_scan,
             read_only: true,
+            validating: false,
+            read_keys: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            read_ranges: std::cell::RefCell::new(Vec::new()),
         }))
     }
 
@@ -522,6 +556,17 @@ struct MemoryTxn {
     /// The timestamp this transaction's **statements** read at. Equal to `start_ts` until a
     /// statement waits and re-reads.
     statement_ts: u64,
+    /// Whether this transaction's reads are being recorded for commit-time validation (ADR 0062).
+    validating: bool,
+    /// Every key this transaction has **read** and not written, for validation at commit.
+    ///
+    /// Behind a `RefCell` because [`Txn::get`] takes `&self` — a read is not a mutation of the
+    /// database and the trait says so, but it *is* a mutation of the read set.
+    read_keys: std::cell::RefCell<std::collections::BTreeSet<Vec<u8>>>,
+    /// Every range this transaction has **scanned**, which is what makes a phantom visible: a key
+    /// that did not exist when the scan ran is in no read set, and only the range it would have
+    /// appeared in can name it.
+    read_ranges: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
     /// The store's scan ceiling; see [`MemoryBackend::with_scan_limit`].
     max_scan: u32,
     /// Set by [`Backend::begin_at`]. A write here is dropped rather than buffered, and the
@@ -566,6 +611,29 @@ impl MemoryTxn {
             .or_insert(self.statement_ts);
     }
 
+    /// Records a key this transaction read, when it is recording at all.
+    ///
+    /// **The catalog is not recorded**, and that is a correctness statement rather than a saving:
+    /// every statement reads the catalog, so validating it would make every concurrent `CREATE
+    /// TABLE` a serialization failure for every transaction in flight. PostgreSQL's own predicate
+    /// locking ignores system catalogs for the same reason (ADR 0062 §1).
+    fn record_key(&self, key: &[u8]) {
+        if !self.validating || key.first() == Some(&esker_keys::prefix::META) {
+            return;
+        }
+        self.read_keys.borrow_mut().insert(key.to_vec());
+    }
+
+    /// The same for a range a scan walked, which is what makes a phantom visible.
+    fn record_range(&self, start: &[u8], end: &[u8]) {
+        if !self.validating || start.first() == Some(&esker_keys::prefix::META) || start >= end {
+            return;
+        }
+        self.read_ranges
+            .borrow_mut()
+            .push((start.to_vec(), end.to_vec()));
+    }
+
     /// Gives back every lock this transaction took.
     ///
     /// **On every way out**, which is why it is a method and not a line in `commit`: a transaction
@@ -606,13 +674,16 @@ impl Txn for MemoryTxn {
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        // Read-your-writes: the buffer wins, and a buffered delete hides a committed value.
+        // Read-your-writes: the buffer wins, and a buffered delete hides a committed value. A read
+        // served from here is this transaction's own value, so nobody else can invalidate it and it
+        // is not part of the read set (ADR 0062 §1).
         if let Some(write) = self.buffer.get(key) {
             return Ok(match write {
                 Write::Put(value) => Some(value.clone()),
                 Write::Delete => None,
             });
         }
+        self.record_key(key);
         Ok(self.versions().visible(key, self.statement_ts))
     }
 
@@ -622,6 +693,9 @@ impl Txn for MemoryTxn {
         if start >= end {
             return Ok(Vec::new());
         }
+        // **The range, not the keys it answered.** A key that did not exist when this ran is in no
+        // read set and is exactly the phantom a range is here to catch (ADR 0062).
+        self.record_range(start, end);
         let versions = self.versions();
         let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
         // **`range`, not a walk with a comparison inside it.** Both maps are ordered by key, so
@@ -701,6 +775,12 @@ impl Txn for MemoryTxn {
         Ok(self.versions().written_since(key, self.statement_ts))
     }
 
+    fn validate_reads(&mut self, on: bool) {
+        // One-way: see [`Txn::validate_reads`]. A transaction that has recorded reads keeps
+        // recording them.
+        self.validating = self.validating || on;
+    }
+
     /// Takes the row lock, or names the holder. See [`Txn::lock`] for why it is here and not in
     /// [`Txn::put`].
     fn lock(&mut self, key: &[u8]) -> Result<Lock> {
@@ -776,6 +856,31 @@ impl Txn for MemoryTxn {
                     // will be against the store rather than only there.
                     key: Some(key.clone()),
                 });
+            }
+        }
+
+        // **The read set, validated** (ADR 0062). Every key this transaction read must be
+        // untouched since its snapshot, and every range it scanned must have gained nothing — which
+        // is the half that catches a phantom. A key it also *wrote* is skipped: its own prewrite
+        // above already refused a commit newer than the snapshot the value came from, and checking
+        // it twice would answer the same question with a different timestamp.
+        if self.validating {
+            for key in self.read_keys.borrow().iter() {
+                if self.buffer.contains_key(key) {
+                    continue;
+                }
+                if versions.written_since(key, self.start_ts) {
+                    drop(versions);
+                    self.release();
+                    return Err(SqlError::ReadWriteDependency);
+                }
+            }
+            for (start, end) in self.read_ranges.borrow().iter() {
+                if versions.range_written_since(start, end, self.start_ts) {
+                    drop(versions);
+                    self.release();
+                    return Err(SqlError::ReadWriteDependency);
+                }
             }
         }
 

@@ -243,15 +243,29 @@ fn not_null_with_a_constant_default_is_instant() {
 /// because `NOT NULL DEFAULT 7` is accepted, and a message about `NOT NULL` alone would send a
 /// user to the wrong half of their statement.
 #[test]
-fn not_null_without_a_default_is_still_refused_and_names_the_pair() {
+fn not_null_without_a_default_depends_on_whether_there_are_rows() {
+    // **Populated: `23502`, and it is a wrong value rather than a missing feature.** This asserted
+    // `0A000` and the refusal's own sentence, on the argument that there is "nothing to pad the
+    // rows already stored with" — true here, and only here.
     let mut node = Node::new();
     a_populated_table(&mut node);
     let error = node.fails("ALTER TABLE t ADD COLUMN n int8 NOT NULL");
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(error.sqlstate(), "23502");
     assert_eq!(
         error.to_string(),
-        "ALTER TABLE ... ADD COLUMN ... NOT NULL without a DEFAULT is not supported"
+        "column \"n\" of relation \"t\" contains null values"
     );
+
+    // **Empty: the column is added.** There is no row to hold a NULL, so there is nothing to
+    // refuse — and every test in the suite that sends this adds to an empty table.
+    let mut empty = Node::new();
+    empty.run("CREATE TABLE e (id int8 PRIMARY KEY)").unwrap();
+    empty
+        .run("ALTER TABLE e ADD COLUMN n int8 NOT NULL")
+        .unwrap();
+    // And the column really is `NOT NULL` afterwards, which is what makes the next insert fail.
+    let error = empty.fails("INSERT INTO e (id) VALUES (1)");
+    assert_eq!(error.sqlstate(), "23502");
 }
 
 /// An **expression** default on `ADD COLUMN` is refused, and the reason is the rewrite.

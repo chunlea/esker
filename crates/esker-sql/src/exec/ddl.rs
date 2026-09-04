@@ -3106,6 +3106,130 @@ fn generated_columns_reading(table: &TableDef, column: &str) -> Option<String> {
     })
 }
 
+/// Every table whose foreign key points at this one, by record.
+///
+/// The same back-reference range a `DELETE` on a parent walks (`crate::exec::foreign_key`), so a
+/// truncate asks the question the row-level check already asks and gets the same answer. A child
+/// that references itself is not one: emptying the table takes its own rows with it.
+fn referencing_children(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+) -> Result<Vec<TableDef>> {
+    let mut children = Vec::new();
+    for (child, _) in super::foreign_key::children_of(executor, txn, table)? {
+        if child.id != table.id && !children.iter().any(|seen: &TableDef| seen.id == child.id) {
+            children.push((*child).clone());
+        }
+    }
+    Ok(children)
+}
+
+/// `TRUNCATE [TABLE] t [, …] [RESTART IDENTITY] [CASCADE]`.
+///
+/// **Not a `DELETE` without a `WHERE`**, and the difference is what it leaves alone: a sequence an
+/// identity or `serial` column owns keeps its value, so the next `nextval` carries on from where it
+/// was. `RESTART IDENTITY` is the clause that moves it, measured — and it is the one
+/// `ActiveRecord` sends when it wants a table to look new.
+///
+/// Every table named is emptied in the statement's own transaction, and every index entry with it:
+/// an index whose rows were dropped and whose entries were not is a `SELECT` answering from a row
+/// that is gone.
+pub(super) fn truncate(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    truncate: &plan::Truncate,
+) -> Result<Outcome> {
+    let mut tables = Vec::with_capacity(truncate.names.len());
+    for name in &truncate.names {
+        catalog::pg_catalog::refuse_write(name)?;
+        let Some(catalog::Relation::Table { table_id }) = existing_relation(executor, txn, name)?
+        else {
+            return Err(SqlError::UndefinedTableForDrop(name.clone()));
+        };
+        tables.push((*executor.table_by_id(txn, table_id)?).clone());
+    }
+    // **A table something references is refused before anything is emptied**, so a statement that
+    // names three tables and cannot empty the second empties none of them. `CASCADE` truncates the
+    // children instead — and a table named in the same statement is not a reason to refuse, which
+    // is why the check is against the whole list.
+    if !truncate.cascade {
+        for table in &tables {
+            for child in referencing_children(executor, txn, table)? {
+                // A child named in the same statement is emptied too, so it is no reason to
+                // refuse — which is exactly what PostgreSQL's own hint advises doing.
+                if tables.iter().any(|named| named.id == child.id) {
+                    continue;
+                }
+                return Err(SqlError::CannotTruncateReferenced {
+                    relation: catalog::display_name(&table.name),
+                    child: catalog::display_name(&child.name),
+                });
+            }
+        }
+    }
+    let mut queue = tables.clone();
+    let mut done: Vec<u64> = Vec::new();
+    while let Some(table) = queue.pop() {
+        if done.contains(&table.id) {
+            continue;
+        }
+        done.push(table.id);
+        if truncate.cascade {
+            for child in referencing_children(executor, txn, &table)? {
+                queue.push(child);
+            }
+        }
+        truncate_one_table(executor, txn, &table, truncate.restart_identity)?;
+    }
+    Ok(Outcome::done("TRUNCATE TABLE"))
+}
+
+/// Every row of one table, and every index entry over it — and its sequences if asked.
+fn truncate_one_table(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    restart_identity: bool,
+) -> Result<()> {
+    // The rows first, through the ordinary removal path, so every index entry and every
+    // back-reference goes with each one rather than being reasoned about separately here.
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            rows.push(crate::row::decode_row(&schema, value)?);
+        }
+        Ok(())
+    })?;
+    for row in rows {
+        super::dml::remove_row(executor, txn, table, &row)?;
+    }
+    // **Only if asked.** Without `RESTART IDENTITY` the sequence keeps its value and the next id
+    // carries on past the rows that are gone — measured, and the opposite of what "empty" suggests.
+    if restart_identity {
+        // **Two things, and neither alone is enough**: the stored counter, reset in a transaction
+        // of its own because that is the one `nextval` reads in, and this session's reserved
+        // block, which would otherwise keep handing out values from inside it. Measured: the
+        // counter alone gave 33 and the block alone gave 5, where PostgreSQL gives 1.
+        for sequence in &table.sequences {
+            executor.restart_sequence(sequence.id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the table holds a single row — asked with a bound of one, not a count.
+///
+/// The question every "is there a row that predates this?" check asks, and the whole table is the
+/// wrong thing to read for it: one key is enough to know, and a table with a million rows answers
+/// as fast as one with none.
+fn has_any_row(txn: &dyn Txn, executor: &Executor, table: &TableDef) -> Result<bool> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    Ok(!txn.scan(&start, &end, 1)?.is_empty())
+}
+
 /// Computes every generated column for the rows already stored, after one was added.
 ///
 /// The whole table is read and written in the statement's own transaction — the trade `backfill`
@@ -4288,6 +4412,16 @@ pub(super) fn alter_table(
                 relation: alter.name.clone(),
             });
         }
+        // **`NOT NULL` with no `DEFAULT` is about the rows, not about the clause.** There is no
+        // value to give a row that predates the column, so a table holding one is `23502` — with
+        // the sentence `SET NOT NULL` uses, because no constraint exists yet to name. A table with
+        // no rows has nothing to refuse, and that is the case every test in the suite sends.
+        if column.not_null && column.default.is_none() && has_any_row(&*txn, executor, &updated)? {
+            return Err(SqlError::ColumnContainsNulls {
+                column: column.name.clone(),
+                relation: updated.name.clone(),
+            });
+        }
         // The catalog decides what the declared name is, exactly as it does at `CREATE TABLE`,
         // and the default is folded against the answer rather than against the placeholder.
         let (ty, user_type) = resolve_user_type(&*txn, executor, column)?;
@@ -4323,10 +4457,9 @@ pub(super) fn alter_table(
             ty,
             typmod: column.typmod,
             default_expr: column.default_expr.clone(),
-            // `NOT NULL` is admissible **only with a constant default**, which is what makes every
-            // row already stored hold a value: the missing value below is that value, and the
-            // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the
-            // alternative is a rewrite and this `ALTER` touches no row.
+            // With a constant default, the missing value below is what every row already stored
+            // holds and the decoder pads with it. Without one, the check above has already refused
+            // any table that has a row — so reaching here means there are none to pad.
             not_null: column.not_null,
             default: default.clone(),
             // **The missing value is frozen here**, at `ADD COLUMN` time, and a later

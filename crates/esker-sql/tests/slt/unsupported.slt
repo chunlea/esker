@@ -82,10 +82,11 @@ CREATE TABLE other_schema.q (id int8 PRIMARY KEY)
 # (see alter_table.slt). What is left is what would need a row rewritten, and each is named rather
 # than lumped together.
 #
-# `NOT NULL` with no default: nothing to pad the rows already stored with. The refusal names the
-# pair, because `NOT NULL DEFAULT 7` is accepted.
-statement error (0A000)
-ALTER TABLE t ADD COLUMN c int8 NOT NULL
+# `NOT NULL` with no default was here as a `0A000`, on the argument that there is "nothing to pad
+# the rows already stored with". That is true only when there *are* rows: an empty table takes the
+# column, which is what PostgreSQL does and what every test in the suite sends. A populated one is
+# `23502` — a wrong value, not a missing feature — so it belongs in `tests/add_column_not_null.rs`
+# rather than in this file.
 
 # Still refused on ADD COLUMN, and for the rewrite rather than for volatility: PostgreSQL gives
 # every row already stored its own value, and this ALTER is defined not to touch them.

@@ -235,6 +235,21 @@ impl Txn for Recording<'_> {
         self.inner.begin_statement()
     }
 
+    // The two that were missed the *second* time, and they were missed the same way: a `Txn`
+    // method with a default is a method this wrapper silently answers for. With `validate_reads`
+    // defaulted, a SERIALIZABLE transaction with a savepoint open recorded nothing and validated
+    // nothing — `test_SerializationFailure_inside_nested_SavepointTransaction_is_recoverable`, and
+    // Rails opens a savepoint for every nested `transaction do` block, so this is not a corner. With
+    // `changed_since_statement` defaulted, the statement re-check that replaced a hundred spurious
+    // `40001`s did not run there either.
+    fn validate_reads(&mut self, on: bool) {
+        self.inner.validate_reads(on);
+    }
+
+    fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
+        self.inner.changed_since_statement(key)
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) {
         if self.failed.is_none() {
             let before = self.before(key);

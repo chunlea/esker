@@ -655,8 +655,21 @@ fn widen_for_dependencies(
         Ok(())
     };
     for item in &select.projection {
-        if let SelectItem::Expr { expr, .. } = item {
-            consider(expr)?;
+        match item {
+            SelectItem::Expr { expr, .. } => consider(expr)?,
+            // **A star is every column it expands to, and skipping it was the bug.** The check
+            // below sees the expansion — it is what `SELECT *` returns — so a widening that looked
+            // only at written expressions freed nothing for the one shape `ActiveRecord` writes
+            // most: `Model.group(:id)` on a relation selecting everything. Measured on PG 19:
+            // `SELECT * FROM fam GROUP BY fam.id` answers rows.
+            //
+            // The expansion is [`crate::exec::query::Scope::expand`], the same call the target
+            // list itself uses, rather than a second walk of the scope — a `USING` merge and the
+            // written order are both in it, and a copy would have to know that too.
+            SelectItem::Wildcard => consider_expansion(scope, None, &mut consider)?,
+            SelectItem::QualifiedWildcard(qualifier) => {
+                consider_expansion(scope, Some(qualifier), &mut consider)?;
+            }
         }
     }
     if let Some(having) = &select.having {
@@ -665,6 +678,26 @@ fn widen_for_dependencies(
     for key in determined {
         key_types.push(super::query::expr_type(&key, scope)?);
         keys.push(key);
+    }
+    Ok(())
+}
+
+/// Offers each column a star expands to for the same dependency test a written column gets.
+///
+/// A qualifier naming no relation in the query is `42P01`, and it is [`Scope::expand`]'s answer
+/// rather than one invented here — the target list would refuse the same statement with the same
+/// sentence a line later.
+fn consider_expansion(
+    scope: &Scope<'_>,
+    qualifier: Option<&str>,
+    consider: &mut impl FnMut(&Expr) -> Result<()>,
+) -> Result<()> {
+    for (at, column) in scope.expand(qualifier)? {
+        consider(&Expr::Ordinal {
+            at,
+            ty: column.ty,
+            typmod: column.typmod,
+        })?;
     }
     Ok(())
 }

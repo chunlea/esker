@@ -651,6 +651,13 @@ impl Executor {
                     if self.isolation().waits() {
                         txn.begin_statement()?;
                     }
+                    // **Asked once per statement, because the level can be set inside the block.**
+                    // `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` is a statement like any other,
+                    // and a transaction that learned its level only at `BEGIN` would record nothing
+                    // for the one shape a client actually writes (ADR 0062).
+                    txn.validate_reads(
+                        self.isolation() == crate::parameter::Isolation::Serializable,
+                    );
                     let outcome = if savepoints.recording() {
                         let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
                         let outcome = self.run_recording(&mut recording, &statement, &mut written);
@@ -681,6 +688,7 @@ impl Executor {
 
         let mut txn = self.open_txn()?;
         self.catalog_written = false;
+        txn.validate_reads(self.isolation() == crate::parameter::Isolation::Serializable);
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
             Err(error) => {
@@ -779,6 +787,7 @@ impl Executor {
                 });
                 Ok(Outcome::done("DO"))
             }
+            Statement::Truncate(truncate) => ddl::truncate(self, txn, truncate),
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
@@ -1766,6 +1775,37 @@ impl Executor {
     ///
     /// The gaps it leaves are wider than PostgreSQL's default, and that is the declared
     /// divergence on [`crate::catalog::SEQUENCE_BATCH`]: `CACHE n` is a sequence option PostgreSQL
+    /// Drops this session's reserved block for one sequence, so the next `nextval` re-reads the
+    /// stored counter.
+    ///
+    /// `TRUNCATE … RESTART IDENTITY` needs it: the counter is a key and the block is in memory, so
+    /// resetting only the key leaves the session handing out values from inside a block that no
+    /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
+    /// because a value that was never handed out is not one this session last took.
+    fn forget_sequence_block(&mut self, sequence_id: u64) {
+        self.sequences.remove(&sequence_id);
+        self.currval_defined.remove(&sequence_id);
+        if self.last_sequence == Some(sequence_id) {
+            self.last_sequence = None;
+        }
+    }
+
+    /// Sets one sequence back to its start — the counter **and** this session's block.
+    ///
+    /// **In a transaction of its own**, because that is the transaction `nextval` reads in. A
+    /// counter reset inside the statement's transaction is invisible to the next allocation, which
+    /// reads the committed value and carries on: measured, the next id was 33 rather than 1. So
+    /// `TRUNCATE … RESTART IDENTITY` resets a sequence the way `nextval` advances one, and it
+    /// inherits the same non-transactionality — a rolled-back `TRUNCATE … RESTART IDENTITY` leaves
+    /// the sequence restarted, exactly as a rolled-back `INSERT` leaves its value consumed.
+    pub(crate) fn restart_sequence(&mut self, sequence_id: u64) -> Result<()> {
+        let mut txn = self.backend.begin()?;
+        crate::catalog::restart_sequence(&mut *txn, self.tenant, sequence_id);
+        txn.commit()?;
+        self.forget_sequence_block(sequence_id);
+        Ok(())
+    }
+
     /// has with exactly this behaviour, and neither server offers gap-freeness.
     fn next_sequence_value(&mut self, sequence_id: u64) -> Result<i64> {
         if let Some((next, end)) = self.sequences.get_mut(&sequence_id)
@@ -2719,6 +2759,7 @@ fn fill_sequence_reads_in(
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
         Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
+        Statement::Truncate(truncate) => vec![format!("Truncate on {}", truncate.names.join(", "))],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
         Statement::CreateExtension(create) => {
             vec![format!("Create Extension on {}", create.name)]
