@@ -1,0 +1,41 @@
+crates/esker-sql/src/error.rs
+  s_0ae9006f3dc5a2::t_edd74da78a7e75 223-231,2186
+crates/esker-sql/src/exec/mod.rs
+  s_0ae9006f3dc5a2::t_883b112cb17b52 1222-1232,1234-1235,1267-1327
+crates/esker-sql/src/exec/query.rs
+  s_0ae9006f3dc5a2::t_d1bab26f0c896c 29,201-237,504-533,771-774,831-836,839-840,850-856,860-928
+crates/esker-sql/src/parse/lower.rs
+  s_0ae9006f3dc5a2::t_30317267211589 5373-5374,5376-5379,5390-5393,5395-5399
+crates/esker-sql/src/plan/mod.rs
+  s_0ae9006f3dc5a2::t_69a192b5f14857 49
+crates/esker-sql/src/plan/query.rs
+  s_0ae9006f3dc5a2::t_bfed175e0782f3 176-191,194-203,210-211,256-259
+crates/esker-sql/tests/corpus/pg19_row_locking.txt
+  s_0ae9006f3dc5a2::t_e65ff1e9ce3226 47-59,102-115
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_0ae9006f3dc5a2::t_7d28f6797e8ff8 43-91
+crates/esker-sql/tests/read_committed.rs
+  s_0ae9006f3dc5a2::t_0156a0fa4d8cd8 23,29
+crates/esker-sql/tests/row_locking.rs
+  s_0ae9006f3dc5a2::t_5d5d147cd6f517 11-18,43-49,66-223
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_0ae9006f3dc5a2::t_1675085d35b9bf 608-610,612-616,618,630-632
+docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md
+  s_0ae9006f3dc5a2::t_4f9461f5d84150 247-341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d6a6afb5d50167d97133034ec3e96b8fe41ca053",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9006f3dc5a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dda7865a-6020-489a-b184-a2d3ff7a56d7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
