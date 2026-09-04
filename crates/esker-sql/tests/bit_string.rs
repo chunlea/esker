@@ -31,18 +31,26 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', '101'::bit(8)",
         "SELECT 'r', '101010101'::bit(4)",
         "SELECT 'r', '10101'::bit varying(3)",
+        // **The values agree now** — `x'F'` is `1111` and `x'1A'` is `00011010`, four bits a
+        // digit — and what is left is the standing one three lines up: a cast's typmod does not
+        // reach the declared type, so this says `"bit"` where a real server says `bit(4)`.
+        "SELECT 'r', x'F'::bit(4), x'1A'::bit(8)",
+        // The same, one spelling over: `'101'::bit` is `1` here and there — the bare keyword is
+        // the grammar's `bit(1)` and truncates — and it is only the *declared* `bit(1)` that this
+        // node reports as `"bit"`, because a `Literal::Typed` carries a `Datum` and not a typmod.
+        "SELECT 'r', '101'::bit, '101'::bit varying",
+        // `pg_typeof` is a `regtype` there and `text` here, the standing catalog trade; the
+        // values are `bit` in both, which is what these two ask.
+        "SELECT 'r', B'00000011', pg_typeof(B'00000011')",
+        "SELECT 'r', X'F', X'ff', X'0', pg_typeof(X'ff')",
+        // `column_name`, `data_type` and `column_default` are `information_schema`'s own domains
+        // and `text` here. **Every value agrees** — including `'00000011'::"bit"` and
+        // `'0011'::"bit"`, which is the quoted spelling a real server prints for a `B'…'` default
+        // even on a `bit varying` column, and `bit(1)` for the bare `another_bit`.
+        "SELECT 'r', column_name, data_type, character_maximum_length, column_default FROM \
+         information_schema.columns WHERE table_name = 'bl' ORDER BY ordinal_position",
     ],
     answers: &[
-        // **The bit *literals* are their own small feature and the suite writes none of them.**
-        // `ActiveRecord` sends `'00001010'` as an ordinary string; `B'101'` and `x'F'` are SQL's
-        // own spellings and reach this node as a lexical form it has no value for. The hex one
-        // is where the two meet: `x'F'` is `1111`, four bits per digit, which is also what
-        // `bit_string_test.rb`'s `"0xF"` becomes — client-side, before the statement exists.
-        ("SELECT 'r', B'101', B'0'", "a bit literal is its own unit"),
-        (
-            "SELECT 'r', x'F'::bit(4), x'1A'::bit(8)",
-            "a hexadecimal bit literal is its own unit",
-        ),
         // **`integer -> bit` is a cast and not a reading of the digits.** `5::int4::bit(8)` is
         // `00000101` — the number in binary — where this node reads the *text* `5` and finds a
         // character that is not a binary digit. Refused rather than answered, and named here.
@@ -54,6 +62,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the suite: `length`/`octet_length`, the bitwise `& | # ~`, and the shifts.
         (
             "SELECT 'r', length('10101'::bit(5)), octet_length('10101'::bit(5))",
+            "the bit-string functions are their own unit",
+        ),
+        // The same unit, reached through the literal: the `B'1010'` and the `B''` beside it are
+        // right and the `length` is what refuses, which is why the whole statement is here.
+        (
+            "SELECT 'r', B'1010', length(B'1010'), B''",
             "the bit-string functions are their own unit",
         ),
         (

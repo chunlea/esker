@@ -26,20 +26,23 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     ],
     answers: &[
         // **The allowlist is deliberate and is the user's call**, not an oversight: this node
-        // offers `citext`, `hstore`, `pgcrypto`, `plpgsql` and `uuid-ossp`, and nothing else
-        // without a decision — because `CREATE EXTENSION` here means the extension *and* what it
-        // promises, so an entry nothing implements would be a name that installs and then fails at
-        // the first value. `ltree` and `postgres_fdw` are the two the capture reaches.
+        // offers `citext`, `hstore`, `ltree`, `pgcrypto`, `plpgsql` and `uuid-ossp`, and nothing
+        // else without a decision — because `CREATE EXTENSION` here means the extension *and*
+        // what it promises, so an entry nothing implements would be a name that installs and then
+        // fails at the first value. **`ltree` was on this list and has left it**: the type, its
+        // order, its operators and `lquery` all landed, so the row and the `CREATE EXTENSION`
+        // both agree now and rule 2 deleted their declarations. `postgres_fdw` is what the
+        // capture still reaches, and a foreign-data wrapper is a feature rather than a type.
         (
             "SELECT 'r', name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('hstore','citext','ltree','postgres_fdw') ORDER BY name",
-            "Two rows here rather than four: `ltree` and `postgres_fdw` are not on the allowlist, \
-             so they are not available and the view does not claim they are.",
+            "Three rows here rather than four: `postgres_fdw` is not on the allowlist, so it is \
+             not available and the view does not claim it is.",
         ),
         (
-            "CREATE EXTENSION IF NOT EXISTS \"ltree\"",
-            "`0A000 extension \"ltree\" is not available`, with PostgreSQL's own HINT — the answer \
-             a real server gives for an extension its *system* does not have, which is exactly \
-             this node's position.",
+            "CREATE EXTENSION IF NOT EXISTS \"postgres_fdw\"",
+            "`0A000 extension \"postgres_fdw\" is not available`, with PostgreSQL's own HINT — \
+             the answer a real server gives for an extension its *system* does not have, which is \
+             exactly this node's position.",
         ),
         // A C1 gap rather than a refusal: `sqlparser` 0.62.0 cannot read the clause at all, so
         // this is `42601` where a real server runs the statement. The lowering already refuses

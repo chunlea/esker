@@ -292,6 +292,23 @@ pub enum ColumnType {
     /// `xml[]`. `xml_test.rb` declares no array; the type exists because a real server's `xml` has
     /// `typarray = 143`, and a base type whose `typarray` is `0` is what cost run 53 its 43 tests.
     XmlArray,
+    /// The `ltree` extension's type: a **path of dot-separated labels**, stored as written.
+    ///
+    /// A label is one or more of `A-Za-z0-9_-` and any non-ASCII letter; the empty path is a
+    /// value and has zero labels. Nothing is normalised, so equality is the text's — and
+    /// **ordering is not**: ltree compares the labels in turn, and a shorter path that is a
+    /// prefix of a longer one sorts first. See [`Datum::Ltree`] for what that costs the key.
+    Ltree,
+    /// `ltree[]`. `ltree_test.rb` declares none; the type exists because a real server's `ltree`
+    /// has a `typarray`, and a base type whose `typarray` is `0` is what cost run 53 its 43 tests.
+    LtreeArray,
+    /// The `ltree` extension's `lquery`: a **pattern** over a path, not a path.
+    ///
+    /// `json`'s shape — a validated string with no comparison of its own — because that is all a
+    /// pattern is here: it is written in a statement, matched with `~`, and never stored. No
+    /// column in the suite is one, so it has no array type; see [`ColumnType::Ltree`] for the
+    /// thing it matches.
+    LQuery,
     /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
     /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
     /// `can't quote Array` tests.
@@ -437,7 +454,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 78] = [
+    pub const ALL: [ColumnType; 81] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -516,6 +533,9 @@ impl ColumnType {
         ColumnType::Line,
         ColumnType::Xml,
         ColumnType::XmlArray,
+        ColumnType::Ltree,
+        ColumnType::LtreeArray,
+        ColumnType::LQuery,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in
@@ -646,6 +666,15 @@ pub enum Datum {
     /// floats too, and is named in text rather than linked for the reason the module doc gives:
     /// it is in the crate above this one).
     Citext(String),
+    /// [`ColumnType::Ltree`]: a path of dot-separated labels, stored **as written**.
+    ///
+    /// Its own variant for `Citext`'s reason and not `json`'s: **an ltree's order is not its
+    /// text's**. `'a.b' < 'a-b'` is true as an ltree and false as bytes, because a `.` (0x2E) is
+    /// above a `-` (0x2D) and ltree compares label by label rather than character by character.
+    /// [`crate::row`] encodes the key with the separator lowered below every byte a label can
+    /// hold, which reproduces PostgreSQL's order exactly and is reversible — unlike a citext's
+    /// fold, so an ltree key decodes back to the value it was written from.
+    Ltree(String),
     /// [`ColumnType::Bool`].
     Bool(bool),
     /// [`ColumnType::Bytea`].
@@ -797,6 +826,11 @@ impl PartialEq for Datum {
             // have. Adding a `Datum` variant means adding a line here.
             (Datum::Text(a), Datum::Text(b))
             | (Datum::Citext(a), Datum::Citext(b))
+            // And for an ltree that is the path as written, which is also its SQL equality — the
+            // type differs from `text` in its *order*, not in what two equal values are. It
+            // arrived without this line and was never equal to itself either; the same property
+            // test caught it, one type later.
+            | (Datum::Ltree(a), Datum::Ltree(b))
             | (Datum::Hstore(a), Datum::Hstore(b)) => a == b,
             // The canonical text and the subtype together: two ranges are one row when they print
             // the same *and* are the same type.
@@ -831,6 +865,7 @@ impl Datum {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
             Datum::Citext(_) => ColumnType::Citext,
+            Datum::Ltree(_) => ColumnType::Ltree,
             Datum::Point { .. } => ColumnType::Point,
             Datum::Money(_) => ColumnType::Money,
             // The flag is what tells the two apart, which is the whole reason it is carried.
@@ -929,6 +964,7 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Xml
+                | ColumnType::LQuery
         )
     )
 }

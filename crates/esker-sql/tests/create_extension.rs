@@ -100,6 +100,9 @@ fn the_two_extension_views_agree() {
             // goes on with the type and not before.
             vec!["citext", "1.8", "\\N"],
             vec!["hstore", "1.8", "\\N"],
+            // `ltree` joined them with `ltree_test.rb`'s type, at the oracle's own 1.3 where the
+            // two string extensions are at 1.8.
+            vec!["ltree", "1.3", "\\N"],
             vec!["pgcrypto", "1.4", "\\N"],
             vec!["plpgsql", "1.0", "1.0"],
             vec!["uuid-ossp", "1.1", "1.1"],
