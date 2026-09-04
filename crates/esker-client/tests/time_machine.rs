@@ -404,10 +404,18 @@ fn a_timestamp_from_a_duration_comes_from_the_oracle() {
     let now = cluster.oracle().tso_one();
     let ago = client.ts_ago(Duration::from_millis(500)).unwrap();
     assert!(ago < now, "the past is below the present");
+    // **500 is the ceiling here, not the floor**, and the bound was on the wrong side of it.
+    // `ts_ago` takes its *own* TSO read — `self.oracle.timestamp()` — which happens after the
+    // `now` above, so `ago = later - 500` and `gap = 500 - (later - now)`. The two reads cannot
+    // run in the other order, so `gap` reaches 500 only when both land in the same millisecond
+    // and is below it by however long the second call took. A range starting at 500 therefore
+    // fails on any machine slow enough to cross a millisecond boundary between two TSO reads,
+    // which is not load-sensitivity to be waited out: it is the assertion asking for a value the
+    // code cannot produce.
     let gap = physical_ms(now).saturating_sub(physical_ms(ago));
     assert!(
-        (500..=600).contains(&gap),
-        "half a second back, give or take the time the calls took: {gap} ms"
+        (400..=500).contains(&gap),
+        "half a second back, less the time the second TSO read took: {gap} ms"
     );
 
     // Longer than the oracle's clock has run: the bottom of the space, refused as too old
