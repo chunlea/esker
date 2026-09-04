@@ -1,6 +1,6 @@
 # ADR 0057 — READ COMMITTED waits for the writer in front of it
 
-Status: accepted (the wire change alone is held for the human) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
+Status: accepted, the two format changes included (approved 2026-09-04) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family
 
 ## Context
 
@@ -209,20 +209,40 @@ Why that is sound rather than a weakening:
 
 This is TiDB's `for_update_ts` without the pessimistic lock.
 
-### The wire change, and the question for the human
+### The two format changes, and the ruling
 
-`Prewrite` gains a per-key read timestamp, which is an `esker-proto` message with a golden test —
-so per `CLAUDE.md` it needs a ruling before it lands. **The question, in one sentence: may
-`TxnKvReq::Prewrite` gain an optional per-key `read_ts` (absent means "the transaction's
-`start_ts`", so every existing golden stays byte-identical and an old client keeps working), or
-would you rather it were a new request variant that leaves `Prewrite` untouched?**
+**Approved by the human on 2026-09-04**, in the shape below, which is *not* the one this section
+first proposed. Landed as the branch's last commit.
 
-The additive form is the one this ADR proposes, and the reason is the goldens: an optional field
-written only when it differs from `start_ts` means every frame this node writes today is the frame
-it writes tomorrow, and the format-version byte does not move. A new variant costs a second apply
-path in the store for the lifetime of the old one. Everything above this line is built first and
-independently; the field itself is **held in its own commit at the end of the branch**, so the rest
-lands whatever the ruling is.
+There are **two** formats, not one. `TxnMutation` is the wire message, and `TxnWrite` is the
+**Raft log** — `TxnCommand::Prewrite` is a replicated command with its own encoding — so a per-key
+read timestamp is a wire change and a log change together, and per `CLAUDE.md` both needed a yes.
+The question as it was actually put: *may a mutation that says which snapshot its value was computed
+from take a tag of its own — 3 and 4 beside the existing 1 and 2 — in both the wire message and the
+log entry?*
+
+A **new tag** rather than an optional field on the existing one, because:
+
+* **Every existing golden stays byte-identical, and not by accident.** A mutation whose value came
+  from the transaction's own snapshot — every mutation this node has ever made, and every one a
+  statement that never waited makes now — is still tag 1 or 2 and still encodes exactly the bytes it
+  encoded before. The format-version byte does not move, and every log entry ever written still
+  decodes.
+* **An older peer refuses rather than misreads.** An unknown tag is a decode error; a longer message
+  under a *known* tag would be read as a short one with trailing bytes, which is the one thing a
+  framing change must never do. The same argument holds for a node replaying a log written by a
+  newer one.
+* The cost is two arms in each encoder and two in each decoder, against a second apply path in the
+  store for the lifetime of the old message — which is what a new *request* variant would have cost.
+
+The alternative this section originally floated — an optional field on `Prewrite` itself — was not
+taken, because the timestamp is **per key**: a transaction whose first statement wrote row 1 and
+whose second waited on row 2 carries two different stamps in one prewrite, and a request-level field
+cannot say that. That per-key-ness is the half of §4 that stops a fresh timestamp being a licence to
+lose an update.
+
+Everything above this line was built first and independently, and the field itself was **held in its
+own commit at the end of the branch** until the ruling.
 
 ## 5. `SELECT … FOR UPDATE` locks nothing today, and must
 
