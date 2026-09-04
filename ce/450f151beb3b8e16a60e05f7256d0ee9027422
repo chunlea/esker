@@ -1,0 +1,21 @@
+docs/DESIGN.md
+  s_6f7019c05b578b::t_e6cb13c0093a59 714,719-721
+docs/acceptance/v1.md
+  s_6f7019c05b578b::t_c89f30102c570f 96-97,148-152,154-155,159,164,167,195,198,200,202-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ce450f151beb3b8e16a60e05f7256d0ee9027422",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
