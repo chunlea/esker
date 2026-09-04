@@ -58,7 +58,7 @@ pub use messages::{
 };
 pub use pd::{
     MemberChange, Operator, OperatorProgress, OperatorStatus, PdChannel, PdMemberInfo,
-    PdMembership, PdRaftBatch, PdReq, PdResp, ScannedRegion, StoreInfo,
+    PdMembership, PdRaftBatch, PdReq, PdResp, PdRole, ScannedRegion, StoreInfo,
 };
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};

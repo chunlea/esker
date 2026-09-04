@@ -53,6 +53,7 @@ impl StandIn {
                 members: vec![esker_proto::PdMemberInfo {
                     id: 1,
                     address: "127.0.0.1:2379".to_owned(),
+                    role: esker_proto::PdRole::Voter,
                 }],
             }
         }
