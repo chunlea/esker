@@ -1,0 +1,39 @@
+Cargo.lock
+  s_2bed4ac2b1c944::t_f75645b6dceac3 415
+crates/esker-cli/src/pd.rs
+  s_2bed4ac2b1c944::t_215ac21d3ca008 395-433,497
+crates/esker-pd/Cargo.toml
+  s_2bed4ac2b1c944::t_71b7e96160a005 45-47
+crates/esker-pd/src/service.rs
+  s_2bed4ac2b1c944::t_b6b2567846e8eb 167,169-188,191-198
+crates/esker-pd/src/transport.rs
+  s_2bed4ac2b1c944::t_7668411ba24865 11
+crates/esker-pd/tests/failover.rs
+  s_2bed4ac2b1c944::t_b4754d19305f5d 37-38,49-52,185,273,287-291,648,734,803
+crates/esker-pd/tests/tso_window.proptest-regressions
+  s_2bed4ac2b1c944::t_dae765a74367e6 1-7
+crates/esker-pd/tests/tso_window.rs
+  s_2bed4ac2b1c944::t_4c44c415128db4 1-213
+crates/esker-proto/src/pd.rs
+  s_2bed4ac2b1c944::t_de87cec644b29a 947
+crates/esker-proto/tests/messages.rs
+  s_2bed4ac2b1c944::t_e1cf60d8ae4771 111-117,143-152,180-213,261-262
+docs/plans/phase-15-pd-ha.md
+  s_2bed4ac2b1c944::t_d6186378924f65 344-386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bc7398e81c51b422f7a97bec37d61f52151e5573",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
