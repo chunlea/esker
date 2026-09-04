@@ -1,0 +1,16 @@
+crates/esker-client/tests/crash_through_the_client.rs
+  h_44076b318daf9c 264-276,278-291
+docs/plans/debt-c6.md
+  h_44076b318daf9c 838-902
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "461668866619c743ee5384f1e7e296e096fa7837",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
