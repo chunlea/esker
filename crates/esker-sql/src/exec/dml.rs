@@ -423,6 +423,7 @@ pub(super) fn insert(
         fit_typmods(&table, &mut row)?;
         fill_generated(&table, &mut row)?;
         check_not_null(&table, &row)?;
+        check_domain_constraints(&table, &row)?;
         check_constraints(&table, &row)?;
         // **A partitioned table stores nothing itself**: the row goes to the partition its key
         // selects, and lands there under that table's own row id, key and indexes. A row no
@@ -850,6 +851,7 @@ pub(super) fn update(
             // — and a `SET generated = DEFAULT` recomputes rather than storing NULL.
             fill_generated(&table, &mut new)?;
             check_not_null(&table, &new)?;
+            check_domain_constraints(&table, &new)?;
             check_constraints(&table, &new)?;
             // Anything pointing at the row's **old** key. Refusing comes first, so a `RESTRICT` leaves
             // the table as it was; the cascade comes *after* the row has moved, because a child whose
@@ -1824,11 +1826,79 @@ fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
 
 fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
     for (ordinal, column) in table.columns.iter().enumerate() {
-        if column.not_null && matches!(row[ordinal], Datum::Null) {
+        if !matches!(row[ordinal], Datum::Null) {
+            continue;
+        }
+        // **A domain's `NOT NULL` is the domain's, and it says so** — measured, `23502 domain
+        // dm_pos does not allow null values`, which names neither the column nor the table. It is
+        // checked before the column's own so that a column of a `NOT NULL` domain reports the
+        // domain, which is what a real server does (ADR 0065).
+        if let Some(crate::catalog::TypeKind::Domain { not_null: true, .. }) = column
+            .user_type
+            .and_then(|oid| table.enums.get(&oid))
+            .map(|def| &def.kind)
+        {
+            return Err(SqlError::DomainNotNull(
+                domain_name_of(table, column).to_owned(),
+            ));
+        }
+        if column.not_null {
             return Err(SqlError::NotNullViolationInRelation {
                 column: column.name.clone(),
                 relation: table.name.clone(),
                 row: Some(super::index::render_values(row)),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The bare name of the domain a column was declared as, for a message that quotes it.
+fn domain_name_of<'a>(table: &'a TableDef, column: &crate::catalog::ColumnDef) -> &'a str {
+    column
+        .user_type
+        .and_then(|oid| table.enums.get(&oid))
+        .map_or("", |def| crate::catalog::split_qualified(&def.name).1)
+}
+
+/// Every **domain** `CHECK` a row's columns are subject to.
+///
+/// **`VALUE` is the column**, which is the whole of the rewrite: a domain's constraint is written
+/// against a value with no name, and the row it is checked in has the value in a named column. So
+/// the stored text is parsed and `VALUE` resolved against that column, and the rest of the
+/// evaluation is the one a table's own `CHECK` goes through (ADR 0065).
+fn check_domain_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
+    if table.enums.is_empty() {
+        return Ok(());
+    }
+    for (ordinal, column) in table.columns.iter().enumerate() {
+        let Some(def) = column.user_type.and_then(|oid| table.enums.get(&oid)) else {
+            continue;
+        };
+        let crate::catalog::TypeKind::Domain {
+            check: Some(expr), ..
+        } = &def.kind
+        else {
+            continue;
+        };
+        // **NULL is not checked**, which is PostgreSQL's rule for a domain exactly as it is for a
+        // table's `CHECK`: unknown passes, and a NULL is refused by `NOT NULL` or not at all.
+        if matches!(row[ordinal], Datum::Null) {
+            continue;
+        }
+        let name = crate::catalog::split_qualified(&def.name).1;
+        let text = expr.replace("VALUE", &format!("\"{}\"", column.name));
+        let parsed = crate::parse::parse_stored_expr(&text).map_err(|error| {
+            SqlError::Internal(format!(
+                "the stored CHECK of domain {name} no longer parses: {error}"
+            ))
+        })?;
+        let scope = query::Scope::single(table);
+        let resolved = query::resolve(&parsed, &scope)?;
+        if matches!(cursor::evaluate(&resolved, row)?, Datum::Bool(false)) {
+            return Err(SqlError::DomainCheckViolation {
+                domain: name.to_owned(),
+                constraint: format!("{name}_check"),
             });
         }
     }

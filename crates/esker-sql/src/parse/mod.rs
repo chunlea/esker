@@ -224,6 +224,10 @@ impl StatementClass {
 /// one file would already be false. So the AST stays inside and everything outside works with the
 /// class, the rendering, and (from unit 6) the lowered plan.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact about one statement that `sqlparser` could not               carry, and they are read one at a time by the lowering. Grouping them into a               sub-struct would put two names in front of every read and relate facts that are               unrelated -- `UNLOGGED` on a table, `CONCURRENTLY` on a drop and `NOT NULL` on a               domain have nothing to do with each other."
+)]
 pub struct Parsed {
     statement: Statement,
     class: StatementClass,
@@ -274,6 +278,9 @@ pub struct Parsed {
     /// ([`Parsed::lower`]). Every other rewrite in this module keeps the tree and adds to it;
     /// this one is the exception, and it is why the field carries the whole statement.
     raise: Option<(String, crate::error::Severity)>,
+    /// Whether a `CREATE DOMAIN` said `NOT NULL`, which `sqlparser` 0.62.0 cannot read
+    /// ([`strip_domain_not_null`]).
+    domain_not_null: bool,
     /// `WITH DATA` / `WITH NO DATA` on a `CREATE MATERIALIZED VIEW`: `Some(false)` for `NO DATA`.
     ///
     /// `sqlparser` 0.62.0 reads `CREATE MATERIALIZED VIEW … AS <query>` and then expects the
@@ -346,6 +353,12 @@ impl Parsed {
     #[must_use]
     pub fn raised(&self) -> Option<&(String, crate::error::Severity)> {
         self.raise.as_ref()
+    }
+
+    /// Whether a `CREATE DOMAIN` said `NOT NULL`.
+    #[must_use]
+    pub fn domain_not_null(&self) -> bool {
+        self.domain_not_null
     }
 
     /// `WITH DATA` / `WITH NO DATA`, or `None` when the statement carried neither.
@@ -465,6 +478,10 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = virtual_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
+    // `NOT NULL` on a `CREATE DOMAIN` is a clause the parser stops at; it comes off and the fact
+    // travels on `Parsed`.
+    let domain_not_null_rewrite = strip_domain_not_null(sql, &scanned);
+    let sql = domain_not_null_rewrite.as_deref().unwrap_or(sql);
     // `WITH [NO] DATA` is the last thing in a `CREATE MATERIALIZED VIEW` and the parser stops at
     // it; the clause comes off and the answer travels on `Parsed`.
     let with_data_rewrite = strip_with_data(sql, &scanned);
@@ -499,6 +516,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                     .as_ref()
                     .map(|(_, flags)| flags.clone())
                     .unwrap_or_default(),
+                domain_not_null: domain_not_null_rewrite.is_some(),
                 with_data: with_data_rewrite.as_ref().map(|(_, data)| *data),
                 refresh: refresh.clone(),
             }
@@ -541,6 +559,29 @@ fn do_body(sql: &str) -> Option<&str> {
 /// **`EXCEPTION` is deliberately not here.** It is an error — `P0001` with the raised text as the
 /// whole message — and routing it through the notice path would turn a failed statement into a
 /// successful one. It stays refused by name until something needs it.
+/// Cuts `NOT NULL` out of a `CREATE DOMAIN`, returning the rest of the statement.
+///
+/// `sqlparser` 0.62.0 reads a domain's `DEFAULT` and its `CHECK` and stops at `NOT NULL`
+/// (`Expected: end of statement, found: NOT`), so the two words come out and the fact travels on
+/// [`Parsed::domain_not_null`] — the same arrangement `strip_unlogged` uses for a keyword the
+/// parser cannot carry.
+///
+/// **Only in a `CREATE DOMAIN`**, because `NOT NULL` means something in half the statements this
+/// module sees and removing it from a `CREATE TABLE` would drop a column constraint on the floor.
+fn strip_domain_not_null(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    if !starts_with_words(&scanned.words, &["CREATE", "DOMAIN"]) {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let at = upper.find(" NOT NULL")?;
+    // A whole clause: what follows must not continue the word.
+    let after = sql.get(at + " NOT NULL".len()..)?;
+    if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(format!("{}{after}", sql.get(..at)?))
+}
+
 /// Cuts a trailing `WITH [NO] DATA` off a `CREATE MATERIALIZED VIEW`, returning the rest of the
 /// statement and whether data was asked for.
 ///
@@ -1708,7 +1749,8 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         // **Here as well as in `parse_statements`**, and for the reason `strip_unlogged` is in
         // both: this function is an entry point of its own, and a clause that only comes off on
         // the other path makes the same statement parse through one door and not the other.
-        .or_else(|| strip_with_data(sql, &scanned).map(|(kept, _)| kept));
+        .or_else(|| strip_with_data(sql, &scanned).map(|(kept, _)| kept))
+        .or_else(|| strip_domain_not_null(sql, &scanned));
     // **A recognised `REFRESH` parses as a placeholder here too.** `sqlparser` has no `REFRESH`
     // statement at all, so without this the same statement parsed through `parse_statements` and
     // was a bare `42601` through this door — and `42601` about valid PostgreSQL is the one answer
