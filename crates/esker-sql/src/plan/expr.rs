@@ -653,6 +653,16 @@ pub enum CatalogFunc {
     /// Like `pg_get_indexdef` its argument is a column, and like it, an oid that names no
     /// constraint is NULL rather than an error.
     PgGetConstraintdef,
+    /// `pg_get_viewdef(oid)`, `pg_get_viewdef(oid, pretty)`: a view's `SELECT`, printed.
+    ///
+    /// **This node prints the definition as it was stored, not PostgreSQL's reconstruction.** A
+    /// real server deparses its own parse tree — re-cased, re-qualified, re-indented, every
+    /// expression parenthesised and a semicolon on the end — and reproducing that is `ruleutils.c`
+    /// rather than a function. What is returned here is the same text `pg_views.definition`
+    /// already returns, which is the query the user wrote; the *content* agrees and the layout
+    /// does not. Declared in `tests/view_debts.rs` (ADR 0031: nothing in the suite parses the
+    /// deparser's layout).
+    PgGetViewdef,
     /// `pg_encoding_to_char(int)`: an encoding number's name.
     ///
     /// **6 is `UTF8`**, which is the only encoding this node speaks and the only number
@@ -945,6 +955,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
             () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
             () if name.eq_ignore_ascii_case("pg_get_indexdef") => Some(CatalogFunc::PgGetIndexdef),
+            () if name.eq_ignore_ascii_case("pg_get_viewdef") => Some(CatalogFunc::PgGetViewdef),
             () if name.eq_ignore_ascii_case("pg_get_constraintdef") => {
                 Some(CatalogFunc::PgGetConstraintdef)
             }
@@ -976,6 +987,7 @@ impl CatalogFunc {
             CatalogFunc::PgGetExpr => "pg_get_expr",
             CatalogFunc::PgGetIndexdef => "pg_get_indexdef",
             CatalogFunc::PgGetConstraintdef => "pg_get_constraintdef",
+            CatalogFunc::PgGetViewdef => "pg_get_viewdef",
             CatalogFunc::PgEncodingToChar => "pg_encoding_to_char",
             CatalogFunc::PgGetSerialSequence => "pg_get_serial_sequence",
             CatalogFunc::ColDescription => "col_description",
@@ -1054,7 +1066,9 @@ impl CatalogFunc {
             // `pg_get_expr`'s two really are two forms as well.
             CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr => &[2, 3],
             CatalogFunc::PgGetIndexdef => &[1, 3],
-            CatalogFunc::PgGetConstraintdef | CatalogFunc::ObjDescription => &[1, 2],
+            CatalogFunc::PgGetConstraintdef
+            | CatalogFunc::PgGetViewdef
+            | CatalogFunc::ObjDescription => &[1, 2],
             CatalogFunc::RangeLowerInc
             | CatalogFunc::RangeUpperInc
             | CatalogFunc::RangeLowerInf
@@ -1092,6 +1106,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetExpr
             | CatalogFunc::PgGetIndexdef
             | CatalogFunc::PgGetConstraintdef
+            | CatalogFunc::PgGetViewdef
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::DateRange
             | CatalogFunc::ColDescription

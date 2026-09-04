@@ -2835,21 +2835,7 @@ pub(super) fn drop_view(
             Some(catalog::Relation::View { .. }) => {
                 // A view built on this one is a dependency exactly as a view on a table is —
                 // same `2BP01`, with `view` on both sides of the `DETAIL`.
-                let dependents = dependent_views(executor, txn, &stored)?;
-                if let Some(outer) = dependents.first()
-                    && !drop.cascade
-                {
-                    return Err(SqlError::ViewDependsOnRelation {
-                        kind: "view",
-                        name: catalog::display_name(&stored),
-                        detail: format!(
-                            "view {} depends on view {}",
-                            catalog::display_name(outer),
-                            catalog::display_name(&stored)
-                        ),
-                    });
-                }
-                drop_views_cascading(executor, txn, dependents)?;
+                refuse_or_drop_dependent_views(executor, txn, &stored, "view", drop.cascade)?;
                 catalog::drop_view(txn, executor.tenant, &stored)?;
                 executor.catalog_written = true;
             }
@@ -2957,6 +2943,35 @@ pub(super) fn alter_schema_rename(
     Ok(Outcome::done("ALTER SCHEMA"))
 }
 
+/// The view half of a `DROP`: refuse if anything is built on `relation`, or take it with `CASCADE`.
+///
+/// Checked **before** the foreign keys, because PostgreSQL reports the first dependent it finds and
+/// views come first in its own order. Without this the base could go and the view be left naming a
+/// relation that is gone — a name outliving its object, reached from an ordinary `DROP TABLE`.
+fn refuse_or_drop_dependent_views(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    relation: &str,
+    kind: &'static str,
+    cascade: bool,
+) -> Result<()> {
+    let dependents = dependent_views(executor, txn, relation)?;
+    if let Some(view) = dependents.first()
+        && !cascade
+    {
+        return Err(SqlError::ViewDependsOnRelation {
+            kind,
+            name: catalog::display_name(relation),
+            detail: format!(
+                "view {} depends on {kind} {}",
+                catalog::display_name(view),
+                catalog::display_name(relation)
+            ),
+        });
+    }
+    drop_views_cascading(executor, txn, dependents)
+}
+
 /// Drops each view and everything built on it, depth first.
 ///
 /// **A view over a view is a dependency too**, so a cascade that dropped only the direct
@@ -3035,10 +3050,7 @@ fn dependent_views(executor: &Executor, txn: &dyn Txn, relation: &str) -> Result
         let Some(Ok(lowered)) = parsed.first().map(crate::parse::Parsed::lower) else {
             continue;
         };
-        if super::bind::table_names(&lowered)
-            .iter()
-            .any(|name| *name == relation)
-        {
+        if super::bind::table_names(&lowered).contains(&relation) {
             found.push(view.name.clone());
         }
     }
@@ -3091,26 +3103,7 @@ pub(super) fn drop_table(
                 return Err(SqlError::UndefinedTableForDrop(name.clone()));
             }
         };
-        // **A view built on this table is a dependency too**, and it is checked before the
-        // foreign keys because PostgreSQL reports the first dependent it finds and views come
-        // first in its own order. Without this the table could go and the view be left naming a
-        // relation that is gone — a name outliving its object, reached from an ordinary
-        // `DROP TABLE`. `CASCADE` drops the views instead.
-        let dependents = dependent_views(executor, txn, &table.name)?;
-        if let Some(view) = dependents.first()
-            && !drop.cascade
-        {
-            return Err(SqlError::ViewDependsOnRelation {
-                kind: "table",
-                name: table.name.clone(),
-                detail: format!(
-                    "view {} depends on table {}",
-                    catalog::display_name(view),
-                    catalog::display_name(&table.name)
-                ),
-            });
-        }
-        drop_views_cascading(executor, txn, dependents)?;
+        refuse_or_drop_dependent_views(executor, txn, &table.name, "table", drop.cascade)?;
         // **A table something references cannot be dropped**, and `2BP01` names the constraint
         // that stops it — unless `CASCADE`, which takes the constraint with the table instead.
         // `RESTRICT` is the default and the same thing as writing nothing; measured, both.

@@ -930,7 +930,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
 }
 
 /// Whether a statement mentions a parameter at all, so the common case costs no walk of its own.
-pub(super) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool {
+pub(crate) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool {
     let mut found = false;
     for_each_expr(statement, &mut |expr| {
         found = found || wanted(expr);

@@ -2397,8 +2397,6 @@ impl SqlError {
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
             }
-            SqlError::CouldNotCreateUniqueIndex { detail, .. } => Some(detail.clone()),
-            SqlError::ViewDependsOnRelation { detail, .. } => Some(detail.clone()),
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
@@ -2427,7 +2425,9 @@ impl SqlError {
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
-            SqlError::DependentType { detail, .. }
+            SqlError::CouldNotCreateUniqueIndex { detail, .. }
+            | SqlError::ViewDependsOnRelation { detail, .. }
+            | SqlError::DependentType { detail, .. }
             | SqlError::MalformedArrayLiteral { detail, .. }
             | SqlError::NumericFieldOverflow { detail }
             | SqlError::ForeignKeyViolation { detail, .. }
