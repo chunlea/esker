@@ -1023,3 +1023,61 @@ That is the old behaviour written down as an expectation, and under the fix it r
 `[10, 20, 2501]`. It now asserts the two properties separately — the looks before the last back
 off and grow, and the last one waits out what remains of the lease — with a note saying what it
 used to say and why that was the bug rather than the specification.
+
+## 15. `MemTable::add` could not report failure, so a full arena lost an acknowledged write
+
+Handed over by the `skip` lane with its arena skiplist ([ADR 0041](../adr/0041-the-in-house-arena-skiplist.md)),
+which is what made the failure *possible*: `crossbeam-skiplist` allocated from the global
+allocator and could not refuse, so before that landing there was nothing here to report.
+
+### What it was
+
+```rust
+pub fn add(&self, …) {
+    if !self.store().insert(key, &tag, value) {
+        tracing::error!(…, "the memtable arena is full and the entry was not stored");
+    }
+    self.approximate_size.fetch_add(charge, …);   // charged anyway
+}
+```
+
+`add` answered `()`. On a refusal it logged at `error!`, **charged `approximate_size` for the
+entry it had just failed to store**, and returned — so `commit_group` carried on and the write was
+acknowledged. Its bytes were already in the log by then, which is what makes it silent rather than
+merely wrong: nothing on the read path can tell an entry that was refused from one never written,
+and the table over-reported its size on the way to losing it. `CLAUDE.md` invariant 1, broken
+without a word.
+
+Unreachable in practice — four gigabytes in one memtable, against a 64 MiB default — which is why
+it is worth fixing rather than shrugging at: the cost of the fix is four lines and the cost of
+reaching it is a lost acknowledged write nobody can trace.
+
+### Both halves, and a third the compiler found
+
+* **`add` returns `Result<()>`**, with the refusal as an `Error::Unsupported` naming the seqno and
+  the sizes, and `approximate_size` charged only for what was stored.
+* **`db/write.rs` fails the group's commit** with `?`, the same treatment a log-write failure gets
+  a few lines above and for the same reason.
+* **`db/open.rs`, which clippy found and I had not** — WAL *recovery* replayed entries with the
+  same ignored result. An arena that refuses there means the database cannot hold its own log, and
+  an open that carried on would present one missing writes acknowledged before the crash. The same
+  silent loss reached from the other direction, and `-D warnings` on an unused `Result` is what
+  surfaced it.
+
+### The red, which is the mutation and not the absence of one
+
+`a_full_arena_is_an_error_and_not_a_lost_entry` builds a memtable on `Chunks::cramped` — the
+`#[cfg(test)]` arena that gives up after two small chunks, so the exhaustion path is reachable
+without allocating four gigabytes to get to it — fills it until it refuses, and asserts both the
+error *and* that the table holds exactly what `add` accepted.
+
+Restoring the old log-and-continue behaviour behind the new signature turns it red in the shape of
+the bug itself:
+
+```
+a cramped arena accepted 10000 entries without refusing
+```
+
+Ten thousand successes reported over a full arena. That is the defect stated as a number, and it
+is why the assertion is "the entry is not lost" rather than "an error is returned" — the second
+would have passed against a version that returned an error and dropped the entry anyway.

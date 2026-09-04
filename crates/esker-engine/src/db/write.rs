@@ -254,8 +254,14 @@ impl DbInner {
                         // ([`crate::batch::WriteBatch::delete_range`]).
                         mem.active.add_range(entry.seqno, entry.key, entry.value);
                     } else {
+                        // **A refusal fails the group.** The arena being full means this entry
+                        // is not in the table, and the group's bytes are already in the log — so
+                        // returning success here would acknowledge a write no read can answer,
+                        // which is invariant 1 broken without a word. Failing the group is the
+                        // same treatment a log-write failure gets a few lines above, and for the
+                        // same reason (`docs/plans/debt-c6.md` §15).
                         mem.active
-                            .add(entry.seqno, entry.kind, entry.key, entry.value);
+                            .add(entry.seqno, entry.kind, entry.key, entry.value)?;
                     }
                 }
                 None => {
