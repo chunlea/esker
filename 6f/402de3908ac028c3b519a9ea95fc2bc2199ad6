@@ -1,0 +1,25 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_7d07d91824ef4f 2218-2229,2703-2739
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_8f70bc7bf5d864 1837-1847,3152-3172,3196-3222
+crates/esker-sql/tests/rename_column.rs
+  s_6f7019c05b578b::t_feae5e4ff21e09 128-213
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_3c9ef533e01a79 1542
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6f402de3908ac028c3b519a9ea95fc2bc2199ad6",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
