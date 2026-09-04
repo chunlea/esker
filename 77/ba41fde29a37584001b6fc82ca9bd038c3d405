@@ -1,0 +1,57 @@
+crates/esker-proto/src/txn.rs
+  s_b20cd111ee22fe::t_bdfc591988b637 255-264,270-271,280,293-296,300,304,313,317,892-893
+crates/esker-store/tests/retire.rs
+  s_b20cd111ee22fe::t_9296cb87439194 262,296
+crates/esker-store/src/txn_command.rs
+  s_b20cd111ee22fe::t_d029bbe4ff7789 56-62,68-69,78,86-90,93-97,174-178,181-185,262-265,270,337,341,449,453,584,588
+crates/esker-txn/src/percolator.rs
+  s_b20cd111ee22fe::t_eeff365a7beae3 83-100,115-118,124-130,382-385
+crates/esker-client/src/txn.rs
+  s_b20cd111ee22fe::t_43d85034616192 402-403,446-457,503,510-527,533,815-818,822-825
+crates/esker-client/tests/txn_crash_boundaries.rs
+  s_b20cd111ee22fe::t_627221fbba7494 127,136,311
+crates/esker-store/src/txnkv.rs
+  s_b20cd111ee22fe::t_d7d97f9288a172 331-338
+crates/esker-sql/tests/joint_gate.rs
+  s_b20cd111ee22fe::t_158216fd600839 1015,1020
+crates/esker-proto/tests/messages.rs
+  s_b20cd111ee22fe::t_4accb69a875866 405,409,1315-1316
+crates/esker-store/tests/schema_fetch.rs
+  s_b20cd111ee22fe::t_2ffc7e88d88ec7 301,322,424,437,458,470
+crates/esker-client/src/wire.rs
+  s_b20cd111ee22fe::t_28ab8f7728a71e 116-119
+crates/esker-store/tests/sim_sweep.rs
+  s_b20cd111ee22fe::t_a4e12390e66fae 235,261
+crates/esker-txn/tests/protocol.rs
+  s_b20cd111ee22fe::t_050c8a84aec668 612,623,658,670
+crates/esker-store/tests/snapshot.rs
+  s_b20cd111ee22fe::t_de9a619d2f8453 259
+crates/esker-store/tests/columnar_region.rs
+  s_b20cd111ee22fe::t_059f95681e90fe 96,173,199-205,273
+crates/esker-store/tests/columnar_resume.rs
+  s_b20cd111ee22fe::t_6cea11908fb965 83,195
+crates/esker-client/tests/txn.rs
+  s_b20cd111ee22fe::t_410d3b58f41768 367-368,437-440
+crates/esker-store/tests/txnkv.rs
+  s_b20cd111ee22fe::t_1e3a5197b7585f 67,204,890
+crates/esker-client/tests/anomalies.rs
+  s_b20cd111ee22fe::t_c91b7f67bb7eb8 116
+crates/esker-client/tests/bank.rs
+  s_b20cd111ee22fe::t_af91d98639143f 489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "77ba41fde29a37584001b6fc82ca9bd038c3d405",
+  "prompts": {},
+  "sessions": {
+    "s_b20cd111ee22fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d47fb1f-9385-4f6f-88a7-2a1d2aaf1b64",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
