@@ -364,7 +364,8 @@ fn the_primary_goes_first_in_both_phases() {
                 mutations,
                 vec![TxnMutation::Put {
                     key: key(b"a"),
-                    value: key(b"1")
+                    value: key(b"1"),
+                    read_ts: None,
                 }],
                 "the primary is prewritten alone"
             );
@@ -433,7 +434,10 @@ fn a_key_written_twice_is_prewritten_once() {
     match nth_txn(&transport, 0) {
         TxnKvReq::Prewrite { mutations, .. } => assert_eq!(
             mutations,
-            vec![TxnMutation::Delete { key: key(b"k") }],
+            vec![TxnMutation::Delete {
+                key: key(b"k"),
+                read_ts: None
+            }],
             "the last write for a key wins, and it is the only one"
         ),
         other => panic!("{other:?}"),

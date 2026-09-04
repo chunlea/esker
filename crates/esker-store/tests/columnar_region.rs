@@ -93,6 +93,7 @@ fn put(id: i64, name: &str) -> TxnMutation {
     TxnMutation::Put {
         key: row_key(id),
         value: row(id, name),
+        read_ts: None,
     }
 }
 
@@ -169,6 +170,7 @@ fn a_copy_is_built_from_what_the_region_holds_and_kept_up_by_what_arrives() {
         &[TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published(1)),
+            read_ts: None,
         }],
     );
     // Then rows the region committed **before** anything asked for a copy of them.
@@ -194,7 +196,13 @@ fn a_copy_is_built_from_what_the_region_holds_and_kept_up_by_what_arrives() {
         &db,
         50,
         51,
-        &[TxnMutation::Delete { key: row_key(2) }, put(4, "barbara")],
+        &[
+            TxnMutation::Delete {
+                key: row_key(2),
+                read_ts: None,
+            },
+            put(4, "barbara"),
+        ],
     );
     slot.commit(&db, 0, 51, &keys).unwrap();
 
@@ -262,6 +270,7 @@ fn opening_a_copy_rebuilds_it_from_the_region() {
         &[TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published(1)),
+            read_ts: None,
         }],
     );
     commit(&db, 20, 21, &[put(1, "ada")]);

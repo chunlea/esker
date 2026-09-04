@@ -113,8 +113,10 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
                 + mutations
                     .iter()
                     .map(|mutation| match mutation {
-                        TxnMutation::Put { key, value } => key.len() + value.len() + 2 * PER_FIELD,
-                        TxnMutation::Delete { key } => key.len() + PER_FIELD,
+                        TxnMutation::Put { key, value, .. } => {
+                            key.len() + value.len() + 2 * PER_FIELD
+                        }
+                        TxnMutation::Delete { key, .. } => key.len() + PER_FIELD,
                     })
                     .sum::<usize>()
                 + 4 * PER_FIELD

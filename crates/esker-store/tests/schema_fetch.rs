@@ -298,6 +298,7 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
         vec![TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published()),
+            read_ts: None,
         }],
     )
     .await;
@@ -318,6 +319,7 @@ async fn a_learner_without_the_catalog_fetches_the_schema_and_answers() {
             vec![TxnMutation::Put {
                 key: row_key(id),
                 value: row(id, name),
+                read_ts: None,
             }],
         )
         .await;
@@ -419,6 +421,7 @@ async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
         vec![TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published()),
+            read_ts: None,
         }],
     )
     .await;
@@ -431,6 +434,7 @@ async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
             vec![TxnMutation::Put {
                 key: row_key(id),
                 value: row(id, name),
+                read_ts: None,
             }],
         )
         .await;
@@ -451,6 +455,7 @@ async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
         vec![TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published_widened()),
+            read_ts: None,
         }],
     )
     .await;
@@ -462,6 +467,7 @@ async fn a_widened_table_is_answered_rather_than_frozen_at_the_first_version() {
         vec![TxnMutation::Put {
             key: row_key(3),
             value: wide_row(3, "three", "a note"),
+            read_ts: None,
         }],
     )
     .await;

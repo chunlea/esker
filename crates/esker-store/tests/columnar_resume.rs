@@ -80,6 +80,7 @@ fn put(id: i64, name: &str) -> TxnMutation {
     TxnMutation::Put {
         key: row_key(id),
         value: row(id, name),
+        read_ts: None,
     }
 }
 
@@ -191,6 +192,7 @@ fn ask_for_a_copy(db: &Db, log: &mut Log) {
         &[TxnMutation::Put {
             key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
             value: Bytes::from(published(1)),
+            read_ts: None,
         }],
     );
 }

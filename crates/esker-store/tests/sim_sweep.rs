@@ -232,6 +232,7 @@ async fn seed_all_three_families(store: &Arc<Store>, region: &Region) {
                 mutations: vec![TxnMutation::Put {
                     key: k.clone(),
                     value: Bytes::from_static(b"committed"),
+                    read_ts: None,
                 }],
             },
         )
@@ -257,6 +258,7 @@ async fn seed_all_three_families(store: &Arc<Store>, region: &Region) {
             mutations: vec![TxnMutation::Put {
                 key: key(50),
                 value: Bytes::from_static(b"uncommitted"),
+                read_ts: None,
             }],
         },
     )

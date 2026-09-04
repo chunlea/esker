@@ -124,6 +124,7 @@ fn abandon_at(cluster: &Cluster, router: &Router, boundary: Boundary, value: &[u
     prewrite(vec![TxnMutation::Put {
         key: key(PRIMARY),
         value: key(value),
+        read_ts: None,
     }]);
     if boundary == Boundary::PrimaryPrewritten {
         return start_ts;
@@ -132,6 +133,7 @@ fn abandon_at(cluster: &Cluster, router: &Router, boundary: Boundary, value: &[u
     prewrite(vec![TxnMutation::Put {
         key: key(SECONDARY),
         value: key(value),
+        read_ts: None,
     }]);
     if boundary == Boundary::SecondariesPrewritten {
         return start_ts;
@@ -306,6 +308,7 @@ fn a_live_lock_is_waited_for_rather_than_killed() {
             mutations: vec![TxnMutation::Put {
                 key: key(PRIMARY),
                 value: key(b"alive"),
+                read_ts: None,
             }],
         },
     ) {

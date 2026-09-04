@@ -1012,10 +1012,12 @@ fn strand_a_secondary_lock(
                 TxnMutation::Put {
                     key: primary.clone(),
                     value: row_value(4, "katherine"),
+                    read_ts: None,
                 },
                 TxnMutation::Put {
                     key: secondary.clone(),
                     value: row_value(5, "barbara"),
+                    read_ts: None,
                 },
             ],
         },

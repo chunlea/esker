@@ -259,6 +259,7 @@ async fn commit_one(store: &Arc<Store>, region: &Region, k: Bytes, start_ts: u64
             mutations: vec![TxnMutation::Put {
                 key: k.clone(),
                 value: Bytes::from_static(b"committed"),
+                read_ts: None,
             }],
         },
     )
@@ -292,6 +293,7 @@ async fn prewrite_only(store: &Arc<Store>, region: &Region, k: Bytes, start_ts: 
             mutations: vec![TxnMutation::Put {
                 key: k,
                 value: Bytes::from_static(b"uncommitted"),
+                read_ts: None,
             }],
         },
     )
