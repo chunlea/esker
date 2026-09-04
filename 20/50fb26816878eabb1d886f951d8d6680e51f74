@@ -1,0 +1,19 @@
+crates/esker-store/tests/snapshot.rs
+  s_2d916f5f540186::t_3cf3e84e6514d4 1108,1110-1130,1134-1175,1177,1179-1201,1203-1205,1280-1284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2050fb26816878eabb1d886f951d8d6680e51f74",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
