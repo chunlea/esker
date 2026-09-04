@@ -3921,6 +3921,24 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         })));
     }
     let Some(func) = plan::AggregateFunc::from_name(&name) else {
+        // **A name this vocabulary lacks may be a function the catalog holds**, and lowering
+        // cannot see the catalog — the same seam a column `DEFAULT` naming one already sits on.
+        // So the call is carried out rather than refused, and `Executor::resolve_user_function`
+        // raises the identical `0A000` for a name nobody declared. A name with no argument list at
+        // all is not a call and keeps its own message.
+        if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args {
+            let mut carried = vec![plan::Expr::Literal(plan::Literal::String(name.clone()))];
+            for arg in args {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                    return Err(SqlError::unsupported(format!("the function {name}")));
+                };
+                carried.push(lower_expr(expr)?);
+            }
+            return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::UserFunc,
+                args: carried,
+            })));
+        }
         return Err(SqlError::unsupported(format!("the function {name}")));
     };
 
