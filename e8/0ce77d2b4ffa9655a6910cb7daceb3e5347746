@@ -1,0 +1,21 @@
+docs/adr/0066-a-tsvector-is-its-canonical-text.md
+  s_3f615600dbce74::t_1fdc38f169f237 1-90
+docs/plans/tsvector.md
+  s_3f615600dbce74::t_381b215cdf6b95 1-128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e80ce77d2b4ffa9655a6910cb7daceb3e5347746",
+  "prompts": {},
+  "sessions": {
+    "s_3f615600dbce74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "763171d7-06a5-4af8-a3be-00a4e647dd9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
