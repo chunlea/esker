@@ -759,16 +759,21 @@ that goes silent is pinged, and one that stays silent is dropped with every wait
 | `request_timeout` | 30 s | How long a call waits for its answer before `Timeout`. |
 | `shutdown_grace` | 10 s | How long a graceful shutdown waits for in-flight requests before closing anyway. Graceful cannot mean "for ever": a handler wedged on a stuck disk must not hold the process open. |
 
-**Nothing on this wire is encrypted or authenticated**, and both halves of that are deliberate for
-now. A request carries a region epoch and a cluster id, neither of which is a credential: a store's
-`StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the socket,
-so the network boundary is the trust boundary. TLS here is one implementor away — the decision, the
-provider and the shape are settled by
-[ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md) and built once already on the
-SQL port — but this surface wants **mutual** authentication rather than server TLS, and a verified
-peer certificate is still not an authorization decision: mapping an identity to "may register as
-store 7" or "may vote in region 4" is application logic `esker-pd` does not have yet. That, not the
-encryption, is the bulk of the work here, and it is why this surface is not first.
+**This wire can be encrypted, and it still authorises nobody.** `connect_with_tls` and
+`Server::with_tls` put a TLS session under the framing, behind the same default-off `tls` feature
+the other two surfaces use ([ADR 0055](adr/0055-the-tls-options-across-three-surfaces-measured.md));
+`--rpc-tls-cert/-key/-ca` on `esker server` and `esker pd serve` turn it on, and `--rpc-tls-mutual`
+adds client certificates in both directions for the links where both ends are ours — store↔store
+and PD↔PD. Encryption here is **required, not offered**: there is no in-band upgrade like the
+PostgreSQL port's `SSLRequest`, so a server with TLS on refuses a peer that arrives in the clear.
+A node given an incomplete set of flags refuses to start rather than serving unencrypted on a port
+an operator believes is protected.
+What has *not* changed is who may say what. A request carries a region epoch and a cluster id,
+neither of which is a credential, and a verified certificate only says the peer holds a key this
+cluster's CA vouched for. Mapping that identity to "may register as store 7" or "may vote in
+region 4" is application logic `esker-pd` does not have, so a `StoreHeartbeat` or a
+`RaftTransport::Batch` from any peer the CA signed is still accepted on its own say-so. mTLS makes
+the identity available to check; the check is the work that remains.
 
 `HelloAck` reports the server's `max_frame_size` so a client can refuse an oversized request without
 spending a round trip on it. **A client is not obliged to adopt it**, and `esker-client` does not:

@@ -50,7 +50,7 @@ tracing-subscriber.workspace = true
 # the runtime graph is byte-for-byte what it was, and `SSLRequest` is answered `N` exactly as
 # before. Turning it on is what `just check` does (`--all-features`), so the gated tests are not
 # tests that never run.
-tls = ["dep:rustls", "dep:rustls-graviola"]
+tls = ["dep:rustls", "dep:rustls-graviola", "esker-proto/tls"]
 
 [dev-dependencies]
 # The end-to-end tests run the corpus against real stores over real sockets, which is the only

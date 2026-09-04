@@ -34,6 +34,20 @@ tokio = { workspace = true, features = [
     "time",
     "macros",
 ] }
+# **Optional, and off by default** (`tls` below). The same two crates and the same provider the
+# PostgreSQL port and the S3 tier took (ADR 0055); this is the third and last surface, so it costs
+# nothing further against the budget. Contained to `src/transport/tls.rs`: a `use rustls::`
+# anywhere else in this crate is a review failure.
+rustls = { workspace = true, optional = true }
+rustls-graviola = { workspace = true, optional = true }
+
+[features]
+# TLS on the framed RPC, and the shared session driver `esker-sql` uses for the PostgreSQL port.
+#
+# **Off by default.** With it off this crate links neither crate above, the runtime graph is what
+# it was, and `RpcTls::from_files` is a startup error naming the feature rather than a node that
+# comes up unencrypted on a port an operator believes is protected.
+tls = ["dep:rustls", "dep:rustls-graviola"]
 
 [dev-dependencies]
 proptest.workspace = true
