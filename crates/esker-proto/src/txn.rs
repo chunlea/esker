@@ -270,6 +270,29 @@ pub enum TxnMutation {
         /// As [`TxnMutation::Put::read_ts`].
         read_ts: Option<u64>,
     },
+    /// **Verify that `key` has not been committed since this transaction's snapshot, and hold it**
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
+    /// [ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// A key a SERIALIZABLE transaction **read**. It writes no value: what it leaves is the lock
+    /// record, which is what makes the validation and the commit atomic against another
+    /// transaction's — a check that left nothing behind would let a commit land between the check
+    /// and this transaction's own.
+    Check {
+        /// The user key that was read.
+        key: Bytes,
+    },
+    /// The same for a **range** a SERIALIZABLE transaction scanned.
+    ///
+    /// Its own variant rather than a key with a flag, because a range is two keys and a key is one:
+    /// a row that did not exist when the scan ran is in no read set, and only the range it would
+    /// have appeared in can name it. That is the phantom half of ADR 0062.
+    CheckRange {
+        /// Inclusive lower bound.
+        start: Bytes,
+        /// Exclusive upper bound.
+        end: Bytes,
+    },
 }
 
 impl TxnMutation {
@@ -277,7 +300,10 @@ impl TxnMutation {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key, .. } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key } => key,
+            // A range routes by its lower bound, which is the only part of it a single-region
+            // request can be addressed by — the same rule `RawKvReq::Scan` follows.
+            Self::CheckRange { start, .. } => start,
         }
     }
 
@@ -296,6 +322,8 @@ impl TxnMutation {
             Self::Delete { read_ts: None, .. } => 2,
             Self::Put { .. } => 3,
             Self::Delete { .. } => 4,
+            Self::Check { .. } => 5,
+            Self::CheckRange { .. } => 6,
         }
     }
 
@@ -319,6 +347,11 @@ impl TxnMutation {
                     out.put_varint(*read_ts);
                 }
             }
+            Self::Check { key } => out.put_bytes(key),
+            Self::CheckRange { start, end } => {
+                out.put_bytes(start);
+                out.put_bytes(end);
+            }
         }
     }
 
@@ -341,6 +374,13 @@ impl TxnMutation {
             4 => Ok(Self::Delete {
                 key: take(input, "mutation.key")?,
                 read_ts: Some(input.get_varint("mutation.read_ts")?),
+            }),
+            5 => Ok(Self::Check {
+                key: take(input, "mutation.key")?,
+            }),
+            6 => Ok(Self::CheckRange {
+                start: take(input, "mutation.start")?,
+                end: take(input, "mutation.end")?,
             }),
             tag => Err(DecodeError::invalid(
                 "mutation.tag",
@@ -435,6 +475,17 @@ pub enum TxnKvReq {
         /// The new safepoint. A store never moves its safepoint backwards.
         safepoint: u64,
     },
+    /// **The newest `commit_ts` for one key** — the question a waiter asks instead of guessing
+    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// A statement that took a row lock without waiting cannot tell from the lock alone whether the
+    /// writer in front committed and released between its read and its lock. The store already
+    /// computes this for its own prewrite conflict check; this asks it. Read-only: no lock, no log
+    /// entry, no `TxnWrite` variant.
+    LatestCommit {
+        /// The user key.
+        key: Bytes,
+    },
 }
 
 impl TxnKvReq {
@@ -450,6 +501,7 @@ impl TxnKvReq {
             Self::ResolveLock { .. } => Method::TxnResolveLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
+            Self::LatestCommit { .. } => Method::TxnLatestCommit,
         }
     }
 
@@ -470,6 +522,7 @@ impl TxnKvReq {
             | Self::ResolveLock { keys, .. } => keys.first().map_or(&[][..], |key| &key[..]),
             Self::Heartbeat { primary, .. } => primary,
             Self::GcSafepoint { .. } => &[],
+            Self::LatestCommit { key } => key,
         }
     }
 
@@ -538,6 +591,7 @@ impl TxnKvReq {
                 out.put_varint(*ttl_ms);
             }
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
+            Self::LatestCommit { key } => out.put_bytes(key),
         }
     }
 
@@ -591,6 +645,9 @@ impl TxnKvReq {
             },
             Method::TxnGcSafepoint => Self::GcSafepoint {
                 safepoint: input.get_varint("safepoint")?,
+            },
+            Method::TxnLatestCommit => Self::LatestCommit {
+                key: take(input, "key")?,
             },
             other => {
                 return Err(DecodeError::invalid(
@@ -653,6 +710,15 @@ pub enum TxnKvResp {
         /// transaction" learns whether there is more to do.
         resolved: u64,
     },
+    /// **The newest `commit_ts` for the key, or `None` for a key never committed.**
+    ///
+    /// `None` and `Some(0)` are different answers and both are possible: a key nobody has written
+    /// has no commit, and a timestamp is never zero (`docs/txn-spec.md` §5.5), so the option is not
+    /// a sentinel dressed as one.
+    LatestCommit {
+        /// The newest commit timestamp.
+        newest: Option<u64>,
+    },
     /// The lock's TTL now in effect. It may be *longer* than what was asked for, because a
     /// store never shortens a lock; it is never shorter.
     Heartbeat {
@@ -688,6 +754,7 @@ impl TxnKvResp {
             Self::ResolveLock { .. } => Method::TxnResolveLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
+            Self::LatestCommit { .. } => Method::TxnLatestCommit,
         }
     }
 
@@ -713,6 +780,15 @@ impl TxnKvResp {
             Self::ResolveLock { resolved } => out.put_varint(*resolved),
             Self::Heartbeat { ttl_ms } => out.put_varint(*ttl_ms),
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
+            // **A `u64` and a flag, not a sentinel.** Zero is not a timestamp, but writing zero for
+            // "never committed" would make the absence unreadable the day it is not.
+            Self::LatestCommit { newest } => match newest {
+                Some(ts) => {
+                    out.put_u8(1);
+                    out.put_varint(*ts);
+                }
+                None => out.put_u8(0),
+            },
         }
     }
 
@@ -751,6 +827,18 @@ impl TxnKvResp {
             },
             Method::TxnGcSafepoint => Self::GcSafepoint {
                 safepoint: input.get_varint("safepoint")?,
+            },
+            Method::TxnLatestCommit => Self::LatestCommit {
+                newest: match input.get_u8("latest_commit.present")? {
+                    0 => None,
+                    1 => Some(input.get_varint("latest_commit.newest")?),
+                    other => {
+                        return Err(DecodeError::invalid(
+                            "latest_commit.present",
+                            format!("{other} is not a presence flag"),
+                        ));
+                    }
+                },
             },
             other => {
                 return Err(DecodeError::invalid(
