@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -301,14 +302,22 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
 
     // Load keeps running while the cluster grows, which is the case the lag criterion has to work
     // under: a learner is never exactly level with a leader that is still taking writes.
+    //
+    // **The writer counts what it has finished.** `JoinHandle::is_finished` is a bool, and the
+    // difference between key 899 of 900 and key 350 is the whole diagnosis: the first is a clock
+    // and the second is something blocking. A run that expires reporting only `writer_done=false`
+    // sends the next reader to the deadline, which is the one place the answer is not.
+    let written = Arc::new(AtomicU32::new(0));
     let writer = {
         let store = Arc::clone(&first.store);
         let store2 = Arc::clone(&second.store);
         let store3 = Arc::clone(&third.store);
         let value = value.clone();
+        let written = Arc::clone(&written);
         tokio::spawn(async move {
             for n in 300..900 {
                 put(&[&store, &store2, &store3], key(n), &value).await;
+                written.fetch_add(1, Ordering::Relaxed);
             }
         })
     };
@@ -318,7 +327,7 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     // the load keeps splitting, so there is nearly always one that is merely new. A learner that
     // is *still* a learner after `PROMOTION_DEADLINE` is exactly the acceptance finding, where
     // every region held two of them for four minutes and for ever after.
-    watch_until_every_learner_votes(&pd, &[&second, &third], &writer).await;
+    watch_until_every_learner_votes(&pd, &[&first, &second, &third], &writer, &written).await;
     writer.await.expect("the load completed");
 
     first.stop().await;
@@ -351,6 +360,46 @@ fn one_peer_per_store(region: &Region) {
     }
 }
 
+/// What whichever store leads `region` believes about `peer`, or why nobody could say.
+///
+/// [`esker_store::RaftPeer::progress`] answers with the leader's `Progress` table and is **empty
+/// unless it leads**, so asking every node and keeping the one that answers finds the leader
+/// without having to know which it is — and without racing a transfer that moves it between the
+/// question and the answer.
+///
+/// The three numbers are the ones the promotion decision reads: `matched` is how far the leader
+/// thinks the peer has got, `pending_snapshot` non-zero means it is being caught up by state
+/// rather than by log, and `recent_active` false means the leader has not heard from it inside an
+/// election timeout. A learner that PD calls a learner, that says `applied=N` itself, and that the
+/// leader records at `matched=0` is not a slow promotion — it is two parties describing different
+/// peers.
+async fn leader_progress(all: &[&Node], region_id: u64, peer_id: u64) -> String {
+    for node in all {
+        let Some(peer) = node.store.peer_of(region_id) else {
+            continue;
+        };
+        let Ok(progress) = peer.progress().await else {
+            continue;
+        };
+        let Some(entry) = progress.iter().find(|entry| entry.id == peer_id) else {
+            continue;
+        };
+        return format!(
+            "store {} leads region {region_id} and records peer {peer_id} at matched={} next={} \
+             is_learner={} pending_snapshot={} recent_active={}",
+            node.store.store_id(),
+            entry.matched,
+            entry.next,
+            entry.is_learner,
+            entry.pending_snapshot,
+            entry.recent_active
+        );
+    }
+    // Worth saying rather than printing an empty string: no store answering means no store led
+    // this region at the moment it was asked, which is its own diagnosis.
+    format!("no store led region {region_id} when asked, so nothing has a Progress for {peer_id}")
+}
+
 /// Polls until every learner that appears has been promoted, failing the moment one outlives
 /// [`PROMOTION_DEADLINE`]. Each is timed from when it was first seen, so a learner that is merely
 /// new is not mistaken for one that is stranded.
@@ -360,11 +409,34 @@ fn one_peer_per_store(region: &Region) {
 )]
 async fn watch_until_every_learner_votes(
     pd: &Arc<Pd>,
-    joined: &[&Node],
+    all: &[&Node],
     writer: &tokio::task::JoinHandle<()>,
+    written: &Arc<AtomicU32>,
 ) {
+    // Store 1 bootstrapped the cluster alone; the promotions under test are the peers placed on
+    // the two that joined afterwards. `all` is taken instead of just those two because the
+    // **leader** may by then be any of the three, and only a leader can say what it believes about
+    // a follower.
+    let joined: Vec<&Node> = all
+        .iter()
+        .copied()
+        .filter(|node| node.store.store_id() != 1)
+        .collect();
     let mut first_seen: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
     let mut promoted: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // Whether the load was still in flight when the cluster started to grow, so that "under
+    // load" is checked rather than hoped for. Sampled at the first learner, and at the window's
+    // start for the run where the roles were never caught in a sample — the `recorded_promoted`
+    // path below exists for exactly that run.
+    //
+    // **It asks whether the writer had finished, not how far it had got.** The first version of
+    // this check required the writer to *advance* between the first learner and the last
+    // promotion, and that is rate-dependent in the wrong direction: on a quiet box the whole
+    // promotion completes inside a single write, so it failed at zero load with
+    // "16 writes when the first learner appeared, 16 when the last one voted" while passing at
+    // 14, 40 and 80. A test that fails because the machine is fast is the mirror of the bug this
+    // unit is fixing.
+    let mut load_live_at_growth: Option<bool> = None;
     let mut placed_on_second = false;
     let deadline = Instant::now() + Duration::from_secs(180);
 
@@ -398,7 +470,10 @@ async fn watch_until_every_learner_votes(
                             region.epoch,
                             region.id
                         );
-                        let since = *first_seen.entry(id).or_insert_with(Instant::now);
+                        let since = *first_seen.entry(id).or_insert_with(|| {
+                            load_live_at_growth.get_or_insert_with(|| !writer.is_finished());
+                            Instant::now()
+                        });
                         if since.elapsed() >= PROMOTION_DEADLINE {
                             // What the *learner's own store* thinks, which is the half the
                             // leader's progress cannot show — and the half that proved it was
@@ -414,10 +489,21 @@ async fn watch_until_every_learner_votes(
                                     )
                                 })
                                 .collect();
+                            // **And what the leader believes about it**, which is the half neither
+                            // PD nor the learner can show. PD reports a role and the learner
+                            // reports its own applied index; a learner that is caught up by both
+                            // and still not promoted is a leader that thinks otherwise, and
+                            // `matched` / `pending_snapshot` / `recent_active` are the three
+                            // numbers the promotion decision actually reads
+                            // (`server.rs`, "not promoting: the learner has not caught up").
+                            // `RaftPeer::progress` is empty unless the peer leads, so asking all
+                            // three and keeping what answers finds the leader without naming it.
+                            let believed = leader_progress(all, region.id, peer.peer_id).await;
                             panic!(
                                 "peer {} of region {} has been a learner for {:?} — the phase-4 \
                                  acceptance stall. the placement driver holds {:?} at epoch {:?}, \
-                                 led by peer {}. the learner's own store says: {theirs:?}",
+                                 led by peer {}. the learner's own store says: {theirs:?}. the \
+                                 leader believes: {believed}",
                                 peer.peer_id,
                                 region.id,
                                 since.elapsed(),
@@ -478,7 +564,20 @@ async fn watch_until_every_learner_votes(
                     .iter()
                     .any(|node| node.store.store_id() == event.store_id)
         });
-        if writer.is_finished() && (seen_promoted || recorded_promoted) {
+        if seen_promoted || recorded_promoted {
+            // **"Under load" is asserted, not assumed.** Dropping `writer.is_finished()` from the
+            // break would otherwise let this pass over an idle cluster, which is the easy case and
+            // not the one the test is named for. What makes it load is that writes were *flowing
+            // across the window*: the writer had got somewhere by the time the first learner
+            // appeared, and got further before the last one voted.
+            let live = *load_live_at_growth.get_or_insert_with(|| !writer.is_finished());
+            assert!(
+                live,
+                "every learner voted, but the load generator had already finished all 600 writes \
+                 before the cluster grew, so the promotions happened over a quiet store — which \
+                 is the easy case and not the one this test is named for. It has written {} now.",
+                written.load(Ordering::Relaxed)
+            );
             break;
         }
         // The history is what decides success, so it is what a failure has to show: "0 learners
@@ -486,11 +585,12 @@ async fn watch_until_every_learner_votes(
         // right thing.
         assert!(
             Instant::now() < deadline,
-            "the cluster never settled: {} learners seen, {} promoted, writer_done={}; PD's \
-             history is {:?}",
+            "the cluster never settled: {} learners seen, {} promoted, writer_done={} after {} \
+             of 600 writes; PD's history is {:?}",
             first_seen.len(),
             promoted.len(),
             writer.is_finished(),
+            written.load(Ordering::Relaxed),
             pd.history()
                 .unwrap_or_default()
                 .iter()
