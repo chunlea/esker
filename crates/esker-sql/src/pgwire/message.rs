@@ -585,8 +585,28 @@ fn framed(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
     out[length_at..length_at + 4].copy_from_slice(&length.to_be_bytes());
 }
 
+/// A NUL-terminated string, with any **interior** NUL removed.
+///
+/// Every string on this wire is a C string, so a NUL inside one does not mean "a NUL" — it means
+/// "the string ended here". A value carrying one ends its field early, the reader takes the next
+/// byte as the following field's code, and the frame stops agreeing with its length: libpq answers
+/// `message contents do not agree with length in message type "E"` and **drops the connection**,
+/// because a stream it cannot parse is a stream it cannot resynchronise.
+///
+/// That is run 54's bug. A raw engine key was rendered into an error message — memcomparable keys
+/// are full of `0x00` — and `transactions_test.rb` died rather than failed. The call site is fixed
+/// too, but the guarantee belongs here: a statement that fails is ordinary, and no message this
+/// node can construct should be able to cost a client its connection.
+///
+/// **Removed rather than escaped**, which is what a real server's guarantee amounts to: its strings
+/// come from a C API and cannot contain one at all, so there is no escaped form to match. Anything
+/// wanting to show bytes has to render them printably before it gets here.
 fn cstring(out: &mut Vec<u8>, text: &str) {
-    out.extend_from_slice(text.as_bytes());
+    if text.as_bytes().contains(&0) {
+        out.extend(text.bytes().filter(|byte| *byte != 0));
+    } else {
+        out.extend_from_slice(text.as_bytes());
+    }
     out.push(0);
 }
 
@@ -687,4 +707,107 @@ fn encode_fields(out: &mut Vec<u8>, fields: &[(ErrorField, String)]) {
         cstring(out, value);
     }
     out.push(0);
+}
+
+/// How many NUL bytes a slice holds. A named function because `iter().filter().count()` over bytes
+/// is what clippy calls counting the naive way, and the intent here is worth a name anyway.
+#[cfg(test)]
+fn bytecount(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte == 0)
+        .fold(0, |n, _| n + 1)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::{Backend, ErrorField, bytecount};
+
+    /// Walks a frame the way libpq does and answers whether the body agrees with the length.
+    ///
+    /// This is the whole of what the client checks: read the four-byte length, walk the field list
+    /// to its terminator, and require that the terminator lands **exactly** at the end. A value
+    /// carrying an interior NUL ends the list early and leaves bytes over, which is the
+    /// `message contents do not agree with length in message type "E"` a client answers with — and
+    /// a client that says that drops the connection rather than failing a statement.
+    fn agrees(frame: &[u8]) -> bool {
+        assert_eq!(frame[0], b'E', "an ErrorResponse");
+        let length = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        if length + 1 != frame.len() {
+            return false;
+        }
+        let body = &frame[5..];
+        let mut at = 0;
+        while at < body.len() {
+            if body[at] == 0 {
+                // The terminator: the list ends here, and nothing may follow it.
+                return at + 1 == body.len();
+            }
+            at += 1; // the field code
+            let Some(end) = body[at..].iter().position(|byte| *byte == 0) else {
+                return false;
+            };
+            at += end + 1;
+        }
+        false
+    }
+
+    /// **Run 54's protocol bug.** A message carrying a NUL made the frame unreadable, and the
+    /// source was a raw engine key rendered into it: a row key is memcomparable and full of
+    /// `0x00`, so `could not serialize access due to concurrent update: key t` was everything
+    /// before the first one.
+    ///
+    /// The fix is in the codec rather than at the one call site, because the property has to hold
+    /// for **every** message: a statement that fails is ordinary, and a frame a client cannot
+    /// parse takes the connection with it.
+    #[test]
+    fn a_field_value_with_a_nul_still_makes_a_readable_frame() {
+        let ordinary = vec![
+            (ErrorField::SEVERITY, "ERROR".to_owned()),
+            (ErrorField::CODE, "40001".to_owned()),
+            (ErrorField::MESSAGE, "plain".to_owned()),
+        ];
+        assert!(agrees(&Backend::Error(&ordinary).to_bytes()));
+
+        // The shape run 54 met: a key rendered into the text, NULs and all.
+        let key = String::from_utf8_lossy(b"r\x00\x00\x00\x00\x00\x00\x00\x01topics").into_owned();
+        let with_nuls = vec![
+            (ErrorField::SEVERITY, "ERROR".to_owned()),
+            (ErrorField::CODE, "40001".to_owned()),
+            (
+                ErrorField::MESSAGE,
+                format!("could not serialize access due to concurrent update: key {key}"),
+            ),
+        ];
+        let frame = Backend::Error(&with_nuls).to_bytes();
+        assert!(
+            agrees(&frame),
+            "the frame must be readable whatever the message carries: {frame:?}"
+        );
+        // And a NUL must not have been able to end the list early: every field is still there.
+        // **Counted past the header**, because the four-byte length is itself mostly zero bytes —
+        // a frame this size begins `00 00 00 4e`, and counting those would be counting the ruler.
+        assert_eq!(
+            bytecount(&frame[5..]),
+            with_nuls.len() + 1,
+            "one terminator per value and one for the list, and no others"
+        );
+    }
+
+    /// A `NoticeResponse` is the same frame under another tag, so it needs the same guarantee —
+    /// and notices carry user text too (`DROP TABLE IF EXISTS` names the table).
+    #[test]
+    fn a_notice_is_held_to_the_same_rule() {
+        let fields = vec![(ErrorField::MESSAGE, "a\u{0}b".to_owned())];
+        let frame = Backend::Notice(&fields).to_bytes();
+        assert_eq!(frame[0], b'N');
+        let length = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        assert_eq!(length + 1, frame.len());
+        assert_eq!(
+            bytecount(&frame[5..]),
+            2,
+            "the value's terminator and the list's, and no NUL from inside the text"
+        );
+    }
 }

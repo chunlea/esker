@@ -486,10 +486,14 @@ impl Txn for MemoryTxn {
         for key in self.buffer.keys() {
             if versions.written_since(key, self.start_ts) {
                 return Err(SqlError::SerializationFailure {
-                    message: format!(
-                        "key {} was written after this transaction's snapshot",
-                        String::from_utf8_lossy(key)
-                    ),
+                    // **The key is not rendered into the text.** It is a raw engine key —
+                    // memcomparable, and full of `0x00` — so `from_utf8_lossy` put NULs into a
+                    // message that becomes a C string on the wire, and the client stopped reading
+                    // at the first one. That is run 54's `message contents do not agree with
+                    // length`, and it killed the connection rather than the statement. A real
+                    // server's own sentence carries no key either; the key is on the error's own
+                    // field below, where the executor reads it to tell this from a `23505`.
+                    message: "a key was written after this transaction's snapshot".to_owned(),
                     // The fake answers per key like a real `Prewrite` does, so the executor's
                     // translation of a lost race into a `23505` is exercised here the same way it
                     // will be against the store rather than only there.
