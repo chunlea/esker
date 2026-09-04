@@ -814,12 +814,19 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
   on a port an operator believes is encrypted. `pgwire::tls` is the only module that knows what TLS
   is; the session is driven by a task over a duplex pipe rather than a hand-written poll adapter,
   because the adapter is a third crate or a class of hang.
-  **S3** stays on option 1 (plain HTTP to `MinIO` or a TLS-terminating sidecar) and `Endpoint::parse`
-  still **refuses** `https://` with a message pointing at ADR 0025 — the seam is `esker_s3::Transport`,
-  already a trait, and what it still needs is a root store, which is one crate and one licence line
-  (`webpki-roots`, `CDLA-Permissive-2.0`) that this exception deliberately does not include.
-  **The RPC layer (§9)** carries no TLS and no peer authentication; ADR 0055 says why the second is
-  the larger half of that work.
+  **S3 — built, and it cost no further crates.** `esker_s3::tls` is the second implementor the
+  transport trait was designed for (ADR 0025 decision 1, which needed no change), and
+  `Endpoint::parse` now accepts `https://` under the feature and refuses it without, naming the
+  feature. The root store is **not** `webpki-roots`: the host's CA bundle is a file, `SSL_CERT_FILE`
+  overrides it and `ESKER_S3_CA_CERT` names one for a self-signed `MinIO`, so the vendored-roots
+  crate and its `CDLA-Permissive-2.0` licence line are both avoided and the exception stays at nine
+  crates for both surfaces. Its connection pool absorbs post-handshake messages rather than peeking
+  at the socket, because a TLS 1.3 server sends tickets and key updates whenever it likes and the
+  plain transport's check would throw away a good connection for them — silently, since every
+  response stays correct. `esker-s3` costs nothing with the feature off, as it always has.
+  **The RPC layer (§9) is what is left.** It carries no TLS and no peer authentication, and ADR 0055
+  says why the second is the larger half of that work: mTLS makes a peer identity available, and
+  nothing in `esker-pd` yet decides what a given identity is *allowed* to be.
 - **Stateless SQL nodes (`esker-sql`):** in-house PostgreSQL wire protocol v3 (startup, simple and
   extended query, `psql` compatibility — ~2k lines, no `pgwire` crate) → SQL parser (the one expected
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
