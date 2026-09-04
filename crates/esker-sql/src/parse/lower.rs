@@ -1420,8 +1420,28 @@ pub(super) fn column_default(
     // does not have refused when the table is created** rather than when the first row is written,
     // which is where a real server raises it — and it is also what refuses `random() * 100` by
     // naming the operator, since this node has no arithmetic at all.
-    lower_expr(expr)?;
+    //
+    // **A name the vocabulary lacks is the one thing lowering cannot decide**, because a user may
+    // have declared a function of that name and only the catalog knows. So it is carried out
+    // rather than refused, and `crate::exec::ddl` — which can see the catalog — refuses the ones
+    // nobody declared. Everything else about the expression is still refused here.
+    if let Err(error) = lower_expr(expr)
+        && unsupported_function_name(&error).is_none()
+    {
+        return Err(error);
+    }
     Ok((None, Some(expr.to_string())))
+}
+
+/// The function name out of the `0A000` this module raises for one it does not have.
+///
+/// **Lives beside the two places that build that message**, so the two cannot drift apart
+/// unnoticed: it is a reading of this module's own sentence and not of PostgreSQL's.
+pub(crate) fn unsupported_function_name(error: &SqlError) -> Option<&str> {
+    match error {
+        SqlError::FeatureNotSupported(text) => text.strip_prefix("the function "),
+        _ => None,
+    }
 }
 
 /// How a real server prints a literal that was written with a cast: `(0)::bigint`, `'x'::text`.
@@ -2068,6 +2088,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                         "CHECK ... ENFORCED, which is MySQL's",
                     )?;
                     checks.push(catalog::CheckDef {
+                        validated: true,
                         name: constraint
                             .name
                             .as_ref()
@@ -2236,11 +2257,14 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         } = operation
         {
             let mut lowered = lower_added_constraint(&table_name, constraint)?;
-            // **`NOT VALID` is only a foreign key's here.** PostgreSQL takes it on `CHECK` too,
-            // and refusing it there by name is the honest answer while nothing skips that scan.
+            // **A foreign key's and a check's**, which are the two PostgreSQL takes it on. What
+            // it skips is the scan of the rows already there; the constraint is enforced for every
+            // row written afterwards either way — measured, an `INSERT` violating a `NOT VALID`
+            // check is `23514`.
             if *not_valid {
                 match &mut lowered {
                     plan::AlterTableAction::AddForeignKey(key) => key.validated = false,
+                    plan::AlterTableAction::AddCheck(check) => check.validated = false,
                     _ => return Err(SqlError::unsupported("ADD CONSTRAINT ... NOT VALID")),
                 }
             }
@@ -2557,6 +2581,7 @@ fn lower_table_constraints(
                     "CHECK ... ENFORCED, which is MySQL's",
                 )?;
                 checks.push(catalog::CheckDef {
+                    validated: true,
                     name: check
                         .name
                         .as_ref()
@@ -2704,6 +2729,7 @@ fn lower_added_constraint(
         "CHECK ... ENFORCED, which is MySQL's",
     )?;
     Ok(plan::AlterTableAction::AddCheck(catalog::CheckDef {
+        validated: true,
         name: check
             .name
             .as_ref()
@@ -6578,16 +6604,24 @@ fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<St
     match lower_type(data_type) {
         Ok((ty, typmod)) => Ok((ty, typmod, None)),
         Err(error) => match data_type {
+            // **One part or two.** A type may live in a schema — a domain does
+            // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md))
+            // — and `schema_test.rb` creates `schema_1.text` and then declares columns of it. A
+            // one-part guard here meant a qualified type could be **created and never
+            // referenced**: `CREATE DOMAIN r77s.ds` succeeded and `CREATE TABLE r77s.t (v r77s.ds)`
+            // was `0A000 the type r77s.ds is not supported`, about a type the catalog held.
             DataType::Custom(name, modifiers)
-                if modifiers.is_empty() && name.0.len() == 1 && !is_serial_spelling(data_type) =>
+                if modifiers.is_empty()
+                    && (1..=2).contains(&name.0.len())
+                    && !is_serial_spelling(data_type) =>
             {
-                let Some(part) = name.0.first().and_then(|part| part.as_ident()) else {
+                let Ok(stored) = relation_name(name) else {
                     return Err(error);
                 };
                 // The type is unknown here and the placeholder says so: `Int2` is what an enum's
                 // ordinal is, and the executor replaces it for any other kind. Nothing reads it
                 // before then — a `CREATE TABLE` plan is executed, never evaluated.
-                Ok((ColumnType::Int2, NO_TYPMOD, Some(ident(part))))
+                Ok((ColumnType::Int2, NO_TYPMOD, Some(stored)))
             }
             _ => Err(error),
         },

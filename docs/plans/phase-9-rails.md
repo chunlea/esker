@@ -1602,3 +1602,77 @@ deliberately *not* `42501` (`DROP INDEX` is `42809`, `CREATE TABLE` is `42P07`).
 | **`xml`** — run 74's row, 5 tests in `xml_test.rb` | **done**, and it is `json`'s shape with a different validator: the characters as sent, no equality operator at all, not an index key. What could not be derived is that the type takes XML **content** and not only a document — `'plain text'::xml` and `'<a/><b/>'` are both values — and that its refusal class is its own, `2200N invalid XML content` where every other input function raises `22P02`, with `libxml`'s message reaching the client unchanged. **The two line numbers in that message are different questions**: the `line N:` prefix is where the parser stopped and the number inside names where the tag was *opened*, which `E'<a>\n</b>'` settles and one counter would have got wrong. **The declaration is the one thing not stored as written** — a real server keeps it in the value and drops it in `xml_out`, so this node drops it on the way in instead and declares the one `::text` divergence that buys, rather than teaching every row-to-bytes path the column's declared type. **Three wrong answers found, all of the worst class, and two of them were not about `xml`.** `ORDER BY` over a `json`, a `point` or any of the six shapes answered from `pg_cmp`'s text comparison where a real server raises `42883 could not identify an ordering operator` with a HINT — `jsonb` is deliberately not in that list, because it *is* ordered there. And `SELECT DISTINCT` and `GROUP BY` over a type with no equality operator class answered where `count(DISTINCT …)` over the same column already refused: **three lists that disagreed**, now one `value::has_equality_operator`. It is **not** the list `same_family` keeps and the geometric corpus refused the merge in one run — an `lseg` has an `=` that answers `t` and no btree family to put it in, which is exactly the distinction. 77 statements, 4 answers declared — `pg_typeof` reads the value, an `E'…'` literal does not lower at all (twice), and the declaration — and 12 type-only, the catalog trade plus `json`'s own standing one where a cast to a `Datum::Text` type loses its oid | this commit |
 | **The `B'…'` / `X'…'` bit-string literal** — run 73's row, 6 tests in `bit_string_test.rb` | **done**, and the file never writes one: it declares a *string* default (`t.bit :a_bit, default: "00000011", limit: 8`) and **`ActiveRecord` renders it back out as `B'00000011'`**, which is how the file meets the one form the node did not take. `"B" is not a valid binary digit` was the literal's *envelope* reaching `bit`'s input function — run 68's range bounds one type over. `sqlparser` gives the two as `SingleQuotedByteStringLiteral` and `HexStringLiteral`, case-insensitively, and both are a `bit` with **no typmod**; `X'…'` is four bits a digit, so `X'ff'` is eight bits and not two, with a refusal of its own: `22P02 "G" is not a valid hexadecimal digit`. **Three things measured that reasoning would invert.** `'101'::bit` is **`1`** — the bare keyword is the grammar's `bit(1)` and truncates — where `'101'::"bit"`, *quoted*, is `101`: the quotes make it a type name with no length. That is why a real server prints a bit default as `'00000011'::"bit"` and it is not decoration — the bare spelling would throw away every bit but the first when the default is re-read per row. It is also the **literal's** type in that text and not the column's: a `bit varying(4)` column defaulted to `B'0011'` stores `'0011'::"bit"`. Behind all three: a bare `bit` is `bit(1)` **everywhere a type is written**, column and cast alike, so `lower_type` puts the 1 on and `format_type(Bit, NO_TYPMOD)` — which now only a literal reaches — answers `"bit"`. Two special cases went away with it and one wrong value: `'101'::bit` was answering `101`. A quoted type name now resolves at all, which it did not (`'1'::"int4"` too). 90 statements, 5 answers declared — the bit-string functions, the bitwise operators, the shifts, `integer -> bit` — and 13 type-only | this commit |
 | **`ltree`** — run 70's row, 4 tests in `ltree_test.rb`, plus `lquery` and the three operators | **done**, and the type's whole point is one line of the capture: **`'a.b'::ltree < 'a-b'::ltree` is `t` and `'a.b' < 'a-b'` as bytes is `f`.** A real server compares label by label, and a `.` (0x2E) sits above a `-` (0x2D) — eight paths sort `A a a.B a.a a.b a-b ab b` as ltrees and `A a a-b a.B a.a a.b ab b` as bytes. Equality *is* the text's, so this is ADR 0042 with only half of it failing: the type may share `text`'s row representation and may **not** share its key. So `Datum::Ltree` gets a key encoding that rewrites the separator to `\x01` — below the lowest byte a label can start with, and a byte no label can contain, so it is a **bijection** where citext's fold is lossy and an ltree key decodes back to its value. `tests/corpus/pg19_order.txt` gained the row that proves it. **Its refusal is a *syntax* error**, `42601 ltree syntax error at character N`, one-based, not the `22P02` every other input function raises; a trailing separator has no character to point at and moves what it knows into a DETAIL. A label is `A-Za-z0-9_-` or any non-ASCII letter (`héllo` is a path), and the empty path is a value with zero labels. **`min(ltree)` still does not exist** — the sharpest member of ADR 0031's aggregate list, because this type *is* fully ordered and indexable and the aggregate is still absent. `lquery` came with it rather than being declared away: `*`, `*{n}`, `*{n,m}`, `*{n,}`, `|`, `!`, `@` and the two prefix modifiers — and **`%` is not `*`**, it wants the prefix to end a word, so `ab%` matches `ab_c` and not `abc`. The pattern must match the **whole** path, which is why `'a.b.c' ~ 'a.b'` is `f`. `~`, `@>`, `<@` and `||` are each spelled the same as another type's, so all four dispatch on the operand — the rule the `||` regression taught, now applied four times in one unit. **Two guardrails fired and both were right**: `row_order.rs` demanded the ordering fixture, and `Datum`'s hand-written `PartialEq` — whose own comment warns that a missing arm is not a compile error — left an `ltree` unequal to itself until the round-trip property caught it, exactly as it caught `citext`. 48 statements, 3 answers declared (`COLLATE`, twice, which is a parser gap for every type) and 5 type-only. `ltree` also left `SWALLOWING_DEBT`, one statement shorter | this commit |
+
+---
+
+## Unit 9 (planned, **blocked on a ruling**): `changed_since_statement` on the store path
+
+`docs/plans/debts-v1.md` #1 and #2. Written before any code, because the answer to the first
+question decides whether there is code to write at all.
+
+### What the store has to answer
+
+After a statement takes a row lock **without waiting**, one question decides whether it may keep the
+value it already read: *has this key a committed version newer than the statement's read timestamp?*
+A lock taken at once is not proof that nothing moved — the writer in front may have committed **and
+released** between this statement's read and its lock. `MemoryTxn` answers it with
+`written_since(key, statement_ts)`, and that check is what turned ~100 spurious `40001`s in 1,200
+transactions into zero (run 66's shrink).
+
+### Can it be asked over the wire today? **No.**
+
+* `TxnKvResp::Get` carries `{ value }` and nothing else. There is no timestamp in it.
+* The `TxnKv` methods are `Get`, `Scan`, `Prewrite`, `Commit`, `Rollback`, `ResolveLock`,
+  `Heartbeat`, `GcSafepoint`. None returns a version.
+* **The store already computes the answer** — `TxnSnapshot::newest_write_after(key, ts)`
+  (`crates/esker-txn/src/snapshot.rs:69`), which is exactly what `check_prewrite` calls at
+  `percolator.rs:385`. The primitive is there; only the wire cannot carry the question.
+
+So this needs a **wire change**, and per `CLAUDE.md` that is the human's call — which is why this
+section stops here.
+
+**It is a smaller ask than tags 3/4/5 were, in a way worth stating: it is read-only.** A question
+about the newest write is not a replicated command, so there is **no Raft log change** and no
+`TxnWrite` variant. Existing messages keep their bytes; an older peer meets an unknown method and
+refuses, exactly as it does an unknown tag.
+
+### The three shapes, and what each costs
+
+1. **A new read method** — `TxnKvReq::CommittedAfter { key, ts }` → `TxnKvResp::CommittedAfter {
+   newest: Option<u64> }`. Exact. One round trip per locked key per statement, and only for a
+   *write* statement under READ COMMITTED whose lock was taken without waiting. The store side is
+   three lines over a primitive that already exists.
+2. **Two `Get`s and a value comparison** — read at the statement's snapshot, read at a fresh one,
+   and call them changed if the bytes differ. **No wire change**, and it is the option this plan
+   recommends *against*: it misses a rewrite to identical bytes, so the residual case still ends in
+   a `40001` at commit; it needs a fresh timestamp and so a TSO call as well as the extra read; and
+   a read at a fresh timestamp can meet a live lock and turn a cheap check into a resolve. It buys
+   most of the benefit by putting a silent approximation in a correctness-adjacent path, which is
+   the trade this project has refused everywhere else.
+3. **Fold it into unit 8b's lock message.** ADR 0062's store path needs a cluster-wide lock, and a
+   real one — TiKV's `AcquirePessimisticLock` is the shape — **returns the newest commit on the key
+   as part of acquiring it**, because that is what the caller needs to decide whether to re-run.
+   One wire change instead of two, and the same message answers both units.
+
+**Recommendation: 3 if unit 8b is approved, 1 if it is not, and never 2.** If the tag-6 ruling comes
+back yes, this unit is a field on a message that is being added anyway; if it comes back no, option 1
+is a self-contained read method that can land alone.
+
+### What lands when it is approved
+
+* `StoreTxn::changed_since_statement` calls it, and the answer is exact.
+* Debt #2 needs **no code**: `savepoint::Recording` already forwards `changed_since_statement`
+  (landed with the ADR 0062 savepoint fix). #2 is #1's consequence under a savepoint and closes with
+  it.
+* Tests in the shape unit 7 used — `tests/store_locking.rs`, three real stores over real sockets: a
+  writer whose lock is free but whose value is stale must **re-run** rather than answer `40001`, and
+  the same with a savepoint open. The distinguishing assertion is the one unit 5 taught: assert the
+  outcome only the intended mechanism can produce, not the final value, which a lost update also
+  produces.
+* The measure: `transaction_nested_test.rb`'s two cases against a store-backed node, and the
+  spurious-`40001` count in the three-writers probe run against a cluster rather than in process.
+
+### What it does not close
+
+Cross-node deadlock (debt #4) is untouched by this: it needs a graph both nodes can see, which is
+PD's.

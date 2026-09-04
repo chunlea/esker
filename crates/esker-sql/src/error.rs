@@ -929,6 +929,18 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A `CHECK` added over rows that already violate it: `23514`.
+    ///
+    /// **A different sentence from the one an `INSERT` gets**, which prints the failing row —
+    /// measured, this one names the constraint and the relation and stops there, because the
+    /// scan found *some* row and naming one of many would suggest it was the only one.
+    #[error("check constraint \"{constraint}\" of relation \"{relation}\" is violated by some row")]
+    CheckViolatedByRow {
+        /// The constraint that was being added or validated.
+        constraint: String,
+        /// The table it is on.
+        relation: String,
+    },
     /// A NULL into a column of a `NOT NULL` **domain**: `23502`, and it names the domain rather
     /// than the column or the table — measured, `domain dm_pos does not allow null values`.
     #[error("domain {0} does not allow null values")]
@@ -2404,6 +2416,7 @@ impl SqlError {
             SqlError::NoPartitionForRow { .. }
             | SqlError::PartitionConstraintViolation(_)
             | SqlError::CheckViolation { .. }
+            | SqlError::CheckViolatedByRow { .. }
             // A domain's `CHECK` is a check constraint like any other; only its sentence differs.
             | SqlError::DomainCheckViolation { .. } => sqlstate::CHECK_VIOLATION,
             SqlError::DuplicateTable(_) | SqlError::AlreadyExistsSkipping(_) => {

@@ -48,7 +48,36 @@ pub(crate) struct RowLocks {
     waits_for: BTreeMap<u64, u64>,
 }
 
+/// What one node's lock table holds, flattened for `pg_locks`.
+///
+/// A snapshot rather than a borrow: the view is read under the same mutex every other caller takes,
+/// and holding that mutex while a catalog view formats rows would make reading `pg_locks` block
+/// every statement on the node — which is the opposite of what a diagnostic is for.
+#[derive(Debug, Default)]
+pub struct LockView {
+    /// `(key, holder transaction id, holder start_ts)` — one per key actually held.
+    pub held: Vec<(Vec<u8>, u64, u64)>,
+    /// `(waiter transaction id, the id it is waiting for)` — one per session currently blocked.
+    pub waiting: Vec<(u64, u64)>,
+}
+
 impl RowLocks {
+    /// A snapshot of the table, for `pg_locks`.
+    pub(crate) fn view(&self) -> LockView {
+        LockView {
+            held: self
+                .locks
+                .iter()
+                .map(|(key, (holder, start_ts))| (key.clone(), *holder, *start_ts))
+                .collect(),
+            waiting: self
+                .waits_for
+                .iter()
+                .map(|(waiter, holder)| (*waiter, *holder))
+                .collect(),
+        }
+    }
+
     /// An id for a new transaction. Ids start at 1 and are never reused.
     pub(crate) fn next_id(&mut self) -> u64 {
         self.next_txn += 1;

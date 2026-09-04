@@ -1582,6 +1582,12 @@ pub struct CheckDef {
     /// The predicate, as the user wrote it. Re-parsed on load and printed by
     /// `pg_get_constraintdef`.
     pub expr: String,
+    /// `pg_constraint.convalidated`: whether the rows already in the table were checked.
+    ///
+    /// `false` only for one added `NOT VALID` and not yet validated. **A `NOT VALID` check is
+    /// still enforced for new rows** — measured, an `INSERT` that violates one is `23514` — so
+    /// this says what was skipped, not what is enforced.
+    pub validated: bool,
 }
 
 impl ColumnDef {
@@ -3949,7 +3955,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "20",               // catalog format version
+                "21",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -4042,7 +4048,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "20",       // catalog format version
+                "21",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4124,7 +4130,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "20",                 // catalog format version
+                "21",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5441,7 +5447,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "20",               // catalog format version
+                "21",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

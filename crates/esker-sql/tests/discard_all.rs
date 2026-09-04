@@ -56,26 +56,23 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "The same.",
         ),
         ("SELECT count(*) FROM pg_prepared_statements", "The same."),
-        // `pg_locks`, already declared by the advisory-lock unit and repeated here because this
-        // corpus reads it to prove which targets release a lock. The releases themselves are
-        // asserted in `discarding_all_clears_the_session`.
+        // **`pg_locks` exists now and answers `0` correctly**, so the two lines that count zero
+        // advisory locks have been deleted from this list — they agree. What is left is the two
+        // that count a lock *while it is held*, and they diverge for a reason worth naming: the
+        // view reports **row** locks, which live in the node's lock table, and an advisory lock is
+        // **session** state. A catalog view is handed a transaction and a tenant, not a session,
+        // so the advisory table cannot be reached from here — the same wall `pg_prepared_statements`
+        // is behind, and the same one `pg_stat_activity` reports one row because of.
         (
             "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001",
-            "`42P01`: no `pg_locks` (see `tests/advisory_lock.rs`). The lock is taken and \
-             released correctly; there is nothing here that reports it.",
-        ),
-        (
-            "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'",
-            "The same.",
-        ),
-        (
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
-            "The same.",
+            "`0` here and `1` on the oracle: the lock is taken and released correctly (asserted in \
+             `discarding_all_clears_the_session`), and `pg_locks` shows row locks rather than \
+             advisory ones — session state a catalog view is not given.",
         ),
         (
             "SELECT 'r', current_setting('statement_timeout'), count(*) FROM pg_locks WHERE \
              locktype = 'advisory' AND objid = 7001",
-            "The same — and the `statement_timeout` half agrees: `DEALLOCATE ALL` leaves it at \
+            "The same, and the `statement_timeout` half agrees: `DEALLOCATE ALL` leaves it at \
              `31s`, which is the point of the line.",
         ),
         // **The reset itself is right and one boot value is spelled differently.** `DISCARD ALL`

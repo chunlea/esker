@@ -312,9 +312,40 @@ fn declared_columns(
         {
             kept.default = fold_user_default(kept.default.as_ref(), ty, &def, &kept)?;
         }
+        refuse_unknown_default_function(txn, executor, &kept)?;
         columns.push(kept);
     }
     Ok(columns)
+}
+
+/// Refuses a column `DEFAULT` that calls a function **nobody declared**.
+///
+/// Lowering carries the name out instead of raising, because a name its vocabulary lacks may be a
+/// user's function and only the catalog knows (`crate::parse::lower::column_default`). This is
+/// where that is decided: a declared function is accepted, and anything else gets the same
+/// `0A000 the function <name>` it always got, at the same moment — when the table is created.
+///
+/// **`uuid_test.rb` is the file that needs this**: it defines `my_uuid_generator()` and then
+/// creates a table defaulting to it, and it never inserts a row — the eight tests read the
+/// *schema*, so the name has to survive into `pg_attrdef` and out through the dumper.
+fn refuse_unknown_default_function(
+    txn: &dyn Txn,
+    executor: &Executor,
+    column: &ColumnDef,
+) -> Result<()> {
+    let Some(text) = &column.default_expr else {
+        return Ok(());
+    };
+    let Err(error) = crate::parse::parse_stored_expr(text) else {
+        return Ok(());
+    };
+    let Some(name) = crate::parse::lower::unsupported_function_name(&error) else {
+        return Err(error);
+    };
+    if catalog::function(txn, executor.tenant, name)?.is_some() {
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// The `TypeKind` of a column's user type when it is a **domain**, and `None` otherwise.
@@ -531,8 +562,56 @@ fn add_check(
     }
     updated.checks.push(check.clone());
     validate_checks(updated)?;
+    // **The rows already there are checked, unless `NOT VALID` says not to** — the same rule the
+    // foreign-key path follows, and it was missing here entirely: a `CHECK` added over a row that
+    // violates it was accepted silently, leaving a table whose rows contradict a constraint it
+    // advertises as validated. Measured: `23514 check constraint "q_plain" of relation "nv_t" is
+    // violated by some row`, a different sentence from the one an `INSERT` gets.
+    if check.validated {
+        validate_check_rows(txn, executor, updated, check)?;
+    }
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// Scans the table for a row the check refuses, and names the constraint if it finds one.
+///
+/// The scan is paged for the reason [`backfill`]'s is: a table that does not fit in memory is a
+/// table this must still be able to check.
+fn validate_check_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    check: &CheckDef,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut violated = false;
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            if violated {
+                return Ok(());
+            }
+            let row = crate::row::decode_row(&schema, value)?;
+            let parsed = crate::parse::parse_stored_expr(&check.expr)?;
+            let scope = super::query::Scope::single(table);
+            let resolved = super::query::resolve(&parsed, &scope)?;
+            // Only `false` violates: NULL is unknown and passes, which is the rule every other
+            // reader of a `CHECK` in this crate follows.
+            violated = matches!(
+                super::cursor::evaluate(&resolved, &row)?,
+                Datum::Bool(false)
+            );
+        }
+        Ok(())
+    })?;
+    if violated {
+        return Err(SqlError::CheckViolatedByRow {
+            constraint: check.name.clone(),
+            relation: table.name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
@@ -1102,6 +1181,18 @@ fn validate_constraint(
     updated: &mut TableDef,
     name: &str,
 ) -> Result<()> {
+    // **A check is validated by name too**, and it is looked for first because the two namespaces
+    // are one: `ALTER TABLE … VALIDATE CONSTRAINT` takes any constraint's name and a table cannot
+    // hold two of one name.
+    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+        if updated.checks[at].validated {
+            return Ok(());
+        }
+        let check = updated.checks[at].clone();
+        validate_check_rows(txn, executor, updated, &check)?;
+        updated.checks[at].validated = true;
+        return Ok(());
+    }
     let at = updated
         .foreign_keys
         .iter()
@@ -1650,9 +1741,19 @@ pub(super) fn create_function(
     txn: &mut dyn Txn,
     create: &plan::CreateFunction,
 ) -> Result<Outcome> {
-    // The only procedural language this node knows the name of. It knows nothing else about it —
-    // and that is the point: a body it cannot run is still a body it can keep.
-    if !create.language.eq_ignore_ascii_case("plpgsql") {
+    // **The two trusted languages a real server has**, measured: `pg_language` holds `c`,
+    // `internal`, `plpgsql` and `sql`, and only the last two are `lanpltrusted`. The other two
+    // name a shared object or a built-in symbol, neither of which exists here, so a function in
+    // one has nothing to be — `42704` for those is a truer answer than storing a body that names
+    // a file this node will never open.
+    //
+    // It knows nothing else about either, and that is the point: a body it cannot run is still a
+    // body it can keep, and `uuid_test.rb` needs exactly that — a `LANGUAGE SQL` function whose
+    // name has to survive into a column default the schema dumper prints back.
+    if !matches!(
+        create.language.to_ascii_lowercase().as_str(),
+        "plpgsql" | "sql"
+    ) {
         return Err(SqlError::UndefinedLanguage(create.language.clone()));
     }
     let id = match catalog::function(txn, executor.tenant, &create.name)? {
@@ -1795,6 +1896,34 @@ fn built_in_signature(name: &str, args: &[&str]) -> String {
     format!("{name}({})", args.join(","))
 }
 
+/// The first column whose `DEFAULT` names this function, with the table it is on.
+///
+/// **Read out of the stored text**, the same way `dependent_views` reads a view's body: a default
+/// is kept as the expression `pg_get_expr` prints, and the name is in it. A function call is the
+/// only shape that can name one, so the parse is what finds it rather than a substring match — a
+/// column defaulting to `'my_uuid_generator()'::text` names nothing.
+fn default_naming(
+    executor: &Executor,
+    txn: &dyn Txn,
+    function: &str,
+) -> Result<Option<(String, String)>> {
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    for table in relations.tables() {
+        for column in table.user_columns().map(|(_, column)| column) {
+            let Some(text) = &column.default_expr else {
+                continue;
+            };
+            let Err(error) = crate::parse::parse_stored_expr(text) else {
+                continue;
+            };
+            if crate::parse::lower::unsupported_function_name(&error) == Some(function) {
+                return Ok(Some((column.name.clone(), table.name.clone())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `DROP FUNCTION [IF EXISTS] f [(<types>)] [, …]`.
 ///
 /// **Not a no-op, even though nothing here can create a function.** Three outcomes, and `IF EXISTS`
@@ -1827,6 +1956,20 @@ pub(super) fn drop_function(
         // A **stored** function: this node has those now, and dropping one is ordinary — unless a
         // trigger still names it, which is `2BP01` with the trigger and its table in the DETAIL.
         if let Some(stored) = catalog::function(txn, executor.tenant, name)? {
+            // **A column default is a dependency too**, and it is the one this node could
+            // acquire without noticing: a default that names a function is stored as *text*, so
+            // dropping the function leaves a table whose every insert then fails. Measured —
+            // `2BP01`, with the column and its table in the `DETAIL`, exactly as the trigger edge
+            // below reports the trigger and its table.
+            if let Some((column, table)) = default_naming(executor, txn, name)? {
+                return Err(SqlError::DependentFunction {
+                    function: format!("{name}()"),
+                    detail: format!(
+                        "default value for column {column} of table {table} depends on function \
+                         {name}()"
+                    ),
+                });
+            }
             if let Some((trigger, table)) = trigger_naming(executor, txn, name)? {
                 return Err(SqlError::DependentFunction {
                     function: format!("{name}()"),
@@ -2199,6 +2342,27 @@ fn references_a_key(parent: &TableDef, columns: &[usize]) -> bool {
 /// key declared on it, and the sequence it owned. Only a dependent living on another object
 /// raises `2BP01`, and here that is another table's foreign key referencing the column. All
 /// measured against 19beta1.
+/// Drops one column and writes the table back, for a `CASCADE` that reaches it from elsewhere.
+///
+/// `DROP TYPE … CASCADE` takes the columns declared as the type
+/// ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)),
+/// and it arrives with a table rather than an `ALTER TABLE` statement — so this is the same
+/// [`drop_column`] the statement uses, with the write around it.
+pub(super) fn drop_column_cascading(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    table: &TableDef,
+    column: &str,
+) -> Result<()> {
+    let mut updated = (*table).clone();
+    let name = table.name.clone();
+    if drop_column(txn, executor, &mut updated, &name, column, false, true)? {
+        catalog::replace_table(txn, executor.tenant, table, &updated)?;
+        executor.catalog_written = true;
+    }
+    Ok(())
+}
+
 fn drop_column(
     txn: &mut dyn Txn,
     executor: &mut Executor,
@@ -3497,13 +3661,36 @@ pub(super) fn drop_schema(
         // with an inheriting child is — and `CASCADE` takes the relations with it instead.
         // `IF EXISTS` does not excuse this: the clause covers absence, not dependence. Measured.
         let held = catalog::relations_in_schema(&*txn, executor.tenant, name)?;
-        if let Some(first) = held.first()
-            && !drop.cascade
+        // **A type in the schema is a dependent too**, and it is the one nothing here could see: a
+        // type is not a name record, so `relations_in_schema` never returned one. A schema holding
+        // only a domain dropped **silently**, and the domain survived with a record key naming a
+        // schema that was gone — visible in `pg_type` under `public`, not resolvable by name, and
+        // not droppable. Measured on PostgreSQL: `2BP01 … DETAIL: type ds_s.ds depends on schema
+        // ds_s`, with the type named the way a table is.
+        let types: Vec<String> = catalog::user_types(&*txn, executor.tenant)?
+            .into_iter()
+            .map(|def| def.name)
+            .filter(|stored| catalog::split_qualified(stored).0 == name)
+            .collect();
+        if !drop.cascade
+            // **A type is named before a table**, measured: a schema holding both reports the
+            // type. PostgreSQL names one dependent of many and this is the one it picks.
+            && let Some(detail) = types
+                .first()
+                .map(|first| {
+                    let bare = catalog::split_qualified(first).1;
+                    format!("type {name}.{bare} depends on schema {name}")
+                })
+                .or_else(|| {
+                    held.first().map(|first| {
+                        let bare = catalog::split_qualified(first).1;
+                        format!("table {name}.{bare} depends on schema {name}")
+                    })
+                })
         {
-            let bare = catalog::split_qualified(first).1;
             return Err(SqlError::DependentSchema {
                 schema: name.clone(),
-                detail: format!("table {name}.{bare} depends on schema {name}"),
+                detail,
             });
         }
         // Only the **tables** are dropped, and each takes its own indexes, sequences and primary
@@ -3516,6 +3703,11 @@ pub(super) fn drop_schema(
                 let table = executor.table_by_id(txn, table_id)?;
                 drop_one_table(executor, txn, &table)?;
             }
+        }
+        // The types go too, and after the tables: a column declared as one of them has already
+        // gone with its table, so nothing is left pointing at a type this removes.
+        for stored in &types {
+            catalog::drop_type(txn, executor.tenant, stored);
         }
         catalog::drop_schema(txn, executor.tenant, name)?;
     }

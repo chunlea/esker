@@ -176,6 +176,21 @@ pub enum CatalogView {
     /// asking. That row is **true**: it is `active`, because it is running the query that reads
     /// the view, and its `datname` is the database it is serving.
     PgStatActivity,
+    /// **Who holds a row lock on this node, and who is waiting for one** — the view a stuck
+    /// session's counterpart can be found in.
+    ///
+    /// PostgreSQL's `pg_locks` has sixteen columns and this one has the same sixteen, because the
+    /// tools that read it — `ActiveRecord`'s lock tests, and the Rails harness's own forensics —
+    /// select named columns rather than `*`. What differs is which of them can be true here, and
+    /// each is answered `NULL` rather than invented: this node has no pages, no tuple numbers and
+    /// no virtual transactions, so `page`, `tuple` and `virtualxid` are `NULL` where a real server
+    /// has numbers.
+    ///
+    /// Measured against PostgreSQL 19 with one session holding `SELECT … FOR UPDATE` and a second
+    /// blocked behind it: the holder shows a `tuple` row with `granted = true`, and **the waiter
+    /// shows a `transactionid` row with `granted = false`** naming the transaction it waits for.
+    /// That pair is the whole diagnostic, and it is the shape reproduced here.
+    PgLocks,
     /// The databases this server has, which is **one**.
     ///
     /// `ActiveRecord`'s adapter reads it three times while connecting — the encoding, the collation
@@ -220,7 +235,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 32] = [
+    pub const ALL: [CatalogView; 33] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -241,6 +256,7 @@ impl CatalogView {
         CatalogView::PgViews,
         CatalogView::PgMatviews,
         CatalogView::PgStatActivity,
+        CatalogView::PgLocks,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
         CatalogView::PgSequence,
@@ -280,6 +296,7 @@ impl CatalogView {
             CatalogView::PgViews => "pg_views",
             CatalogView::PgMatviews => "pg_matviews",
             CatalogView::PgStatActivity => "pg_stat_activity",
+            CatalogView::PgLocks => "pg_locks",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
             CatalogView::PgSequence => "pg_sequence",
@@ -341,6 +358,7 @@ impl CatalogView {
             CatalogView::PgIndexes
             | CatalogView::PgViews
             | CatalogView::PgStatActivity
+            | CatalogView::PgLocks
             | CatalogView::PgAvailableExtensions
             | CatalogView::InformationSchemaTables
             | CatalogView::InformationSchemaViews
@@ -385,6 +403,13 @@ impl CatalogView {
                 // above records.
                 CatalogView::PgMatviews => 29,
                 CatalogView::PgStatActivity => 28,
+                // **31, because 30 is `InformationSchemaDomains`'s.** This view and g1's
+                // domains view were written in parallel and both took 30, which git merged
+                // without a word: the arrays combined cleanly and the id collided. Two views
+                // sharing one resolve to each other, and what it broke was *their* test —
+                // `information_schema.domains` answered no rows — which is the third time this
+                // file has recorded that failure.
+                CatalogView::PgLocks => 31,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
@@ -549,7 +574,11 @@ impl CatalogView {
                 ("pronargs", ColumnType::Int2),
                 ("provolatile", ColumnType::Text),
                 ("prosrc", ColumnType::Text),
-                ("prolang", ColumnType::Text),
+                // **An oid, not the name.** `pg_language.oid = pg_proc.prolang` is the join
+                // every client writes to learn a function's language, and a `text` here made it
+                // `42883 operator does not exist: bigint = text` — a join that reads as a type
+                // error about a catalog rather than as a missing column.
+                ("prolang", ColumnType::Int8),
             ],
             // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
             // DDL used.
@@ -601,6 +630,28 @@ impl CatalogView {
             // `client_addr`, `xid` for the two transaction columns, `name` for the two identifier
             // ones — and each answers as the nearest thing it does have, the standing trade every
             // `pg_catalog` column makes.
+            // Sixteen columns, in PostgreSQL 19's order and under its names and types — measured
+            // from `\d pg_locks` rather than copied from documentation. `xid` is the one type this
+            // node does not have, and `transactionid` is an `int8` here carrying the holder's
+            // start timestamp, which is the identity a waiter is waiting for.
+            CatalogView::PgLocks => &[
+                ("locktype", ColumnType::Text),
+                ("database", ColumnType::Oid),
+                ("relation", ColumnType::Oid),
+                ("page", ColumnType::Int4),
+                ("tuple", ColumnType::Int2),
+                ("virtualxid", ColumnType::Text),
+                ("transactionid", ColumnType::Int8),
+                ("classid", ColumnType::Oid),
+                ("objid", ColumnType::Oid),
+                ("objsubid", ColumnType::Int2),
+                ("virtualtransaction", ColumnType::Text),
+                ("pid", ColumnType::Int4),
+                ("mode", ColumnType::Text),
+                ("granted", ColumnType::Bool),
+                ("fastpath", ColumnType::Bool),
+                ("waitstart", ColumnType::TimestampTz),
+            ],
             CatalogView::PgStatActivity => &[
                 ("datid", ColumnType::Oid),
                 ("datname", ColumnType::Text),
@@ -756,6 +807,7 @@ impl CatalogView {
             CatalogView::PgViews => views_rows(txn, tenant),
             CatalogView::PgMatviews => matviews_rows(txn, tenant),
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
+            CatalogView::PgLocks => Ok(locks_rows(txn, tenant)),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             // **The standard's views delegate as a group**, in their own function: they are six
             // arms that all call one module, and keeping them here is what pushed `rows_of` past
@@ -763,14 +815,25 @@ impl CatalogView {
             view if view.schema() == super::INFORMATION_SCHEMA => {
                 Self::information_schema_rows(view, txn, tenant)
             }
-            // **Trusted**, which is what `lanpltrusted` says of `plpgsql` on a real server: a
-            // non-superuser may write a function in it. Nothing here acts on the flag; it is
-            // reported because a client reads it before defining one.
-            CatalogView::PgLanguage => Ok(vec![vec![
-                Datum::Int8(PLPGSQL_LANGUAGE_OID),
-                Datum::Text("plpgsql".to_owned()),
-                Datum::Bool(true),
-            ]]),
+            // **The four a real server has**, measured: `c`, `internal`, `plpgsql` and `sql`,
+            // with only the last two `lanpltrusted` — a non-superuser may write a function in
+            // those and not in the other two. Nothing here acts on the flag; it is reported
+            // because a client reads it before defining one.
+            //
+            // All four are listed even though only two can hold a function here, because this is
+            // the catalog a client *reads*: a language missing from it is a language that does not
+            // exist, and `c` and `internal` do exist on the server this node answers as. What
+            // happens when a function is actually written in one is `crate::exec::ddl`'s answer.
+            CatalogView::PgLanguage => Ok(LANGUAGES
+                .iter()
+                .map(|(oid, name, trusted)| {
+                    vec![
+                        Datum::Int8(*oid),
+                        Datum::Text((*name).to_owned()),
+                        Datum::Bool(*trusted),
+                    ]
+                })
+                .collect()),
             // `amtype` `i` — an index method, which is what both of these are. A real server's
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
@@ -895,6 +958,7 @@ impl CatalogView {
             // Catalog-backed like `pg_indexes`: `rows_of` answers for it before it delegates here.
             | CatalogView::PgViews
             | CatalogView::PgStatActivity
+            | CatalogView::PgLocks
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -1046,8 +1110,29 @@ pub fn refuse_write(name: &str) -> Result<()> {
 /// reserved beside the view ids for the same reason they are — nothing a user creates can reach
 /// it. What has to be true is only that `relnamespace` equals `pg_namespace.oid`, which is the
 /// join `ActiveRecord` writes.
+/// The languages `pg_language` reports, and the oids `pg_proc.prolang` points at.
+///
+/// **Ours rather than a real server's**, the same choice every reserved id in this module makes:
+/// what has to be true is that the two catalogs agree with each other, which is the join a client
+/// writes.
+const LANGUAGES: &[(i64, &str, bool)] = &[
+    (13, "c", false),
+    (12, "internal", false),
+    (PLPGSQL_LANGUAGE_OID, "plpgsql", true),
+    (14, "sql", true),
+];
+
 /// The oid `pg_language` reports for `plpgsql`, and what a `pg_proc.prolang` would point at.
 const PLPGSQL_LANGUAGE_OID: i64 = 14_024;
+
+/// One language's oid by name, for `pg_proc.prolang`. Zero for a name that is not a language,
+/// which no stored function has: `crate::exec::ddl::create_function` refuses one first.
+fn language_oid(name: &str) -> i64 {
+    LANGUAGES
+        .iter()
+        .find(|(_, known, _)| known.eq_ignore_ascii_case(name))
+        .map_or(0, |(oid, _, _)| *oid)
+}
 
 const PUBLIC_NAMESPACE_OID: i64 = 11;
 
@@ -1183,7 +1268,7 @@ fn proc_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum
                 // `v` for volatile, which is the default and what a trigger function is.
                 Datum::Text("v".to_owned()),
                 Datum::Text(function.body),
-                Datum::Text(function.language),
+                Datum::Int8(language_oid(&function.language)),
             ]
         })
         .collect())
@@ -1255,6 +1340,95 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
 /// server sends for a backend whose detail it will not show, so a client that reads one is on a
 /// path it already has; a `client_addr` of `127.0.0.1` or a `backend_start` of "now" would be a
 /// fact nobody measured.
+/// `pg_locks`: what this node holds, and who is waiting for it.
+///
+/// **Two row shapes, because that is what a real server answers with.** Measured against
+/// PostgreSQL 19 with a held row and a blocked writer: the holder appears as a `tuple` row with
+/// `granted = true`, and the waiter appears as a `transactionid` row with `granted = false` naming
+/// the transaction it waits for. Reading those two together is how a stuck session's counterpart is
+/// found, which is the whole reason this view exists.
+///
+/// **What is `NULL` here and is a number on a real server**: `page` and `tuple`, because this node
+/// locks a *key* rather than a tuple at a page offset; and `virtualxid`, because there are no
+/// virtual transactions. A row lock's identity travels in `virtualtransaction` instead, as
+/// `0/<transaction id>` — the shape PostgreSQL uses, and the only column that tells two sessions of
+/// this node apart, since every one of them reports the node's own `pid`.
+///
+/// **What is not modelled**: PostgreSQL also shows a waiter holding a `tuple` lock while it waits,
+/// and shows relation-level locks (`RowShareLock`, `RowExclusiveLock`) that this node does not take
+/// at all. Their absence is the truth about this node rather than a gap in the view.
+///
+/// Locks are node-local (`crate::backend::locks`), so this answers for **this process**. Rows whose
+/// key belongs to another database are left out, which is what `database` filtering would do
+/// anyway.
+fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
+    let view = txn.locks();
+    let pid = Datum::Int4(i32::try_from(std::process::id()).unwrap_or(i32::MAX));
+    let database = Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX));
+    let mut rows = Vec::with_capacity(view.held.len() + view.waiting.len());
+    // `holder id -> start_ts`, so a waiter's row can name the transaction it waits for the way a
+    // real server does: by the transaction, not by the key.
+    let mut start_of: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for (key, holder, start_ts) in &view.held {
+        start_of.insert(*holder, *start_ts);
+        let Some((owner, table_id)) = esker_keys::prefix::row_key_table(key) else {
+            // Not a row key: an index entry or a metadata key, which this node does not row-lock.
+            continue;
+        };
+        if owner != tenant {
+            continue;
+        }
+        rows.push(vec![
+            Datum::Text("tuple".to_owned()),
+            database.clone(),
+            Datum::Int8(i64::try_from(table_id).unwrap_or(i64::MAX)),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Int8(i64::try_from(*start_ts).unwrap_or(i64::MAX)),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Text(format!("0/{holder}")),
+            pid.clone(),
+            // `FOR SHARE` is served as `FOR UPDATE` (ADR 0057 §5), so every row lock here is
+            // exclusive and reporting anything else would describe a mode this node cannot take.
+            Datum::Text("ExclusiveLock".to_owned()),
+            Datum::Bool(true),
+            Datum::Bool(false),
+            Datum::Null,
+        ]);
+    }
+    for (waiter, holder) in &view.waiting {
+        rows.push(vec![
+            Datum::Text("transactionid".to_owned()),
+            database.clone(),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Int8(
+                start_of
+                    .get(holder)
+                    .and_then(|ts| i64::try_from(*ts).ok())
+                    .unwrap_or(i64::MAX),
+            ),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Text(format!("0/{waiter}")),
+            pid.clone(),
+            // What a waiter asks for on the holder's transaction id, measured.
+            Datum::Text("ShareLock".to_owned()),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            // The table records that a session waits, not since when.
+            Datum::Null,
+        ]);
+    }
+    rows
+}
+
 fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let datname = super::databases(txn)?
         .into_iter()
@@ -2178,5 +2352,42 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Uuid => "uuid_in",
         ColumnType::Interval => "interval_in",
         ColumnType::Oid => "oidin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatalogView;
+
+    /// **Every view's reserved relation id is its own**, and this test exists because that has now
+    /// failed three times.
+    ///
+    /// The ids are a hand-maintained table, and two lanes adding a view in parallel cannot see each
+    /// other: the arrays merge cleanly and the numbers collide in silence. Two views sharing an id
+    /// **resolve to each other**, so what breaks is not the new view but some *other* one — which is
+    /// how it was found each time. `pg_views` taking `pg_sequence`'s id turned eight unrelated tests
+    /// red; `pg_locks` taking `information_schema.domains`'s id emptied that view in another lane's
+    /// corpus, and neither lane could have seen it coming.
+    ///
+    /// A duplicated name resolves the same way and costs the same to check, so both are here.
+    #[test]
+    fn no_two_views_share_a_relation_id_or_a_name() {
+        let mut by_id: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
+        let mut by_name: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for view in CatalogView::ALL {
+            let (id, name) = (view.id(), view.name());
+            // `insert` hands back what was there **before**, which is the other view's name. Read
+            // the map after inserting and the message names the new view twice, which is a
+            // failure that tells you nothing about who it collided with.
+            if let Some(other) = by_id.insert(id, name) {
+                panic!(
+                    "{name} and {other} both reserve relation id {id}; they resolve to each other"
+                );
+            }
+            if let Some(other) = by_name.insert(name, id) {
+                panic!("two views are both named {name}, with ids {id} and {other}");
+            }
+        }
+        assert_eq!(by_id.len(), CatalogView::ALL.len());
     }
 }
