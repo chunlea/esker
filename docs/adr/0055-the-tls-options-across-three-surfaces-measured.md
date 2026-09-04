@@ -1,9 +1,10 @@
 # 0055 — The TLS options across three surfaces, measured
 
-Status: **accepted 2026-09-04, and built for the PostgreSQL port and the S3 tier.** The maintainer
-took option 4 and named `rustls-graviola` as the exception: refusal discipline everywhere now,
-`rustls` + `rustls-graviola` behind a default-off `tls` feature, PG port first, then S3, then RPC.
-Two of the three surfaces are done and **the second one cost no crates at all**. What that turned
+Status: **accepted 2026-09-04, and built on all three surfaces.** The maintainer took option 4 and
+named `rustls-graviola` as the exception: refusal discipline everywhere, `rustls` +
+`rustls-graviola` behind a default-off `tls` feature, PG port first, then S3, then RPC. All three
+are done, and **the whole exception is still the nine crates the first one cost** — the second and
+third added none. What that turned
 into is at the end of this file, under "What was built, and what is still owed"; the option list
 below is unchanged from the measurement that produced it.
 
@@ -363,15 +364,55 @@ Two things this surface found that the PG port did not:
 * **A handshake failure is two kinds of error.** A reset or a timeout is `Io` and retryable, because
   a server may be restarting; a certificate that does not verify is `Tls` and is not, because the
   uploader retries forever (ADR 0024 decision 2) and would hide a wrong CA indefinitely.
-### What RPC still needs
+### The RPC, built — and what mTLS does and does not buy
 
-* **RPC** (`esker-proto`, DESIGN.md §9): the harder one, and not because of TLS. It is the surface
-  where both ends are ours, so it is the one that wants **mutual** authentication — and mTLS gives
-  a verified peer identity, not an authorization decision. Nothing in `esker-pd` today maps an
-  identity to "may register as this store id" or "may vote in this region": a store's
-  `StoreHeartbeat` and a peer's `RaftTransport::Batch` are accepted from whoever can open the
-  socket. Encrypting that link without also deciding who is allowed on it moves the problem rather
-  than solving it, and the deciding is application logic no option in this ADR provides. Whoever
-  takes this surface should expect the certificate-issuance story (a private CA, most likely) and
-  the identity check to be the bulk of the work, with the TLS itself the small part — `TlsConfig`
-  and the session driver in `pgwire::tls` are the shape it can reuse.
+`esker-proto` gained `connect_with_tls` and `Server::with_tls`, both additive, so the plaintext
+constructors are untouched and nothing that does not ask for TLS moved. `TransportConfig` was left
+alone deliberately: it is `Copy` and `Eq` and is passed by value into every connection task, and a
+configuration behind an `Arc` is neither. The settings sit beside it.
+
+**Encryption here is required, not offered.** This protocol has no in-band upgrade like the
+PostgreSQL port's `SSLRequest`, so a server with TLS on turns away a peer that connects in the
+clear, and a client that wants TLS does not fall back. Both directions have a test.
+
+**mTLS is the point of this surface.** Store↔store and PD↔PD are links where both ends are ours,
+and `--rpc-tls-mutual` makes each node present a certificate and demand one. The two tests that
+matter are the refusals: a peer whose chain a *different* CA signed, and a peer with **no**
+certificate — the second being what a server that *requested* rather than *required* client auth
+would admit, with nothing in the traffic to show it.
+
+**And it is still not authorisation.** A verified certificate says the peer holds a key this
+cluster's CA vouched for. It does not say that peer may register as store 7 or vote in region 4.
+Nothing in `esker-pd` maps an identity to a right, and this ADR said so before the work and says so
+after it: mTLS makes the identity *available* to check. The check is unbuilt.
+
+Three things this surface found that the other two did not:
+
+* **One driver, not three.** The `tokio` TLS session driver moved into `esker-proto` and
+  `esker_sql::pgwire::tls` became its caller. The proof the move changed nothing is that the PG
+  port's ten tests — including its deadlock case and its 200 KiB multi-record case — pass unchanged
+  against the relocated code. The PEM reader went further down still, to `esker-base`, where it is
+  base64 and two markers and names no cryptographic type.
+* **A rejected peer learns of it as a closed connection.** TLS 1.3 lets a client finish its side of
+  the handshake before the server has validated the certificate it just sent, so under mTLS the
+  refusal arrives during the `Hello` exchange rather than as a handshake error. An operator
+  debugging "why will this node not join" sees a peer that closed; the complaint naming the CA is
+  in the *server's* log. This was expected to be `NotSent` and is not.
+* **The membership can move under a live transport.** `PdTcpTransport::reconfigure` adds and drops
+  one link per changed member and leaves the rest connected — a member is unchanged only if its id
+  *and* its address are. It exists because the alternative, replacing the whole transport, costs a
+  reconnect on links nobody touched.
+
+### What is still owed
+
+* **A replicated store's outbound peer links.** `esker server` wires TLS on the way in and
+  **refuses to start** with `--peers` and the TLS flags together, because the outbound dialling is
+  reached through `RaftOptions` in `crates/esker-store/src/server.rs` — one field, one line at the
+  `StoreTransport::spawn_with_tls` call — which the TLS lane did not own. Encrypting one direction
+  and not the other is the half-configured state every refusal here exists to prevent, so it says
+  so and stops rather than doing half of it.
+* **`crates/esker-pd/src/wiring.rs` can go.** It exists only because `transport.rs` was carved
+  elsewhere; `reconfigure` replaces it.
+* **`esker-s3` still carries its own PEM reader.** It does not depend on `esker-proto`, and this
+  work was not the place to add an edge — but it already depends on `esker-base`, so dropping the
+  copy costs nothing.
