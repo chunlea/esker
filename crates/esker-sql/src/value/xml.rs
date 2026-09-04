@@ -2,7 +2,8 @@
 //!
 //! # It is `json`'s shape with a different validator
 //!
-//! Like [`crate::value::json`], an `xml` is stored as the characters that were sent — `'  <a/>  '`
+//! Like `json` (`crate::value::json`, which is crate-private and so not linked), an `xml` is
+//! stored as the characters that were sent — `'  <a/>  '`
 //! keeps its spaces and `'<a></a>'` does not become `'<a/>'` — because the type has no canonical
 //! form to normalise towards. And like `json` it has **no equality at all**, so it is not an index
 //! key, cannot be `DISTINCT`ed and cannot be ordered. Measured, and each of those is a *different
@@ -338,9 +339,8 @@ impl Scanner {
             }
             self.bump();
             self.skip_space();
-            let quote = match self.peek() {
-                Some(quote @ ('"' | '\'')) => quote,
-                _ => return self.refuse("AttValue: \" or ' expected"),
+            let Some(quote @ ('"' | '\'')) = self.peek() else {
+                return self.refuse("AttValue: \" or ' expected");
             };
             self.bump();
             if !self.skip_past(&quote.to_string()) {

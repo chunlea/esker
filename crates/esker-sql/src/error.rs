@@ -2599,9 +2599,6 @@ impl SqlError {
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
             }
-            // The whole first DETAIL line, `line N:` prefix and all — `crate::value::xml` builds
-            // it, because only the scanner knows which line the parser stopped on.
-            SqlError::InvalidXmlContent(detail) => Some(detail.clone()),
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
             }
@@ -2649,7 +2646,12 @@ impl SqlError {
             | SqlError::DependentExtension { detail, .. }
             | SqlError::DependentFunction { detail, .. }
             | SqlError::DependentSchema { detail, .. }
-            | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),
+            | SqlError::NoPartitionForRow { detail, .. }
+            // The whole first DETAIL line, `line N:` prefix and all — the scanner in
+            // `crate::value::xml` builds it, because only it knows which line the parser stopped
+            // on. Merged with the arms above because the body is theirs: the detail *is* the
+            // payload, which is what every variant on this arm has in common.
+            | SqlError::InvalidXmlContent(detail) => Some(detail.clone()),
             SqlError::OnConflictMovesPartition => Some(
                 "The result tuple would appear in a different partition than the original tuple."
                     .to_owned(),
