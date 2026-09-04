@@ -32,8 +32,7 @@
 //! | [`routing`] | the region table: epoch-guarded upserts, and where a key lives |
 //! | [`raft_log`] | PD's Raft log, on the engine's `raft` column family |
 //! | [`pd`] | the six operations, synchronous, over one database |
-//! | [`transport`] | one connection per member pair, a batch per tick |
-//! | [`wiring`] | the connections this member holds, rebuilt when the group changes |
+//! | [`transport`] | one connection per member pair, rebuilt as the group changes |
 //! | [`service`] | the async edge: PD behind `esker-proto`'s server, and the tick |
 //!
 //! PD is a **Raft group of up to three members** ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md),
@@ -63,7 +62,6 @@ pub mod schedule;
 pub mod service;
 pub mod transport;
 pub mod tso;
-pub mod wiring;
 
 pub use balance::Balance;
 pub use clock::{Clock, SystemClock};
@@ -80,7 +78,6 @@ pub use routing::{RegionBeat, StoreBeat, Upsert};
 pub use schedule::{Cluster, LoadDelta, Repair};
 pub use service::PdService;
 pub use transport::PdTcpTransport;
-pub use wiring::PdWiring;
 
 /// Bits of the logical counter in a timestamp: `ts = physical_ms << 18 | logical`
 /// (`docs/DESIGN.md` §7). Part of the wire format — every timestamp on disk uses it.
