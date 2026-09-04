@@ -2099,7 +2099,18 @@ fn add_unique_constraint(
         predicate: None,
         comment: None,
     });
-    Ok(())
+    // **The index has to be filled, not merely declared.** Without this the constraint was a
+    // catalog entry over an empty index: the rows already in the table were not in it, so a later
+    // duplicate of one of them was accepted *and* a `SELECT … WHERE a = <that value>` answered
+    // with only the new row. A wrong answer to an ordinary query, reached through a statement that
+    // succeeded — and the scan that fixes it is the same one that refuses a constraint the
+    // existing rows already break (ADR 0020's recorded gap).
+    let index = updated
+        .indexes
+        .last()
+        .ok_or_else(|| SqlError::Internal("the index just pushed is not there".to_owned()))?
+        .clone();
+    backfill(executor, txn, updated, &index)
 }
 
 /// The derived name, or the first `<name><n>` that nothing answers to.
@@ -4073,9 +4084,17 @@ fn backfill(
             if entry.by_value && entries.iter().any(|(existing, _)| existing == &entry.key) {
                 // Out of the walk as well as out of the page: the index cannot be built and
                 // reading the rest of the table would learn nothing.
-                return Err(SqlError::UniqueViolation {
-                    constraint: index.name.clone(),
-                    key: None,
+                //
+                // **The build's sentence, not the insert's.** Nothing was inserted here, and
+                // PostgreSQL says so — `could not create unique index "…"`, with the `DETAIL`
+                // naming the first duplicate found.
+                return Err(SqlError::CouldNotCreateUniqueIndex {
+                    index: index.name.clone(),
+                    // `render_key` already writes the leading `Key `.
+                    detail: format!(
+                        "{} is duplicated.",
+                        super::index::render_key(table, &index.keys, &entry.values)
+                    ),
                 });
             }
             entries.push((

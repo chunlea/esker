@@ -760,6 +760,20 @@ pub enum SqlError {
         target: String,
     },
 
+    /// A `UNIQUE` index that cannot be **built**, because the rows already there break it: `23505`.
+    ///
+    /// **A different sentence from the one an `INSERT` gets**, and deliberately: nothing was
+    /// inserted. PostgreSQL says `could not create unique index "…"` here and `duplicate key value
+    /// violates unique constraint "…"` there, both `23505`, and `ALTER TABLE … ADD CONSTRAINT …
+    /// UNIQUE` uses *this* one because what it does is build an index.
+    #[error("could not create unique index \"{index}\"")]
+    CouldNotCreateUniqueIndex {
+        /// The index or constraint being built.
+        index: String,
+        /// `Key (a)=(5) is duplicated.` — the first duplicate found, for the `DETAIL` field.
+        detail: String,
+    },
+
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
     #[error("{0} must not be negative")]
@@ -2159,7 +2173,8 @@ impl SqlError {
             SqlError::DuplicateColumn(_)
             | SqlError::DuplicateColumnInRelation { .. }
             | SqlError::DuplicateColumnSkipping { .. } => sqlstate::DUPLICATE_COLUMN,
-            SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
+            SqlError::CouldNotCreateUniqueIndex { .. }
+            | SqlError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
             SqlError::ColumnContainsNulls { .. }
             | SqlError::NotNullViolation(_)
             | SqlError::NotNullViolationInRelation { .. } => {
@@ -2360,6 +2375,7 @@ impl SqlError {
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
             }
+            SqlError::CouldNotCreateUniqueIndex { detail, .. } => Some(detail.clone()),
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
