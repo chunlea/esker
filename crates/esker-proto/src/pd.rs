@@ -1454,6 +1454,18 @@ impl PdChannel {
         }
     }
 
+    /// Who is in this placement driver's group, and which member leads.
+    ///
+    /// Answered by **any** member, which is what a client refreshing a stale endpoint list needs:
+    /// it is asking precisely because the one it reached was not the leader
+    /// ([ADR 0060](../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    pub async fn members(&self) -> Result<PdMembership, ProtoError> {
+        match self.call(PdReq::Members).await? {
+            PdResp::Members(membership) => Ok(membership),
+            other => Err(mismatch("Members", &other)),
+        }
+    }
+
     async fn call(&self, request: PdReq) -> Result<PdResp, ProtoError> {
         let response = self
             .transport
