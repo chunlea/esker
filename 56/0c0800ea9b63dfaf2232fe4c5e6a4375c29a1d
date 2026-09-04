@@ -1,0 +1,80 @@
+crates/esker-keys/src/array.rs
+  h_44076b318daf9c 113,157
+crates/esker-keys/src/columnar.rs
+  h_44076b318daf9c 143-144,228-229
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 479-480,504,863-864,1065-1066,1280-1283,1977,2097-2107
+crates/esker-keys/src/value.rs
+  h_44076b318daf9c 284-294,440,517-518,927-931
+crates/esker-sql/src/catalog/information_schema.rs
+  h_44076b318daf9c 83-122,199-208,237-247,258-260,299-305,523-527
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 844-864,875,888-891,3952,4045,4127,5444
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 99-102,267,306,331,365,416-417,478-483,730,750-776,804-808,928,1718,1736-1738,1756,1760-1762,1765,1769,1771-1778,1780-1784,1795-1805,1809,1823-1825,2009-2010,2114,2145-2147,2163,2188-2205,2246-2247,2256
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 106,139-141,300-301,404-405,532-533,796-812,830-843
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 567-580,913-926,2381-2385,2396,2401,2452,2500,2666-2671,2764-2768
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 211-216,280-290,953-955,958
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 1275-1276,1311-1314
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 266-273,277,293-306,320-333,390-396,493-495
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 426,854,1829-1845,1856-1907
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 679-682
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 813-824,963-988,2881-2883,2893-2900,2903,2906
+crates/esker-sql/src/exec/typedef.rs
+  h_44076b318daf9c 50-52
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 164-168,676-725,6587-6589
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 227-230,281-283,358-363,481-484,519,562-584,1752-1753
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 1752,1835,1912
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 78,224-234
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 62-64
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 63,322-354,637-638,666-667,773-775,810,921,994,1074-1075,1139,1145,1355-1356,1375-1382,1525,1567-1568,2266,2276
+crates/esker-sql/src/value/xml.rs
+  h_44076b318daf9c 1-470
+crates/esker-sql/tests/corpus/pg19_domain.txt
+  h_44076b318daf9c 1-51
+crates/esker-sql/tests/corpus/pg19_geometric.txt
+  h_44076b318daf9c 25-28
+crates/esker-sql/tests/corpus/pg19_xml.txt
+  h_44076b318daf9c 1-104
+crates/esker-sql/tests/domain.rs
+  h_44076b318daf9c 1-68
+crates/esker-sql/tests/geometric.rs
+  h_44076b318daf9c 25-29
+crates/esker-sql/tests/pg_catalog.rs
+  h_44076b318daf9c 194-197,208-211,298,316-327,735-738,742-743,749-750
+crates/esker-sql/tests/row_order.rs
+  h_44076b318daf9c 122-127
+crates/esker-sql/tests/xml.rs
+  h_44076b318daf9c 1-104
+crates/esker-store/src/columnar/decode.rs
+  h_44076b318daf9c 237-240
+docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md
+  h_44076b318daf9c 1-75
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "560c0800ea9b63dfaf2232fe4c5e6a4375c29a1d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
