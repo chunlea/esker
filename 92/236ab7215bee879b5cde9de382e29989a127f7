@@ -1,0 +1,37 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_1c60b7f9215af1 1605-1620,2196-2204
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_dc0bc5ae077df9 1562-1603,1875-1876,2011,2074,2128,2254,2272-2278
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_103e7e890ee26e 1628-1824,2712-2731,2792-2793,2946-2967
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_e6d82d6c7dd9bd 1928-1940,2235-2247
+crates/esker-sql/src/plan/ddl.rs
+  s_6f7019c05b578b::t_974b4c91daa054 773-795
+crates/esker-sql/tests/corpus/pg19_drop_constraint.txt
+  s_6f7019c05b578b::t_a370d86f9993d9 1-95
+crates/esker-sql/tests/drop_constraint.rs
+  s_6f7019c05b578b::t_7a37ad6c8b550c 1-58
+crates/esker-sql/tests/lowering.rs
+  s_6f7019c05b578b::t_b96d68888bfc50 209-211,213
+crates/esker-sql/tests/unique_constraint.rs
+  s_6f7019c05b578b::t_624f1c0f957ec6 22-28,32-43
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_fd37cec6a0778c 1265,1533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "92236ab7215bee879b5cde9de382e29989a127f7",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
