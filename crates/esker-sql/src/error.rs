@@ -548,6 +548,12 @@ pub enum SqlError {
     #[error("you don't own a lock of type {0}")]
     LockNotHeld(&'static str),
 
+    /// `'192.168.1.5/24'::cidr`: the text parsed and the value is not a network. Its own
+    /// sentence and its own DETAIL, neither of which is the ordinary input-syntax one — measured,
+    /// and the reason `cidr` does not simply share `inet`'s error.
+    #[error("invalid cidr value: \"{0}\"")]
+    InvalidCidrValue(String),
+
     /// `money` overflowing, which is its own sentence: PostgreSQL quotes no value in it, unlike
     /// every other overflow message. Measured — `'92233720368547758.07'::money + '0.01'::money`.
     #[error("money out of range")]
@@ -2297,6 +2303,7 @@ impl SqlError {
             }
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
             SqlError::MalformedRangeLiteral { .. }
+            | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidTextRepresentation { .. }
             | SqlError::InvalidEnumValue { .. }
             | SqlError::InvalidByteaFormat => {
@@ -2493,6 +2500,9 @@ impl SqlError {
         match self {
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
+            }
+            SqlError::InvalidCidrValue(_) => {
+                Some("Value has bits set to right of mask.".to_owned())
             }
             SqlError::ReservedSchemaName(_) => {
                 Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())

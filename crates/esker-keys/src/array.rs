@@ -114,6 +114,9 @@ impl ArrayValue {
             ColumnType::Oid => ColumnType::OidArray,
             ColumnType::Citext => ColumnType::CitextArray,
             ColumnType::Money => ColumnType::MoneyArray,
+            ColumnType::Inet => ColumnType::InetArray,
+            ColumnType::Cidr => ColumnType::CidrArray,
+            ColumnType::MacAddr => ColumnType::MacAddrArray,
             _ => return None,
         })
     }
@@ -152,6 +155,9 @@ impl ArrayValue {
             ColumnType::OidArray => ColumnType::Oid,
             ColumnType::CitextArray => ColumnType::Citext,
             ColumnType::MoneyArray => ColumnType::Money,
+            ColumnType::InetArray => ColumnType::Inet,
+            ColumnType::CidrArray => ColumnType::Cidr,
+            ColumnType::MacAddrArray => ColumnType::MacAddr,
             _ => return None,
         })
     }

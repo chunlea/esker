@@ -4784,6 +4784,42 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::Bytea(bytes.to_vec()),
             ))));
         }
+        // **An address cast keeps the prefix the output function hides, and `inet::cidr` masks
+        // rather than refuses.** Both were measured and both differ from "print it and read it
+        // back": `'192.168.1.1'::inet::text` is `192.168.1.1/32` where the field is
+        // `192.168.1.1`, and `'192.168.1.5/24'::inet::cidr` is `192.168.1.0/24` where the same
+        // text handed to `cidr_in` is `22P02 invalid cidr value`.
+        if let Some(from) = source_type(expr)?
+            && matches!(from, ColumnType::Inet | ColumnType::Cidr)
+            && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            let address = value::inet::from_text(&text, from == ColumnType::Cidr)?;
+            match to {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                    return Ok(plan::Expr::Literal(plan::Literal::String(
+                        value::inet::to_cast_text(&address),
+                    )));
+                }
+                ColumnType::Cidr | ColumnType::Inet => {
+                    let cidr = to == ColumnType::Cidr;
+                    let address = if cidr {
+                        value::inet::masked_to_cidr(&address)
+                    } else {
+                        address
+                    };
+                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                        Datum::Inet {
+                            family: address.family,
+                            bits: address.bits,
+                            cidr,
+                            addr: address.addr,
+                        },
+                    ))));
+                }
+                _ => {}
+            }
+        }
         // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
         // output function writes `$567.89` and `numeric`'s input function refuses it, so the
         // ordinary text path made a conversion a real server performs into a `22P02` about the
@@ -6405,6 +6441,11 @@ fn range_type_name(name: &str) -> Option<ColumnType> {
         // this one — a `Custom` name here like the rest. `money_test.rb` writes `t.money`, which
         // the adapter sends as the bare word.
         "money" => Some(ColumnType::Money),
+        // **The three network types**, which `sqlparser` has no variant for either.
+        // `network_test.rb` writes `t.inet`, `t.cidr` and `t.macaddr` in one `create_table`.
+        "inet" => Some(ColumnType::Inet),
+        "cidr" => Some(ColumnType::Cidr),
+        "macaddr" => Some(ColumnType::MacAddr),
         _ => None,
     }
 }

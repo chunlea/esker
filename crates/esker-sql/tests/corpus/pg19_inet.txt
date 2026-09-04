@@ -1,0 +1,94 @@
+# `inet`, `cidr` and `macaddr` — against PostgreSQL 19beta1.
+#
+# **Run 59's tier-3 row: 8 tests in `adapters/postgresql/network_test.rb`**, whose `setup`
+# declares all three in one `create_table`, each with a default — so any one missing fails all 8.
+#
+# Things reasoning would get wrong:
+#
+# * **`inet` and `cidr` are one representation and two types.** `'192.168.1.1'::inet =
+#   '192.168.1.1'::cidr` is `t`, so under ADR 0042 they may share one; what differs is the input
+#   rule and the output. An `inet` **hides a full-length prefix** and a `cidr` never does:
+#   `'172.16.1.254/32'::inet` prints `172.16.1.254`.
+# * **A missing octet is a prefix, not a zero**: `'10/8'` is `10.0.0.0/8` and `'192.168.1'` is
+#   `192.168.1.0/24`. The octets that were written set the default prefix, 8 bits each.
+# * **A `cidr` refuses bits to the right of its mask** — `22P02 invalid cidr value` with a DETAIL
+#   of its own — and **the `inet::cidr` cast zeroes them instead**: `'192.168.1.5/24'::inet::cidr`
+#   is `192.168.1.0/24`. The cast is not "print it and read it back".
+# * **`::text` is not the output function either**: `'192.168.1.1'::inet::text` is
+#   `192.168.1.1/32`, prefix included, where the same value as a field is `192.168.1.1`.
+# * **`macaddr` is six bytes, category `U`, and four input spellings** — `Ab:Cd:Ef:01:02:03`,
+#   `0123.4567.890a`, `01-23-45-67-89-0a`, `0123456789ab` — all lower-cased on the way out, which
+#   is why the suite's "changing the case does not mark it dirty" test passes there.
+# * **A zone id is refused**: `'fe80::1%eth0'::inet` is `22P02` on a real server too.
+# * `inet = text` is `42883`; `inet = cidr` is `t`.
+#
+BEGIN		-
+SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('inet','cidr','macaddr','_inet','_cidr','_macaddr') ORDER BY typname	text,name,oid,oid,smallint,"char",regproc	r|_cidr|651|0|-1|A|array_in ; r|_inet|1041|0|-1|A|array_in ; r|_macaddr|1040|0|-1|A|array_in ; r|cidr|650|651|-1|I|cidr_in ; r|inet|869|1041|-1|I|inet_in ; r|macaddr|829|1040|6|U|macaddr_in
+CREATE TABLE n (id int8 primary key, inet_address inet DEFAULT '192.168.1.1', cidr_address cidr DEFAULT '192.168.1.0/24', mac_address macaddr DEFAULT 'ff:ff:ff:ff:ff:ff')		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"n"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|inet_address|inet ; r|cidr_address|cidr ; r|mac_address|macaddr
+SELECT 'r', column_name, data_type, udt_name, column_default FROM information_schema.columns WHERE table_name = 'n' ORDER BY ordinal_position	text,name,character varying,name,character varying	r|id|bigint|int8|\N ; r|inet_address|inet|inet|'192.168.1.1'::inet ; r|cidr_address|cidr|cidr|'192.168.1.0/24'::cidr ; r|mac_address|macaddr|macaddr|'ff:ff:ff:ff:ff:ff'::macaddr
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid = '"n"'::regclass ORDER BY d.adnum		r|'192.168.1.1'::inet ; r|'192.168.1.0/24'::cidr ; r|'ff:ff:ff:ff:ff:ff'::macaddr
+INSERT INTO n (id, cidr_address, inet_address, mac_address) VALUES (1, '192.168.0.0/24', '172.16.1.254/32', '01:23:45:67:89:0a')		-
+INSERT INTO n (id, cidr_address, inet_address, mac_address) VALUES (2, '10.1.2.3/32', '10.0.0.0/8', 'bc:de:f0:12:34:56')		-
+INSERT INTO n (id) VALUES (3)		-
+SELECT 'r', id, inet_address, cidr_address, mac_address FROM n ORDER BY id		r|1|172.16.1.254|192.168.0.0/24|01:23:45:67:89:0a ; r|2|10.0.0.0/8|10.1.2.3/32|bc:de:f0:12:34:56 ; r|3|192.168.1.1|192.168.1.0/24|ff:ff:ff:ff:ff:ff
+SELECT 'r', '192.168.1.1'::inet, '192.168.1.1/24'::inet, '10.0.0.0/8'::inet, '172.16.1.254/32'::inet	text,inet,inet,inet,inet	r|192.168.1.1|192.168.1.1/24|10.0.0.0/8|172.16.1.254
+SELECT 'r', '192.168.1.0/24'::cidr, '10/8'::cidr, '192.168.1'::cidr, '::1'::inet	text,cidr,cidr,cidr,inet	r|192.168.1.0/24|10.0.0.0/8|192.168.1.0/24|::1
+SELECT 'r', 'Ab:Cd:Ef:01:02:03'::macaddr, '0123.4567.890a'::macaddr, '01-23-45-67-89-0a'::macaddr, '0123456789ab'::macaddr	text,macaddr,macaddr,macaddr,macaddr	r|ab:cd:ef:01:02:03|01:23:45:67:89:0a|01:23:45:67:89:0a|01:23:45:67:89:ab
+SELECT 'r', pg_typeof('192.168.1.1'::inet), pg_typeof('192.168.1.0/24'::cidr), pg_typeof('ff:ff:ff:ff:ff:ff'::macaddr)	text,regtype,regtype,regtype	r|inet|cidr|macaddr
+SELECT 'r', '2001:db8::1'::inet, '2001:db8::/32'::cidr, '::ffff:192.168.1.1'::inet	text,inet,cidr,inet	r|2001:db8::1|2001:db8::/32|::ffff:192.168.1.1
+SAVEPOINT z1		-
+SELECT 'r', 'fe80::1%eth0'::inet	!22P02 invalid input syntax for type inet: "fe80::1%eth0"
+ROLLBACK TO SAVEPOINT z1		-
+SAVEPOINT y1		-
+SELECT 'r', host('192.168.1.5/24'::inet), masklen('192.168.1.5/24'::inet), network('192.168.1.5/24'::inet), broadcast('192.168.1.5/24'::inet)	text,text,integer,cidr,inet	r|192.168.1.5|24|192.168.1.0/24|192.168.1.255/24
+ROLLBACK TO SAVEPOINT y1		-
+SAVEPOINT y2		-
+SELECT 'r', abbrev('192.168.1.0/24'::cidr), family('192.168.1.1'::inet), family('::1'::inet), text('192.168.1.5/24'::inet)	text,text,integer,integer,text	r|192.168.1/24|4|6|192.168.1.5/24
+ROLLBACK TO SAVEPOINT y2		-
+SAVEPOINT y3		-
+SELECT 'r', '192.168.1.5'::inet << '192.168.1.0/24'::inet, '192.168.1.0/24'::inet >> '192.168.1.5'::inet, '192.168.1.5'::inet <<= '192.168.1.5/32'::inet	text,boolean,boolean,boolean	r|t|t|t
+ROLLBACK TO SAVEPOINT y3		-
+SELECT 'r', '192.168.1.1'::inet = '192.168.1.1'::inet, '192.168.1.1'::inet < '192.168.1.2'::inet, '10.0.0.1'::inet > '9.0.0.1'::inet	text,boolean,boolean,boolean	r|t|t|t
+SELECT 'r', id, inet_address FROM n WHERE inet_address IS NOT NULL ORDER BY inet_address		r|2|10.0.0.0/8 ; r|1|172.16.1.254 ; r|3|192.168.1.1
+SELECT 'r', '192.168.1.1'::inet::cidr, '192.168.1.0/24'::cidr::inet, '192.168.1.1'::inet::text	text,cidr,inet,text	r|192.168.1.1/32|192.168.1.0/24|192.168.1.1/32
+SELECT 'r', count(DISTINCT inet_address), count(DISTINCT mac_address) FROM n		r|3|3
+SELECT 'r', '{192.168.1.1,10.0.0.1}'::inet[], pg_typeof('{192.168.1.1}'::inet[])	text,inet[],regtype	r|{192.168.1.1,10.0.0.1}|inet[]
+CREATE INDEX n_inet_idx ON n (inet_address)		-
+SELECT 'r', id FROM n WHERE inet_address = '10.0.0.0/8'::inet		r|2
+UPDATE n SET inet_address = '10.0.0.0/8', cidr_address = '10.1.2.3/32', mac_address = 'bc:de:f0:12:34:56' WHERE id = 3		-
+SELECT 'r', id, inet_address, cidr_address, mac_address FROM n WHERE id = 3		r|3|10.0.0.0/8|10.1.2.3/32|bc:de:f0:12:34:56
+SAVEPOINT s1		-
+SELECT 'r', 'invalid addr'::inet	!22P02 invalid input syntax for type inet: "invalid addr"
+ROLLBACK TO SAVEPOINT s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'invalid addr'::cidr	!22P02 invalid input syntax for type cidr: "invalid addr"
+ROLLBACK TO SAVEPOINT s2		-
+SAVEPOINT s3		-
+SELECT 'r', '192.168.1.5/24'::cidr	!22P02 invalid cidr value: "192.168.1.5/24" DETAIL: Value has bits set to right of mask.
+ROLLBACK TO SAVEPOINT s3		-
+SAVEPOINT s4		-
+SELECT 'r', 'zz:zz:zz:zz:zz:zz'::macaddr	!22P02 invalid input syntax for type macaddr: "zz:zz:zz:zz:zz:zz"
+ROLLBACK TO SAVEPOINT s4		-
+SAVEPOINT s5		-
+SELECT 'r', '192.168.1.1'::inet = '192.168.1.1'::cidr	text,boolean	r|t
+ROLLBACK TO SAVEPOINT s5		-
+SAVEPOINT s6		-
+SELECT 'r', '192.168.1.1'::inet = '192.168.1.1'::text	!42883 operator does not exist: inet = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s6		-
+SAVEPOINT s7		-
+SELECT 'r', 'ff:ff:ff:ff:ff:ff'::macaddr::text, 'ff:ff:ff:ff:ff:ff'::macaddr < '00:00:00:00:00:01'::macaddr	text,text,boolean	r|ff:ff:ff:ff:ff:ff|f
+ROLLBACK TO SAVEPOINT s7		-
+SAVEPOINT s8		-
+SELECT 'r', min(inet_address), max(inet_address) FROM n		r|10.0.0.0/8|172.16.1.254
+ROLLBACK TO SAVEPOINT s8		-
+SAVEPOINT s9		-
+SAVEPOINT y4		-
+SELECT 'r', '192.168.1.1'::inet + 1, '192.168.1.2'::inet - '192.168.1.1'::inet	text,inet,bigint	r|192.168.1.2|1
+ROLLBACK TO SAVEPOINT y4		-
+ROLLBACK TO SAVEPOINT s9		-
+SELECT 'r', '192.168.1.5/24'::inet::cidr, '192.168.1.1'::inet::cidr, '192.168.1.1'::text::inet, '192.168.1.5/24'::inet::text	text,cidr,cidr,inet,text	r|192.168.1.0/24|192.168.1.1/32|192.168.1.1|192.168.1.5/24
+SELECT 'r', 'ff:ff:ff:ff:ff:ff'::macaddr::text, '01:23:45:67:89:0a'::macaddr::varchar	text,text,character varying	r|ff:ff:ff:ff:ff:ff|01:23:45:67:89:0a
+DROP TABLE n		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'n'	text,bigint	r|0

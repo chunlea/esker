@@ -2808,6 +2808,14 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // `i64` compare with cents and with nothing else.
             ColumnType::Money => 61,
             ColumnType::MoneyArray => 62,
+            // **One family for `inet` and `cidr`**, which is the whole point of them sharing a
+            // representation: `'192.168.1.1'::inet = '192.168.1.1'::cidr` is `t` on a real server.
+            // A `macaddr` is its own — no operator relates it to an address.
+            ColumnType::Inet | ColumnType::Cidr => 63,
+            ColumnType::MacAddr => 64,
+            ColumnType::InetArray => 65,
+            ColumnType::CidrArray => 66,
+            ColumnType::MacAddrArray => 67,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on

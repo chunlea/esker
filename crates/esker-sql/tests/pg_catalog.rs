@@ -195,12 +195,17 @@ fn activerecord_s_four_type_map_queries_answer() {
             // geometric type is a `b`ase type like any other, and its `typelem` is 0 because a
             // point is not an array of its coordinates.
             vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
+            // **`cidr`, `macaddr` and `inet`** — three more names the adapter's list has always
+            // held and got nothing back for. `cidr_in`, `macaddr_in`, `inet_in`.
+            vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
             // **`money` is in the adapter's own list** and was one of the names it asked about
             // and got nothing back for. `cash_in`, not `money_in`: the input function is named
             // for the C type behind it.
             vec!["790", "money", "0", ",", "cash_in", "\\N", "b", "0"],
+            vec!["829", "macaddr", "0", ",", "macaddr_in", "\\N", "b", "0"],
+            vec!["869", "inet", "0", ",", "inet_in", "\\N", "b", "0"],
             // `bpchar` is `character(n)`'s internal name and is in this query's list of forty.
             vec!["1042", "bpchar", "0", ",", "bpcharin", "\\N", "b", "0"],
             vec!["1043", "varchar", "0", ",", "varcharin", "\\N", "b", "0"],
@@ -293,6 +298,16 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "199".to_owned(),
                 "_json".to_owned(),
                 "114".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "651".to_owned(),
+                "_cidr".to_owned(),
+                "650".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),
@@ -428,6 +443,26 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1028".to_owned(),
                 "_oid".to_owned(),
                 "26".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1040".to_owned(),
+                "_macaddr".to_owned(),
+                "829".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1041".to_owned(),
+                "_inet".to_owned(),
+                "869".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

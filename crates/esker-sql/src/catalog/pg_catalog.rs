@@ -1737,6 +1737,12 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         // one is `_money` on a real server — measured beside the type it is over.
         ColumnType::Money => "money",
         ColumnType::MoneyArray => "_money",
+        ColumnType::Inet => "inet",
+        ColumnType::Cidr => "cidr",
+        ColumnType::MacAddr => "macaddr",
+        ColumnType::InetArray => "_inet",
+        ColumnType::CidrArray => "_cidr",
+        ColumnType::MacAddrArray => "_macaddr",
         // **No row of their own.** These two are the representation a user-defined range type
         // gets, and its `pg_type` row is written by `user_type_rows` under the name the
         // `CREATE TYPE` gave it — `ColumnType::ALL`, which is what this view iterates, leaves
@@ -1823,6 +1829,10 @@ fn typcategory(ty: ColumnType) -> &'static str {
         // **And a money**, which a real server puts here too — not in `U` with the extension
         // types and not in a category of its own. Measured.
         | ColumnType::Money => "N",
+        // **`I` for the two addresses**, which is not what a reader would guess: PostgreSQL has a
+        // network-address category and puts only `inet` and `cidr` in it — a `macaddr` joins the
+        // `U` group below. Measured off `pg_type.typcategory`.
+        ColumnType::Inet | ColumnType::Cidr => "I",
         // **`S` for citext too**, measured: it is a string type to the adapter, which is how it
         // is told apart from hstore's `U` in the boot type-map query.
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => "S",
@@ -1836,7 +1846,10 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Hstore
-        | ColumnType::Uuid => "U",
+        | ColumnType::Uuid
+        // **And a `macaddr`**, which a real server groups with them rather than with the two
+        // addresses it looks like. Measured.
+        | ColumnType::MacAddr => "U",
         // `T` for timespan, which is its own category and not the datetimes' `D`.
         ColumnType::Interval => "T",
         // `A` for array, whatever the elements are — the category is the constructor's, not the
@@ -1847,7 +1860,7 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`.
@@ -1901,7 +1914,10 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::CitextArray
-        | ColumnType::MoneyArray => "array_in",
+        | ColumnType::MoneyArray
+        | ColumnType::InetArray
+        | ColumnType::CidrArray
+        | ColumnType::MacAddrArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",
@@ -1921,6 +1937,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Int8Range => "int8range_in",
         // Not `money_in`: the input function is named for the C type behind it.
         ColumnType::Money => "cash_in",
+        ColumnType::Inet => "inet_in",
+        ColumnType::Cidr => "cidr_in",
+        ColumnType::MacAddr => "macaddr_in",
         // **`range_in` for a user-defined range**, measured: a real server's `floatrange` has
         // `typinput = range_in`, not `floatrange_in` — the input function belongs to the range
         // *machinery* and reads the subtype out of `pg_range`. These two have no row of their

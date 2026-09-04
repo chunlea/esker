@@ -70,6 +70,9 @@ mod tests {
             | ColumnType::OidArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
+            | ColumnType::InetArray
+            | ColumnType::CidrArray
+            | ColumnType::MacAddrArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);
@@ -157,6 +160,34 @@ mod tests {
             // Cents, the whole `i64` of them: both ends of the range are values a client can
             // write, and the ordering property is exactly the integer's.
             ColumnType::Money => proptest::num::i64::ANY.prop_map(Datum::Money).boxed(),
+            // The ordering property is the family, then the address, then the prefix — so the
+            // strategy has to reach both families and both types.
+            ColumnType::Inet | ColumnType::Cidr => (
+                prop::sample::select(vec![
+                    esker_keys::value::INET_V4,
+                    esker_keys::value::INET_V6,
+                ]),
+                prop::array::uniform16(any::<u8>()),
+                // The flag is the column's: a value whose `cidr` disagrees with its column does
+                // not `fit` it, which is the round-trip property working rather than failing.
+                Just(ty == ColumnType::Cidr),
+            )
+                .prop_map(|(family, addr, cidr)| Datum::Inet {
+                    family,
+                    bits: if family == esker_keys::value::INET_V6 { 128 } else { 32 },
+                    cidr,
+                    addr: if family == esker_keys::value::INET_V6 {
+                        addr
+                    } else {
+                        let mut narrow = [0u8; 16];
+                        narrow[..4].copy_from_slice(&addr[..4]);
+                        narrow
+                    },
+                })
+                .boxed(),
+            ColumnType::MacAddr => prop::array::uniform6(any::<u8>())
+                .prop_map(Datum::MacAddr)
+                .boxed(),
             ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
             | ColumnType::FloatRange | ColumnType::VarcharRange => {
                 Just(Datum::Range {

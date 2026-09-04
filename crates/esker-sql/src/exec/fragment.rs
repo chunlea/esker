@@ -660,6 +660,12 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // type in hand, so a money pushed down would come back a `bigint`.
         | Row::Money
         | Row::MoneyArray
+        | Row::Inet
+        | Row::Cidr
+        | Row::MacAddr
+        | Row::InetArray
+        | Row::CidrArray
+        | Row::MacAddrArray
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray
@@ -695,6 +701,8 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // comparison at all.
         Datum::Point { .. }
         | Datum::Money(_)
+        | Datum::Inet { .. }
+        | Datum::MacAddr(_)
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)

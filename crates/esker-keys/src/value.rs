@@ -227,6 +227,27 @@ pub enum ColumnType {
     /// representation to itself — `Datum::Money` — rather than by storing cents in an `Int8`,
     /// which would answer `bigint` to `pg_typeof` and admit every integer operator.
     Money,
+    /// PostgreSQL's `inet`: an address and a prefix length.
+    ///
+    /// **`inet` and `cidr` are one representation and two types**, which ADR 0042 allows because
+    /// they share a comparison: `'192.168.1.1'::inet = '192.168.1.1'::cidr` is `t` on a real
+    /// server. What differs is the input rule and the output — a `cidr` refuses bits to the right
+    /// of its mask and always prints its prefix, an `inet` does neither — so the *value* carries
+    /// which of the two it is (`Datum::Inet::cidr`), the lesson `Datum::Hstore` records.
+    Inet,
+    /// PostgreSQL's `cidr`. See [`ColumnType::Inet`], whose representation it shares.
+    Cidr,
+    /// PostgreSQL's `macaddr`: **six bytes**, which is what `typlen` says, and its own comparison —
+    /// no operator relates it to an address.
+    MacAddr,
+    /// `inet[]`, `cidr[]` and `macaddr[]`. `network_test.rb` declares none of the three; they exist
+    /// because a real server pairs each with an array, and a base type whose `typarray` is `0` is
+    /// what cost run 53 its 43 `can't quote Array` tests.
+    InetArray,
+    /// See [`ColumnType::InetArray`].
+    CidrArray,
+    /// See [`ColumnType::InetArray`].
+    MacAddrArray,
     /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
     /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
     /// `can't quote Array` tests.
@@ -359,6 +380,12 @@ pub enum ColumnType {
     CitextArray,
 }
 
+/// The address family a `Datum::Inet` names: 4 for IPv4, 6 for IPv6, and the **first** byte of an
+/// index key so that every IPv4 address sorts below every IPv6 one — PostgreSQL's own order.
+pub const INET_V4: u8 = 4;
+/// See [`INET_V4`].
+pub const INET_V6: u8 = 6;
+
 impl ColumnType {
     /// Every type **that has a `pg_type` row of its own**, for tests that must not silently skip
     /// one — and for the catalog, which derives that view from this list.
@@ -366,7 +393,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 60] = [
+    pub const ALL: [ColumnType; 66] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -427,6 +454,12 @@ impl ColumnType {
         ColumnType::PointArray,
         ColumnType::Money,
         ColumnType::MoneyArray,
+        ColumnType::Inet,
+        ColumnType::Cidr,
+        ColumnType::MacAddr,
+        ColumnType::InetArray,
+        ColumnType::CidrArray,
+        ColumnType::MacAddrArray,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in
@@ -490,6 +523,25 @@ pub enum Datum {
         /// The canonical text, which is what `crate::value::range` renders.
         text: String,
     },
+    /// [`ColumnType::Inet`] and [`ColumnType::Cidr`]: an address, its prefix length, and which of
+    /// the two types the value is.
+    ///
+    /// The flag is part of the **representation** and not of the comparison: two values that
+    /// differ only in it are equal to `esker_sql::value::PgDatum::pg_cmp` — `inet = cidr` is `t` —
+    /// and different to `PartialEq`, which asks whether a round trip preserved the value. Without
+    /// it a folded `'192.168.1.1'::cidr` constant would print `192.168.1.1`, one `/32` short.
+    Inet {
+        /// 4 or 6, and the **first** thing compared: every IPv4 address sorts below every IPv6 one.
+        family: u8,
+        /// The prefix length in bits.
+        bits: u8,
+        /// Whether the value is a `cidr` rather than an `inet`.
+        cidr: bool,
+        /// The address, big-endian, an IPv4 in the first four bytes and the rest zero.
+        addr: [u8; 16],
+    },
+    /// [`ColumnType::MacAddr`]: six bytes, which is the whole type.
+    MacAddr([u8; 6]),
     /// [`ColumnType::Money`]: **cents**, as an `i64`.
     ///
     /// A variant of its own rather than an `Int8` under a different column type, for the reason
@@ -589,6 +641,24 @@ impl PartialEq for Datum {
             | (Datum::Timestamp(a), Datum::Timestamp(b))
             | (Datum::Time(a), Datum::Time(b)) => a == b,
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
+            // **Representation equality, flag included**, which is not the SQL comparison: an
+            // `inet` and a `cidr` holding the same address are equal on a real server and are two
+            // different rows here. `pg_cmp` is where the value is compared.
+            (
+                Datum::Inet {
+                    family: af,
+                    bits: ab,
+                    cidr: ac,
+                    addr: aa,
+                },
+                Datum::Inet {
+                    family: bf,
+                    bits: bb,
+                    cidr: bc,
+                    addr: ba,
+                },
+            ) => af == bf && ab == bb && ac == bc && aa == ba,
+            (Datum::MacAddr(a), Datum::MacAddr(b)) => a == b,
             (Datum::Oid(a), Datum::Oid(b)) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
@@ -666,6 +736,10 @@ impl Datum {
             Datum::Citext(_) => ColumnType::Citext,
             Datum::Point { .. } => ColumnType::Point,
             Datum::Money(_) => ColumnType::Money,
+            // The flag is what tells the two apart, which is the whole reason it is carried.
+            Datum::Inet { cidr: true, .. } => ColumnType::Cidr,
+            Datum::Inet { .. } => ColumnType::Inet,
+            Datum::MacAddr(_) => ColumnType::MacAddr,
             Datum::Hstore(_) => ColumnType::Hstore,
             // **The inverse of `crate::row::range_subtype`, and it is not total.** `int4range`
             // and `int8range` are both ranges *of* an `int8` here — an `int4` is read as one

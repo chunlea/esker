@@ -1184,7 +1184,18 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Point => Datum::Point { x: 0.0, y: 0.0 },
         // Nothing, which is a money like any other: what stands in is never read, only its type.
         ColumnType::Money => Datum::Money(0),
-        ColumnType::MoneyArray => {
+        // `0.0.0.0/32` and `00:00:00:00:00:00`: what stands in is never read, only its type is.
+        ColumnType::Inet | ColumnType::Cidr => Datum::Inet {
+            family: esker_keys::value::INET_V4,
+            bits: 32,
+            cidr: ty == ColumnType::Cidr,
+            addr: [0; 16],
+        },
+        ColumnType::MacAddr => Datum::MacAddr([0; 6]),
+        ColumnType::InetArray
+        | ColumnType::CidrArray
+        | ColumnType::MacAddrArray
+        | ColumnType::MoneyArray => {
             Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::Money))
         }
         // An empty array of the right element type: the shape a parameter takes before its value
