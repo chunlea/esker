@@ -2071,6 +2071,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                         "CHECK ... ENFORCED, which is MySQL's",
                     )?;
                     checks.push(catalog::CheckDef {
+                        validated: true,
                         name: constraint
                             .name
                             .as_ref()
@@ -2239,11 +2240,14 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         } = operation
         {
             let mut lowered = lower_added_constraint(&table_name, constraint)?;
-            // **`NOT VALID` is only a foreign key's here.** PostgreSQL takes it on `CHECK` too,
-            // and refusing it there by name is the honest answer while nothing skips that scan.
+            // **A foreign key's and a check's**, which are the two PostgreSQL takes it on. What
+            // it skips is the scan of the rows already there; the constraint is enforced for every
+            // row written afterwards either way — measured, an `INSERT` violating a `NOT VALID`
+            // check is `23514`.
             if *not_valid {
                 match &mut lowered {
                     plan::AlterTableAction::AddForeignKey(key) => key.validated = false,
+                    plan::AlterTableAction::AddCheck(check) => check.validated = false,
                     _ => return Err(SqlError::unsupported("ADD CONSTRAINT ... NOT VALID")),
                 }
             }
@@ -2560,6 +2564,7 @@ fn lower_table_constraints(
                     "CHECK ... ENFORCED, which is MySQL's",
                 )?;
                 checks.push(catalog::CheckDef {
+                    validated: true,
                     name: check
                         .name
                         .as_ref()
@@ -2707,6 +2712,7 @@ fn lower_added_constraint(
         "CHECK ... ENFORCED, which is MySQL's",
     )?;
     Ok(plan::AlterTableAction::AddCheck(catalog::CheckDef {
+        validated: true,
         name: check
             .name
             .as_ref()

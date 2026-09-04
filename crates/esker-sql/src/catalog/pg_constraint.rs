@@ -216,8 +216,8 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
                 // constraint that is not deferrable is `f`/`f` and cannot be either.
                 Datum::Bool(constraint.condeferrable),
                 Datum::Bool(constraint.condeferred),
-                // `convalidated`: false only for a foreign key added `NOT VALID` and not yet
-                // validated. It was a constant `true` until `NOT VALID` existed, which made
+                // `convalidated`: false only for a foreign key or a **check** added `NOT VALID`
+                // and not yet validated. It was a constant `true` until `NOT VALID` existed, which made
                 // `ActiveRecord`'s `validate: false` schema dump wrong rather than incomplete.
                 Datum::Bool(constraint.convalidated),
                 Datum::Int8(relation.oid),
@@ -291,8 +291,11 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
         && let Some(check) = table.checks.get(at)
     {
         // `CHECK ((p > 0))` — the doubled parentheses are PostgreSQL's, which wraps the whole
-        // predicate and then prints it parenthesised. Measured.
-        return Datum::Text(format!("CHECK (({}))", check.expr));
+        // predicate and then prints it parenthesised. Measured, and so is the suffix: an unvalidated
+        // one prints `CHECK ((quantity > 0)) NOT VALID`, which is what the schema dumper reads to
+        // write `validate: false` back out.
+        let suffix = if check.validated { "" } else { " NOT VALID" };
+        return Datum::Text(format!("CHECK (({})){suffix}", check.expr));
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.
     if let Some((table_id, at)) = foreign_key_of(oid)
@@ -441,7 +444,10 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             foreign: None,
             condeferrable: false,
             condeferred: false,
-            convalidated: true,
+            // **A check can be unvalidated too**, not only a foreign key: `ADD CONSTRAINT … CHECK
+            // … NOT VALID` skips the scan of the rows already there and leaves this `f` until
+            // `VALIDATE CONSTRAINT` runs it.
+            convalidated: check.validated,
         });
     }
     // `FOREIGN KEY`, contype `f`. `conindid` is the index on the **parent** that the constraint

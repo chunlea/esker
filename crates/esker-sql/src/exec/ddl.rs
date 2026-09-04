@@ -562,8 +562,56 @@ fn add_check(
     }
     updated.checks.push(check.clone());
     validate_checks(updated)?;
+    // **The rows already there are checked, unless `NOT VALID` says not to** — the same rule the
+    // foreign-key path follows, and it was missing here entirely: a `CHECK` added over a row that
+    // violates it was accepted silently, leaving a table whose rows contradict a constraint it
+    // advertises as validated. Measured: `23514 check constraint "q_plain" of relation "nv_t" is
+    // violated by some row`, a different sentence from the one an `INSERT` gets.
+    if check.validated {
+        validate_check_rows(txn, executor, updated, check)?;
+    }
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// Scans the table for a row the check refuses, and names the constraint if it finds one.
+///
+/// The scan is paged for the reason [`backfill`]'s is: a table that does not fit in memory is a
+/// table this must still be able to check.
+fn validate_check_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    check: &CheckDef,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut violated = false;
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (_, value) in page {
+            if violated {
+                return Ok(());
+            }
+            let row = crate::row::decode_row(&schema, value)?;
+            let parsed = crate::parse::parse_stored_expr(&check.expr)?;
+            let scope = super::query::Scope::single(table);
+            let resolved = super::query::resolve(&parsed, &scope)?;
+            // Only `false` violates: NULL is unknown and passes, which is the rule every other
+            // reader of a `CHECK` in this crate follows.
+            violated = matches!(
+                super::cursor::evaluate(&resolved, &row)?,
+                Datum::Bool(false)
+            );
+        }
+        Ok(())
+    })?;
+    if violated {
+        return Err(SqlError::CheckViolatedByRow {
+            constraint: check.name.clone(),
+            relation: table.name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
@@ -1133,6 +1181,18 @@ fn validate_constraint(
     updated: &mut TableDef,
     name: &str,
 ) -> Result<()> {
+    // **A check is validated by name too**, and it is looked for first because the two namespaces
+    // are one: `ALTER TABLE … VALIDATE CONSTRAINT` takes any constraint's name and a table cannot
+    // hold two of one name.
+    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+        if updated.checks[at].validated {
+            return Ok(());
+        }
+        let check = updated.checks[at].clone();
+        validate_check_rows(txn, executor, updated, &check)?;
+        updated.checks[at].validated = true;
+        return Ok(());
+    }
     let at = updated
         .foreign_keys
         .iter()

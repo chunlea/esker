@@ -127,25 +127,67 @@ fn a_derived_name_and_a_duplicate_one() {
     );
 }
 
-/// A constraint added by `ALTER` binds the rows written after it.
+/// A constraint added by `ALTER` is checked against the rows already there.
 ///
-/// **It is not validated against the rows already there**, which PostgreSQL does do. A backfill is
-/// the schema-change machinery of ADR 0020 and an `ADD CONSTRAINT` does not go through it yet, so
-/// this test pins what the node actually does rather than what it should eventually do — and says
-/// so, which is the difference between a known gap and a surprise.
+/// **This test used to pin the opposite**, and said so: the rows were not validated, an
+/// `ADD CONSTRAINT` did not go through ADR 0020's backfill, and it recorded what the node did
+/// rather than what PostgreSQL does. Closing that is what `NOT VALID` needed — the clause skips a
+/// scan, and there was no scan to skip.
 #[test]
-fn a_constraint_added_later_binds_later_rows() {
+fn a_constraint_added_later_is_checked_against_the_rows_already_there() {
     let mut node = parity::Node::new(&[]);
     for statement in [
         "CREATE TABLE ck (id int8 PRIMARY KEY, p int8)",
         "INSERT INTO ck VALUES (1, -5)",
-        "ALTER TABLE ck ADD CONSTRAINT ck_p CHECK (p > 0)",
     ] {
         node.run(statement).unwrap();
     }
-    // The row that predates the constraint is still there — no validation pass ran.
-    assert_eq!(node.rows("SELECT p FROM ck"), vec![vec!["-5"]]);
-    // And the constraint binds from here on.
-    let error = node.run("INSERT INTO ck VALUES (2, -1)").unwrap_err();
+    let error = node
+        .run("ALTER TABLE ck ADD CONSTRAINT ck_p CHECK (p > 0)")
+        .unwrap_err();
     assert_eq!(error.sqlstate(), "23514");
+    // **Its own sentence**, and not the one an `INSERT` gets: the scan found *some* row, and
+    // naming one of many would suggest it was the only one.
+    assert_eq!(
+        error.to_string(),
+        "check constraint \"ck_p\" of relation \"ck\" is violated by some row"
+    );
+    // The row is untouched and the constraint was not added.
+    assert_eq!(node.rows("SELECT p FROM ck"), vec![vec!["-5"]]);
+}
+
+/// `NOT VALID` takes the constraint without the scan — and it still binds every later row.
+///
+/// The half a reader gets backwards: `NOT VALID` says what was **skipped**, not what is enforced.
+#[test]
+fn a_not_valid_constraint_skips_the_scan_and_binds_later_rows() {
+    let mut node = parity::Node::new(&[]);
+    for statement in [
+        "CREATE TABLE ckn (id int8 PRIMARY KEY, p int8)",
+        "INSERT INTO ckn VALUES (1, -5)",
+        "ALTER TABLE ckn ADD CONSTRAINT ckn_p CHECK (p > 0) NOT VALID",
+    ] {
+        node.run(statement).unwrap();
+    }
+    // The row that predates it is still there, and the catalog says the scan was skipped.
+    assert_eq!(node.rows("SELECT p FROM ckn"), vec![vec!["-5"]]);
+    assert_eq!(
+        node.rows("SELECT convalidated FROM pg_constraint WHERE conname = 'ckn_p'"),
+        vec![vec!["f"]]
+    );
+    // And it binds from here on regardless.
+    let error = node.run("INSERT INTO ckn VALUES (2, -1)").unwrap_err();
+    assert_eq!(error.sqlstate(), "23514");
+    // `VALIDATE CONSTRAINT` runs the scan that was skipped, and finds the row.
+    let error = node
+        .run("ALTER TABLE ckn VALIDATE CONSTRAINT ckn_p")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "23514");
+    node.run("DELETE FROM ckn WHERE p < 0").unwrap();
+    node.run("ALTER TABLE ckn VALIDATE CONSTRAINT ckn_p")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT convalidated FROM pg_constraint WHERE conname = 'ckn_p'"),
+        vec![vec!["t"]]
+    );
 }

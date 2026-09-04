@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 32;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 33;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1912,6 +1912,13 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // whether it has been populated (ADR 0064). Fifteenth section, on the end like every one
     // before it — a table written before 31 reads back `matview: None`, which is exactly what it
     // was.
+    // Version 33. One flag per check, on the end for the sixteenth time and the same reason: a
+    // check written before 33 has none and reads back `validated: true`, which is what every
+    // check was while `ADD CONSTRAINT ... NOT VALID` was `0A000`.
+    for check in &table.checks {
+        out.push(u8::from(check.validated));
+    }
+
     match &table.matview {
         None => out.push(0),
         Some(matview) => {
@@ -1929,6 +1936,17 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
 /// Read **after** version 26's `ON COMMIT` byte, because the sections come off in the order they
 /// went on. A table written before 31 answers `None` — an ordinary table, which is all any of them
 /// could have been while `CREATE MATERIALIZED VIEW` was `0A000`.
+fn read_check_validated(reader: &mut Reader<'_>, checks: &mut [CheckDef]) -> Result<()> {
+    if reader.version < 33 {
+        return Ok(());
+    }
+    for check in checks {
+        check.validated = reader.flag()?;
+    }
+    Ok(())
+}
+
+/// The version 31 tail, read after version 33's flags because it was appended before them.
 fn read_matview(reader: &mut Reader<'_>) -> Result<Option<super::MatviewDef>> {
     if reader.version < 31 || reader.byte()? == 0 {
         return Ok(None);
@@ -2518,10 +2536,11 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     // A version 5 table has none, which is what every table written before version 6 had:
     // `CHECK` was `0A000` until then. Read **before** `finish`, which consumes the reader and
     // asserts the record is exhausted.
-    let checks = if reader.version >= 6 {
+    let mut checks = if reader.version >= 6 {
         let mut checks = Vec::with_capacity(reader.count()?);
         for _ in 0..checks.capacity() {
             checks.push(CheckDef {
+                validated: true,
                 name: reader.string()?,
                 expr: reader.string()?,
             });
@@ -2565,6 +2584,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_dropped(&mut reader, &mut columns)?;
     read_user_types(&mut reader, &mut columns)?;
     let on_commit = read_on_commit(&mut reader)?;
+    read_check_validated(&mut reader, &mut checks)?;
     let matview = read_matview(&mut reader)?;
     reader.finish()?;
 
