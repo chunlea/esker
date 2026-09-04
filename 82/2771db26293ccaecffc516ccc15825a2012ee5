@@ -1,0 +1,14 @@
+docs/plans/debt-c7.md
+  h_44076b318daf9c 378-530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "822771db26293ccaecffc516ccc15825a2012ee5",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
