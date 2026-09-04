@@ -15,6 +15,16 @@
 //! written *beside* the engine, one directory per region id, so nothing the engine reclaims can
 //! reach it and it has to be reclaimed by name — which is why `FileSystem` grew a tree removal
 //! and why both halves of the rule are asserted about it too.
+//!
+//! # And the same two halves across a crash
+//!
+//! Retiring a region is **two** durable steps — the batch that destroys its Raft state and its
+//! `'m'` record, and the clear of its range — so a crash lands between them, and until
+//! [ADR 0056](../../../docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md)
+//! that was permanent: the `'m'` record is the only thing on disk that says which *range* the
+//! region was, and destroying it first left the keys with nothing that could name them again. The
+//! last three tests here are the same rule at a restart — reclaim what is orphaned, and never
+//! touch what is owned.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -43,6 +53,17 @@ impl Node {
     async fn stop(self) {
         self.store.stop();
         let _ = within("the server to shut down", self.handle.shutdown()).await;
+    }
+
+    /// Stops everything holding the database and hands back the directory, so the same store can
+    /// be opened again — which is all a restart is.
+    ///
+    /// The server goes too, and is awaited: it holds an `Arc<Store>` of its own through
+    /// `StoreService`, and an engine whose `Db` is still alive cannot be reopened.
+    async fn crash(self) -> tempfile::TempDir {
+        self.store.stop();
+        let _ = within("the server to shut down", self.handle.shutdown()).await;
+        self.dir
     }
 
     /// Where a region's columnar copy lives on this store: one directory per region id, written
@@ -468,4 +489,331 @@ async fn a_removed_peer_reclaims_the_range_in_every_column_family() {
 
     first.stop().await;
     second.stop().await;
+}
+
+/// Opens a store on a directory that already holds a database, as a restart does.
+///
+/// No server: what is under test happens inside `Store::open`, before anything is served, and a
+/// socket would only add a way for the test to fail for another reason.
+fn reopen(
+    dir: &tempfile::TempDir,
+    store_id: u64,
+    pd: &Arc<FakePd>,
+    raft: RaftOptions,
+) -> Arc<Store> {
+    Store::open(
+        dir.path(),
+        StoreOptions {
+            store_id,
+            peer_id: store_id,
+            region_id: store_id,
+            raft: Some(raft),
+            pd: Some(Arc::clone(pd) as Arc<dyn PdClient>),
+            address: format!("127.0.0.1:{}", 40_000 + store_id),
+            heartbeat_tick: Duration::from_millis(5),
+            store_heartbeat: Duration::from_millis(20),
+            region_heartbeat: Duration::from_millis(20),
+            split: SplitOptions {
+                region_split_size: u64::MAX,
+                max_sampled_keys: 1024,
+            },
+            ..StoreOptions::new()
+        },
+    )
+    .unwrap()
+}
+
+/// Whether a region's retirement is still announced on disk.
+fn retirement_announced(store: &Arc<Store>, region_id: u64) -> bool {
+    esker_store::meta::load_retiring(store.db())
+        .unwrap()
+        .iter()
+        .any(|region| region.id == region_id)
+}
+
+/// The first of a retirement's two durable steps, and then nothing — which is what a crash between
+/// them leaves.
+///
+/// It is the call `Store::retire_region` makes, with the same arguments: the region's own record
+/// for the range, and `Some` because the membership no longer names a peer on this store. Driving
+/// it directly rather than racing the real path is the only way to *stop* between the two steps;
+/// what the real path does with the pair is the subject of the test above this one.
+///
+/// The peers are stopped first, and that is not tidiness. `retire_region` stops the region's peer
+/// before it destroys anything, and a peer left running writes its state record back underneath
+/// this — which is what the first version of this test observed, as a restarted store hosting the
+/// region it had just been removed from.
+fn destroy_but_do_not_reclaim(store: &Arc<Store>, region: &Region) {
+    store.stop();
+    let entries = esker_store::raft_log::destroy(store.db(), region.id, Some(region)).unwrap();
+    assert!(
+        entries > 0,
+        "the region had no log entries, so this store never really held it"
+    );
+}
+
+/// A crash between a retirement's two durable steps costs a restart, not the range.
+///
+/// # What used to happen, and why nothing could find it afterwards
+///
+/// The batch that ends a region on this store deletes its `'m'` record, and that record is the
+/// only thing on disk that says which **keys** the region was. Delete it first and crash, and the
+/// range's keys are in all three column families under no region, with nothing that can name them
+/// again: not the store, which hosts no region covering them; not the placement driver, which has
+/// no idea what this disk holds; and not a later retirement, which needs the record that is gone.
+/// One rebalance interrupted by a `kill -9` leaked a whole region, for ever.
+///
+/// The three assertions in the middle are what make the last three mean anything: they are the
+/// crash *observed* — the record gone, the announcement present, and the keys still there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_between_the_record_and_the_range_is_finished_at_the_next_open() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = first.store.regions().regions()[0].clone();
+    seed_all_three_families(&first.store, &region).await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), Some(vec![2])),
+        2,
+    )
+    .await;
+    let arrived = place_on(&pd, &first, &second).await;
+    let held = counts(&second.store, &arrived);
+    assert!(
+        held.iter().all(|(_, keys)| *keys > 0),
+        "the second store does not hold all three column families: {held:?}"
+    );
+    let shed_copy = plant_columnar_copy(&second, 1);
+    let other_copy = plant_columnar_copy(&second, 7);
+
+    // The crash. Step one runs, step two never does.
+    destroy_but_do_not_reclaim(&second.store, &arrived);
+    assert!(
+        esker_store::meta::load_regions(second.store.db())
+            .unwrap()
+            .is_empty(),
+        "the record that names the range survived the step that destroys it"
+    );
+    assert!(
+        retirement_announced(&second.store, 1),
+        "the range was orphaned: its record is gone and nothing announces what it was"
+    );
+    assert_eq!(
+        counts(&second.store, &arrived),
+        held,
+        "the range was reclaimed by the step that only destroys the record"
+    );
+    let dir = second.crash().await;
+
+    // The restart.
+    let restarted = reopen(&dir, 2, &pd, raft_options(peers, None));
+    assert!(
+        restarted.regions().is_empty(),
+        "the restarted store hosts a region it was removed from"
+    );
+    assert_eq!(
+        counts(&restarted, &arrived),
+        vec![
+            (esker_engine::cf::DEFAULT, 0),
+            (esker_engine::cf::LOCK, 0),
+            (esker_engine::cf::WRITE, 0)
+        ],
+        "a retirement interrupted by a crash left its range on disk for ever"
+    );
+    assert!(
+        !retirement_announced(&restarted, 1),
+        "the retirement finished but is still announced, so every later open sweeps it again"
+    );
+    assert!(
+        !shed_copy.exists(),
+        "the columnar copy of a region whose retirement crashed was left behind"
+    );
+    assert!(
+        other_copy.exists(),
+        "finishing one region's retirement took another region's columnar copy with it"
+    );
+
+    // And the store that still owns the range lost nothing to a neighbour's restart.
+    assert_eq!(
+        first
+            .store
+            .handle(
+                RequestHeader::new(region.id, first.store.regions().regions()[0].epoch, 0),
+                RawKvReq::get(key(200))
+            )
+            .unwrap(),
+        esker_proto::RawKvResp::Get {
+            value: Some(Bytes::from_static(b"raw"))
+        },
+        "the owner's own key stopped reading after a neighbour finished a retirement"
+    );
+
+    restarted.stop();
+    first.stop().await;
+}
+
+/// Announces a retirement of `region` by hand, as the batch that destroys a record does.
+fn announce_retirement(store: &Arc<Store>, region: &Region) {
+    let cf_id = store.db().cf_id(esker_engine::cf::RAFT).unwrap();
+    let mut batch = esker_engine::WriteBatch::new();
+    esker_store::meta::stage_retiring(&mut batch, cf_id, region);
+    store
+        .db()
+        .write(batch, &esker_engine::WriteOptions::synced())
+        .unwrap();
+}
+
+/// A region this store still hosts is not emptied by a stale announcement of the range it covers.
+///
+/// **This is the half that is data loss when it is wrong**, and it is not hypothetical: a parent
+/// whose split narrowed it, retired against the range it had *before*, announces a range the child
+/// is now serving. The gate that catches it lives in the region map, which is why the sweep runs
+/// after the peers are hosted and not before — run first it would find an empty map, conclude that
+/// nothing overlaps, and delete the child's keys under it.
+///
+/// The announcement is dropped rather than kept, because the range is not orphaned: it belongs to
+/// a region that is being served, and an announcement kept for it would ask the same refused
+/// question at every open for the life of the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_announcement_never_empties_a_range_this_store_still_serves() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let address_listener = reserve();
+    let address = address_listener.local_addr().unwrap();
+    let peers = vec![PeerAddress::new(1, 1, address)];
+
+    let node = open(
+        address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        node.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = node.store.regions().regions()[0].clone();
+    seed_all_three_families(&node.store, &region).await;
+    let held = counts(&node.store, &region);
+    assert!(
+        held.iter().all(|(_, keys)| *keys > 0),
+        "the store does not hold all three column families: {held:?}"
+    );
+
+    // The stale announcement: a region that is gone, over a range this store is still serving as
+    // region 1. A split parent's record is exactly this shape.
+    let stale = Region {
+        id: 99,
+        ..region.clone()
+    };
+    announce_retirement(&node.store, &stale);
+    let dir = node.crash().await;
+
+    let restarted = reopen(&dir, 1, &pd, raft_options(peers, Some(vec![1])));
+    assert_eq!(
+        counts(&restarted, &region),
+        held,
+        "a stale retirement announcement emptied a range this store still serves"
+    );
+    assert!(
+        !retirement_announced(&restarted, 99),
+        "a refused announcement was kept, so every later open asks the same refused question"
+    );
+    restarted.stop();
+}
+
+/// Finishing a retirement twice is finishing it once.
+///
+/// A crash may land *after* the range is empty and before the announcement is dropped, so the
+/// ordinary case at open is a sweep over a range that has already been swept. It has to be cheap
+/// and it has to be silent: `clear_range` returns early on an empty range, and a columnar tree
+/// that is not there is a removal that is already done.
+///
+/// It runs on a store that hosts **nothing**, and that is the whole setup rather than a detail: on
+/// a store that hosts a region, every range is inside one, so gate 2 would refuse the sweep and
+/// this would pass without ever reaching the code it is about — the same shape as a green test
+/// over a feature that is switched off.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_announcement_whose_range_is_already_empty_is_simply_dropped() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    // The first store exists only to bootstrap the cluster, so that the second one hosts nothing.
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = first.store.regions().regions()[0].clone();
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), Some(vec![2])),
+        2,
+    )
+    .await;
+    assert!(
+        second.store.regions().is_empty(),
+        "the second store hosts a region, so no range on it is unowned"
+    );
+
+    // A retirement that got as far as emptying its range and no further.
+    let finished = Region {
+        id: 42,
+        ..region.clone()
+    };
+    announce_retirement(&second.store, &finished);
+    let dir = second.crash().await;
+
+    let restarted = reopen(&dir, 2, &pd, raft_options(peers, None));
+    assert!(
+        !retirement_announced(&restarted, 42),
+        "an announcement over an already-empty range was kept rather than dropped, so every \
+         later open sweeps it again"
+    );
+    restarted.stop();
+    first.stop().await;
 }

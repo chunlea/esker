@@ -35,7 +35,7 @@ use crate::version::Version;
 
 use super::level_iter::LevelCursor;
 use super::merge::MergeCursor;
-use super::{Db, Snapshot, lock, read_lock};
+use super::{ColumnFamily, Db, DbInner, Snapshot, lock, read_lock};
 
 /// Which way the iterator is travelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,20 +371,52 @@ impl Cursor for DbIterator {
     }
 }
 
-impl Db {
-    /// A cursor over `cf`, positioned nowhere until it is seeked.
-    ///
-    /// The iterator pins a version and a snapshot for its whole life, so every file it can
-    /// read stays on disk and every version it can see survives compaction. Holding one for a
-    /// long time therefore holds disk space; that is the trade a consistent scan costs.
-    pub fn iter(&self, cf: &str, options: &ReadOptions) -> Result<DbIterator> {
-        let cf = self.inner.cf_by_name(cf)?;
-        let snapshot = self.inner.read_seqno(options)?;
+/// Everything a merged read of one column family needs: the cursors, the range tombstones that
+/// apply to them, and the version that keeps their files on disk.
+///
+/// The three travel together because they are one snapshot of the column family taken at one
+/// instant. Split apart, a caller can hold cursors over files a dropped version has let a
+/// compaction delete, or apply a tombstone set to a run it was not collected from.
+pub(crate) struct MergeSources {
+    /// One cursor per memtable and per L0 file, and one per deeper level.
+    pub(crate) children: Vec<Box<dyn Cursor + Send>>,
+    /// Every range tombstone in the column family, which lives only in memtables and L0.
+    pub(crate) tombstones: RangeTombstones,
+    /// Held, not read: dropping it lets a compaction delete a file a cursor is inside.
+    pub(crate) version: Arc<Version>,
+}
 
+impl DbInner {
+    /// Every internal cursor over `cf`, the range tombstones that cover it, and the version they
+    /// were taken from.
+    ///
+    /// The whole of "what is currently in this column family", as sources a [`MergeCursor`] can
+    /// merge. It has two callers that must not disagree: a read
+    /// ([`Db::iter`](crate::Db::iter)), and the overlap check an ingest runs before it adopts a
+    /// file ([`crate::db::ingest`]). An ingest that consulted a *different* set of sources than a
+    /// read would refuse ingests that are safe, or worse, allow one whose keys a reader can
+    /// already see.
+    ///
+    /// The version is returned rather than dropped because it pins the files the cursors read:
+    /// dropping it lets a compaction delete a file a cursor is still inside.
+    ///
+    /// # Why the shape is what it is
+    ///
+    /// **L0 is opened file by file, and has to be.** Its files overlap, so any of them can hold
+    /// the next key and all of them are live at once — and it is the only level a range tombstone
+    /// can be in (ADR 0017 decision 6: a compaction whose inputs carry one becomes a discharge).
+    /// Collecting the tombstone set is therefore an L0 walk rather than a walk of every file in
+    /// the database.
+    ///
+    /// Every deeper level **partitions** the key space, so it is one cursor that opens the file it
+    /// has reached ([`LevelCursor`]). A scan of a database with a full L4 used to open every L4
+    /// file — four reads each, index and filter resident for the scan's life — before it read a
+    /// byte of the range it wanted.
+    pub(crate) fn merge_sources(&self, cf: &Arc<ColumnFamily>) -> Result<MergeSources> {
         // The tombstone set for the whole scan, collected once up front rather than per key:
         // a range delete hides keys the merged run has never seen, so there is nothing to
         // consult it *at* ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
-        let user_order = self.inner.comparator.user_comparator();
+        let user_order = self.comparator.user_comparator();
         let mut tombstones = RangeTombstones::new();
 
         let mut children: Vec<Box<dyn Cursor + Send>> = Vec::new();
@@ -402,29 +434,20 @@ impl Db {
             }
         }
 
-        let version = lock(&self.inner.versions)?.current();
-        let table_options = self.inner.table_options(&cf);
+        let version = lock(&self.versions)?.current();
+        let table_options = self.table_options(cf);
         let levels = version
             .cf(cf.id())
             .map_or(0, crate::version::CfVersion::num_levels);
 
-        // **L0 is opened file by file, and has to be.** Its files overlap, so any of them can
-        // hold the next key and all of them are live at once — and it is the only level a range
-        // tombstone can be in (ADR 0017 decision 6: a compaction whose inputs carry one becomes a
-        // discharge). Collecting the tombstone set is therefore an L0 walk rather than a walk of
-        // every file in the database, which is the second reason the old shape opened them all.
         for file in version.files(cf.id(), 0) {
-            let reader = self.inner.table_cache.get(file.number, &table_options)?;
+            let reader = self.table_cache.get(file.number, &table_options)?;
             if !reader.range_tombstones().is_empty() {
                 tombstones.extend(reader.range_tombstones(), user_order.as_ref());
             }
             children.push(table_cursor(reader.iter()));
         }
 
-        // Every deeper level **partitions** the key space, so it is one cursor that opens the
-        // file it has reached (`level_iter`). A scan of a database with a full L4 used to open
-        // every L4 file — four reads each, index and filter resident for the scan's life —
-        // before it read a byte of the range it wanted.
         for level in 1..levels {
             let files = version.files(cf.id(), level);
             if files.is_empty() {
@@ -432,26 +455,45 @@ impl Db {
             }
             children.push(Box::new(LevelCursor::new(
                 files.to_vec(),
-                Arc::clone(&self.inner.table_cache),
+                Arc::clone(&self.table_cache),
                 table_options.clone(),
-                Arc::clone(&self.inner.comparator),
+                Arc::clone(&self.comparator),
             )));
         }
+        Ok(MergeSources {
+            children,
+            tombstones,
+            version,
+        })
+    }
+}
+
+impl Db {
+    /// A cursor over `cf`, positioned nowhere until it is seeked.
+    ///
+    /// The iterator pins a version and a snapshot for its whole life, so every file it can
+    /// read stays on disk and every version it can see survives compaction. Holding one for a
+    /// long time therefore holds disk space; that is the trade a consistent scan costs.
+    pub fn iter(&self, cf: &str, options: &ReadOptions) -> Result<DbIterator> {
+        let cf = self.inner.cf_by_name(cf)?;
+        let snapshot = self.inner.read_seqno(options)?;
+
+        let sources = self.inner.merge_sources(&cf)?;
 
         Ok(DbIterator {
-            merger: MergeCursor::new(children, Arc::clone(&self.inner.comparator)),
+            merger: MergeCursor::new(sources.children, Arc::clone(&self.inner.comparator)),
             comparator: Arc::clone(&self.inner.comparator),
             snapshot,
             direction: Direction::Forward,
             current: None,
-            tombstones,
+            tombstones: sources.tombstones,
             prefix: None,
             extractor: options
                 .prefix_same_as_start
                 .then(|| cf.options().prefix_extractor.clone())
                 .flatten(),
             status: None,
-            _version: version,
+            _version: sources.version,
             _snapshot: options.snapshot.clone(),
         })
     }

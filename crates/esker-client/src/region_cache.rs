@@ -55,8 +55,9 @@ impl Route {
     /// this region's peer list by [`RegionCache::set_leader`].
     #[must_use]
     pub fn target(&self) -> Option<&Peer> {
-        // TODO(phase-3): with real replicas, prefer a peer that has not just failed rather
-        // than always the first one, so a down store is not asked twice per retry budget.
+        // `TODO(debt-c6 #3)`: prefer a peer that has not just failed rather than always the
+        // first one, so a down store is not asked twice in one retry budget
+        // (`docs/plans/debt-c6.md` §4).
         self.leader.as_ref().or_else(|| self.region.peers.first())
     }
 }

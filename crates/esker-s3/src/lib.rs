@@ -32,6 +32,7 @@ pub mod error;
 pub mod http;
 pub mod memory;
 pub mod sigv4;
+pub mod tls;
 pub mod transport;
 mod xml;
 
@@ -39,6 +40,7 @@ pub use client::{Config, Endpoint, S3Client};
 pub use error::{Error, Result};
 pub use memory::MemoryStore;
 pub use sigv4::Credentials;
+pub use tls::TlsRoots;
 
 use std::fmt;
 

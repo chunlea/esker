@@ -22,9 +22,10 @@
 //!   receiver would get keys belonging to the region's neighbour — data it has no claim to, and
 //!   which `Db::ingest` would refuse outright if the neighbour happens to live on the same store.
 //!   Range-precision is not something file granularity can offer.
-//! * **`Db::ingest` refuses any overlap, tombstones included** (its own docs say so; rewriting
-//!   sequence numbers is a v2 feature). So a receive that had to be retried after a partial one
-//!   could never ingest again, and the recovery path would be the thing that wedged.
+//! * **`Db::ingest` refuses a file holding a key the column family already has an entry for**
+//!   (its own docs say so; rewriting sequence numbers is a v2 feature). A receive retried after a
+//!   partial one would collide with exactly the keys the partial one left, so it could never
+//!   ingest again, and the recovery path would be the thing that wedged.
 //!
 //! What is given up is that the bytes are read and written rather than linked. They cross a
 //! network either way, so the read is paid regardless; the cost is one write on the receiver.

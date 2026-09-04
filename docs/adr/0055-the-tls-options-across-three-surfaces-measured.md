@@ -1,10 +1,11 @@
 # 0055 — The TLS options across three surfaces, measured
 
-Status: **accepted 2026-09-04, and built for the PostgreSQL port.** The maintainer took option 4
-and named `rustls-graviola` as the exception: refusal discipline everywhere now, `rustls` +
-`rustls-graviola` behind `esker-sql`'s `tls` feature, off by default, PG port first. What that
-turned into is at the end of this file, under "What was built, and what is still owed"; the option
-list below is unchanged from the measurement that produced it.
+Status: **accepted 2026-09-04, and built for the PostgreSQL port and the S3 tier.** The maintainer
+took option 4 and named `rustls-graviola` as the exception: refusal discipline everywhere now,
+`rustls` + `rustls-graviola` behind a default-off `tls` feature, PG port first, then S3, then RPC.
+Two of the three surfaces are done and **the second one cost no crates at all**. What that turned
+into is at the end of this file, under "What was built, and what is still owed"; the option list
+below is unchanged from the measurement that produced it.
 
 [ADR 0025](0025-s3-transport-and-tls.md)
 settled S3's transport for phase 6b (plain HTTP now, `https://` refused at parse time) and wrote down
@@ -320,24 +321,50 @@ Three things the measurement did not predict, all now written down where someone
   the feature-on graph, because it walks `resolve.nodes[].deps` without consulting the activated
   feature list. That is a false positive in the one test that must not have them, and it is owed to
   whoever owns `crates/esker-cli/`. The same flaw inflates the default count by two.
+* **The PEM reader and the test certificates now exist twice.** `esker_sql::pgwire::tls` and
+  `esker_s3::tls` each carry a base64 decoder and a PEM block scanner, and each crate's tests carry
+  their own throwaway CA and leaf. `esker-base` is where both belong — it is already the home of
+  `crc32c`, the varints and the hashes, and both crates already depend on it. Neither TLS lane owned
+  that crate, so this is written down rather than done. It is duplication, not divergence: the two
+  readers agree on the same strictness (padding required, no guessing), and the S3 test's third
+  reader is deliberate, so a bug in the client's cannot hide itself in the test's.
 * **The budget has four crates of headroom, not twenty.** ADR 0025 said "the teens"; the real number
   today is 36 of 40, `sqlparser` and tokio's chain having landed since. Nothing here needs the
   budget raised, and the next thing that wants a crate should re-measure rather than trust either
   number.
 
-### What S3 and RPC still need
+### The S3 tier, built — and the root store that cost nothing
 
-Neither surface is touched by this work. Both terminate outside the process today, which is
-option 1 and remains correct until someone does for them what this did for the PG port.
+`esker_s3::tls` is the second implementor ADR 0025 decision 1 built its trait for, and it is much
+smaller than the PostgreSQL port's: that surface is `tokio` and needed a task and a pipe to drive a
+sans-io state machine, while this crate blocks by rule and `rustls::StreamOwned` is a `Read + Write`
+over a session. `Endpoint::parse` accepts `https://` under the feature and refuses it without,
+naming the feature.
 
-* **S3** (`esker-s3`, ADR 0025): the transport is already a trait with one blocking `std::net`
-  implementor, so this is a second implementor and a config field, not a refactor. It needs the one
-  thing the PG port did not: **a root store**, because a client verifies a certificate where a
-  server only presents one. `webpki-roots` is one crate and one `CDLA-Permissive-2.0` line in
-  `deny.toml`'s `[licenses] allow` — that licence is not on the list today and the check fails on
-  it, measured. An explicit `--ca-file` is the other half, per ADR 0025 decision 4 item 3.
-  `Endpoint::parse` should stop refusing `https://` in the same change that makes it work, and not
-  before.
+**The prediction above was wrong in the project's favour, and the correction is the interesting
+part.** This surface was expected to want `webpki-roots` — one crate, plus a `CDLA-Permissive-2.0`
+line in `deny.toml`'s licence allow-list, which that file does not have. It wants neither. A CA
+bundle is a PEM file; every platform this builds for ships one; reading a file is not a dependency.
+`TlsRoots::Platform` takes the first bundle it finds (honouring `SSL_CERT_FILE`) and
+`ESKER_S3_CA_CERT` names one for a self-signed `MinIO`. **Measured after: 43 crates with both
+surfaces on, the same nine, and the licence list untouched.** Vendored roots remain a defensible
+choice for a client that must behave identically on every machine; a database talking to its own
+object store is not that client.
+
+Two things this surface found that the PG port did not:
+
+* **A TLS connection pool cannot use the plain one's liveness check.** TLS 1.3 lets a server send
+  session tickets and key updates after the handshake, so bytes waiting on an idle connection's
+  socket are normal. The plain transport reads "readable" as "not at a message boundary" and would
+  discard the connection — every response still correct, every request paying for a handshake, and
+  only the connection count showing it (ADR 0039's saving, silently undone). The check absorbs
+  pending bytes into the session instead, and `tests/https.rs` tells the two apart with a server
+  that talks between requests: 8 handshakes against the naive check, 1 against this one.
+* **A handshake failure is two kinds of error.** A reset or a timeout is `Io` and retryable, because
+  a server may be restarting; a certificate that does not verify is `Tls` and is not, because the
+  uploader retries forever (ADR 0024 decision 2) and would hide a wrong CA indefinitely.
+### What RPC still needs
+
 * **RPC** (`esker-proto`, DESIGN.md §9): the harder one, and not because of TLS. It is the surface
   where both ends are ours, so it is the one that wants **mutual** authentication — and mTLS gives
   a verified peer identity, not an authorization decision. Nothing in `esker-pd` today maps an
