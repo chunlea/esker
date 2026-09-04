@@ -1,0 +1,21 @@
+docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md
+  s_2bed4ac2b1c944::t_9494ed26c1425a 1-148
+docs/plans/phase-15-pd-ha.md
+  s_2bed4ac2b1c944::t_f03ed6ab071eb9 446-587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cf9ccf35479d894a26d8fe2ea6b63de0796a72f3",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
