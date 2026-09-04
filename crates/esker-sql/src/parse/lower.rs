@@ -2473,8 +2473,8 @@ fn lower_foreign_key(
         columns,
         parent: relation_name(&key.foreign_table)?,
         parent_columns: key.referred_columns.iter().map(ident).collect(),
-        on_update: referential_action(key.on_update.as_ref())?,
-        on_delete: referential_action(key.on_delete.as_ref())?,
+        on_update: referential_action(key.on_update.as_ref()),
+        on_delete: referential_action(key.on_delete.as_ref()),
         // The `NOT VALID` that may follow belongs to the `ALTER TABLE ... ADD CONSTRAINT` and not
         // to the constraint's own grammar, so it is applied by the caller that can see it.
         validated: true,
@@ -2492,15 +2492,15 @@ fn lower_foreign_key(
 /// `ActiveRecord` writes uses it, and the whole clause is one `Option` away when something does.
 fn referential_action(
     action: Option<&sqlparser::ast::ReferentialAction>,
-) -> Result<catalog::ReferentialAction> {
+) -> catalog::ReferentialAction {
     use sqlparser::ast::ReferentialAction as Written;
-    Ok(match action {
+    match action {
         None | Some(Written::NoAction) => catalog::ReferentialAction::NoAction,
         Some(Written::Restrict) => catalog::ReferentialAction::Restrict,
         Some(Written::Cascade) => catalog::ReferentialAction::Cascade,
         Some(Written::SetNull) => catalog::ReferentialAction::SetNull,
         Some(Written::SetDefault) => catalog::ReferentialAction::SetDefault,
-    })
+    }
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::CreateIndex> {

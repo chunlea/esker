@@ -10,7 +10,7 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// One `migrate(:up)`, as ActiveRecord sends it — the statements are copied from the oracle's
+/// One `migrate(:up)`, as `ActiveRecord` sends it — the statements are copied from the oracle's
 /// `log_statement = all` output, prefix and all.
 const UP: [&str; 3] = [
     "CREATE UNLOGGED TABLE \"p_rockets\" (\"id\" bigserial primary key, \"name\" character varying)",

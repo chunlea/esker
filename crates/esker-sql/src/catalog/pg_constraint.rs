@@ -383,6 +383,10 @@ fn not_null_declared_by<'a>(relations: &'a Relations, table: &'a TableDef) -> &'
 }
 
 /// Every constraint one table has, in name order — which is the order `pg_constraint` is read in.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one block per contype; splitting it would hide the vocabulary rather than clarify it"
+)]
 fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Vec<Constraint> {
     // **A partition's `NOT NULL` rows carry the *parent's* name.** They are the parent's
     // constraints, inherited with the column rather than declared again: `pk_part_1` reports
