@@ -1,0 +1,16 @@
+crates/esker-engine/src/memtable.rs
+  h_44076b318daf9c 24-31
+crates/esker-engine/src/memtable/arena.rs
+  h_44076b318daf9c 1-500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "70a1dda4aed0acddd05c9709e3dc43292b0acb3d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
