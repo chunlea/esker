@@ -1833,19 +1833,24 @@ impl Executor {
     /// resetting only the key leaves the session handing out values from inside a block that no
     /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
     /// because a value that was never handed out is not one this session last took.
-    /// How many sequences this session holds a reserved block of — for the test that a dropped
-    /// sequence's block goes with it.
-    #[must_use]
-    pub fn held_sequence_blocks(&self) -> usize {
-        self.sequences.len()
-    }
-
     pub(super) fn forget_sequence_block(&mut self, sequence_id: u64) {
         self.sequences.remove(&sequence_id);
         self.currval_defined.remove(&sequence_id);
         if self.last_sequence == Some(sequence_id) {
             self.last_sequence = None;
         }
+    }
+
+    /// How many sequences this session holds a reserved block of.
+    ///
+    /// For `tests/real_backend.rs`, which asserts that a dropped table's sequence takes its block
+    /// with it: a connection that creates and drops tables for its whole life would otherwise
+    /// collect one entry per drop. It cannot hand out a wrong value — a relation id is never
+    /// reused, so a re-created sequence is a different sequence — which is why the leak needs a
+    /// count to be visible at all.
+    #[must_use]
+    pub fn held_sequence_blocks(&self) -> usize {
+        self.sequences.len()
     }
 
     /// Sets one sequence back to its start — the counter **and** this session's block.
