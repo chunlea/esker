@@ -507,6 +507,8 @@ version = "0.1.0"
 dependencies = [
  "esker-base",
  "proptest",
+ "rustls",
+ "rustls-graviola",
  "thiserror",
  "tracing",
 ]

@@ -119,3 +119,35 @@ signing implementation that only agrees with itself is worth nothing, which is t
   status line, headers, `Content-Length` and chunked bodies — rejecting everything else rather
   than guessing (`CLAUDE.md` invariant 9, and the same discipline as `esker-proto`'s framing).
 - When TLS lands it is one new implementor of one trait plus a dependency ADR, not a rewrite.
+
+## Closing note (2026-09-04): decision 4 is satisfied, and `https://` is accepted
+
+Decision 3 shipped plain HTTP and decision 4 listed the four things that had to be true before TLS
+landed here. All four now are, and the transport exists —
+[ADR 0055](0055-the-tls-options-across-three-surfaces-measured.md) is the decision and
+`esker_s3::tls` is the code. Against decision 4's own list:
+
+1. **A dependency count, measured.** Nine crates for the whole TLS exception, shared with the
+   PostgreSQL port, and this surface added none of its own: 34 crates by `cargo tree` with the
+   feature off, 43 with it on. `cargo deny check` is green with them in the graph.
+2. **Certificate verification that verifies.** There is no `danger_accept_invalid_certs`, in any
+   form, in any build. `tests/https.rs` proves the refusals rather than asserting the happy path
+   alone: a chain to an untrusted root, a certificate for another name, and a plaintext server
+   behind an `https://` URL are each refused, and each is checked to be **non-retryable** so the
+   uploader cannot wait out a misconfiguration for ever.
+3. **The root store decision, with its own paragraph.** It is not `webpki-roots`, which this ADR
+   expected. The host's CA bundle is a file, `SSL_CERT_FILE` is the conventional override, and
+   `ESKER_S3_CA_CERT` names one for a self-signed endpoint — so the vendored-roots crate and the
+   `CDLA-Permissive-2.0` licence line it would have cost are both avoided. ADR 0055 has the
+   reasoning and the trade.
+4. **The budget, raised only if it must be.** It did not have to be: with the feature off the graph
+   is unchanged, and nothing measures the feature-on graph against the budget today (ADR 0055 says
+   why, and what would have to be fixed in `dep_budget.rs` first).
+
+**What changes here:** `Endpoint::parse` accepts `https://` in a build with the `tls` feature and
+still refuses it without one — now naming the feature as well as this ADR, because "rebuild with
+`--features tls`" is the actionable half. Decision 3's sidecar deployment note stays true and stays
+the answer for a build that does not carry TLS.
+
+The transport trait of decision 1 needed no change of any kind, which is the part worth keeping:
+the seam was designed for exactly this and it held.
