@@ -1667,6 +1667,14 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::TsRange => "tsrange",
         ColumnType::TstzRange => "tstzrange",
         ColumnType::Int4Range => "int4range",
+        ColumnType::DateRange => "daterange",
+        ColumnType::NumRange => "numrange",
+        ColumnType::Int8Range => "int8range",
+        ColumnType::TstzRangeArray => "_tstzrange",
+        ColumnType::Int4RangeArray => "_int4range",
+        ColumnType::DateRangeArray => "_daterange",
+        ColumnType::NumRangeArray => "_numrange",
+        ColumnType::Int8RangeArray => "_int8range",
         ColumnType::TsRangeArray => "_tsrange",
         ColumnType::BoolArray => "_bool",
         ColumnType::ByteaArray => "_bytea",
@@ -1707,7 +1715,12 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
 /// (ADR 0050); this is only the types the column vocabulary has.
 fn typtype(ty: ColumnType) -> &'static str {
     match ty {
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "r",
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range => "r",
         _ => "b",
     }
 }
@@ -1752,9 +1765,9 @@ fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
-        | ColumnType::TsRangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
-        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range => "R",
+        ColumnType::TsRange | ColumnType::TstzRange | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range => "R",
     }
 }
 
@@ -1777,6 +1790,11 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::TextArray
         | ColumnType::HstoreArray
         | ColumnType::TsRangeArray
+        | ColumnType::TstzRangeArray
+        | ColumnType::Int4RangeArray
+        | ColumnType::DateRangeArray
+        | ColumnType::NumRangeArray
+        | ColumnType::Int8RangeArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -1806,6 +1824,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::TsRange => "tsrange_in",
         ColumnType::TstzRange => "tstzrange_in",
         ColumnType::Int4Range => "int4range_in",
+        ColumnType::DateRange => "daterange_in",
+        ColumnType::NumRange => "numrange_in",
+        ColumnType::Int8Range => "int8range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",

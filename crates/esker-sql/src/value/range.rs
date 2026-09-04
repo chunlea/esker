@@ -310,6 +310,11 @@ pub fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
     // bracket a client sees is not always the bracket it sent.
     range.lower_inc &= range.lower.is_some();
     range.upper_inc &= range.upper.is_some();
+    // **A discrete subtype canonicalises and a continuous one does not**, and `pg_range` says
+    // which is which: `rngcanonical` names a function for `int4range`, `int8range` and
+    // `daterange`, and is `-` for `numrange`, `tsrange` and `tstzrange`. Measured, all six —
+    // `numrange '[0.1,0.2]'` comes back exactly as written where `int8range '[10,100]'` comes
+    // back `[10,101)`, and a `numeric` between two others is why: it has no successor.
     if matches!(subtype, ColumnType::Int4 | ColumnType::Int8) {
         if let (Some(Datum::Int8(lower)), true) = (range.lower.clone(), !range.lower_inc) {
             range.lower = Some(Datum::Int8(lower.saturating_add(1)));
@@ -317,6 +322,19 @@ pub fn canonicalise(subtype: ColumnType, range: &mut Range) -> Result<()> {
         }
         if let (Some(Datum::Int8(upper)), true) = (range.upper.clone(), range.upper_inc) {
             range.upper = Some(Datum::Int8(upper.saturating_add(1)));
+            range.upper_inc = false;
+        }
+    }
+    // **A date's successor is the next day**, which is the same rule one type over:
+    // `daterange '[2012-01-02,2012-01-04]'` is `[2012-01-02,2012-01-05)`. A `Datum::Date` holds
+    // the day count, so "the next one" is an increment exactly as an integer's is.
+    if subtype == ColumnType::Date {
+        if let (Some(Datum::Date(lower)), true) = (range.lower.clone(), !range.lower_inc) {
+            range.lower = Some(Datum::Date(lower.saturating_add(1)));
+            range.lower_inc = true;
+        }
+        if let (Some(Datum::Date(upper)), true) = (range.upper.clone(), range.upper_inc) {
+            range.upper = Some(Datum::Date(upper.saturating_add(1)));
             range.upper_inc = false;
         }
     }

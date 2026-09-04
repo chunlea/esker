@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::rpc_tls::RpcTlsFlags;
 use esker_pd::{MemberList, Pd, PdInspector, PdMember, PdOptions, PdService, PdTcpTransport};
 use esker_proto::{Server, TransportConfig};
 
@@ -124,11 +125,14 @@ pub(crate) struct ServeOptions {
     /// A member added at run time cannot derive the group's id — the derivation moved when it was
     /// added — so it asks. Empty means this member is founding a group rather than joining one.
     pub(crate) join: String,
+    /// The RPC TLS this member speaks to the rest of its group.
+    pub(crate) tls: RpcTlsFlags,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
+            tls: RpcTlsFlags::default(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             listen: DEFAULT_LISTEN.to_owned(),
             id: 1,
@@ -465,6 +469,23 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
         join_group(options)?
     };
 
+    // **Before the runtime and before the database.** A placement driver told to speak TLS that
+    // came up without it would carry the group's Raft log in the clear on a link an operator
+    // believes is protected; refusing here is the same rule every other surface follows
+    // (ADR 0055).
+    let tls = options.tls.build()?;
+    if tls.is_enabled() {
+        println!(
+            "esker pd: the group's links are TLS{}",
+            if tls.is_mutual() {
+                " with client certificates"
+            } else {
+                ""
+            }
+        );
+    }
+    let tls_for_server = tls.clone();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -473,7 +494,7 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
     // Inside the runtime, because the transport's delivery tasks live on it — and before
     // `Pd::open`, because the driver it starts sends its first vote the moment it ticks.
     let transport = runtime.block_on(async {
-        PdTcpTransport::spawn(options.id, &members, TransportConfig::new())
+        PdTcpTransport::spawn_with_tls(options.id, &members, TransportConfig::new(), &tls)
             .map_err(|error| format!("connecting to the group: {error}"))
     })?;
 
@@ -498,6 +519,7 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
             TransportConfig::new(),
         )
         .await
+        .map(|server| server.with_tls(tls_for_server))
         .map_err(|error| format!("listening on {address}: {error}"))?;
         let bound = server
             .local_addr()

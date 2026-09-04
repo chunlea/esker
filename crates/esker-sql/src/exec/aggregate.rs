@@ -182,7 +182,15 @@ impl Aggregation {
                 ColumnType::TsRange
                 | ColumnType::TstzRange
                 | ColumnType::Int4Range
+                | ColumnType::DateRange
+                | ColumnType::NumRange
+                | ColumnType::Int8Range
                 | ColumnType::TsRangeArray
+                | ColumnType::TstzRangeArray
+                | ColumnType::Int4RangeArray
+                | ColumnType::DateRangeArray
+                | ColumnType::NumRangeArray
+                | ColumnType::Int8RangeArray
                 | ColumnType::Bool
                 | ColumnType::Json
                 | ColumnType::Jsonb

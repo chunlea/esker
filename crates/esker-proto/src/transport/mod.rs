@@ -26,12 +26,14 @@
 mod client;
 mod conn;
 mod server;
+pub mod tls;
 
 use std::time::Duration;
 
 pub use client::{BlockingTransport, StreamResponse, TcpTransport};
 pub use conn::BoxFuture;
 pub use server::{ChunkSender, ChunkStream, Reply, Server, ServerHandle, Service};
+pub use tls::{MaybeTlsStream, RpcTls, TlsError};
 
 use crate::{MAX_FRAME_SIZE, ProtoError, Request, Response};
 

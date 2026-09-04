@@ -1713,11 +1713,21 @@ pub(super) fn exclusion_conflict(
 /// Two keys under `&&`. Anything that is not a range is not a conflict — the parser refused every
 /// other operator, so a non-range here would be a key expression of some other type entirely.
 fn overlap(left: &Datum, right: &Datum) -> bool {
-    match (left, right) {
-        (Datum::Text(left), Datum::Text(right)) => {
+    // **Either shape.** A key built by `daterange(a, b)` is a `Datum::Range` since that type
+    // exists, and was a `Datum::Text` before it; a stored range column has always been the
+    // former. Matching one variant made every `INSERT` conflict-free — the constraint was still
+    // registered and still checked, and it agreed with everything — which is a silent wrong
+    // answer rather than an error, and it is what `tests/exclusion_constraint.rs` caught the
+    // moment the constructor's value changed shape.
+    let text = |value: &Datum| match value {
+        Datum::Text(text) | Datum::Range { text, .. } => Some(text.clone()),
+        _ => None,
+    };
+    match (text(left), text(right)) {
+        (Some(left), Some(right)) => {
             match (
-                crate::value::range::DateRange::from_text(left),
-                crate::value::range::DateRange::from_text(right),
+                crate::value::range::DateRange::from_text(&left),
+                crate::value::range::DateRange::from_text(&right),
             ) {
                 (Some(left), Some(right)) => left.overlaps(right),
                 _ => false,
