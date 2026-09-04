@@ -1,0 +1,14 @@
+crates/esker-cli/tests/cluster_chaos.rs
+  h_44076b318daf9c 435-460,480-482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d3698dcaa57ca720348f70e489f6d53809179b16",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
