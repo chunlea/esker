@@ -1,0 +1,25 @@
+crates/esker-client/src/txn.rs
+  s_2bed4ac2b1c944::t_9320b162365571 404,457,459-464,510,518-530,542-591,613,656,727
+crates/esker-sql/src/backend/store.rs
+  s_2bed4ac2b1c944::t_397109e35944bf 28-29,39-51,91-107,125,136-138,180-199,218-231,261-342
+crates/esker-sql/tests/store_locking.rs
+  s_2bed4ac2b1c944::t_c76152ead5e2dd 1-164
+docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md
+  s_2bed4ac2b1c944::t_4314fe88f6a2d9 323-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ff4a8d1442c5e1a610e6e4d8e9cf603ce413d7d5",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
