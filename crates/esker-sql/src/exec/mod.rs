@@ -2261,16 +2261,6 @@ impl Executor {
         }
     }
 
-    /// `'happy'::mood` — the label in a projection, the ordinal everywhere else.
-    ///
-    /// Resolved here rather than per row for the reason `::regclass` is: the catalog answer is the
-    /// same for every row, and reading it per row is the cost trap `08ff6a2` paid for once. What
-    /// it is replaced *with* depends on where it sits, which is not a special case but what an
-    /// enum is — a number that prints as a label
-    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
-    ///
-    /// **The projection is walked first**, because the general walk below rewrites every cast it
-    /// finds and would leave nothing to tell the two positions apart.
     /// Replaces every call the catalog holds a function for with that function's **body**, and
     /// raises the `0A000` lowering used to raise for every name nobody declared.
     ///
@@ -2326,6 +2316,16 @@ impl Executor {
         }
     }
 
+    /// `'happy'::mood` — the label in a projection, the ordinal everywhere else.
+    ///
+    /// Resolved here rather than per row for the reason `::regclass` is: the catalog answer is the
+    /// same for every row, and reading it per row is the cost trap `08ff6a2` paid for once. What
+    /// it is replaced *with* depends on where it sits, which is not a special case but what an
+    /// enum is — a number that prints as a label
+    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    ///
+    /// **The projection is walked first**, because the general walk below rewrites every cast it
+    /// finds and would leave nothing to tell the two positions apart.
     fn resolve_user_cast(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
         use crate::plan::Expr;
 
