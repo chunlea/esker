@@ -312,7 +312,9 @@ pub enum Datum {
     /// and a unique index all fold it.
     ///
     /// **`PartialEq` stays bitwise** — it is what the round-trip tests assert and it is not SQL
-    /// equality for any type here (see [`Datum::pg_cmp`], which disagrees with it for floats too).
+    /// equality for any type here (`esker_sql::value::PgDatum::pg_cmp` disagrees with it for
+    /// floats too, and is named in text rather than linked for the reason the module doc gives:
+    /// it is in the crate above this one).
     Citext(String),
     /// [`ColumnType::Bool`].
     Bool(bool),
