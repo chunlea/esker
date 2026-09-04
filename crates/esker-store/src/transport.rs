@@ -39,6 +39,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use esker_proto::transport::RpcTls;
 use esker_proto::{
     Epoch, RaftBatch, RaftMessage, Request, TcpTransport, Transport, TransportConfig,
 };
@@ -143,12 +144,31 @@ impl StoreTransport {
     /// driver threads that feed them are deliberately not async at all.
     #[must_use]
     pub fn spawn(store_id: u64, stores: &[StoreAddress], config: TransportConfig) -> Arc<Self> {
+        Self::spawn_with_tls(store_id, stores, config, &RpcTls::disabled())
+    }
+
+    /// [`StoreTransport::spawn`], with the TLS every peer link uses.
+    ///
+    /// Store-to-store traffic is Raft: the log that decides what every region contains. Both ends
+    /// are ours, so this is the other link mTLS is for. A `tls` that is disabled connects in the
+    /// clear, exactly as before.
+    pub fn spawn_with_tls(
+        store_id: u64,
+        stores: &[StoreAddress],
+        config: TransportConfig,
+        tls: &RpcTls,
+    ) -> Arc<Self> {
         let mut queues = Vec::new();
         let mut tasks = Vec::new();
         for store in stores.iter().filter(|store| store.store_id != store_id) {
             let (sender, receiver) = mpsc::channel(PEER_SEND_QUEUE);
             queues.push((store.store_id, sender));
-            tasks.push(tokio::spawn(deliver_to(store.clone(), receiver, config)));
+            tasks.push(tokio::spawn(deliver_to(
+                store.clone(),
+                receiver,
+                config,
+                tls.clone(),
+            )));
         }
         queues.sort_by_key(|(id, _)| *id);
         Arc::new(Self {
@@ -386,6 +406,7 @@ async fn deliver_to(
     store: StoreAddress,
     mut queue: mpsc::Receiver<RaftMessage>,
     config: TransportConfig,
+    tls: RpcTls,
 ) {
     let mut connection: Option<TcpTransport> = None;
     while let Some(first) = queue.recv().await {
@@ -401,7 +422,9 @@ async fn deliver_to(
             connection = None;
         }
         if connection.is_none() {
-            match TcpTransport::connect_with(store.addr, config).await {
+            // Verified against the peer's configured address, which is what an address book of
+            // `SocketAddr`s can offer; a store's certificate therefore carries its IP.
+            match TcpTransport::connect_with_tls(store.addr, config, &tls, None).await {
                 Ok(transport) => connection = Some(transport),
                 Err(error) => {
                     tracing::debug!(

@@ -517,16 +517,43 @@ impl BlockingTransport {
 
     /// Connects with an explicit configuration.
     pub fn connect_with(addr: SocketAddr, config: TransportConfig) -> Result<Self, ProtoError> {
-        // One worker thread, so the reader, the writer and the keepalive keep running between
-        // calls. On a current-thread runtime they would only advance while a caller was
-        // blocked inside `block_on`, and a connection that only lives during a call cannot
-        // notice a dead peer.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = Self::runtime()?;
+        let transport = runtime.block_on(TcpTransport::connect_with(addr, config))?;
+        Ok(Self {
+            runtime: Some(runtime),
+            transport,
+        })
+    }
+
+    /// The runtime a blocking connection lives on.
+    ///
+    /// One worker thread, so the reader, the writer and the keepalive keep running between calls.
+    /// On a current-thread runtime they would only advance while a caller was blocked inside
+    /// `block_on`, and a connection that only lives during a call cannot notice a dead peer.
+    fn runtime() -> Result<Runtime, ProtoError> {
+        tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .map_err(|error| ProtoError::internal(format!("building a runtime: {error}")))?;
-        let transport = runtime.block_on(TcpTransport::connect_with(addr, config))?;
+            .map_err(|error| ProtoError::internal(format!("building a runtime: {error}")))
+    }
+
+    /// [`BlockingTransport::connect_with`], over TLS.
+    ///
+    /// The synchronous caller — the CLI, a benchmark — reaching a cluster that requires it.
+    ///
+    /// # Errors
+    ///
+    /// As [`BlockingTransport::connect_with`], plus a handshake the peer refused.
+    pub fn connect_with_tls(
+        addr: SocketAddr,
+        config: TransportConfig,
+        tls: &RpcTls,
+        name: Option<&str>,
+    ) -> Result<Self, ProtoError> {
+        let runtime = Self::runtime()?;
+        let transport =
+            runtime.block_on(TcpTransport::connect_with_tls(addr, config, tls, name))?;
         Ok(Self {
             runtime: Some(runtime),
             transport,

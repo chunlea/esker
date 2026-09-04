@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use esker_proto::pd::{PdRaftBatch, PdReq};
+use esker_proto::transport::RpcTls;
 use esker_proto::{Request, TcpTransport, Transport, TransportConfig};
 use esker_raft::{Message, NodeId};
 use tokio::sync::mpsc;
@@ -59,6 +60,24 @@ impl PdTcpTransport {
     /// Must be called from inside a `tokio` runtime: the tasks are where the async lives, and the
     /// driver thread that feeds them is deliberately not async at all.
     pub fn spawn(id: NodeId, members: &MemberList, config: TransportConfig) -> Result<Arc<Self>> {
+        Self::spawn_with_tls(id, members, config, &RpcTls::disabled())
+    }
+
+    /// [`PdTcpTransport::spawn`], with the TLS every member link uses.
+    ///
+    /// A placement-driver group is the clearest case for mTLS in this project: every end is ours,
+    /// the membership is static, and the traffic is the Raft log that decides where every region
+    /// lives. A `tls` that is disabled connects in the clear, exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// A member address that is not an address, as [`PdTcpTransport::spawn`].
+    pub fn spawn_with_tls(
+        id: NodeId,
+        members: &MemberList,
+        config: TransportConfig,
+        tls: &RpcTls,
+    ) -> Result<Arc<Self>> {
         let group_id = members.group_id();
         let mut peers = Vec::new();
         let mut tasks = Vec::new();
@@ -72,7 +91,13 @@ impl PdTcpTransport {
             let (sender, receiver) = mpsc::channel(MEMBER_SEND_QUEUE);
             peers.push((member.id, sender));
             tasks.push(tokio::spawn(deliver_to(
-                member.id, address, group_id, id, receiver, config,
+                member.id,
+                address,
+                group_id,
+                id,
+                receiver,
+                config,
+                tls.clone(),
             )));
         }
         peers.sort_by_key(|(id, _)| *id);
@@ -154,6 +179,7 @@ async fn deliver_to(
     from: NodeId,
     mut queue: mpsc::Receiver<Message>,
     config: TransportConfig,
+    tls: RpcTls,
 ) {
     let mut connection: Option<TcpTransport> = None;
     while let Some(first) = queue.recv().await {
@@ -169,7 +195,9 @@ async fn deliver_to(
             connection = None;
         }
         if connection.is_none() {
-            match TcpTransport::connect_with(address, config).await {
+            // The peer is verified against its configured address, which is what a member list of
+            // addresses can offer; a certificate for a placement driver therefore carries its IP.
+            match TcpTransport::connect_with_tls(address, config, &tls, None).await {
                 Ok(transport) => connection = Some(transport),
                 Err(error) => {
                     tracing::debug!(
