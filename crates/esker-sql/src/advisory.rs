@@ -373,6 +373,15 @@ mod tests {
 
         // A negative low half must not sign-extend into the high one.
         assert_eq!(Key::pair(1, -1).key, (1i64 << 32) | 0xffff_ffff);
+
+        // **The two keys r1's capture proves a real server takes**, and both are edges of the
+        // packing: `i64::MIN` has every high bit set, and the second is the number
+        // `ActiveRecord`'s migrator actually computes (`MIGRATOR_SALT * crc32(database)`).
+        for key in [i64::MIN, 3_966_820_834_000_112_000] {
+            let extreme = locks.session();
+            assert!(locks.try_lock(extreme, Key::whole(key), Mode::Exclusive));
+            assert!(locks.unlock(extreme, Key::whole(key), Mode::Exclusive));
+        }
     }
 
     /// One session's locks go together and nobody else's move.
