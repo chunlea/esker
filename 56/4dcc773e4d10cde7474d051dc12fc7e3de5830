@@ -1,0 +1,18 @@
+crates/esker-store/src/lib.rs
+  h_44076b318daf9c 60,125-134,136-143
+crates/esker-store/src/reclaim.rs
+  h_44076b318daf9c 1-579
+crates/esker-store/src/snapshot.rs
+  h_44076b318daf9c 513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "564dcc773e4d10cde7474d051dc12fc7e3de5830",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
