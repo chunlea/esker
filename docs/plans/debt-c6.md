@@ -214,3 +214,103 @@ assertion `left == right` failed: a retirement a SIGKILL interrupted left its 8 
   left: [("default", 8), ("lock", 0), ("write", 0)]
  right: [("default", 0), ("lock", 0), ("write", 0)]
 ```
+
+## 3. `Db::ingest` refused any overlap, tombstones included
+
+Inventory #21, the one item of the brief's eight that HEAD still owed.
+`crates/esker-engine/src/db/ingest.rs`.
+
+### What was there
+
+`DbInner::place` refused three ways — against another file in the same ingest, against the
+memtable, and against **any level** whose files' ranges overlapped the candidate's — and each
+refusal named the same reason: a file built elsewhere carries another database's sequence numbers,
+so an overlap has no defensible answer.
+
+The reason is right. The rule was a proxy for it, and a badly-fitting one.
+
+### The rule, which is about keys and not about ranges
+
+**An ingest is refused exactly when the file holds a user key the column family already has an
+entry for** — a value, a point tombstone, or a range tombstone covering it.
+
+Sequence numbers only decide anything between two entries under the **same** user key. For entries
+under different keys the question is never asked: a read resolves one user key at a time, finds
+exactly one version of it, and the numbers decide nothing. Range disjointness is a sufficient
+condition for key disjointness, not an equivalent one.
+
+And in this system the gap between the two is the ordinary case, not a corner. `esker-txn` encodes
+the MVCC version **into the key** — `'x' ++ enc(user_key) ++ !ts` — so two versions of one row are
+two distinct engine keys, and two files can interleave completely across a range while sharing not
+one key. A bulk load of a time range for rows that already exist has exactly that shape: it
+overlaps everything and collides with nothing. Every one of those was refused.
+
+### The structural constraint is not a reason to refuse
+
+Levels 1 and below are sorted runs — their files must be range-disjoint or a seek cannot binary
+search the level — and L0's files overlap by construction. So a file whose keys are free but whose
+range is not is not a refusal, it is a **placement**: it goes to L0 and a later compaction sorts it
+downward. `place` therefore stops returning an error and returns the deepest level whose ranges
+leave room, which is 0 when none does. A genuinely disjoint bulk load still lands deep.
+
+### What the check consults, and the duplication it removed
+
+The read path's own list. `DbInner::merge_sources` was extracted out of `Db::iter` — the cursors
+over every memtable and every level, plus the range tombstones, from one pinned version — and both
+callers now use it. An ingest that consulted a different set than a read would refuse ingests that
+are safe or, far worse, allow one whose keys a reader can already see. It returns a `MergeSources`
+rather than a tuple because the three parts are one snapshot at one instant: split apart, a caller
+can hold cursors over files a dropped version has let a compaction delete.
+
+The walk is over the *candidate's* keys, seeking the merged cursor to each, which costs a seek per
+distinct key in the file rather than a scan of the range — and the range can be the whole column
+family while the file is small, which under MVCC keys is the ordinary case.
+
+Point tombstones do **not** free a key, and the module says so: a delete is an entry under its key,
+and the sequence number would still have to choose between the delete and the ingested value.
+Range tombstones are checked separately from the cursors, because a range delete hides keys the
+merged run has never seen (ADR 0017) — a cursor would show nothing and the conflict would be
+invisible.
+
+### The property test, and the two reds
+
+`crates/esker-engine/tests/ingest_overlap.rs`, two properties. Both sides draw keys from one
+24-wide space, so ranges overlap heavily and key sets collide often; a generator that partitioned
+the space would have tested the old rule and never produced the case this unit is about.
+
+1. **the decision matches the rule**, both directions — `Ok` iff the ingested key set is disjoint
+   from every key the family has an entry for and no range tombstone covers one;
+2. **an accepted ingest reads back as the union**, and a refused one changed nothing, asserted per
+   key across the whole space.
+
+Property 2 is what makes property 1 worth having: widening a rule is easy to do in a way that
+passes every "is it refused" test and answers the wrong value afterwards, and a wrong answer is a
+*readable* one.
+
+Red in both directions:
+
+* **too permissive** (nothing is ever a conflict) — `ingesting {2} into a family holding {2}: the
+  rule says free=false, ingest said None`;
+* **too strict** (the pre-c6 range rule, restored) — both properties fail, and
+  `interleaved_ranges_that_share_no_key_are_all_accepted` fails outright, which is the case the
+  widening exists for.
+
+`crates/esker-engine/tests/checkpoint.rs`'s two refusal tests both use genuinely shared keys and
+stay red, as they should; one assertion moved from the old message to the new one, which names the
+colliding key.
+
+### A debt found while writing the rule, and not fixed here
+
+**An ingest is visible to snapshots taken before it.** `ingest` raises the database's sequence
+number *above* the file's, so later writes sort above the ingested data — but it does not give the
+file a number of this database's own, so an ingested entry keeps a number from a numbering this
+database never issued. A reader holding a snapshot older than the ingest can therefore see the
+ingested keys, because their numbers may fall below its own.
+
+It is unaffected by the rule above — it is about *when* an ingest becomes visible, not about which
+of two versions wins — and closing it means a per-file global sequence number in the SST footer,
+which is a format change with a golden test and an ADR. Recorded here, and marked in the module
+header, rather than fixed inside a unit about overlap.
+
+- **Site:** `crates/esker-engine/src/db/ingest.rs`, `Db::ingest`'s `raise_seqno_above`.
+- **Size:** medium; a format change, so it needs the human (`CLAUDE.md` §"Ask before doing").
