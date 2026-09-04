@@ -189,7 +189,7 @@ async fn deliver_to(
         // **Cluster id zero, on purpose.** This frame is not a question about a cluster — the
         // group has to elect a leader before `Bootstrap` has minted a cluster id at all — so the
         // service exempts it from the cluster check and the group id is what guards it instead
-        // ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)). Sending a real one would
+        // ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). Sending a real one would
         // imply a check that is not being made.
         let request = Request::Pd {
             cluster_id: 0,

@@ -42,7 +42,7 @@ pub enum PdError {
     },
 
     /// This member does not lead PD's Raft group, or leads it and has not yet caught up, so it
-    /// answers nothing ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// answers nothing ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     ///
     /// A refusal, not a failure: the request provably did not take effect, and the caller's repair
     /// is to ask the member named — or, when nothing is named, to back off, because an election is

@@ -86,7 +86,7 @@ pub enum Method {
     /// every region does not ask `GetRegion` once per region ([`crate::pd`]).
     PdScanRegions = 0x030a,
     /// `Pd::Raft` — a tick's worth of Raft messages between two placement drivers
-    /// ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md), [`crate::pd::PdRaftBatch`]).
+    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md), [`crate::pd::PdRaftBatch`]).
     ///
     /// On the `Pd` service rather than on `RaftTransport`, because the two are addressed
     /// differently and a store must not be able to receive one: `RaftTransport` carries a
@@ -95,7 +95,7 @@ pub enum Method {
     /// consensus traffic from its placement driver's without decoding a body.
     PdRaft = 0x030b,
     /// `Pd::Members` — who is in this placement driver's group and which member leads
-    /// ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)).
     ///
     /// Answered by **any** member, leader or not, which is the whole point: an operator reaches
     /// for it exactly when the leader is the thing that is missing. Its own method rather than a

@@ -491,7 +491,7 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
 ## 7. Placement driver (`esker-pd`)
 
 One binary; **a Raft group of up to three of them**, each with its own `esker-engine` instance
-([ADR 0058](adr/0058-pd-is-a-raft-group.md), `docs/plans/phase-15-pd-ha.md`). A group of one is
+([ADR 0059](adr/0059-pd-is-a-raft-group.md), `docs/plans/phase-15-pd-ha.md`). A group of one is
 what phase 4 shipped and is still the default: it wins with a quorum of itself, needs no ticks and
 no transport, and behaves exactly as the single durable PD did.
 
@@ -969,12 +969,12 @@ pending compaction bytes, raft proposal latency, apply lag, region count, TSO ra
 
 Joint consensus vs single-server changes only · separate Raft log store · async commit / 1PC ·
 leader leases vs ReadIndex only · **dynamic PD membership** (adding or removing a placement driver
-at run time, which needs the group id minted into the log — [ADR 0058](adr/0058-pd-is-a-raft-group.md))
+at run time, which needs the group id minted into the log — [ADR 0059](adr/0059-pd-is-a-raft-group.md))
 · secondary-index encoding for composite keys · how much Postgres surface for the first SQL
 milestone.
 
 *Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
-`esker-raft`, phase 15 ([ADR 0058](adr/0058-pd-is-a-raft-group.md), §7 above).
+`esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above).
 
 ## 16. Columnar (`esker-columnar`)
 

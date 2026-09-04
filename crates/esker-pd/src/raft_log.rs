@@ -1,7 +1,7 @@
 //! PD's Raft log, on the engine's `raft` column family.
 //!
 //! The placement driver replicates itself with `esker-raft`
-//! ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)), which means it needs the same
+//! ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)), which means it needs the same
 //! [`LogStorage`] a region's peer needs. This is that, and it is deliberately **not** shared with
 //! `esker_store::raft_log`: that one is keyed by region id because a store holds many groups,
 //! and PD holds exactly one. Sharing it would mean carrying a region id that is always the same
@@ -152,7 +152,7 @@ pub struct PersistedState {
     ///
     /// Not the membership *in force*: the core replays the log's conf-change entries onto this
     /// one, so what it needs is a configuration that predates the entries still held. PD's
-    /// membership is static ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)), so today
+    /// membership is static ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)), so today
     /// this never changes after `open` — the field is here because a log that compacts must write
     /// it, and because the day membership stops being static is not the day to discover it was
     /// missing.

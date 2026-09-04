@@ -274,7 +274,7 @@ Server options:
                         HOST:PORT or several separated by commas — a placement
                         driver is a Raft group of up to three and only its leader
                         answers, so a store given all three follows the redirect
-                        when one takes over (ADR 0058). With
+                        when one takes over (ADR 0059). With
                         one, PD decides which store creates region 1 and this store
                         reports its regions on the schedule of DESIGN.md §14.
                         Without one, the store bootstraps a region of its own and

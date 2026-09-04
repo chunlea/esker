@@ -109,7 +109,7 @@ pub struct Leadership {
     ///
     /// The two are not the same fact, and the gap between them is where a new leader would
     /// otherwise answer out of state it has not caught up on
-    /// ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     pub serving: bool,
     /// The term this member last took office in, or `0`. A caller rebuilds its working state
     /// when this moves.
@@ -645,7 +645,7 @@ impl PdDriver {
     /// Proposes a command and waits for it to **apply**.
     ///
     /// The wait is the whole point: an id or a timestamp that left PD before its entry committed
-    /// is one a new leader would hand out again ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// is one a new leader would hand out again ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     pub fn propose(&self, command: Command) -> Result<Answer> {
         let (notify, answer) = channel();
         self.post(DriverMsg::Propose {
@@ -884,7 +884,7 @@ mod tests {
     }
 
     /// A proposal is answered when it **applies**, not when it is accepted — which is the whole
-    /// of "ack after commit" ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// of "ack after commit" ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     #[test]
     fn a_proposal_is_answered_with_what_applying_it_produced() {
         let member = alone();

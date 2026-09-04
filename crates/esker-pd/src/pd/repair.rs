@@ -401,7 +401,7 @@ impl Pd {
     }
 
     /// One cluster-unique peer id, its reservation committed before it is handed out
-    /// ([`crate::alloc`], [ADR 0058](../../../../docs/adr/0058-pd-is-a-raft-group.md)).
+    /// ([`crate::alloc`], [ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
     fn next_peer_id(&self, state: &mut State) -> Result<u64> {
         let driver = self.driver();
         state.alloc.allocate(1, |end| reserve(driver, end))

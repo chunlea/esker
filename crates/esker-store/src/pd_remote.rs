@@ -34,7 +34,7 @@
 //! # Three endpoints, and following the hint
 //!
 //! A placement driver is a Raft group of up to three members and only its leader answers
-//! ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)). So a store is given the whole list,
+//! ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). So a store is given the whole list,
 //! believes one of them, and moves when it is told to:
 //!
 //! * a [`ProtoError::PdNotLeader`] that **names** a member moves this client to that endpoint and

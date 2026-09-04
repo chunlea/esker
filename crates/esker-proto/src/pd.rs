@@ -460,7 +460,7 @@ pub struct PdMembership {
 /// A tick's worth of Raft messages between two **placement drivers**.
 ///
 /// The placement driver replicates itself with `esker-raft`
-/// ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md)), so it needs a transport of its own —
+/// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)), so it needs a transport of its own —
 /// and it needs *less* than a store's. [`crate::RaftMessage`] wraps every message in a region id,
 /// an epoch and the store the sender is on, because a store holds many groups and a receiver has
 /// to know which. A placement driver holds exactly one group, and that group is not a region, so

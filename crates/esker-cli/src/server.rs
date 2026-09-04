@@ -148,7 +148,7 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
         None => None,
         Some(listed) => {
             // A **list**, because a placement driver is a Raft group of up to three and only its
-            // leader answers ([ADR 0058](../../../docs/adr/0058-pd-is-a-raft-group.md)). One
+            // leader answers ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). One
             // address is still one address, so every existing invocation means what it did.
             let mut endpoints = Vec::new();
             for part in listed.split(',').map(str::trim).filter(|p| !p.is_empty()) {

@@ -35,7 +35,7 @@
 //! | [`transport`] | one connection per member pair, a batch per tick |
 //! | [`service`] | the async edge: PD behind `esker-proto`'s server, and the tick |
 //!
-//! PD is a **Raft group of up to three members** ([ADR 0058](../../docs/adr/0058-pd-is-a-raft-group.md),
+//! PD is a **Raft group of up to three members** ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md),
 //! `docs/plans/phase-15-pd-ha.md`). Every durable write is a [`command`] proposed by the leader,
 //! applied by [`machine`] on every member, and acknowledged only once *this* member has applied
 //! it. A group of one behaves exactly as the single durable PD of phase 4a did, and is what every
