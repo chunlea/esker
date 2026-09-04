@@ -16,8 +16,6 @@ esker-base.workspace = true
 esker-s3.workspace = true
 # `Bytes` at API boundaries only; `&[u8]` internally (CLAUDE.md, "Toolchain and conventions").
 bytes.workspace = true
-# The memtable, and the one piece of concurrent unsafe code we buy rather than write.
-crossbeam-skiplist.workspace = true
 # The only compression codec, pure Rust (DESIGN §4.5).
 lz4_flex.workspace = true
 thiserror.workspace = true

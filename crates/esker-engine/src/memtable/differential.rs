@@ -29,7 +29,6 @@ use std::sync::atomic::{AtomicU64, Ordering as Memory};
 
 use proptest::prelude::*;
 
-use super::bought::Bought;
 use super::skiplist::{NIL, SkipList};
 use super::store::Store;
 use crate::dbformat::{
@@ -321,14 +320,6 @@ proptest! {
     #[test]
     fn the_skiplist_answers_what_a_sorted_map_would(ops in prop::collection::vec(op(), 1..80)) {
         differential::<SkipList>(&ops)?;
-    }
-
-    /// The same programme through the store this one replaces. Two implementations that have
-    /// nothing in common but the trait, held to one model: a disagreement is a bug in whichever
-    /// of them the model does not match, and it is cheaper to find here than in the engine.
-    #[test]
-    fn the_bought_store_answers_the_same(ops in prop::collection::vec(op(), 1..80)) {
-        differential::<Bought>(&ops)?;
     }
 }
 

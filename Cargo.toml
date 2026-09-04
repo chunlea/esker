@@ -15,7 +15,6 @@ publish = false
 [workspace.dependencies]
 # --- runtime allowlist ---
 bytes = { version = "1", default-features = false }
-crossbeam-skiplist = { version = "0.1", default-features = false, features = ["std"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # The one large dependency exception CLAUDE.md anticipated (docs/adr/0014-sqlparser.md).
 # `default-features = false` is load-bearing: the default `recursive-protection` feature pulls

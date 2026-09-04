@@ -2,10 +2,9 @@
 //!
 //! Every write lands here after its bytes are in the log, and stays until the memtable is
 //! flushed to an SST. Since [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) it is
-//! an in-house arena skiplist — `skiplist::SkipList`, the last piece of concurrent code the
-//! project bought rather than wrote, now written. The `crossbeam-skiplist` one is still here as
-//! `bought::Bought` and still tested; the private `Selected` alias is the one line that says
-//! which the engine uses.
+//! an in-house arena skiplist — `skiplist::SkipList`. It was `crossbeam-skiplist`, the last
+//! piece of concurrent code the project bought rather than wrote; that dependency is gone, and
+//! with it three crates from the runtime budget.
 //!
 //! # Nothing is ever removed
 //!
@@ -23,15 +22,6 @@
 //! The store holds the comparator once, on the table, rather than once per key.
 
 mod arena;
-// Kept compiled, and dead in the library until [`Selected`] names it — which is the point:
-// ADR 0041 says the bought store stays until a benchmark decides between the two, and a
-// version that stopped compiling would not be a choice any more. Its tests construct it, and
-// `differential.rs` holds both implementations to the same battery.
-#[allow(
-    dead_code,
-    reason = "compiled and tested; used by the library only if `Selected` says"
-)]
-mod bought;
 mod skiplist;
 mod store;
 
@@ -53,9 +43,12 @@ use crate::dbformat::{
 
 /// Which store the engine uses.
 ///
-/// The one line ADR 0041's decision lives on. Both implementations are compiled and both are
-/// held to the same battery in `differential.rs`, so moving between them on the strength of a
-/// benchmark is this line and nothing else.
+/// The one line ADR 0041's decision lives on. It had two candidates while the benchmark was
+/// being taken and now has one, and the seam is kept rather than inlined because the number that
+/// came out was mixed: `docs/bench/skiplist.md` records an eighteen-fold cheaper scan against an
+/// insert between 1.2 and 1.8 times dearer. If someone takes that insert on — `LevelDB`'s layout,
+/// with the key bytes inside the node's own allocation, is the obvious next thing to try — this
+/// is what keeps the attempt to one file.
 type Selected = skiplist::SkipList;
 
 /// Where a cursor is, in whichever store [`Selected`] names.
@@ -300,9 +293,9 @@ impl MemTable {
 /// cannot outlive the bytes because it cannot outlive the table.
 ///
 /// That is what [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) was for.
-/// `crossbeam-skiplist` hands out entries that borrow the map, so a cursor built from one would
-/// be self-referential; its position is a copy of the entry and every step re-finds the key,
-/// which is `O(log n)` and an allocation. Both are still here, behind the `Selected` alias.
+/// `crossbeam-skiplist` handed out entries that borrow the map, so a cursor built from one would
+/// have been self-referential; its position was a copy of the entry and every step re-found the
+/// key, which is `O(log n)` and an allocation.
 #[derive(Debug)]
 pub struct MemTableIter {
     table: Arc<MemTable>,

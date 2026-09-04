@@ -7,8 +7,10 @@
 # crate we already know about, the test catches a shape we have not seen yet.
 #
 # The transitive runtime crate budget. The test reads this line, so keep the format exact.
-# Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md).
-# esker-dep-budget = 40
+# Lowering it is welcome; raising it needs an ADR (docs/adr/0003-dependencies.md). It came down
+# from 40 when `crossbeam-skiplist` left with `crossbeam-epoch` and `crossbeam-utils` behind it
+# (docs/adr/0041-the-in-house-arena-skiplist.md).
+# esker-dep-budget = 37
 
 [graph]
 # The two platforms CI builds. Without this, cargo-deny would also consider the Windows
