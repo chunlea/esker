@@ -2215,6 +2215,18 @@ pub fn replace_table(
     previous: &TableDef,
     table: &TableDef,
 ) -> Result<()> {
+    // **And a sequence that is no longer in the record**, which is the fourth relation kind under
+    // this rule and the one that cost the most. A `serial` column's sequence holds a name record
+    // like any other relation, and `DROP COLUMN` takes the sequence out of the definition — so
+    // without this the name outlived it, and the name a `serial` column's sequence holds is
+    // exactly the name the *next* `CREATE TABLE` wants. Run 55's schema loads stopped there.
+    for sequence in &previous.sequences {
+        if !table.sequences.iter().any(|kept| kept.id == sequence.id) {
+            txn.delete(&record::sequence_key(tenant, previous.id, sequence.id));
+            txn.delete(&record::name_key(tenant, &sequence.name));
+            txn.delete(&record::sequence_value_key(tenant, sequence.id));
+        }
+    }
     // **And the table's own name**, which `ALTER TABLE … RENAME TO` changes. Same rule, same
     // reason: `write_table` writes a name record for it, and a rename that left the old key behind
     // would leave two names pointing at one table — the second of which `DROP TABLE` would not
@@ -2686,6 +2698,43 @@ pub fn replace_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) 
         &record::sequence_key(tenant, sequence.table_id, sequence.id),
         &record::encode_sequence(sequence),
     );
+}
+
+/// Renames one sequence: its record and its **name entry**, which is the half a rename forgets.
+///
+/// The name record is a separate key from the sequence's own, so moving one and not the other is
+/// how a name outlives what it points at — the same shape three relation kinds have already been
+/// bitten by. Here it is worse than a stale row: the sequence a `serial` column owns is re-created
+/// by name on the next `CREATE TABLE`, so a stale entry stops a schema loading at all.
+///
+/// # Errors
+///
+/// Any failure reading the new name's key.
+pub fn rename_sequence(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    sequence: &SequenceDef,
+    to: &str,
+) -> Result<()> {
+    if txn.get(&record::name_key(tenant, to))?.is_some() {
+        return Err(SqlError::DuplicateTable(to.to_owned()));
+    }
+    let mut renamed = sequence.clone();
+    renamed.name.clear();
+    renamed.name.push_str(to);
+    txn.delete(&record::name_key(tenant, &sequence.name));
+    txn.put(
+        &record::sequence_key(tenant, renamed.table_id, renamed.id),
+        &record::encode_sequence(&renamed),
+    );
+    txn.put(
+        &record::name_key(tenant, to),
+        &record::encode_relation(&Relation::Sequence {
+            table_id: renamed.table_id,
+            sequence_id: renamed.id,
+        }),
+    );
+    bump_version(txn)
 }
 
 /// `pg_get_triggerdef(oid)` — a trigger's `CREATE TRIGGER`, re-printed.

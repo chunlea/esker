@@ -125,3 +125,89 @@ fn the_rows_written_before_a_rename_read_after_it() {
     // The old table name is free again, which it would not be if the name record had leaked.
     node.run("CREATE TABLE rr (id bigint PRIMARY KEY)").unwrap();
 }
+
+/// **Run 55's cliff, reproduced.** From file 326 every schema load failed with
+/// `relation "references_id_seq" already exists`, and 101 files went with it.
+///
+/// The mechanism is a refusal, not a leak. `rename_table` renames the table and then renames the
+/// sequence its `serial` column owns with a second statement — `ALTER TABLE <seq> RENAME TO …`,
+/// a *sequence* named where the grammar says table (`schema_statements.rb:459,474`). A real server
+/// runs it; this node answered `42809`. So the table moved and its sequence kept the **old** name.
+///
+/// After that the suite's own `force: true` cycle cannot clean up: `DROP TABLE IF EXISTS
+/// "references"` finds nothing, because the table is called something else now — and the
+/// `CREATE TABLE` that follows wants `references_id_seq`, which is still there, still owned by the
+/// renamed table. Every later schema load hits the same wall, and the node answers every health
+/// check perfectly while it happens.
+#[test]
+fn a_renamed_table_leaves_no_sequence_to_collide_with() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE refs (id bigserial PRIMARY KEY, name text)")
+        .unwrap();
+
+    // What `rename_table` sends, both statements.
+    node.run("ALTER TABLE refs RENAME TO refs2").unwrap();
+    node.run("ALTER TABLE refs_id_seq RENAME TO refs2_id_seq")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'refs_id_seq'"),
+        [["0"]],
+        "the sequence follows its table, or the old name is left to collide with"
+    );
+
+    // The schema's `force: true` cycle, which is where the cliff was: the drop finds nothing under
+    // the old name, and the create must still succeed.
+    node.run("DROP TABLE IF EXISTS refs").unwrap();
+    node.run("CREATE TABLE refs (id bigserial PRIMARY KEY, name text)")
+        .unwrap();
+    // Both tables and both sequences now exist, under four distinct names.
+    assert_eq!(
+        node.rows(
+            "SELECT relname FROM pg_class WHERE relname LIKE 'refs%' AND relkind = 'S' ORDER BY relname"
+        ),
+        [["refs2_id_seq"], ["refs_id_seq"]]
+    );
+    // And the sequence still fills the column it belongs to.
+    node.run("INSERT INTO refs (name) VALUES ('a')").unwrap();
+    node.run("INSERT INTO refs2 (name) VALUES ('b')").unwrap();
+    assert_eq!(node.rows("SELECT id FROM refs"), [["1"]]);
+    assert_eq!(node.rows("SELECT id FROM refs2"), [["1"]]);
+}
+
+/// **The same leak from the other direction: a `serial` column's sequence must die with the
+/// column.**
+///
+/// `DROP COLUMN` takes the sequence out of the table's record — measured on the oracle, and the
+/// `DROP COLUMN` unit asserts it — but a sequence has a **name record** of its own, and a name that
+/// outlives what it points at is what stopped run 55's schema loads. This is the third relation
+/// kind to need that reconciliation and the one where the cost is highest: the name a `serial`
+/// column's sequence holds is the name the *next* `CREATE TABLE` wants.
+#[test]
+fn dropping_a_serial_column_takes_its_sequence_name_with_it() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE sq (id bigint PRIMARY KEY, counter bigserial)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'sq_counter_seq'"),
+        [["1"]]
+    );
+
+    node.run("ALTER TABLE sq DROP COLUMN counter").unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'sq_counter_seq'"),
+        [["0"]],
+        "the sequence goes with the column, name record and all"
+    );
+
+    // And the name is free: the `force: true` cycle re-creates the table and wants that exact
+    // sequence name back. This is the statement 101 files could not get past.
+    node.run("DROP TABLE IF EXISTS sq").unwrap();
+    node.run("CREATE TABLE sq (id bigint PRIMARY KEY, counter bigserial)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'sq_counter_seq'"),
+        [["1"]]
+    );
+    node.run("INSERT INTO sq (id) VALUES (1)").unwrap();
+    assert_eq!(node.rows("SELECT counter FROM sq"), [["1"]]);
+}
