@@ -425,7 +425,7 @@ const SUPERVISE_TICK: Duration = Duration::from_millis(250);
 /// This used to poll `TcpStream::connect`, which asks *is anybody listening here* — and anybody
 /// is not the driver. Whatever else holds the port satisfies it: a driver left over from an
 /// earlier run, another cluster started on the same base port, or this file's own squatter in
-/// [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`]. The driver is then spawned,
+/// `cluster_start.rs`'s `a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`. The driver is then spawned,
 /// fails to bind with `Address already in use` and exits — while this check has already answered
 /// `Ok` on somebody else's socket and every store has been spawned against it.
 ///
@@ -503,7 +503,7 @@ fn ask_the_driver(address: &str) -> Result<(), String> {
 /// busy threads it does not, and the command prints *4 nodes started*, writes a state file naming
 /// a pid that is already dead, and supervises three nodes it calls four. `stop` then signals
 /// whatever the operating system has since given that pid to — which is the second assertion in
-/// [`a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`], reached from the other side.
+/// `cluster_start.rs`'s `a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`, reached from the other side.
 ///
 /// A store that answers `Admin::Regions` has opened its engine, registered with the driver if
 /// there is one, and is serving. That is the event "started" was always meant to name, and it is
