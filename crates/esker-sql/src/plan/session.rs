@@ -18,6 +18,13 @@
 /// transaction the session is in, and a `SET` outside a block must not open one at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatement {
+    /// `SET [LOCAL|SESSION] SESSION AUTHORIZATION DEFAULT`: the session's own user, which is what
+    /// it already is.
+    ///
+    /// A **no-op that is not a lie**: this node has no roles, so there is nothing to switch away
+    /// from and `DEFAULT` asks for exactly that. A named role is `22023` in the lowering and never
+    /// becomes one of these.
+    SetSessionAuthorization,
     /// `SET esker.read_as_of = '...'`, or `= DEFAULT` / `RESET`, which carry `None`.
     SetReadAsOf {
         /// What the user wrote, unresolved. `None` clears the setting.
@@ -73,6 +80,7 @@ impl SessionStatement {
         match self {
             SessionStatement::SetReadAsOf { .. }
             | SessionStatement::SetSnapshot(_)
+            | SessionStatement::SetSessionAuthorization
             | SessionStatement::SetParameter { .. } => "SET",
             // **`RESET`, not `SET`.** A `RESET ALL` reports its own verb, which is what a client
             // reading the command tag expects; `RESET <name>` is a `SetParameter` with no value
