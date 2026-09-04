@@ -67,6 +67,9 @@ impl Node {
             last = match parsed.class() {
                 StatementClass::Begin => {
                     self.executor.begin(parsed.begins_read_only())?;
+                    if let Some(level) = parsed.begins_isolation() {
+                        self.executor.set_isolation(level)?;
+                    }
                     Outcome::done("BEGIN")
                 }
                 StatementClass::Commit => {

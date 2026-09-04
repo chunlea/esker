@@ -180,7 +180,12 @@ fn answer(script: &str) -> String {
 fn run_one(executor: &mut Executor, sql: &str) -> esker_sql::Result<()> {
     for parsed in parse_statements(sql)? {
         match parsed.class() {
-            StatementClass::Begin => executor.begin(parsed.begins_read_only())?,
+            StatementClass::Begin => {
+                executor.begin(parsed.begins_read_only())?;
+                if let Some(level) = parsed.begins_isolation() {
+                    executor.set_isolation(level)?;
+                }
+            }
             StatementClass::Commit => executor.commit()?,
             StatementClass::Rollback => executor.rollback()?,
             _ => {

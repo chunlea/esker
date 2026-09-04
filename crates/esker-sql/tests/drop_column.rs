@@ -29,24 +29,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **`CREATE VIEW` landed (`tests/view.rs`) and deleted the three entries that used to be
         // here** — the view is created, and `pg_class` reports it. What replaces them is the gap
         // that was hiding behind the refusal, and one bug that was hiding behind the *abort*.
-        (
-            "ALTER TABLE \"dc\" DROP COLUMN \"shown\"",
-            "**Nothing tracks that a view reads a column.** PostgreSQL refuses with `2BP01` naming \
-             `dc_view`; this node drops the column and leaves the view reading one that is gone. \
-             The rule itself is implemented for the *other* dependent that lives outside the \
-             table — another table's foreign key, in \
-             `the_drop_takes_its_dependents_and_refuses_the_others` — so what is missing is the \
-             dependency edge from a view to the columns its definition names, not the refusal. \
-             That edge is the follow-on unit, and this capture already says what both answers must \
-             become.",
-        ),
-        (
-            "SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_view'",
-            "The other half of the same missing edge: `DROP COLUMN … CASCADE` takes the dependent \
-             view with it there and leaves it here. The **first** occurrence of this statement, \
-             before the `CASCADE`, agrees at one on both — which is what says the view itself is \
-             right and only the dependency is missing.",
-        ),
+        // **Both entries here were the missing view-to-column dependency edge**, and this file
+        // named the follow-on unit that would close them: "that edge is the follow-on unit, and
+        // this capture already says what both answers must become." It was built
+        // (`tests/view_debts.rs`), both lines agree, and both entries are deleted (ADR 0031
+        // rule 2).
     ],
 };
 

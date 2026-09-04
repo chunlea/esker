@@ -54,6 +54,9 @@ impl Node {
             last = match parsed.class() {
                 StatementClass::Begin => {
                     self.executor.begin(parsed.begins_read_only())?;
+                    if let Some(level) = parsed.begins_isolation() {
+                        self.executor.set_isolation(level)?;
+                    }
                     Outcome::done("BEGIN")
                 }
                 StatementClass::Commit => {
@@ -541,8 +544,15 @@ fn the_deleter_is_never_behind_the_inserter_of_a_row_it_can_see() {
     advance(&mut node, "t", esker_sql::catalog::SchemaState::DeleteOnly);
 
     // A second session opens a transaction at delete-only, before the row exists.
+    //
+    // **At `REPEATABLE READ`, which is what this argument assumes.** The property under test is
+    // that a session cannot delete a row it cannot see, and "cannot see" is a *transaction*
+    // snapshot — under `READ COMMITTED`, now the default here as on a real server, each statement
+    // takes a new one and the `DELETE` below would see the row and remove it, correctly (ADR
+    // 0057). The schema-state arithmetic is unchanged; the level the argument needs is now said
+    // out loud instead of being the only one there was.
     let mut behind = other_session(&node);
-    behind.run("BEGIN").unwrap();
+    behind.run("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
     behind.run("SELECT id FROM t").unwrap();
 
     advance(&mut node, "t", esker_sql::catalog::SchemaState::WriteOnly);

@@ -515,9 +515,11 @@ fn golden_txn_write_requests() -> Vec<(&'static str, Request)> {
                         TxnMutation::Put {
                             key: Bytes::from_static(b"a"),
                             value: Bytes::from_static(b"1"),
+                            read_ts: None,
                         },
                         TxnMutation::Delete {
                             key: Bytes::from_static(b"b"),
+                            read_ts: None,
                         },
                     ],
                 },
@@ -1528,8 +1530,8 @@ proptest! {
                 primary: key.clone(),
                 ttl_ms,
                 mutations: vec![
-                    TxnMutation::Put { key: key.clone(), value },
-                    TxnMutation::Delete { key },
+                    TxnMutation::Put { key: key.clone(), value, read_ts: None },
+                    TxnMutation::Delete { key, read_ts: None },
                 ],
             },
             3 => TxnKvReq::Commit { start_ts, commit_ts, keys: vec![key, value] },

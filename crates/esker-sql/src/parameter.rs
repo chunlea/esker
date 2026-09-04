@@ -171,6 +171,46 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Duration,
         read_only: false,
     },
+    // **`0`, which is PostgreSQL's: wait forever.** A ceiling was tried here and reverted, and the
+    // reason is worth keeping: a long-held lock in another worker is *normal* in a Rails
+    // application and a real server waits for it, so a node that gives up after some seconds fails
+    // a production workload that PostgreSQL serves — and `SHOW` reporting the ceiling honestly
+    // does not make the node compatible, it only makes the incompatibility documented. If this
+    // node ever needs self-protection from an unbounded wait it belongs in a setting of its own,
+    // named as esker's and off by default, never in the default of a parameter a client already
+    // knows the meaning of.
+    // **The isolation level, as a parameter rather than as a field.** `SHOW transaction_isolation`,
+    // `SET TRANSACTION ISOLATION LEVEL`, `BEGIN ISOLATION LEVEL …` and the session default are
+    // four spellings of one value, and modelling it here gives all four the same machinery — the
+    // block's save-and-restore included, so a level set inside a transaction ends with it, which
+    // is what a real server does ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    //
+    // `read uncommitted` is accepted and served as `read committed`, which is what PostgreSQL
+    // itself does — it has no weaker level.
+    Parameter {
+        name: "transaction_isolation",
+        reported: "transaction_isolation",
+        boot: "read committed",
+        values: Values::Enum(&[
+            "read uncommitted",
+            "read committed",
+            "repeatable read",
+            "serializable",
+        ]),
+        read_only: false,
+    },
+    Parameter {
+        name: "default_transaction_isolation",
+        reported: "default_transaction_isolation",
+        boot: "read committed",
+        values: Values::Enum(&[
+            "read uncommitted",
+            "read committed",
+            "repeatable read",
+            "serializable",
+        ]),
+        read_only: false,
+    },
     Parameter {
         name: "lock_timeout",
         reported: "lock_timeout",
@@ -446,9 +486,14 @@ impl Parameter {
             // than as a wrong answer: a client told it holds a 150 ms cancellation waits for one,
             // and `adapters/postgresql/transaction_test.rb` waited twenty minutes. `0` is
             // accepted because it asks for what is already the case.
-            ("statement_timeout" | "lock_timeout", value) if !is_no_timeout(value) => Err(
-                SqlError::unsupported(format!("a non-zero {} ({value})", self.reported)),
-            ),
+            // **`lock_timeout` is honoured now** — it is the first timeout this node can keep,
+            // because a waiter is a loop the SQL layer drives and is cancellable in a way a
+            // statement that is *working* is not (ADR 0057). It therefore falls through to the
+            // catch-all below rather than having an arm of its own. `statement_timeout` stays
+            // refused, and the refusal is narrower rather than gone.
+            ("statement_timeout", value) if !is_no_timeout(value) => Err(SqlError::unsupported(
+                format!("a non-zero {} ({value})", self.reported),
+            )),
             // **A `search_path` is not validated**, on a real server or here: an entry naming no
             // schema is *skipped* rather than refused, which is what makes the default
             // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
@@ -501,6 +546,97 @@ fn is_utc(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "utc" | "etc/utc" | "universal" | "zulu" | "z" | "+00:00" | "utc+0" | "utc-0"
     )
+}
+
+/// What a transaction promises about what it can see, and what it does about a conflict.
+///
+/// **Two behaviours under three names.** `READ COMMITTED` waits for the writer in front of it and
+/// re-runs the statement; `REPEATABLE READ` and `SERIALIZABLE` keep the transaction's snapshot and
+/// answer `40001`, which is what this node did for every transaction before ADR 0057. So the
+/// level that already worked keeps working and the change cannot regress it.
+///
+/// `SERIALIZABLE` being snapshot isolation is a **declared divergence**: SI admits write skew and
+/// a real server's SSI does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// PostgreSQL's default, and this node's: statement-level snapshots, and a writer waits.
+    #[default]
+    ReadCommitted,
+    /// The transaction's snapshot, and `40001` rather than a wait.
+    RepeatableRead,
+    /// Served as [`Isolation::RepeatableRead`], declared.
+    Serializable,
+}
+
+impl Isolation {
+    /// The level a parameter's value names. Anything unrecognised is the default, which the
+    /// parameter's own `Values::Enum` has already refused — so this is total rather than lossy.
+    #[must_use]
+    pub fn named(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "repeatable read" => Isolation::RepeatableRead,
+            "serializable" => Isolation::Serializable,
+            // `read uncommitted` is `read committed` on a real server too: there is no weaker one.
+            _ => Isolation::ReadCommitted,
+        }
+    }
+
+    /// Whether a writer at this level **waits** for the row in front of it.
+    #[must_use]
+    pub fn waits(self) -> bool {
+        self == Isolation::ReadCommitted
+    }
+}
+
+/// `transaction_isolation`, the level this transaction is running at.
+#[must_use]
+pub fn transaction_isolation() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "transaction_isolation")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// `default_transaction_isolation`, the level each new transaction starts at.
+#[must_use]
+pub fn default_transaction_isolation() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "default_transaction_isolation")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// `lock_timeout`, which bounds how long a writer waits for the row in front of it (ADR 0057).
+#[must_use]
+pub fn lock_timeout() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "lock_timeout")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// `statement_timeout`, which bounds the same wait when `lock_timeout` does not.
+#[must_use]
+pub fn statement_timeout() -> &'static Parameter {
+    PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == "statement_timeout")
+        .unwrap_or(&PARAMETERS[0])
+}
+
+/// A timeout parameter's value in milliseconds, or `None` for one that is not a duration.
+///
+/// PostgreSQL reports these as a bare number of milliseconds or with a unit — `0`, `31s`, `300ms`
+/// — and both spellings reach here, because both are spellings a client `SET`.
+#[must_use]
+pub fn timeout_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    for (suffix, scale) in [("ms", 1_u64), ("s", 1_000), ("min", 60_000)] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number.trim().parse::<u64>().ok().map(|n| n * scale);
+        }
+    }
+    value.parse::<u64>().ok()
 }
 
 /// The `search_path` parameter, for the executor that resolves it.

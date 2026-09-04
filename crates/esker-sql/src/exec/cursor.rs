@@ -2322,6 +2322,15 @@ fn catalog_function(
         // having none: `pg_get_indexdef(oid)` is the whole definition and
         // `pg_get_indexdef(oid, NULL, true)` is NULL. Measured, and the difference is invisible in
         // an `Option` that flattens the two.
+        // The stored `SELECT`, not a deparse of it — the divergence `tests/view_debts.rs`
+        // declares. `pretty` changes nothing, because there is no layout of ours to change.
+        CatalogFunc::PgGetViewdef => match oid_argument(args.first())? {
+            None => Datum::Null,
+            Some(oid) => u64::try_from(oid)
+                .ok()
+                .and_then(|oid| env.relations().ok()?.view_definition(oid))
+                .map_or(Datum::Null, |text| Datum::Text(text.to_owned())),
+        },
         CatalogFunc::PgGetIndexdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
         CatalogFunc::PgGetIndexdef => crate::catalog::pg_index::index_definition(
             env.relations()?,

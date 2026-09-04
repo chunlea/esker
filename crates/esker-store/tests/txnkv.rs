@@ -64,6 +64,7 @@ fn put(k: &'static [u8], v: &'static [u8]) -> TxnMutation {
     TxnMutation::Put {
         key: key(k),
         value: key(v),
+        read_ts: None,
     }
 }
 
@@ -200,6 +201,7 @@ async fn a_long_value_round_trips_through_the_default_cf() {
             mutations: vec![TxnMutation::Put {
                 key: key(b"big"),
                 value: long.clone(),
+                read_ts: None,
             }],
         },
     )
@@ -885,6 +887,7 @@ async fn collect_after_versions(versions: u64) {
                 mutations: vec![TxnMutation::Put {
                     key: key(b"hot"),
                     value: Bytes::from(format!("v{round}")),
+                    read_ts: None,
                 }],
             },
         )

@@ -113,6 +113,7 @@ fn snapshot_isolation_prevents_a_dirty_read() {
             mutations: vec![TxnMutation::Put {
                 key: Bytes::from_static(b"row"),
                 value: Bytes::from_static(b"dirty"),
+                read_ts: None,
             }],
         }))
         .unwrap()
