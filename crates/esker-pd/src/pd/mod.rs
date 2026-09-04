@@ -33,9 +33,9 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, cf};
+use esker_engine::{Db, FileSystem, LocalFileSystem, Options, WalSyncMode, WriteBatch, cf};
 use esker_proto::pd::{ColumnarWish, PdMemberInfo, PdMembership, PdRaftBatch};
 use esker_proto::{Operator, OperatorProgress, OperatorStatus, Region, ScannedRegion, StoreInfo};
 use esker_raft::{Config, NodeId, Term};
@@ -324,9 +324,14 @@ pub struct Pd {
     machine: Arc<Machine>,
     /// The Raft group underneath. Dropped last, which joins its thread.
     driver: PdDriver,
-    /// The group as this member was configured to see it. Configuration, not state
-    /// ([`crate::member`]).
-    members: MemberList,
+    /// The group this member believes it is in, and what that group is called.
+    ///
+    /// **It moves**, which is what dynamic membership means
+    /// ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
+    /// a conf change appended to the log rewrites it, at append, before the messages of that same
+    /// `Ready` go out. The lock is its own, taken briefly and never across a propose — the same
+    /// rule the applied state follows and for the same reason ([`crate::driver`]).
+    members: RwLock<MemberList>,
     /// Ids reserved per commit. Kept because a member rebuilds its allocator on taking office.
     alloc_batch: u64,
     /// How far ahead the mark is written. Kept for the same reason.
@@ -436,14 +441,20 @@ impl Pd {
             cf,
             Arc::clone(&options.clock),
         )?);
-        let log = PdLogStorage::open(
+        let mut log = PdLogStorage::open(
             Arc::clone(&db),
             esker_raft::ConfState::from_voters(options.members.ids()),
         )?;
+        // **Who this member is with, and what the group is called.** The record wins over the
+        // command line, which is `esker-raft`'s own rule for membership — after a membership change
+        // `--peers` is exactly the stale thing that rule is about
+        // ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        let members = settle_membership(&mut log, &options.members, &db)?;
         let applied = log.applied_index();
 
-        let mut config = Config::new(options.id, options.members.ids(), options.raft_seed);
+        let mut config = Config::new(options.id, members.ids(), options.raft_seed);
         config.applied = applied;
+        let alone = members.is_alone();
         let transport = options
             .transport
             .clone()
@@ -453,7 +464,7 @@ impl Pd {
         // A group of one wins with a quorum of itself, so it is leading and caught up before this
         // returns — which is what keeps `Pd::open` synchronous, runtime-free and behaviourally
         // identical to the single durable PD it replaces. A larger group elects on ticks.
-        if options.members.is_alone() {
+        if alone {
             driver.campaign()?;
             if !driver.leadership().serving {
                 return Err(PdError::internal(
@@ -482,7 +493,7 @@ impl Pd {
             clock: options.clock,
             machine,
             driver,
-            members: options.members,
+            members: RwLock::new(members),
             alloc_batch: options.alloc_batch,
             tso_save_interval_ms: options.tso_save_interval_ms,
             max_store_down_time_ms: options.max_store_down_time_ms,
@@ -538,10 +549,22 @@ impl Pd {
         self.driver.leadership()
     }
 
-    /// The group this member belongs to.
+    /// The group this member believes it is in.
+    ///
+    /// A clone, because it moves: holding a reference across a membership change would be holding
+    /// a list that is no longer the group's.
     #[must_use]
-    pub fn members(&self) -> &MemberList {
-        &self.members
+    pub fn members(&self) -> MemberList {
+        self.member_list()
+    }
+
+    /// The membership, or — if the lock is poisoned, which means a thread panicked holding it — a
+    /// group of this member alone. Poisoned means this process is finished either way; answering
+    /// something rather than panicking is `CLAUDE.md` invariant 9.
+    fn member_list(&self) -> MemberList {
+        self.members
+            .read()
+            .map_or_else(|_| MemberList::alone(self.driver.id()), |held| held.clone())
     }
 
     /// Whether this member may answer. A follower answers nothing but [`PdError::NotLeader`].
@@ -563,7 +586,8 @@ impl Pd {
     /// [ADR 0011](../../../docs/adr/0011-pd-service-and-the-cluster-id.md) was written about with
     /// a worse consequence.
     pub fn step_raft(&self, batch: &PdRaftBatch) -> Result<()> {
-        let expected = self.members.group_id();
+        let members = self.member_list();
+        let expected = members.group_id();
         if batch.group_id != expected {
             return Err(PdError::invalid(format!(
                 "a placement-driver batch from member {} is for group {:#018x}; this is group                  {expected:#018x} — check that every --pd-peers list names the same members",
@@ -573,7 +597,7 @@ impl Pd {
         // A correct group id implies a member this list names, so this can only fire on a
         // deliberate forgery or a hash collision. Refused rather than stepped: a message from
         // outside the configuration is one the core would have to reason about.
-        if !self.members.contains(batch.from) {
+        if !members.contains(batch.from) {
             return Err(PdError::invalid(format!(
                 "a placement-driver batch claims to come from member {}, which is not in this                  group",
                 batch.from
@@ -594,13 +618,13 @@ impl Pd {
     #[must_use]
     pub fn membership(&self) -> PdMembership {
         let office = self.driver.leadership();
+        let members = self.member_list();
         PdMembership {
-            group_id: self.members.group_id(),
+            group_id: members.group_id(),
             this_id: office.id,
             leader_id: office.leader.unwrap_or(0),
             term: office.term,
-            members: self
-                .members
+            members: members
                 .members()
                 .iter()
                 .map(|member| PdMemberInfo {
@@ -1074,7 +1098,7 @@ impl Pd {
         PdError::NotLeader {
             leader_id,
             leader_address: self
-                .members
+                .member_list()
                 .address_of(leader_id)
                 .unwrap_or_default()
                 .to_owned(),
@@ -1133,6 +1157,69 @@ fn reserve(driver: &PdDriver, allocated_end: u64) -> Result<()> {
     driver
         .propose(Command::ReserveIds { end: allocated_end })
         .map(|_| ())
+}
+
+/// Settles what group this member is in, and what it is called, at open.
+///
+/// Three cases, and the first is the only one that writes:
+///
+/// * **a fresh database, or one written before there were group ids.** The id is derived from the
+///   configured list — *once* — and written down with the members. Deriving it is what makes the
+///   upgrade invisible: every deployment running today computes exactly this id on every start, so
+///   the first member upgraded keeps talking to the ones that have not been.
+/// * **a member joining an existing group**, which was told the id and the members by
+///   [`PdOptions::members`] and writes them before it starts.
+/// * **an existing member.** The record answers, and a `--peers` that disagrees is a warning rather
+///   than an argument — after a membership change that flag is exactly the out-of-date command line
+///   `esker_raft::Config` says not to believe.
+fn settle_membership(
+    log: &mut PdLogStorage,
+    configured: &MemberList,
+    db: &Arc<Db>,
+) -> Result<MemberList> {
+    let recorded = log.group_id();
+    let told = configured.recorded_group_id();
+
+    if recorded == 0 {
+        let group_id = told.unwrap_or_else(|| configured.derived_group_id());
+        let mut batch = WriteBatch::new();
+        log.stage_group(&mut batch, group_id, configured.members())?;
+        db.write(batch, &esker_engine::WriteOptions::synced())?;
+        tracing::info!(
+            group_id = format_args!("{group_id:#018x}"),
+            members = configured.len(),
+            minted = told.is_none(),
+            "placement-driver group settled"
+        );
+        return Ok(configured.clone().with_group_id(group_id));
+    }
+
+    if let Some(told) = told
+        && told != recorded
+    {
+        return Err(PdError::invalid(format!(
+            "this placement driver belongs to group {recorded:#018x} and was told to join \
+             {told:#018x}; a group id is minted once and never changes"
+        )));
+    }
+    if log.members().is_empty() {
+        // Recorded id, no address book: a version-1 record whose id was minted on a previous open
+        // of *this* build. Take the configured list, which is the only one there is.
+        let mut batch = WriteBatch::new();
+        log.stage_group(&mut batch, recorded, configured.members())?;
+        db.write(batch, &esker_engine::WriteOptions::synced())?;
+        return Ok(configured.clone().with_group_id(recorded));
+    }
+
+    let held = MemberList::new(log.members().to_vec())?.with_group_id(recorded);
+    if held.members() != configured.members() {
+        tracing::warn!(
+            recorded = ?held.members().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            configured = ?configured.members().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "the recorded membership and --peers disagree; believing the record"
+        );
+    }
+    Ok(held)
 }
 
 /// The clock a member resumes its oracle against on taking office.
