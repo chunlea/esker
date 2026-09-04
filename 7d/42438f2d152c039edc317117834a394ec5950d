@@ -1,0 +1,21 @@
+crates/esker-s3/Cargo.toml
+  s_0ae9006f3dc5a2::t_3f90c03b21f592 17-32
+crates/esker-s3/src/client.rs
+  s_0ae9006f3dc5a2::t_3019c87b32abb9 35-39,43,45-48,50-65,67,85,93,97-101,104,599-601,606,613-643,650-651
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7d42438f2d152c039edc317117834a394ec5950d",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9006f3dc5a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dda7865a-6020-489a-b184-a2d3ff7a56d7",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
