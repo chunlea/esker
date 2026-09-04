@@ -1,0 +1,21 @@
+crates/esker-sql/tests/join_cost.rs
+  s_2d916f5f540186::t_63453b5f68133d 44-47,49-72,112-113,116-117,120-121,124-132,150-163,166-169,171-172,174-187
+docs/plans/debts-v1.md
+  s_2d916f5f540186::t_2a1501608ea636 69-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "72065eb4da88665ecb0b1deadae27c5e205db027",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
