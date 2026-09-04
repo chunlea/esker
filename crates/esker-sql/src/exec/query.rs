@@ -285,7 +285,7 @@ impl<'a> Scope<'a> {
     ///
     /// A qualifier that names no table in the query is the same `42P01` a qualified *column*
     /// reference gives, which is what a real server answers for `SELECT wrong.* FROM o`.
-    fn expand(
+    pub(super) fn expand(
         &self,
         qualifier: Option<&str>,
     ) -> Result<std::vec::IntoIter<(usize, &'a ColumnDef)>> {

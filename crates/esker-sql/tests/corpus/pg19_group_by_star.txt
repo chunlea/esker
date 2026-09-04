@@ -1,0 +1,53 @@
+# `SELECT *` with `GROUP BY` — PostgreSQL 19beta1's functional dependency, the star form.
+#
+# Run 59's ranking: 10 tests over 3 files stopped by `column "…" must appear in the GROUP BY
+# clause`. The named-column form landed earlier (`pg19_aggregate.txt`); this is the one where the
+# target list is `*`, so the columns the rule must free are the ones the expansion produced.
+#
+# Captured in one session against the `esker-pg19` container, inside `BEGIN … ROLLBACK`, with
+# `ON_ERROR_ROLLBACK` so a refusal does not take the rest of the file. The `count(*)` after the
+# rollback proves it left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A view does not get the dependency.** `SELECT * FROM famv GROUP BY id` is `42803` even
+#     though the view is `SELECT * FROM fam` and `fam.id` is a primary key. The rule is about a
+#     base relation's key, and a view's columns are a subquery's output.
+#   * **The message names the first column of the expansion that is not free**, in output order —
+#     not the column that was grouped and not the last one. Grouping `fam` by `name` names
+#     `fam.id`; grouping the keyless `nokey` by `name` names `nokey.n`, because `name` itself *is*
+#     free.
+#   * **`GROUP BY 1` participates.** A position names an output column, and if that column is the
+#     key then the whole expansion is free.
+#   * **Per table, in a join.** Grouping by `fam.id` alone frees every column of `fam` and none of
+#     `kid`, and the message names `kid.id` — the *other* relation's first column.
+#   * A composite primary key needs **all** of its columns grouped; one of two is `42803`.
+BEGIN		-
+CREATE TABLE fam (id bigint primary key, name text, n integer)		-
+INSERT INTO fam VALUES (1,'a',10), (2,'b',20)		-
+CREATE TABLE kid (id bigint primary key, fam_id bigint, tag text)		-
+INSERT INTO kid VALUES (1,1,'x'), (2,1,'y')		-
+CREATE TABLE nokey (name text, n integer)		-
+INSERT INTO nokey VALUES ('a',1)		-
+CREATE VIEW famv AS SELECT * FROM fam		-
+CREATE TABLE two (a bigint, b bigint, n integer, PRIMARY KEY (a,b))		-
+INSERT INTO two VALUES (1,1,5)		-
+SELECT * FROM fam GROUP BY fam.id ORDER BY id		1|a|10 ; 2|b|20
+SELECT * FROM fam GROUP BY id ORDER BY id		1|a|10 ; 2|b|20
+SELECT * FROM fam GROUP BY name	!42803 column "fam.id" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT fam.* FROM fam GROUP BY fam.id ORDER BY 1		1|a|10 ; 2|b|20
+SELECT * FROM fam JOIN kid ON kid.fam_id = fam.id GROUP BY fam.id	!42803 column "kid.id" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT * FROM fam JOIN kid ON kid.fam_id = fam.id GROUP BY fam.id, kid.id ORDER BY kid.id		1|a|10|1|1|x ; 1|a|10|2|1|y
+SELECT *, count(*) FROM fam GROUP BY fam.id ORDER BY id		1|a|10|1 ; 2|b|20|1
+SELECT * FROM nokey GROUP BY name	!42803 column "nokey.n" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT * FROM famv GROUP BY id	!42803 column "famv.name" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT * FROM fam GROUP BY 1 ORDER BY id		1|a|10 ; 2|b|20
+SELECT * FROM two GROUP BY a, b ORDER BY a		1|1|5
+SELECT * FROM two GROUP BY a	!42803 column "two.b" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT * FROM fam GROUP BY fam.id HAVING count(*) = 1 ORDER BY id		1|a|10 ; 2|b|20
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('fam','kid','nokey','famv','two')	bigint	0
