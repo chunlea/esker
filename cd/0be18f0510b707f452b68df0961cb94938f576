@@ -1,0 +1,23 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_bc5dab5ebc1748 1526-1537,1541-1543,1571-1583,1624-1625,1627-1646
+crates/esker-sql/tests/drop_column.rs
+  s_6f7019c05b578b::t_d0e855f8580f1d 277-349
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_fe5e24369ec29d 1528
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cd0be18f0510b707f452b68df0961cb94938f576",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
