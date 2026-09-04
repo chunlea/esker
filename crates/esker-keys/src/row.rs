@@ -182,7 +182,11 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
         // **A citext is stored as it was written** — the folding is the comparison's, not the
         // value's, so the row keeps the user's capitals and only the key below is folded.
-        Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) | Datum::Range { text: v, .. } => {
+        Datum::Text(v)
+        | Datum::Citext(v)
+        | Datum::Hstore(v)
+        | Datum::Range { text: v, .. }
+        | Datum::Geometry { text: v, .. } => {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v.as_bytes());
         }
@@ -508,6 +512,12 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::VarcharRange
         | ColumnType::Bit
         | ColumnType::VarBit
+        | ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -630,7 +640,7 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // not an index key at all: `point = point` is `42883` on a real server and a key space
         // needs an order the type does not have. The column type is refused in
         // `decode_key_column`, which is where the error a caller sees comes from.
-        Datum::Null | Datum::Point { .. } => {}
+        Datum::Null | Datum::Point { .. } | Datum::Geometry { .. } => {}
         Datum::Int8(v)
         | Datum::TimestampTz(v)
         | Datum::Timestamp(v)
@@ -810,6 +820,17 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
     Ok(match ty {
         ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
         ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
+        // **The kind comes from the column**, which is where it is known: the bytes are only the
+        // canonical text, exactly as a range's are.
+        ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line => Datum::Geometry {
+            kind: Box::new(ty),
+            text: text_from_utf8(body)?,
+        },
         // The flag, then the digits — the length header the caller wrote covers both.
         ColumnType::Bit | ColumnType::VarBit => {
             let (&flag, digits) = body.split_first().ok_or_else(|| {
@@ -1030,7 +1051,13 @@ pub fn decode_key_columns(types: &[ColumnType], mut bytes: &[u8]) -> Result<(Vec
 pub fn is_index_key(ty: ColumnType) -> bool {
     !matches!(
         ty,
-        ColumnType::Json
+        ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line
+            | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Point
             | ColumnType::Hstore
@@ -1261,7 +1288,15 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::NumRange
         | ColumnType::Int8Range
         | ColumnType::FloatRange
-        | ColumnType::VarcharRange => Err(not_a_key())?,
+        | ColumnType::VarcharRange
+        // **The six geometric shapes join `point`**, and a real server agrees: `CREATE INDEX` on
+        // an `lseg` is `42704 … has no default operator class for access method "btree"`.
+        | ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line => Err(not_a_key())?,
         ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
             return decode_key_text(ty, bytes);
         }
@@ -2031,6 +2066,18 @@ mod tests {
                 .boxed(),
             // The flag is the column's, for the reason `inet`'s is: a value whose flag disagrees
             // with its column does not `fit` it.
+            // One value per shape: the round trip is about the *encoding*, and a shape that
+            // prints canonically is one string whatever its coordinates are.
+            ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line => Just(Datum::Geometry {
+                kind: Box::new(ty),
+                text: "canonical".to_owned(),
+            })
+            .boxed(),
             ColumnType::Bit | ColumnType::VarBit => "[01]*"
                 .prop_map(move |bits: String| Datum::Bit {
                     varying: ty == ColumnType::VarBit,

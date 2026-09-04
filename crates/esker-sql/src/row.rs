@@ -191,6 +191,16 @@ mod tests {
                 .prop_map(Datum::MacAddr)
                 .boxed(),
             // The flag is the column's, for the reason `inet`'s is.
+            ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line => Just(Datum::Geometry {
+                kind: Box::new(ty),
+                text: "canonical".to_owned(),
+            })
+            .boxed(),
             ColumnType::Bit | ColumnType::VarBit => "[01]*"
                 .prop_map(move |bits: String| Datum::Bit {
                     varying: ty == ColumnType::VarBit,

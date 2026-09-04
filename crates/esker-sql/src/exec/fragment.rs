@@ -670,6 +670,12 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::VarBit
         | Row::BitArray
         | Row::VarBitArray
+        | Row::Lseg
+        | Row::Box
+        | Row::Path
+        | Row::Polygon
+        | Row::Circle
+        | Row::Line
         | Row::BoolArray
         | Row::ByteaArray
         | Row::BpcharArray
@@ -708,6 +714,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         | Datum::Inet { .. }
         | Datum::MacAddr(_)
         | Datum::Bit { .. }
+        | Datum::Geometry { .. }
         | Datum::Null
         | Datum::Array(_)
         | Datum::Citext(_)

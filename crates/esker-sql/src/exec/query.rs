@@ -2821,6 +2821,13 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Bit | ColumnType::VarBit => 68,
             ColumnType::BitArray => 69,
             ColumnType::VarBitArray => 70,
+            // A family each: no operator relates one shape to another.
+            ColumnType::Lseg => 71,
+            ColumnType::Box => 72,
+            ColumnType::Path => 73,
+            ColumnType::Polygon => 74,
+            ColumnType::Circle => 75,
+            ColumnType::Line => 76,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
