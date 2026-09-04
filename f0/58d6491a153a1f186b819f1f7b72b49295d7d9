@@ -1,0 +1,19 @@
+docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md
+  s_3f615600dbce74::t_819834308da429 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f058d6491a153a1f186b819f1f7b72b49295d7d9",
+  "prompts": {},
+  "sessions": {
+    "s_3f615600dbce74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "763171d7-06a5-4af8-a3be-00a4e647dd9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
