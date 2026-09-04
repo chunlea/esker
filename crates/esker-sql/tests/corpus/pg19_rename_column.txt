@@ -1,0 +1,82 @@
+# `ALTER TABLE … RENAME COLUMN` — and everything that follows the column across.
+#
+# **Run 50 ranking: `ALTER TABLE … RENAME COLUMN is not supported`, 18 tests over 5 files.** AR sends
+# exactly one shape (`abstract/schema_statements.rb:1923`):
+# `ALTER TABLE "x" RENAME COLUMN "a" TO "b"` — `rename_column` builds nothing else, and
+# `ALTER TABLE … RENAME TO` (12 tests, 3 files) is its neighbour at `:459`, captured here too.
+#
+# Things reasoning would get wrong:
+#
+# * **A rename does not move the column.** `attnum` is unchanged, so every index, constraint and
+#   default keeps pointing at the same attribute and needs no rewriting — but everything that
+#   *renders* a definition (`pg_get_indexdef`, `pg_get_constraintdef`, a view's definition) comes
+#   back with the **new** name, because those are rendered from `attnum` on demand.
+# * **The sequence of a `serial` column is NOT renamed with it.** After renaming `id`, the sequence
+#   is still `<table>_id_seq` and still owned by the renamed column. Renaming the *table*, by
+#   contrast, is what AR follows up with an explicit `ALTER TABLE <seq> RENAME TO` (`:474`) — the
+#   two cases are different and the rows below show both.
+# * **The failure modes are two different SQLSTATEs**: a column that is not there is `42703`, a name
+#   that is already taken is `42701`.
+# * **A view over the column keeps working**, and its stored definition shows the new name.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` line after the `ROLLBACK` proves it left nothing behind. `\gdesc` runs in
+# a second session after that rollback, so statements naming these tables have an **empty**
+# declared-types column.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE rc (id serial primary key, name character varying(255) DEFAULT 'x' NOT NULL, qty integer)		-
+INSERT INTO rc (name, qty) VALUES ('one', 1)		-
+CREATE INDEX index_rc_on_name ON rc (name)		-
+CREATE UNIQUE INDEX index_rc_on_qty ON rc (qty)		-
+ALTER TABLE rc ADD CONSTRAINT rc_qty_check CHECK (qty >= 0)		-
+CREATE VIEW rc_view AS SELECT id, name FROM rc		-
+SELECT 'r', a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"rc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|1|id|integer|t ; r|2|name|character varying(255)|t ; r|3|qty|integer|f
+# ---- the statement AR sends ----
+ALTER TABLE "rc" RENAME COLUMN "name" TO "title"		-
+SELECT 'r', a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"rc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|1|id|integer|t ; r|2|title|character varying(255)|t ; r|3|qty|integer|f
+# ---- what followed it across, rendered from attnum ----
+SELECT 'r', indexname, indexdef FROM pg_indexes WHERE tablename = 'rc' ORDER BY indexname	text,name,text	r|index_rc_on_name|CREATE INDEX index_rc_on_name ON public.rc USING btree (title) ; r|index_rc_on_qty|CREATE UNIQUE INDEX index_rc_on_qty ON public.rc USING btree (qty) ; r|rc_pkey|CREATE UNIQUE INDEX rc_pkey ON public.rc USING btree (id)
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '"rc"'::regclass ORDER BY conname		r|rc_id_not_null|NOT NULL id ; r|rc_name_not_null|NOT NULL title ; r|rc_pkey|PRIMARY KEY (id) ; r|rc_qty_check|CHECK ((qty >= 0))
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = '"rc"'::regclass AND a.attname = 'title'		r|'x'::character varying
+SELECT 'r', pg_get_viewdef('rc_view'::regclass, true)		r| SELECT id,
+SELECT 'r', id, title FROM rc ORDER BY id		r|1|one
+SELECT 'r', count(*) FROM rc_view		r|1
+# ---- rename the primary key column: the SEQUENCE keeps its old name ----
+ALTER TABLE "rc" RENAME COLUMN "id" TO "pk"		-
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"rc"'::regclass AND a.attnum = 1		r|pk
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'rc_id_seq'	text,bigint	r|1
+SELECT 'r', pg_get_serial_sequence('rc', 'pk')	text,text	r|public.rc_id_seq
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '"rc"'::regclass AND contype = 'p'		r|rc_pkey|PRIMARY KEY (pk)
+INSERT INTO rc (title, qty) VALUES ('two', 2)		-
+SELECT 'r', pk, title FROM rc ORDER BY pk		r|1|one ; r|2|two
+# ---- the two failure modes ----
+SAVEPOINT r1		-
+ALTER TABLE "rc" RENAME COLUMN "nosuchcolumn" TO "x"	!42703 column "nosuchcolumn" does not exist
+ROLLBACK TO r1		-
+SAVEPOINT r2		-
+ALTER TABLE "rc" RENAME COLUMN "title" TO "qty"	!42701 column "qty" of relation "rc" already exists
+ROLLBACK TO r2		-
+SAVEPOINT r3		-
+ALTER TABLE "nosuchtable" RENAME COLUMN "a" TO "b"	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO r3		-
+# ---- renaming to the name it already has ----
+SAVEPOINT r4		-
+ALTER TABLE "rc" RENAME COLUMN "title" TO "title"	!42701 column "title" of relation "rc" already exists
+ROLLBACK TO r4		-
+# ---- ALTER TABLE ... RENAME TO, the neighbour (12 tests / 3 files) ----
+ALTER TABLE "rc" RENAME TO "rc2"		-
+SELECT 'r', relname FROM pg_class WHERE relname IN ('rc','rc2')	text,name	r|rc2
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'rc_id_seq'	text,bigint	r|1
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'rc2' ORDER BY indexname	text,name	r|index_rc_on_name ; r|index_rc_on_qty ; r|rc_pkey
+SELECT 'r', pg_get_serial_sequence('rc2', 'pk')	text,text	r|public.rc_id_seq
+# ---- and what AR sends after it, to keep the sequence's name in step (schema_statements.rb:474) --
+ALTER TABLE "rc_id_seq" RENAME TO "rc2_pk_seq"		-
+SELECT 'r', pg_get_serial_sequence('rc2', 'pk')	text,text	r|public.rc2_pk_seq
+INSERT INTO rc2 (title, qty) VALUES ('three', 3)		-
+SELECT 'r', count(*) FROM rc2		r|3
+DROP VIEW rc_view		-
+DROP TABLE rc2		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('rc','rc2','rc_view','rc_id_seq','rc2_pk_seq')	bigint	0

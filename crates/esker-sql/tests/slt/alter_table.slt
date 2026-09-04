@@ -259,3 +259,57 @@ ALTER TABLE dc DROP COLUMN nosuch
 
 statement ok
 ALTER TABLE dc DROP COLUMN IF EXISTS nosuch
+
+# --- RENAME COLUMN and RENAME TO: only the name moves, the ordinal does not ---
+
+statement ok
+CREATE TABLE rn (id int8 PRIMARY KEY, name text, qty int8)
+
+statement ok
+INSERT INTO rn VALUES (1, 'one', 10)
+
+statement ok
+CREATE INDEX index_rn_on_qty ON rn (qty)
+
+statement ok
+ALTER TABLE rn RENAME COLUMN name TO title
+
+# The row written under the old name reads under the new one: a rename does not move the column,
+# and the ordinal is what the row codec decodes at.
+query ITI rowsort
+SELECT id, title, qty FROM rn
+----
+1	one	10
+
+statement error (42703)
+SELECT name FROM rn
+
+# A name already taken is 42701, including renaming a column to the name it already has.
+statement error (42701)
+ALTER TABLE rn RENAME COLUMN title TO qty
+
+statement error (42701)
+ALTER TABLE rn RENAME COLUMN title TO title
+
+statement error (42703)
+ALTER TABLE rn RENAME COLUMN nosuchcolumn TO x
+
+# The table form, whose indexes keep their own names — which is why ActiveRecord follows it with
+# an explicit rename for the sequence.
+statement ok
+ALTER TABLE rn RENAME TO rn2
+
+query I rowsort
+SELECT count(*) FROM rn2
+----
+1
+
+query T rowsort
+SELECT indexname FROM pg_indexes WHERE tablename = 'rn2'
+----
+index_rn_on_qty
+rn_pkey
+
+# The old name is free again, and the second table's derived key is numbered rather than refused.
+statement ok
+CREATE TABLE rn (id int8 PRIMARY KEY)

@@ -1946,6 +1946,26 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
         // `ADD COLUMN` in the same one — which the loop this sits in already allows. `sqlparser`
         // additionally reads `DROP COLUMN a, b` as one action naming two columns, so the names
         // are a list here and each becomes its own action.
+        if let AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } = operation
+        {
+            actions.push(plan::AlterTableAction::RenameColumn {
+                from: ident(old_column_name),
+                to: ident(new_column_name),
+            });
+            continue;
+        }
+        if let AlterTableOperation::RenameTable { table_name } = operation {
+            // `AS` is MySQL's spelling of the same thing; PostgreSQL writes `TO` and that is what
+            // `rename_table` sends, so the other one is named rather than quietly accepted.
+            let sqlparser::ast::RenameTableNameKind::To(name) = table_name else {
+                return Err(SqlError::unsupported("ALTER TABLE ... RENAME AS"));
+            };
+            actions.push(plan::AlterTableAction::RenameTo(relation_name(name)?));
+            continue;
+        }
         if let AlterTableOperation::DropConstraint {
             name,
             if_exists,

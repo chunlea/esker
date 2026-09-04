@@ -122,10 +122,16 @@ pub(super) fn create_table(
         // **`<partition>_pkey`, not the parent's name.** A partition's key is its own relation and
         // its own `pg_index` row, and it is that name a duplicate row quotes back — measured,
         // `pk_part_1_pkey` rather than `pk_part_pkey`.
-        let name = create
-            .primary_key_name
-            .clone()
-            .unwrap_or_else(|| plan::primary_key_name(&create.name));
+        // **A *derived* name that is taken gets a number; a *given* one is an error.** That is
+        // PostgreSQL's rule and it is reachable now that a table can be renamed: after
+        // `ALTER TABLE rr RENAME TO rr2` the old key is still `rr_pkey`, so a new `rr` derives
+        // the same string — measured, a real server names the second one `rr_pkey1`. Refusing
+        // instead would make "rename it out of the way and recreate it" fail, which is an
+        // ordinary migration.
+        let name = match &create.primary_key_name {
+            Some(given) => given.clone(),
+            None => free_derived_name(txn, executor, &plan::primary_key_name(&create.name))?,
+        };
         (columns, primary_key, name)
     };
 
@@ -1780,6 +1786,118 @@ fn add_unique_constraint(
     Ok(())
 }
 
+/// The derived name, or the first `<name><n>` that nothing answers to.
+///
+/// **Only for names this node derives.** PostgreSQL uniquifies a name it made up and refuses one
+/// the user gave, and the difference matters: a migration that renames a table and recreates the
+/// old name expects the second key to be numbered, while a `CONSTRAINT c` that collides is a
+/// mistake worth reporting. Measured: after a rename, a new table's key is `<table>_pkey1`.
+fn free_derived_name(txn: &dyn Txn, executor: &Executor, derived: &str) -> Result<String> {
+    if !catalog::name_exists(txn, executor.tenant, derived)? {
+        return Ok(derived.to_owned());
+    }
+    for suffix in 1..u32::MAX {
+        let candidate = format!("{derived}{suffix}");
+        if !catalog::name_exists(txn, executor.tenant, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(SqlError::DuplicateTable(derived.to_owned()))
+}
+
+/// `ALTER TABLE … RENAME COLUMN <from> TO <to>`.
+///
+/// **Only `attname` changes.** The column keeps its ordinal, so every index, constraint, default
+/// and primary key goes on pointing at the same attribute — they all reference a column by
+/// *position* here — and everything that renders a definition renders the new name for free. That
+/// is what makes this a one-field write rather than a rewrite, and it is what a real server does
+/// too.
+///
+/// Two failure modes and they are different codes: a column that is not there is `42703` with the
+/// short sentence (no relation named), and a name already taken is `42701` — **including renaming
+/// a column to the name it already has**, measured.
+fn rename_column(updated: &mut TableDef, relation: &str, from: &str, to: &str) -> Result<()> {
+    let Some(at) = updated.column(from) else {
+        return Err(SqlError::UndefinedColumn(from.to_owned()));
+    };
+    if updated.live_column(to).is_some() {
+        return Err(SqlError::DuplicateColumnInRelation {
+            column: to.to_owned(),
+            relation: relation.to_owned(),
+        });
+    }
+    // **A stored expression names the column as text and would not follow it.** A `CHECK`, an
+    // `EXCLUDE` key or an index predicate is kept as the text the user wrote and re-lowered per
+    // write, so renaming a column one of them mentions would leave a constraint that cannot
+    // resolve — a table that stops accepting rows, which is worse than a refusal. A real server
+    // re-renders these from the attnum and does not care; this node names the constraint and
+    // refuses until the same is true here. `DROP COLUMN` finds its dependents the same way.
+    let mut renamed = updated.clone();
+    renamed.columns[at].name.clear();
+    renamed.columns[at].name.push_str(to);
+    if let Some(named) = unresolvable_after(&renamed) {
+        return Err(SqlError::unsupported(format!(
+            "renaming {from}, which {named} is written in terms of"
+        )));
+    }
+    updated.columns[at].name.clear();
+    updated.columns[at].name.push_str(to);
+    Ok(())
+}
+
+/// The first stored expression that no longer resolves against the table, by the name of what
+/// carries it.
+fn unresolvable_after(table: &TableDef) -> Option<String> {
+    for check in &table.checks {
+        if !resolves(table, &check.expr) {
+            return Some(format!("the constraint {}", check.name));
+        }
+    }
+    for exclude in &table.excludes {
+        if !resolves(table, &exclude.key)
+            || exclude
+                .predicate
+                .as_deref()
+                .is_some_and(|predicate| !resolves(table, predicate))
+        {
+            return Some(format!("the constraint {}", exclude.name));
+        }
+    }
+    for index in &table.indexes {
+        if index
+            .predicate
+            .as_deref()
+            .is_some_and(|predicate| !resolves(table, predicate))
+        {
+            return Some(format!("the index {}", index.name));
+        }
+    }
+    None
+}
+
+/// `ALTER TABLE … RENAME TO <name>` — the table itself.
+///
+/// **The indexes and the sequence keep their own names**, measured: after renaming `rc` to `rc2`
+/// the indexes are still `index_rc_on_name` and the sequence still `rc_id_seq`, which is why
+/// `ActiveRecord` follows this with an explicit `ALTER TABLE <seq> RENAME TO` (`:474`). A node that
+/// renamed them helpfully would answer that follow-up with `42P01`.
+///
+/// The old name record is removed by `catalog::replace_table`, which reconciles a table's name the
+/// way it reconciles an index's — the rule the primary key's leak taught it.
+fn rename_table(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    to: &str,
+) -> Result<()> {
+    if catalog::name_exists(&*txn, executor.tenant, to)? {
+        return Err(SqlError::DuplicateTable(to.to_owned()));
+    }
+    updated.name.clear();
+    updated.name.push_str(to);
+    Ok(())
+}
+
 /// `ALTER TABLE … DROP CONSTRAINT [IF EXISTS] <name> [CASCADE]`. Answers whether anything changed,
 /// which is `false` only for `IF EXISTS` on a name that is nothing.
 ///
@@ -3045,6 +3163,16 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::AddUnique(constraint) = action {
             add_unique_constraint(txn, executor, &mut updated, constraint)?;
+            changed = true;
+            continue;
+        }
+        if let AlterTableAction::RenameColumn { from, to } = action {
+            rename_column(&mut updated, &alter.name, from, to)?;
+            changed = true;
+            continue;
+        }
+        if let AlterTableAction::RenameTo(name) = action {
+            rename_table(txn, executor, &mut updated, name)?;
             changed = true;
             continue;
         }
