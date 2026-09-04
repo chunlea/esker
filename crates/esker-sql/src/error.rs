@@ -2232,6 +2232,9 @@ impl SqlError {
     /// It is the part of a `23505` a user actually reads — the constraint name says *which* rule
     /// was broken and the detail says *what broke it*.
     #[must_use]
+    // One arm per condition that has a detail, the same table `sqlstate` is and for the same
+    // reason: the sentence a client reads sits beside the variant it belongs to.
+    #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
             SqlError::CreateInSystemSchema(_) => {

@@ -916,8 +916,11 @@ pub fn view(name: &str) -> Option<CatalogView> {
         .find(|view| view.name() == name)
 }
 
-/// The view an **oid** is, if it is one — the inverse of the reserved ids [`CatalogView::id`]
+/// The view an **oid** is, if it is one — the inverse of the reserved ids `CatalogView::id`
 /// hands out, and what makes `<oid>::regclass` print a catalog relation's name.
+///
+/// The name is written plainly rather than linked: `id` is private, and a public item's doc may
+/// not link to one under `RUSTDOCFLAGS="-D warnings"`.
 #[must_use]
 pub fn view_by_oid(oid: i64) -> Option<CatalogView> {
     CatalogView::ALL
