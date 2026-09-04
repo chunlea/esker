@@ -1,0 +1,21 @@
+docs/adr/0055-pd-is-a-raft-group.md
+  s_b20cd111ee22fe::t_3737c6ebca128a 1-191
+docs/plans/phase-15-pd-ha.md
+  s_b20cd111ee22fe::t_8fa1258ce2fa8f 1-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fae2b8b2194558be35ac79ae77bdb167c56c0eb0",
+  "prompts": {},
+  "sessions": {
+    "s_b20cd111ee22fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d47fb1f-9385-4f6f-88a7-2a1d2aaf1b64",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
