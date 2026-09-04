@@ -2236,19 +2236,58 @@ impl Execute for Executor {
         // is run, so a placeholder of the right type is all the planner needs to answer the shape.
         let mut statement = statement;
         bind::substitute_placeholders(&mut statement, &types);
+        // **A derived table has no shape until its sub-select is planned**, and the shape is the
+        // whole of what a `Describe` answers. `Executor::plan_select` does this before it plans;
+        // here it was skipped, so `FROM (SELECT …) AS x` reached the planner as a relation with
+        // nothing behind it and came back `XX000 a derived table reached the planner without a
+        // shape` — a code that says *this server has a bug* about a statement it runs perfectly
+        // well through the simple protocol.
+        if let Statement::Select(select) = &mut statement
+            && subquery::present(select)
+        {
+            let catalogued = Catalogued {
+                exec: self,
+                txn: &*txn,
+            };
+            subquery::plan_subqueries(select, self.tenant, &*txn, &catalogued, None)?;
+        }
         let fields = match &statement {
-            Statement::Select(select) => Some(
-                query::plan(
-                    select,
-                    self.tenant,
-                    tables.first().map(AsRef::as_ref),
-                    &tables.iter().skip(1).map(AsRef::as_ref).collect::<Vec<_>>(),
-                )?
-                .columns
-                .into_iter()
-                .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
-                .collect(),
-            ),
+            // **The relations are resolved here, not read out of `tables` by position.**
+            // `tables` comes from `bind::table_names`, which is built for parameter *typing*: a
+            // name appearing twice is one name to type against and a name the catalog does not
+            // have is nothing to type against, so that list de-duplicates and it drops. Both are
+            // right for typing and wrong for a position — a **self-join**'s two entries collapsed
+            // into one and left this planning a one-join `SELECT` with nothing to join to, which
+            // is `42P01` for a table that is right there. Seventeen of run 51's forty-seven
+            // `relation "…" does not exist` were `topics` alone, because `Reply < Topic` makes
+            // `Topic.joins(:replies)` a self-join.
+            //
+            // So it resolves the way `Executor::plan_select` does, off the statement's own `FROM`
+            // and joins, which is also the only reading that a derived table cannot shift.
+            Statement::Select(select) => {
+                let catalogued = Catalogued {
+                    exec: self,
+                    txn: &*txn,
+                };
+                let from = match &select.from {
+                    Some(table) => Some(subquery::relation_of(table, &catalogued)?),
+                    None => None,
+                };
+                let inners = select
+                    .joins
+                    .iter()
+                    .map(|join| subquery::relation_of(&join.table, &catalogued))
+                    .collect::<Result<Vec<_>>>()?;
+                let inner_refs: Vec<&crate::catalog::TableDef> =
+                    inners.iter().map(AsRef::as_ref).collect();
+                Some(
+                    query::plan(select, self.tenant, from.as_deref(), &inner_refs)?
+                        .columns
+                        .into_iter()
+                        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
+                        .collect(),
+                )
+            }
             Statement::Explain(..) => Some(vec![FieldDescription::computed(
                 "QUERY PLAN",
                 ColumnType::Text,

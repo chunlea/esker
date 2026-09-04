@@ -89,6 +89,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         // a gap costs nothing and a guess about why it is there costs a reader.
         ColumnType::Hstore => 27,
         ColumnType::HstoreArray => 28,
+        ColumnType::Citext => 29,
     }
 }
 
@@ -121,6 +122,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         24 => ColumnType::TextArray,
         27 => ColumnType::Hstore,
         28 => ColumnType::HstoreArray,
+        29 => ColumnType::Citext,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

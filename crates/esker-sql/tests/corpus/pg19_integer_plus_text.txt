@@ -1,0 +1,70 @@
+# `operator does not exist: integer + text` — and the **bind parameter** actually behind it.
+#
+# Run 51's top shape: **282 + 38 tests over 44 files**. The board's wording invites the wrong fix,
+# and r1's capture (`captures/pg19_integer_plus_text.txt`) says so in its first paragraph: **no test
+# adds a string to a number.** The statement was traced out of a failing file with the runner's own
+# SQL hook and it is `ActiveRecord`'s counter-cache update —
+#
+#     UPDATE "posts" SET "tags_count" = COALESCE("posts"."tags_count", 0) + $1 WHERE "posts"."id" = $2
+#
+# — in which there is no `text` at all. `$1` is a bind parameter, and this node resolved it to
+# `text` before looking at what it was being added to.
+#
+# **This is a `bind` corpus and r1's is not**, and that is the one deliberate difference. r1
+# observed PostgreSQL's resolution through `PREPARE` and `pg_prepared_statements.parameter_types`,
+# which is the only way to see it in the simple protocol — and this node has neither. The extended
+# protocol is where the bug actually lives and where `ActiveRecord` actually is, so the same
+# statements are re-captured through `psql`'s `\bind`, which sends Parse/Bind/Execute with
+# **untyped** parameters. `PREPARE` would have typed them from the DDL and the resolution under
+# test would never have happened.
+#
+#   sql <tab> [json params] <tab> types <tab> rows
+#
+# **The transaction statements are captured and then dropped from the file.** The oracle side runs
+# inside `BEGIN … ROLLBACK` with the error probes in `SAVEPOINT`/`ROLLBACK TO`, so it leaves nothing
+# behind; the bind harness replays each statement on its own with no block around it, so a `BEGIN`
+# here would be measuring the harness rather than the shape. The answers are the ones the oracle
+# gave inside its block, and the corpus builds and drops its own table.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`unknown` is not `text`.** `SELECT 1 + '2'` is `3`: the literal is `unknown` and resolves to
+#     `integer`. `pg_typeof('2')` is **`unknown`**, and only an explicit `'2'::text` has no `+` with
+#     an integer. A node that defaults an unresolved literal or parameter to `text` turns every one
+#     of these into a missing operator, which is exactly what this shape is.
+#   * **A parameter's type comes from where it is used**, and that includes through `COALESCE`:
+#     `COALESCE(c, 0) + $1` makes `$1` an `integer`. `title || $1` makes it a `text`. The context
+#     decides, not a default.
+#   * **Two parameters with nothing to resolve against is the error case**, and it is
+#     `42725 operator is not unique: unknown + unknown` — *not* `42P18`, and not a missing operator.
+#     That is what genuinely undecidable looks like.
+#   * **`1 + 'x'` is `22P02 invalid input syntax for type integer: "x"`**, not a missing operator:
+#     the literal resolved to `integer` and then failed to *read* as one. Same resolution, different
+#     failure, and a node that refuses the operator instead reports the wrong thing.
+#   * **`||` is not `+`.** `text || integer` resolves happily and `1::text || '2'` is `12`.
+#   * `1 + NULL` is NULL and its type is `integer` — a NULL resolves like any other unknown.
+#   * There are **no** `+` operators with `text` on either side in `pg_operator`, which is what
+#     "does not exist" is read out of.
+CREATE TABLE posts (id serial primary key, tags_count integer DEFAULT 0, title character varying(255))	[]		-
+INSERT INTO posts (id, tags_count, title) VALUES (1, 5, 'one')	[]		-
+UPDATE "posts" SET "tags_count" = COALESCE("posts"."tags_count", 0) + $1 WHERE "posts"."id" = $2	[1,1]		-
+SELECT 'r', id, tags_count FROM posts ORDER BY id	[]		r|1|6
+UPDATE "posts" SET "tags_count" = COALESCE("posts"."tags_count", 0) + $1 WHERE "posts"."id" = $2	[-2,1]		-
+SELECT 'r', id, tags_count FROM posts ORDER BY id	[]		r|1|4
+SELECT 'r', 1 + $1	[4]	text,integer	r|5
+SELECT 'r', COALESCE(NULL::integer, 0) + $1	[4]	text,integer	r|4
+SELECT 'r', tags_count + $1 FROM posts	[2]		r|6
+SELECT 'r', title || $1 FROM posts	["!"]		r|one!
+SELECT 'r', $1 + $2	[1,2]		!42725 operator is not unique: unknown + unknown DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
+SELECT 'r', 1 + '2'	[]	text,integer	r|3
+SELECT 'r', pg_typeof(1 + '2'), pg_typeof('2'), pg_typeof('2'::text)	[]	text,regtype,regtype,regtype	r|integer|unknown|text
+SELECT 'r', 1 + 'x'	[]		!22P02 invalid input syntax for type integer: "x"
+SELECT 'r', 1 + '2'::text	[]		!42883 operator does not exist: integer + text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', '2'::text + 1	[]		!42883 operator does not exist: text + integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', tags_count + title FROM posts	[]		!42883 operator does not exist: integer + character varying DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', 1 + '2'::integer, 1 + '2'::numeric, 1 + '2'::text::integer, 1::text || '2'	[]	text,integer,numeric,integer,text	r|3|3|3|12
+SELECT 'r', pg_typeof(1 + '2'::numeric), pg_typeof(1::text || '2')	[]	text,regtype,regtype	r|numeric|text
+SELECT 'r', 1 + NULL IS NULL, pg_typeof(1 + NULL)	[]	text,boolean,regtype	r|t|integer
+SELECT 'r', count(*) FROM pg_operator WHERE oprname = '+' AND 'text'::regtype IN (oprleft, oprright)	[]	text,bigint	r|0
+DROP TABLE posts	[]		-
+SELECT count(*) FROM pg_class WHERE relname = 'posts'	[]	bigint	0

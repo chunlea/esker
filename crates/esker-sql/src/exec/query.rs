@@ -2210,14 +2210,13 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                         })),
                     }
                 }
-                // **`hstore` is stored as text, so the value cannot say what it is.** The static
-                // type can — the same reason an enum is folded above, and the same fix: the name
-                // is known here and nowhere else. Only for the types whose storage is another
-                // type's; everything else still reads the value, which is what makes
-                // `pg_typeof` of an aggregate over no rows NULL.
+                // **`hstore[]` alone still needs the static type**: an array's elements carry
+                // theirs and the array does not, so the value cannot say which array it is.
+                // `hstore` itself no longer needs this — `Datum::Hstore` says so — and neither
+                // does `citext`, which is why the list is one entry rather than three.
                 (crate::plan::CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     match expr_type(arg, scope) {
-                        Ok(ty @ (ColumnType::Hstore | ColumnType::HstoreArray)) => {
+                        Ok(ty @ ColumnType::HstoreArray) => {
                             Expr::Literal(Literal::String(ty.name().to_owned()))
                         }
                         _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
@@ -2542,6 +2541,8 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Jsonb => 5,
             // A family of its own: an hstore compares only with an hstore.
             ColumnType::Hstore => 27,
+            // Its own family: a citext compares only with a citext and with an `unknown`.
+            ColumnType::Citext => 28,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
@@ -3320,6 +3321,23 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // A sequence function answers `bigint` on a real server, all four of them.
         Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
         // Every catalog function returns `text`, which is what makes them one variant.
+        // **`||` is spelled the same for three types**, and its result is its operands': an
+        // hstore concatenation is an hstore and everything else is `text` — measured,
+        // `pg_typeof('x'::citext || 'y')` is `text`. This works only because a folded
+        // `'a=>b'::hstore` constant is a `Datum::Hstore` and not a `Datum::Text`; while it was the
+        // latter, the type was gone by the time anything could ask, and the two concatenations
+        // were indistinguishable.
+        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::HstoreConcat => {
+            let hstore = call
+                .args
+                .iter()
+                .any(|arg| matches!(expr_type(arg, scope), Ok(ColumnType::Hstore)));
+            if hstore {
+                ColumnType::Hstore
+            } else {
+                ColumnType::Text
+            }
+        }
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 

@@ -1,0 +1,92 @@
+# `citext` as a **column type and a value** — what `citext_test.rb` sends, as PostgreSQL 19beta1
+# answers it.
+#
+# The other half of run 47's ranking row 7 (`extension "…" is not available`, 114 tests over 9
+# files); `tests/corpus/pg19_hstore.txt` is the first half and `captures/pg19_extensions.txt` pins
+# the install mechanics, which this file does not repeat.
+#
+# **Derived from `esker-rails-harness/captures/pg19_hstore_citext.txt` and re-captured on its own**,
+# for the reason the hstore corpus says: r1's file measures both types in one stateful session, so
+# replaying it whole makes one type's gap swallow the other's statements. Every answer they share is
+# byte-identical to r1's. Six statements were added here and are marked below — the ones that decide
+# how the type has to be *built*, which the suite's own statements do not.
+#
+# The `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing behind, and both answer 0.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`citext` is not `text` with a `lower()` around it, and the suite asserts exactly that**:
+#     `test_case_insensitiveness` requires `ActiveRecord` to emit **no** `lower(...)`, so `=` itself
+#     folds case. `'ABC'::citext = 'abc'` is `t` where the same comparison over `text` is `f`.
+#   * **This database cannot tell citext's *ordering* from `text`'s**, and that is worth knowing
+#     before writing a test that thinks it can: the container's collation is `en_US.utf8`, under
+#     which `'B' < 'a'` is already `f` for plain `text`. So `'B'::citext < 'a'::citext` being `f`
+#     proves nothing, and the ordering probe is here to record that it proves nothing. What
+#     separates the two types on this oracle is **equality**, and everything that follows from it:
+#     `DISTINCT`, `GROUP BY`, and a unique index.
+#   * **`GROUP BY` keeps the first row's spelling**: two rows `Cased Text` and `CASED TEXT` are one
+#     group printed `Cased Text`, and `count(DISTINCT cival)` is 1. The value that comes *back* is
+#     the one that was stored, never a folded one — `SELECT cival WHERE cival = 'cased text'`
+#     answers `Cased Text`.
+#   * **A unique index over citext folds case, and that is what the suite needs it for**:
+#     `validates_uniqueness_of` is enforced by one, and the index cannot even be *built* over two
+#     rows differing only in case — `23505 could not create unique index … Key (cival)=(Cased Text)
+#     is duplicated`, with the **stored** spelling in the DETAIL. The insert that then collides is
+#     the ordinary `23505 duplicate key value violates unique constraint`, quoting the **new**
+#     value's spelling.
+#   * **`lower`, `upper`, `length` and `||` all answer `text`**, not citext: `pg_typeof('x'::citext
+#     || 'y')` is `text`. The type is not preserved through a function or a concatenation, so only
+#     a column, a cast and a comparison carry it.
+#   * **The folding is not ASCII-only**: `'Ä'::citext = 'ä'::citext` is `t`. A build whose `lower`
+#     is ASCII-only answers `f` there and is wrong for every non-English application.
+#   * `indexdef` prints the index as `USING btree (cival)` with **no** `lower(...)` in it, which is
+#     the other half of what `test_case_insensitiveness` reads.
+BEGIN		-
+CREATE EXTENSION IF NOT EXISTS "citext"		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname IN ('citext') ORDER BY extname	text,name,text	r|citext|1.8
+SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('citext') ORDER BY t.typname	text,name,oid,"char",regproc,"char",oid,"char",smallint	r|citext|0|,|citextin|b|0|S|-1
+SELECT 'r', t.typname, t.oid = 0 AS oid_is_zero, t.typarray = 0 AS no_array_type FROM pg_type t WHERE t.typname IN ('citext') ORDER BY t.typname	text,name,boolean,boolean	r|citext|f|f
+SELECT 'r', pg_typeof('x'::citext)		r|citext
+DROP TABLE IF EXISTS cit		-
+CREATE TABLE cit (id serial primary key, cival citext)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"cit"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('cit_id_seq'::regclass)|t ; r|cival|citext|\N|f
+INSERT INTO cit (cival) VALUES ('Cased Text')		-
+SELECT 'r', cival FROM cit WHERE cival = 'cased text'		r|Cased Text
+SELECT 'r', 'ABC'::citext = 'abc'::citext, 'ABC'::citext = 'abc', 'ABC'::citext <> 'abd'		r|t|t|t
+SELECT 'r', 'ABC'::citext LIKE 'abc', 'ABC'::citext ILIKE 'abc', 'ABC'::citext ~~ 'abc'		r|t|t|t
+SELECT 'r', 'ABC'::citext < 'abd'::citext, 'ABC'::citext > 'abb'::citext		r|t|t
+SELECT 'r', 'B'::citext < 'a'::citext, 'B' < 'a', 'B'::citext > 'a'::citext		r|f|f|t
+SAVEPOINT s0		-
+SELECT 'r', string_agg(v::text, ' ; ' ORDER BY v) FROM (VALUES ('B'::citext),('a'),('C'),('b'),('A')) t(v)		r|a ; A ; B ; b ; C
+ROLLBACK TO SAVEPOINT s0		-
+SELECT 'r', lower('ABC'::citext), upper('abc'::citext)		r|abc|ABC
+SAVEPOINT s0b		-
+SELECT 'r', length('ABC'::citext)		r|3
+ROLLBACK TO SAVEPOINT s0b		-
+SELECT 'r', pg_typeof('x'::citext), pg_typeof(lower('X'::citext))		r|citext|text
+SAVEPOINT s0c		-
+SELECT 'r', pg_typeof('x'::citext || 'y')		r|text
+ROLLBACK TO SAVEPOINT s0c		-
+SELECT 'r', 'Ä'::citext = 'ä'::citext, 'STRASSE'::citext = 'strasse'::citext		r|t|t
+INSERT INTO cit (cival) VALUES ('CASED TEXT')		-
+SELECT 'r', count(*) FROM cit WHERE cival = 'cased text'		r|2
+SELECT 'r', count(DISTINCT cival) FROM cit		r|1
+SELECT 'r', cival FROM cit ORDER BY cival, id		r|Cased Text ; r|CASED TEXT
+SELECT 'r', cival, count(*) FROM cit GROUP BY cival		r|Cased Text|2
+SELECT 'r', cival = 'Cased Text' AS eq_exact, cival = 'CASED TEXT' AS eq_folded FROM cit ORDER BY id		r|t|t ; r|t|t
+SAVEPOINT s3		-
+CREATE UNIQUE INDEX cit_cival_uidx ON cit (cival)	!23505 could not create unique index "cit_cival_uidx" DETAIL: Key (cival)=(Cased Text) is duplicated.
+ROLLBACK TO s3		-
+DELETE FROM cit WHERE id = (SELECT max(id) FROM cit)		-
+CREATE UNIQUE INDEX cit_cival_uidx ON cit (cival)		-
+SAVEPOINT s4		-
+INSERT INTO cit (cival) VALUES ('cased text')	!23505 duplicate key value violates unique constraint "cit_cival_uidx" DETAIL: Key (cival)=(cased text) already exists.
+ROLLBACK TO s4		-
+SELECT 'r', indexdef FROM pg_indexes WHERE indexname = 'cit_cival_uidx'	text,text	r|CREATE UNIQUE INDEX cit_cival_uidx ON public.cit USING btree (cival)
+SELECT 'r', cival FROM cit WHERE cival = 'CASED TEXT'		r|Cased Text
+ALTER TABLE cit ADD COLUMN "username" citext		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"cit"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|cival|citext ; r|username|citext
+DROP TABLE cit		-
+ROLLBACK		-
+SELECT count(*) FROM pg_extension WHERE extname IN ('citext')	bigint	0
+SELECT count(*) FROM pg_class WHERE relname IN ('cit')	bigint	0

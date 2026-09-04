@@ -151,6 +151,15 @@ pub enum ColumnType {
     /// why nothing may hard-code it — a fixed one on this side is invisible to a client that
     /// reads it the way the adapter does.
     Hstore,
+    /// The `citext` extension's type: text whose **comparison folds case**.
+    ///
+    /// Stored exactly as it was written — `'Cased Text'` comes back `Cased Text` — and compared
+    /// through [`Datum::Citext`], which folds. That split is the whole type: the value is the
+    /// user's spelling and the *comparison* is the folded one, which is why it needs a `Datum` of
+    /// its own where `hstore` needed none. ADR 0042 named this shape in advance — a type may share
+    /// another's representation only if it shares its comparison, and citext shares neither
+    /// equality nor order with `text`.
+    Citext,
     /// `hstore[]`, which `hstore_test.rb` declares as `t.hstore "payload", array: true`.
     HstoreArray,
     /// Two-valued, with no third state but NULL.
@@ -233,7 +242,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Every type, for tests that must not silently skip one.
-    pub const ALL: [ColumnType; 27] = [
+    pub const ALL: [ColumnType; 28] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -243,6 +252,7 @@ impl ColumnType {
         ColumnType::Json,
         ColumnType::Jsonb,
         ColumnType::Hstore,
+        ColumnType::Citext,
         ColumnType::HstoreArray,
         ColumnType::Bool,
         ColumnType::Bytea,
@@ -285,6 +295,27 @@ pub enum Datum {
     /// [`ColumnType::Text`]. Always valid UTF-8: the server encoding is UTF8, and bytes that are
     /// not are refused on the way in the way PostgreSQL refuses them.
     Text(String),
+    /// [`ColumnType::Hstore`]: the map, as its canonical text.
+    ///
+    /// A variant of its own for the reason [`Datum::Citext`] is one, arrived at the same way: a
+    /// cast of a constant folds at plan time, and a folded `'a=>b'::hstore` that came out as a
+    /// `Text` had lost the only thing that said it was an hstore — so `pg_typeof` over it answered
+    /// `text` and `||` could not tell which concatenation it was. Its **comparison is `text`'s**,
+    /// unlike citext's, because the canonical form is a function of the content.
+    Hstore(String),
+    /// [`ColumnType::Citext`]: the text **as it was written**, compared **folded**.
+    ///
+    /// A variant of its own rather than a `Text` under a different column type, because the
+    /// difference is in the *comparison* and a comparison sees only the values — which is exactly
+    /// what ADR 0042 said would eventually be needed and why it left `jsonb` refused instead of
+    /// guessing. `'Cased Text'` is stored and returned with its capitals; `=`, `pg_cmp`, `DISTINCT`
+    /// and a unique index all fold it.
+    ///
+    /// **`PartialEq` stays bitwise** — it is what the round-trip tests assert and it is not SQL
+    /// equality for any type here (`esker_sql::value::PgDatum::pg_cmp` disagrees with it for
+    /// floats too, and is named in text rather than linked for the reason the module doc gives:
+    /// it is in the crate above this one).
+    Citext(String),
     /// [`ColumnType::Bool`].
     Bool(bool),
     /// [`ColumnType::Bytea`].
@@ -368,7 +399,18 @@ impl PartialEq for Datum {
                     && left_days == right_days
                     && left_micros == right_micros
             }
-            (Datum::Text(a), Datum::Text(b)) => a == b,
+            // **Representation equality, and for citext that is the *unfolded* spelling** — this
+            // asks whether a round trip preserved the value, and `'Cased Text'` and `'CASED TEXT'`
+            // are different rows however they compare. `pg_cmp` is where the folding is, exactly
+            // as it is where `1.0` and `1.00` are compared as numbers.
+            //
+            // **A missing arm here is not a compile error**, because this impl is written pair by
+            // pair and falls through to `false`: citext arrived without one and was never equal to
+            // itself, which `any_row_survives_encode_and_decode` caught and nothing else would
+            // have. Adding a `Datum` variant means adding a line here.
+            (Datum::Text(a), Datum::Text(b))
+            | (Datum::Citext(a), Datum::Citext(b))
+            | (Datum::Hstore(a), Datum::Hstore(b)) => a == b,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
             // Bitwise, so a round-trip test cannot pass by turning -0.0 into 0.0 or one NaN
@@ -389,6 +431,8 @@ impl Datum {
         Some(match self {
             Datum::Null => return None,
             Datum::Int8(_) => ColumnType::Int8,
+            Datum::Citext(_) => ColumnType::Citext,
+            Datum::Hstore(_) => ColumnType::Hstore,
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Date(_) => ColumnType::Date,
             Datum::Time(_) => ColumnType::Time,
@@ -429,8 +473,7 @@ impl Datum {
                 | ColumnType::Varchar
                 | ColumnType::Bpchar
                 | ColumnType::Json
-                | ColumnType::Jsonb
-                | ColumnType::Hstore,
+                | ColumnType::Jsonb,
             ) => true,
             (Some(actual), wanted) => actual == wanted,
         }

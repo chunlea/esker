@@ -1007,13 +1007,20 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
                 .map_or("unknown", crate::value::PgType::name)
         ))
     };
+    // **At least one operand has to be a real hstore.** A `Datum::Text` is accepted only as the
+    // `unknown` literal beside one — `h @> 'a=>b'` is how the suite writes containment — and never
+    // on its own: `||` is spelled the same for text, and reading *both* sides as hstores turned
+    // `title || $1` into `42601 syntax error in hstore` where a real server concatenates two
+    // strings. An operator this crate carries for one type must not answer for another's.
+    let anchored = args.iter().any(|value| matches!(value, Datum::Hstore(_)));
     let map = |value: Option<&Datum>| match value {
-        Some(Datum::Text(text)) => hstore::from_text(text).map(Some),
+        Some(Datum::Hstore(text)) => hstore::from_text(text).map(Some),
+        Some(Datum::Text(text)) if anchored => hstore::from_text(text).map(Some),
         Some(Datum::Null) | None => Ok(None),
         other => Err(wrong_type(other)),
     };
     let text = |value: Option<&Datum>| match value {
-        Some(Datum::Text(text)) => Ok(Some(text.clone())),
+        Some(Datum::Text(text) | Datum::Citext(text)) => Ok(Some(text.clone())),
         Some(Datum::Null) | None => Ok(None),
         other => Err(wrong_type(other)),
     };
@@ -1050,7 +1057,7 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
         CatalogFunc::HstoreConcat => match (map(args.first())?, map(args.get(1))?) {
             (Some(mut left), Some(right)) => {
                 left.extend(right);
-                Datum::Text(hstore::to_text(&left))
+                Datum::Hstore(hstore::to_text(&left))
             }
             _ => Datum::Null,
         },
@@ -1122,7 +1129,7 @@ fn build_hstore(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
         }
         _ => return Datum::Null,
     }
-    Datum::Text(hstore::to_text(&out))
+    Datum::Hstore(hstore::to_text(&out))
 }
 
 /// The three functions `crate::value::range` answers: `daterange`, `isempty` and `&&`.
@@ -1197,7 +1204,7 @@ fn range_argument(value: Option<&Datum>) -> Result<Option<crate::value::range::D
 fn like_text(value: &Datum) -> Result<Option<String>> {
     match value {
         Datum::Null => Ok(None),
-        Datum::Text(text) => Ok(Some(text.clone())),
+        Datum::Text(text) | Datum::Citext(text) => Ok(Some(text.clone())),
         other => Err(SqlError::UndefinedOperator {
             op: "~~",
             left: other.column_type().map_or_else(
@@ -1358,6 +1365,11 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         } => {
             let subject = evaluate_in(operand, row, env)?;
             let pattern_value = evaluate_in(pattern, row, env)?;
+            // **A citext folds `LIKE` too**, which is the type's own rule rather than the
+            // statement's: `'ABC'::citext LIKE 'abc'` is `t` where the same `LIKE` over `text` is
+            // `f`, and `citext_test.rb` reads it. So `ILIKE` and a citext operand are two roads to
+            // the same fold.
+            let case_insensitive = &(*case_insensitive || matches!(subject, Datum::Citext(_)));
             match (like_text(&subject)?, like_text(&pattern_value)?) {
                 (Some(subject), Some(pattern)) => {
                     let fold = |text: String| {
@@ -1403,7 +1415,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         }
         Expr::Scalar { func, operand } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
-            Datum::Text(text) => Datum::Text(match func {
+            // **A citext is binary-coercible to `text`**, so every text function takes one — and
+            // the *result* is a `text`, not a citext: measured, `pg_typeof(lower('X'::citext))` is
+            // `text`. The type survives a column, a cast and a comparison, and nothing else.
+            Datum::Text(text) | Datum::Citext(text) => Datum::Text(match func {
                 crate::plan::ScalarFunc::Lower => text.to_lowercase(),
                 crate::plan::ScalarFunc::Upper => text.to_uppercase(),
                 // Unreachable: the arm above catches `abs` before this one is tried.

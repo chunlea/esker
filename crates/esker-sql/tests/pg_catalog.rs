@@ -236,6 +236,7 @@ fn activerecord_s_four_type_map_queries_answer() {
             // orders by oid — the adapter reads the name and the input function, both of which
             // are what a real server's are.
             vec!["16400", "hstore", "0", ",", "hstore_in", "\\N", "b", "0"],
+            vec!["16402", "citext", "0", ",", "citextin", "\\N", "b", "0"],
         ]
     );
 

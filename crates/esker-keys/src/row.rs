@@ -144,7 +144,9 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Bool(v) => out.push(u8::from(*v)),
         Datum::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
         Datum::Real(v) => out.extend_from_slice(&v.to_le_bytes()),
-        Datum::Text(v) => {
+        // **A citext is stored as it was written** — the folding is the comparison's, not the
+        // value's, so the row keeps the user's capitals and only the key below is folded.
+        Datum::Text(v) | Datum::Citext(v) | Datum::Hstore(v) => {
             varint::put_u64(v.len() as u64, out);
             out.extend_from_slice(v.as_bytes());
         }
@@ -390,6 +392,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Hstore
+        | ColumnType::Citext
         | ColumnType::Bytea => {
             let (len, consumed) = varint::get_u64(bytes)
                 .map_err(|error| corrupt(format!("column length: {error}")))?;
@@ -398,18 +401,20 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (body, rest) = bytes[consumed..]
                 .split_at_checked(len)
                 .ok_or_else(|| corrupt(format!("a column of {len} bytes is truncated")))?;
-            let value = if matches!(
-                ty,
+            let value = match ty {
+                // **A citext comes back as a citext**, not as a `Text` under a different column
+                // type: the difference between the two is the *comparison*, and a comparison sees
+                // only values. A row that decoded to `Datum::Text` would sort, group and
+                // deduplicate by bytes — which is what it did before this line, and what made
+                // `count(DISTINCT cival)` answer 2 where a real server says 1.
+                ColumnType::Citext => Datum::Citext(text_from_utf8(body)?),
                 ColumnType::Text
-                    | ColumnType::Varchar
-                    | ColumnType::Bpchar
-                    | ColumnType::Json
-                    | ColumnType::Jsonb
-                    | ColumnType::Hstore
-            ) {
-                Datum::Text(text_from_utf8(body)?)
-            } else {
-                Datum::Bytea(body.to_vec())
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Json
+                | ColumnType::Jsonb => Datum::Text(text_from_utf8(body)?),
+                ColumnType::Hstore => Datum::Hstore(text_from_utf8(body)?),
+                _ => Datum::Bytea(body.to_vec()),
             };
             (value, rest)
         }
@@ -551,7 +556,13 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // Sign-magnitude does not sort as an integer does, and PostgreSQL has fewer floats than
         // IEEE has; `sort_bits_of_f64` handles both.
         Datum::Double(v) => codec::encode_u64(sort_bits_of_f64(*v), out),
-        Datum::Text(v) => codec::encode_bytes(v.as_bytes(), out),
+        // An hstore's key is its canonical text: its comparison *is* text's, unlike citext's.
+        Datum::Text(v) | Datum::Hstore(v) => codec::encode_bytes(v.as_bytes(), out),
+        // **The key is the folded value**, which is the whole of how citext works: byte order over
+        // folded bytes is case-insensitive order, byte equality over them is case-insensitive
+        // equality, and a unique index therefore refuses two rows differing only in case — which
+        // is what `validates_uniqueness_of` is enforced by. The *row* still holds the spelling.
+        Datum::Citext(v) => codec::encode_bytes(v.to_lowercase().as_bytes(), out),
         Datum::Bytea(v) => codec::encode_bytes(v, out),
         // **The one encoding here that normalises**, and it has to: `1.0` and `1.00` are
         // different values of this type that *compare equal*, and an index key whose bytes
@@ -644,6 +655,22 @@ fn decode_array(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
 /// A dimension or a lower bound, which are `i32` on a real server too.
 fn narrow_dimension(value: i64) -> Result<i32> {
     i32::try_from(value).map_err(|_| corrupt(format!("an array dimension of {value}")))
+}
+
+/// A text-shaped index key column.
+///
+/// **A citext key holds the folded value**, so it decodes to a folded one — that is what makes a
+/// unique index over one refuse two rows differing in case, and why an index is not where a citext
+/// *value* is read back from; the row is. `Datum::Citext` says which of the two a caller has, so
+/// confusing them is a type error rather than a wrong spelling.
+fn decode_key_text(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
+    let (body, rest) = codec::decode_bytes(bytes)
+        .map_err(|error| corrupt(format!("index key column: {error}")))?;
+    let text = text_from_utf8(&body)?;
+    Ok(match ty {
+        ColumnType::Citext => (Datum::Citext(text), rest),
+        _ => (Datum::Text(text), rest),
+    })
 }
 
 /// An array back out of an index key, in the shape [`encode_key_array`] wrote.
@@ -890,10 +917,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Json | ColumnType::Jsonb | ColumnType::Hstore | ColumnType::HstoreArray => {
             return Err(corrupt("an index key column of type json, jsonb or hstore"));
         }
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
-            let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
-            (Datum::Text(text_from_utf8(&body)?), rest)
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => {
+            return decode_key_text(ty, bytes);
         }
+
         ColumnType::Bytea => {
             let (body, rest) = codec::decode_bytes(bytes).map_err(decoded)?;
             (Datum::Bytea(body), rest)
@@ -1566,7 +1593,12 @@ mod tests {
             // An hstore is a `Datum::Text` here like every other text-shaped type: this crate
             // stores the canonical form and `esker_sql::value::hstore` is what makes one, so the
             // strategy is text and the round trip is the text's.
-            ColumnType::Hstore => ".*".prop_map(|text: String| Datum::Text(text)).boxed(),
+            ColumnType::Hstore => ".*".prop_map(Datum::Hstore).boxed(),
+            // A citext's *key* is its folded value, so the strategy is folded text: an unfolded
+            // one would state a round trip the key encoding does not make.
+            ColumnType::Citext => ".*"
+                .prop_map(|text: String| Datum::Citext(text.to_lowercase()))
+                .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",
                 "true",

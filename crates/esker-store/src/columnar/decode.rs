@@ -202,7 +202,11 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // enum and teaching it a type is that crate's unit. A table with one routes to the row
         // engine, which is correct and slower — and the `Option` here is what says so out loud.
         | StoredType::Hstore
-        | StoredType::HstoreArray => return None,
+        | StoredType::HstoreArray
+        // Not columnar either, and for a sharper reason than hstore's: a citext's comparison is
+        // not its bytes', so a columnar run that filtered or sorted one would have to fold, and
+        // that crate's `ColumnType` has no way to say so.
+        | StoredType::Citext => return None,
     })
 }
 
@@ -211,7 +215,9 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
 /// An array never reaches it: [`columnar_type`] refuses the column before a decoder exists.
 fn value_of(datum: &Datum) -> Value {
     match datum {
-        Datum::Null | Datum::Array(_) => Value::Null,
+        // A citext never reaches this either — the column is refused above, for the same reason
+        // an array is: this vocabulary has no way to carry a comparison that folds.
+        Datum::Null | Datum::Array(_) | Datum::Citext(_) | Datum::Hstore(_) => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),
         Datum::Int2(int) => Value::Int2(*int),
