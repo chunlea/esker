@@ -2293,17 +2293,15 @@ impl Executor {
             // `lower_type` gave before this pass existed, and the same one a column of it gets.
             return Err(SqlError::unsupported(format!("the type {name}")));
         };
-        let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+        // **A composite is still refused by name.** Its value is a row, which this vocabulary
+        // has no shape for; the other two kinds are answered below.
+        if matches!(def.kind, crate::catalog::TypeKind::Composite { .. }) {
             return Err(SqlError::unsupported(format!(
-                "a cast to the {} type {name}",
-                match def.kind {
-                    crate::catalog::TypeKind::Range { .. } => "range",
-                    _ => "composite",
-                }
+                "a cast to the composite type {name}"
             )));
-        };
-        // **Only a literal.** A cast of a *column* to an enum happens per row and would need the
-        // labels in the row evaluator; nothing the suite sends writes one, and a `0A000` naming
+        }
+        // **Only a literal.** A cast of a *column* to a user type happens per row and would need
+        // the type in the row evaluator; nothing the suite sends writes one, and a `0A000` naming
         // the type is the honest answer rather than a value read some other way.
         let text = match operand {
             Expr::Literal(Literal::String(text)) => text.clone(),
@@ -2316,6 +2314,33 @@ impl Executor {
                 return Ok(Some(Expr::Literal(Literal::Null)));
             }
             _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+        };
+        // **A range's value is the range**, where an enum's is an ordinal — the two halves of
+        // ADR 0053's rule, and this is where they part. `range_test.rb` writes
+        // `'[0.5,0.7]'::floatrange` in a `WHERE`, so the cast has to fold to something the
+        // comparison can use, and the canonical text is what a `floatrange` column holds.
+        if let crate::catalog::TypeKind::Range { subtype, .. } = def.kind {
+            let Some(representation) = ddl::range_representation(subtype) else {
+                return Err(SqlError::unsupported(format!(
+                    "a cast to the range type {name}, whose subtype is {}",
+                    subtype.name()
+                )));
+            };
+            let value = <Datum as PgDatum>::from_text(representation, &text)?;
+            return Ok(Some(if printed {
+                // Its output function, which for a range is the canonical text — the brackets
+                // and the bounds as the type prints them, not as they were written.
+                Expr::Literal(Literal::String(
+                    PgDatum::to_text(&value).unwrap_or_default(),
+                ))
+            } else {
+                Expr::Literal(Literal::Typed(Box::new(value)))
+            }));
+        }
+        let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
+            return Err(SqlError::Internal(
+                "a user type that is neither enum, range nor composite reached the cast".to_owned(),
+            ));
         };
         let Some(ordinal) = crate::catalog::enum_ordinal(labels, &text) else {
             return Err(SqlError::InvalidEnumValue {

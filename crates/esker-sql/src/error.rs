@@ -1590,6 +1590,13 @@ pub enum SqlError {
     #[error("data type {0} has no default operator class for access method \"btree\"")]
     NoDefaultOperatorClass(&'static str),
 
+    /// `CREATE TYPE … AS RANGE (subtype = point)`: the **same** `42704` and the same message,
+    /// with a different `HINT`. Measured: a range needs its subtype ordered, because ordering the
+    /// bounds is what a range *is*, so the two types with no btree operator class are the two a
+    /// range cannot be over either.
+    #[error("data type {0} has no default operator class for access method \"btree\"")]
+    RangeSubtypeNotOrdered(&'static str),
+
     /// `CREATE TYPE` for a name that is already a type. `42710`, the same class a duplicate
     /// trigger gets, and the same one PostgreSQL uses.
     #[error("type \"{0}\" already exists")]
@@ -2191,6 +2198,7 @@ impl SqlError {
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
             | SqlError::NoDefaultOperatorClass(_)
+            | SqlError::RangeSubtypeNotOrdered(_)
             | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. }
             | SqlError::ConstraintDoesNotExist(_)
@@ -2586,6 +2594,11 @@ impl SqlError {
     pub fn hint(&self) -> Option<String> {
         match self {
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
+            SqlError::RangeSubtypeNotOrdered(_) => Some(
+                "You must specify an operator class for the range type or define a default \
+                 operator class for the subtype."
+                    .to_owned(),
+            ),
             SqlError::NoDefaultOperatorClass(_) => Some(
                 "You must specify an operator class for the index or define a default operator class for the data type."
                     .to_owned(),

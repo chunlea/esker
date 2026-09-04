@@ -118,9 +118,24 @@ pub(super) fn enum_of<'a>(
     table: &'a crate::catalog::TableDef,
     column: &ColumnDef,
 ) -> Option<&'a crate::catalog::TypeDef> {
-    let oid = column.user_type?;
-    let def = table.enums.get(&oid)?;
+    let def = user_type_of(table, column)?;
     matches!(def.kind, crate::catalog::TypeKind::Enum { .. }).then_some(def)
+}
+
+/// The user-defined type a column was declared as, **whatever kind it is**.
+///
+/// [`enum_of`] narrows this to enums, and the two are not interchangeable: an enum is the kind
+/// whose *values* are rewritten — a label in, an ordinal stored, a label out — and everything
+/// keyed on that must ask the narrow question. A user-defined **range** stores its own value
+/// unchanged, and what it needs is only the type's *name and oid*: `pg_typeof`, the
+/// `RowDescription` a client picks its decoder from, and `information_schema`. Asking the enum
+/// question there answered `floatrange` with `float8range`, the storage — ADR 0031's worst class,
+/// a wrong value where the right one was one lookup away.
+pub(super) fn user_type_of<'a>(
+    table: &'a crate::catalog::TableDef,
+    column: &ColumnDef,
+) -> Option<&'a crate::catalog::TypeDef> {
+    table.enums.get(&column.user_type?)
 }
 
 /// A **literal** meeting an enum column, as the value it stands for.

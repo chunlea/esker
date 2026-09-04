@@ -262,7 +262,7 @@ fn declared_columns(
             return Err(SqlError::DuplicateColumn(column.name.clone()));
         }
         let (ty, user_type) = resolve_user_type(txn, executor, column)?;
-        columns.push(ColumnDef {
+        let mut kept = ColumnDef {
             name: column.name.clone(),
             ty,
             typmod: column.typmod,
@@ -280,7 +280,16 @@ fn declared_columns(
             comment: None,
             dropped: false,
             user_type,
-        });
+        };
+        // **The default is folded again once the type is known**, which is the only moment it
+        // can be: lowering read it against `crate::plan::Column::ty`, a placeholder for a column
+        // declared as a user-defined type.
+        if let Some(oid) = user_type
+            && let Some(def) = type_by_oid(txn, executor, oid)?
+        {
+            kept.default = fold_user_default(kept.default.as_ref(), ty, &def, &kept)?;
+        }
+        columns.push(kept);
     }
     Ok(columns)
 }
@@ -304,9 +313,19 @@ fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<ca
 /// catalog on the way out; nothing below this crate ever sees anything but a small integer, which
 /// is invariant 7 kept rather than worked around.
 ///
-/// The other two kinds are **refused by name**. A range's and a composite's values are their own
-/// units in the ADR's order, and answering a `CREATE TABLE` for one of them would make a column
-/// nothing can read — a wrong answer where a refusal is available (ADR 0031).
+/// **A range's value is a range**
+/// ([ADR 0063](../../../docs/adr/0063-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md)),
+/// and the column type is chosen by its *subtype*: a
+/// `CREATE TYPE floatrange AS RANGE (subtype = float8)` column holds the same canonical text a
+/// `numrange` one does, read and written by the same `crate::value::range`. Which range type it
+/// *is* stays the oid's answer, exactly as two enums over the same `int2` stay two types — and
+/// two user ranges over one subtype share a representation for the same reason (ADR 0042: a type
+/// may share another's representation only if it shares its comparison, and a range's comparison
+/// is its canonical text, which is a function of the subtype alone).
+///
+/// A **composite** is still refused by name: its value is a row, which this vocabulary has no
+/// shape for, and answering a `CREATE TABLE` for one would make a column nothing can read — a
+/// wrong answer where a refusal is available (ADR 0031).
 fn resolve_user_type(
     txn: &dyn Txn,
     executor: &Executor,
@@ -322,17 +341,82 @@ fn resolve_user_type(
     };
     match def.kind {
         catalog::TypeKind::Enum { .. } => Ok((ColumnType::Int2, Some(def.oid))),
-        catalog::TypeKind::Range { .. } => Err(SqlError::unsupported(format!(
-            "a column of the range type {name}"
-        ))),
+        catalog::TypeKind::Range { subtype, .. } => match range_representation(subtype) {
+            Some(ty) => Ok((ty, Some(def.oid))),
+            // A subtype no range here can hold. Named rather than answered: a column typed as
+            // some *other* range would read every value back wrong.
+            None => Err(SqlError::unsupported(format!(
+                "a column of the range type {name}, whose subtype is {}",
+                subtype.name()
+            ))),
+        },
         catalog::TypeKind::Composite { .. } => Err(SqlError::unsupported(format!(
             "a column of the composite type {name}"
         ))),
     }
 }
 
-/// **`json` and `point` cannot be indexed**, and they are the only two — measured, one type at a
-/// time, against a real server: `jsonb`, every range, `hstore` and every array all have a default
+/// A `DEFAULT` on a column declared as a **user-defined type**, read as that type.
+///
+/// Lowering folds a default against the column's `ty`, and for one of these columns that `ty` is
+/// a placeholder — `crate::plan::Column::ty` says so — because only the catalog knows what the
+/// name meant. So the fold has to happen again here, where it is known, and the two kinds want
+/// opposite things from it:
+///
+/// * an **enum**'s default is a *label*, which becomes the ordinal the row holds;
+/// * a **range**'s default is already its own value and only needs reading as the right range —
+///   `DEFAULT '[0.5,0.7]'` arrives as a `Datum::Text` and a column that stored that would hand
+///   back text where every other row of it hands back a range.
+fn fold_user_default(
+    default: Option<&Datum>,
+    ty: ColumnType,
+    def: &catalog::TypeDef,
+    column: &ColumnDef,
+) -> Result<Option<Datum>> {
+    let Some(value) = default else {
+        return Ok(None);
+    };
+    Ok(Some(match (&def.kind, value) {
+        (catalog::TypeKind::Enum { .. }, _) => {
+            super::assign::into_enum(value.clone(), column, def)?
+        }
+        (catalog::TypeKind::Range { .. }, Datum::Text(text)) => {
+            <Datum as crate::value::PgDatum>::from_text(ty, text)?
+        }
+        // A NULL, or a value that already has the column's shape.
+        _ => value.clone(),
+    }))
+}
+
+/// The range representation whose bounds are `subtype`, or `None` for a subtype no range here
+/// holds.
+///
+/// **The list is the set of range representations this node has**, not a set of blessed subtypes:
+/// a user range over `timestamp` is a `tsrange` in the row and a user range over `float8` is the
+/// representation added for `range_test.rb`'s own `floatrange`. `int4` and `int8` answer their own
+/// range types even though both store an `i64`, so that `pg_range.rngsubtype` reports the subtype
+/// that was written.
+///
+/// `text` is deliberately absent beside `varchar`: the two would share a representation happily —
+/// they compare alike — but `lower()` of a bound has to answer `text` for one and
+/// `character varying` for the other, and there would be nothing left to tell them apart. A range
+/// over `text` is a `0A000` naming the subtype until that is worth a representation of its own.
+pub(super) fn range_representation(subtype: ColumnType) -> Option<ColumnType> {
+    Some(match subtype {
+        ColumnType::Timestamp => ColumnType::TsRange,
+        ColumnType::TimestampTz => ColumnType::TstzRange,
+        ColumnType::Int4 => ColumnType::Int4Range,
+        ColumnType::Int8 => ColumnType::Int8Range,
+        ColumnType::Date => ColumnType::DateRange,
+        ColumnType::Numeric => ColumnType::NumRange,
+        ColumnType::Double => ColumnType::FloatRange,
+        ColumnType::Varchar => ColumnType::VarcharRange,
+        _ => return None,
+    })
+}
+
+/// **`json` and `point` cannot be indexed on a real server**, and they are the only two —
+/// measured, one type at a time: `jsonb`, every range, `hstore` and every array all have a default
 /// btree operator class there and index fine.
 ///
 /// The message is PostgreSQL's own, HINT included, and it names the *type* because that is what a
@@ -340,9 +424,24 @@ fn resolve_user_type(
 /// `json` column answered `Done` where a real server refuses, and the first write into it then
 /// found the row codec's own "an index key column of type json, jsonb, hstore or a range", which
 /// is an internal corruption error for a table the user was allowed to create.
-fn refuse_unindexable(ty: ColumnType) -> Result<()> {
+///
+/// **The other half is this node's own gap and had the same hole.** `jsonb`, `hstore` and every
+/// range are index keys there and are not here — `esker_keys::row::is_index_key` is the list —
+/// so `CREATE INDEX … (ts_range)` built an index whose first write hit that same internal error.
+/// It is `0A000` naming the type: a gap a client can read, rather than a table it cannot write
+/// to. The name is the **declared** one, so a `floatrange` column is refused as a `floatrange`
+/// and not as the representation holding it.
+fn refuse_unindexable(table: &TableDef, column: &ColumnDef) -> Result<()> {
+    let ty = column.ty;
     if matches!(ty, ColumnType::Json | ColumnType::Point) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
+    }
+    if !esker_keys::row::is_index_key(ty) {
+        let declared = super::assign::user_type_of(table, column)
+            .map_or_else(|| ty.name().to_owned(), |def| def.name.clone());
+        return Err(SqlError::unsupported(format!(
+            "an index on a column of type {declared}"
+        )));
     }
     Ok(())
 }
@@ -3438,7 +3537,7 @@ pub(super) fn create_index(
                     let at = table
                         .column(column)
                         .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?;
-                    refuse_unindexable(table.columns[at].ty)?;
+                    refuse_unindexable(&table, &table.columns[at])?;
                     KeyPart::Column(at)
                 }
                 plan::KeyPartName::Expression { expr, shape } => {
@@ -4192,15 +4291,16 @@ pub(super) fn alter_table(
         // The catalog decides what the declared name is, exactly as it does at `CREATE TABLE`,
         // and the default is folded against the answer rather than against the placeholder.
         let (ty, user_type) = resolve_user_type(&*txn, executor, column)?;
-        let default = match (
-            &column.default,
-            match user_type {
-                Some(oid) => type_by_oid(&*txn, executor, oid)?,
-                None => None,
-            },
-        ) {
-            (Some(value), Some(def)) => Some(super::assign::into_enum(
-                value.clone(),
+        let default = match match user_type {
+            Some(oid) => type_by_oid(&*txn, executor, oid)?,
+            None => None,
+        } {
+            // The same fold `CREATE TABLE` does, against the type the catalog just named: a
+            // label becomes an ordinal and a range literal becomes a range.
+            Some(def) => fold_user_default(
+                column.default.as_ref(),
+                ty,
+                &def,
                 &ColumnDef {
                     name: column.name.clone(),
                     ty,
@@ -4215,9 +4315,8 @@ pub(super) fn alter_table(
                     dropped: false,
                     user_type,
                 },
-                &def,
-            )?),
-            (other, _) => other.clone(),
+            )?,
+            None => column.default.clone(),
         };
         updated.columns.push(ColumnDef {
             name: column.name.clone(),

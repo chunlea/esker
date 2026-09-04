@@ -340,19 +340,32 @@ impl<'a> Scope<'a> {
         Ok((at, column))
     }
 
-    /// The enum the column at a resolved position was declared as, or `None`.
+    /// The **enum** the column at a resolved position was declared as, or `None`.
     ///
     /// A position is an index into the **concatenated** row, so this walks the tables the way
     /// [`Scope::offset`] builds it: the labels live on the table
     /// (`crate::catalog::TableDef::enums`) and the oid on the column, so both halves have to be
     /// found together (ADR 0050).
+    ///
+    /// Narrower than [`Scope::user_type_at`] on purpose: everything that rewrites a *value*
+    /// belongs here, because an enum is the only kind whose value is not what is stored.
+    fn enum_at(&self, at: usize) -> Option<&'a crate::catalog::TypeDef> {
+        self.user_type_at(at)
+            .filter(|def| matches!(def.kind, crate::catalog::TypeKind::Enum { .. }))
+    }
+
+    /// The user-defined type the column at a resolved position was declared as, of any kind.
+    ///
+    /// What a client is *told* — `pg_typeof`, the `RowDescription` oid, `information_schema` —
+    /// comes from here, so that a `floatrange` column is called a `floatrange` and not the range
+    /// representation that holds it.
     fn user_type_at(&self, at: usize) -> Option<&'a crate::catalog::TypeDef> {
         let mut start = 0;
         for table in &self.tables {
             let end = start + table.columns.len();
             if at < end {
                 let column = table.columns.get(at - start)?;
-                return super::assign::enum_of(table, column);
+                return super::assign::user_type_of(table, column);
             }
             start = end;
         }
@@ -2248,7 +2261,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // The operand's output function, where the operand is an enum column: the label, not
             // the ordinal the row holds.
             let enum_labels = match &operand {
-                Expr::Ordinal { at, .. } => match scope.user_type_at(*at).map(|def| &def.kind) {
+                Expr::Ordinal { at, .. } => match scope.enum_at(*at).map(|def| &def.kind) {
                     Some(crate::catalog::TypeKind::Enum { labels }) => Some(labels.clone()),
                     _ => None,
                 },
@@ -2474,7 +2487,7 @@ fn resolve_in_list(
     // item is reconciled against the operand on its own, which is what `x IN (a, b)` means — a set
     // of `=` — and each gives the same three answers a single `=` gives (ADR 0050).
     if let Expr::Ordinal { at, .. } = &operand
-        && scope.user_type_at(*at).is_some()
+        && scope.enum_at(*at).is_some()
     {
         let mut coerced = Vec::with_capacity(items.len());
         for item in items {
@@ -2786,6 +2799,10 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // early return below; this rank exists so the match stays total.
             ColumnType::Point => 57,
             ColumnType::PointArray => 58,
+            // A family each, like every other range: a `floatrange` compares with a
+            // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
+            ColumnType::FloatRange => 59,
+            ColumnType::VarcharRange => 60,
             // **A family of one, and not the datetime family.** A `date` joins `timestamp`
             // because `date = timestamp` is a real operator; a `time` does not, because
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
@@ -2846,7 +2863,7 @@ fn reconcile_enum(
         return Ok(None);
     }
     let enum_of = |expr: &Expr| match expr {
-        Expr::Ordinal { at, .. } => scope.user_type_at(*at),
+        Expr::Ordinal { at, .. } => scope.enum_at(*at),
         _ => None,
     };
     let (def, other, flipped) = match (enum_of(left), enum_of(right)) {

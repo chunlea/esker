@@ -645,6 +645,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::DateRange
         | Row::NumRange
         | Row::Int8Range
+        | Row::FloatRange
+        | Row::VarcharRange
         | Row::TstzRangeArray
         | Row::Int4RangeArray
         | Row::DateRangeArray

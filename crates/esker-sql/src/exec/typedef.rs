@@ -39,6 +39,21 @@ pub(super) fn create(
         }
         return Err(SqlError::DuplicateType(create.name.clone()));
     }
+    // **A range's subtype has to be ordered**, because ordering the bounds is what a range is:
+    // `CREATE TYPE r AS RANGE (subtype = point)` is `42704 data type point has no default
+    // operator class for access method "btree"` on a real server, with a HINT of its own.
+    // Measured — and the two types it refuses are the same two `CREATE INDEX` refuses, which is
+    // not a coincidence: both questions are "can a btree put these in order".
+    if let catalog::TypeKind::Range { subtype, .. } = create.kind
+        && matches!(
+            subtype,
+            crate::value::ColumnType::Json | crate::value::ColumnType::Point
+        )
+    {
+        return Err(SqlError::RangeSubtypeNotOrdered(
+            <crate::value::ColumnType as crate::value::PgType>::name(subtype),
+        ));
+    }
     let oid = catalog::allocate_id(txn, executor.tenant)?;
     // **Two ids, and the second is the array type's.** A real server makes a type's array type
     // when it makes the type, and `pg_type` here reports `typarray` as `oid + 1` and emits a row
