@@ -1601,6 +1601,37 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `DROP EXTENSION` for one this database has not installed: `42704`.
+    ///
+    /// **The verb decides the class**, which is the trap this pair exists to record:
+    /// `CREATE EXTENSION nosuch` is [`SqlError::ExtensionNotAvailable`]'s `0A000` — the *server*
+    /// does not have it — and the drop is `42704`, because this *database* has not installed it.
+    /// Same name, two classes, measured.
+    #[error("extension \"{0}\" does not exist")]
+    UndefinedExtension(String),
+
+    /// A `DROP EXTENSION` something still depends on: `2BP01`.
+    ///
+    /// Only the type-bearing extensions can produce one, and the dependent is always a column —
+    /// `hstore` and `citext` are column types here, so dropping the extension out from under one
+    /// would leave a column whose type nothing declares.
+    #[error("cannot drop extension {extension} because other objects depend on it")]
+    DependentExtension {
+        /// The extension that cannot be dropped.
+        extension: String,
+        /// `column c of table ce depends on type citext`
+        detail: String,
+    },
+
+    /// What a `CASCADE` took: a **notice**, one per object, in PostgreSQL's own wording.
+    #[error("drop cascades to column {column} of table {relation}")]
+    CascadeDropsColumn {
+        /// The column the cascade dropped.
+        column: String,
+        /// The table it was on.
+        relation: String,
+    },
+
     /// A `numeric` special cast to an integer: **`0A000`**, not `22003`.
     ///
     /// The one SQLSTATE nobody would predict here — `'NaN'::numeric::int` is
@@ -1874,6 +1905,8 @@ impl SqlError {
             | SqlError::UndefinedRole(_)
             | SqlError::UndefinedConstraint { .. }
             | SqlError::UndefinedConstraintSkipping { .. }
+            | SqlError::UndefinedExtension(_)
+            | SqlError::CascadeDropsColumn { .. }
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
             SqlError::WrongObjectType { .. }
@@ -2009,6 +2042,7 @@ impl SqlError {
             | SqlError::DependentTable { .. }
             | SqlError::DependentColumn { .. }
             | SqlError::DependentConstraint { .. }
+            | SqlError::DependentExtension { .. }
             | SqlError::DependentType { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
@@ -2072,6 +2106,7 @@ impl SqlError {
             | SqlError::DoesNotExistSkipping { .. }
             | SqlError::DuplicateColumnSkipping { .. }
             | SqlError::UndefinedConstraintSkipping { .. }
+            | SqlError::CascadeDropsColumn { .. }
             | SqlError::IdentifierTruncated { .. } => Severity::Notice,
             SqlError::ActiveTransaction
             | SqlError::NoActiveTransaction
@@ -2126,6 +2161,7 @@ impl SqlError {
             | SqlError::DependentTable { detail, .. }
             | SqlError::DependentColumn { detail, .. }
             | SqlError::DependentConstraint { detail, .. }
+            | SqlError::DependentExtension { detail, .. }
             | SqlError::DependentFunction { detail, .. }
             | SqlError::DependentSchema { detail, .. }
             | SqlError::NoPartitionForRow { detail, .. } => Some(detail.clone()),

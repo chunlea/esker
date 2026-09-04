@@ -2044,6 +2044,16 @@ pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &s
     );
 }
 
+/// Removes an installed extension. The caller has already checked it is installed and that nothing
+/// depends on it.
+///
+/// The mirror of [`install_extension`], and a catalog write like any other — so it commits and
+/// rolls back with the transaction that ran the `DROP EXTENSION`, which is what makes the
+/// statement safe inside the schema-load transaction `ActiveRecord` wraps everything in.
+pub fn uninstall_extension(txn: &mut dyn Txn, tenant: u64, name: &str) {
+    txn.delete(&record::extension_key(tenant, name));
+}
+
 /// Writes a user-defined type. The caller has already checked that the name is free.
 pub fn put_type(txn: &mut dyn Txn, tenant: u64, def: &TypeDef) {
     txn.put(

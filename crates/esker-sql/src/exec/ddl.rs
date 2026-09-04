@@ -484,6 +484,106 @@ pub(super) fn create_extension(
     done
 }
 
+/// `DROP EXTENSION [IF EXISTS] <name> [CASCADE]` — what the suite's teardown sends.
+///
+/// **The verb decides the class**, which is the trap: `CREATE EXTENSION nosuch` is `0A000`
+/// (the *server* does not have it) and `DROP EXTENSION nosuch` is `42704` (this *database* has not
+/// installed it). Same name, two classes, measured.
+///
+/// A column of a type the extension provides is `2BP01` without `CASCADE`, with PostgreSQL's own
+/// `DETAIL` naming the column and the type. That case is not in the capture and is here because
+/// `hstore` and `citext` are column types now: dropping the extension out from under one would
+/// leave a column whose type nothing declares.
+pub(super) fn drop_extension(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropExtension,
+) -> Result<Outcome> {
+    let done = Ok(Outcome::done("DROP EXTENSION"));
+    if !catalog::pg_catalog::is_installed(txn, executor.tenant, &drop.name)? {
+        if drop.if_exists {
+            executor.notice(SqlError::DoesNotExistSkipping {
+                kind: "extension",
+                name: drop.name.clone(),
+            });
+            return done;
+        }
+        return Err(SqlError::UndefinedExtension(drop.name.clone()));
+    }
+    drop_extension_columns(executor, txn, &drop.name, drop.cascade)?;
+    catalog::uninstall_extension(txn, executor.tenant, &drop.name);
+    done
+}
+
+/// Refuses, or takes with `CASCADE`, every column whose type the extension provides.
+///
+/// A dropped column is ADR 0051's tombstone, which is what a real server does too: the column goes
+/// and the rows are not rewritten. `NOTICE: drop cascades to column c of table ce` is PostgreSQL's
+/// own wording for it.
+fn drop_extension_columns(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    extension: &str,
+    cascade: bool,
+) -> Result<()> {
+    let types = catalog::pg_catalog::extension_types(extension);
+    if types.is_empty() {
+        return Ok(());
+    }
+    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let tables: Vec<TableDef> = relations
+        .rows()
+        .filter_map(|row| relations.table(row))
+        .filter(|table| {
+            table
+                .live_columns()
+                .any(|(_, column)| types.contains(&column.ty))
+        })
+        .cloned()
+        .collect();
+    for table in tables {
+        let dependent: Vec<String> = table
+            .live_columns()
+            .filter(|(_, column)| types.contains(&column.ty))
+            .map(|(_, column)| column.name.clone())
+            .collect();
+        if !cascade {
+            return Err(SqlError::DependentExtension {
+                extension: extension.to_owned(),
+                detail: format!(
+                    "column {} of table {} depends on type {}",
+                    dependent[0],
+                    table.name,
+                    table
+                        .live_column(&dependent[0])
+                        .map_or(extension, |(_, column)| {
+                            crate::value::PgType::name(column.ty)
+                        })
+                ),
+            });
+        }
+        let mut updated = table.clone();
+        for column in &dependent {
+            executor.notice(SqlError::CascadeDropsColumn {
+                column: column.clone(),
+                relation: table.name.clone(),
+            });
+            drop_column(
+                txn,
+                executor,
+                &mut updated,
+                &table.name,
+                column,
+                false,
+                true,
+            )?;
+        }
+        updated.schema_version += 1;
+        catalog::replace_table(txn, executor.tenant, &table, &updated)?;
+    }
+    Ok(())
+}
+
 /// A sequence's first value as the counter stores it.
 ///
 /// The counter is a `u64` and `START` is signed, so a negative start is refused by name rather

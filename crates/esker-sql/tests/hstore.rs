@@ -40,15 +40,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', 'a=>1, b=>2'::hstore - 'a'::text, 'a=>1'::hstore ?& ARRAY['a']",
             "hstore's - and ?& operators are not built",
         ),
-        // **`DROP EXTENSION` is not built at all**, and it is not this lane's to build: it is a
-        // DDL arm in `crate::parse::lower`, which belongs to the DDL lane. `hstore_test.rb`'s
-        // teardown sends `disable_extension "hstore", force: :cascade`, so the file leaves an
-        // extension installed where a real server leaves none — which matters between test files
-        // and not inside one. Named here so the ranking has it; refused rather than approximated.
-        (
-            "DROP EXTENSION IF EXISTS \"hstore\" CASCADE",
-            "DROP EXTENSION is not built, and it is the DDL lane's arm rather than this one's",
-        ),
     ],
 };
 

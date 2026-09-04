@@ -137,6 +137,21 @@ pub struct UniqueConstraint {
     pub deferred: bool,
 }
 
+/// `DROP EXTENSION [IF EXISTS] <name> [CASCADE|RESTRICT]`.
+///
+/// **What the suite's teardown sends**, always in the `IF EXISTS` form and with `CASCADE` when
+/// `disable_extension(name, force: :cascade)` asks for it (`postgresql_adapter.rb:503`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropExtension {
+    /// The extension's name, folded.
+    pub name: String,
+    /// `IF EXISTS`: a name nothing has installed is a **notice** rather than `42704`.
+    pub if_exists: bool,
+    /// `CASCADE`: also drop what depends on the extension's types. Without it a column of one is
+    /// `2BP01` — measured, and the case the capture does not reach.
+    pub cascade: bool,
+}
+
 /// `CREATE EXTENSION [IF NOT EXISTS] name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateExtension {

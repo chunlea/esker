@@ -348,6 +348,27 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
                 if_not_exists: create.if_not_exists,
             }))
         }
+        // `DROP EXTENSION [IF EXISTS] name [CASCADE|RESTRICT]` — the suite's teardown, always in
+        // the `IF EXISTS` form (`postgresql_adapter.rb:503`).
+        //
+        // **One name per statement.** `sqlparser` takes a list because PostgreSQL's grammar does,
+        // and a list is refused rather than half-run: dropping the second of two would leave the
+        // first gone and the statement failed, which is the shape a client cannot undo.
+        Statement::DropExtension(drop) => {
+            let [name] = drop.names.as_slice() else {
+                return Err(SqlError::unsupported(
+                    "DROP EXTENSION of more than one extension",
+                ));
+            };
+            Ok(plan::Statement::DropExtension(plan::DropExtension {
+                name: name.value.clone(),
+                if_exists: drop.if_exists,
+                cascade: matches!(
+                    drop.cascade_or_restrict,
+                    Some(sqlparser::ast::ReferentialAction::Cascade)
+                ),
+            }))
+        }
         // `CREATE SCHEMA [IF NOT EXISTS] name`. **The suite writes the nested form**
         // (`CREATE SCHEMA s CREATE TABLE t (…)`) which `sqlparser` 0.62.0 cannot read at all — a
         // C1 gap in the plan's register, and the reason `schema_test.rb` is still out of reach.
