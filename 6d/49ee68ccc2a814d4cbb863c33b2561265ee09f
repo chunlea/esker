@@ -1,0 +1,26 @@
+crates/esker-store/src/lib.rs
+  h_44076b318daf9c 107-123,125
+crates/esker-store/src/meta.rs
+  h_44076b318daf9c 43,240-317
+crates/esker-store/src/raft_log.rs
+  h_44076b318daf9c 38,96-104,178-191,217-223
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 317-475,642-646,944-969,971-975,994-997,1004-1007,1009-1012,1018,1020,1022-1032,1034-1036
+crates/esker-store/tests/retire.rs
+  h_44076b318daf9c 18-27,58-68,493-819
+docs/adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md
+  h_44076b318daf9c 1-126
+docs/plans/debt-c6.md
+  h_44076b318daf9c 106-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6d49ee68ccc2a814d4cbb863c33b2561265ee09f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
