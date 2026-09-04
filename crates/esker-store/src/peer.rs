@@ -348,9 +348,9 @@ pub struct PeerCore {
     /// has moved that one and not this one, and writing the wrong one is the mistake `86d9824`
     /// and `91de89a` were both about.
     ///
-    /// `TODO(phase-4c unit 5)`: moved by applying a `ConfChange` entry. Until an operator proposes
-    /// one it is the configuration the peer started with, which is the membership as of every
-    /// index it has.
+    /// Moved by applying a `ConfChange` entry, in `apply_conf_change` and nowhere else, which is
+    /// the one place that can know an index has been applied. Before the first one it is the
+    /// configuration the peer started with, which is the membership as of every index it has.
     applied_conf: ConfState,
     /// This region as the **log** has made it: narrowed by every split this peer has applied.
     ///

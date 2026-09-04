@@ -217,7 +217,7 @@ pub fn destroy(db: &Db, region_id: u64, retiring: Option<&Region>) -> Result<u64
     // **In the same batch, or not at all.** The `'m'` record being deleted is the only thing on
     // disk that says which range this region was; the announcement is what a restart reclaims
     // from. Two batches with a crash between them is the state this replaces
-    // ([ADR 0055](../../../docs/adr/0055-a-retirement-is-announced-before-the-record-that-names-it-goes.md)).
+    // ([ADR 0056](../../../docs/adr/0056-a-retirement-is-announced-before-the-record-that-names-it-goes.md)).
     if let Some(region) = retiring {
         crate::meta::stage_retiring(&mut batch, cf_id, region);
     }
@@ -286,10 +286,10 @@ pub struct PersistedState {
     /// the entries it still holds. Writing the current one instead would apply every change twice
     /// and leave the core unable to tell which part of its membership is still revertible.
     ///
-    /// Nothing writes this after `open`, and nothing has to while the log starts at index 1: the
-    /// membership the region was bootstrapped with *is* the membership as of index 0, and the
-    /// entries say the rest. That stops being true the moment the log is truncated — see the
-    /// `TODO(phase-4)` on [`RaftLogStorage::snapshot`].
+    /// At `open` it is the membership the region was bootstrapped with, which *is* the membership
+    /// as of index 0, and the entries say the rest. It moves only when the log is truncated:
+    /// [`RaftLogStorage::stage_compact`] writes the configuration as of the truncation point with
+    /// it, because after a truncation there are no longer entries in front of it to replay.
     pub conf_state: ConfState,
     /// The highest index the state machine has applied, written with the data it applied.
     pub applied_index: Index,

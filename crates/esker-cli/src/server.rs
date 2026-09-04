@@ -261,9 +261,8 @@ async fn serve(
     if let Some(pd) = &options.pd {
         println!("esker server: registered with the placement driver at {pd}");
     }
-    // Every region this store hosts, in key order. In phase 4a that is one, bootstrapped to
-    // cover everything; `TODO(phase-4b)` a split makes the list grow while the server runs, and
-    // this line only says what it found at open.
+    // Every region this store hosts, in key order — what it found **at open**, and no more than
+    // that: a split makes the list grow while the server runs, and nothing reprints it.
     for region in store.regions().regions() {
         println!(
             "esker server: region {} covers [{}, {})",

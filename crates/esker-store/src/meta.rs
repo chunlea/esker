@@ -157,9 +157,9 @@ pub fn decode_region_from(input: &mut Decoder<'_>) -> Result<Region> {
 /// Adds `region`'s record to `batch`.
 ///
 /// Staged rather than written, so a caller can put it in the same batch as whatever made it true:
-/// a bootstrap writes it beside the region's first Raft state, and `TODO(phase-4b)` a split writes
-/// both halves' records in the batch that applies the split entry — which is what makes a split
-/// atomic on a peer rather than a sequence a crash can land inside.
+/// a bootstrap writes it beside the region's first Raft state, and a split writes **both** halves'
+/// records in the batch that applies the split entry (`crate::peer`, `stage_split`) — which is
+/// what makes a split atomic on a peer rather than a sequence a crash can land inside.
 pub fn stage_region(batch: &mut WriteBatch, cf: u32, region: &Region) {
     batch.put(cf, &metadata_key(region.id), &encode_region(region));
 }
@@ -317,8 +317,12 @@ pub fn load_retiring(db: &Db) -> Result<Vec<Region>> {
 
 /// Adds the removal of a region's record to `batch`.
 ///
-/// `TODO(phase-4c)`: the `RemovePeer` operator is what calls this, in the batch that also deletes
-/// the region's data and its Raft log.
+/// **Not what the retirement path uses.** `RemovePeer` reaches
+/// [`crate::raft_log::destroy`], which deletes this key alongside the
+/// region's log, state and pending-snapshot records in one synced batch — a record removed without
+/// them would leave a log for a region nothing hosts. What is left here is the record on its own,
+/// for a caller that is replacing it rather than ending it; the tests that plant a routing table
+/// by hand are the users.
 pub fn stage_removal(batch: &mut WriteBatch, cf: u32, region_id: u64) {
     batch.delete(cf, &metadata_key(region_id));
 }

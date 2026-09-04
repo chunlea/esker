@@ -263,9 +263,9 @@ pub struct Store {
     runtime: Option<tokio::runtime::Handle>,
     /// One per replicated region: the timer that feeds its driver thread.
     ///
-    /// `TODO(phase-4d)`: one timer per region is one task per region. At fifty regions that is
+    /// `TODO(debt-c6 #1)`: one timer per region is one task per region. At fifty regions that is
     /// fifty timers where one wheel would do, which is the same sharding decision as the apply
-    /// worker's and belongs with it.
+    /// worker's and belongs with it (`docs/plans/debt-c6.md` §4).
     ///
     /// Behind a lock because a split adds one, from the parent's driver thread.
     tickers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
