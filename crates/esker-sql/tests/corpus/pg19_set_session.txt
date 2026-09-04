@@ -1,0 +1,70 @@
+# `SET SESSION` — 12 refusals behind run 57's aborted-transaction row.
+#
+# **`SESSION` is the default scope spelled out**, which is the whole of it: `SET SESSION x TO v`,
+# `SET x TO v` and `SET x = v` are one statement, and `ActiveRecord` writes the long form in four
+# places — the `variables:` config (`postgresql_adapter.rb:1008-1010`), the timezone it sets on
+# every connection (`:1033`), and `SET SESSION AUTHORIZATION` for a role.
+#
+# Things reasoning would get wrong:
+#
+# * **`SET LOCAL` is the transaction's and `SET SESSION` is not.** A `ROLLBACK TO` undoes a `SET
+#   LOCAL` back to the session's value, which is the pair this file measures rather than asserting
+#   the two words are synonyms.
+# * **`TO DEFAULT` is not `TO 'default'`** — it resets the parameter, the same thing `RESET` does.
+# * **`RESET SESSION x` is a syntax error.** `RESET` has no scope keyword; only `SET` does. So the
+#   two are not symmetrical, which is exactly the sort of thing a rule invented from one side gets
+#   wrong.
+# * **A name nobody has is `42704 unrecognized configuration parameter`**, not a syntax error and
+#   not silence.
+#
+# The capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`, and
+# the `SELECT` after the `ROLLBACK` proves the session's own parameter came back.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE SCHEMA ss_one		-
+CREATE SCHEMA ss_two		-
+SELECT 'r', current_setting('search_path') AS before	text,text	r|"$user", public
+SET SESSION search_path TO 'ss_one'		-
+SELECT 'r', current_setting('search_path') AS after_session_to	text,text	r|ss_one
+SET SESSION search_path = 'ss_two'		-
+SELECT 'r', current_setting('search_path') AS after_session_eq	text,text	r|ss_two
+SET search_path TO 'ss_one'		-
+SELECT 'r', current_setting('search_path') AS after_plain	text,text	r|ss_one
+SET SESSION search_path TO DEFAULT		-
+SELECT 'r', current_setting('search_path') AS after_default	text,text	r|"$user", public
+SET SESSION client_min_messages TO 'warning'		-
+SELECT 'r', current_setting('client_min_messages') AS after_client_min_messages	text,text	r|warning
+SHOW client_min_messages	text	warning
+SET SESSION timezone TO 'UTC'		-
+SELECT 'r', current_setting('timezone') AS after_timezone	text,text	r|UTC
+# ---- SET LOCAL is the transaction's, and SET SESSION is not ----
+SET SESSION search_path TO 'ss_one'		-
+SAVEPOINT s1		-
+SET LOCAL search_path TO 'ss_two'		-
+SELECT 'r', current_setting('search_path') AS inside_local	text,text	r|ss_two
+ROLLBACK TO s1		-
+SELECT 'r', current_setting('search_path') AS after_rollback_to	text,text	r|ss_one
+# ---- what a name nobody has is ----
+SAVEPOINT s2		-
+SET SESSION nosuchparameter TO 'x'	!42704 unrecognized configuration parameter "nosuchparameter"
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+RESET SESSION search_path	!42601 syntax error at or near "search_path"
+ROLLBACK TO s3		-
+# ---- SET SESSION AUTHORIZATION: the 12 refusals behind this row ----
+SELECT 'r', current_user, session_user	text,name,name	r|esker|esker
+SET SESSION AUTHORIZATION esker		-
+SELECT 'r', current_user AS after_authorization	text,name	r|esker
+SET SESSION AUTHORIZATION DEFAULT		-
+SELECT 'r', current_user AS after_authorization_default	text,name	r|esker
+SAVEPOINT s5		-
+SET SESSION AUTHORIZATION nosuchrole	!22023 role "nosuchrole" does not exist
+ROLLBACK TO s5		-
+SET LOCAL SESSION AUTHORIZATION esker		-
+RESET search_path		-
+SELECT 'r', current_setting('search_path') AS after_reset	text,text	r|"$user", public
+DROP SCHEMA ss_one		-
+DROP SCHEMA ss_two		-
+ROLLBACK		-
+SELECT current_setting('search_path')	text	"$user", public

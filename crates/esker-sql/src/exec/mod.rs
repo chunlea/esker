@@ -677,6 +677,9 @@ impl Executor {
         use crate::plan::SessionStatement;
 
         match statement {
+            // Nothing to switch away from: this node has no roles, so `DEFAULT` is what the
+            // session already is. A named role never reaches here — it is `22023` in the lowering.
+            SessionStatement::SetSessionAuthorization => Ok(Outcome::done("SET")),
             SessionStatement::SetReadAsOf { value, local } => {
                 self.set_read_as_of(value.as_deref(), *local)?;
                 Ok(Outcome::done("SET"))
