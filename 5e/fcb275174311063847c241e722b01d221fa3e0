@@ -1,0 +1,60 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 1795-1804,1982-1985,1987-1990,2263-2268,2270,3032-3100
+crates/esker-sql/src/catalog/pg_attribute.rs
+  h_44076b318daf9c 227-230
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 148-149,194,212,247,286-290,465-473,572,711-712,1016-1035,1443-1444
+crates/esker-sql/src/catalog/pg_index.rs
+  h_44076b318daf9c 443-446
+crates/esker-sql/src/catalog/pg_relations.rs
+  h_44076b318daf9c 79-85,108,268-269,334-346
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 16,184-186,795-857,2373-2376,2402-2404
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1119-1135,1925,1964,2378,2485-2500
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 177,217-218,240-293,688-689,901-902,986-987
+crates/esker-sql/src/exec/comment.rs
+  h_44076b318daf9c 47-52
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 1418-1424,2376-2502,2598-2605,3186-3192,3345-3353
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 593-594,1231-1246,2235-2236,2535-2643
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 447-474,534-543
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 1385-1402
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 284-317
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 36,38-40,95-98,205-206,259-260
+crates/esker-sql/tests/alter_index.rs
+  h_44076b318daf9c 1-136
+crates/esker-sql/tests/corpus/pg19_alter_index.txt
+  h_44076b318daf9c 44,48,51
+crates/esker-sql/tests/corpus/pg19_view.txt
+  h_44076b318daf9c 1-118
+crates/esker-sql/tests/drop_column.rs
+  h_44076b318daf9c 29-31,34-41,45-48
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 40-45
+crates/esker-sql/tests/rename_column.rs
+  h_44076b318daf9c 19-23,25-27,29-33,35-37,39-45
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 111-112,114
+crates/esker-sql/tests/view.rs
+  h_44076b318daf9c 1-69
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1311-1314,1547,1566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5efcb275174311063847c241e722b01d221fa3e0",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
