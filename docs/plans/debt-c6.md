@@ -301,6 +301,24 @@ Red in both directions:
 stay red, as they should; one assertion moved from the old message to the new one, which names the
 colliding key.
 
+### One seek for the disjoint case, so the widening does not cost a bulk load
+
+The rule costs a seek per distinct key in the candidate file, where the old range check cost one
+lookup per level. On the path ingest exists for — a phase-6 bulk load of a large file — that is a
+regression, and shipping the widening without answering it would trade a refusal for a cliff.
+
+So the old range check is kept, for what it is actually good for: a cheap **sufficient** condition
+rather than the rule. One seek positions the merged cursor at the first key of the column family at
+or after the candidate's smallest; if there is none, or it sorts above the candidate's largest, and
+no range tombstone's bounds reach the candidate's range, then no key of the file can be held and
+the walk is skipped entirely. A bulk load into fresh key space therefore pays one seek, as before.
+
+It is a conservative test in both of its halves — a gap *between* two tombstones is not exploited,
+and a tombstone ending exactly at the candidate's first key falls through to the walk rather than
+being reasoned about — because a short-circuit that is wrong is an ingest that is allowed, and the
+walk it falls through to is merely slower. The property test is what guards it: removing the
+tombstone half alone turns the decision test red, since `range_del` is one of its generated inputs.
+
 ### A debt found while writing the rule, and not fixed here
 
 **An ingest is visible to snapshots taken before it.** `ingest` raises the database's sequence

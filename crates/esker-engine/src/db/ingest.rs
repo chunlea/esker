@@ -284,6 +284,33 @@ impl DbInner {
 
         let file = self.fs.open(candidate).at(candidate)?;
         let reader = TableReader::open(file, 0, table_options.clone(), None)?;
+        let bounds = {
+            let properties = reader.properties();
+            (
+                extract_user_key(&properties.smallest_key).to_vec(),
+                extract_user_key(&properties.largest_key).to_vec(),
+            )
+        };
+        // **One seek for the disjoint case**, which is what a bulk load into fresh key space is.
+        // Nothing in the column family between the candidate's first and last key means no key of
+        // it can be held, and the walk below — a seek per distinct key in the file — is skipped
+        // entirely. This is the old range check, kept for what it is actually good for: a cheap
+        // *sufficient* condition, rather than the rule.
+        held.seek(&lookup_key(&bounds.0, MAX_SEQNO));
+        held.status()?;
+        let range_is_clear = !held.valid()
+            || user.cmp(extract_user_key(held.key()), &bounds.1) == std::cmp::Ordering::Greater;
+        let tombstones_are_clear =
+            tombstones
+                .key_bounds(user.as_ref())
+                .is_none_or(|(low, high)| {
+                    user.cmp(high, &bounds.0) == std::cmp::Ordering::Less
+                        || user.cmp(low, &bounds.1) == std::cmp::Ordering::Greater
+                });
+        if range_is_clear && tombstones_are_clear {
+            return Ok(None);
+        }
+
         let mut wanted = reader.iter();
         wanted.seek_to_first();
         let mut previous: Option<Vec<u8>> = None;
