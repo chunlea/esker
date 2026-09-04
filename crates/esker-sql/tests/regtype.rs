@@ -36,17 +36,6 @@ const PG_TYPEOF: &str = "`pg_typeof` is not implemented at all, so this is `0A00
      function rather than a wrong type — the honest answer under contract C2. Several of these \
      lines would *prove* the `regtype`-is-`text` divergence above if the function existed.";
 
-/// Names with quoting or a schema on them.
-///
-/// **This is now the *agreeing* half and the three statements that carried it are gone.** A type
-/// name is parsed rather than compared: `esker_sql::value::split_type_name` reads the quotes and
-/// the qualifier, and `'"int4"'` is 23 where `'"integer"'` is `42704`, because a quoted or
-/// qualified name is an identifier and `integer` is a name only the SQL grammar has. What is left
-/// under this heading is the spelling PostgreSQL's *parser* refuses before any type is looked up.
-const NAME_SYNTAX: &str = "**A type name is parsed, not compared**, and this node parses it now \
-     — what is left here is a spelling PostgreSQL's own parser refuses at the token rather than \
-     at the type.";
-
 /// The other direction: an OID back to a name.
 const REVERSE: &str = "**The reverse direction answers now** — `t.typelem::regtype` is how \
      `ActiveRecord` reads what an array type is over, which is the caller this half never had — \
