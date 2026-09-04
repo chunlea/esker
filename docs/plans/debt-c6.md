@@ -961,3 +961,65 @@ Five hypotheses, measured rather than argued:
 
 Two fixes, one correction of my own overstatement, two hypotheses killed. The two that were killed
 cost one container run each and would have cost a wrong change apiece.
+
+## 14. The joint gate's `txn.scan(..).unwrap()`: a budget in tries against a lease in milliseconds
+
+`esker-sql::joint_gate a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines`, seen twice,
+3/3 alone. The panic is on a **cluster read** — `txn.scan(..).unwrap()` — so it read as a flake in
+the read path. It is not: it is arithmetic, and the fix is in `esker-client`, not in the test.
+
+### The cause
+
+`Transaction::call_resolving` bounded lock resolution by an **attempt count**, and spent each
+attempt on one step of an exponential backoff capped at 2 s. Eight of them:
+
+```
+10 + 20 + 40 + 80 + 160 + 320 + 640 + 1280 = 2550 ms      LOCK_TTL_MS = 3000 ms
+```
+
+So a reader meeting a lock **younger than 450 ms** ran out of budget 450 ms before that lock could
+possibly have expired, and reported `LockNotCleared` — "its owner is alive, give up" — about a
+lease it had not waited out. It bites only in the first 450 ms of a lease whose owner then dies
+rather than commits, which is exactly the shape of a twice-seen sighting.
+
+It is [inventory #6](debt-c3.md) again in a different budget: wave c3 found the router's retry
+budget spending nine attempts against an epoch that kept moving, and the correction there was the
+same one — count the thing you are actually waiting for.
+
+### The red test, and why it asserts about waiting
+
+`a_reader_waits_out_the_lease_before_it_reports_a_lock_uncleared`, deterministic, no load:
+
+```
+waited 2550 ms before reporting the lock uncleared, but 2900 ms of its lease were still to run:
+[10, 20, 40, 80, 160, 320, 640, 1280]
+```
+
+It asserts that the client *waited*, not that the read succeeded, and that is deliberate:
+`CountingOracle` advances only the logical half of a timestamp, so a live lock in that file is
+immortal and no amount of waiting settles it. The invariant that can be checked without a wall
+clock is the one that matters — the client did not stop short of the lease it was told about.
+
+### The fix, and the one I tried first that was worse
+
+**Rejected: dropping the attempt bound and looping until the lease is waited out.** It makes the
+red test pass and introduces a hang: a heartbeating owner extends its lease every round, so the
+deadline recedes for ever. Two existing tests caught it, which is the argument for running the
+whole file rather than the new test. The original bound was not wrong to exist — the doc beside it
+says exactly why: *"a lock whose owner keeps heartbeating never clears and a client that waited
+for ever would be indistinguishable from one that hung."*
+
+**Landed: the count bounds the *looks*, and the last look waits out the *lease*.** The looks stay
+bounded, so the loop terminates whatever the owner does; the total wait covers the lease by
+construction, whatever the backoff schedule adds up to and whatever `max_lock_resolutions` is set
+to. `LockNotCleared` is then only ever reported about a lease that has run out or an owner that
+extended it — never one that still had time. The same rule is applied on the prewrite path, which
+had the identical loop.
+
+### A test that encoded the defect, replaced in the open
+
+`a_lock_inside_its_lease_is_waited_for_rather_than_settled` asserted `sleeps == [10, 20, 40]`.
+That is the old behaviour written down as an expectation, and under the fix it reads
+`[10, 20, 2501]`. It now asserts the two properties separately — the looks before the last back
+off and grow, and the last one waits out what remains of the lease — with a note saying what it
+used to say and why that was the bug rather than the specification.
