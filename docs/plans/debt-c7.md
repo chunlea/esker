@@ -137,24 +137,60 @@ ADR, because the rule is a decision a future reader might reverse — range-disj
 `RocksDB`-shaped intuition reaches for, and the argument against it lives in a module header rather
 than in `docs/adr/`.
 
-## 5. Still open
+## 5. `promotion`: the writer gate closed, one arm still open
 
-**`promotion::a_learner_on_a_fresh_store_becomes_a_voter_under_load` is a race and is not fixed.**
-The curve is 3.90 / 188.5 / 75.8 / 202.6 s — up, down, up — and the failures are not one failure:
+The curve was 3.90 / 188.5 / 75.8 / 202.6 s — up, down, up — so a race, and the panic could not say
+which one because it reported `writer.is_finished()` as a bare boolean. Giving it the writer's
+position answered it on the first run:
 
-| load | what failed |
-|---|---|
-| 14 | `3 learners seen, 3 promoted, writer_done=false`. Promotion worked; the **load generator** never finished its 600 writes. PD's 64-entry history is entirely `TransferLeader`, one region appearing eight times. |
-| 40 | `peer 34 of region 9 has been a learner for 30.1 s`, PD holding `[(10,1,Voter),(26,3,Voter),(34,2,Learner)]` at `conf_ver 4`, the learner's own store at `applied=75` and the same epoch. A stranded learner that is **not** the phase-14 duplicate-peer bug: it exists and it has applied. |
-| 80 | as 14 |
+```
+the cluster never settled: 5 learners seen, 5 promoted, writer_done=false after 569 of 600 writes
+```
 
-Two distinct states under one deadline, so it is at least two questions. The next reader should not
-start from the 180 s budget: start from `writer.is_finished()`, which the panic reports as a bare
-boolean and which should report **how far the writer got** — the difference between key 899 of 900
-(a clock) and key 350 (something is blocking) is the whole diagnosis, and the test does not say.
-The leadership churn in the history is worth its own look regardless of this test: `CLAUDE.md` lists
-predictable tail latency as a goal, and a region whose leadership moves eight times in one 64-event
-window is not that.
+**Promotion had finished.** The test spent the rest of its budget waiting for the last thirty-one
+writes of its own load generator, because `writer.is_finished()` was in the break condition. The
+break now takes the subject — every placed learner voting — and "under load" is asserted instead:
+the load must still have been **in flight** when the cluster began to grow.
+
+The first version of that assertion required the writer to *advance* between the first learner and
+the last promotion, and failed at **zero load** (`16 writes when the first learner appeared, 16 when
+the last one voted`) because a quiet box finishes the whole promotion inside one write — the same
+defect pointed the other way. It is rate-independent now, and its wrong first version is the
+evidence it is not vacuous.
+
+| busy threads | 0 | 14 | 40 | 80 |
+|---|---|---|---|---|
+| before | 3.90 s | **188.5 s FAILED** | **75.8 s FAILED** | **202.6 s FAILED** |
+| after | 3.84 s | 15.6 s | 72.9 s | 70.4 s |
+
+### Still open: the stranded learner, seen once
+
+One run at forty threads failed differently, and this is the whole of what is known about it:
+
+```
+peer 34 of region 9 has been a learner for 30.146219674s — the phase-4 acceptance stall.
+the placement driver holds [(10, 1, Voter), (26, 3, Voter), (34, 2, Learner)]
+  at epoch Epoch { conf_ver: 4, version: 6 }, led by peer 10.
+the learner's own store says: ["applied=75 leader=false epoch=Epoch { conf_ver: 4, version: 6 }",
+                              "applied=75 leader=false epoch=Epoch { conf_ver: 4, version: 6 }"]
+```
+
+It is **not** the phase-14 duplicate-peer bug: one peer per store, and the learner *exists* and has
+*applied* to the same index and epoch as the voters. Not reproduced since — it has not recurred in
+any of the eight runs of the four-load curve.
+
+What was missing is the third view. PD reports a role and the learner reports its own applied
+index; neither can show what the **leader** believes, and that is what the promotion decision reads.
+`leader_progress` now prints it — `matched`, `next`, `is_learner`, `pending_snapshot`,
+`recent_active`, from whichever store answers `RaftPeer::progress` (it is empty unless the peer
+leads, so asking all three finds the leader without racing a transfer). A learner PD calls a
+learner, that says `applied=75` itself, and that the leader records at `matched=0` is not a slow
+promotion — it is two parties describing different peers, which is the shape phase-14 U2 found
+twice. The next sighting will say which.
+
+The leadership churn beside it is worth its own look regardless of this test: PD's 64-entry history
+was **entirely** `TransferLeader` in the failing runs, one region appearing eight times, and
+`CLAUDE.md` lists predictable tail latency as a goal.
 
 ## 6. The sixth sighting: `esker-sql::real_backend`, unreproduced, and why
 
@@ -237,3 +273,51 @@ alternate `JOIN` and `CONTROL` and compare medians, so shared load cancels — a
 off the noise floor so the ratio's denominator is not a 1.6 ms sample. `docs/plans/debt-c4.md` §9's
 rule applies to the diagnosis as much as to the fix: this was found by making it deterministic at
 one load, not by counting runs.
+
+## 8. `DROP DATABASE`: the reclaim, and the one thing it still needs
+
+`catalog::drop_database` walks every key the tenant owns inside a single Percolator transaction —
+`txn.scan(&start, &end, u32::MAX)` over 257 ranges, then `txn.delete` per key. `Txn::scan` answers
+`Vec<(Bytes, Bytes)>` **with values**, so a database of *n* bytes is *n* bytes of coordinator memory
+before one key is deleted, and every key then becomes a prewrite lock and a commit record in one
+transaction. It does not commit for a database of any size, and each delete is an MVCC version, so
+the data grows before it shrinks.
+
+[ADR 0069](../adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md) decides the
+shape: the catalog drop stays a small transaction and is what makes the database *gone*; the rows
+are not deleted, their **range is reclaimed**, gated on the GC safepoint and resumable from a
+cursor. The safepoint gate is the part that makes it correct rather than merely fast — a
+transaction whose snapshot predates the drop may still legally read those rows, so the clear waits
+until the drop's commit timestamp is below the floor PD publishes.
+
+The store half is built. `snapshot::clear_range` was already this exact operation — delete, flush,
+discharge, verify, over all three families and both physical namespaces — but only for a whole
+`Region`, and a tenant's range is part of one or spans several. The region-shaped calls are now the
+general ones (`physical_ranges_of`, `first_key_in_user_range`, `clear_user_range`), with
+`clear_range` delegating.
+
+Bounded and idempotent fell out of the operation rather than being added to it: the delete is six
+range tombstones in one synced batch, `O(1)` in the range's size and atomic across `kill -9`
+because the batch is either in the WAL or it is not; re-clearing an empty range takes the early
+return. The **compaction** is the unbounded step, so a whole-tenant reclaim walks the range a chunk
+at a time — and a test compares the chunked form against the whole one rather than against an
+assertion, because a chunk boundary is where a range mapping gets an off-by-one wrong.
+
+### Blocked on one wire message, deliberately
+
+The trigger crosses the wire and `esker-proto` is the coordinator's to sequence. ADR 0069 names
+what is needed and stops:
+
+```text
+TxnKvReq::ReclaimRange { start: Bytes, end: Bytes, below_ts: u64 }
+```
+
+a sibling of the `TxnKvReq::GcSafepoint` a store already answers — `below_ts` being the drop's
+commit timestamp, so the safepoint condition is a property of the request rather than of the
+caller's timing. Until it exists, `clear_user_range` is reachable in-process only and
+`DROP DATABASE` keeps its current behaviour.
+
+`esker-sql` also keeps a cheaper fallback that needs nothing from this crate: chunked *logical*
+deletes across many transactions, re-driven by the schema-job machinery that already exists. It is
+still `O(keys)` and still leaves the space to GC, but it is bounded, idempotent and crash-safe
+today. If the wire message is not sequenced, that is the answer.
