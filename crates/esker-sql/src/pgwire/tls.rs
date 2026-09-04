@@ -4,6 +4,14 @@
 //! this crate is a review failure. Everything above this module sees [`TlsConfig`], which exists in
 //! both builds, and a byte stream.
 //!
+//! # Where the session driver lives
+//!
+//! `esker_proto::transport::tls`, not here. The RPC surface needed the same thing — a `tokio`
+//! socket, a sans-io state machine, and something to carry bytes between them — and one driver
+//! for both is the point of ADR 0055's third unit. This module keeps what is specific to *this*
+//! surface: the `SSLRequest` answer, which PEM label maps to which key shape, and a `TlsConfig`
+//! that exists in both builds so `Config` needs no `cfg`.
+//!
 //! # Two builds, one API
 //!
 //! `rustls` and `rustls-graviola` are optional dependencies behind the crate's `tls` feature, which
@@ -27,6 +35,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+pub use esker_proto::transport::MaybeTlsStream;
 
 /// What went wrong configuring TLS.
 ///
@@ -188,278 +198,6 @@ impl TlsConfig {
             Ok(Self {
                 server: Some(std::sync::Arc::new(server)),
             })
-        }
-    }
-}
-
-/// A client connection, before or after it became a TLS one.
-///
-/// [`Connection`](super::server::Connection) is generic over its stream and does not care which of
-/// these it has; this exists so the accept path can decide *after* reading the client's
-/// `SSLRequest` and still hand one type onwards.
-pub enum MaybeTlsStream<S> {
-    /// The socket as it arrived.
-    Plain(S),
-    /// The plaintext side of a TLS session. The ciphertext side is owned by the task the
-    /// handshake spawned, which is what talks to the socket from then on.
-    #[cfg(feature = "tls")]
-    Tls(tokio::io::DuplexStream),
-}
-
-impl<S> fmt::Debug for MaybeTlsStream<S> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Plain(_) => "MaybeTlsStream::Plain",
-            #[cfg(feature = "tls")]
-            Self::Tls(_) => "MaybeTlsStream::Tls",
-        })
-    }
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for MaybeTlsStream<S> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_read(context, buffer),
-            #[cfg(feature = "tls")]
-            Self::Tls(stream) => std::pin::Pin::new(stream).poll_read(context, buffer),
-        }
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for MaybeTlsStream<S> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        bytes: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write(context, bytes),
-            #[cfg(feature = "tls")]
-            Self::Tls(stream) => std::pin::Pin::new(stream).poll_write(context, bytes),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_flush(context),
-            #[cfg(feature = "tls")]
-            Self::Tls(stream) => std::pin::Pin::new(stream).poll_flush(context),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(context),
-            #[cfg(feature = "tls")]
-            Self::Tls(stream) => std::pin::Pin::new(stream).poll_shutdown(context),
-        }
-    }
-}
-
-/// How much plaintext may be in flight in each direction between the session and the TLS task.
-///
-/// One buffer per direction per connection, so it is not free; 64 KiB is four of this protocol's
-/// largest ordinary replies and small next to `MAX_MESSAGE_LEN`.
-#[cfg(feature = "tls")]
-const PLAINTEXT_BUFFER: usize = 64 * 1024;
-
-/// Runs the server handshake on `socket` and returns the plaintext side of the session.
-///
-/// The caller has already answered `S` to the client's `SSLRequest`; from here the whole
-/// connection, the client's real startup packet included, is inside TLS records.
-///
-/// # The shape of this, and why it is not an `AsyncRead` wrapper
-///
-/// `rustls` is sans-io: bytes go in, bytes come out, and something has to carry them between the
-/// socket and the session. The usual answer is a stream adapter implementing `poll_read`/
-/// `poll_write` over the rustls state machine — that is what `tokio-rustls` is, and it is a crate
-/// this project has not taken (ADR 0055 accepted two crates, not three).
-///
-/// Writing that adapter by hand means hand-written `Poll` code where a missed wakeup is a hung
-/// connection that reproduces once a week. This does the same job with a task and a duplex pipe:
-/// ordinary `async` code, cancel-safe `select!` arms, no manual `Poll` at all. It costs one task
-/// and one copy per direction, which this protocol — small requests, small replies, a blocking
-/// executor between them — will not notice.
-///
-/// **The known limit**: the pump reads from the socket only while the session is keeping up, so a
-/// peer that sends a large body while refusing to read its reply can stall the connection rather
-/// than being backpressured into an error. Request/response traffic cannot reach that state, and
-/// `COPY` in both directions at once is not something this node does yet. It is written down here
-/// because it is the thing to look at first if a connection ever hangs with data pending.
-///
-/// # Errors
-///
-/// Anything the socket does, and any TLS failure: a malformed `ClientHello`, a version or suite with
-/// no overlap, a client that goes away mid-handshake. All of them are error values (invariant 9) —
-/// a handshake failure ends one connection and touches nothing else.
-#[cfg(feature = "tls")]
-pub(crate) async fn accept<S>(
-    mut socket: S,
-    config: &std::sync::Arc<rustls::ServerConfig>,
-) -> std::io::Result<tokio::io::DuplexStream>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut session =
-        rustls::ServerConnection::new(std::sync::Arc::clone(config)).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-        })?;
-
-    let mut buffer = vec![0u8; 8 * 1024];
-    while session.is_handshaking() {
-        flush_tls(&mut session, &mut socket).await?;
-        if !session.is_handshaking() {
-            break;
-        }
-        let read = socket.read(&mut buffer).await?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "the client went away during the TLS handshake",
-            ));
-        }
-        feed_tls(&mut session, &buffer[..read])?;
-    }
-    // The last flight of the handshake is still queued at this point.
-    flush_tls(&mut session, &mut socket).await?;
-
-    let (session_side, caller_side) = tokio::io::duplex(PLAINTEXT_BUFFER);
-    tokio::spawn(async move {
-        if let Err(error) = pump(socket, session, session_side).await {
-            tracing::debug!(%error, "the TLS session ended");
-        }
-    });
-    Ok(caller_side)
-}
-
-/// Writes whatever the session has queued to the socket.
-#[cfg(feature = "tls")]
-async fn flush_tls<S>(session: &mut rustls::ServerConnection, socket: &mut S) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-
-    while session.wants_write() {
-        let mut encrypted = Vec::new();
-        // Writing into a `Vec` cannot fail, so this only reports a session that has nothing to say.
-        if session.write_tls(&mut encrypted)? == 0 {
-            break;
-        }
-        socket.write_all(&encrypted).await?;
-    }
-    socket.flush().await
-}
-
-/// Feeds ciphertext to the session and advances its state machine.
-#[cfg(feature = "tls")]
-fn feed_tls(session: &mut rustls::ServerConnection, mut ciphertext: &[u8]) -> std::io::Result<()> {
-    while !ciphertext.is_empty() {
-        // `read_tls` takes what fits in the session's buffer, which may be less than is offered,
-        // so this loops rather than assuming one call drains it.
-        let taken = session.read_tls(&mut ciphertext)?;
-        if taken == 0 {
-            break;
-        }
-        session
-            .process_new_packets()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    }
-    Ok(())
-}
-
-/// Moves everything the session has already decrypted up to the protocol loop.
-///
-/// Answers `false` when the peer has sent `close_notify`, which is an orderly end rather than a
-/// failure. `reader()` reports an empty buffer as `WouldBlock` and a closed one as zero, which is
-/// the distinction this turns into a `bool`.
-#[cfg(feature = "tls")]
-async fn deliver<W>(
-    session: &mut rustls::ServerConnection,
-    plaintext: &mut W,
-    buffer: &mut [u8],
-) -> std::io::Result<bool>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-
-    loop {
-        match std::io::Read::read(&mut session.reader(), buffer) {
-            Ok(0) => return Ok(false),
-            Ok(read) => plaintext.write_all(&buffer[..read]).await?,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Carries bytes between the socket and the session for the life of the connection.
-#[cfg(feature = "tls")]
-async fn pump<S>(
-    socket: S,
-    mut session: rustls::ServerConnection,
-    plaintext: tokio::io::DuplexStream,
-) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use tokio::io::AsyncReadExt;
-
-    let (mut socket_rx, mut socket_tx) = tokio::io::split(socket);
-    let (mut session_rx, mut session_tx) = tokio::io::split(plaintext);
-    let mut from_socket = vec![0u8; 8 * 1024];
-    let mut from_session = vec![0u8; 8 * 1024];
-    let mut decrypted = vec![0u8; 8 * 1024];
-
-    loop {
-        // **Deliver first, and before waiting on the socket.** The handshake reads whole TCP
-        // segments, and a client is entitled to put its `Finished` and its first application data
-        // — here, the PostgreSQL startup packet — in the same one. Those bytes are already
-        // decrypted and sitting in the session by the time this task starts. Draining only in the
-        // socket arm below would leave them there until the peer sent *more*, which it will not:
-        // it is waiting for the answer to the packet it already sent. That is a deadlock, and it
-        // is the one this loop is shaped to avoid.
-        if !deliver(&mut session, &mut session_tx, &mut decrypted).await? {
-            return Ok(());
-        }
-        flush_tls(&mut session, &mut socket_tx).await?;
-        // Both arms are cancel-safe reads, which is what makes `select!` correct here: the arm
-        // that loses has not consumed anything.
-        tokio::select! {
-            read = socket_rx.read(&mut from_socket) => {
-                let read = read?;
-                if read == 0 {
-                    // The peer closed the connection. Dropping our side of the pipe is what tells
-                    // the session above that its client is gone.
-                    return Ok(());
-                }
-                feed_tls(&mut session, &from_socket[..read])?;
-            }
-            written = session_rx.read(&mut from_session) => {
-                let written = written?;
-                if written == 0 {
-                    // The protocol loop finished. Tell the peer so rather than dropping the
-                    // socket: an unannounced close is indistinguishable from a truncation attack,
-                    // and a client that checks will say so.
-                    session.send_close_notify();
-                    flush_tls(&mut session, &mut socket_tx).await?;
-                    return Ok(());
-                }
-                std::io::Write::write_all(&mut session.writer(), &from_session[..written])?;
-            }
         }
     }
 }
