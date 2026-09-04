@@ -1,0 +1,127 @@
+crates/esker-keys/src/array.rs
+  s_e5c0c6e78b5662::t_e698756dccb741 93-109,124-140
+crates/esker-keys/src/columnar.rs
+  s_e5c0c6e78b5662::t_5c5c13f66c17e2 93-112,146-165
+crates/esker-keys/src/row.rs
+  s_e5c0c6e78b5662::t_4510c66f7b3e18 149,314-318,375-392,418-420,429,571-573,673-718,870-874,882-897,996-1009,1644-1661,1704-1712
+crates/esker-keys/src/value.rs
+  s_e5c0c6e78b5662::t_6eb199d6fa0954 154-167,255-291,296,307-310,329-344,377-392,501-512,535-539,566-583,588-604
+crates/esker-sql/src/catalog/information_schema.rs
+  s_e5c0c6e78b5662::t_a7f4b12bf529a5 55-58,60
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_e5c0c6e78b5662::t_8cb7553ec9635f 76,88-124
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_c7ca517b799be8 177-183,277-327,655,845,896-905,908-914,920-931,1363-1396,1420,1484-1485,1522,1526-1528,1667-1686,1703-1714,1754-1757,1778-1795,1806-1808
+crates/esker-sql/src/exec/aggregate.rs
+  s_e5c0c6e78b5662::t_96a764ea78ec56 179-189
+crates/esker-sql/src/exec/assign.rs
+  s_e5c0c6e78b5662::t_16f825cb675f64 61-84
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_ce2b7c2b10b485 571-575,580-586,627-631,1118-1135,1155-1163
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_9a918f32e34e42 32,1148,1294,1297,1312-1478,1480,1483,1493-1495,1512-1514,1531-1533,1718-1728,1744,1824,2208,2272-2293,2368-2372,2380-2393,2415-2420,2459-2460,2581
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_b5e8ace1c7b63d 56-90,92,95,176,2375-2383,2401-2407,2640-2645,2844-2916
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_21e3781d292daa 640-660,675-679
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_a27678c505f368 167-175,207-236,328-334,440,740-761,1567,1720-1793,1801-1803,1808,1842,1859-1862,1924-2066,2134-2138,2141-2143,2169-2183,2688-2698
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_c35dfee3f24b7e 2145-2171,2571-2596,2614-2620,2846-2870,2875-2891
+crates/esker-sql/src/exec/subquery.rs
+  s_e5c0c6e78b5662::t_d5bf2b59fea7f8 204,340,430-440,442-454
+crates/esker-sql/src/exec/typedef.rs
+  s_e5c0c6e78b5662::t_d8b239c2c9c288 36-47
+crates/esker-sql/src/exec/values.rs
+  s_e5c0c6e78b5662::t_9fca1d42f36fe2 57
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_35d44ec239599d 1910-1933,1935-1938,3079-3082,3089-3096,3921-3926,3932,3936,3956-3962,4010-4047,4050-4060,4368-4401,4420-4424,4443-4445,4447-4469,4575-4583,6046-6055,6063-6066,6075,6252-6262,6519-6520,6535-6562,6570-6590
+crates/esker-sql/src/plan/ddl.rs
+  s_e5c0c6e78b5662::t_22ebd3c6dd050c 37-39
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_6eb5615b5ce7ea 724-739,767-788,928-932,988-992,995-996,1003-1006,1039-1040,1047,1053-1055,1058-1062,1069,1105,1115-1118,1131-1135,1142,1618-1623,1694-1699,1704-1723,1764-1769
+crates/esker-sql/src/plan/session.rs
+  s_e5c0c6e78b5662::t_25db79eb1a0cb2 111-115
+crates/esker-sql/src/row.rs
+  s_e5c0c6e78b5662::t_a7bcd8830c0273 50-68,150-158
+crates/esker-sql/src/sqlstate.rs
+  s_e5c0c6e78b5662::t_d7a1ac63556e7a 73-79,220-224
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_eb44171fbb05af 77-87,117-131,194-209,277-286,418-426,429-434,498-503,532,587-591,617-618,627-631,734-738,755-771,787-806,850-853,937-939,984-1001,1025-1033,1099-1101,1106-1111,1130-1147,1221,1226-1230,1384-1396,1476-1477,1717-1720,1734-1737
+crates/esker-sql/src/value/range.rs
+  s_e5c0c6e78b5662::t_4d4f8e3cd1ff54 22-23,103,169-501
+crates/esker-sql/tests/array.rs
+  s_e5c0c6e78b5662::t_9bad1d29c86e58 109-113
+crates/esker-sql/tests/array_type_map.rs
+  s_e5c0c6e78b5662::t_07c14281ab8a25 1-143
+crates/esker-sql/tests/corpus/pg19_array_type_map.txt
+  s_e5c0c6e78b5662::t_00889ec657fac3 1-99
+crates/esker-sql/tests/corpus/pg19_catalog_namespace.txt
+  s_e5c0c6e78b5662::t_46d6113307210c 1-108
+crates/esker-sql/tests/corpus/pg19_enum_value.txt
+  s_e5c0c6e78b5662::t_21f2c5aa6e517e 62,106,145-207,209
+crates/esker-sql/tests/corpus/pg19_operator_types.txt
+  s_e5c0c6e78b5662::t_17a2c9dec97e5b 49-73
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_e5c0c6e78b5662::t_c149662d6c2620 59-81
+crates/esker-sql/tests/corpus/pg19_temp_on_commit.txt
+  s_e5c0c6e78b5662::t_512b30d9b70f4a 1-48
+crates/esker-sql/tests/corpus/pg19_temp_table.txt
+  s_e5c0c6e78b5662::t_f58dda54af4ef8 1-113
+crates/esker-sql/tests/corpus/pg19_tsrange.txt
+  s_e5c0c6e78b5662::t_671aeea1f210f2 1-93
+crates/esker-sql/tests/discard_all.rs
+  s_e5c0c6e78b5662::t_2e1919d23c9d58 26-30
+crates/esker-sql/tests/enum_value.rs
+  s_e5c0c6e78b5662::t_b561ca0de5a246 32-56,77-79,81-82,84-89,91-93,95-102,104-106,109-111
+crates/esker-sql/tests/lowering.rs
+  s_e5c0c6e78b5662::t_babe270d054a6c 8,10-14,416-419,421
+crates/esker-sql/tests/operator_types.rs
+  s_e5c0c6e78b5662::t_4a4814d1ec55ab 18-26
+crates/esker-sql/tests/pg_catalog.rs
+  s_e5c0c6e78b5662::t_362ee4a07f15fd 243-249,251-258,261-268,279-308,339-358,369-448,459-488
+crates/esker-sql/tests/pg_catalog_namespace.rs
+  s_e5c0c6e78b5662::t_ee55e4f5e5f008 1-124
+crates/esker-sql/tests/regclass_name.rs
+  s_e5c0c6e78b5662::t_9db6a0c3f4f48c 98-99,102-107,109,111-114,116-117
+crates/esker-sql/tests/regtype.rs
+  s_e5c0c6e78b5662::t_81f07fe61b3cd0 48-53
+crates/esker-sql/tests/relation_resolution.rs
+  s_e5c0c6e78b5662::t_1f1a9facaaa1dc 37-39,95-100,102-103
+crates/esker-sql/tests/row_order.rs
+  s_e5c0c6e78b5662::t_6800d783063671 68-77,80-89,146-159
+crates/esker-sql/tests/schema_namespace.rs
+  s_e5c0c6e78b5662::t_d8622871f0b90a 67-68,72-82,88-91,102
+crates/esker-sql/tests/slt/unsupported.slt
+  s_e5c0c6e78b5662::t_c483b58641e580 48-50
+crates/esker-sql/tests/temp_table.rs
+  s_e5c0c6e78b5662::t_a1357c25a69132 1-127
+crates/esker-sql/tests/tsrange.rs
+  s_e5c0c6e78b5662::t_f9e5a8cbdf19fd 1-58
+crates/esker-sql/tests/unlogged_table.rs
+  s_e5c0c6e78b5662::t_7edfa03066f05d 27,35-39
+crates/esker-store/src/columnar/decode.rs
+  s_e5c0c6e78b5662::t_caa1c0f38a6b8d 209-215,226-230
+docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md
+  s_e5c0c6e78b5662::t_8dbe03dc94f6fa 1-88
+docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
+  s_e5c0c6e78b5662::t_a8a8bc7d0ac0d1 1-113
+docs/plans/phase-9-rails.md
+  s_e5c0c6e78b5662::t_8b18d0ff84cb7b 1315-1322,1573-1574,1576-1577,1580-1583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "19cb71f9c263fd0d56ba1e3585e872f4c57d5cb1",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
