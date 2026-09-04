@@ -1,0 +1,19 @@
+crates/esker-pd/src/transport.rs
+  s_2d916f5f540186::t_e6b43dff014720 27,46,51,53-79,107-142,149-176,178-180,182-191,193-201,218-220,222,239-240,250,337-341,357,403-506
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f28089fb0aa32b8c9cd77bb3a85e9ca255729d02",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
