@@ -75,6 +75,14 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
         .unwrap_or_else(|_: tokio::time::error::Elapsed| panic!("timed out waiting for {what}"))
 }
 
+/// Waits for a condition, with a deadline that is deliberately enormous next to the work.
+///
+/// Measured under forty-eight spinning threads, worst case across five runs: 429 ms for the
+/// first election, 190 ms for the promotion, 276 ms for a peer to notice it has no leader, and
+/// microseconds for the two that are already true when asked. Against thirty seconds that is
+/// about seventy times over, so these waits are not what makes this file load-sensitive — which
+/// is worth knowing, because the recorded sighting was labelled "time-based" and they are the
+/// only clocks left in it once the watch window is accounted for (`docs/plans/debt-c6.md` §9).
 async fn wait_for<F: FnMut() -> bool>(what: &str, mut ready: F) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !ready() {

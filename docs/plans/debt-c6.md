@@ -683,10 +683,39 @@ being read as a decision.
 
 No bug was found. A stated precondition became a checked one.
 
+### The other clocks, measured too
+
+The watch window is not the only wall clock in the test: five `wait_for` calls carry 30 s
+deadlines over work that is round-driven, which is the same shape and had to be checked rather
+than assumed. Worst case across five runs under forty-eight spinning threads:
+
+| wait | quiet | loaded | deadline |
+|---|---|---|---|
+| a leader on the first store | 285 ms | 429 ms | 30 s |
+| the region to arrive on the second store | 30 ms | 75 ms | 30 s |
+| the second store's peer to become a voter | 63 ms | 190 ms | 30 s |
+| every column family to arrive | 354 µs | 61 µs | 30 s |
+| the peer to lose its leader | 270 ms | 276 ms | 30 s |
+
+About seventy times over at the tightest. So the deadlines are not the mechanism either, and the
+measurement is written into `wait_for`'s doc so the next reader does not have to take it on faith.
+
 ### The sighting, left as a sighting
 
-Unreproduced across two load models and thirteen runs. Recorded rather than explained, with what
-was eliminated: it is not the window's length, and it is not the round rate under CPU load.
+Unreproduced across two load models and thirteen runs, and now with every clock in the test
+measured: the watch window has ~7x margin in time and ~10x in rounds, the five waits have ~70x.
+The recorded "time-based" label is wrong on both counts.
+
+Also excluded: this file has its own copy of the no-hint `put` helper that §8 fixed in
+`snapshot.rs`, and it does build a two-voter group — but `seed_all_three_families` runs **before**
+the second store is opened, so every write happens while store 1 is the sole voter and cannot lose
+office. Ruled out by ordering rather than by hope.
+
+Recorded rather than explained. What is eliminated: the window's length, the round rate under CPU
+load, the five wait deadlines, and the leader-hint livelock. What remains is one container run
+that failed once for a reason this lane could not find — and the window's precondition is now
+asserted, so the next occurrence says whether it ran out of clock instead of reporting a
+truncation as a decision.
 
 ### The wider family, and the one that fails the other way
 
