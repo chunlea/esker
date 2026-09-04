@@ -1,0 +1,19 @@
+docs/acceptance/v1.md
+  s_6f7019c05b578b::t_a78f926b245d2b 11-26,29-31,33-39,45-55,119-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e8c7dc8a53205da702d3484d6319dcdff1175740",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
