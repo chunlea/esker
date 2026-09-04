@@ -1,0 +1,14 @@
+crates/esker-store/tests/promotion.rs
+  h_44076b318daf9c 22,305-310,316,320,330,363-402,412,414,416-424,427-439,473-476,492-501,505-506,567-580,588-589,593
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3e436086648a388a621401674c131bb59fcb6cb4",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
