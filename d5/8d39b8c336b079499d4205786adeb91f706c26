@@ -1,0 +1,21 @@
+crates/esker-sql/tests/joint_gate.rs
+  s_49075263d2b3e7::t_56f8643b047a44 77-89,278-285,312,326
+crates/esker-sql/tests/routing_differential.rs
+  s_49075263d2b3e7::t_ccc8a0e5279a7e 331-338,363,376,608-611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d58d39b8c336b079499d4205786adeb91f706c26",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
