@@ -41,14 +41,14 @@ SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'ai'::regclass AND conty
 ALTER INDEX "public"."index_ai_on_title" RENAME TO "index_ai_on_name"		-
 SELECT 'r', count(*) FROM pg_indexes WHERE indexname = 'index_ai_on_name'	text,bigint	r|1
 SAVEPOINT a1		-
-ALTER INDEX "nosuchindex" RENAME TO "x"		!42P01 relation "nosuchindex" does not exist
+ALTER INDEX "nosuchindex" RENAME TO "x"	!42P01 relation "nosuchindex" does not exist
 ROLLBACK TO a1		-
 ALTER INDEX IF EXISTS "nosuchindex" RENAME TO "x"		-
 SAVEPOINT a2		-
-ALTER INDEX "index_ai_on_name" RENAME TO "index_ai_on_qty"		!42P07 relation "index_ai_on_qty" already exists
+ALTER INDEX "index_ai_on_name" RENAME TO "index_ai_on_qty"	!42P07 relation "index_ai_on_qty" already exists
 ROLLBACK TO a2		-
 SAVEPOINT a3		-
-ALTER INDEX "index_ai_on_name" ALTER COLUMN 1 SET STATISTICS 100		!0A000 cannot alter statistics on non-expression column "name" of index "index_ai_on_name" HINT: Alter statistics on table column instead.
+ALTER INDEX "index_ai_on_name" ALTER COLUMN 1 SET STATISTICS 100	!0A000 cannot alter statistics on non-expression column "name" of index "index_ai_on_name" HINT: Alter statistics on table column instead.
 ROLLBACK TO a3		-
 ALTER INDEX "index_ai_on_name" SET (fillfactor = 70)		-
 ALTER INDEX "index_ai_on_name" SET TABLESPACE pg_default		-

@@ -2243,8 +2243,14 @@ pub fn replace_table(
     {
         txn.delete(&record::name_key(tenant, &previous.primary_key_name));
     }
+    // **Reconciled by name, not by id.** An index that was *renamed* keeps its id, so an
+    // id-keyed comparison saw it as still present and left the old name record behind — two names
+    // resolving to one index, and the definition still printing the first. That is the same leak
+    // the table's own name, the primary key's and a sequence's each had, in its fifth costume: the
+    // question this loop asks is "is this **name** still in use", and it has to be asked about the
+    // name.
     for index in &previous.indexes {
-        if !table.indexes.iter().any(|kept| kept.id == index.id) {
+        if !table.indexes.iter().any(|kept| kept.name == index.name) {
             txn.delete(&record::name_key(tenant, &index.name));
         }
     }
