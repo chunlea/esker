@@ -1,0 +1,23 @@
+crates/esker-sql/src/error.rs
+  s_dc640bf0df4adb::t_4dcbf975d1f8b4 586-591,2449
+crates/esker-sql/src/value/geometric.rs
+  s_dc640bf0df4adb::t_85aaa0de4d835e 81-100,103-114,116-125,277-322
+crates/esker-sql/tests/corpus/pg19_geometric.txt
+  s_dc640bf0df4adb::t_1c84e7ec742f2d 45-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ad73c03396cba8d2fab7d9dd2f1980a9c09d4d24",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
