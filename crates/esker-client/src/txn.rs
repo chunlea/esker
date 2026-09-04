@@ -553,7 +553,7 @@ impl Transaction {
     ///
     /// **A re-run is not a second statement, and the stamps say so.** A key an *earlier* statement
     /// wrote keeps its older timestamp, because the value being written derives from that
-    /// statement's read (see [`Transaction::stamp`]) — but the writes of the attempt that *waited*
+    /// statement's read — but the writes of the attempt that *waited*
     /// are discarded and recomputed from a fresh read, so their stamps must move forward with them.
     /// Without this the waiter's prewrite is validated against the snapshot it held **before** the
     /// wait, and it dies with `40001` naming the very commit it waited for: measured against three
@@ -564,14 +564,13 @@ impl Transaction {
     /// no longer matches — and a stale write left behind would be committed as if it had.
     pub fn restart_statement(&mut self, read_ts: u64) {
         for (key, before) in std::mem::take(&mut self.statement_undo) {
-            match before {
-                Some(write) => {
-                    self.buffer.insert(key, write);
-                }
-                None => {
-                    self.buffer.remove(&key);
-                    self.read_ts.remove(&key);
-                }
+            if let Some(write) = before {
+                self.buffer.insert(key, write);
+            } else {
+                // Nothing was there before this statement, so the key leaves with its stamp: a
+                // re-run that writes it again reads it fresh and stamps it fresh.
+                self.buffer.remove(&key);
+                self.read_ts.remove(&key);
             }
         }
         self.statement_ts = Some(read_ts);
