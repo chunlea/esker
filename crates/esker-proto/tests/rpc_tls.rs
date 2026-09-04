@@ -69,7 +69,10 @@ fn a_request() -> Request {
 }
 
 /// Starts a server on an ephemeral port and answers with its address.
-async fn serve(tls: RpcTls) -> std::net::SocketAddr {
+///
+/// Not `async` — it awaits nothing — but it must be *called* from a runtime, because that is
+/// where the accept loop is spawned.
+fn serve(tls: RpcTls) -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = Server::from_listener(listener, Arc::new(Ack), TransportConfig::new())
@@ -86,7 +89,7 @@ async fn serve(tls: RpcTls) -> std::net::SocketAddr {
 /// One request, over TLS, arriving as the same framed request it is in the clear.
 #[tokio::test]
 async fn a_request_crosses_a_tls_connection() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", false)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", false));
     let client = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -104,7 +107,7 @@ async fn a_request_crosses_a_tls_connection() {
 /// address book of `SocketAddr`s can offer.
 #[tokio::test]
 async fn a_peer_is_verified_against_its_address_when_no_name_is_given() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", false)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", false));
     let client = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -122,7 +125,7 @@ async fn a_peer_is_verified_against_its_address_when_no_name_is_given() {
 /// mTLS: two nodes that share a CA reach each other.
 #[tokio::test]
 async fn mutual_tls_lets_two_nodes_of_the_same_cluster_talk() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", true)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", true));
     let client = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -143,7 +146,7 @@ async fn mutual_tls_lets_two_nodes_of_the_same_cluster_talk() {
 /// disqualifies it is that *this* cluster's CA did not.
 #[tokio::test]
 async fn mutual_tls_turns_away_a_peer_from_another_ca() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", true)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", true));
     let stranger = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -163,7 +166,7 @@ async fn mutual_tls_turns_away_a_peer_from_another_ca() {
 /// through: a peer with no certificate at all.
 #[tokio::test]
 async fn mutual_tls_turns_away_a_peer_with_no_certificate() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", true)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", true));
     // A client configured without mutual auth presents nothing.
     let anonymous = TcpTransport::connect_with_tls(
         address,
@@ -182,7 +185,7 @@ async fn mutual_tls_turns_away_a_peer_with_no_certificate() {
 /// client↔store link, where the other end is a SQL node with no cluster identity.
 #[tokio::test]
 async fn one_way_tls_serves_a_client_without_a_certificate() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", false)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", false));
     let client = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -204,7 +207,7 @@ async fn one_way_tls_serves_a_client_without_a_certificate() {
 /// server sees a handshake that is not one.
 #[tokio::test]
 async fn a_plaintext_peer_cannot_reach_a_tls_server() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", false)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", false));
     let plain = TcpTransport::connect_with(address, TransportConfig::new()).await;
     assert!(
         plain.is_err(),
@@ -215,7 +218,7 @@ async fn a_plaintext_peer_cannot_reach_a_tls_server() {
 /// And the other way round: a TLS client against a plaintext server.
 #[tokio::test]
 async fn a_tls_peer_cannot_reach_a_plaintext_server() {
-    let address = serve(RpcTls::disabled()).await;
+    let address = serve(RpcTls::disabled());
     let encrypted = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -243,7 +246,7 @@ async fn a_tls_peer_cannot_reach_a_plaintext_server() {
 /// making it the more precise `NotSent` is a deliberate improvement rather than an accident.
 #[tokio::test]
 async fn a_rejected_peer_learns_of_it_as_a_closed_connection() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", true)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", true));
     let Err(error) = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
@@ -266,7 +269,7 @@ async fn a_rejected_peer_learns_of_it_as_a_closed_connection() {
 /// Many requests over one TLS connection, which is what a Raft link actually does.
 #[tokio::test]
 async fn many_requests_share_one_tls_connection() {
-    let address = serve(tls_for("node-a", "ca-cert.pem", true)).await;
+    let address = serve(tls_for("node-a", "ca-cert.pem", true));
     let client = TcpTransport::connect_with_tls(
         address,
         TransportConfig::new(),
