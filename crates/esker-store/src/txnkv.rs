@@ -220,7 +220,7 @@ fn cf_id(db: &Db, column: Cf) -> Result<u32, ProtoError> {
     })
 }
 
-/// **The newest `commit_ts` for one key, or `None`** — ADR 0066's read.
+/// **The newest `commit_ts` for one key, or `None`** — ADR 0067's read.
 ///
 /// The question a waiter asks instead of guessing: a statement that took a row lock without waiting
 /// cannot tell from the lock alone whether the writer in front committed and released between its
@@ -380,7 +380,7 @@ pub fn prewrite(
 
     for mutation in mutations {
         // **A range is validated rather than locked**, because there is no key to hold: a phantom
-        // is a row that does not exist yet (ADR 0066 §3). Anything committed inside the range since
+        // is a row that does not exist yet (ADR 0067 §3). Anything committed inside the range since
         // this transaction's snapshot refuses the whole prewrite, which is what makes the read set
         // mean something; what it cannot do is stop an insert that lands *after* this check, and
         // ADR 0062 declares that window.

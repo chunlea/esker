@@ -175,7 +175,7 @@ fn a_dropped_session_gives_its_row_locks_back_against_real_stores() {
 /// The same doctors as `tests/serializable.rs`, over three real stores and real sockets. In process
 /// the validation needs no lock, because it and the version writes share one critical section;
 /// here they are separate messages to separate regions, and what closes that window is the `Check`
-/// mutation's lock record (ADR 0062 §2, ADR 0066 §1). So this test is not a duplicate of the
+/// mutation's lock record (ADR 0062 §2, ADR 0067 §1). So this test is not a duplicate of the
 /// in-process one: it is the case the in-process one cannot make.
 #[test]
 fn write_skew_is_refused_against_real_stores() {
@@ -229,7 +229,7 @@ fn write_skew_is_refused_against_real_stores() {
     );
 }
 
-/// **`changed_since_statement` is exact on the store path** (ADR 0066 §2, debt #1).
+/// **`changed_since_statement` is exact on the store path** (ADR 0067 §2, debt #1).
 ///
 /// A writer whose lock is free but whose value is stale must **re-run** and write over what is
 /// there, not answer `40001`. Before `LatestCommit` the store path could not ask, so it took the

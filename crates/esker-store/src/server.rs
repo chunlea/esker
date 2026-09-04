@@ -2914,7 +2914,7 @@ impl Store {
                 crate::txnkv::scan(&self.db, &start, &end, limit, ts, reverse)
             }
             // **A read, and it is answered here for the same reason `Get` is**: it asks what the
-            // engine already knows and changes nothing (ADR 0066 §2).
+            // engine already knows and changes nothing (ADR 0067 §2).
             TxnKvReq::LatestCommit { key } => {
                 state.meta().check_key(&key)?;
                 crate::txnkv::latest_commit(&self.db, &key)

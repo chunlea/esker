@@ -460,7 +460,7 @@ pub struct Transaction {
     statement_ts: Option<u64>,
     /// **Keys this transaction only read**, for SERIALIZABLE's commit-time validation
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
-    /// [ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// Empty for every transaction at another level, which is what makes this cost nothing to the
     /// two that do not ask for it. A key that is *also* written is not here: its own write lock
@@ -668,7 +668,7 @@ impl Transaction {
     }
 
     /// **The newest `commit_ts` for `key`, or `None`** — the question, not an acquisition
-    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// Read-only: no lock, no log entry. What asks it is a statement that took a row lock without
     /// waiting and cannot tell from the lock alone whether the writer in front committed and
@@ -831,7 +831,7 @@ impl Transaction {
         //
         // **A checked key is a secondary.** It takes a lock like any other key of this
         // transaction, so it groups, commits and rolls back by the machinery already here — which
-        // is the whole reason ADR 0066 put the check on the *mutation* rather than inventing a
+        // is the whole reason ADR 0067 put the check on the *mutation* rather than inventing a
         // second kind of request (ADR 0062 §2, §4).
         let secondaries: Vec<Bytes> = self
             .buffer
@@ -982,7 +982,7 @@ impl Transaction {
                 },
                 // Not in the buffer: a key this transaction **read** and is asking the store to
                 // verify and hold. `Check` writes no value; what it leaves is the lock that makes
-                // the validation and the commit atomic (ADR 0066 §1).
+                // the validation and the commit atomic (ADR 0067 §1).
                 None => TxnMutation::Check { key: key.clone() },
             })
             .collect()
@@ -1086,7 +1086,7 @@ impl Transaction {
     /// committed inside it since this transaction's snapshot refuses the prewrite.
     ///
     /// **A range that spans a region boundary is checked in the region its start is in and no
-    /// further**, which is the same bound `Scan` has and is declared in ADR 0066 §3: a phantom
+    /// further**, which is the same bound `Scan` has and is declared in ADR 0067 §3: a phantom
     /// inserted past the boundary is not seen. Splitting a range check across regions is the same
     /// problem as splitting a scan and is not solved here.
     fn prewrite_range_checks(&self, primary: &Bytes) -> Result<()> {

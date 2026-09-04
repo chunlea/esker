@@ -472,7 +472,7 @@ fn golden_txn_read_requests() -> Vec<(&'static str, Request)> {
         (
             // **A read, and pinned as one**: it carries a key and nothing else, and it is in this
             // list rather than the write list because it takes no lock and writes no log entry
-            // (ADR 0066).
+            // (ADR 0067).
             "txn-latest-commit",
             Request::txn_kv(
                 h,
@@ -547,7 +547,7 @@ fn golden_txn_prewrite_requests() -> Vec<(&'static str, Request)> {
         (
             // **A second prewrite golden rather than a changed one.** The row above pins tags 1 and
             // 2 and must not move — that is what "additive" means here — so the check mutations get
-            // their own row (ADR 0066 §1).
+            // their own row (ADR 0067 §1).
             "txn-prewrite-checks",
             Request::txn_kv(
                 h,

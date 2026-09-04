@@ -387,7 +387,7 @@ impl Txn for StoreTxn {
         self.validating = self.validating || on;
     }
 
-    /// **The question ADR 0066 added, asked** — the store path's answer is exact now.
+    /// **The question ADR 0067 added, asked** — the store path's answer is exact now.
     ///
     /// One round trip per locked key per statement, and only for a write statement under READ
     /// COMMITTED whose lock was taken without waiting: the writer in front may have committed and

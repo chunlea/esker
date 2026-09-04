@@ -44,7 +44,7 @@ pub enum Op {
     /// **Verify and hold, without writing** — what a SERIALIZABLE transaction does to a key it
     /// only *read*
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
-    /// [ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// It takes the same lock a write takes and stages no value, so the conflict check above it is
     /// the *validation* — a key committed since this transaction's snapshot loses — and the lock is

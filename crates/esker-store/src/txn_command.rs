@@ -69,7 +69,7 @@ pub enum TxnWrite {
         read_ts: Option<u64>,
     },
     /// **A key a SERIALIZABLE transaction read**, verified and locked but never written
-    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     Check {
         /// The user key that was read.
         key: Bytes,
@@ -176,7 +176,7 @@ impl TxnCommand {
     /// The command a request becomes, or `None` for one that changes nothing.
     ///
     /// `Get`, `Scan`, `LatestCommit` and `GcSafepoint` answer `None`: the first three are reads —
-    /// `LatestCommit` asks what the store already knows and takes no lock (ADR 0066 §2) — and the
+    /// `LatestCommit` asks what the store already knows and takes no lock (ADR 0067 §2) — and the
     /// fourth is store-local (see this module's header).
     #[must_use]
     pub fn from_request(request: &TxnKvReq) -> Option<Self> {
@@ -327,7 +327,7 @@ impl TxnCommand {
                             out.put_varint(*read_ts);
                         }
                         // Kinds 5 and 6, beside the four: a check carries no value and a range
-                        // carries two keys (ADR 0066 §1).
+                        // carries two keys (ADR 0067 §1).
                         TxnWrite::Check { key } => {
                             out.put_u8(5);
                             out.put_bytes(key);

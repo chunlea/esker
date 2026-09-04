@@ -272,7 +272,7 @@ pub enum TxnMutation {
     },
     /// **Verify that `key` has not been committed since this transaction's snapshot, and hold it**
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
-    /// [ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// A key a SERIALIZABLE transaction **read**. It writes no value: what it leaves is the lock
     /// record, which is what makes the validation and the commit atomic against another
@@ -476,7 +476,7 @@ pub enum TxnKvReq {
         safepoint: u64,
     },
     /// **The newest `commit_ts` for one key** — the question a waiter asks instead of guessing
-    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// A statement that took a row lock without waiting cannot tell from the lock alone whether the
     /// writer in front committed and released between its read and its lock. The store already

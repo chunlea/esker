@@ -69,7 +69,7 @@ pub trait TxnSnapshot {
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>>;
 
     /// **Anything committed inside `[start, end)` after `ts`** — the phantom test
-    /// ([ADR 0066](../../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// A key-level check names keys that *existed* when a transaction read them; a row inserted
     /// afterwards is in nobody's read set, and only the range it would have appeared in can name it.

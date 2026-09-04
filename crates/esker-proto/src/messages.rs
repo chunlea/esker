@@ -147,7 +147,7 @@ pub enum Method {
     /// `TxnKv::GcSafepoint`.
     TxnGcSafepoint = 0x0208,
     /// `TxnKv::LatestCommit` — the newest `commit_ts` for one key, and nothing else
-    /// ([ADR 0066](../../docs/adr/0066-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// **A question, not an acquisition.** It takes no lock, writes no log entry and has no
     /// `TxnWrite` variant: it answers what the store already computes for its own prewrite check,

@@ -1,6 +1,8 @@
-# ADR 0066 — The `Check` mutation, and the question a waiter asks instead of guessing
+# ADR 0067 — The `Check` mutation, and the question a waiter asks instead of guessing
 
 Status: accepted (approved 2026-09-04) · Date: 2026-09-04 · Phase 9, the locking family ·
+**Numbered 0067, not 0066**: both this lane and c7 claimed 0066 at their own HEAD before either
+landed, and the later lander renumbers ·
 Implements [ADR 0062](0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md) §2 and
 closes `docs/plans/debts-v1.md` #1 and #2 · Builds on
 [ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md) §4
