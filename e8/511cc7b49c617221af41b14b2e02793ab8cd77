@@ -1,0 +1,19 @@
+docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md
+  s_6f7019c05b578b::t_bdabdbbc20f283 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e8511cc7b49c617221af41b14b2e02793ab8cd77",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
