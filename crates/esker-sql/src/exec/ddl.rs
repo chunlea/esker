@@ -781,32 +781,65 @@ fn sequence_start(start: i64) -> Result<u64> {
 /// is narrower than "a cast is possible".
 fn converts_implicitly(from: ColumnType, to: ColumnType) -> bool {
     use ColumnType::{
-        Bpchar, Citext, CitextArray, Int2, Int4, Int8, Text, TextArray, Timestamp, TimestampArray,
-        TimestampTz, TimestampTzArray, Varchar, VarcharArray,
+        Bool, Bpchar, Citext, CitextArray, Date, Double, Int2, Int4, Int8, Interval, Money,
+        Numeric, Real, Text, TextArray, Time, Timestamp, TimestampArray, TimestampTz,
+        TimestampTzArray, Uuid, Varchar, VarcharArray,
     };
     if from == to {
         return true;
     }
-    // The string family is one representation with three names; only the typmod differs, and a
-    // length that no longer fits is caught per row rather than here.
     let string = |ty| matches!(ty, Text | Varchar | Bpchar | Citext);
-    if string(from) && string(to) {
+    // **Every scalar renders into a string, and a string is never a source.** Measured in both
+    // directions and for six different families: a number, a timestamp, a date, a boolean, money
+    // and a uuid all take `TYPE text` with no `USING`, while `text -> integer`, `text -> date`,
+    // `text -> boolean`, `text -> uuid` and `character(5) -> integer` each need one. That
+    // asymmetry is the whole shape of PostgreSQL's assignment casts here: rendering a value is
+    // always defined, parsing one is not.
+    if string(to) {
+        return matches!(
+            from,
+            Int2 | Int4
+                | Int8
+                | Numeric
+                | Double
+                | Real
+                | Money
+                | Date
+                | Timestamp
+                | TimestampTz
+                | Time
+                | Interval
+                | Bool
+                | Uuid
+        ) || string(from);
+    }
+    if string(from) {
+        return false;
+    }
+    let number = |ty| matches!(ty, Int2 | Int4 | Int8 | Numeric | Double | Real);
+    // Every number converts to every other number, and to `money`.
+    if number(from) && (number(to) || to == Money) {
         return true;
     }
-    // The two timestamps are one representation under two labels, and the integers convert **both
-    // directions** — measured: a narrowing is implicit too, and a value that no longer fits is
-    // that row's error rather than the statement's. Assuming "widening only" refused
-    // `bigint -> integer`, which PostgreSQL takes.
+    // **Two edges a "same family" rule gets wrong**, and both were measured rather than reasoned
+    // about — the capture is `captures/pg19_alter_type_cast.txt`:
+    //
+    // * `money -> numeric` converts and **`money -> double precision` does not**, so money is not
+    //   simply a member of the numeric family. It converts *from* any number and *to* `numeric`
+    //   alone.
+    // * `date -> timestamp` converts and **`date -> time` does not**, though `timestamp -> time`
+    //   does. A date has no time of day to keep, and PostgreSQL refuses rather than inventing
+    //   midnight.
     matches!(
         (from, to),
-        (Timestamp | TimestampTz, Timestamp | TimestampTz)
-            | (Int2 | Int4 | Int8, Int2 | Int4 | Int8 | Text | Varchar)
-    ) || matches!(
-        (from, to),
-        // The array pairs whose element pair is itself implicit. Written out rather than derived:
-        // `ColumnType` has one variant per array type and no element accessor, so a rule over
-        // elements would have to invent the mapping this list *is*.
-        (TextArray, VarcharArray)
+        (Money, Numeric)
+            | (Date | Timestamp | TimestampTz, Date | Timestamp | TimestampTz)
+            | (Timestamp | TimestampTz, Time)
+            | (Time | Interval, Time | Interval)
+            // The array pairs whose element pair is itself implicit. Written out rather than
+            // derived: `ColumnType` has one variant per array type and no element accessor, so a
+            // rule over elements would have to invent the mapping this list *is*.
+            | (TextArray, VarcharArray)
             | (VarcharArray, TextArray)
             | (TextArray | VarcharArray, CitextArray)
             | (CitextArray, TextArray | VarcharArray)
@@ -847,7 +880,6 @@ fn converts_with_using(from: ColumnType, to: ColumnType) -> bool {
 /// timestamps have *distinct* `Datum` variants for the same bytes, so those are re-tagged here —
 /// which is a fact about this crate's representation, not about SQL.
 fn convert_datum(from: ColumnType, to: ColumnType, value: &Datum) -> Result<Datum> {
-    use crate::value::PgDatum as _;
     if matches!(value, Datum::Null) || from == to {
         return Ok(value.clone());
     }
@@ -869,15 +901,56 @@ fn convert_datum(from: ColumnType, to: ColumnType, value: &Datum) -> Result<Datu
         (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::Timestamp) => {
             Some(Datum::Timestamp(*micros))
         }
+        // **A date becomes midnight**, measured: `2020-01-02` -> `2020-01-02 00:00:00`. Through
+        // the text path a date renders without a time and parses back the same way, so this is a
+        // retag with arithmetic rather than a re-read.
+        (Datum::Date(days), ColumnType::Timestamp) => {
+            Some(Datum::Timestamp(i64::from(*days) * MICROS_PER_DAY))
+        }
+        (Datum::Date(days), ColumnType::TimestampTz) => {
+            Some(Datum::TimestampTz(i64::from(*days) * MICROS_PER_DAY))
+        }
+        // **The time of day, and nothing above it.** `interval '1 day'` becomes `00:00:00` — the
+        // months and days are dropped rather than folded in, measured — and a time becomes an
+        // interval that is only a time of day.
+        (Datum::Interval { micros, .. }, ColumnType::Time) => Some(Datum::Time(*micros)),
+        (Datum::Time(micros), ColumnType::Interval) => Some(Datum::Interval {
+            months: 0,
+            days: 0,
+            micros: *micros,
+        }),
+        // **Money is a scaled integer and renders with a currency symbol**, so the text path
+        // cannot read it back as a number: `$16.00` is not numeric input. Measured both ways —
+        // `money -> numeric` is `16.00` and `integer 7 -> money` is `$7.00`.
+        (Datum::Money(cents), ColumnType::Numeric) => {
+            Some(Datum::Numeric(money_as_numeric(*cents)))
+        }
         _ => None,
     };
     if let Some(datum) = retagged {
         return Ok(datum);
     }
-    let Some(text) = value.to_text() else {
-        return Ok(Datum::Null);
-    };
-    Datum::from_text(to, &text)
+    // **The rest is the coercion an expression already goes through**, not a second copy of it:
+    // `crate::exec::dml::assign_default` is what turns a `now()` into the `date` a column was
+    // declared as, and a column changing type asks the identical question of every stored row.
+    // Two converters would be two chances to disagree about the same pair — and they did: the
+    // rounding rule that function had measured was written down in its comment and missing here,
+    // so `double precision -> integer` refused a row PostgreSQL rounds.
+    super::dml::assign_default(value.clone(), to)
+}
+
+/// Microseconds in a day, which is what a `date` is worth as a `timestamp`.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// A `money` value's cents as the `numeric` PostgreSQL converts it to: the same number, scale two.
+///
+/// **Not a text round trip**, because money renders with a currency symbol and `$16.00` is not
+/// numeric input — the text path answered `22P02` for a conversion a real server performs.
+fn money_as_numeric(cents: i64) -> esker_keys::numeric::Numeric {
+    let sign = if cents < 0 { "-" } else { "" };
+    let text = format!("{sign}{}.{:02}", (cents / 100).abs(), (cents % 100).abs());
+    crate::value::numeric::from_text(&text)
+        .unwrap_or_else(|_| crate::value::numeric::of_i64(cents / 100))
 }
 
 /// `ALTER TABLE … ALTER COLUMN … TYPE <type> [USING …]` — and it rewrites every row.

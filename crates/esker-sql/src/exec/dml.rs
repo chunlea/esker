@@ -209,7 +209,7 @@ pub(super) fn column_default_value(
     clippy::cast_possible_truncation,
     reason = "`in_range` checks the bound first, which is what makes each cast exact"
 )]
-fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
+pub(super) fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
     if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
         return Ok(value);
     }
@@ -254,6 +254,26 @@ fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
             )
             .map(|value| Datum::Int8(value as i64))
             .ok_or_else(out_of_range),
+        };
+    }
+    // **A `numeric` into an integer rounds the other way**, half *away from zero* — the comment
+    // above says so and nothing implemented it, so this fell to the text path and refused the row:
+    // `22P02 invalid input syntax for type integer: "10.50"` for a value PostgreSQL stores as 11.
+    // Measured in one session against the float rule beside it: `12.5::numeric` is **13** and
+    // `-12.5::numeric` is **-13**, where `12.5::float8` is **12**.
+    if let Datum::Numeric(number) = &value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        let rounded = crate::value::numeric::round_half_away_to_integer(number);
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        return match ty {
+            ColumnType::Int2 => i16::try_from(rounded)
+                .map(Datum::Int2)
+                .map_err(|_| out_of_range()),
+            ColumnType::Int4 => i32::try_from(rounded)
+                .map(Datum::Int4)
+                .map_err(|_| out_of_range()),
+            _ => Ok(Datum::Int8(rounded)),
         };
     }
     match value.to_text() {
