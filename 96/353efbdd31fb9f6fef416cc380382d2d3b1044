@@ -1,0 +1,41 @@
+crates/esker-pd/src/command.rs
+  s_555c5659f0909b::t_bc22913bef5cdd 6,70
+crates/esker-pd/src/driver.rs
+  s_555c5659f0909b::t_d8a0eddfd4402d 112,593,784
+crates/esker-pd/src/error.rs
+  s_555c5659f0909b::t_28d8474a6be597 45
+crates/esker-pd/src/lib.rs
+  s_555c5659f0909b::t_2c43834cf4f059 36
+crates/esker-pd/src/member.rs
+  s_555c5659f0909b::t_28bd202148bfb0 4
+crates/esker-pd/src/pd/mod.rs
+  s_555c5659f0909b::t_4a1f0271a70eaf 323,422,591,653,800,930,1022
+crates/esker-pd/src/pd/repair.rs
+  s_555c5659f0909b::t_59d3f780f5def3 404
+crates/esker-pd/src/raft_log.rs
+  s_555c5659f0909b::t_7cac293f27c699 4,155
+crates/esker-pd/src/service.rs
+  s_555c5659f0909b::t_be07bd310516a0 84
+crates/esker-proto/src/error.rs
+  s_555c5659f0909b::t_b342503720e073 127
+docs/adr/0056-pd-is-a-raft-group.md
+  s_555c5659f0909b::t_e4400048fd8614 1
+docs/plans/phase-15-pd-ha.md
+  s_555c5659f0909b::t_25304fcfad0447 193,219,288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "96353efbdd31fb9f6fef416cc380382d2d3b1044",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
