@@ -68,6 +68,21 @@ pub trait TxnSnapshot {
     /// snapshot, and first-committer-wins says we lose.
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>>;
 
+    /// **Anything committed inside `[start, end)` after `ts`** — the phantom test
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// A key-level check names keys that *existed* when a transaction read them; a row inserted
+    /// afterwards is in nobody's read set, and only the range it would have appeared in can name it.
+    /// Any answer at all refuses the prewrite.
+    ///
+    /// The default answers `None`, which is right for a snapshot with no range access and honest
+    /// rather than silently weaker: a store that cannot scan a range cannot claim a range is
+    /// unchanged, and every implementation in this workspace overrides it.
+    fn newest_write_in_range(&self, start: &[u8], end: &[u8], ts: u64) -> Result<Option<Version>> {
+        let _ = (start, end, ts);
+        Ok(None)
+    }
+
     /// The record the transaction at `start_ts` left on this key — a commit, or the rollback
     /// marker at `commit_ts == start_ts`.
     ///
@@ -89,6 +104,9 @@ impl<T: TxnSnapshot + ?Sized> TxnSnapshot for &T {
     }
     fn seek_write(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {
         (**self).seek_write(user_key, ts)
+    }
+    fn newest_write_in_range(&self, start: &[u8], end: &[u8], ts: u64) -> Result<Option<Version>> {
+        (**self).newest_write_in_range(start, end, ts)
     }
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {
         (**self).newest_write_after(user_key, ts)

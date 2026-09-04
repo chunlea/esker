@@ -146,6 +146,13 @@ pub enum Method {
     TxnHeartbeat = 0x0207,
     /// `TxnKv::GcSafepoint`.
     TxnGcSafepoint = 0x0208,
+    /// `TxnKv::LatestCommit` — the newest `commit_ts` for one key, and nothing else
+    /// ([ADR 0067](../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// **A question, not an acquisition.** It takes no lock, writes no log entry and has no
+    /// `TxnWrite` variant: it answers what the store already computes for its own prewrite check,
+    /// so that a waiter can tell a stale value from a fresh one instead of guessing.
+    TxnLatestCommit = 0x0209,
 
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
     /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
@@ -192,7 +199,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -225,6 +232,7 @@ impl Method {
         Self::TxnResolveLock,
         Self::TxnHeartbeat,
         Self::TxnGcSafepoint,
+        Self::TxnLatestCommit,
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
@@ -276,6 +284,7 @@ impl Method {
             0x0206 => Some(Self::TxnResolveLock),
             0x0207 => Some(Self::TxnHeartbeat),
             0x0208 => Some(Self::TxnGcSafepoint),
+            0x0209 => Some(Self::TxnLatestCommit),
             0x0501 => Some(Self::AdminSplit),
             0x0502 => Some(Self::AdminTransferLeader),
             0x0503 => Some(Self::AdminRegions),
@@ -340,6 +349,7 @@ impl Method {
             Self::TxnResolveLock => "TxnKv::ResolveLock",
             Self::TxnHeartbeat => "TxnKv::Heartbeat",
             Self::TxnGcSafepoint => "TxnKv::GcSafepoint",
+            Self::TxnLatestCommit => "TxnKv::LatestCommit",
         }
     }
 
@@ -1582,7 +1592,8 @@ mod tests {
                 | Method::TxnRollback
                 | Method::TxnResolveLock
                 | Method::TxnHeartbeat
-                | Method::TxnGcSafepoint => SERVICE_TXN_KV,
+                | Method::TxnGcSafepoint
+                | Method::TxnLatestCommit => SERVICE_TXN_KV,
                 Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
                 Method::SchemaFetch => crate::messages::SERVICE_SCHEMA,
                 _ => SERVICE_RAW_KV,

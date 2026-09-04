@@ -338,36 +338,7 @@ where
 /// exactly like correct data. Rather than weaken the check, this refuses and says so: catching the
 /// peer up is then still impossible, which is where it was before, and the failure is loud.
 pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
-    if first_key_in_region(db, region)?.is_none() {
-        // Nothing to clear, which is the ordinary case: a replica placed on a store that never
-        // held this range. No tombstone is written for it, so no discharge has to be waited for.
-        return Ok(());
-    }
-
-    // Every family and every namespace in one batch, so the range is emptied atomically rather
-    // than family by family with a crash window between them.
-    let mut batch = WriteBatch::new();
-    for (_, name) in SNAPSHOT_CFS {
-        let cf_id = db.cf_id(name).ok_or_else(|| {
-            ProtoError::internal(format!(
-                "the store opened without its `{name}` column family"
-            ))
-        })?;
-        for (low, high) in physical_ranges(region) {
-            batch.delete_range(cf_id, &low, &high);
-        }
-    }
-    db.write(batch, &WriteOptions::synced())
-        .map_err(|error| engine_to_proto(&error))?;
-    for (_, name) in SNAPSHOT_CFS {
-        db.flush(name).map_err(|error| engine_to_proto(&error))?;
-        for (low, high) in physical_ranges(region) {
-            db.compact_range(name, Some(&low), Some(&high))
-                .map_err(|error| engine_to_proto(&error))?;
-        }
-    }
-
-    if let Some(survivor) = first_key_in_region(db, region)? {
+    if let Some(survivor) = clear_and_verify(db, &region.start_key, &region.end_key)? {
         return Err(ProtoError::Unsupported {
             detail: format!(
                 "region {}: clearing [{:?}, {:?}) left key {:?} behind, so the range cannot be \
@@ -379,6 +350,83 @@ pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
         });
     }
     Ok(())
+}
+
+/// Empties a **user-key range** across every column family and both physical namespaces.
+///
+/// The reclaim half of [ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md):
+/// a dropped database's rows are not deleted one at a time, their range is cleared. This is
+/// [`clear_range`] without a region — the same delete, flush, discharge and verify — for a caller
+/// that has a range and no `Region` to describe it.
+///
+/// # What is bounded here, and what is not
+///
+/// The **delete** is `O(1)` in the size of the range: six range tombstones, one per column family
+/// per namespace, in one synced batch. That is also what makes it crash-safe with nothing to
+/// recover: after `kill -9` the batch is either in the WAL or it is not, and there is no
+/// intermediate state a restart could find.
+///
+/// The **compaction** is not bounded — it is proportional to the data under the range, and it is
+/// synchronous here because that is what makes the verify below meaningful. A caller reclaiming a
+/// whole tenant should therefore call this per chunk of the range rather than once for all of it;
+/// re-clearing a chunk that is already empty is a no-op, so the chunking needs no coordination
+/// beyond a cursor.
+///
+/// # Errors
+///
+/// The engine's, and [`ProtoError::Unsupported`] naming a key that survived the clear — which
+/// means a tombstone is still above the compaction floor because something is holding an engine
+/// snapshot open.
+pub fn clear_user_range(db: &Db, start: &[u8], end: &[u8]) -> Result<(), ProtoError> {
+    if let Some(survivor) = clear_and_verify(db, start, end)? {
+        return Err(ProtoError::Unsupported {
+            detail: format!(
+                "clearing [{start:?}, {end:?}) left key {survivor:?} behind: a tombstone is still \
+                 above the compaction floor, so something is holding an engine snapshot open \
+                 (docs/plans/phase-4.md §18)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Deletes `[start, end)` everywhere, discharges the tombstones, and answers the first key that
+/// survived — `None` when the range is provably empty.
+///
+/// Returning the survivor instead of formatting a message is what lets a region-shaped caller and
+/// a range-shaped one share this and still say *which* thing they were clearing.
+fn clear_and_verify(db: &Db, start: &[u8], end: &[u8]) -> Result<Option<Vec<u8>>, ProtoError> {
+    if first_key_in_user_range(db, start, end)?.is_none() {
+        // Nothing to clear, which is the ordinary case: a replica placed on a store that never
+        // held this range, or a chunk a previous pass already reclaimed. No tombstone is written
+        // for it, so no discharge has to be waited for — and this is also where the idempotence
+        // ADR 0069 needs comes from, as a property of the operation rather than a guard on it.
+        return Ok(None);
+    }
+
+    // Every family and every namespace in one batch, so the range is emptied atomically rather
+    // than family by family with a crash window between them.
+    let mut batch = WriteBatch::new();
+    for (_, name) in SNAPSHOT_CFS {
+        let cf_id = db.cf_id(name).ok_or_else(|| {
+            ProtoError::internal(format!(
+                "the store opened without its `{name}` column family"
+            ))
+        })?;
+        for (low, high) in physical_ranges_of(start, end) {
+            batch.delete_range(cf_id, &low, &high);
+        }
+    }
+    db.write(batch, &WriteOptions::synced())
+        .map_err(|error| engine_to_proto(&error))?;
+    for (_, name) in SNAPSHOT_CFS {
+        db.flush(name).map_err(|error| engine_to_proto(&error))?;
+        for (low, high) in physical_ranges_of(start, end) {
+            db.compact_range(name, Some(&low), Some(&high))
+                .map_err(|error| engine_to_proto(&error))?;
+        }
+    }
+    first_key_in_user_range(db, start, end)
 }
 
 /// Every engine range a region's user-key range maps to, one per physical namespace.
@@ -394,21 +442,31 @@ pub fn clear_range(db: &Db, region: &Region) -> Result<(), ProtoError> {
 /// below every raw key and `'x' + 1` is above every transactional one, which needs no argument
 /// about what the codec does with nothing.
 fn physical_ranges(region: &Region) -> [(Vec<u8>, Vec<u8>); PHYSICAL_NAMESPACES.len()] {
-    let raw_low = prefix::raw_key(&region.start_key);
-    let raw_high = if region.end_key.is_empty() {
+    physical_ranges_of(&region.start_key, &region.end_key)
+}
+
+/// The same mapping for a bare user-key range, which is what a reclaim that is not a whole region
+/// needs ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+///
+/// A region *is* a user-key range, so this is the general case and [`physical_ranges`] is the
+/// region-shaped call of it. An empty bound means the namespace's own edge, exactly as it does
+/// there: `'r'` is below every raw key and `'x' + 1` is above every transactional one.
+fn physical_ranges_of(start: &[u8], end: &[u8]) -> [(Vec<u8>, Vec<u8>); PHYSICAL_NAMESPACES.len()] {
+    let raw_low = prefix::raw_key(start);
+    let raw_high = if end.is_empty() {
         vec![prefix::RAW + 1]
     } else {
-        prefix::raw_key(&region.end_key)
+        prefix::raw_key(end)
     };
-    let txn_low = if region.start_key.is_empty() {
+    let txn_low = if start.is_empty() {
         vec![prefix::TXN]
     } else {
-        esker_txn::key::prefix(&region.start_key)
+        esker_txn::key::prefix(start)
     };
-    let txn_high = if region.end_key.is_empty() {
+    let txn_high = if end.is_empty() {
         vec![prefix::TXN + 1]
     } else {
-        esker_txn::key::prefix(&region.end_key)
+        esker_txn::key::prefix(end)
     };
     [(raw_low, raw_high), (txn_low, txn_high)]
 }
@@ -446,13 +504,19 @@ pub fn key_counts(
     Ok(counts)
 }
 
-/// The first key of `region`'s range that any shipped column family holds, if there is one.
+/// The first key of the user-key range `[start, end)` that any shipped column family holds, if
+/// there is one.
 ///
 /// Every family, because the question this answers is "is this range empty" and a range that is
-/// empty in `default` and not in `write` is not empty.
-fn first_key_in_region(db: &Db, region: &Region) -> Result<Option<Vec<u8>>, ProtoError> {
+/// empty in `default` and not in `write` is not empty. Every physical namespace too, for the same
+/// reason: a user key reaches the engine as `'r' ++ key` or as `'x' ++ enc(key) ++ !ts`.
+fn first_key_in_user_range(
+    db: &Db,
+    start: &[u8],
+    end: &[u8],
+) -> Result<Option<Vec<u8>>, ProtoError> {
     for (_, name) in SNAPSHOT_CFS {
-        for (low, high) in physical_ranges(region) {
+        for (low, high) in physical_ranges_of(start, end) {
             if let Some(found) = first_key_in(db, name, &low, &high)? {
                 return Ok(Some(found));
             }
@@ -611,8 +675,8 @@ mod tests {
     use esker_keys::prefix;
 
     use super::{
-        CHUNK_TARGET_BYTES, SnapshotHeader, clear_range, decode_pairs, encode_pairs,
-        first_key_in_region, read_pairs, stage_pairs,
+        CHUNK_TARGET_BYTES, SnapshotHeader, clear_range, clear_user_range, decode_pairs,
+        encode_pairs, first_key_in_user_range, read_pairs, stage_pairs,
     };
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, WriteBatch, WriteOptions, cf};
@@ -1055,14 +1119,14 @@ mod tests {
         clear_range(&db, &region(b"d", b"m")).unwrap();
 
         assert_eq!(
-            first_key_in_region(&db, &region(b"d", b"m")).unwrap(),
+            first_key_in_user_range(&db, b"d", b"m").unwrap(),
             None,
             "the range was not emptied, so refilling it would serve a mix of two states"
         );
         // And only that range: the keys on either side of it are untouched, in every family.
         for (key, what) in [(&b"a"[..], "below"), (&b"z"[..], "above")] {
             assert!(
-                first_key_in_region(&db, &region(key, &[key[0] + 1]))
+                first_key_in_user_range(&db, key, &[key[0] + 1])
                     .unwrap()
                     .is_some(),
                 "clearing a region's range took a key {what} it"
@@ -1079,6 +1143,101 @@ mod tests {
         stage_transactional(&db, b"e", 10, 11);
         clear_range(&db, &region(b"d", b"m")).unwrap();
         clear_range(&db, &region(b"d", b"m")).unwrap();
-        assert_eq!(first_key_in_region(&db, &region(b"d", b"m")).unwrap(), None);
+        assert_eq!(first_key_in_user_range(&db, b"d", b"m").unwrap(), None);
+    }
+
+    /// **A reclaim clears a sub-range of a region and nothing on either side of it.**
+    ///
+    /// [ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md):
+    /// a dropped database's rows are reclaimed by range, and a tenant's range is not a region's —
+    /// it is some part of one, or spans several. The neighbour half is the whole safety argument:
+    /// a reclaim that took a key outside the range it was given would delete a live database's
+    /// rows, and a store holds many tenants.
+    #[test]
+    fn a_reclaim_clears_its_own_range_and_leaves_its_neighbours() {
+        let (_dir, db) = open();
+        for key in [&b"c"[..], b"e", b"f", b"q"] {
+            stage_pairs(
+                &db,
+                DEFAULT_CF,
+                &raw_pairs(&[std::str::from_utf8(key).unwrap()]),
+            )
+            .unwrap();
+            stage_transactional(&db, key, 10, 11);
+        }
+
+        // A strict sub-range of the region: `e` and `f` are inside, `c` and `q` are not.
+        clear_user_range(&db, b"d", b"m").unwrap();
+
+        assert_eq!(
+            first_key_in_user_range(&db, b"d", b"m").unwrap(),
+            None,
+            "the range the reclaim was given still holds a key"
+        );
+        for (key, what) in [(&b"c"[..], "below"), (&b"q"[..], "above")] {
+            assert!(
+                first_key_in_user_range(&db, key, &[key[0] + 1])
+                    .unwrap()
+                    .is_some(),
+                "the reclaim took a key {what} the range it was given, in some family"
+            );
+        }
+    }
+
+    /// **Reclaiming is idempotent**, which is what lets ADR 0069's driver resume from a persisted
+    /// cursor after a crash without tracking what it had already done.
+    ///
+    /// The second call takes the early return — the range is provably empty, so nothing is
+    /// written and no discharge is waited for — which is idempotence as a property of the
+    /// operation rather than a guard in front of it.
+    #[test]
+    fn reclaiming_a_range_twice_is_the_same_as_reclaiming_it_once() {
+        let (_dir, db) = open();
+        stage_pairs(&db, DEFAULT_CF, &raw_pairs(&["e"])).unwrap();
+        stage_transactional(&db, b"e", 10, 11);
+        clear_user_range(&db, b"d", b"m").unwrap();
+        clear_user_range(&db, b"d", b"m").unwrap();
+        assert_eq!(first_key_in_user_range(&db, b"d", b"m").unwrap(), None);
+    }
+
+    /// **A range reclaimed in chunks ends up exactly where one reclaimed whole would.**
+    ///
+    /// This is the bounded-work half of ADR 0069: the delete is `O(1)` in the range's size but the
+    /// compaction is not, so a caller reclaiming a whole tenant walks it a chunk at a time. That is
+    /// only sound if the chunks compose, and a chunk boundary is the place a range mapping gets an
+    /// off-by-one wrong — so the chunked and whole forms are compared against each other rather
+    /// than each against an assertion.
+    #[test]
+    fn a_range_reclaimed_in_chunks_matches_one_reclaimed_whole() {
+        let keys = ["d", "e", "f", "g", "h"];
+        let (_whole_dir, whole) = open();
+        let (_chunked_dir, chunked) = open();
+        for db in [&whole, &chunked] {
+            for key in keys {
+                stage_pairs(db, DEFAULT_CF, &raw_pairs(&[key])).unwrap();
+                stage_transactional(db, key.as_bytes(), 10, 11);
+            }
+            // A neighbour on each side, so a chunk that overran would be visible.
+            for key in ["c", "z"] {
+                stage_pairs(db, DEFAULT_CF, &raw_pairs(&[key])).unwrap();
+                stage_transactional(db, key.as_bytes(), 10, 11);
+            }
+        }
+
+        clear_user_range(&whole, b"d", b"m").unwrap();
+        for (low, high) in [(&b"d"[..], &b"f"[..]), (b"f", b"h"), (b"h", b"m")] {
+            clear_user_range(&chunked, low, high).unwrap();
+        }
+
+        for db in [&whole, &chunked] {
+            assert_eq!(first_key_in_user_range(db, b"d", b"m").unwrap(), None);
+            for key in [&b"c"[..], b"z"] {
+                assert!(
+                    first_key_in_user_range(db, key, &[key[0] + 1])
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 }
