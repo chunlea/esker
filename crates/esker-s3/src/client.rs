@@ -17,6 +17,7 @@ use esker_base::sha256;
 use crate::error::{Error, Result};
 use crate::http::{Method, Request, Response};
 use crate::sigv4::{self, CanonicalRequest, Credentials, Scope};
+use crate::tls::TlsRoots;
 use crate::transport::{TcpTransport, Transport};
 use crate::xml;
 use crate::{GetResponse, MAX_SINGLE_PUT, ObjectStore, ObjectSummary, PutOutcome};
@@ -133,6 +134,12 @@ pub struct Config {
     /// *ordering*; this is not ordering — `SigV4` requires a timestamp within fifteen minutes of
     /// the server's, and no TSO can supply that.
     pub clock: fn() -> i64,
+    /// Which roots verify the endpoint's certificate, when the endpoint is `https://`.
+    ///
+    /// Ignored for a plain endpoint, and present in both builds so this struct needs no `cfg`.
+    /// [`TlsRoots::Platform`] is the host's own CA bundle; a self-signed `MinIO` wants
+    /// [`TlsRoots::File`] instead (`ESKER_S3_CA_CERT`).
+    pub tls_roots: TlsRoots,
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
@@ -185,6 +192,7 @@ impl Config {
             prefix,
             region: region.into(),
             credentials,
+            tls_roots: TlsRoots::default(),
             path_style: true,
             clock: unix_now,
         })
@@ -205,10 +213,42 @@ pub struct S3Client {
 }
 
 impl S3Client {
-    /// A client over a plain TCP transport.
+    /// A client over the transport the endpoint's scheme calls for.
+    ///
+    /// **A plain transport is never used for an `https://` endpoint.** With the `tls` feature the
+    /// TLS transport is built here and its root store is loaded on first use, so a CA file that
+    /// cannot be read fails every request with the reason rather than falling back to plaintext.
+    /// [`S3Client::open`] is the same thing with that load brought forward, which is what a
+    /// process that wants to fail at startup should call.
+    ///
+    /// Without the feature this cannot see a TLS endpoint at all: [`Endpoint::parse`] refuses one.
     #[must_use]
     pub fn new(config: Config) -> Self {
+        #[cfg(feature = "tls")]
+        if config.endpoint.tls {
+            let transport = crate::tls::TlsTransport::new(config.tls_roots.clone());
+            return Self::with_transport(config, Arc::new(transport));
+        }
         Self::with_transport(config, Arc::new(TcpTransport::new()))
+    }
+
+    /// A client whose transport is ready **now**, so a misconfigured trust store is a startup
+    /// error rather than a failure on the first upload.
+    ///
+    /// # Errors
+    ///
+    /// For a TLS endpoint: the CA bundle could not be found, read or parsed. A plain endpoint
+    /// cannot fail here and never does.
+    pub fn open(config: Config) -> Result<Self> {
+        #[cfg(feature = "tls")]
+        if config.endpoint.tls {
+            let transport = crate::tls::TlsTransport::prepared(
+                config.tls_roots.clone(),
+                crate::transport::Timeouts::default(),
+            )?;
+            return Ok(Self::with_transport(config, Arc::new(transport)));
+        }
+        Ok(Self::new(config))
     }
 
     /// A client over a transport of the caller's choosing — a TLS one, when there is one, or a
