@@ -1,4 +1,4 @@
-# 0062 — A user-defined range is a representation chosen by its subtype
+# 0063 — A user-defined range is a representation chosen by its subtype
 
 *Status: accepted. 2026-09-04.*
 

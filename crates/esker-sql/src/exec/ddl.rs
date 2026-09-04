@@ -314,7 +314,7 @@ fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<ca
 /// is invariant 7 kept rather than worked around.
 ///
 /// **A range's value is a range**
-/// ([ADR 0062](../../../docs/adr/0062-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md)),
+/// ([ADR 0063](../../../docs/adr/0063-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md)),
 /// and the column type is chosen by its *subtype*: a
 /// `CREATE TYPE floatrange AS RANGE (subtype = float8)` column holds the same canonical text a
 /// `numrange` one does, read and written by the same `crate::value::range`. Which range type it
