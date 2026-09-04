@@ -1,0 +1,41 @@
+crates/esker-proto/src/transport/client.rs
+  s_555c5659f0909b::t_0f2903ecee3c50 21,64-97,105,107,620-654
+crates/esker-proto/src/transport/server.rs
+  s_555c5659f0909b::t_bd64c63b835c5e 21,108-112,128,132-144,170,196,199,270,274-278,471-498
+crates/esker-proto/tests/fixtures/README.md
+  s_555c5659f0909b::t_3d853af1d906f3 1-46
+crates/esker-proto/tests/fixtures/ca-cert.pem
+  s_555c5659f0909b::t_11b9f244e20473 1-11
+crates/esker-proto/tests/fixtures/node-a-cert.pem
+  s_555c5659f0909b::t_81e3aa8654d527 1-12
+crates/esker-proto/tests/fixtures/node-a-key.pem
+  s_555c5659f0909b::t_07650d0b95aeef 1-5
+crates/esker-proto/tests/fixtures/node-b-cert.pem
+  s_555c5659f0909b::t_804b1cf4f30dee 1-12
+crates/esker-proto/tests/fixtures/node-b-key.pem
+  s_555c5659f0909b::t_9ae81f2a489d66 1-5
+crates/esker-proto/tests/fixtures/other-ca-cert.pem
+  s_555c5659f0909b::t_05c8c78d2a04ce 1-11
+crates/esker-proto/tests/fixtures/stranger-cert.pem
+  s_555c5659f0909b::t_8fcb5f62ce4e98 1-12
+crates/esker-proto/tests/fixtures/stranger-key.pem
+  s_555c5659f0909b::t_89785c96f67d95 1-5
+crates/esker-proto/tests/rpc_tls.rs
+  s_555c5659f0909b::t_0d2b931626dfa7 1-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "24998f8bb7c2323cd9b805f287402689ff0732ff",
+  "prompts": {},
+  "sessions": {
+    "s_555c5659f0909b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78f69efd-98df-486d-bfe5-99f8c29b03a0",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
