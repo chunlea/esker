@@ -1,6 +1,6 @@
 # ADR 0062 — SERIALIZABLE is snapshot isolation plus a validated read set
 
-Status: proposed · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family ·
+Status: accepted (the `Check` tag approved 2026-09-04) · Date: 2026-09-04 · Phase 9 (Rails compatibility), the locking family ·
 Builds on [ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md)
 
 ## Context
@@ -149,14 +149,41 @@ in the Rails suite constructs one, and the cost of option 1 falls on the workloa
 common and most performance-sensitive. `SERIALIZABLE READ ONLY DEFERRABLE`, PostgreSQL's own answer
 to this, is a `0A000` naming itself until this is revisited.
 
+## What unit 8a built, and why it needs no lock
+
+The in-process backend, which is where the measure lives: `docs/bench/rails-scoreboard.md` runs the
+scoreboard node on it, so this is the half that moves the two tests.
+
+`Txn::validate_reads` turns recording on for a transaction the executor sees at SERIALIZABLE — asked
+once per statement, because `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` is a statement and a
+transaction that learned its level only at `BEGIN` would record nothing for the one spelling a client
+actually writes. `get` records the key it read (unless the buffer answered it, or it is a catalog
+key); `scan` records the **range**, which is what makes a phantom visible. At commit, every recorded
+key must be untouched since `start_ts` and every recorded range must have gained nothing.
+
+**And here it needs no check lock**, which §2 above requires on the wire. The reason is specific
+rather than a shortcut: this backend does the validation and the version writes **inside one
+critical section** — the same `Versions` mutex, never released between them — so no commit can slip
+between the check and the write. On the store path validation and commit are separate messages to
+separate regions, and there the lock is the only thing that closes that window. The two
+implementations are the same rule under different atomicity, and a reader should not conclude from
+the simpler one that the harder one is optional.
+
+**PostgreSQL's own sentence, for this cause.** A write-write conflict is `could not serialize access
+due to concurrent update`; this is `could not serialize access due to read/write dependencies among
+transactions`, with `HINT: The transaction might succeed if retried.` — two messages under one code,
+measured. What is **not** copied is `DETAIL: Reason code: Canceled on identification as a pivot,
+during commit attempt`: that names a step in SSI's dangerous-structure detection, and this node
+reaches the same conclusion by validating a read set. Repeating it would describe machinery that is
+not here.
+
 ## What this does **not** catch
 
-* **Phantoms.** A key-level read set records keys that *existed*. `SELECT … WHERE duty` that matched
-  two rows records those two; a third row **inserted** by a concurrent transaction is a key nobody
-  read, so no check names it and both transactions commit. Ranges are the fix and they are their own
-  decision — see §Ranges below. Until then this is SERIALIZABLE **without phantom protection**,
-  which is materially stronger than SI and materially weaker than PostgreSQL, and must be documented
-  as exactly that rather than as "serializable".
+* ~~**Phantoms.**~~ **Caught, by recording the range rather than the keys.** A key that did not
+  exist when the scan ran is in no read set and only the range it would have appeared in can name
+  it; unit 8a records `[start, end)` per scan and validates it at commit. The cost is the one §Ranges
+  predicted — a scan of a wide range conflicts with any commit inside it — and the shape that pays it
+  is a query with no useful bound, which is also the query that scans the table.
 * **Predicates the store cannot see.** A read filtered in the SQL layer still read the keys it
   filtered, so the read set is a superset — that direction is safe (spurious `40001`s, never a missed
   conflict). A read that never happened because a plan skipped it is invisible, and a plan that reads

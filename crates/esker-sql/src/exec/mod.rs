@@ -651,6 +651,13 @@ impl Executor {
                     if self.isolation().waits() {
                         txn.begin_statement()?;
                     }
+                    // **Asked once per statement, because the level can be set inside the block.**
+                    // `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` is a statement like any other,
+                    // and a transaction that learned its level only at `BEGIN` would record nothing
+                    // for the one shape a client actually writes (ADR 0062).
+                    txn.validate_reads(
+                        self.isolation() == crate::parameter::Isolation::Serializable,
+                    );
                     let outcome = if savepoints.recording() {
                         let mut recording = savepoint::Recording::new(&mut *txn, &mut savepoints);
                         let outcome = self.run_recording(&mut recording, &statement, &mut written);
@@ -681,6 +688,7 @@ impl Executor {
 
         let mut txn = self.open_txn()?;
         self.catalog_written = false;
+        txn.validate_reads(self.isolation() == crate::parameter::Isolation::Serializable);
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
             Err(error) => {

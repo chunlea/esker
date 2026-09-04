@@ -220,6 +220,21 @@ pub enum SqlError {
     #[error("permission denied to create \"{0}\"")]
     CreateInSystemSchema(String),
 
+    /// A SERIALIZABLE transaction whose **read set** was written by somebody else
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
+    ///
+    /// **`40001`, and PostgreSQL's own sentence for this cause rather than for the other one.** A
+    /// write-write conflict is `could not serialize access due to concurrent update`; this is the
+    /// read/write dependency a real server's SSI reports, and the two are different messages under
+    /// one code, measured (`tests/corpus/pg19_transaction_timeouts.txt`).
+    ///
+    /// What is **not** copied is PostgreSQL's `DETAIL: Reason code: Canceled on identification as a
+    /// pivot, during commit attempt`. That names a step in SSI's dangerous-structure detection —
+    /// finding a pivot transaction — and this node reaches the same conclusion by validating a read
+    /// set instead. Repeating the sentence would be describing machinery that is not here.
+    #[error("could not serialize access due to read/write dependencies among transactions")]
+    ReadWriteDependency,
+
     /// `NOWAIT` over a row another transaction holds.
     ///
     /// **`55P03`, and PostgreSQL's own sentence**, measured with two sessions: the relation is the
@@ -2343,7 +2358,9 @@ impl SqlError {
             }
             SqlError::NegativeLimit("LIMIT") => sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             SqlError::NegativeLimit(_) => sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-            SqlError::SerializationFailure { .. } => sqlstate::SERIALIZATION_FAILURE,
+            SqlError::SerializationFailure { .. } | SqlError::ReadWriteDependency => {
+                sqlstate::SERIALIZATION_FAILURE
+            }
             SqlError::OutcomeUnknown(_) => sqlstate::STATEMENT_COMPLETION_UNKNOWN,
             SqlError::StoreUnavailable(_) => sqlstate::CONNECTION_FAILURE,
             SqlError::DoesNotExistSkipping { .. } => sqlstate::SUCCESSFUL_COMPLETION,
@@ -2621,6 +2638,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, and true here for the same reason it is true there: the conflict is
+            // with a transaction that has now finished, so the retry reads a settled state.
+            SqlError::ReadWriteDependency => {
+                Some("The transaction might succeed if retried.".to_owned())
+            }
             // PostgreSQL's own, and the reason this error is worth more than a refusal:
             // `change_column` reads the sentence and re-sends the statement with that `USING`.
             SqlError::CannotCastColumnAutomatically { using, .. } => {

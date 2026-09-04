@@ -302,18 +302,14 @@ const DIVERGENCES: &[(char, &str, &str)] = &[
     (
         'B',
         "COMMIT",
-        "PostgreSQL's `SERIALIZABLE` detects the read/write dependency between two transactions \
-         that both read `sum(n)` and each insert a *different* row, and refuses B's commit with \
-         `40001`. This node is snapshot isolation (ADR 0031): its conflict rule is about the keys \
-         a transaction **wrote**, so two inserts of different keys both commit and the table ends \
-         with 4 rows rather than 3. `BEGIN ISOLATION LEVEL SERIALIZABLE` is accepted and gives \
-         snapshot isolation — the standing caveat this whole phase is measured under.",
-    ),
-    (
-        'A',
-        "SELECT count(*) FROM tt_rows",
-        "The row above's consequence, one line later: 4 here where PostgreSQL has 3, because B's \
-         insert survived. A follow-on and not a divergence of its own.",
+        "**The refusal is the same and the DETAIL is not.** This node now refuses B's commit with \
+         `40001 could not serialize access due to read/write dependencies among transactions`, \
+         PostgreSQL's own sentence and hint for this cause (ADR 0062) — what it does not carry is \
+         `DETAIL: Reason code: Canceled on identification as a pivot, during commit attempt`, \
+         which names a step in SSI's dangerous-structure detection. This node reaches the same \
+         conclusion by validating the read set, so repeating that sentence would describe \
+         machinery that is not here. The line above it — B's insert — is what closed: two \
+         transactions that both read the table and insert different rows no longer both commit.",
     ),
     (
         'B',
@@ -635,14 +631,19 @@ fn every_locking_clause_answers_its_rows_when_nobody_holds_them() {
     }
 }
 
-/// **`BEGIN ISOLATION LEVEL SERIALIZABLE` is accepted and gives snapshot isolation**, which is the
-/// caveat ADR 0031 makes permanent — and the observable half of it is here.
+/// **`SERIALIZABLE` refuses the second of two transactions that read what the other wrote.**
 ///
-/// Two transactions each read the whole table and each insert a *different* row. PostgreSQL's SSI
-/// sees the read/write dependency and refuses the second commit; this node's conflict rule is
-/// about keys **written**, so both commit and the table has four rows where PostgreSQL has three.
+/// This test asserted the opposite until ADR 0062: two transactions each read the whole table and
+/// each insert a *different* row, so nothing about first-committer-wins had an opinion and both
+/// committed, leaving four rows where PostgreSQL leaves three. That was ADR 0031's standing caveat
+/// and it is now closed — not by detecting SSI's dangerous structures, but by validating at commit
+/// that nothing this transaction **read** has been written since its snapshot.
+///
+/// The insert is the write and `sum(n)` over the whole table is the read, so B's commit meets A's
+/// new row inside a range it read. Exactly one of the two survives, which is what a real server
+/// does; which one is the first committer, which is what a real server also does.
 #[test]
-fn serializable_is_snapshot_isolation_and_two_different_keys_both_commit() {
+fn serializable_refuses_the_second_of_two_transactions_that_read_what_the_other_wrote() {
     let mut cluster = Cluster::new(&['A', 'B']);
     cluster
         .session('A')
@@ -654,9 +655,11 @@ fn serializable_is_snapshot_isolation_and_two_different_keys_both_commit() {
         .unwrap();
 
     for who in ['A', 'B'] {
+        cluster.session(who).run("BEGIN").unwrap();
+        // The level as its own statement: this fixture's `BEGIN` takes no clauses.
         cluster
             .session(who)
-            .run("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap();
         assert_eq!(
             cluster.session(who).rows("SELECT sum(n) FROM tt_rows"),
@@ -673,15 +676,22 @@ fn serializable_is_snapshot_isolation_and_two_different_keys_both_commit() {
         .run("INSERT INTO tt_rows VALUES (4, 40)")
         .unwrap();
     cluster.session('A').run("COMMIT").unwrap();
-    cluster
+    let refused = cluster
         .session('B')
         .run("COMMIT")
-        .expect("different keys do not conflict under snapshot isolation");
+        .expect_err("B read the table A wrote into");
+    assert_eq!(refused.sqlstate(), "40001");
+    assert_eq!(
+        refused.to_string(),
+        "could not serialize access due to read/write dependencies among transactions",
+        "PostgreSQL's sentence for this cause, not the one it uses for a write-write conflict"
+    );
 
+    cluster.session('B').run("ROLLBACK").unwrap();
     assert_eq!(
         cluster.session('A').rows("SELECT count(*) FROM tt_rows"),
-        [["4"]],
-        "PostgreSQL's SERIALIZABLE leaves 3 here; snapshot isolation leaves 4"
+        [["3"]],
+        "three rows, which is what PostgreSQL's SERIALIZABLE leaves"
     );
 }
 
