@@ -174,3 +174,53 @@ fn the_same_skew_under_read_committed_commits_both() {
         .unwrap()
         .expect("READ COMMITTED is snapshot isolation here and commits both");
 }
+
+/// **The same skew with a savepoint open**, which is what `ActiveRecord` writes for every nested
+/// `transaction do` block.
+///
+/// A statement inside a savepoint runs through `savepoint::Recording`, a `Txn` that wraps the real
+/// one — and a trait method it does not forward is a method that statement does not really call.
+/// `validate_reads` defaulted to doing nothing, so a SERIALIZABLE transaction with a savepoint open
+/// recorded nothing and validated nothing. That is the third method to be missed this way, after
+/// `lock` in unit 1, and the reason this test exists rather than a note.
+#[test]
+fn write_skew_is_caught_with_a_savepoint_open() {
+    let pair = Pair::new(&[
+        "CREATE TABLE nested (name text primary key, duty boolean)",
+        "INSERT INTO nested VALUES ('alice', true), ('bob', true)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let second = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        b.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        b.run("SAVEPOINT inner_one").unwrap();
+        b.rows("SELECT count(*) FROM nested WHERE duty");
+        b.run("UPDATE nested SET duty = false WHERE name = 'bob'")
+            .unwrap();
+        reached(&b_says, "B has read and written");
+        edge(&hears_a, "A has committed");
+        b.run("COMMIT").map(|_| ())
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    a.run("SAVEPOINT inner_one").unwrap();
+    a.rows("SELECT count(*) FROM nested WHERE duty");
+    a.run("UPDATE nested SET duty = false WHERE name = 'alice'")
+        .unwrap();
+    edge(&hears_b, "B has read and written");
+    a.run("COMMIT").unwrap();
+    reached(&a_says, "A has committed");
+
+    let refused = second
+        .join()
+        .unwrap()
+        .expect_err("a savepoint must not turn validation off");
+    assert_eq!(refused.sqlstate(), "40001", "{refused}");
+}
