@@ -1,0 +1,19 @@
+docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md
+  s_2bed4ac2b1c944::t_5db46c90421139 1-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "53b7d50edaa51b3f7b3382441e91589a581b1f0b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
