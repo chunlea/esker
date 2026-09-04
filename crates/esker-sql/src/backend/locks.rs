@@ -105,10 +105,18 @@ impl RowLocks {
                     lease_ms: u64::MAX,
                 }
             }
-            // Ours already, or nobody's.
-            Some(_) => Lock::Taken,
+            // Ours already, or nobody's. **Either way this transaction is no longer waiting**,
+            // and the edge has to go with the wait: the graph below is what the deadlock detector
+            // walks, so an edge left behind can close a cycle that does not exist and answer
+            // `40P01` to a transaction that was never in one. It also outlives its client in
+            // `pg_locks`, which is how run 78 found it.
+            Some(_) => {
+                self.waits_for.remove(&id);
+                Lock::Taken
+            }
             None => {
                 self.locks.insert(key.to_vec(), (id, start_ts));
+                self.waits_for.remove(&id);
                 Lock::Taken
             }
         }
@@ -144,5 +152,57 @@ impl RowLocks {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RowLocks;
+    use crate::backend::Lock;
+
+    /// **A transaction that stops waiting stops being a waiter**, and both ways out count: it
+    /// acquires the key, or it gives up holding nothing.
+    ///
+    /// The wait-for graph is what the deadlock detector walks, so a stale edge is not merely an
+    /// untidy `pg_locks` row — it is an edge that can close a cycle that does not exist, and the
+    /// answer to that is `40P01` for a transaction that was never in a deadlock.
+    ///
+    /// Run 78's capture is the untidy half: a waiter still listed an hour after its client exited,
+    /// with a second one accumulated beside it.
+    #[test]
+    fn a_wait_ends_when_it_stops_waiting() {
+        let mut locks = RowLocks::default();
+        let (a, b) = (locks.next_id(), locks.next_id());
+        assert!(matches!(locks.take(b"k", a, 10), Lock::Taken));
+        assert!(matches!(locks.take(b"k", b, 20), Lock::Held { .. }));
+        assert_eq!(locks.waits_for.get(&b), Some(&a), "b is waiting for a");
+
+        // A ends; B takes the key it was waiting for.
+        locks.release(a, &[b"k".to_vec()]);
+        assert!(matches!(locks.take(b"k", b, 20), Lock::Taken));
+        assert!(
+            locks.waits_for.is_empty(),
+            "b holds the key now and is waiting for nobody: {:?}",
+            locks.waits_for
+        );
+    }
+
+    /// The other way out: the waiter gives up — `lock_timeout` — and so holds nothing at all.
+    ///
+    /// `release` used to return early on an empty list, which is exactly the transaction whose edge
+    /// nothing else would ever remove.
+    #[test]
+    fn a_waiter_that_gave_up_holding_nothing_is_forgotten() {
+        let mut locks = RowLocks::default();
+        let (a, b) = (locks.next_id(), locks.next_id());
+        assert!(matches!(locks.take(b"k", a, 10), Lock::Taken));
+        assert!(matches!(locks.take(b"k", b, 20), Lock::Held { .. }));
+
+        locks.release(b, &[]);
+        assert!(
+            locks.waits_for.is_empty(),
+            "the transaction that gave up is not waiting for anything: {:?}",
+            locks.waits_for
+        );
     }
 }

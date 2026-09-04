@@ -56,7 +56,7 @@
 //! What makes it work is that every one of these operations is idempotent and that the truth
 //! lives in one key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -402,6 +402,8 @@ impl TxnClient {
             read_ts: BTreeMap::new(),
             statement_ts: None,
             statement_undo: BTreeMap::new(),
+            checks: BTreeSet::new(),
+            check_ranges: BTreeMap::new(),
             read_only,
             refused_write: None,
             state: State::Open,
@@ -456,6 +458,18 @@ pub struct Transaction {
     /// The read timestamp of the statement running now, or `None` while it is the transaction's
     /// own. Set by [`Transaction::begin_statement`].
     statement_ts: Option<u64>,
+    /// **Keys this transaction only read**, for SERIALIZABLE's commit-time validation
+    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
+    /// [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// Empty for every transaction at another level, which is what makes this cost nothing to the
+    /// two that do not ask for it. A key that is *also* written is not here: its own write lock
+    /// already covers the interval, and checking it twice would ask the same question at a
+    /// different timestamp.
+    checks: BTreeSet<Bytes>,
+    /// **Ranges this transaction scanned**, `start -> end`. The phantom half: a row that did not
+    /// exist when the scan ran is in no read set, and only the range can name it.
+    check_ranges: BTreeMap<Bytes, Bytes>,
     /// What the buffer held for each key **before the statement running now touched it**, so a
     /// statement that has to be re-run can give its writes back.
     ///
@@ -537,6 +551,20 @@ impl Transaction {
     /// rather than repeated on every key.
     pub fn reading_at(&mut self, read_ts: u64) {
         self.statement_ts = Some(read_ts);
+    }
+
+    /// Hands this transaction the read set its commit must validate (ADR 0062).
+    ///
+    /// Called once, before `commit`, by the layer that knows which reads *count* — the catalog is
+    /// excluded there, not here, because a client that interpreted keys would be deciding SQL
+    /// semantics (`CLAUDE.md` invariant 7). A key already in the write buffer is dropped: its write
+    /// lock covers the same interval.
+    pub fn checking(&mut self, keys: impl IntoIterator<Item = Bytes>, ranges: Vec<(Bytes, Bytes)>) {
+        self.checks = keys
+            .into_iter()
+            .filter(|key| !self.buffer.contains_key(key))
+            .collect();
+        self.check_ranges = ranges.into_iter().collect();
     }
 
     /// Begins a statement: a fresh read timestamp, and the previous statement's undo **discarded**.
@@ -637,6 +665,33 @@ impl Transaction {
     #[must_use]
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// **The newest `commit_ts` for `key`, or `None`** — the question, not an acquisition
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
+    ///
+    /// Read-only: no lock, no log entry. What asks it is a statement that took a row lock without
+    /// waiting and cannot tell from the lock alone whether the writer in front committed and
+    /// released in between.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or region failure the router could not retry away.
+    pub fn latest_commit(&self, key: &[u8]) -> Result<Option<u64>> {
+        let request = TxnKvReq::LatestCommit {
+            key: Bytes::copy_from_slice(key),
+        };
+        match self.call_resolving(&request)? {
+            TxnKvResp::LatestCommit { newest } => Ok(newest),
+            other => Err(unexpected(Method::TxnLatestCommit, &other)),
+        }
+    }
+
+    /// The snapshot this transaction's reads are served at — the running statement's where there is
+    /// one, and the transaction's own otherwise. The public face of the private `read_ts`.
+    #[must_use]
+    pub fn reading_ts(&self) -> u64 {
+        self.read_ts()
     }
 
     /// Reads one key at this transaction's snapshot, its own buffered writes first.
@@ -762,16 +817,38 @@ impl Transaction {
         };
 
         // 2. The primary, alone and first. Its lock is what every resolver reads.
-        self.prewrite(&primary, std::slice::from_ref(&primary))?;
+        //
+        // **A prewrite that fails takes its locks back with it.** Percolator leaves them for the
+        // TTL and a reader resolves them, which is correct and slow: the next reader of those keys
+        // meets a live lock it may not clear and waits out the whole TTL for a transaction that is
+        // already dead. That is bearable when a refusal is rare, and it stopped being rare when
+        // SERIALIZABLE started refusing commits on purpose (ADR 0062) — a transaction that loses a
+        // validation is a *normal* outcome now. So the loser cleans up after itself, which is what
+        // a real server does when it aborts.
+        self.prewrite_or_roll_back(&primary, std::slice::from_ref(&primary), &[])?;
 
         // 3. The secondaries, grouped by region, the groups in parallel.
+        //
+        // **A checked key is a secondary.** It takes a lock like any other key of this
+        // transaction, so it groups, commits and rolls back by the machinery already here — which
+        // is the whole reason ADR 0067 put the check on the *mutation* rather than inventing a
+        // second kind of request (ADR 0062 §2, §4).
         let secondaries: Vec<Bytes> = self
             .buffer
             .keys()
+            .chain(self.checks.iter())
             .filter(|key| **key != primary)
             .cloned()
             .collect();
-        self.prewrite_grouped(&primary, &secondaries)?;
+        self.prewrite_or_roll_back(&primary, &secondaries, std::slice::from_ref(&primary))?;
+        // The ranges, which are not keys and so cannot ride that list: each is verified against the
+        // region its lower bound falls in, and leaves nothing behind to commit.
+        if let Err(error) = self.prewrite_range_checks(&primary) {
+            if !matches!(error, Error::AmbiguousResult { .. }) {
+                self.undo(&primary, &secondaries);
+            }
+            return Err(error);
+        }
 
         // 4. and 5. The commit point.
         let commit_ts = self.oracle.timestamp()?;
@@ -899,12 +976,14 @@ impl Transaction {
                     // makes — and every write at all until the framing change lands.
                     read_ts: self.read_ts.get(key).copied(),
                 },
-                // A key that is not in the buffer cannot be reached: every list here is built
-                // from the buffer's own keys. `Delete` is the safe reading if it ever were.
-                Some(Write::Delete) | None => TxnMutation::Delete {
+                Some(Write::Delete) => TxnMutation::Delete {
                     key: key.clone(),
                     read_ts: self.read_ts.get(key).copied(),
                 },
+                // Not in the buffer: a key this transaction **read** and is asking the store to
+                // verify and hold. `Check` writes no value; what it leaves is the lock that makes
+                // the validation and the commit atomic (ADR 0067 §1).
+                None => TxnMutation::Check { key: key.clone() },
             })
             .collect()
     }
@@ -962,6 +1041,78 @@ impl Transaction {
 
     fn prewrite_grouped(&self, primary: &Bytes, keys: &[Bytes]) -> Result<()> {
         self.grouped(keys, |group| self.prewrite(primary, group))
+    }
+
+    /// Prewrites `keys`, and on failure rolls back everything this transaction has placed.
+    ///
+    /// `placed` is what earlier steps already locked. The rollback is best effort — its own failure
+    /// is not the caller's answer, and what it cannot clean the TTL still will.
+    fn prewrite_or_roll_back(
+        &self,
+        primary: &Bytes,
+        keys: &[Bytes],
+        placed: &[Bytes],
+    ) -> Result<()> {
+        match self.prewrite_grouped(primary, keys) {
+            Ok(()) => Ok(()),
+            // **Only a definite failure is cleaned up after.** An `AmbiguousResult` is a prewrite
+            // whose fate the client does not know, and its whole contract is that the *caller*
+            // decides what to do about it — rolling back here would answer that question on their
+            // behalf and turn "you do not know" into "it is dead", which is a different promise
+            // from the one this error makes.
+            Err(error) if matches!(error, Error::AmbiguousResult { .. }) => Err(error),
+            Err(error) => {
+                self.undo(primary, placed);
+                Err(error)
+            }
+        }
+    }
+
+    /// Rolls back what a failed commit had already locked, best effort.
+    ///
+    /// The keys of the attempt itself are included: a group that failed may have been one of
+    /// several, and the ones that succeeded hold locks nobody is coming back for.
+    fn undo(&self, primary: &Bytes, placed: &[Bytes]) {
+        let _ = self.rollback_keys(std::slice::from_ref(primary));
+        if !placed.is_empty() {
+            let _ = self.rollback_grouped(placed);
+        }
+    }
+
+    /// Sends the range checks, each to the region its **lower bound** falls in.
+    ///
+    /// A range is not a key, so it cannot join the grouped list — and it leaves no lock, so there
+    /// is nothing to commit or roll back for it either. What it does leave is a verdict: anything
+    /// committed inside it since this transaction's snapshot refuses the prewrite.
+    ///
+    /// **A range that spans a region boundary is checked in the region its start is in and no
+    /// further**, which is the same bound `Scan` has and is declared in ADR 0067 §3: a phantom
+    /// inserted past the boundary is not seen. Splitting a range check across regions is the same
+    /// problem as splitting a scan and is not solved here.
+    fn prewrite_range_checks(&self, primary: &Bytes) -> Result<()> {
+        for (start, end) in &self.check_ranges {
+            let request = TxnKvReq::Prewrite {
+                start_ts: self.start_ts,
+                primary: primary.clone(),
+                ttl_ms: self.lock_ttl_ms,
+                mutations: vec![TxnMutation::CheckRange {
+                    start: start.clone(),
+                    end: end.clone(),
+                }],
+            };
+            match self.call_resolving(&request)? {
+                TxnKvResp::Prewrite { keys } => {
+                    if let Some(status) = keys.first() {
+                        // The range's lower bound is the key the conflict is reported against: it
+                        // is what the request routed by, and it is the only key of the range this
+                        // client can name.
+                        self.check(status.clone(), Some(start))?;
+                    }
+                }
+                other => return Err(unexpected(Method::TxnPrewrite, &other)),
+            }
+        }
+        Ok(())
     }
 
     fn commit_grouped(&self, commit_ts: u64, keys: &[Bytes]) -> Result<()> {

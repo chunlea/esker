@@ -101,3 +101,94 @@ fn a_held_row_and_its_waiter_are_both_visible_to_a_third_session() {
     // show here, which is the regression this view makes visible rather than fatal.
     assert!(watcher.rows("SELECT * FROM pg_locks").is_empty());
 }
+
+/// **A waiter that stops waiting stops being a waiter** — and it did not, which is what run 78's
+/// capture found.
+///
+/// The instrument caught a session shown as `granted = f`, waiting on transaction id
+/// `9223372036854775807`, still there an hour after its client had exited, with a second one
+/// accumulated beside it. Every part of that is this bug:
+///
+/// * a wait-for edge was recorded when a transaction **blocked** and removed only when it
+///   **released a key**, so a transaction that waited and then acquired kept its edge, and one that
+///   waited and never acquired anything kept its edge for the life of the process — `release`
+///   returned early when it held nothing;
+/// * `i64::MAX` was `pg_locks` inventing a transaction id for a holder that no longer held
+///   anything, which is precisely what a leaked edge looks like.
+///
+/// So the "waiter on a sentinel" was a stale row, not a stuck session. A diagnostic that invents
+/// waiters is worse than one that says nothing, so this test asserts the view goes **empty**.
+#[test]
+fn a_wait_that_ended_leaves_no_row_behind() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n text)",
+        "INSERT INTO lk VALUES (1, 'a')",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A holds the row");
+        reached(&b_says, "B is about to write");
+        // B waits for A, then acquires the row when A commits.
+        b.run("UPDATE lk SET n = 'b' WHERE id = 1").unwrap();
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+    reached(&a_says, "A holds the row");
+    edge(&hears_b, "B is about to write");
+    std::thread::sleep(Duration::from_millis(200));
+    a.run("COMMIT").unwrap();
+    waiter.join().unwrap();
+
+    let mut watcher = pair.session();
+    assert_eq!(
+        watcher.rows("SELECT locktype, granted, transactionid FROM pg_locks"),
+        Vec::<Vec<String>>::new(),
+        "both transactions are over: nothing is held and nobody is waiting"
+    );
+}
+
+/// **A transaction that waited and never got anything leaves nothing either.**
+///
+/// The other half, and the one that accumulated in the capture: a waiter whose statement gives up —
+/// `lock_timeout` fires — held no key at all, so the release that would have forgotten it returned
+/// early on an empty list.
+#[test]
+fn a_wait_that_timed_out_leaves_no_row_behind() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n text)",
+        "INSERT INTO lk VALUES (1, 'a')",
+    ]);
+    let (a_says, hears_a) = channel();
+
+    let mut b = pair.session();
+    let waiter = std::thread::spawn(move || {
+        edge(&hears_a, "A holds the row");
+        b.run("SET lock_timeout = '150ms'").unwrap();
+        let refused = b
+            .run("UPDATE lk SET n = 'b' WHERE id = 1")
+            .expect_err("A holds it and B gave up");
+        assert_eq!(refused.sqlstate(), "55P03", "{refused}");
+    });
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+    reached(&a_says, "A holds the row");
+    waiter.join().unwrap();
+
+    // A still holds its row, so exactly one row — and no waiter.
+    let mut watcher = pair.session();
+    let rows = watcher.rows("SELECT locktype, granted FROM pg_locks");
+    assert_eq!(
+        rows,
+        vec![vec!["tuple".to_owned(), "t".to_owned()]],
+        "the holder is there and the transaction that gave up is not"
+    );
+    a.run("ROLLBACK").unwrap();
+    assert!(watcher.rows("SELECT * FROM pg_locks").is_empty());
+}

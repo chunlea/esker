@@ -231,7 +231,10 @@ pub fn txn_request_range(request: &esker_proto::TxnKvReq) -> (Bytes, Bytes) {
     }
 
     match request {
-        TxnKvReq::Get { key, .. } => (Bytes::copy_from_slice(key), successor(key)),
+        // One key each: a read of its value, and a read of its newest commit.
+        TxnKvReq::Get { key, .. } | TxnKvReq::LatestCommit { key } => {
+            (Bytes::copy_from_slice(key), successor(key))
+        }
         TxnKvReq::Scan { start, end, .. } => (start.clone(), end.clone()),
         TxnKvReq::Prewrite { mutations, .. } => {
             span(mutations.iter().map(|mutation| &mutation.key()[..]))
@@ -242,6 +245,7 @@ pub fn txn_request_range(request: &esker_proto::TxnKvReq) -> (Bytes, Bytes) {
         TxnKvReq::Heartbeat { primary, .. } => {
             (Bytes::copy_from_slice(primary), successor(primary))
         }
+
         // Store-local: it is addressed to a store rather than to a range.
         TxnKvReq::GcSafepoint { .. } => (Bytes::new(), Bytes::new()),
     }
