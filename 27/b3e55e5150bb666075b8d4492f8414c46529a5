@@ -1,0 +1,34 @@
+crates/esker-cli/src/server.rs
+  h_44076b318daf9c 264-265
+crates/esker-client/src/region_cache.rs
+  h_44076b318daf9c 58-60
+crates/esker-client/src/tcp.rs
+  h_44076b318daf9c 50-52
+crates/esker-client/src/transport.rs
+  h_44076b318daf9c 19-22
+crates/esker-client/src/wire.rs
+  h_44076b318daf9c 147-150
+crates/esker-sim/tests/raft_snapshot.rs
+  h_44076b318daf9c 163-166
+crates/esker-store/src/meta.rs
+  h_44076b318daf9c 160-162,320-325
+crates/esker-store/src/peer.rs
+  h_44076b318daf9c 351-353
+crates/esker-store/src/raft_log.rs
+  h_44076b318daf9c 220,289-292
+crates/esker-store/src/regions.rs
+  h_44076b318daf9c 42-45,279-284
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 266,268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "27b3e55e5150bb666075b8d4492f8414c46529a5",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
