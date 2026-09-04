@@ -311,6 +311,23 @@ pub struct CreateView {
     pub or_replace: bool,
 }
 
+/// `TRUNCATE [TABLE] t [, …] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
+///
+/// **Not a `DELETE` without a `WHERE`**, and the difference that matters here is what it does
+/// *not* touch: the sequences an identity or `serial` column owns keep their value, so the next
+/// `nextval` carries on. `RESTART IDENTITY` is the clause that moves them, and it is the one
+/// `ActiveRecord` sends when it wants a table to look new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Truncate {
+    /// The tables named, folded. PostgreSQL empties them in one statement.
+    pub names: Vec<String>,
+    /// `RESTART IDENTITY`: also set every sequence these tables own back to its start.
+    pub restart_identity: bool,
+    /// `CASCADE`: also truncate the tables whose foreign keys point at these. Without it, a table
+    /// something references is refused.
+    pub cascade: bool,
+}
+
 /// `DROP VIEW [IF EXISTS] name [, …]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropView {

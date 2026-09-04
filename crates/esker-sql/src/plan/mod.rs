@@ -35,7 +35,7 @@ pub use ddl::{
     Comment, CommentObject, CreateDatabase, CreateExtension, CreateFunction, CreateIndex,
     CreateSchema, CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
     DropExtension, DropFunction, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
-    DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd,
+    DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd, Truncate,
     UniqueConstraint, foreign_key_name, index_name, primary_key_name, sequence_name,
     unique_constraint_name,
 };
@@ -109,6 +109,8 @@ pub enum Statement {
     CreateView(CreateView),
     /// `DROP VIEW`.
     DropView(DropView),
+    /// `TRUNCATE [TABLE] …` — every row of the tables named, and their sequences only if asked.
+    Truncate(Truncate),
     /// `CREATE DATABASE` — a second **tenant**, which is what a database is (ADR 0052).
     CreateDatabase(CreateDatabase),
     /// `DROP DATABASE`, which takes everything that tenant held with it.
@@ -206,6 +208,7 @@ impl Statement {
     #[must_use]
     pub fn write_command(&self) -> Option<&'static str> {
         match self {
+            Statement::Truncate(_) => Some("TRUNCATE"),
             Statement::Insert(_) => Some("INSERT"),
             Statement::Update(_) => Some("UPDATE"),
             Statement::Delete(_) => Some("DELETE"),
@@ -268,6 +271,7 @@ impl Statement {
         match self {
             // The tag is the outer statement's, not the body's: a real server answers `DO`.
             Statement::Raise { .. } => "DO",
+            Statement::Truncate(_) => "TRUNCATE TABLE",
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateExtension(_) => "CREATE EXTENSION",
             Statement::DropExtension(_) => "DROP EXTENSION",

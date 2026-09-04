@@ -652,6 +652,32 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         }
         Statement::ShowVariable { variable } => lower_show(variable),
         Statement::Reset(reset) => lower_reset(reset),
+        // `TRUNCATE [TABLE] t [, …]`. `ONLY`, a partition list and `ON CLUSTER` are refused by
+        // name: each narrows *what* is emptied, and emptying more than was asked is the wrong
+        // answer in the one direction that cannot be undone.
+        Statement::Truncate(truncate) => {
+            refuse_if(truncate.partitions.is_some(), "TRUNCATE ... PARTITION")?;
+            refuse_if(truncate.on_cluster.is_some(), "TRUNCATE ... ON CLUSTER")?;
+            refuse_if(truncate.if_exists, "TRUNCATE ... IF EXISTS")?;
+            for target in &truncate.table_names {
+                refuse_if(target.only, "TRUNCATE ONLY")?;
+            }
+            Ok(plan::Statement::Truncate(plan::Truncate {
+                names: truncate
+                    .table_names
+                    .iter()
+                    .map(|target| relation_name(&target.name))
+                    .collect::<Result<Vec<_>>>()?,
+                restart_identity: matches!(
+                    truncate.identity,
+                    Some(sqlparser::ast::TruncateIdentityOption::Restart)
+                ),
+                cascade: matches!(
+                    truncate.cascade,
+                    Some(sqlparser::ast::CascadeOption::Cascade)
+                ),
+            }))
+        }
         other => Err(SqlError::unsupported(feature_name(other))),
     }
 }
@@ -2328,15 +2354,11 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             };
             return Err(SqlError::unsupported(named));
         }
-        // `NOT NULL` needs a value for every row already stored, and a constant default is exactly
-        // that value. Without one there is nothing to pad with, and the alternative is a rewrite
-        // this `ALTER` is defined not to do — so it stays refused, and the refusal names the pair
-        // rather than the keyword, because `NOT NULL DEFAULT 7` *is* accepted.
-        if not_null && default.is_none() {
-            return Err(SqlError::unsupported(
-                "ALTER TABLE ... ADD COLUMN ... NOT NULL without a DEFAULT",
-            ));
-        }
+        // `NOT NULL` without a `DEFAULT` was refused here, on the argument that it "needs a value
+        // for every row already stored" and there is "nothing to pad with". **That is half the
+        // rule**: an *empty* table has no row to hold a NULL, so there is nothing to refuse — and
+        // every test in the suite that sends this adds a column to an empty table. The question is
+        // about the rows, so it is asked by the executor, which can see them.
         // `ALTER TABLE ... ADD COLUMN id bigserial` would have to create a sequence *and* fill
         // every row already stored from it, which is the table rewrite this `ALTER` is defined not
         // to do. Refused by name rather than half-done.

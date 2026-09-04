@@ -362,7 +362,7 @@ fn still_referenced(
 /// constraints point here. A child that has been dropped leaves no record, and its back-reference
 /// goes with it (`crate::exec::ddl::drop_table`) — so a missing table here is skipped rather than
 /// an error, which is the same tolerance a `DELETE` of an absent index entry has.
-fn children_of(
+pub(super) fn children_of(
     executor: &Executor,
     txn: &dyn Txn,
     table: &TableDef,

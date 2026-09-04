@@ -842,6 +842,20 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `TRUNCATE` of a table another table's foreign key points at: `0A000`, unless `CASCADE`.
+    ///
+    /// **`0A000`, not `2BP01`** — measured, and it is the one refusal in this family PostgreSQL
+    /// spells as a missing feature rather than a dependency: a `DROP` of the same table is
+    /// `2BP01`. Both carry the `CASCADE` hint.
+    #[error("cannot truncate a table referenced in a foreign key constraint")]
+    CannotTruncateReferenced {
+        /// The table being truncated.
+        relation: String,
+        /// The child whose foreign key points at it — it appears in **both** the `DETAIL` and the
+        /// `HINT`, and the hint's advice is to name it in the same statement.
+        child: String,
+    },
+
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
     #[error("{0} must not be negative")]
@@ -2130,7 +2144,10 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            SqlError::FeatureNotSupported(_)
+            // **`0A000`, not `2BP01`** — measured. A `DROP` of the same table is a dependency
+            // error; PostgreSQL spells the truncate refusal as a missing feature.
+            SqlError::CannotTruncateReferenced { .. }
+            | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference
             | SqlError::DefaultSubquery
             | SqlError::DefaultSetReturning
@@ -2502,6 +2519,9 @@ impl SqlError {
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
+            SqlError::CannotTruncateReferenced { relation, child } => {
+                Some(format!("Table \"{child}\" references \"{relation}\"."))
+            }
             SqlError::CouldNotCreateUniqueIndex { detail, .. }
             | SqlError::ViewDependsOnRelation { detail, .. }
             | SqlError::DependentType { detail, .. }
@@ -2593,9 +2613,8 @@ impl SqlError {
     #[must_use]
     #[allow(
         clippy::too_many_lines,
-        reason = "one arm per condition PostgreSQL was measured sending a hint for, which is a \
-                  table rather than a function: splitting it would put half the sentences a \
-                  client reads somewhere a reader of the other half would not look"
+        reason = "one arm per condition PostgreSQL was seen to hint on, like `sqlstate` and \
+                  `detail` beside it; splitting it would scatter the vocabulary across functions"
     )]
     pub fn hint(&self) -> Option<String> {
         match self {
@@ -2671,6 +2690,12 @@ impl SqlError {
             | SqlError::ViewDependsOnRelation { .. } => {
                 Some("Use DROP ... CASCADE to drop the dependent objects too.".to_owned())
             }
+            // PostgreSQL's own for this one, and it names the **child** — the advice is to
+            // truncate it in the same statement, which is why a table named alongside is not a
+            // reason to refuse at all.
+            SqlError::CannotTruncateReferenced { child, .. } => Some(format!(
+                "Truncate table \"{child}\" at the same time, or use TRUNCATE ... CASCADE."
+            )),
             SqlError::WrongObjectType { found, .. } => drop_verb_hint(found),
             // PostgreSQL's own, and it names the **constraint** — measured for both the primary
             // key and a `UNIQUE` constraint, which give the identical sentence. The hint here used
