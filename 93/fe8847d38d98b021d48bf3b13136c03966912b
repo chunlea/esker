@@ -1,0 +1,16 @@
+docs/adr/0068-an-ingest-is-refused-for-a-shared-key-not-a-shared-range.md
+  h_44076b318daf9c 1
+docs/plans/debt-c7.md
+  h_44076b318daf9c 132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "93fe8847d38d98b021d48bf3b13136c03966912b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
