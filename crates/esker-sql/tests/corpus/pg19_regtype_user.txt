@@ -24,6 +24,30 @@ SELECT 'r', 'mood'::regtype::oid = (SELECT oid FROM pg_type WHERE typname = 'moo
 SELECT 'r', 'floatrange'::regtype::oid = (SELECT oid FROM pg_type WHERE typname = 'floatrange') AS range_matches		r|t
 SELECT 'r', 'int4'::regtype::oid, 'text'::regtype::oid, 'timestamp'::regtype::oid	text,oid,oid,oid	r|23|25|1114
 SELECT 'r', 'mood'::regtype::text, 'floatrange'::regtype::text, 'int4'::regtype::text		r|mood|floatrange|integer
+# --- **A schema-qualified type name**, which is what a client writes when it looks a type up by
+# its fully-qualified name. `public.mood` resolves; **`"public.mood"` does not** — the quotes make
+# it *one* identifier holding a dot, so it is a type nobody declared and the whole of it is quoted
+# back; and a schema nobody declared is `3F000`, a different class from a type nobody declared.
+SELECT 'r', 'public.mood'::regtype, 'public."mood"'::regtype, '"public"."mood"'::regtype		r|mood|mood|mood
+SELECT 'r', ' public . mood '::regtype, 'pg_catalog.int4'::regtype		r|mood|integer
+SAVEPOINT q1		-
+SELECT 'r', '"public.mood"'::regtype	!42704 type "public.mood" does not exist
+ROLLBACK TO SAVEPOINT q1		-
+SAVEPOINT q2		-
+SELECT 'r', 'nosuchschema.mood'::regtype	!3F000 schema "nosuchschema" does not exist
+ROLLBACK TO SAVEPOINT q2		-
+SAVEPOINT q3		-
+SELECT 'r', 'public.nosuchtype'::regtype	!42704 type "public.nosuchtype" does not exist
+ROLLBACK TO SAVEPOINT q3		-
+SAVEPOINT q4		-
+SELECT 'r', '"MOOD"'::regtype	!42704 type "MOOD" does not exist
+ROLLBACK TO SAVEPOINT q4		-
+# --- **`format_type` over a user type**, which is what a schema dumper reads back.
+SELECT 'r', format_type('mood'::regtype, NULL), format_type('mood'::regtype, -1)		r|mood|mood
+SELECT 'r', format_type('floatrange'::regtype, NULL)		r|floatrange
+SELECT 'r', format_type('int4'::regtype, NULL), format_type(23, NULL), format_type(23, -1)	text,text,text,text	r|integer|integer|integer
+SELECT 'r', format_type('varchar'::regtype, NULL), format_type(1043, 259)	text,text,text	r|character varying|character varying(255)
+SELECT 'r', format_type(0, NULL), format_type(999999, NULL)	text,text,text	r|-|???
 SELECT 'r', pg_typeof('mood'::regtype), pg_typeof('mood'::regtype::oid)		r|regtype|oid
 SAVEPOINT s1		-
 SELECT 'r', 'nosuchtype'::regtype	!42704 type "nosuchtype" does not exist

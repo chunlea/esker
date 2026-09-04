@@ -2339,6 +2339,17 @@ fn catalog_function(
         // reports a column's user type rather than its storage, so this is the call that prints
         // `mood` where the row holds an `int2` (ADR 0050).
         CatalogFunc::FormatType => {
+            // **A `regtype` over a user type arrives as its *name***, not its oid — that is what
+            // `UserRegType` resolves to, and ADR 0053 says why position cannot decide otherwise.
+            // So the name is looked up before the built-in table is asked, which is where it
+            // would have been `42704 type "mood" does not exist`: measured,
+            // `format_type('mood'::regtype, NULL)` is `mood`, and a typmod does not change it.
+            if let Some(Datum::Text(name)) = args.first()
+                && crate::value::type_by_name(name)?.is_none()
+                && let Some(def) = env.relations()?.user_type_by_name(name)
+            {
+                return Ok(Datum::Text(crate::catalog::display_name(&def.name)));
+            }
             let oid = type_oid_argument(args.first())?;
             let built_in =
                 crate::catalog::def_functions::format_type(oid, typmod_argument(args.get(1))?);

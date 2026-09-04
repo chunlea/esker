@@ -2365,10 +2365,19 @@ impl Executor {
                 Some(known) => known,
                 None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
             };
-            let Some(def) = known.iter().find(|def| &def.name == name) else {
+            // **The same splitter the built-ins use** — one grammar, one parser. A user type is
+            // in `public`, so `'public.mood'::regtype` is `mood` and `'"public.mood"'` is one
+            // quoted identifier holding a dot and resolves to nothing.
+            let (schema, bare) = crate::value::split_type_name(name);
+            let Some(def) = known.iter().find(|def| def.name == bare) else {
                 // The same sentence a real server gives, and the same class: a name that is not a
-                // type is `42704`, not the `0A000` a *feature* this node lacks would get.
-                return Err(SqlError::UndefinedType(name.clone()));
+                // type is `42704`, not the `0A000` a *feature* this node lacks would get. The
+                // **qualification stays in the message** when one was written, measured:
+                // `'public.nosuchtype'::regtype` quotes `public.nosuchtype` and not `nosuchtype`.
+                return Err(SqlError::UndefinedType(match &schema {
+                    Some(schema) => format!("{schema}.{bare}"),
+                    None => bare,
+                }));
             };
             // **The name unless the `::oid` was written**, which is the half `ActiveRecord`
             // asks for and the half this node can answer without a `regtype` type of its own.
