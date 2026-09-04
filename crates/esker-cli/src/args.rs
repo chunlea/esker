@@ -31,7 +31,9 @@ use std::path::PathBuf;
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
-use crate::pd::{InspectOptions, MembersOptions, PdCommand, ServeOptions, StatusOptions};
+use crate::pd::{
+    InspectOptions, MembersChange, MembersOptions, PdCommand, ServeOptions, StatusOptions,
+};
 use crate::raw::{RawCommand, RawOptions, from_hex};
 use crate::region::{RegionCommand, RegionOptions};
 use crate::server::ServerOptions;
@@ -290,6 +292,11 @@ Pd options:
   pd members                Ask any member who is in its group and which one leads.
                             Answered by a follower too, which is the point: it is what
                             you reach for when the leader is what is missing
+  pd members add ID@ADDR    Add a placement driver. It joins as a LEARNER, catches up,
+                            and is promoted — one step per round trip, so running the
+                            command again after any failure picks up where it left off
+  pd members remove ID      Remove one. Refused if it would leave the group without a
+                            quorum of members it has heard from, or if it is the last
   pd inspect                Print what a **stopped** PD has stored: the cluster, the
                             allocator, the oracle's mark, every store and region, and
                             the operator history
@@ -299,9 +306,14 @@ Pd options:
       --data-dir PATH       PD's database, for serve and inspect (default ./esker-pd)
       --id N                This member's id in its group, for serve (default 1)
       --peers LIST          The whole group as id@host:port, comma-separated, this
-                            member included. Every member is given the SAME list: the
-                            group's identity is derived from it, so two members given
-                            different lists are two groups and will not talk
+                            member included, when FOUNDING a group. Every member is
+                            given the SAME list: the group's id is derived from it once
+                            and then written down, so two members given different lists
+                            found two groups and will not talk. Ignored once this member
+                            has a database — after a change the flag is the stale half
+      --join ADDR           Join an existing group instead of founding one: ask the
+                            member at ADDR for the group's id and members. Run
+                            `pd members add` against the group first
       --listen HOST:PORT    Address to serve on, for serve (default 127.0.0.1:2379)
       --pd HOST:PORT        The placement driver to ask, for status and members
                             (default 127.0.0.1:2379)
@@ -848,6 +860,7 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
     let mut inspect = InspectOptions::default();
     let mut status = StatusOptions::default();
     let mut members = MembersOptions::default();
+    let mut words: Vec<String> = Vec::new();
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -886,6 +899,9 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             "--peers" => {
                 serve.peers = take_value(arguments, &mut index, inline, "--peers")?;
             }
+            "--join" => {
+                serve.join = take_value(arguments, &mut index, inline, "--join")?;
+            }
             "--pd" => {
                 let value = take_value(arguments, &mut index, inline, "--pd")?;
                 status.pd.clone_from(&value);
@@ -894,8 +910,18 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
-            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+            // `members add 4@host:port` and `members remove 4`: two bare words after the verb.
+            // Positional rather than flags, because they are what the command is *about* and a
+            // `--id` beside a `--address` reads like two independent options rather than one
+            // member.
+            other => words.push(other.to_owned()),
         }
+    }
+
+    if verb == "members" {
+        members.change = parse_member_change(&words)?;
+    } else if let Some(stray) = words.first() {
+        return Err(ParseError::UnexpectedArgument(stray.clone()));
     }
 
     match verb.as_str() {
@@ -904,6 +930,50 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
         "status" => Ok(Command::Pd(PdCommand::Status(status))),
         "members" => Ok(Command::Pd(PdCommand::Members(members))),
         other => Err(ParseError::UnknownPdCommand(other.to_owned())),
+    }
+}
+
+/// Reads `add <id>@<host:port>` or `remove <id>` after `pd members`, or `None` for a listing.
+fn parse_member_change(words: &[String]) -> Result<Option<MembersChange>, ParseError> {
+    let Some(verb) = words.first() else {
+        return Ok(None);
+    };
+    let Some(subject) = words.get(1) else {
+        return Err(ParseError::MissingArgument(
+            "a member, as `id@host:port` to add or `id` to remove",
+        ));
+    };
+    if let Some(stray) = words.get(2) {
+        return Err(ParseError::UnexpectedArgument(stray.clone()));
+    }
+    match verb.as_str() {
+        "add" => {
+            let mut parsed =
+                crate::pd::parse_peers(subject).map_err(|_| ParseError::InvalidValue {
+                    flag: "members add",
+                    value: subject.clone(),
+                })?;
+            match parsed.len() {
+                1 => Ok(Some(MembersChange::Add(parsed.remove(0)))),
+                // One member at a time, and it is not a limitation of the parser: `esker-raft`
+                // makes single-server changes, and two at once is what produces two disjoint
+                // majorities (dissertation §4.1).
+                _ => Err(ParseError::InvalidValue {
+                    flag: "members add",
+                    value: subject.clone(),
+                }),
+            }
+        }
+        "remove" => subject
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .map(|id| Some(MembersChange::Remove(id)))
+            .ok_or_else(|| ParseError::InvalidValue {
+                flag: "members remove",
+                value: subject.clone(),
+            }),
+        other => Err(ParseError::UnknownPdCommand(format!("members {other}"))),
     }
 }
 
@@ -1389,7 +1459,68 @@ mod tests {
             panic!("pd members did not parse");
         };
         assert_eq!(members.pd, "10.0.0.1:2379");
+        assert_eq!(members.change, None, "listing is not a change");
         assert!(parse(["pd", "wat"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn pd_members_adds_and_removes_one_member() {
+        let Command::Pd(PdCommand::Members(add)) = parse_ok(&[
+            "pd",
+            "members",
+            "add",
+            "4@127.0.0.1:2382",
+            "--pd",
+            "127.0.0.1:2379,127.0.0.1:2380",
+        ]) else {
+            panic!("pd members add did not parse");
+        };
+        assert_eq!(add.pd, "127.0.0.1:2379,127.0.0.1:2380");
+        let Some(MembersChange::Add(member)) = add.change else {
+            panic!("pd members add parsed as something else");
+        };
+        assert_eq!(member.id, 4);
+        assert_eq!(member.address, "127.0.0.1:2382");
+
+        let Command::Pd(PdCommand::Members(remove)) = parse_ok(&["pd", "members", "remove", "2"])
+        else {
+            panic!("pd members remove did not parse");
+        };
+        assert_eq!(remove.change, Some(MembersChange::Remove(2)));
+    }
+
+    /// **One member at a time**, and it is not a limitation of the parser: `esker-raft` makes
+    /// single-server changes, and two at once is what produces two disjoint majorities.
+    #[test]
+    fn pd_members_refuses_anything_but_one_member() {
+        for bad in [
+            vec!["pd", "members", "add"],
+            vec!["pd", "members", "add", "127.0.0.1:2382"],
+            vec!["pd", "members", "add", "4@127.0.0.1:2382,5@127.0.0.1:2383"],
+            vec!["pd", "members", "add", "4@127.0.0.1:2382", "5@x:1"],
+            vec!["pd", "members", "remove", "0"],
+            vec!["pd", "members", "remove", "two"],
+            vec!["pd", "members", "wat", "4"],
+        ] {
+            assert!(
+                parse(bad.iter().copied()).is_err(),
+                "`{}` was accepted",
+                bad.join(" ")
+            );
+        }
+    }
+
+    /// Founding a group and joining one are different acts, and the flags say which.
+    #[test]
+    fn pd_serve_joins_a_group_it_did_not_found() {
+        let Command::Pd(PdCommand::Serve(serve)) =
+            parse_ok(&["pd", "serve", "--id", "4", "--join", "127.0.0.1:2379"])
+        else {
+            panic!("pd serve did not parse");
+        };
+        assert_eq!(serve.id, 4);
+        assert_eq!(serve.join, "127.0.0.1:2379");
+        assert!(serve.peers.is_empty(), "a joining member founds nothing");
     }
 
     /// A `--peers` entry says which member it is; a list whose meaning came from its order would

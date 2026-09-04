@@ -733,6 +733,33 @@ pub enum SqlError {
         severity: Severity,
     },
 
+    /// `ALTER COLUMN … TYPE` for a pair PostgreSQL will not convert on its own: `42804`.
+    ///
+    /// The HINT is the whole value of this message — it tells the caller the `USING` to write, and
+    /// `change_column` is built to read exactly that.
+    #[error("column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastColumnAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type, spelled the way `format_type` spells it.
+        target: String,
+        /// The `USING` the caller should have written, for the HINT.
+        using: String,
+    },
+
+    /// The same statement, failing on the **default** rather than on the rows: `42804`.
+    ///
+    /// `USING` governs the rows and says nothing about the default, so a column whose default will
+    /// not convert stops the statement even when every row would — and a `SET DEFAULT` later in
+    /// the same statement does not rescue it. Measured on two independent pairs.
+    #[error("default for column \"{column}\" cannot be cast automatically to type {target}")]
+    CannotCastDefaultAutomatically {
+        /// The column being converted.
+        column: String,
+        /// The target type.
+        target: String,
+    },
+
     /// A negative `LIMIT` or `OFFSET`. They carry *different* codes — `2201W` and `2201X` — so a
     /// client is told which clause it got wrong.
     #[error("{0} must not be negative")]
@@ -2112,7 +2139,9 @@ impl SqlError {
             | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. }
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
-            SqlError::ColumnTypeConflict { .. } => sqlstate::DATATYPE_MISMATCH,
+            SqlError::ColumnTypeConflict { .. }
+            | SqlError::CannotCastColumnAutomatically { .. }
+            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. } => sqlstate::DUPLICATE_OBJECT,
 
@@ -2458,6 +2487,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::Syntax { hint, .. } => hint.map(str::to_owned),
+            // PostgreSQL's own, and the reason this error is worth more than a refusal:
+            // `change_column` reads the sentence and re-sends the statement with that `USING`.
+            SqlError::CannotCastColumnAutomatically { using, .. } => {
+                Some(format!("You might need to specify \"USING {using}\"."))
+            }
             // PostgreSQL's own, verbatim: the extension is missing from the *system*, not from the
             // statement, so the fix is outside SQL.
             SqlError::ExtensionNotAvailable(_) => Some(

@@ -114,6 +114,29 @@ impl Default for ServerOptions {
     }
 }
 
+/// Reads a `--pd` value: one `HOST:PORT`, or several separated by commas.
+///
+/// **A list**, because a placement driver is a Raft group and only its leader answers
+/// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). One address is still one address, so
+/// every invocation written before there were groups means exactly what it did.
+pub(crate) fn pd_endpoints(listed: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut endpoints = Vec::new();
+    for part in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        endpoints
+            .push(part.parse::<SocketAddr>().map_err(|error| {
+                format!("`--pd {listed}`: `{part}` is not an address: {error}")
+            })?);
+    }
+    if endpoints.is_empty() {
+        return Err(format!("`--pd {listed}` names no placement driver"));
+    }
+    Ok(endpoints)
+}
+
 /// Opens the store, serves it, and returns when it has stopped cleanly.
 pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     let address: SocketAddr = options
@@ -147,18 +170,7 @@ pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
     let pd = match &options.pd {
         None => None,
         Some(listed) => {
-            // A **list**, because a placement driver is a Raft group of up to three and only its
-            // leader answers ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). One
-            // address is still one address, so every existing invocation means what it did.
-            let mut endpoints = Vec::new();
-            for part in listed.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                endpoints.push(part.parse::<SocketAddr>().map_err(|error| {
-                    format!("`--pd {listed}`: `{part}` is not an address: {error}")
-                })?);
-            }
-            if endpoints.is_empty() {
-                return Err(format!("`--pd {listed}` names no placement driver"));
-            }
+            let endpoints = pd_endpoints(listed)?;
             let client = RemotePd::connect_to(&endpoints, TransportConfig::new())
                 .map_err(|error| format!("starting the placement-driver client: {error}"))?;
             Some(Arc::new(client) as Arc<dyn PdClient>)
