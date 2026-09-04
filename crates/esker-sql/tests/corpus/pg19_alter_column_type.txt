@@ -1,0 +1,132 @@
+# `ALTER TABLE … ALTER COLUMN … TYPE` — which conversions PostgreSQL 19 takes, and which need
+# `USING`.
+#
+# **Run 59: `ALTER TABLE … ALTER COLUMN … TYPE TIMESTAMP is not supported`, 13 tests over 2 files.**
+# The files are `adapters/postgresql/change_schema_test.rb` (8) and `array_test.rb` (2), plus
+# `migration/change_schema_test.rb` — note there are **two** files named `change_schema_test.rb`
+# and the ranking's basename does not say which; the timestamp row is the `adapters/postgresql` one.
+#
+# Twelve distinct statements were logged running those files against PostgreSQL 19. Every one of the
+# five timestamp conversions is written with an explicit `USING CAST(...)`, because the column being
+# converted is `character varying` and **PostgreSQL will not do that one implicitly**. The others
+# carry no `USING` at all, and three of them change the type and the default in one statement.
+#
+# Things reasoning would get wrong:
+#
+#   * **"Needs USING" is a property of the pair, not of the target type.** `varchar -> timestamp`
+#     needs it and `timestamp -> timestamptz` does not; the rule is whether an *assignment* cast
+#     exists, which is a narrower relation than a cast being possible at all.
+#   * **A widening is not always free.** `varchar(10) -> varchar(5)` is accepted at DDL time and
+#     fails on the *data* (`22001`), so the length is checked per row rather than compared.
+#   * **`USING` does not license everything**: it is an expression over the old row, so it makes a
+#     conversion possible, not permitted — the expression still has to yield the target type.
+#   * **The default is converted too, and it can be the thing that fails**: a column defaulted to a
+#     string and retyped to integer takes the default with it.
+#   * **`SET DEFAULT` in the same statement is applied after the type change**, which is what lets
+#     `ALTER COLUMN c TYPE text[], ALTER COLUMN c SET DEFAULT '{}'` work when the old default was
+#     not a valid array.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+
+BEGIN;		-
+
+CREATE TABLE act (id bigserial primary key, s character varying, n integer, t text, ts timestamp);		-
+INSERT INTO act (s, n, t, ts) VALUES ('2024-01-02 03:04:05', 7, 'hello', '2024-01-02 03:04:05');		-
+
+-- ------------------------------------------------- implicit: the pairs with an assignment cast		-
+ALTER TABLE act ALTER COLUMN ts TYPE timestamptz;		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'act'::regclass AND attname = 'ts';		timestamp with time zone
+ALTER TABLE act ALTER COLUMN ts TYPE timestamp;		-
+ALTER TABLE act ALTER COLUMN n TYPE bigint;		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'act'::regclass AND attname = 'n';		bigint
+ALTER TABLE act ALTER COLUMN t TYPE character varying;		-
+ALTER TABLE act ALTER COLUMN t TYPE text;		-
+ALTER TABLE act ALTER COLUMN s TYPE character varying(64);		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'act'::regclass AND attname = 's';		character varying(64)
+ALTER TABLE act ALTER COLUMN s TYPE character varying(128);		-
+ALTER TABLE act ALTER COLUMN n TYPE integer;		-
+ALTER TABLE act ALTER COLUMN n TYPE text;		-
+ALTER TABLE act ALTER COLUMN n TYPE integer USING n::integer;		-
+
+-- ------------------------------------------------- refused without USING		-
+SAVEPOINT s1;		-
+ALTER TABLE act ALTER COLUMN s TYPE timestamp;	!42804 column "s" cannot be cast automatically to type timestamp without time zone HINT: You might need to specify "USING s::timestamp without time zone".
+ROLLBACK TO s1;		-
+SAVEPOINT s2;		-
+ALTER TABLE act ALTER COLUMN t TYPE integer;	!42804 column "t" cannot be cast automatically to type integer HINT: You might need to specify "USING t::integer".
+ROLLBACK TO s2;		-
+-- and the same pair accepted once USING says how		-
+ALTER TABLE act ALTER COLUMN s TYPE timestamp USING CAST("s" AS timestamp);		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'act'::regclass AND attname = 's';		timestamp without time zone
+ALTER TABLE act ALTER COLUMN s TYPE character varying USING s::text;		-
+
+-- ------------------------------------------------- a narrowing is checked against the data		-
+ALTER TABLE act ALTER COLUMN s TYPE character varying(64);		-
+SAVEPOINT s3;		-
+ALTER TABLE act ALTER COLUMN s TYPE character varying(5);	!22001 value too long for type character varying(5)
+ROLLBACK TO s3;		-
+-- `length()` is not implemented on this node (its own gap, unrelated to this unit), so the		-
+-- evidence that the value is too long for `varchar(5)` is the value itself.		-
+SELECT s FROM act;		2024-01-02 03:04:05
+
+-- ------------------------------------------------- the five the suite sends, on a varchar column		-
+DROP TABLE IF EXISTS strings;		-
+CREATE TABLE strings (id bigserial primary key, somedate character varying);		-
+ALTER TABLE "strings" ALTER COLUMN "somedate" TYPE timestamp USING CAST("somedate" AS timestamp);		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'strings'::regclass AND attname = 'somedate';		timestamp without time zone
+DROP TABLE IF EXISTS strings;		-
+CREATE TABLE strings (id bigserial primary key, somedate character varying);		-
+ALTER TABLE "strings" ALTER COLUMN "somedate" TYPE timestamptz USING CAST("somedate" AS timestamptz);		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'strings'::regclass AND attname = 'somedate';		timestamp with time zone
+DROP TABLE IF EXISTS strings;		-
+CREATE TABLE strings (id bigserial primary key, somedate character varying);		-
+ALTER TABLE "strings" ALTER COLUMN "somedate" TYPE timestamp(6) USING CAST("somedate" AS timestamp(6));		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'strings'::regclass AND attname = 'somedate';		timestamp(6) without time zone
+DROP TABLE IF EXISTS strings;		-
+CREATE TABLE strings (id bigserial primary key, somedate character varying);		-
+ALTER TABLE "strings" ALTER COLUMN "somedate" TYPE timestamptz(6) USING CAST("somedate" AS timestamptz(6));		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'strings'::regclass AND attname = 'somedate';		timestamp(6) with time zone
+DROP TABLE IF EXISTS strings;		-
+CREATE TABLE strings (id bigserial primary key, somedate character varying);		-
+ALTER TABLE "strings" ALTER COLUMN "somedate" TYPE timestamp[] USING CAST("somedate" AS timestamp[]);		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'strings'::regclass AND attname = 'somedate';		timestamp without time zone[]
+
+-- ------------------------------------------------- several actions in one statement		-
+CREATE TABLE testings (id bigserial primary key, money character varying DEFAULT '0' NOT NULL);		-
+-- **The old default is converted too, and it is what fails here** -- `USING` governs the rows and		-
+-- says nothing about the default, so a varchar default going to integer stops the statement even		-
+-- though every row would convert. The `SET DEFAULT` later in the same statement does not save it.		-
+SAVEPOINT s5;		-
+ALTER TABLE "testings" ALTER COLUMN "money" TYPE integer USING CAST("money" AS integer), ALTER COLUMN "money" SET DEFAULT 1000, ALTER COLUMN "money" SET NOT NULL;	!42804 default for column "money" cannot be cast automatically to type integer
+ROLLBACK TO s5;		-
+-- Dropping the default first is what makes it work, which is why AR emits `DROP DEFAULT` beside		-
+-- the type change when it has one.		-
+ALTER TABLE "testings" ALTER COLUMN "money" DROP DEFAULT;		-
+ALTER TABLE "testings" ALTER COLUMN "money" TYPE integer USING CAST("money" AS integer), ALTER COLUMN "money" SET DEFAULT 1000, ALTER COLUMN "money" SET NOT NULL;		-
+SELECT format_type(atttypid, atttypmod), attnotnull FROM pg_attribute WHERE attrelid = 'testings'::regclass AND attname = 'money';		integer|t
+SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'testings'::regclass AND a.attname = 'money';		1000
+ALTER TABLE "testings" ALTER COLUMN "money" TYPE integer, ALTER COLUMN "money" DROP DEFAULT, ALTER COLUMN "money" DROP NOT NULL;		-
+SELECT format_type(atttypid, atttypmod), attnotnull FROM pg_attribute WHERE attrelid = 'testings'::regclass AND attname = 'money';		integer|f
+
+-- ------------------------------------------------- arrays, and the DEFAULT applied after the type		-
+CREATE TABLE pg_arrays (id bigserial primary key, snippets character varying DEFAULT 'x', a_string text[]);		-
+ALTER TABLE "pg_arrays" ALTER COLUMN "a_string" TYPE character varying[];		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'pg_arrays'::regclass AND attname = 'a_string';		character varying[]
+-- The same rule as `testings.money`, confirmed on a second pair: the old default is converted and		-
+-- it is what stops the statement. Two independent occurrences is why this is a rule and not a		-
+-- quirk of one type.		-
+SAVEPOINT s6;		-
+ALTER TABLE "pg_arrays" ALTER COLUMN "snippets" TYPE text[] USING string_to_array("snippets", ','), ALTER COLUMN "snippets" SET DEFAULT '{}';	!42804 default for column "snippets" cannot be cast automatically to type text[]
+ROLLBACK TO s6;		-
+ALTER TABLE "pg_arrays" ALTER COLUMN "snippets" DROP DEFAULT;		-
+ALTER TABLE "pg_arrays" ALTER COLUMN "snippets" TYPE text[] USING string_to_array("snippets", ','), ALTER COLUMN "snippets" SET DEFAULT '{}';		-
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'pg_arrays'::regclass AND attname = 'snippets';		text[]
+
+-- ------------------------------------------------- a column nothing has		-
+SAVEPOINT s4;		-
+ALTER TABLE act ALTER COLUMN nosuch TYPE integer;	!42703 column "nosuch" of relation "act" does not exist
+ROLLBACK TO s4;		-
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname IN ('act','strings','testings','pg_arrays');	bigint	0

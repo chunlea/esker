@@ -643,6 +643,204 @@ fn sequence_start(start: i64) -> Result<u64> {
 /// that one droppable without `CASCADE` on the very next line. A node that added the new sequence
 /// beside the old one would leave the column drawing from two counters and would answer `2BP01`
 /// to the drop, which is PostgreSQL's own correct answer to a state it should not be in.
+/// Whether PostgreSQL converts this pair **without** a `USING` — an assignment cast.
+///
+/// Measured, not derived: `timestamp -> timestamptz` needs no help and `varchar -> timestamp` does,
+/// though both are casts that exist. "Needs `USING`" is a property of the *pair*, and the relation
+/// is narrower than "a cast is possible".
+fn converts_implicitly(from: ColumnType, to: ColumnType) -> bool {
+    use ColumnType::{
+        Bpchar, Citext, CitextArray, Int2, Int4, Int8, Text, TextArray, Timestamp, TimestampArray,
+        TimestampTz, TimestampTzArray, Varchar, VarcharArray,
+    };
+    if from == to {
+        return true;
+    }
+    // The string family is one representation with three names; only the typmod differs, and a
+    // length that no longer fits is caught per row rather than here.
+    let string = |ty| matches!(ty, Text | Varchar | Bpchar | Citext);
+    if string(from) && string(to) {
+        return true;
+    }
+    // Widening within the integers, and every integer to text.
+    matches!(
+        (from, to),
+        (Timestamp, TimestampTz)
+            | (TimestampTz, Timestamp)
+            // **Both directions**, measured: a narrowing is implicit too, and a value that no
+            // longer fits is that row's error rather than the statement's. Assuming "widening
+            // only" refused `bigint -> integer`, which PostgreSQL takes.
+            | (Int2 | Int4 | Int8, Int2 | Int4 | Int8)
+            | (Int8 | Int4 | Int2, Text | Varchar)
+    ) || matches!(
+        (from, to),
+        // The array pairs whose element pair is itself implicit. Written out rather than derived:
+        // `ColumnType` has one variant per array type and no element accessor, so a rule over
+        // elements would have to invent the mapping this list *is*.
+        (TextArray, VarcharArray)
+            | (VarcharArray, TextArray)
+            | (TextArray | VarcharArray, CitextArray)
+            | (CitextArray, TextArray | VarcharArray)
+            | (TimestampArray, TimestampTzArray)
+            | (TimestampTzArray, TimestampArray)
+    )
+}
+
+/// Whether a conversion is possible **at all**, with a `USING` to license it.
+///
+/// Everything an assignment cast covers, plus the pairs that go through the type's own text
+/// representation — which is what `CAST(c AS t)` does for every type this node stores.
+fn converts_with_using(from: ColumnType, to: ColumnType) -> bool {
+    use ColumnType::{Bpchar, Citext, Text, Varchar};
+    if converts_implicitly(from, to) {
+        return true;
+    }
+    // **Text is the hub, in both directions.** Every type renders itself into a string and every
+    // type reads itself back out of one, so with a `USING` to license it a conversion goes to a
+    // string type or comes from one — and the parse is per row, so a value that does not parse is
+    // that row's error rather than the statement's.
+    //
+    // This is the whole of what `USING` buys here, and it is why `USING string_to_array(c, ',')`
+    // stays refused: that asks for a computation, not a conversion.
+    matches!(from, Text | Varchar | Bpchar | Citext)
+        || matches!(to, Text | Varchar | Bpchar | Citext)
+}
+
+/// One value, moved from `from` to `to`.
+///
+/// **Through the type's own text representation**, which is what `CAST` does for these pairs and
+/// what keeps this narrow enough to be honest: there is no per-row expression evaluator here, and
+/// this is not one — it is the same `to_text`/`from_text` pair the wire protocol uses, so a value
+/// converts exactly as it would if the client had sent it to a column of the new type.
+///
+/// **The string family is relabelled rather than round-tripped.** `text`, `varchar` and `bpchar`
+/// share `Datum::Text`, and going through text would be the identity anyway; `citext` and the two
+/// timestamps have *distinct* `Datum` variants for the same bytes, so those are re-tagged here —
+/// which is a fact about this crate's representation, not about SQL.
+fn convert_datum(from: ColumnType, to: ColumnType, value: &Datum) -> Result<Datum> {
+    use crate::value::PgDatum as _;
+    if matches!(value, Datum::Null) || from == to {
+        return Ok(value.clone());
+    }
+    // Same bytes, different tag. Written as a match on the *value* so a type pair that shares no
+    // representation still falls through to the text path below.
+    let retagged = match (value, to) {
+        (Datum::Text(text) | Datum::Citext(text), ColumnType::Citext) => {
+            Some(Datum::Citext(text.clone()))
+        }
+        (
+            Datum::Text(text) | Datum::Citext(text),
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar,
+        ) => Some(Datum::Text(text.clone())),
+        // No zone conversion in either direction, which is what this node's `timestamptz` means
+        // (`ColumnType::TimestampTz`): the micros are the value and only the label moves.
+        (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::TimestampTz) => {
+            Some(Datum::TimestampTz(*micros))
+        }
+        (Datum::Timestamp(micros) | Datum::TimestampTz(micros), ColumnType::Timestamp) => {
+            Some(Datum::Timestamp(*micros))
+        }
+        _ => None,
+    };
+    if let Some(datum) = retagged {
+        return Ok(datum);
+    }
+    let Some(text) = value.to_text() else {
+        return Ok(Datum::Null);
+    };
+    Datum::from_text(to, &text)
+}
+
+/// `ALTER TABLE … ALTER COLUMN … TYPE <type> [USING …]` — and it rewrites every row.
+///
+/// A row is stored positionally and decoded against the table's *current* schema (ADR 0030), so a
+/// column that changes type and leaves its rows alone makes every row already written decode as
+/// the wrong value. The whole table is read and written back in the statement's own transaction,
+/// which is the same trade [`backfill`] makes and for the same reason.
+///
+/// The order of the checks is PostgreSQL's, and it is observable: the **pair** is rejected before
+/// any row is read (`42804` with the `USING` to write), the **default** before that (`42804`
+/// naming the default), and only then can a row fail on its own value.
+fn set_column_type(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    updated: &mut TableDef,
+    column: &str,
+    ty: ColumnType,
+    typmod: i32,
+    using: Option<ColumnType>,
+) -> Result<()> {
+    let at = updated
+        .column(column)
+        .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+            column: column.to_owned(),
+            relation: updated.name.clone(),
+        })?;
+    let from = updated.columns[at].ty;
+    let target = crate::value::format_type(ty, typmod);
+    // **Two hops when a `USING` names its own type**: the column has to reach the `USING`'s type,
+    // and that type has to reach the column's new one on its own — which is why
+    // `TYPE character varying USING s::text` works and is not the same statement as
+    // `TYPE character varying` alone.
+    let allowed = match using {
+        None => converts_implicitly(from, ty),
+        Some(cast_to) => converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty),
+    };
+    if !allowed {
+        return Err(SqlError::CannotCastColumnAutomatically {
+            column: column.to_owned(),
+            target: target.clone(),
+            using: format!("{column}::{target}"),
+        });
+    }
+    // **The default converts or the statement stops**, before any row is touched — and it is held
+    // to the *assignment* cast, not to whether its particular value happens to parse. A `varchar`
+    // column defaulted to `'0'` going to `integer` is refused even though `'0'` is a fine integer,
+    // because `USING` governs the rows and says nothing about the default. Measured on two
+    // independent pairs, and the `SET DEFAULT` later in the same statement does not rescue it.
+    if updated.columns[at].default.is_some() && !converts_implicitly(from, ty) {
+        return Err(SqlError::CannotCastDefaultAutomatically {
+            column: column.to_owned(),
+            target,
+        });
+    }
+
+    // Every row, a page at a time, decoded against the old schema and written back under the new
+    // one. Collected before anything is written: the walk holds the transaction.
+    let (start, end) = crate::row::table_row_range(executor.tenant, updated.id);
+    let schema = updated.row_schema();
+    let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+        }
+        Ok(())
+    })?;
+
+    let mut converted = updated.clone();
+    converted.columns[at].ty = ty;
+    converted.columns[at].typmod = typmod;
+    if let Some(default) = updated.columns[at].default.clone() {
+        converted.columns[at].default = Some(convert_datum(from, ty, &default)?);
+    }
+    if let Some(missing) = updated.columns[at].missing.clone() {
+        converted.columns[at].missing = Some(convert_datum(from, ty, &missing)?);
+    }
+    let types = converted.column_types();
+    for (key, mut row) in rows {
+        // The typmod is applied per row and not compared once: `varchar(5)` over a nineteen
+        // character value is `22001`, and which row raises it depends on the data. `fit_to_typmod`
+        // is the same function an `INSERT` uses, so a rounded `timestamp(6)` rounds identically.
+        row[at] = crate::value::fit_to_typmod(convert_datum(from, ty, &row[at])?, ty, typmod)?;
+        txn.put(&key, &crate::row::encode_row(&types, &row)?);
+    }
+    updated.columns[at].ty = ty;
+    updated.columns[at].typmod = typmod;
+    updated.columns[at].default = converted.columns[at].default.clone();
+    updated.columns[at].missing = converted.columns[at].missing.clone();
+    Ok(())
+}
+
 /// `ALTER TABLE … VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
 ///
 /// It runs the scan the `ADD` skipped and, when every row satisfies the constraint, records it as
@@ -3524,6 +3722,7 @@ fn alter_action_name(action: Option<&AlterTableAction>) -> &'static str {
             "ALTER COLUMN"
         }
         Some(AlterTableAction::ValidateConstraint(_)) => "VALIDATE CONSTRAINT",
+        Some(AlterTableAction::SetColumnType { .. }) => "ALTER COLUMN",
         Some(_) => "ALTER",
     }
 }
@@ -3626,6 +3825,17 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::SetTriggersDisabled { disabled } = action {
             set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+            continue;
+        }
+        if let AlterTableAction::SetColumnType {
+            column,
+            ty,
+            typmod,
+            using,
+        } = action
+        {
+            set_column_type(txn, executor, &mut updated, column, *ty, *typmod, *using)?;
+            changed = true;
             continue;
         }
         if let AlterTableAction::ValidateConstraint(name) = action {
