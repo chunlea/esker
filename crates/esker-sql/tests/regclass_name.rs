@@ -95,23 +95,26 @@ fn the_binder_descends_into_every_node_that_holds_an_expression() {
     );
 }
 
-/// **A divergence this unit found and did not close**, pinned so it is visible rather than
-/// discovered again.
+/// **A divergence this unit found and did not close — and the namespace unit closed it.** Kept as
+/// the assertion it should always have been.
 ///
 /// A `regclass` on a real server is an oid whose *output function* prints a name, so
-/// `'rc'::regclass::text` is `rc` there. Here the forward cast resolves to the oid before the plan
-/// is built — which is what makes `WHERE attrelid = 'x'::regclass` one catalog read per statement
-/// rather than one per row — and `::text` of an `int8` prints the number. The **reverse**
-/// direction, which is the one `ActiveRecord` writes, is exact.
+/// `'rc'::regclass::text` is `rc` there and was the oid's digits here: the forward cast resolves
+/// to a number before the plan is built, which is what makes `WHERE attrelid = 'x'::regclass` one
+/// catalog read per statement rather than one per row, and `::text` of an `int8` prints the
+/// number. Both halves of the fix were already in this file — the forward cast resolves the name
+/// and [`plan::CatalogFunc::RegClassName`] is the inverse — so `'x'::regclass::text` composes
+/// them, and a name nothing answers to still fails in the forward half.
 #[test]
-fn the_forward_cast_prints_its_oid_where_a_real_server_prints_the_name() {
+fn the_forward_cast_prints_the_name_a_real_server_prints() {
     let mut node = parity::Node::new(&["CREATE TABLE rc (id int8 PRIMARY KEY)"]);
-    let ours = node.rows("SELECT 'rc'::regclass::text");
-    assert_ne!(ours, [["rc"]], "PostgreSQL 19 answers `rc` here");
-    assert_eq!(
-        ours,
+    assert_eq!(node.rows("SELECT 'rc'::regclass::text"), [["rc"]]);
+    // **And the oid is still an oid where it is asked for as one**, which is the half that must
+    // not move: `::regclass::oid` is the number, and it is what a `WHERE` compares.
+    assert_ne!(
         node.rows("SELECT 'rc'::regclass::oid::text"),
-        "what this node prints is the oid, which is what the value is"
+        [["rc"]],
+        "the oid cast prints what the value is"
     );
 }
 

@@ -217,6 +217,11 @@ pub const CONNECTION_FAILURE: &str = "08006";
 /// `permission denied: "pg_type" is a system catalog`.
 pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
+/// `42939` — a name in the space a system reserves for itself. PostgreSQL raises it for a schema
+/// whose name begins `pg_`, which is a *different* answer from "already exists": the name is
+/// refused before anything looks to see whether it is taken.
+pub const RESERVED_NAME: &str = "42939";
+
 /// The statement is not valid SQL. Contract C1 says this must never be the answer to a statement
 /// PostgreSQL 19 would have accepted.
 pub const SYNTAX_ERROR: &str = "42601";

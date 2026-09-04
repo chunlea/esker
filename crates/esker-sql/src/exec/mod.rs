@@ -1985,10 +1985,16 @@ impl Executor {
         txn: &dyn Txn,
         name: &str,
     ) -> Result<Option<String>> {
-        if let Some(view) = crate::catalog::pg_catalog::view(name) {
+        let stored = crate::catalog::parse_qualified(name);
+        let reach = crate::catalog::reach_of(name);
+        if reach.catalog()
+            && let Some(view) = crate::catalog::pg_catalog::view(&stored)
+        {
             return Ok(Some(view.name().to_owned()));
         }
-        let stored = crate::catalog::parse_qualified(name);
+        if !reach.records() {
+            return Ok(None);
+        }
         let relations = match relations {
             Some(relations) => relations,
             slot => slot.insert(crate::catalog::pg_relations::Relations::read(
@@ -2012,13 +2018,23 @@ impl Executor {
         txn: &dyn Txn,
         name: &str,
     ) -> Result<i64> {
-        if let Some(view) = crate::catalog::pg_catalog::view(name) {
-            return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
-        }
         // **`::regclass` takes a name as a *string***, so a schema in it is a dot rather than the
         // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
-        // `se_idx`, and looking it up whole would find nothing.
+        // `se_idx`, and looking it up whole would find nothing. It is also where the quoting is
+        // undone: `ActiveRecord` writes `'\"pg_type\"'::regclass`, which found nothing until the
+        // catalog was consulted with the *normalised* name rather than the written one.
         let stored = crate::catalog::parse_qualified(name);
+        let reach = crate::catalog::reach_of(name);
+        if reach.catalog()
+            && let Some(view) = crate::catalog::pg_catalog::view(&stored)
+        {
+            return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
+        }
+        if !reach.records() {
+            return Err(SqlError::UndefinedTable(crate::catalog::written_display(
+                name,
+            )));
+        }
         // **Read once per statement, not once per literal.** The catalog scan is one pass over the
         // name records plus a point read per relation, so a statement with three `::regclass` casts
         // was three of those — and `ActiveRecord`'s schema dump writes several per statement

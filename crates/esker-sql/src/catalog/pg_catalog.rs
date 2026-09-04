@@ -274,6 +274,57 @@ impl CatalogView {
         }
     }
 
+    /// The schema it lives in: `pg_catalog`, or `information_schema` for the SQL-standard views.
+    ///
+    /// **This is what keeps the catalog out of a client's table list**, and it is the right thing
+    /// to keep it out with. `ActiveRecord`'s `tables()` filters `n.nspname = ANY
+    /// (current_schemas(false))`, which is `{public}`; `pg_catalog` is in the *implicit* path and
+    /// so resolves without a qualifier while never appearing in the list. Before this, every
+    /// catalog relation was reported in `public` and `relkind` `v` was doing the schema's job —
+    /// which worked, and was two wrong answers at once.
+    #[must_use]
+    pub fn schema(self) -> &'static str {
+        match self {
+            CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaColumns
+            | CatalogView::InformationSchemaTableConstraints
+            | CatalogView::InformationSchemaKeyColumnUsage
+            | CatalogView::InformationSchemaReferentialConstraints => super::INFORMATION_SCHEMA,
+            _ => super::PG_CATALOG_SCHEMA,
+        }
+    }
+
+    /// The bare name, without the schema its stored one may carry.
+    #[must_use]
+    pub fn relname(self) -> &'static str {
+        match self.name().split_once('.') {
+            Some((_, name)) => name,
+            None => self.name(),
+        }
+    }
+
+    /// Its `pg_class.relkind`, as PostgreSQL 19 reports it — **measured, one relation at a time**.
+    ///
+    /// Most of `pg_catalog` is ordinary tables (`r`); the five that are views are the ones a real
+    /// server defines *over* those tables. Guessing this from the name would get
+    /// `pg_partitioned_table` and `pg_available_extensions` the wrong way round, so the corpus
+    /// asks for all twenty-nine at once.
+    #[must_use]
+    pub fn relkind(self) -> &'static str {
+        match self {
+            CatalogView::PgIndexes
+            | CatalogView::PgViews
+            | CatalogView::PgStatActivity
+            | CatalogView::PgAvailableExtensions
+            | CatalogView::InformationSchemaTables
+            | CatalogView::InformationSchemaColumns
+            | CatalogView::InformationSchemaTableConstraints
+            | CatalogView::InformationSchemaKeyColumnUsage
+            | CatalogView::InformationSchemaReferentialConstraints => "v",
+            _ => "r",
+        }
+    }
+
     /// Its reserved relation id.
     #[must_use]
     fn id(self) -> u64 {
@@ -841,12 +892,37 @@ impl CatalogView {
     }
 }
 
-/// The view a name is, if it is one.
+/// The view a **stored** name is, if it is one.
+///
+/// Two spellings reach here and both are the parser's output. A bare `pg_class` is the search
+/// path's answer — `pg_catalog` is in the implicit path, so a name with no qualifier finds the
+/// catalog before it finds anything else. A `pg_catalog`-qualified one carries the schema in the
+/// stored form (`super::SCHEMA_SEPARATOR`), and then only a relation *in* `pg_catalog` may answer:
+/// `pg_catalog.books` is `42P01` on a real server however many `books` there are in `public`.
+///
+/// `information_schema.tables` is its own third case and always has been: the qualifier is part
+/// of the name, because that schema is **not** in the search path and a client must write it.
 #[must_use]
 pub fn view(name: &str) -> Option<CatalogView> {
+    if let Some(bare) = name.strip_prefix(super::PG_CATALOG_SCHEMA)
+        && let Some(bare) = bare.strip_prefix(super::SCHEMA_SEPARATOR)
+    {
+        return CatalogView::ALL
+            .into_iter()
+            .find(|view| view.schema() == super::PG_CATALOG_SCHEMA && view.relname() == bare);
+    }
     CatalogView::ALL
         .into_iter()
         .find(|view| view.name() == name)
+}
+
+/// The view an **oid** is, if it is one — the inverse of the reserved ids [`CatalogView::id`]
+/// hands out, and what makes `<oid>::regclass` print a catalog relation's name.
+#[must_use]
+pub fn view_by_oid(oid: i64) -> Option<CatalogView> {
+    CatalogView::ALL
+        .into_iter()
+        .find(|view| i64::try_from(view.id()).unwrap_or(i64::MAX) == oid)
 }
 
 /// The view a relation is, if it is one. By id, so a `TableDef` that has travelled does not have
@@ -1439,16 +1515,13 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
     // filter `relkind IN ('r', 'p')`, so these rows are invisible to them exactly as they should
     // be. The name is the unqualified one, which is what `relname` holds — the schema is a
     // separate column there and `information_schema.tables` is `tables` in `pg_class`.
+    let schemas = super::schema_names(txn, tenant)?;
     let views = CatalogView::ALL.into_iter().map(|view| {
         vec![
             Datum::Int8(i64::try_from(view.id()).unwrap_or(i64::MAX)),
-            Datum::Text(
-                view.name()
-                    .rsplit_once('.')
-                    .map_or_else(|| view.name().to_owned(), |(_, name)| name.to_owned()),
-            ),
-            Datum::Int8(PUBLIC_NAMESPACE_OID),
-            Datum::Text("v".to_owned()),
+            Datum::Text(view.relname().to_owned()),
+            Datum::Int8(namespace_oid(&schemas, view.schema())),
+            Datum::Text(view.relkind().to_owned()),
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Bool(false),
@@ -1458,7 +1531,6 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
             Datum::Text(super::Persistence::Permanent.relpersistence().to_owned()),
         ]
     });
-    let schemas = super::schema_names(txn, tenant)?;
     Ok(relations
         .rows()
         .map(|relation| {

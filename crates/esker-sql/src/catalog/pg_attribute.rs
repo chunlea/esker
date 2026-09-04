@@ -73,7 +73,7 @@ const NO_COLLATION: i64 = 0;
 /// Every `pg_attribute` row this tenant has.
 pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
-    let mut rows = Vec::new();
+    let mut rows = catalog_rows();
     for relation in relations.rows() {
         let Some(table) = relations.table(relation) else {
             continue;
@@ -83,6 +83,43 @@ pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
         }
     }
     Ok(rows)
+}
+
+/// **The catalog describes itself here too.** One row per column of every catalog relation.
+///
+/// A real server's `pg_attribute` has them because its catalog *is* tables, and a client reads
+/// them the same way it reads a user table's: `attrelid = 'pg_views'::regclass`. Without these
+/// rows that question came back empty, which is a different answer from "four columns" and the
+/// one a client cannot tell from "no such relation".
+///
+/// They are derived from [`super::pg_catalog::CatalogView::columns`] rather than written out, so
+/// a column added to a view cannot be missing from the catalog that describes it — the same rule
+/// `pg_class`'s own rows follow. Nothing here can carry a default, an identity or a generated
+/// expression, so the flags are constants: a catalog relation is computed, and there is nowhere
+/// for one to be stored.
+fn catalog_rows() -> Vec<Vec<Datum>> {
+    let mut rows = Vec::new();
+    for view in super::pg_catalog::CatalogView::ALL {
+        let oid = i64::try_from(view.table_def().id).unwrap_or(i64::MAX);
+        for (attnum, (name, ty)) in (1..).zip(view.columns()) {
+            rows.push(vec![
+                Datum::Int8(oid),
+                Datum::Text((*name).to_owned()),
+                Datum::Int8(i64::from(ty.oid())),
+                Datum::Int2(attnum),
+                // No typmod: every column of every catalog view here is declared at its type's
+                // own width, which is what `-1` says.
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Text(NOT_IDENTITY.to_owned()),
+                Datum::Text(NOT_IDENTITY.to_owned()),
+                Datum::Bool(false),
+                Datum::Int8(NO_COLLATION),
+            ]);
+        }
+    }
+    rows
 }
 
 /// Every `pg_attrdef` row this tenant has: one per column that has a default, and no others.

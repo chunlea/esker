@@ -2260,7 +2260,15 @@ fn qualified_create(
 /// — where a relation missing from a schema that is there is `42P01`. A relation in `public`
 /// passes straight through, which is what keeps every existing answer unchanged.
 fn refuse_missing_schema(txn: &dyn Txn, executor: &Executor, stored: &str) -> Result<()> {
-    let (schema, _) = catalog::split_qualified(stored);
+    let (schema, name) = catalog::split_qualified(stored);
+    // **Nothing may be created in the two schemas the catalog owns**, and the sentence is its own:
+    // `42501 permission denied to create "pg_catalog.mine"`, the whole qualified name inside the
+    // quotes. It is the other half of `pg_catalog::refuse_write` — that one guards a write to a
+    // relation that *is* a catalog, this one a write to a schema that is — and it is what makes
+    // the qualifier a lookup key that no record can ever carry.
+    if catalog::is_reserved_schema(schema) {
+        return Err(SqlError::CreateInSystemSchema(format!("{schema}.{name}")));
+    }
     if catalog::schema_exists(txn, executor.tenant, schema)? {
         return Ok(());
     }
@@ -2278,6 +2286,13 @@ pub(super) fn create_schema(
     txn: &mut dyn Txn,
     create: &plan::CreateSchema,
 ) -> Result<Outcome> {
+    // **The `pg_` prefix is refused before existence is even asked about**, which is why this
+    // comes first and why `information_schema` — same reservation, no prefix — falls through to
+    // the ordinary `42P06`. Measured, both, and `IF NOT EXISTS` does not cover this one: the name
+    // is unacceptable rather than taken.
+    if create.name.starts_with("pg_") {
+        return Err(SqlError::ReservedSchemaName(create.name.clone()));
+    }
     if catalog::schema_exists(&*txn, executor.tenant, &create.name)? {
         // **`IF NOT EXISTS` is a notice and a success**, which is what a real server answers; the
         // notice itself is on stderr in `psql` and is not a row.
@@ -2510,6 +2525,12 @@ pub(super) fn drop_schema(
     drop: &plan::DropSchema,
 ) -> Result<Outcome> {
     for name in &drop.names {
+        // **The catalog's own two are `2BP01` before anything else is looked at**, `IF EXISTS`
+        // included: they exist, so the clause does not apply, and what is wrong is that the
+        // database system depends on them rather than that some table does.
+        if catalog::is_reserved_schema(name) {
+            return Err(SqlError::RequiredSchema(name.clone()));
+        }
         if !catalog::schema_exists(&*txn, executor.tenant, name)? {
             if drop.if_exists {
                 executor.notice(SqlError::DoesNotExistSkipping {

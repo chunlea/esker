@@ -210,6 +210,29 @@ pub enum SqlError {
     #[error("permission denied: \"{0}\" is a system catalog")]
     SystemCatalog(&'static str),
 
+    /// Creating a relation **in** `pg_catalog` or `information_schema`.
+    ///
+    /// A different sentence from [`SqlError::SystemCatalog`], and the difference is which half is
+    /// wrong: that one is a write to a relation that is a catalog, this one is a write to a
+    /// *schema* that is. Measured — `CREATE TABLE pg_catalog.mine` is `42501 permission denied to
+    /// create "pg_catalog.mine"`, the whole qualified name inside the quotes, with a DETAIL that
+    /// names the rule rather than the object.
+    #[error("permission denied to create \"{0}\"")]
+    CreateInSystemSchema(String),
+
+    /// `DROP SCHEMA pg_catalog`. **`2BP01`, not `42501`** — the schema is not forbidden to you,
+    /// it is depended on, and the message says so in PostgreSQL's own words. The name is
+    /// **unquoted** here, unlike every other schema message; measured.
+    #[error("cannot drop schema {0} because it is required by the database system")]
+    RequiredSchema(String),
+
+    /// `CREATE SCHEMA pg_catalog`. **Not `42P06 already exists`**, even though it does: the name
+    /// is refused for its *prefix*, before anything looks to see whether it is taken, so
+    /// `CREATE SCHEMA pg_anything` is this too. `information_schema` has no such prefix and is
+    /// `42P06` — measured, both.
+    #[error("unacceptable schema name \"{0}\"")]
+    ReservedSchemaName(String),
+
     /// An aggregate whose argument has **no type**: `sum('lit')`, `array_agg(NULL)`.
     ///
     /// PostgreSQL has one candidate per input type and an `unknown` matches all of them, so the
@@ -1987,7 +2010,10 @@ impl SqlError {
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
-            SqlError::SystemCatalog(_) => sqlstate::INSUFFICIENT_PRIVILEGE,
+            SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
+                sqlstate::INSUFFICIENT_PRIVILEGE
+            }
+            SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
             SqlError::WrongObjectType { .. }
             | SqlError::AlterActionOnWrongObject { .. }
             // A constraint that cannot be deferred is the wrong *kind* of object for the
@@ -2127,6 +2153,7 @@ impl SqlError {
             | SqlError::DependentType { .. }
             | SqlError::DependentSequence { .. }
             | SqlError::FunctionRequiredBySystem(_)
+            | SqlError::RequiredSchema(_)
             | SqlError::DependentFunction { .. } => {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
@@ -2207,6 +2234,12 @@ impl SqlError {
     #[must_use]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::CreateInSystemSchema(_) => {
+                Some("System catalog modifications are currently disallowed.".to_owned())
+            }
+            SqlError::ReservedSchemaName(_) => {
+                Some("The prefix \"pg_\" is reserved for system schemas.".to_owned())
+            }
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
