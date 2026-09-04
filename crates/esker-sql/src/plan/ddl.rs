@@ -72,7 +72,19 @@ pub struct Column {
     /// all, and the catalog reports it in a different place (`catalog::ColumnDef::generated`).
     pub generated: Option<String>,
     /// The type it was declared as.
+    ///
+    /// For a column declared as a **user-defined type** this is what the value physically is —
+    /// `int2` for an enum's ordinal — and it is a placeholder until the executor has read the
+    /// catalog. [`Column::user_type_name`] is the name that decides it.
     pub ty: ColumnType,
+    /// The **name** of a user-defined type this column was declared as, unresolved.
+    ///
+    /// Unresolved for the same reason `partition_of`'s bound and `inherits`' parents are: reading
+    /// it needs the catalog, and a plan is lowered without one. The executor turns it into
+    /// `catalog::ColumnDef::user_type` and settles `ty` at the same time, and it is where the
+    /// `0A000 the type <name> is not supported` for a name nobody declared comes from — lowering
+    /// can no longer tell a user type from a typo, because only the catalog knows.
+    pub user_type_name: Option<String>,
     /// PostgreSQL's `atttypmod` for the declaration, or `crate::value::NO_TYPMOD`. See
     /// `crate::catalog::ColumnDef::typmod`, which is where it comes to rest.
     pub typmod: i32,

@@ -56,28 +56,27 @@
 #   * **A missing sequence is `42P01 relation "nosuchseq" does not exist`**, the ordinary relation
 #     error, not a sequence-specific one.
 #
-# **THE THREE `last_value, is_called` PROBES ARE HELD BACK.** Reading a sequence *as a relation* is
-# a second feature — PostgreSQL keeps `last_value`/`is_called` in the sequence itself and its
-# parameters in `pg_sequence`, and this node stores one counter, the next value to hand out, from
-# which `(5, false)` and `(4, true)` cannot be told apart. `setval`'s own semantics are right
-# either way, which is what the inserts below measure; reporting the pair faithfully needs the flag
-# stored beside the counter. The full capture is
-# `esker-rails-harness/captures/pg19_reset_pk_sequence.txt`.
+#   * **`last_value` is not the counter.** A sequence that has called reports the value
+#     before the next one and a sequence that has not reports the next one itself, which is
+#     the whole difference between `setval(s, 5, true)` and `setval(s, 5, false)`.
 BEGIN		-
 CREATE TABLE posts (id bigserial primary key, title character varying)		-
 INSERT INTO posts (id, title) VALUES (1, 'a'), (2, 'b'), (3, 'c')		-
+SELECT 'r', last_value, is_called FROM posts_id_seq		r|1|f
 SAVEPOINT s1		-
 INSERT INTO posts (title) VALUES ('collide')	!23505 duplicate key value violates unique constraint "posts_pkey" DETAIL: Key (id)=(1) already exists.
 ROLLBACK TO s1		-
 SELECT attr.attname, nsp.nspname, seq.relname FROM pg_class seq, pg_attribute attr, pg_depend dep, pg_constraint cons, pg_namespace nsp WHERE seq.oid = dep.objid AND seq.relkind = 'S' AND attr.attrelid = dep.refobjid AND attr.attnum = dep.refobjsubid AND attr.attrelid = cons.conrelid AND attr.attnum = cons.conkey[1] AND seq.relnamespace = nsp.oid AND cons.contype = 'p' AND dep.classid = 'pg_class'::regclass AND dep.refobjid = '"posts"'::regclass		id|public|posts_id_seq
 SELECT MAX("id") FROM "posts"		3
 SELECT 'r', setval('"posts_id_seq"', 3, true)		r|3
+SELECT 'r', last_value, is_called FROM posts_id_seq		r|3|t
 INSERT INTO posts (title) VALUES ('after reset') RETURNING id		4
 SELECT 'r', id, title FROM posts ORDER BY id		r|1|a ; r|2|b ; r|3|c ; r|4|after reset
 CREATE TABLE authors (id bigserial primary key, name character varying)		-
 SELECT 'r', MAX("id") IS NULL FROM "authors"		r|t
 SELECT 'r', seqmin FROM pg_sequence WHERE seqrelid = '"authors_id_seq"'::regclass		r|1
 SELECT 'r', setval('"authors_id_seq"', 1, false)		r|1
+SELECT 'r', last_value, is_called FROM authors_id_seq		r|1|f
 INSERT INTO authors (name) VALUES ('first') RETURNING id		1
 SELECT 'r', setval('"authors_id_seq"', 10)		r|10
 INSERT INTO authors (name) VALUES ('eleven') RETURNING id		11

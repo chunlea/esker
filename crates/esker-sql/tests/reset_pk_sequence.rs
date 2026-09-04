@@ -29,7 +29,7 @@ fn every_sequence_reset_answer_is_postgresql_19_s() {
         &DIVERGENCES,
     );
     assert!(
-        checked > 30,
+        checked > 33,
         "only {checked} statements ran; the corpus did not load"
     );
 }

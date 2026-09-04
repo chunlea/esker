@@ -68,7 +68,7 @@ pub(super) fn create_table(
     // relation where it actually is.
     let create = &qualified_create(&*txn, executor, create)?;
     refuse_missing_schema(&*txn, executor, &create.name)?;
-    let declared = declared_columns(create)?;
+    let declared = declared_columns(&*txn, executor, create)?;
     // **The parents' columns come first**, whatever order the child declared its own in, and a
     // child that redeclares an inherited name merges into it rather than adding a second column.
     let (parents, columns) = inherited_columns(executor, txn, create, declared)?;
@@ -110,6 +110,7 @@ pub(super) fn create_table(
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
         with_row_id.extend(columns);
         (with_row_id, vec![0], String::new())
@@ -163,6 +164,7 @@ pub(super) fn create_table(
         sequences,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     };
 
     validate_checks(&table)?;
@@ -210,7 +212,11 @@ pub(super) fn create_table(
 /// taking that name in the same namespace tables and indexes share — `CREATE TABLE t_id_seq` after
 /// a `bigserial` is `42P07` on both servers.
 /// The table's columns, as the catalog holds them, refusing a name written twice.
-fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
+fn declared_columns(
+    txn: &dyn Txn,
+    executor: &Executor,
+    create: &CreateTable,
+) -> Result<Vec<ColumnDef>> {
     let mut columns = Vec::with_capacity(create.columns.len());
     for column in &create.columns {
         if columns
@@ -219,9 +225,10 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
         {
             return Err(SqlError::DuplicateColumn(column.name.clone()));
         }
+        let (ty, user_type) = resolve_user_type(txn, executor, column)?;
         columns.push(ColumnDef {
             name: column.name.clone(),
-            ty: column.ty,
+            ty,
             typmod: column.typmod,
             default_expr: column.default_expr.clone(),
             // A primary key column is NOT NULL whether or not it said so, which is PostgreSQL's
@@ -235,9 +242,56 @@ fn declared_columns(create: &CreateTable) -> Result<Vec<ColumnDef>> {
             generated: column.generated.clone(),
             comment: None,
             dropped: false,
+            user_type,
         });
     }
     Ok(columns)
+}
+
+/// One user-defined type by oid, for the places that hold an oid rather than a name.
+fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<catalog::TypeDef>> {
+    Ok(catalog::user_types(txn, executor.tenant)?
+        .into_iter()
+        .find(|def| def.oid == oid))
+}
+
+/// A column's type, once the catalog has been asked about the name lowering could not resolve.
+///
+/// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s first unit. Lowering
+/// hands over a bare type name it does not recognise (`crate::plan::Column::user_type_name`) and
+/// this is where it becomes a type or an error, because this is where the catalog is.
+///
+/// **An enum's value is the `int2` of its label's position**, which is what makes ordering,
+/// grouping, `=` and an index over the column all the ordinal's — `pg_enum.enumsortorder` is
+/// PostgreSQL's own sort key for exactly the same reason. The label is rendered back through the
+/// catalog on the way out; nothing below this crate ever sees anything but a small integer, which
+/// is invariant 7 kept rather than worked around.
+///
+/// The other two kinds are **refused by name**. A range's and a composite's values are their own
+/// units in the ADR's order, and answering a `CREATE TABLE` for one of them would make a column
+/// nothing can read — a wrong answer where a refusal is available (ADR 0031).
+fn resolve_user_type(
+    txn: &dyn Txn,
+    executor: &Executor,
+    column: &plan::Column,
+) -> Result<(ColumnType, Option<u64>)> {
+    let Some(name) = &column.user_type_name else {
+        return Ok((column.ty, None));
+    };
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+        // The name is not a type anybody declared, which is where lowering's own refusal has been
+        // waiting for a catalog to confirm it. Same `0A000` and same wording as before.
+        return Err(SqlError::unsupported(format!("the type {name}")));
+    };
+    match def.kind {
+        catalog::TypeKind::Enum { .. } => Ok((ColumnType::Int2, Some(def.oid))),
+        catalog::TypeKind::Range { .. } => Err(SqlError::unsupported(format!(
+            "a column of the range type {name}"
+        ))),
+        catalog::TypeKind::Composite { .. } => Err(SqlError::unsupported(format!(
+            "a column of the composite type {name}"
+        ))),
+    }
 }
 
 /// A `CHECK` added after the fact.
@@ -1206,6 +1260,9 @@ pub(super) fn create_sequence(
         executor.tenant,
         sequence.id,
         sequence_start(create.start)?,
+        // Nothing has been handed out yet, which is what a fresh sequence reports: `last_value` is
+        // the start value and `is_called` is false, so the first `nextval` answers the start.
+        false,
     );
     if let Some((table, _)) = owner {
         // The owning table's cached definition now has one more sequence in it.
@@ -2386,6 +2443,9 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
 fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
     use crate::plan::Literal;
     match literal {
+        // A typed NULL deparses under **its own** type, not the column's: it is what the user
+        // wrote, and `pg_get_expr` prints back what was written.
+        Literal::TypedNull(null) => format!("NULL::{}", null.name()),
         Literal::Null => format!("NULL::{}", ty.name()),
         Literal::Bool(value) => value.to_string(),
         Literal::Integer(value) => value.to_string(),
@@ -2715,9 +2775,38 @@ pub(super) fn alter_table(
                 relation: alter.name.clone(),
             });
         }
+        // The catalog decides what the declared name is, exactly as it does at `CREATE TABLE`,
+        // and the default is folded against the answer rather than against the placeholder.
+        let (ty, user_type) = resolve_user_type(&*txn, executor, column)?;
+        let default = match (
+            &column.default,
+            match user_type {
+                Some(oid) => type_by_oid(&*txn, executor, oid)?,
+                None => None,
+            },
+        ) {
+            (Some(value), Some(def)) => Some(super::assign::into_enum(
+                value.clone(),
+                &ColumnDef {
+                    name: column.name.clone(),
+                    ty,
+                    typmod: column.typmod,
+                    default_expr: None,
+                    not_null: false,
+                    default: None,
+                    missing: None,
+                    generated: None,
+                    comment: None,
+                    dropped: false,
+                    user_type,
+                },
+                &def,
+            )?),
+            (other, _) => other.clone(),
+        };
         updated.columns.push(ColumnDef {
             name: column.name.clone(),
-            ty: column.ty,
+            ty,
             typmod: column.typmod,
             default_expr: column.default_expr.clone(),
             // `NOT NULL` is admissible **only with a constant default**, which is what makes every
@@ -2725,16 +2814,17 @@ pub(super) fn alter_table(
             // decoder pads with it. Without one the lowering refuses `NOT NULL`, because the
             // alternative is a rewrite and this `ALTER` touches no row.
             not_null: column.not_null,
-            default: column.default.clone(),
+            default: default.clone(),
             // **The missing value is frozen here**, at `ADD COLUMN` time, and a later
             // `ALTER COLUMN SET DEFAULT` must not touch it. Measured on PostgreSQL 19beta1: after
             // `SET DEFAULT 'new'`, rows that predate the column still read `old`
             // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
             // first time somebody changed a default.
-            missing: column.default.clone(),
+            missing: default,
             generated: None,
             comment: None,
             dropped: false,
+            user_type,
         });
         changed = true;
     }

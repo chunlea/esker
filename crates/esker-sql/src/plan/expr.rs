@@ -355,6 +355,18 @@ pub enum Expr {
         /// Decided where the operand's type is known — at resolution — because a `Datum::Text`
         /// does not know it came from a `bpchar`.
         strip_blanks: bool,
+        /// The labels of the **enum** the operand was declared as, or `None`.
+        ///
+        /// An enum column holds the `int2` of its label's position, so its output function is a
+        /// catalog lookup rather than the number's own text — `current_mood::text` is `sad` and not
+        /// `1`. Set at resolution beside `strip_blanks` and for the same reason: a `Datum::Int2`
+        /// does not know it came from an enum, and only the scope does.
+        ///
+        /// Carried as a field of the cast that already exists rather than as an `Expr` variant of
+        /// its own, which is what keeps every walker over this tree unchanged — a new variant that
+        /// holds another expression has to be taught to two of them, and they have drifted before
+        /// (ADR 0050).
+        enum_labels: Option<Vec<String>>,
     },
     /// A **set-returning function in the target list**: `SELECT generate_series(1,3)`.
     ///
@@ -1085,6 +1097,17 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
+    /// Whether this aggregate's result is **the argument's own type**.
+    ///
+    /// `min` and `max` are, and it is what makes `min(current_mood)` a `mood` on a real server
+    /// rather than the `int2` an enum is stored as. `count` is a `bigint` whatever it counts,
+    /// `sum` and `avg` promote, and `array_agg` makes an array — none of the four can hand a
+    /// user-defined type back (ADR 0050).
+    #[must_use]
+    pub fn keeps_its_argument_type(self) -> bool {
+        matches!(self, AggregateFunc::Min | AggregateFunc::Max)
+    }
+
     /// The five names, matched the way PostgreSQL matches them: case-insensitively, so `COUNT(*)`
     /// and `Count(*)` are the same call. Measured — both forms execute on a real server.
     #[must_use]
@@ -1257,6 +1280,17 @@ impl BinaryOp {
 pub enum Literal {
     /// `NULL`, which fits every column and no type.
     Null,
+    /// `NULL::bigint` — a NULL that **knows what it is**.
+    ///
+    /// PostgreSQL types a NULL the moment a cast names one, and everything after resolves against
+    /// that type rather than around it: `WHERE id IN (SELECT NULL::bigint)` matches nothing, where
+    /// the same subquery over an *untyped* NULL is `42883 operator does not exist: bigint = text`
+    /// — an untyped NULL is `text` in this crate and there is no such operator. Dropping the cast,
+    /// which is what `NULL::anything is NULL` did, loses exactly that.
+    ///
+    /// The **value** is still nothing: it assigns as `Datum::Null`, compares as unknown and prints
+    /// as NULL. Only its type survives, which is the whole of what the cast was for.
+    TypedNull(ColumnType),
     /// An integer.
     Integer(i64),
     /// A decimal, kept as written — see the module note on why the digits matter.
@@ -1277,6 +1311,8 @@ impl Literal {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
+            // The type the cast named, which is the whole point of carrying it.
+            Literal::TypedNull(ty) => ty.name(),
             // A NULL has no type to name, and never reaches a mismatch anyway; a quoted string
             // is PostgreSQL's `unknown` and takes whatever type the column gives it.
             Literal::Null | Literal::String(_) => "unknown",
@@ -1299,6 +1335,15 @@ impl Literal {
     #[must_use]
     pub fn comparable_with(&self, ty: ColumnType) -> bool {
         match self {
+            // **A typed NULL is comparable where its type is**, and not otherwise: the value being
+            // nothing does not make an operator exist, so `id = NULL::text` over a `bigint` should
+            // be the same `42883` that `id = 'x'::text` is.
+            //
+            // **Not captured.** It follows from PostgreSQL resolving an operator by the *types* of
+            // its arguments, and `tests/corpus/pg19_operator_types.txt` measures that rule for two
+            // columns — but this exact pair has not been put to the oracle, which was unreachable
+            // when this landed. `docs/plans/phase-9-rails.md` owes it a corpus.
+            Literal::TypedNull(null) => crate::exec::query::same_family(*null, ty),
             // `unknown` takes whatever type the other side has -- if it can be read as one.
             Literal::Null | Literal::String(_) => true,
             Literal::Integer(_) => matches!(
@@ -1344,12 +1389,14 @@ impl Literal {
         let mismatch = || {
             Err(SqlError::DatatypeMismatchInColumn {
                 column: column.to_owned(),
-                column_type: ty.name(),
+                column_type: ty.name().to_owned(),
                 expression_type: self.type_name(),
             })
         };
         match self {
-            Literal::Null => Ok(Datum::Null),
+            // A typed NULL assigns like an untyped one: the type was for resolution, and the
+            // value is nothing whatever column it lands in.
+            Literal::Null | Literal::TypedNull(_) => Ok(Datum::Null),
 
             // The `unknown` literal: whatever the column is, read it as that. This is one
             // function, checked against a real server for all six types, rather than six rules.

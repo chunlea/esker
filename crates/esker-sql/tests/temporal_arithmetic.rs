@@ -13,21 +13,21 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The **same dropped cast** as the `date + NULL::interval` entry below, showing as a type
-    // rather than as an error: `NULL::int4` is an untyped `Literal::Null`, so the rule that gives
-    // an untyped NULL the other side's type makes this `date - date`, whose answer is a count of
-    // days. The row is right — NULL either way — and the type a client is told is `integer` where
-    // PostgreSQL says `date`.
-    types: &["SELECT '2020-01-01'::date - NULL::int4"],
+    // `SELECT '2020-01-01'::date - NULL::int4` was here, declared as a type divergence: a dropped
+    // cast made it `date - date` and the client was told `integer` where PostgreSQL says `date`.
+    // `Literal::TypedNull` keeps the cast, so the operator resolves as `date - int4` and both the
+    // row and the type agree.
+    types: &[],
     answers: &[
         (
             "SELECT '2020-01-01'::date + 1.5",
             "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares. Both raise the same `42883` for the same reason: `date` has no arithmetic with either type. One word of the message differs and nothing else does.",
         ),
-        (
-            "SELECT '2020-01-01'::date + NULL::interval",
-            "**A cast on a NULL is dropped at lowering** — `NULL::interval` is a `Literal::Null` with no type, because until arithmetic arrived a NULL's type never mattered: every comparison with one is NULL whatever it was written as. So the untyped-NULL rule takes the other side's type and this resolves as `date + date`, which has no operator, where PostgreSQL resolves `date + interval` and answers a NULL `timestamp`. It is the one place in these three corpora where this node **raises where PostgreSQL returns a row**, and closing it means giving `Literal::Null` a type rather than anything arithmetic can do from inside.",
-        ),
+        // `SELECT '2020-01-01'::date + NULL::interval` was here — the one place in these three
+        // corpora where this node **raised where PostgreSQL returns a row**, because a dropped
+        // cast made `NULL::interval` an untyped NULL that took the other side's type and resolved
+        // as `date + date`. `Literal::TypedNull` is the type surface that closed it: the operator
+        // resolves as `date + interval` and the answer is a NULL `timestamp`.
         (
             "SELECT '1 day'::interval * 'Infinity'::float8",
             "**An interval has no infinity in this node.** PostgreSQL 17 gave the type one, so `'1 day' * 'Infinity'::float8` is `infinity` there; here an interval is three finite fields. Scaling by an infinite factor is **refused by name** rather than truncated to `00:00:00`, which is what it would otherwise answer — a wrong value where a refusal is available (ADR 0031).",

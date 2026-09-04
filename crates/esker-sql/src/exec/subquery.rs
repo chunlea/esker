@@ -216,6 +216,7 @@ pub(super) fn table_function_def(
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         }],
         primary_key: Vec::new(),
         indexes: Vec::new(),
@@ -234,6 +235,7 @@ pub(super) fn table_function_def(
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     })
 }
 
@@ -309,15 +311,15 @@ fn plan_derived(
         .columns
         .iter()
         .enumerate()
-        .map(|(at, (column, ty, typmod))| crate::catalog::ColumnDef {
+        .map(|(at, output)| crate::catalog::ColumnDef {
             // The alias replaces the name outright: after `AS t(a, b)`, `t.id` is `42703`.
             name: derived
                 .columns
                 .get(at)
                 .cloned()
-                .unwrap_or_else(|| column.clone()),
-            ty: *ty,
-            typmod: *typmod,
+                .unwrap_or_else(|| output.name.clone()),
+            ty: output.ty,
+            typmod: output.typmod,
             // Nothing is ever written into a derived table, so none of these can be read: a
             // `NOT NULL` is checked on insert and a default is applied on one.
             default_expr: None,
@@ -330,6 +332,7 @@ fn plan_derived(
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         })
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
@@ -358,6 +361,7 @@ fn plan_derived(
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     }));
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
     // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`
@@ -506,7 +510,7 @@ fn plan_one(
     sub.column = planned
         .columns
         .first()
-        .map(|(name, ty, _)| (name.clone(), *ty));
+        .map(|output| (output.name.clone(), output.ty));
     // Correlation is a fact about the **plan**, not a reading of the statement: a reference that
     // resolved to the sub-select's own scope after all is not one, which is exactly the shadowing
     // case (`WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = id)` is `b.a_id = b.id`).
@@ -1026,6 +1030,8 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
         Node::Columnar(columnar) => for_each_node_expr(&columnar.fallback, visit),
         Node::OneRow
         | Node::CatalogView { .. }
+        // A sequence's one row is a counter, not an expression.
+        | Node::SequenceRead { .. }
         | Node::SeqScan { .. }
         | Node::PointGet { .. }
         | Node::IndexLookup { .. } => {}
@@ -1108,6 +1114,8 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
         Node::Columnar(columnar) => for_each_node_expr_mut(&mut columnar.fallback, visit),
         Node::OneRow
         | Node::CatalogView { .. }
+        // A sequence's one row is a counter, not an expression.
+        | Node::SequenceRead { .. }
         | Node::SeqScan { .. }
         | Node::PointGet { .. }
         | Node::IndexLookup { .. } => {}

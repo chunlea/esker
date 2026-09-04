@@ -114,3 +114,44 @@ fn the_forward_cast_prints_its_oid_where_a_real_server_prints_the_name() {
         "what this node prints is the oid, which is what the value is"
     );
 }
+
+/// Resolving `::regclass` costs **one** catalog read per statement, not one per literal.
+///
+/// The debt `08ff6a2` named, and the reason it mattered: a catalog read is a scan of the name
+/// records plus a point read per relation, and `ActiveRecord`'s schema dump writes several
+/// `::regclass` casts in one statement against a catalog with hundreds of relations. On the node
+/// that was serving the Rails suite, one `SELECT 'people'::regclass` took **1.98 s** — the scan
+/// itself was walking the whole store, which `95dbd77` fixed; this is the multiplier that sat on
+/// top of it.
+///
+/// **Asserted as a ratio against a control**, the way `a_scan_costs_its_range_and_not_the_store`
+/// is: eight literals against one, over the same catalog. One read serves all eight, so the two
+/// statements cost the same; one read per literal makes the second eight times the first. Comparing
+/// them is what makes this a statement about the shape of the work rather than about this machine.
+#[test]
+fn one_catalog_read_serves_every_regclass_in_a_statement() {
+    let mut node = parity::Node::new(&[]);
+    for at in 0..200 {
+        node.run(&format!("CREATE TABLE rc{at} (id int8 PRIMARY KEY)"))
+            .unwrap();
+    }
+
+    let elapsed = |node: &mut parity::Node, sql: &str| {
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            node.run(sql).unwrap();
+        }
+        start.elapsed()
+    };
+    let one = elapsed(&mut node, "SELECT 'rc0'::regclass");
+    let eight = elapsed(
+        &mut node,
+        "SELECT 'rc0'::regclass, 'rc1'::regclass, 'rc2'::regclass, 'rc3'::regclass, \
+         'rc4'::regclass, 'rc5'::regclass, 'rc6'::regclass, 'rc7'::regclass",
+    );
+    assert!(
+        eight < one * 4 + std::time::Duration::from_millis(200),
+        "eight `::regclass` casts took {eight:?} where one took {one:?}: the catalog is being \
+         read once per literal rather than once per statement"
+    );
+}

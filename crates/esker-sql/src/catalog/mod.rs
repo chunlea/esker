@@ -47,7 +47,7 @@ pub mod pg_index;
 pub mod pg_relations;
 mod record;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::Txn;
@@ -178,6 +178,44 @@ pub struct ColumnDef {
     /// must show the tombstone (`ActiveRecord`'s own `column_definitions` filters on
     /// `NOT attisdropped`, so the row has to be there to be filtered).
     pub dropped: bool,
+    /// The oid of the **user-defined type** this column was declared as, or `None` for a column
+    /// declared as one of this node's own types.
+    ///
+    /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s shape, and the field
+    /// exists because [`ColumnType`] must not learn one. `ty` stays what the value physically
+    /// **is** — an enum label is stored as the `int2` of its position — and this is what it is
+    /// *called*, which is the half that needs a catalog to answer. Putting the oid in
+    /// `ColumnType` instead would give every exhaustive match over it an arm that cannot be
+    /// answered without a catalog lookup, in a crate (`esker-keys`) that must not have one:
+    /// invariant 7, and the reason option 1 of the ADR was not taken.
+    ///
+    /// It rides on the column for the same reason [`ColumnDef::comment`] does: a `DROP COLUMN`
+    /// takes it away and a `RENAME` keeps it, with no lifetime code to forget.
+    pub user_type: Option<u64>,
+}
+
+/// An enum's labels, in declaration order — which **is** its sort order.
+///
+/// The ordinal a row stores is the label's position **plus one**, matching
+/// `pg_enum.enumsortorder`, which starts at 1. Nothing depends on the offset except that it is the
+/// same in both directions, and matching the catalog column a client can read is worth more than
+/// saving the addition.
+#[must_use]
+pub fn enum_ordinal(labels: &[String], label: &str) -> Option<i16> {
+    let at = labels.iter().position(|known| known == label)?;
+    i16::try_from(at + 1).ok()
+}
+
+/// The label an ordinal names, or `None` for one no label has.
+///
+/// `None` is not reachable from a value this node wrote — an ordinal only ever comes from
+/// [`enum_ordinal`] — and it is what makes the never-reuse rule of ADR 0050 visible: a stored
+/// ordinal whose label has gone would land here, and the answer is nothing rather than a
+/// neighbouring label.
+#[must_use]
+pub fn enum_label(labels: &[String], ordinal: i16) -> Option<&str> {
+    let at = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+    labels.get(at).map(String::as_str)
 }
 
 /// What kind of `UNIQUE` constraint an index belongs to, when it belongs to one.
@@ -669,6 +707,71 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// counter would be a number in the output of `EXPLAIN` that changed with the statement around it.
 pub const DERIVED_TABLE_ID: u64 = u64::MAX - 1024;
 
+/// Where a **sequence read as a relation** carries its sequence id.
+///
+/// `SELECT last_value, is_called FROM s` is a three-column relation on a real server, and the
+/// relation is the sequence itself — there is no table behind it. So the synthetic `TableDef` the
+/// planner is given carries the sequence's id *in* its own, above every id a tenant can allocate,
+/// and `crate::exec::query` reads it back rather than seeking a key range that does not exist. The
+/// same trick `PRIMARY_KEY_OID_BASE` uses one catalog over.
+pub const SEQUENCE_RELATION_ID_BASE: u64 = u64::MAX - 1_048_576;
+
+/// The three columns PostgreSQL shows for a sequence, in its own order.
+///
+/// `log_cnt` is how many values are left in the WAL-logged batch on a real server — an
+/// implementation detail of *its* crash safety, which this node reaches differently — and it
+/// reports **0**, which is what a freshly written sequence shows there too.
+#[must_use]
+pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
+    let column = |name: &str, ty: ColumnType| ColumnDef {
+        name: name.to_owned(),
+        ty,
+        typmod: value::NO_TYPMOD,
+        not_null: false,
+        default_expr: None,
+        default: None,
+        missing: None,
+        generated: None,
+        comment: None,
+        user_type: None,
+        dropped: false,
+    };
+    Arc::new(TableDef {
+        id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
+        name: name.to_owned(),
+        columns: vec![
+            column("last_value", ColumnType::Int8),
+            column("log_cnt", ColumnType::Int8),
+            column("is_called", ColumnType::Bool),
+        ],
+        persistence: Persistence::Permanent,
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        primary_key_name: String::new(),
+        schema_version: 1,
+        sequences: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers_disabled: false,
+        parents: Vec::new(),
+        children: Vec::new(),
+        triggers: Vec::new(),
+        child_scans: Vec::new(),
+        excludes: Vec::new(),
+        partition_by: None,
+        partition_bound: None,
+        comment: None,
+        primary_key_comment: None,
+        enums: BTreeMap::new(),
+    })
+}
+
+/// The sequence a synthetic relation id names, or `None` for an ordinary table.
+#[must_use]
+pub fn sequence_of_relation(id: u64) -> Option<u64> {
+    id.checked_sub(SEQUENCE_RELATION_ID_BASE)
+}
+
 /// A user-defined type: what `CREATE TYPE` made, by name.
 ///
 /// **Its oid comes from the tenant's relation-id sequence**, the same counter tables and indexes
@@ -797,6 +900,21 @@ pub struct TableDef {
     ///
     /// In column order, which is the order the scan returns them in.
     pub sequences: Vec<SequenceDef>,
+    /// The user-defined types this table's columns were declared as, by oid.
+    ///
+    /// **Not part of the table record either**, and for the same reason [`TableDef::sequences`] is
+    /// not: the type is its own catalog record, keyed by name, and a column stores only its oid
+    /// ([`ColumnDef::user_type`], ADR 0050). Hydrating it where the table is loaded is what makes
+    /// every consumer able to answer without a catalog of its own — resolution has a `Scope`, and
+    /// a `Scope` holds `TableDef`s.
+    ///
+    /// **Only read when a column has one**, so a table of ordinary columns costs nothing: the
+    /// lookup is skipped entirely rather than fetching an empty map.
+    ///
+    /// This is what makes an enum's label a label. The row holds the `int2` of the label's
+    /// position — which is what gives it PostgreSQL's ordering — and the labels here are how it is
+    /// written back out and how a literal on the way in is read.
+    pub enums: BTreeMap<u64, TypeDef>,
     /// `CHECK` constraints, in the order `pg_constraint` lists them — by name.
     ///
     /// Each holds its predicate as **text**, not as a parsed tree, and is re-lowered when the
@@ -1477,6 +1595,13 @@ impl TableDef {
         if self.id == DERIVED_TABLE_ID {
             return None;
         }
+        // A **sequence** read as a relation, for the third time and the same reason: its one row
+        // is a counter rather than something stored, so there is no identity in column 0 — and
+        // hiding one dropped `last_value` from `SELECT * FROM <sequence>`, which is the same wrong
+        // answer the two above it gave before their lines existed.
+        if sequence_of_relation(self.id).is_some() {
+            return None;
+        }
         self.primary_key_name.is_empty().then_some(0)
     }
 
@@ -1849,13 +1974,10 @@ impl View<'_> {
             return Ok(None);
         };
         let mut table = record::decode_table(&bytes)?;
-        // The sequences are a second read, and this is the one place it happens: a `TableDef` in
-        // anybody's hands has them, so nothing above the catalog has to remember to ask.
-        table.sequences = table_sequences(self.txn, self.tenant, table_id)?;
-        // And the parents' — see `inherited_sequences` for why the record stays theirs.
-        let inherited = inherited_sequences(self.txn, self.tenant, &table, &table.parents.clone())?;
-        table.sequences.extend(inherited);
-        table.child_scans = child_scans(self.txn, self.tenant, &table)?;
+        // What the record does not hold is a second read, and [`hydrate`] is where all of it
+        // happens: a `TableDef` in anybody's hands has it, so nothing above the catalog has to
+        // remember to ask.
+        hydrate(self.txn, self.tenant, &mut table)?;
         let table = Arc::new(table);
         if let Some(cache) = cache {
             cache.lock().tables.insert(key, Arc::clone(&table));
@@ -1881,10 +2003,12 @@ impl View<'_> {
         if let Some(table) = self.table(name)? {
             return Ok(table);
         }
-        if matches!(self.relation(name)?, Some(Relation::Sequence { .. })) {
-            return Err(SqlError::unsupported(format!(
-                "reading a sequence as a relation, which is what \"{name}\" is"
-            )));
+        // **A sequence is a three-column relation**, which is what PostgreSQL shows for one, and
+        // the relation *is* the sequence — there is no table behind it. The def carries the
+        // sequence's id in its own so that the planner can read the counter rather than seek a key
+        // range that does not exist (`sequence_relation_def`).
+        if let Some(Relation::Sequence { sequence_id, .. }) = self.relation(name)? {
+            return Ok(sequence_relation_def(name, sequence_id));
         }
         Err(SqlError::UndefinedTable(name.to_owned()))
     }
@@ -1919,6 +2043,58 @@ pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Typ
         Some(bytes) => record::decode_type(name, &bytes).map(Some),
         None => Ok(None),
     }
+}
+
+/// Everything a `TableDef` carries that is **not** in its own record, read and attached here.
+///
+/// The sequences, the inherited sequences, the child scans and the user-defined types: four
+/// second reads, and the point of one function is that there are two places a table record is
+/// decoded — [`View::table_by_id`], which every statement goes through, and
+/// `pg_relations::table_of`, which the catalog views go through. They had drifted apart once
+/// already by the time this was written: `enums` was attached in the first and not the second, so
+/// `information_schema.columns` reported a column's storage where every other reader reported its
+/// type. **A field added to a `TableDef` outside its record belongs here and nowhere else.**
+pub(crate) fn hydrate(txn: &dyn Txn, tenant: u64, table: &mut TableDef) -> Result<()> {
+    table.sequences = table_sequences(txn, tenant, table.id)?;
+    // And the parents' — see `inherited_sequences` for why the record stays theirs.
+    let inherited = inherited_sequences(txn, tenant, table, &table.parents.clone())?;
+    table.sequences.extend(inherited);
+    table.child_scans = child_scans(txn, tenant, table)?;
+    table.enums = column_user_types(txn, tenant, table)?;
+    Ok(())
+}
+
+/// The user-defined types a table's columns were declared as, by oid.
+///
+/// **A table with no such column reads nothing**, which is every table until a `CREATE TABLE`
+/// names a `CREATE TYPE`. That guard is the whole cost story: this runs where a `TableDef` is
+/// loaded, which is the hottest catalog path there is.
+///
+/// A type is keyed by **name** and a column stores its **oid**, so this is a scan and not a point
+/// read — which is also what makes a `RENAME TYPE` free, since the oid a column holds does not
+/// move when the record does.
+fn column_user_types(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+) -> Result<BTreeMap<u64, TypeDef>> {
+    if table
+        .columns
+        .iter()
+        .all(|column| column.user_type.is_none())
+    {
+        return Ok(BTreeMap::new());
+    }
+    let wanted: BTreeSet<u64> = table
+        .columns
+        .iter()
+        .filter_map(|column| column.user_type)
+        .collect();
+    Ok(user_types(txn, tenant)?
+        .into_iter()
+        .filter(|def| wanted.contains(&def.oid))
+        .map(|def| (def.oid, def))
+        .collect())
 }
 
 /// Every user-defined type of one tenant, in name order — which is the order the key space returns
@@ -3019,12 +3195,13 @@ pub fn allocate_sequence_values(
 ) -> Result<i64> {
     let key = record::sequence_value_key(tenant, sequence_id);
     let next = match txn.get(&key)? {
-        Some(bytes) => record::decode_counter(&bytes)?,
+        Some(bytes) => record::decode_sequence_counter(&bytes)?.0,
         // A sequence starts at 1, which is PostgreSQL's `START WITH` default.
         None => 1,
     };
     let after = next.checked_add(count).ok_or(SqlError::BigintOutOfRange)?;
-    txn.put(&key, &record::encode_counter(after));
+    // Handing a value out is what `is_called` means, so it is true from here on whatever it was.
+    txn.put(&key, &record::encode_sequence_counter(after, true));
     i64::try_from(next).map_err(|_| SqlError::BigintOutOfRange)
 }
 
@@ -3034,11 +3211,38 @@ pub fn allocate_sequence_values(
 /// with `is_called` true stores 6 and `setval(s, 5, false)` stores 5. The caller does that sum,
 /// because it is the one place the two spellings differ and it belongs with the function that
 /// reads them.
-pub fn set_sequence_value(txn: &mut dyn Txn, tenant: u64, sequence_id: u64, next: u64) {
+pub fn set_sequence_value(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    sequence_id: u64,
+    next: u64,
+    is_called: bool,
+) {
     txn.put(
         &record::sequence_value_key(tenant, sequence_id),
-        &record::encode_counter(next),
+        &record::encode_sequence_counter(next, is_called),
     );
+}
+
+/// What `SELECT last_value, is_called FROM <sequence>` answers.
+///
+/// **`last_value` is not the counter**: the counter is the value that will be handed out *next*, so
+/// a sequence that has called reports the one before it and a sequence that has not reports the
+/// counter itself. That is the whole of the difference between `setval(s, 5, true)` and
+/// `setval(s, 5, false)` — the first reports 5 and hands out 6, the second reports 5 and hands out
+/// 5 — and it is why the flag is stored rather than derived.
+pub fn sequence_state(txn: &dyn Txn, tenant: u64, sequence_id: u64) -> Result<(i64, bool)> {
+    let key = record::sequence_value_key(tenant, sequence_id);
+    let (next, is_called) = match txn.get(&key)? {
+        Some(bytes) => record::decode_sequence_counter(&bytes)?,
+        None => (1, false),
+    };
+    let last = if is_called {
+        next.saturating_sub(1)
+    } else {
+        next
+    };
+    Ok((i64::try_from(last).unwrap_or(i64::MAX), is_called))
 }
 
 /// Reserves `count` consecutive row ids for one table and answers with the first.
@@ -3153,6 +3357,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     dropped: false,
+                    user_type: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -3165,6 +3370,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     dropped: false,
+                    user_type: None,
                 },
             ],
             primary_key: vec![0],
@@ -3194,6 +3400,7 @@ mod tests {
             child_scans: Vec::new(),
             partition_by: None,
             partition_bound: None,
+            enums: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3218,7 +3425,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",               // catalog format version
+                "19",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -3311,7 +3518,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",       // catalog format version
+                "19",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -3393,7 +3600,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",                 // catalog format version
+                "19",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -3477,6 +3684,12 @@ mod tests {
                 // (ADR 0051). A **count** of ordinals rather than a byte per column, so a table
                 // that never dropped one pays a single zero however wide it is.
                 "00",
+                // Version 25. One varint per column: the oid of the user-defined type it was
+                // declared as, and **0 for none**. An oid comes from the tenant's relation-id
+                // sequence, which starts above zero, so zero is free to mean "one of this node's
+                // own types" without a flag byte in front of it (ADR 0050).
+                "00", // `id` is an `int8`
+                "00", // `email` is a `text`
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -3940,6 +4153,7 @@ mod tests {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
         table.columns.push(ColumnDef {
             name: "c".into(),
@@ -3952,6 +4166,7 @@ mod tests {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
         table.columns.push(ColumnDef {
             name: "t".into(),
@@ -3964,6 +4179,7 @@ mod tests {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
         let back = record::decode_table(&record::encode_table(&table).unwrap()).unwrap();
         assert_eq!(back, table);
@@ -4577,6 +4793,7 @@ mod tests {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         });
         let (_, published) =
             record::decode_columnar(&record::encode_columnar(1, Some(&widened)).unwrap()).unwrap();
@@ -4623,7 +4840,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "18",               // catalog format version
+                "19",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

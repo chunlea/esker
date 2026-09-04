@@ -1,8 +1,10 @@
-# 0050 — A user-defined type is a value (DRAFT — not accepted)
+# 0050 — A user-defined type is a value
 
-Status: **draft, for the human to decide**. Written by `b4-types` at `3b1cd1a`; nothing in this
-ADR is implemented. `docs/adr/0049` and commit `43fe187` built the half that is: `CREATE TYPE` and
-`DROP TYPE` exist, a type is a catalog record keyed by name, and `pg_type` reports it.
+Status: accepted (phase 9, `b4-types`). Drafted at `3b1cd1a`, decided by the human on 2026-09-03:
+**option 3, enum first**, with all three of the questions below answered. `docs/adr/0049` and
+commit `43fe187` built the half that came first: `CREATE TYPE` and `DROP TYPE` exist, a type is a
+catalog record keyed by name, and `pg_type` reports it. This ADR is the other half — what a value
+of such a type *is* — and it is implemented in the order the decision sets, not all at once.
 
 ## Context
 
@@ -74,30 +76,49 @@ Ranges then need their own unit: this crate already has a range **value** (`crat
 `daterange`, `isempty`, `&&`), so a user-defined range is that machinery pointed at a subtype from
 the catalog — a bigger piece than the enum and the one 46 of the 51 tests want.
 
-## What I would decide, and what I want a human to decide
+## Decision
 
-I would take **option 3**, in three commits: enum values, then ranges over the existing range
-machinery, then composites (which need a `pg_class` row per type and are 4 tests).
+**Option 3, and the three questions are answered as follows.**
 
-The three questions I do not want to answer alone:
+1. **`user_type: Option<u64>` on `ColumnDef` is the shape**, not `ColumnType::User(oid)`. Invariant
+   7 decides it: `esker-keys` is byte-opaque and knows no catalog, and option 1 breaks that in
+   every exhaustive match at once — including `Datum::column_type()`, which would have to return an
+   oid it cannot name. A column's `ty` stays what the value physically *is*; the identity of the
+   user type rides beside it on the column, where the catalog is already in scope.
+2. **An enum is stored as its ordinal**, an `int2` holding the label's position, and rendered
+   through the catalog on the way out. Ordering, `=`, indexing and grouping all become the `int2`'s,
+   which is what PostgreSQL does internally too — `pg_enum.enumsortorder` is its sort key. The
+   objection is real and the rule that answers it is now part of this decision:
 
-1. **Is a `user_type` field on `ColumnDef` the right shape**, or does the project want
-   `ColumnType::User(oid)` and the layering change that comes with it? Option 2/3 keeps
-   `esker-keys` ignorant of the catalog, which is invariant 7; option 1 does not.
-2. **Is an enum stored as its ordinal acceptable**, given that the stored bytes then mean nothing
-   without the catalog — a `DROP TYPE` or a relabel would reinterpret existing rows? PostgreSQL has
-   the same property and solves it by never reusing an `enumsortorder`; this node would need the
-   same rule written down.
-3. **Is 46 tests worth a range value type at all**, or is the honest answer to keep
-   `CREATE TYPE … AS RANGE` catalog-only and leave the ranking row where it is? The tests are one
-   adapter file; the machinery is not small.
+   > **An enum's sort order is assigned once and never reused.** A label's ordinal is fixed when
+   > the label is created. Removing a label does not renumber the labels after it, and a new label
+   > never takes a retired label's number. This is PostgreSQL's own rule for `enumsortorder`, and
+   > it is what makes a stored ordinal safe: the bytes on disk mean the same thing for the life of
+   > the type. A statement that would break it — a relabel that renumbers, a `DROP TYPE` with rows
+   > still storing its ordinals — is refused, not silently reinterpreted.
 
-## Consequences if it is taken
+3. **Ranges are worth it, and they come after enums.** 46 of the 51 tests are the range file, so
+   the ranking row does not move until they land; but the enum is the smaller, self-contained piece
+   that proves `user_type` end to end, and doing it first means the range unit inherits a shape
+   that has already been through the codecs and the catalog. Composites stay **deferred**: they are
+   4 tests and they need a `pg_class` row per type, which is a different mechanism from either.
 
-- Catalog record version 23: `ColumnDef` gains `user_type: Option<u64>`, appended like every field
-  before it.
+The order is therefore: **enum values, then `daterange` and the range values over
+`crate::value::range`, then composites when something needs them.** `hstore` and `citext` — two
+extension types the suite also wants — are their own units and their own captures; they are not
+user-defined types and this ADR does not cover them.
+
+## Consequences
+
+- Catalog record version **24**: `ColumnDef` gains `user_type: Option<u64>`, appended like every
+  field before it. (The draft said 23; `a4e65b4` took 23 for `UNLOGGED` while this ADR was waiting,
+  which is the standing rule that a version is claimed at HEAD in the commit that uses it and not
+  reserved in advance.)
 - `pg_attribute.atttypid` reports the user type's oid, and `format_type` its name — both already
   read from the `ColumnDef`, so both follow.
-- The enum's `22P02 invalid input value for enum <name>: "<label>"` on a bad label, measured.
+- The enum's `22P02 invalid input value for enum <name>: "<label>"` on a bad label, measured —
+  `22P02`, the input-syntax class, and not `42704`.
+- An enum label's ordinal is `int2` and the label list may be **empty**: `CREATE TYPE e AS ENUM ()`
+  is legal, so a column of that type can hold nothing but NULL and every literal is `22P02`.
 - `DROP TYPE` with a dependent column becomes reachable, which is the `2BP01` the capture pins and
   `exec/typedef.rs` cannot raise today because no column can depend on a type.

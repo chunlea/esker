@@ -1,0 +1,145 @@
+# An **enum as a column value** — storing one, reading it back, and ordering by it — as a real
+# PostgreSQL 19beta1 answers it.
+#
+# ADR 0050 decided the shape: the label's **ordinal** is what is stored, `user_type` on the column
+# carries the type's identity, and the label is rendered through the catalog on the way out. This
+# capture is what that has to reproduce. It is `activerecord/test/cases/adapters/postgresql/
+# enum_test.rb`'s `setup` and the statements its 19 tests send, plus the ordering probes that are
+# the whole reason the ordinal is the storage.
+#
+# Captured in one session with `scratchpad/sesscap.py`, wrapped in `BEGIN … ROLLBACK`, error probes
+# in `SAVEPOINT` / `ROLLBACK TO`. The `SELECT count(*)` at the end proves it left nothing behind and
+# answers `0`. The `\gdesc` pass runs after the rollback, so a statement naming `mood` has an
+# **empty** declared-types column; `pg_typeof` is used as a *value* wherever the type matters.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Declaration order is sort order, and it is not the alphabet.** `mood` is
+#     `('sad','ok','happy')`, so `ORDER BY current_mood` gives `sad, ok, happy` and
+#     `'happy'::mood < 'ok'::mood` is **`f`** — happy is 3 and ok is 2. A node storing the label as
+#     text answers `happy, ok, sad` and `t`, and both look plausible in isolation. This is the one
+#     fact the whole unit exists for.
+#   * **`min` and `max` follow the ordinal too**: `sad` and `happy`, not the alphabetical
+#     `happy` and `sad`.
+#   * **NULLs sort last ascending and first descending**, as for any type — `ORDER BY x DESC` puts
+#     the NULL row first, which is easy to read as a bug in the enum ordering and is not.
+#   * **An enum does not compare with `text`.** `current_mood = 'sad'::text` is
+#     **`42883 operator does not exist: mood = text`** with the "add explicit type casts" HINT,
+#     while `current_mood::text = 'sad'` is `t` and the *unquoted* `current_mood = 'sad'` works —
+#     an `unknown` literal is coerced to the enum, a `text` one is not. Three spellings, three
+#     different resolutions.
+#   * **A bad label is `22P02 invalid input value for enum mood: "angry"`** — the input-syntax
+#     class, not `42704` and not a `CHECK` violation — and it is the *same* error from an `INSERT`,
+#     an `UPDATE` and a bare cast. The message names the type and quotes the label.
+#   * **`DROP TYPE` with a dependent column is `2BP01`**, and the DETAIL names *the column and its
+#     table* — `column current_mood of table postgresql_enums depends on type mood` — with the
+#     `DROP ... CASCADE` HINT.
+#   * **`ALTER TABLE … ADD COLUMN <enum> DEFAULT 'happy'` backfills every existing row**, and the
+#     default reads back from `pg_get_expr` and from `information_schema.columns.column_default`
+#     as **`'happy'::mood`** — the label quoted and cast, not the bare word.
+#   * **`information_schema.columns` reports `data_type = 'USER-DEFINED'` and `udt_name = 'mood'`**,
+#     which is exactly what `timestamp_test.rb:202` asserts; `format_type` says just `mood`.
+#   * **An empty enum is legal and so is a column of it.** `CREATE TYPE emptymood AS ENUM ()` then
+#     `CREATE TABLE e2 (c emptymood)` both succeed; the column can hold NULL and every literal is
+#     `22P02`.
+#   * **The five statements that name the type in an expression are in `SAVEPOINT`s** rather than run
+#     bare, and that is about *this* node rather than the oracle: PostgreSQL answers all four, and
+#     a cast **to** a user-defined type is not built here — so run bare, one `0A000` would abort the
+#     replay's transaction and take the thirty-seven statements after it, which are the bad-label
+#     probes, the `2BP01`, the default backfill, the index and the empty enum. A savepoint is what
+#     keeps a declared gap from hiding the rest of the file.
+#   * **`create_enum` does not send `CREATE TYPE`.** `ActiveRecord`'s helper sends a
+#     `DO $$ … IF NOT EXISTS … THEN CREATE TYPE … END IF … $$` block, captured at the end of this
+#     file. It is `0A000 DO` on this node, so `enum_test.rb`'s 19 tests stay blocked on the `DO`
+#     block whatever this unit does — the tests reachable by a bare `CREATE TYPE` are
+#     `timestamp_test.rb`'s, which uses raw `execute`.
+BEGIN		-
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TABLE postgresql_enums (id bigserial primary key, current_mood mood)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), t.typtype, t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'postgresql_enums'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint|b|int8 ; r|current_mood|mood|e|mood
+SELECT 'r', typname, typtype FROM pg_type WHERE typtype IN ('r','e','d') ORDER BY typname	text,name,"char"	r|cardinal_number|d ; r|character_data|d ; r|daterange|r ; r|int4range|r ; r|int8range|r ; r|mood|e ; r|numrange|r ; r|sql_identifier|d ; r|time_stamp|d ; r|tsrange|r ; r|tstzrange|r ; r|yes_or_no|d
+SELECT 'r', column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'postgresql_enums' ORDER BY ordinal_position	text,name,character varying,name	r|id|bigint|int8 ; r|current_mood|USER-DEFINED|mood
+INSERT INTO postgresql_enums (current_mood) VALUES ('sad')		-
+INSERT INTO postgresql_enums (current_mood) VALUES ('happy')		-
+INSERT INTO postgresql_enums (current_mood) VALUES ('ok')		-
+INSERT INTO postgresql_enums (current_mood) VALUES (NULL)		-
+SELECT 'r', id, current_mood FROM postgresql_enums ORDER BY id		r|1|sad ; r|2|happy ; r|3|ok ; r|4|\N
+SELECT 'r', pg_typeof(current_mood) FROM postgresql_enums ORDER BY id LIMIT 1		r|mood
+SELECT 'r', id, current_mood FROM postgresql_enums ORDER BY current_mood, id		r|1|sad ; r|3|ok ; r|2|happy ; r|4|\N
+SELECT 'r', id, current_mood FROM postgresql_enums ORDER BY current_mood DESC, id		r|4|\N ; r|2|happy ; r|3|ok ; r|1|sad
+SELECT 'r', id, current_mood FROM postgresql_enums ORDER BY current_mood NULLS FIRST, id		r|4|\N ; r|1|sad ; r|3|ok ; r|2|happy
+SELECT 'r', id FROM postgresql_enums WHERE current_mood = 'sad' ORDER BY id		r|1
+SELECT 'r', id FROM postgresql_enums WHERE current_mood <> 'sad' ORDER BY id		r|2 ; r|3
+SELECT 'r', id FROM postgresql_enums WHERE current_mood > 'sad' ORDER BY id		r|2 ; r|3
+SELECT 'r', id FROM postgresql_enums WHERE current_mood < 'happy' ORDER BY id		r|1 ; r|3
+SELECT 'r', id FROM postgresql_enums WHERE current_mood >= 'ok' ORDER BY id		r|2 ; r|3
+SELECT 'r', id FROM postgresql_enums WHERE current_mood IN ('sad','happy') ORDER BY id		r|1 ; r|2
+SELECT 'r', id FROM postgresql_enums WHERE current_mood IS NULL ORDER BY id		r|4
+SELECT 'r', min(current_mood), max(current_mood) FROM postgresql_enums		r|sad|happy
+SELECT 'r', count(current_mood), count(*) FROM postgresql_enums		r|3|4
+SELECT 'r', current_mood, count(*) FROM postgresql_enums GROUP BY current_mood ORDER BY current_mood		r|sad|1 ; r|ok|1 ; r|happy|1 ; r|\N|1
+SELECT DISTINCT current_mood FROM postgresql_enums ORDER BY current_mood		sad ; ok ; happy ; \N
+SAVEPOINT sc1		-
+SELECT 'r', 'happy'::mood, pg_typeof('happy'::mood)		r|happy|mood
+ROLLBACK TO SAVEPOINT sc1		-
+SAVEPOINT sc4		-
+SELECT 'r', current_mood::text, pg_typeof(current_mood::text) FROM postgresql_enums ORDER BY id LIMIT 1		r|sad|text
+ROLLBACK TO SAVEPOINT sc4		-
+SAVEPOINT sc2		-
+SELECT 'r', 'happy'::text::mood		r|happy
+ROLLBACK TO SAVEPOINT sc2		-
+SAVEPOINT s0		-
+SELECT 'r', current_mood = 'sad'::text FROM postgresql_enums ORDER BY id LIMIT 1	!42883 operator does not exist: mood = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s0		-
+SELECT 'r', current_mood::text = 'sad' FROM postgresql_enums ORDER BY id LIMIT 1		r|t
+SAVEPOINT sc3		-
+SELECT 'r', 'sad'::mood < 'happy'::mood, 'happy'::mood < 'ok'::mood		r|t|f
+ROLLBACK TO SAVEPOINT sc3		-
+SAVEPOINT sc5		-
+SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder		r|sad|1 ; r|ok|2 ; r|happy|3
+ROLLBACK TO SAVEPOINT sc5		-
+SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname	text,name,name,name[]	r|mood|public|{sad,ok,happy}
+SAVEPOINT s1		-
+INSERT INTO postgresql_enums (current_mood) VALUES ('angry')	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO SAVEPOINT s1		-
+SAVEPOINT s2		-
+SELECT 'angry'::mood	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO SAVEPOINT s2		-
+SAVEPOINT s3		-
+UPDATE postgresql_enums SET current_mood = 'angry' WHERE id = 1	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO SAVEPOINT s3		-
+SAVEPOINT s3a		-
+INSERT INTO postgresql_enums (current_mood) VALUES (1)	!42804 column "current_mood" is of type mood but expression is of type integer HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO SAVEPOINT s3a		-
+SAVEPOINT s3b		-
+UPDATE postgresql_enums SET current_mood = 1 WHERE id = 1	!42804 column "current_mood" is of type mood but expression is of type integer HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO SAVEPOINT s3b		-
+SAVEPOINT s3c		-
+SELECT 'r', id FROM postgresql_enums WHERE current_mood = 1	!42883 operator does not exist: mood = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO SAVEPOINT s3c		-
+SAVEPOINT s4		-
+DROP TYPE mood	!2BP01 cannot drop type mood because other objects depend on it DETAIL: column current_mood of table postgresql_enums depends on type mood HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO SAVEPOINT s4		-
+ALTER TABLE postgresql_enums ADD COLUMN good_mood mood DEFAULT 'happy'		-
+SELECT 'r', id, good_mood FROM postgresql_enums ORDER BY id		r|1|happy ; r|2|happy ; r|3|happy ; r|4|happy
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'postgresql_enums'::regclass AND a.attname = 'good_mood'		r|'happy'::mood
+SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name = 'postgresql_enums' AND column_name = 'good_mood'	text,name,character varying	r|good_mood|'happy'::mood
+CREATE INDEX ix_mood ON postgresql_enums (current_mood)		-
+SELECT 'r', id, current_mood FROM postgresql_enums WHERE current_mood = 'happy' ORDER BY id		r|2|happy
+CREATE UNIQUE INDEX ux_mood ON postgresql_enums (good_mood, id)		-
+CREATE TYPE emptymood AS ENUM ()		-
+CREATE TABLE e2 (c emptymood)		-
+SAVEPOINT s5		-
+INSERT INTO e2 (c) VALUES ('x')	!22P02 invalid input value for enum emptymood: "x"
+ROLLBACK TO SAVEPOINT s5		-
+INSERT INTO e2 (c) VALUES (NULL)		-
+SELECT 'r', c, count(*) FROM e2 GROUP BY c		r|\N|1
+SAVEPOINT s6		-
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = 'public') THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$		-
+ROLLBACK TO SAVEPOINT s6		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('mood','emptymood')	bigint	0

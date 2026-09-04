@@ -22,14 +22,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // builds its array as text: now that an array is a type it could build one, and that is the
     // slice after the constructor rather than part of storage.
     types: &[
-        // These three used to be listed below as refusals: a bare `VALUES` list was not a relation
+        // These two used to be listed below as refusals: a bare `VALUES` list was not a relation
         // and the statement could not run. It runs now and the **rows are right**; what is left is
         // that `array_agg` declares `text` whatever it collects, where a real server declares the
         // array type of its argument. That is the aggregate's result typing, not arrays, and it
-        // shows in `tests/array_subquery.rs` and `tests/values_relation.rs` too.
+        // shows in `tests/array_subquery.rs` and `tests/values_relation.rs` too. A third,
+        // `SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)`, left with `Literal::TypedNull`:
+        // the cast survives lowering, so the column is `integer` and the aggregate declares
+        // `integer[]` — one of ADR 0047's four.
         "SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)",
         "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
-        "SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)",
         "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
          typname IN ('_int4','_text') ORDER BY oid",
         "SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, '_int4'::regtype::oid, \

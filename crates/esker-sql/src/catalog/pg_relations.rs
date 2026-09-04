@@ -132,6 +132,13 @@ pub struct Relations {
     rows: Vec<RelationRow>,
     /// Every table, by id, so a view can reach its columns without a second read.
     tables: BTreeMap<u64, TableDef>,
+    /// The tenant's user-defined types, by oid.
+    ///
+    /// One more scan in the read that was happening anyway, so a catalog function can name a type
+    /// a column was declared as without a read of its own — `format_type(a.atttypid, …)` over an
+    /// enum column is per **row**, and a lookup per row is the mistake `d63e7d8` fixed for
+    /// `::regclass`. Empty for a tenant that has declared none, which is most of them.
+    user_types: BTreeMap<u64, super::TypeDef>,
 }
 
 impl Relations {
@@ -169,7 +176,31 @@ impl Relations {
             }
         }
         rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Relations { rows, tables })
+        let user_types = super::user_types(txn, tenant)?
+            .into_iter()
+            .map(|def| (def.oid, def))
+            .collect();
+        Ok(Relations {
+            rows,
+            tables,
+            user_types,
+        })
+    }
+
+    /// The name of the user-defined type with this oid, or `None`.
+    ///
+    /// **Asked only after the built-in types have been asked**, which is what keeps a user oid from
+    /// shadowing one of PostgreSQL's fixed numbers: a type this node already names keeps its name
+    /// whatever the tenant's id sequence has handed out.
+    #[must_use]
+    pub fn user_type_name(&self, oid: u64) -> Option<&str> {
+        self.user_types.get(&oid).map(|def| def.name.as_str())
+    }
+
+    /// The user-defined type with this oid, or `None`.
+    #[must_use]
+    pub fn user_type(&self, oid: u64) -> Option<&super::TypeDef> {
+        self.user_types.get(&oid)
     }
 
     /// Every relation, in name order.
@@ -365,11 +396,10 @@ fn load_table<'a>(
             )));
         };
         let mut table = super::record::decode_table(&bytes)?;
-        table.sequences = crate::catalog::table_sequences(txn, tenant, table_id)?;
-        let inherited =
-            crate::catalog::inherited_sequences(txn, tenant, &table, &table.parents.clone())?;
-        table.sequences.extend(inherited);
-        table.child_scans = crate::catalog::child_scans(txn, tenant, &table)?;
+        // The **same** hydration `View::table_by_id` does, through the same function. Spelled out
+        // here twice before, which is how `enums` came to be attached on one path and not the
+        // other — see [`crate::catalog::hydrate`].
+        crate::catalog::hydrate(txn, tenant, &mut table)?;
         slot.insert(table);
     }
     tables

@@ -908,19 +908,39 @@ impl Executor {
         // no transaction, so running them here is what puts their answers in the *same*
         // transaction at the *same* snapshot as the plan that reads them.
         subquery::resolve(&mut planned.node, &*txn, self.tenant)?;
+        // And a sequence read, which is the opposite case and in the same place: its value must
+        // come from **outside** this transaction, because a sequence is not transactional and a
+        // read through the statement's own snapshot would report the sequence as of `BEGIN`.
+        self.fill_sequence_reads(&mut planned.node)?;
         let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
             rows.push(
                 row.iter()
-                    .map(|value| value.to_text().map(String::into_bytes))
+                    .enumerate()
+                    .map(|(at, value)| {
+                        // **An enum leaves as its label.** The ordinal is what was ordered,
+                        // grouped and indexed by — all of that happened below this line — and the
+                        // label is what a client is told, which is the whole shape ADR 0050 chose.
+                        match planned.columns.get(at).and_then(|c| c.user_type.as_ref()) {
+                            Some(def) => assign::from_enum(value, def).to_text(),
+                            None => value.to_text(),
+                        }
+                        .map(String::into_bytes)
+                    })
                     .collect(),
             );
         }
         let fields = planned
             .columns
             .iter()
-            .map(|(name, ty, typmod)| FieldDescription::of(name.clone(), *ty, *typmod))
+            .map(|column| match &column.user_type {
+                Some(def) => FieldDescription::of_user_type(
+                    column.name.clone(),
+                    u32::try_from(def.oid).unwrap_or(0),
+                ),
+                None => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
+            })
             .collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
@@ -1085,12 +1105,34 @@ impl Executor {
             self.tenant,
             sequence_id,
             u64::try_from(next).unwrap_or(u64::MAX),
+            call.is_called,
         );
         txn.commit()?;
         // `currval` answers the value that was set, whether or not it was called -- measured.
         self.sequences.insert(sequence_id, (value + 1, value + 1));
         self.last_sequence = Some(sequence_id);
         Ok(value)
+    }
+
+    /// Takes each sequence read's value in a transaction of its own.
+    ///
+    /// **Not the statement's**, and that is the whole of it: `nextval` and `setval` commit outside
+    /// the block that calls them, so a sequence read through the block's snapshot answers the value
+    /// as of `BEGIN`. A real server reads the sequence itself, which is what this does.
+    fn fill_sequence_reads(&mut self, node: &mut crate::plan::Node) -> Result<()> {
+        let mut ids = Vec::new();
+        collect_sequence_reads(node, &mut ids);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let txn = self.backend.begin()?;
+        let mut states = std::collections::BTreeMap::new();
+        for id in ids {
+            states.insert(id, crate::catalog::sequence_state(&*txn, self.tenant, id)?);
+        }
+        let _ = txn.rollback();
+        fill_sequence_reads_in(node, &states);
+        Ok(())
     }
 
     /// Resolves the tables a `SELECT` names and plans against them.
@@ -1562,6 +1604,8 @@ impl Executor {
         use crate::plan::{CatalogFunc, Expr, Literal};
 
         let mut failure = None;
+        // One catalog snapshot for the whole statement; see `relation_oid`.
+        let mut relations = None;
         let mut resolve = |expr: &mut Expr| {
             let Expr::CatalogFunc(call) = expr else {
                 return;
@@ -1575,7 +1619,7 @@ impl Executor {
                 ));
                 return;
             };
-            match self.relation_oid(txn, name) {
+            match self.relation_oid(&mut relations, txn, name) {
                 Ok(oid) => *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(oid)))),
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -1594,7 +1638,12 @@ impl Executor {
     /// A `pg_catalog` view answers with its own reserved id, which is what makes
     /// `'pg_class'::regclass` a number rather than a refusal — a real server answers there too, and
     /// this node's `pg_class` really does hold `pg_class`'s columns.
-    fn relation_oid(&self, txn: &dyn Txn, name: &str) -> Result<i64> {
+    fn relation_oid(
+        &self,
+        relations: &mut Option<crate::catalog::pg_relations::Relations>,
+        txn: &dyn Txn,
+        name: &str,
+    ) -> Result<i64> {
         if let Some(view) = crate::catalog::pg_catalog::view(name) {
             return Ok(i64::try_from(view.table_def().id).unwrap_or(i64::MAX));
         }
@@ -1602,7 +1651,20 @@ impl Executor {
         // separator the parser would have produced — `'se_idx.t_i_idx'::regclass` is the index in
         // `se_idx`, and looking it up whole would find nothing.
         let stored = crate::catalog::parse_qualified(name);
-        crate::catalog::pg_relations::Relations::read(txn, self.tenant)?
+        // **Read once per statement, not once per literal.** The catalog scan is one pass over the
+        // name records plus a point read per relation, so a statement with three `::regclass` casts
+        // was three of those — and `ActiveRecord`'s schema dump writes several per statement
+        // against a catalog with hundreds of relations. It is a *snapshot*: every literal in one
+        // statement resolves against the same catalog, which is what a real server does too, and
+        // the statement has not written anything at this point because nothing has run yet.
+        let relations = match relations {
+            Some(relations) => relations,
+            slot => slot.insert(crate::catalog::pg_relations::Relations::read(
+                txn,
+                self.tenant,
+            )?),
+        };
+        relations
             .by_name(&stored)
             .map(|relation| relation.oid)
             .ok_or(SqlError::UndefinedTable(stored))
@@ -1759,6 +1821,32 @@ fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
     found
 }
 
+/// Every sequence a plan reads, so their values can be taken in one transaction.
+fn collect_sequence_reads(node: &mut crate::plan::Node, into: &mut Vec<u64>) {
+    if let crate::plan::Node::SequenceRead { sequence_id, .. } = node {
+        into.push(*sequence_id);
+    }
+    for child in node.children_mut() {
+        collect_sequence_reads(child, into);
+    }
+}
+
+/// Puts those values into the plan.
+fn fill_sequence_reads_in(
+    node: &mut crate::plan::Node,
+    states: &std::collections::BTreeMap<u64, (i64, bool)>,
+) {
+    if let crate::plan::Node::SequenceRead {
+        sequence_id, state, ..
+    } = node
+    {
+        *state = states.get(sequence_id).copied();
+    }
+    for child in node.children_mut() {
+        fill_sequence_reads_in(child, states);
+    }
+}
+
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the
 /// shape `psql` renders and users read.
 fn explain_lines(statement: &Statement) -> Vec<String> {
@@ -1872,10 +1960,10 @@ fn update_returning_fields(
 }
 
 /// A resolved target list as the wire describes it.
-fn described(columns: Vec<(String, ColumnType, i32)>) -> Vec<FieldDescription> {
+fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
     columns
         .into_iter()
-        .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
         .collect()
 }
 
@@ -1944,7 +2032,7 @@ impl Execute for Executor {
                 )?
                 .columns
                 .into_iter()
-                .map(|(name, ty, typmod)| FieldDescription::of(name, ty, typmod))
+                .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
                 .collect(),
             ),
             Statement::Explain(..) => Some(vec![FieldDescription::computed(

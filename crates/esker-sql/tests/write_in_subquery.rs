@@ -20,23 +20,14 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              this one and passes. It is in the capture because it is legal, not because it is \
              used",
         ),
-        (
-            "DELETE FROM vl_posts WHERE id IN (SELECT NULL::bigint)",
-            "**A typed NULL loses its type at lowering** — `NULL::anything` becomes \
-             `plan::Literal::Null`, which has none — so the subquery's column is `text` and the \
-             comparison is `42883 operator does not exist: bigint = text` where a real server \
-             matches nothing and deletes nothing. A refusal rather than a wrong answer, and the \
-             fix is a type surface change: `Literal` has no typed-NULL spelling and `Datum::Null` \
-             carries no type, so one of them has to learn one (ADR 0033's tier). The rule the \
-             corpus is pinning survives it — `NOT IN` over a NULL yields nothing either, the line \
-             below",
-        ),
-        (
-            "DELETE FROM vl_posts WHERE id NOT IN (SELECT NULL::bigint)",
-            "The same typed NULL, negated — see the line above. Both directions refuse here and \
-             both delete nothing there",
-        ),
-        // **The wake of the three above, not divergences of their own.** A capture is one
+        // **Two entries left here in the same round, from two lanes.** The `UPDATE … FROM` with
+        // a self-alias landed on `main` (`tests/update_from.rs`), and
+        // `DELETE FROM vl_posts WHERE id [NOT] IN (SELECT NULL::bigint)` stopped diverging here: a
+        // typed NULL lost its type at lowering, so the subquery's column was `text` and the
+        // comparison was `42883 operator does not exist: bigint = text` where a real server
+        // matches nothing and deletes nothing. `Literal::TypedNull` is the type surface change the
+        // entry asked for, and both directions now delete nothing here too.
+        // **The wake of the one above, not divergences of their own.** A capture is one
         // session in one transaction: a statement this node refuses is a row it did not write,
         // and every count after it is off by exactly that row. `tests/on_conflict.rs` declares a
         // follow-on line for the same reason. Each entry is deleted when the shape above it
@@ -49,7 +40,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "SELECT id, body FROM vl_comments ORDER BY id",
             "A follow-on of **the row constructor**, which is the one refusal left above it: the \
              `DELETE` removed the comment with `body = 'a'` there and none here, so this line \
-             answers with one row too many. The `UPDATE … FROM` two lines up landed \
+             answers with one row too many. The `UPDATE … FROM` this file used to declare landed \
              (`tests/update_from.rs`) and both sides set `body` to `joined`, which is why the \
              values agree and only the count does not",
         ),

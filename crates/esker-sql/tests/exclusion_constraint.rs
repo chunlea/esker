@@ -35,22 +35,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              exclusion it enforces and the refusal is raised where the constraint is read, before \
              any column type is in reach. Same outcome, different half of the sentence.",
         ),
-        // **`daterange` as a column type**, which is a type-surface unit and not this one.
-        (
-            "CREATE TABLE tec_btree (r daterange, CONSTRAINT tec_btree_x EXCLUDE USING btree (r \
-             WITH &&))",
-            "`0A000 the type daterange is not supported`: a range reaches this node as an \
-             *expression* (`daterange(a, b)`), and a stored range column is a type with a codec, \
-             an ordering and a columnar mapping of its own. The suite excludes on an expression \
-             precisely because that is what works without `btree_gist`, so nothing in the schema \
-             needs the column type — these three lines are the capture probing the edges.",
-        ),
-        (
-            "CREATE TABLE tec_plain (r daterange, CONSTRAINT tec_plain_x EXCLUDE (r WITH &&))",
-            "The same missing column type. The shape this line exists for — a bare `EXCLUDE` \
-             defaulting to btree and being refused — is proved by `tec_btree` above and by \
-             `an_exclude_without_using_gist_is_refused` below, which use no range column.",
-        ),
+        // **`daterange` as a column type** — still not built, and two of the three lines that
+        // declared it have gone anyway. ADR 0050's `user_type_name` moved the "no such type"
+        // refusal from *lowering* to the executor, because only the catalog can tell a user type
+        // from a typo, and that changed which of two errors a statement gets: `tec_btree` and
+        // `tec_plain` are refused for their **access method** now, before any type is resolved,
+        // which is the half of the sentence a real server sends. The ratchet found both; neither
+        // was looked for, and the deferral turns out to sit closer to PostgreSQL's own precedence
+        // than the eager refusal did. `tec_gist` below is the one still standing, because `gist`
+        // with `&&` is accepted and the column type is then the thing that is missing.
         (
             "CREATE TABLE tec_gist (r daterange, CONSTRAINT tec_gist_x EXCLUDE USING gist (r WITH \
              &&))",

@@ -164,6 +164,7 @@ fn columns_of<'a>(
                                 generated: None,
                                 comment: None,
                                 dropped: false,
+                                user_type: None,
                             }),
                             // No position in the table: there is no column under it, which is
                             // what `attnum = 0` says in `pg_index.indkey` for the same part.
@@ -202,6 +203,7 @@ fn columns_of<'a>(
                         generated: None,
                         comment: None,
                         dropped: false,
+                        user_type: None,
                     }),
                     None,
                 )]
@@ -258,10 +260,20 @@ fn attribute(
     } else {
         column.name.clone()
     };
+    // **A user-defined type's own oid**, not the oid of what the value physically is — and the
+    // tombstone's `0` wins over both, because a dropped column answers about itself. This is the
+    // column every client reads a type through: `format_type(a.atttypid, …)` prints `mood` rather
+    // than `smallint`, the `JOIN pg_type t ON a.atttypid = t.oid` that `columns()` writes finds
+    // `typtype = 'e'`, and `information_schema.columns` reports `USER-DEFINED` with `udt_name`
+    // `mood`. Answering `int2` here would tell a client the storage, which is the one thing about
+    // an enum it must not be told (ADR 0050).
     let type_oid = if column.dropped {
         0
     } else {
-        i64::from(column.ty.oid())
+        column.user_type.map_or_else(
+            || i64::from(column.ty.oid()),
+            |oid| i64::try_from(oid).unwrap_or(i64::MAX),
+        )
     };
     vec![
         Datum::Int8(relation.oid),
@@ -327,6 +339,24 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
     let value = column.default.as_ref()?;
     if matches!(value, Datum::Null) {
         return None;
+    }
+    // **A user-defined type's default prints as its label and its own cast**: `'happy'::mood`,
+    // not the `3` the row holds — measured on 19beta1 from both `pg_get_expr` and
+    // `information_schema.columns.column_default`, and `ActiveRecord`'s `column_defaults` reads
+    // exactly this string. The ordinal is storage and a client must never be shown it (ADR 0050).
+    if let Some(def) = column
+        .user_type
+        .and_then(|oid| table.enums.get(&oid))
+        .filter(|def| matches!(def.kind, super::TypeKind::Enum { .. }))
+    {
+        let super::TypeKind::Enum { labels } = &def.kind else {
+            return None;
+        };
+        let Datum::Int2(ordinal) = value else {
+            return None;
+        };
+        let label = super::enum_label(labels, *ordinal)?;
+        return Some(format!("'{label}'::{}", def.name));
     }
     Some(super::def_functions::constant_expression(value, column.ty))
 }

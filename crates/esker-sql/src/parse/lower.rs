@@ -1717,7 +1717,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
 
     for column in &create.columns {
         let column_name = ident(&column.name);
-        let (ty, typmod) = lower_type(&column.data_type)?;
+        let (ty, typmod, user_type_name) = lower_column_type(&column.data_type)?;
         let mut not_null = false;
         let mut default = None;
         let mut default_expr: Option<String> = None;
@@ -1801,6 +1801,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         columns.push(plan::Column {
             name: column_name,
             ty,
+            user_type_name,
             typmod,
             default_expr,
             not_null,
@@ -1942,7 +1943,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             column_position.is_some(),
             "ALTER TABLE ... ADD COLUMN at a position",
         )?;
-        let (ty, typmod) = lower_type(&column_def.data_type)?;
+        let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut default = None;
         for option in &column_def.options {
@@ -1959,6 +1960,15 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
                 // where a real server gives them values, which is a wrong answer rather than a
                 // gap. `CREATE TABLE` has no rows to rewrite and takes the same expression.
                 ColumnOption::Default(expr) => {
+                    // **A user-defined type's default is folded by the executor, not here.** The
+                    // column's `ty` is a placeholder until the catalog has been read, so folding
+                    // `'happy'` against it would read a label as a smallint; `text` keeps the
+                    // label as written and `exec::ddl` turns it into the ordinal (ADR 0050).
+                    let ty = if user_type_name.is_some() {
+                        ColumnType::Text
+                    } else {
+                        ty
+                    };
                     let (folded, unfolded) = column_default(expr, ty)?;
                     if let Some(unfolded) = unfolded {
                         return Err(SqlError::unsupported(format!(
@@ -2001,6 +2011,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
             column: plan::Column {
                 name: ident(&column_def.name),
                 ty,
+                user_type_name,
                 typmod,
                 // Always: an expression default is refused above, because this `ALTER` cannot
                 // rewrite the rows a real server would.
@@ -4002,10 +4013,19 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
 /// So the pair is recognised together. That is not a shortcut around a missing type — it is the
 /// one place where composing the two steps would have to allow a cast PostgreSQL forbids.
 fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
-    // `NULL::anything` is NULL, whatever the type — the cast tells a client what the column's type
-    // is and changes nothing about the value.
+    // **`NULL::bigint` is a NULL that knows it is a `bigint`.** The value is nothing either way;
+    // what the cast carries is the type, and everything downstream resolves against it — a
+    // subquery's column type, an operator's two sides, a `COALESCE`'s unification. Dropping it
+    // made `IN (SELECT NULL::bigint)` the `42883 bigint = text` an *untyped* NULL deserves, which
+    // is a refusal where a real server matches nothing.
+    //
+    // A type this node does not have keeps the old answer: an untyped NULL is still a NULL, and
+    // refusing `NULL::money` would refuse a statement whose value is not in question.
     if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
-        return Ok(plan::Expr::Literal(plan::Literal::Null));
+        return Ok(plan::Expr::Literal(match lower_type(data_type) {
+            Ok((ty, _)) => plan::Literal::TypedNull(ty),
+            Err(_) => plan::Literal::Null,
+        }));
     }
     if let Some(array) = lower_array_cast(expr, data_type)? {
         return Ok(array);
@@ -4066,8 +4086,9 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             None if matches!(lower_type(data_type), Ok((ColumnType::Text, _))) => {
                 Ok(plan::Expr::ToText {
                     operand: Box::new(lower_expr(expr)?),
-                    // Set at resolution, where the operand's type is known.
+                    // Both set at resolution, where the operand's type is known.
                     strip_blanks: false,
+                    enum_labels: None,
                 })
             }
             None => Err(SqlError::unsupported(format!("a cast to {data_type}"))),
@@ -5411,6 +5432,47 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// **A bare `character` is `character(1)`**, not "unlimited": measured on 19beta1, where
 /// `format_type` says `character(1)` and a second character is `22001`. That is the opposite of
 /// `character varying`, whose bare spelling means no limit at all.
+/// A **column's** declared type: one of this node's own, or the name of a user-defined one.
+///
+/// The two are told apart by the catalog and not here, which is the whole reason the third
+/// element exists. `sqlparser` gives every name it has no variant for as a `Custom`, so `mood`,
+/// `money` and `nosuchtype` arrive identically — the first is an enum a `CREATE TYPE` made, the
+/// second is a PostgreSQL type this node does not have, and the third is a typo. Lowering cannot
+/// separate them without reading the catalog, so it hands the name on and the executor answers:
+/// a type it finds becomes [`crate::catalog::ColumnDef::user_type`], and one it does not is the
+/// same `0A000 the type <name> is not supported` this function used to raise here.
+///
+/// **A modifier or a qualifier disqualifies it.** `mood(3)` is not a user type — no user type
+/// takes a typmod here — and `test_schema.mood` is a type in a schema, which is
+/// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
+/// the namespace lane's. Both keep the refusal `lower_type` gives them.
+fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<String>)> {
+    match lower_type(data_type) {
+        Ok((ty, typmod)) => Ok((ty, typmod, None)),
+        Err(error) => match data_type {
+            DataType::Custom(name, modifiers)
+                if modifiers.is_empty() && name.0.len() == 1 && !is_serial_spelling(data_type) =>
+            {
+                let Some(part) = name.0.first().and_then(|part| part.as_ident()) else {
+                    return Err(error);
+                };
+                // The type is unknown here and the placeholder says so: `Int2` is what an enum's
+                // ordinal is, and the executor replaces it for any other kind. Nothing reads it
+                // before then — a `CREATE TABLE` plan is executed, never evaluated.
+                Ok((ColumnType::Int2, NO_TYPMOD, Some(ident(part))))
+            }
+            _ => Err(error),
+        },
+    }
+}
+
+/// Whether a custom type name is one of the `serial` spellings, which are integers plus a sequence
+/// and never a user-defined type — a table with a column called `serial` would otherwise resolve
+/// against the catalog and get a worse error than the one [`lower_type`] already gives it.
+fn is_serial_spelling(data_type: &DataType) -> bool {
+    serial_identity(data_type).is_some()
+}
+
 fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     match data_type {

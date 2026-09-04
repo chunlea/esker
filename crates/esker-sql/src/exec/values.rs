@@ -50,6 +50,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
             generated: None,
             comment: None,
             dropped: false,
+            user_type: None,
         })
         .collect();
     Ok(Arc::new(TableDef {
@@ -75,6 +76,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
+        enums: std::collections::BTreeMap::new(),
     }))
 }
 
