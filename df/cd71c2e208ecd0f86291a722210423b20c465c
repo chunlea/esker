@@ -1,0 +1,16 @@
+docs/DESIGN.md
+  h_44076b318daf9c 154-156
+docs/adr/0041-the-in-house-arena-skiplist.md
+  h_44076b318daf9c 275-304,307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "dfcd71c2e208ecd0f86291a722210423b20c465c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
