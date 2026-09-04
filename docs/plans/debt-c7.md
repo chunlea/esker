@@ -484,7 +484,7 @@ ReclaimRange {
 | `txn.rs` header | the `0x02NN` table at the top | it currently stops at `0x0208` and is already missing `0x0209`; add both rows while there |
 | `txn.rs` | `TxnKvReq::routing_key` | **`start`**, like `Scan` — a reclaim is addressed to the range's first region and the store clamps to its own end, exactly as `Command::DeleteRange` already does |
 | `txn.rs` | request `encode`/`decode` | `put_bytes(start)`, `put_bytes(end)`, `put_varint(below_ts)` — length-prefixed, in that order |
-| `txn.rs` | response `encode`/`decode` | `put_bytes(cursor)`, `put_u8(finished as u8)`, `put_varint(safepoint)` |
+| `txn.rs` | response `encode`/`decode` | `put_bytes(cursor)`, **`put_bool(finished)`** — the codec has one, and it is the byte the golden row below pins — then `put_varint(safepoint)` |
 | `txn.rs` tests | `every_request_routes_by_a_key`, the method-order test | the order test asserts `0x0201 + index`, so the new variant goes **last** in that list |
 | `server.rs` | the `TxnKvReq` match arms at `:2852` and `:2922` | where `GcSafepoint` is answered; this is where `reclaim::advance` is called |
 | every crate matching on `TxnKvReq`/`TxnKvResp` | — | a new variant breaks matches in crates nobody edited; build the workspace, not the crate |
@@ -499,9 +499,12 @@ request  body   01 64            start:  len 1, 'd'
                 00               end:    len 0  (the end of the key space, not an absent field)
                 AC 02            below_ts: varint 300
 response body   01 66            cursor: len 1, 'f'
-                00               finished: 0
+                00               finished: put_bool(false)
                 AC 02            safepoint: varint 300
 ```
+
+Checked against the codec rather than remembered: `put_bytes` is `put_varint(len)` then the bytes,
+and `esker-base`'s own test asserts `encode(300) == [0xAC, 0x02]`.
 
 The empty `end` is the row worth having: it is a **length-prefixed empty string**, not an omitted
 field, for the same reason `meta.rs` gives about a region's `end_key` — absence and emptiness would
