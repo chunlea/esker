@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_49075263d2b3e7::t_fee03d2449d265 817-829
+docs/adr/0025-s3-transport-and-tls.md
+  s_49075263d2b3e7::t_492b448e7e79e5 122-153
+docs/adr/0055-the-tls-options-across-three-surfaces-measured.md
+  s_49075263d2b3e7::t_7acfa3c6fcdf53 3-8,324-330,336-366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "96138dff6ced1b9e5c6821c71012b348bc2b4ccd",
+  "prompts": {},
+  "sessions": {
+    "s_49075263d2b3e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd9cef8-2c46-436e-b6be-8b10cffcdbad",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
