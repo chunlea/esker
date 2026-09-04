@@ -102,6 +102,15 @@ pub enum Method {
     /// field added to `Pd::Status`, because that message's bytes are frozen by a golden and this
     /// is an addition rather than a change to what is already on the wire.
     PdMembers = 0x030c,
+    /// `Pd::MemberChange` — add or remove a placement driver, one step at a time
+    /// ([ADR 0060](../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    ///
+    /// **One step**, and the caller loops. Adding a member is three things — propose a learner,
+    /// wait for it to catch up, promote it — and a single call that did all three would hold a
+    /// request open across a catch-up that a snapshot may be part of, well past any sensible
+    /// deadline. So each call does what is missing and says whether more is needed, which is also
+    /// what makes an operator's retry after a `kill -9` a reconciliation rather than a mistake.
+    PdMemberChange = 0x030d,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
@@ -183,7 +192,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -205,6 +214,7 @@ impl Method {
         Self::PdScanRegions,
         Self::PdRaft,
         Self::PdMembers,
+        Self::PdMemberChange,
         Self::RaftBatch,
         Self::RaftSnapshot,
         Self::TxnGet,
@@ -253,6 +263,7 @@ impl Method {
             0x030a => Some(Self::PdScanRegions),
             0x030b => Some(Self::PdRaft),
             0x030c => Some(Self::PdMembers),
+            0x030d => Some(Self::PdMemberChange),
             0x0601 => Some(Self::FragmentEvaluate),
             0x0701 => Some(Self::SchemaFetch),
             0x0401 => Some(Self::RaftBatch),
@@ -312,6 +323,7 @@ impl Method {
             Self::PdScanRegions => "Pd::ScanRegions",
             Self::PdRaft => "Pd::Raft",
             Self::PdMembers => "Pd::Members",
+            Self::PdMemberChange => "Pd::MemberChange",
             Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::SchemaFetch => "Schema::Fetch",
             Self::PdSchemaLease => "Pd::SchemaLease",
@@ -1561,7 +1573,8 @@ mod tests {
                 | Method::PdStatus
                 | Method::PdScanRegions
                 | Method::PdRaft
-                | Method::PdMembers => crate::messages::SERVICE_PD,
+                | Method::PdMembers
+                | Method::PdMemberChange => crate::messages::SERVICE_PD,
                 Method::TxnGet
                 | Method::TxnScan
                 | Method::TxnPrewrite

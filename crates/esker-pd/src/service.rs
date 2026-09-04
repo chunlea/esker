@@ -283,6 +283,24 @@ fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
             PdResp::Raft
         }
         PdReq::Members => PdResp::Members(pd.membership()),
+        // **One step.** Adding a member is three things with a catch-up between them, and a call
+        // that did all three would hold a request open across a snapshot transfer, past any
+        // sensible deadline. Each call does what is missing; `done` says whether to call again
+        // ([ADR 0060](../../../docs/adr/0060-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        PdReq::MemberChange {
+            change,
+            id,
+            address,
+        } => {
+            let done = match change {
+                esker_proto::pd::MemberChange::Add => pd.add_member(*id, address)?,
+                esker_proto::pd::MemberChange::Remove => pd.remove_member(*id)?,
+            };
+            PdResp::MemberChange {
+                membership: pd.membership(),
+                done,
+            }
+        }
         PdReq::Status => {
             let (now_ms, operators) = pd.status()?;
             PdResp::Status { now_ms, operators }

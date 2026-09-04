@@ -131,7 +131,7 @@ growth is allowed, because the group id is now the stable thing it was not befor
   group id zero and an empty address book, which is exactly the state a pre-upgrade member is in.
   No golden file covers it — it is phase 15's own record, pinned by round-trip tests — and both new
   fields are appended, so the existing ones are byte-identical.
-- **`Method::PdMemberChange` (`0x030e`) joins the wire**, with its goldens. An addition: no existing
+- **`Method::PdMemberChange` (`0x030d`) joins the wire, beside `Pd::Members` (`0x030c`)**, with its goldens. An addition: no existing
   golden line moves.
 - **`MemberList::group_id()` means two things now**, and the type says which: the recorded id when
   the group has one, the derived id when it is being founded. A group that has never changed

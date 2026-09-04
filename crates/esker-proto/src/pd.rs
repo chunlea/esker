@@ -435,6 +435,43 @@ pub struct PdMemberInfo {
     pub address: String,
 }
 
+/// What `Pd::MemberChange` is asking for (*fixed*). Zero is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MemberChange {
+    /// Put this member in the group, or move it one step closer to being in it.
+    Add = 1,
+    /// Take it out.
+    Remove = 2,
+}
+
+impl MemberChange {
+    /// The wire byte.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The change for a byte, or `None` for one this version does not define.
+    #[must_use]
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Add),
+            2 => Some(Self::Remove),
+            _ => None,
+        }
+    }
+
+    /// What it is called in a message.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+        }
+    }
+}
+
 /// Who is in a placement driver's group, and which member leads.
 ///
 /// The answer to `Pd::Members`, and the one question **every** member answers — an operator asks
@@ -455,6 +492,43 @@ pub struct PdMembership {
     pub term: u64,
     /// Every member, by id.
     pub members: Vec<PdMemberInfo>,
+}
+
+/// A membership's bytes, shared by the two methods that answer with one.
+///
+/// One encoder, because two would be two places for a field to be added to.
+fn encode_membership(membership: &PdMembership, out: &mut Encoder) {
+    out.put_u64(membership.group_id);
+    out.put_varint(membership.this_id);
+    out.put_varint(membership.leader_id);
+    out.put_varint(membership.term);
+    out.put_varint(membership.members.len() as u64);
+    for member in &membership.members {
+        out.put_varint(member.id);
+        out.put_str(&member.address);
+    }
+}
+
+fn decode_membership(input: &mut Decoder<'_>) -> Result<PdMembership, DecodeError> {
+    let group_id = input.get_u64("members.group_id")?;
+    let this_id = input.get_varint("members.this_id")?;
+    let leader_id = input.get_varint("members.leader_id")?;
+    let term = input.get_varint("members.term")?;
+    let count = input.get_count("members.count")?;
+    let mut members = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        members.push(PdMemberInfo {
+            id: input.get_varint("members.id")?,
+            address: input.get_str("members.address")?.to_owned(),
+        });
+    }
+    Ok(PdMembership {
+        group_id,
+        this_id,
+        leader_id,
+        term,
+        members,
+    })
 }
 
 /// A tick's worth of Raft messages between two **placement drivers**.
@@ -576,6 +650,16 @@ pub enum PdReq {
     /// Who is in this placement driver's group, and which member leads.
     Members,
 
+    /// Add or remove a member, **one step**. Call again until the answer says it is done.
+    MemberChange {
+        /// Which way.
+        change: MemberChange,
+        /// The member.
+        id: u64,
+        /// Where it is. Read only when adding one that is not there yet; empty for a removal.
+        address: String,
+    },
+
     /// A tick's worth of this placement-driver group's own Raft messages.
     ///
     /// Not addressed to a cluster: it carries a [`PdRaftBatch::group_id`] instead, and the service
@@ -683,6 +767,7 @@ impl PdReq {
             Self::ScanRegions { .. } => Method::PdScanRegions,
             Self::Raft(_) => Method::PdRaft,
             Self::Members => Method::PdMembers,
+            Self::MemberChange { .. } => Method::PdMemberChange,
         }
     }
 
@@ -722,6 +807,15 @@ impl PdReq {
             Self::Tso { count } => out.put_varint(u64::from(*count)),
             // No fields, so nothing to write. The method is the whole request, for both of these.
             Self::Raft(batch) => batch.encode(out),
+            Self::MemberChange {
+                change,
+                id,
+                address,
+            } => {
+                out.put_u8(change.as_u8());
+                out.put_varint(*id);
+                out.put_str(address);
+            }
             Self::SchemaLease | Self::Status | Self::Members => {}
             Self::ScanRegions { start_key, limit } => {
                 out.put_bytes(start_key);
@@ -771,6 +865,16 @@ impl PdReq {
             Method::PdStatus => Self::Status,
             Method::PdRaft => Self::Raft(PdRaftBatch::decode(input)?),
             Method::PdMembers => Self::Members,
+            Method::PdMemberChange => {
+                let byte = input.get_u8("member_change.kind")?;
+                Self::MemberChange {
+                    change: MemberChange::from_u8(byte).ok_or_else(|| {
+                        DecodeError::invalid("member_change.kind", format!("kind {byte}"))
+                    })?,
+                    id: input.get_varint("member_change.id")?,
+                    address: input.get_str("member_change.address")?.to_owned(),
+                }
+            }
             Method::PdScanRegions => Self::ScanRegions {
                 start_key: Bytes::copy_from_slice(input.get_bytes("scan.start_key")?),
                 limit: input.get_varint_u32("scan.limit")?,
@@ -802,6 +906,14 @@ impl PdReq {
 pub enum PdResp {
     /// Who is in the group, and which member leads.
     Members(PdMembership),
+
+    /// One step of a membership change, taken.
+    MemberChange {
+        /// The group as it stands after it.
+        membership: PdMembership,
+        /// Whether there is nothing left to do. `false` means "call again".
+        done: bool,
+    },
 
     /// A batch of the group's Raft messages was stepped, or refused.
     ///
@@ -935,6 +1047,7 @@ impl PdResp {
             Self::ScanRegions { .. } => Method::PdScanRegions,
             Self::Raft => Method::PdRaft,
             Self::Members(_) => Method::PdMembers,
+            Self::MemberChange { .. } => Method::PdMemberChange,
         }
     }
 
@@ -988,17 +1101,11 @@ impl PdResp {
                     status.encode(out);
                 }
             }
-            Self::Members(membership) => {
-                out.put_u64(membership.group_id);
-                out.put_varint(membership.this_id);
-                out.put_varint(membership.leader_id);
-                out.put_varint(membership.term);
-                out.put_varint(membership.members.len() as u64);
-                for member in &membership.members {
-                    out.put_varint(member.id);
-                    out.put_str(&member.address);
-                }
+            Self::MemberChange { membership, done } => {
+                encode_membership(membership, out);
+                out.put_bool(*done);
             }
+            Self::Members(membership) => encode_membership(membership, out),
             Self::ScanRegions { regions, stores } => {
                 out.put_varint(regions.len() as u64);
                 for region in regions {
@@ -1049,27 +1156,11 @@ impl PdResp {
                 count: input.get_varint_u32("tso.count")?,
             },
             Method::PdRaft => Self::Raft,
-            Method::PdMembers => {
-                let group_id = input.get_u64("members.group_id")?;
-                let this_id = input.get_varint("members.this_id")?;
-                let leader_id = input.get_varint("members.leader_id")?;
-                let term = input.get_varint("members.term")?;
-                let count = input.get_count("members.count")?;
-                let mut members = Vec::with_capacity(count.min(16));
-                for _ in 0..count {
-                    members.push(PdMemberInfo {
-                        id: input.get_varint("members.id")?,
-                        address: input.get_str("members.address")?.to_owned(),
-                    });
-                }
-                Self::Members(PdMembership {
-                    group_id,
-                    this_id,
-                    leader_id,
-                    term,
-                    members,
-                })
-            }
+            Method::PdMemberChange => Self::MemberChange {
+                membership: decode_membership(input)?,
+                done: input.get_bool("member_change.done")?,
+            },
+            Method::PdMembers => Self::Members(decode_membership(input)?),
             Method::PdScanRegions => {
                 let count = input.get_count("scan.regions")?;
                 let mut regions = Vec::with_capacity(count);
