@@ -1047,15 +1047,25 @@ fn order_keys(
             // not the tables. `SELECT l.id, r.id, id FROM l JOIN r USING (id) ORDER BY id` is the
             // shape — the `id` in the list resolves fine and the three columns it produces do not.
             //
-            // The narrow half of PostgreSQL's rule: it also *prefers* an output column to an input
-            // one, which this does not do. Every case the corpus holds is covered by the
-            // ambiguity alone, and a preference nothing has measured would be invented.
+            // **And the other half: an output column is preferred to an input one.** This
+            // comment used to say that a preference nothing had measured would be invented — it
+            // is measured now, on 19beta1, and the two spellings differ:
+            //
+            // ```text
+            // SELECT m::text        FROM t ORDER BY m  -- sorts by the TEXT: m::text is named m
+            // SELECT m::text AS x   FROM t ORDER BY m  -- sorts by the enum, the input column
+            // ```
+            //
+            // Only a **bare** name is subject to it, and only when exactly one output column
+            // carries that name: two is the `42702` below, which is a different ambiguity from a
+            // column reference's — the target list is what is ambiguous, not the tables.
+            // `SELECT l.id, r.id, id FROM l JOIN r USING (id) ORDER BY id` is that shape.
             if let Expr::Column { table: None, name } = &item.expr
                 && columns.iter().filter(|output| &output.name == name).count() > 1
             {
                 return Err(SqlError::AmbiguousOrderBy(name.clone()));
             }
-            let resolved = resolve(&dealias(&item.expr, select), scope)?;
+            let resolved = resolve(&deshadow(&item.expr, select), scope)?;
             aggregate::check_not_nested(&resolved)?;
             match aggregation {
                 None => resolved,
@@ -2196,6 +2206,43 @@ pub(super) fn resolve_against_scope(expr: &Expr, scope: &Scope<'_>) -> Result<Ex
 }
 
 /// `ORDER BY x` where `x` is an output alias means the expression that alias names.
+/// [`dealias`], and then PostgreSQL's other half: an output column named by a **derived** name
+/// beats an input column of that name too.
+///
+/// Measured on 19beta1, and the two spellings differ by the alias alone:
+///
+/// ```text
+/// SELECT m::text      FROM t ORDER BY m   -- sorts by the TEXT: m::text is *named* m
+/// SELECT m::text AS x FROM t ORDER BY m   -- sorts by the enum, the input column
+/// ```
+///
+/// **Only a projection whose derived name is not its own column's** is substituted here, which is
+/// the whole of what differs: a target-list entry that *is* the bare column produces the same
+/// expression either way, so leaving it alone changes no answer and keeps every aggregated query
+/// on the path it was already taking — `SELECT g, count(*) … GROUP BY g ORDER BY g` resolves `g`
+/// as the grouping key, which is what the rewrite below expects to see.
+pub(super) fn deshadow(expr: &Expr, select: &Select) -> Expr {
+    let aliased = dealias(expr, select);
+    if aliased != *expr {
+        return aliased;
+    }
+    let Expr::Column { table: None, name } = expr else {
+        return aliased;
+    };
+    for item in &select.projection {
+        if let SelectItem::Expr {
+            expr: projected,
+            alias: None,
+        } = item
+            && !matches!(projected, Expr::Column { name: own, .. } if own == name)
+            && figure_column_name(projected) == *name
+        {
+            return projected.clone();
+        }
+    }
+    aliased
+}
+
 pub(super) fn dealias(expr: &Expr, select: &Select) -> Expr {
     let Expr::Column { table: None, name } = expr else {
         return expr.clone();
