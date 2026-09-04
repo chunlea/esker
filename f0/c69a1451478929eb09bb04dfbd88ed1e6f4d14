@@ -1,0 +1,41 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_2d916f5f540186::t_6ebf3d74230932 57
+crates/esker-sql/src/catalog/mod.rs
+  s_2d916f5f540186::t_514ba8138347db 871,1027,1037,3337
+crates/esker-sql/src/catalog/record.rs
+  s_2d916f5f540186::t_c932dfeaddf452 1804
+crates/esker-sql/src/exec/ddl.rs
+  s_2d916f5f540186::t_94c17ab2bf29c9 62,2762,2779
+crates/esker-sql/src/exec/mod.rs
+  s_2d916f5f540186::t_7f36aa6d85d70c 168,208
+crates/esker-sql/tests/corpus/pg19_temp_on_commit.txt
+  s_2d916f5f540186::t_1b3c4770d89b4f 1
+crates/esker-sql/tests/corpus/pg19_temp_table.txt
+  s_2d916f5f540186::t_6c86f0ac4a6789 1
+crates/esker-sql/tests/relation_resolution.rs
+  s_2d916f5f540186::t_6f5271be1e229f 99
+crates/esker-sql/tests/slt/unsupported.slt
+  s_2d916f5f540186::t_39589352f82170 48
+crates/esker-sql/tests/temp_table.rs
+  s_2d916f5f540186::t_ec1dae57eae716 2
+docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md
+  s_2d916f5f540186::t_6bc6dd0906dd38 1
+docs/plans/phase-9-rails.md
+  s_2d916f5f540186::t_e647b72e195f65 1320-1321,1583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f0c69a1451478929eb09bb04dfbd88ed1e6f4d14",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
