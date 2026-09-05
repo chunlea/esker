@@ -39,6 +39,15 @@ mod tests {
     fn values_of(ty: ColumnType) -> BoxedStrategy<Datum> {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
+            // Any oid with any name: the two are independent, which is what the round trip has to
+            // preserve — an oid that is no type carries its own digits, and two spellings of one
+            // type carry different names for one value.
+            ColumnType::RegType => (any::<u32>(), "[a-z ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegType {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             // Every `f64`, `NaN` included: the round trip is over the bits.
             ColumnType::Point => (any::<f64>(), any::<f64>())
@@ -70,6 +79,7 @@ mod tests {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
+            | ColumnType::RegTypeArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
@@ -306,6 +316,34 @@ mod tests {
         )
     }
 
+    /// [`schema_and_rows`] over the types that can actually be **index columns**.
+    ///
+    /// **The two key properties were asking about types that have no key.** `encode_key_column`
+    /// writes nothing for a `point`, a geometry or a `regtype` — they are not index keys and
+    /// `esker_keys::row::is_index_key` says so — so two distinct values of one produce the same
+    /// bytes, and `a_composite_key_compares_field_by_field` compares `Equal` against a `pg_cmp`
+    /// that said `Less`. It passed only because drawing two of those into one column was rare;
+    /// adding `regtype`, whose two values differ *only* in the parts the key does not write, made
+    /// it certain. The row codec still covers every type — that is `schema_and_rows` — and this is
+    /// the key half asking only what a key can answer.
+    fn key_schema_and_rows(
+        columns: std::ops::Range<usize>,
+        rows: usize,
+    ) -> impl Strategy<Value = (Vec<ColumnType>, Vec<Vec<Datum>>)> {
+        use proptest::prelude::*;
+        let every: Vec<ColumnType> = ColumnType::ALL
+            .into_iter()
+            .chain(ColumnType::USER_RANGES)
+            .filter(|ty| esker_keys::row::is_index_key(*ty))
+            .collect();
+        proptest::collection::vec(proptest::sample::select(every), columns).prop_flat_map(
+            move |types| {
+                let row: Vec<_> = types.iter().map(|ty| values_of(*ty)).collect();
+                (Just(types), proptest::collection::vec(row, rows..=rows))
+            },
+        )
+    }
+
     /// Two values PostgreSQL considers equal. Enumerated rather than filtered, because the
     /// interesting pairs are rare enough that a filter rejects almost everything.
     fn equal_pair() -> impl Strategy<Value = (Datum, Datum)> {
@@ -329,7 +367,7 @@ mod tests {
         /// Byte order is value order. This is the property the whole key encoding exists for: get
         /// it wrong and a range scan silently returns the wrong rows.
         #[test]
-        fn key_order_is_value_order((_types, rows) in schema_and_rows(1..2, 2)) {
+        fn key_order_is_value_order((_types, rows) in key_schema_and_rows(1..2, 2)) {
             let (left, right) = (&rows[0][0], &rows[1][0]);
             let key = |value: &Datum| index_key(1, 2, 3, std::slice::from_ref(value), None).unwrap();
             proptest::prop_assert_eq!(
@@ -343,7 +381,7 @@ mod tests {
         /// fixed-width or prefix-free -- the property `codec` provides and this one
         /// checks is still true once a NULL marker is in front of each field.
         #[test]
-        fn a_composite_key_compares_field_by_field((_types, rows) in schema_and_rows(1..4, 2)) {
+        fn a_composite_key_compares_field_by_field((_types, rows) in key_schema_and_rows(1..4, 2)) {
             let (left, right) = (&rows[0], &rows[1]);
             let expected = left
                 .iter()

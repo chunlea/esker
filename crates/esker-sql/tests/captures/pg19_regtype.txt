@@ -127,3 +127,36 @@ SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)	regtype
 SELECT format_type('integer'::regtype::oid, 4)	text	integer
 SELECT format_type(1043, 1028), format_type(1114, 6), format_type(1082, -1)	text,text,text	character varying(1024)|timestamp(6) without time zone|date
 SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN ('date','time','numeric','uuid','json','jsonb','interval') ORDER BY oid	oid,name,smallint,"char"	114|json|-1|U ; 1082|date|4|D ; 1083|time|8|D ; 1186|interval|16|T ; 1700|numeric|-1|N ; 2950|uuid|16|U ; 3802|jsonb|-1|U
+
+# ============================================================================================
+# **A second session, 2026-09-05**, taken for ADR 0077 — the same type, asked the questions the
+# first capture did not: how it *orders*, what it compares against, and what an oid that is no
+# type does. The lines above are unchanged and every citation into them still resolves.
+#
+# `r5` is the one that decides the model: `'text'::regtype < 'int4'::regtype` is **false**, because
+# it is `25 < 23` and not the names. A regtype orders by its oid.
+# ============================================================================================
+
+BEGIN;		-
+SELECT 'r1', 'integer'::regtype, 'int4'::regtype, 'character varying'::regtype, 'text'::regtype;		r1|integer|integer|character varying|text
+SELECT 'r2', 'integer'::regtype::oid, 'text'::regtype::oid, 'character varying'::regtype::oid;		r2|23|25|1043
+SELECT 'r3', pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid);		r3|regtype|oid
+SELECT 'r4', 23::regtype, 25::regtype, 1043::regtype;		r4|integer|text|character varying
+SELECT 'r5', 'text'::regtype = 25, 'text'::regtype = 'text'::regtype, 'text'::regtype < 'int4'::regtype;		r5|t|t|f
+SELECT 'r6', ARRAY['text'::regtype], pg_typeof(ARRAY['text'::regtype]);		r6|{text}|regtype[]
+SELECT 'r7', ARRAY['text'::regtype]::oidvector, pg_typeof(ARRAY['text'::regtype]::oidvector);		r7|25|oidvector
+SELECT 'r8', proargtypes, pg_typeof(proargtypes) FROM pg_proc WHERE proname='lower' ORDER BY oid;		r8|25|oidvector ; r8|3831|oidvector ; r8|4537|oidvector
+SELECT 'r9', proargtypes = ARRAY['text'::regtype]::oidvector FROM pg_proc WHERE proname='lower' ORDER BY oid;		r9|t ; r9|f ; r9|f
+SELECT 'r10', castsource, casttarget, pg_typeof(castsource) FROM pg_cast WHERE castsource='character varying'::regtype ORDER BY casttarget LIMIT 4;		r10|1043|18|oid ; r10|1043|19|oid ; r10|1043|25|oid ; r10|1043|142|oid
+SELECT 'r11', count(*) FROM pg_proc p INNER JOIN pg_cast c ON ARRAY[c.casttarget]::oidvector = p.proargtypes WHERE p.proname='lower' AND c.castsource='character varying'::regtype;		r11|1
+-- ------------------------------------------------- the probe itself, for three column types		-
+SELECT 'r12', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['character varying'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='character varying'::regtype);		r12|t
+SELECT 'r13', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['text'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='text'::regtype);		r13|t
+SELECT 'r14', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['integer'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='integer'::regtype);		r14|f
+-- ------------------------------------------------- a name that is not a type, and an oid that is not		-
+SAVEPOINT s1;		-
+SELECT 'r15', 'nosuchtype'::regtype;	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s1;		-
+SELECT 'r16', 999999::regtype;		r16|999999
+SELECT 'r17', 999999::regtype::text;		r17|999999
+ROLLBACK;		-
