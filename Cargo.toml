@@ -21,6 +21,18 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # `psm`, which compiles assembly through `cc`, and both are banned. esker-sql/src/parse/ owns
 # the stack-depth guard that feature would otherwise have provided.
 sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
+# --- the time-zone table, and only the table (docs/adr/0080-*.md, accepted 2026-09-05) ---
+# The IANA database as TZif bytes, with no dependencies of its own, no build script and no
+# `serde`. Three items and no more: `get(name) -> Option<(&str, &[u8])>`, `available()` and a
+# `VERSION` static naming the release, so an update is a version bump and `SHOW` can say which
+# tzdata this node carries.
+#
+# **The reader is not bought.** A zone name is a legislative history and nothing here can derive
+# it, which is why the table is a dependency; a TZif file is a magic, a version, six counts and
+# five arrays followed by a POSIX rule string, which is the shape CLAUDE.md puts on the in-house
+# list ("all on-disk and wire framing"). `tz-rs` would have parsed it and is one line away if the
+# footer proves harder than RFC 8536 reads.
+jiff-tzdb = { version = "0.1.8", default-features = false }
 # --- the TLS exception, behind a default-off feature (docs/adr/0055-*.md, accepted 2026-09-04) ---
 # Reached only through `esker-sql`'s `tls` feature, which is **off by default**, so the default
 # build's runtime graph is unchanged — `crates/esker-cli/tests/dep_budget.rs` is the proof and it

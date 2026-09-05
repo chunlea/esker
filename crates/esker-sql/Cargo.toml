@@ -24,6 +24,9 @@ esker-client.workspace = true
 # all already here (`docs/plans/phase-10-routing.md` §2).
 esker-columnar.workspace = true
 esker-keys.workspace = true
+# The IANA time-zone table, read by `value::zone` (ADR 0080). Data only: one crate, no
+# dependencies of its own, no build script.
+jiff-tzdb.workspace = true
 # The wire types the client's constructors take (`TransportConfig`). Already in this crate's
 # graph through esker-client; naming it here is what lets the binary build one.
 esker-proto.workspace = true

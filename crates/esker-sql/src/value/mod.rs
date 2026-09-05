@@ -67,6 +67,7 @@ pub mod uuid;
 /// Arrays as the catalog holds them: text, read by the operators (`vector::Array`).
 pub mod vector;
 pub mod xml;
+pub mod zone;
 
 use std::cmp::Ordering;
 
