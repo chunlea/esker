@@ -1245,76 +1245,76 @@ async fn announce_a_snapshot_and_await_the_retire(
     }
 
     let leader = first.store.peer_of(1).expect("the leader");
-    let Some(state) = second.store.regions().get(1) else {
+    if second.store.regions().get(1).is_none() {
         // No region to replace: the scenario is already past what it was going to observe.
         return;
-    };
+    }
 
-    // **Wait for the precondition, then announce.** The guard in `Store::receive_raft` is
-    // `!peer.is_leader() && peer.applied_index() < index`, and the index also has to be one the
-    // *sender* can serve — which is why the writes are here at all. So the loop below waits for a
-    // gap to exist and stops; it does not retry the scenario, and losing a round costs one more
-    // write rather than five seconds and a fresh announcement.
-    let behind_by = within(
-        "a gap between the learner's applied index and the leader's",
-        async {
-            loop {
-                let region = first.store.regions().regions()[0].clone();
-                for n in 40..60 {
-                    // **Both stores, because by here there are two voters.** `AddPeer` has
-                    // promoted peer 2, so the office can move while this loop runs, and a
-                    // one-store group cannot follow the redirect it is then given.
-                    put(&[&first.store, &second.store], &region, key(n), b"value").await;
-                }
-                let ahead = leader.applied_index();
-                if old.applied_index() < ahead {
-                    return ahead;
-                }
-            }
-        },
-    )
-    .await;
+    // **The announcement races the learner catching up, so it is retried rather than sent once.**
+    //
+    // `Store::receive_raft`'s held-region branch needs *both* halves of
+    // `!peer.is_leader() && peer.applied_index() < index`. The office is handled above. The other
+    // half closes on its own: the gap is measured, then the announcement is built and delivered,
+    // and in that window the learner applies more of the log. Under load it reaches the very
+    // index that was chosen, the branch is skipped, nothing retires, and a single-shot wait then
+    // spends its whole sixty seconds saying only that it was a wait with no end -- which is what
+    // this test did in four gates on 2026-09-04, including one that already carried the office
+    // fix (`docs/plans/debt-c7.md` section 17).
+    //
+    // So each round measures the gap afresh, names an index the learner has not reached at the
+    // moment of sending, and watches briefly before announcing again. Losing a round costs one
+    // more announcement instead of the whole deadline. The term is read once, above the loop:
+    // `status()` is an await, and an await between measuring the gap and sending is exactly the
+    // window that closes it.
+    let term = leader.status().await.unwrap().term;
+    let deadline = Instant::now() + AWAIT_DEADLINE;
+    let mut rounds = 0u32;
+    let mut announced = 0u32;
+    loop {
+        rounds += 1;
+        let region = first.store.regions().regions()[0].clone();
+        for n in 40..60 {
+            // **Both stores, because by here there are two voters.** `AddPeer` has promoted
+            // peer 2, so the office can move while this loop runs, and a one-store group cannot
+            // follow the redirect it is then given.
+            put(&[&first.store, &second.store], &region, key(n), b"value").await;
+        }
 
-    let announcement = esker_proto::RaftMessage::new(
-        1,
-        state.region().epoch,
-        1,
-        esker_raft::Message::InstallSnapshot {
-            from: 1,
-            to: 2,
-            term: leader.status().await.unwrap().term,
-            snapshot: esker_raft::Snapshot {
-                meta: esker_raft::SnapshotMeta {
-                    index: behind_by,
-                    term: 1,
-                    conf: esker_raft::ConfState::default(),
+        let ahead = leader.applied_index();
+        let applied = old.applied_index();
+        if applied < ahead
+            && let Some(state) = second.store.regions().get(1)
+            && !second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+        {
+            let announcement = esker_proto::RaftMessage::new(
+                1,
+                state.region().epoch,
+                1,
+                esker_raft::Message::InstallSnapshot {
+                    from: 1,
+                    to: 2,
+                    term,
+                    snapshot: esker_raft::Snapshot {
+                        meta: esker_raft::SnapshotMeta {
+                            index: ahead,
+                            term: 1,
+                            conf: esker_raft::ConfState::default(),
+                        },
+                        data: Bytes::new(),
+                    },
                 },
-                data: Bytes::new(),
-            },
-        },
-    );
-    // The premise again, at the instant it matters: an announcement aimed at a peer that leads
-    // is dropped by the guard rather than acted on, and the only sign of it would be the wait
-    // below expiring sixty seconds later with nothing to say.
-    assert!(
-        !second.store.peer_of(1).is_some_and(|peer| peer.is_leader()),
-        "the office moved to the peer this announcement is aimed at, so `receive_raft`'s \
-         held-region branch (`!peer.is_leader() && peer.applied_index() < index`) will ignore it"
-    );
+            );
+            second
+                .store
+                .receive_raft(esker_proto::RaftBatch::new(vec![announcement]))
+                .await
+                .expect("an announcement is accepted");
+            announced += 1;
 
-    second
-        .store
-        .receive_raft(esker_proto::RaftBatch::new(vec![announcement]))
-        .await
-        .expect("an announcement is accepted");
-
-    // Then the event itself, under the file's own wedge net rather than a budget of its own: the
-    // old peer is gone from the region **and** refuses a proposal, which is what "retired" means
-    // to anything that still holds a handle to it.
-    within(
-        "the old peer to be retired after a snapshot announcement above its applied index",
-        async {
-            loop {
+            // The event itself: the old peer is gone from the region **and** refuses a proposal,
+            // which is what "retired" means to anything still holding a handle to it. Watched
+            // briefly, then announced again rather than waited out.
+            for _ in 0..100 {
                 let replaced = second
                     .store
                     .peer_of(1)
@@ -1324,9 +1324,21 @@ async fn announce_a_snapshot_and_await_the_retire(
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        },
-    )
-    .await;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the old peer was not retired after {announced} announcement(s) in {rounds} rounds \
+             over {:?}. Last round: the leader had applied {}, the learner {} -- a gap of {}, and \
+             `receive_raft` retires only while the learner is behind the index announced. The \
+             learner is a leader: {}",
+            AWAIT_DEADLINE,
+            ahead,
+            applied,
+            i128::from(ahead) - i128::from(applied),
+            second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+        );
+    }
 }
 
 /// One region on store 1, a learner of it arrived on store 2, and the peer that holds it there.
