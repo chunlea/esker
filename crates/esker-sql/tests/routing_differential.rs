@@ -73,6 +73,92 @@ const QUERIES: &[&str] = &[
     "SELECT count(*), sum(amount) FROM t WHERE region = 'north'",
 ];
 
+/// Joins that **must** reach the columnar path once the join fragment lands.
+///
+/// Each is an aggregate over a fact table joined to a dimension on the dimension's **primary
+/// key**, which is what makes the semi-join rewrite exact: `Probe::PrimaryKey` means at most one
+/// inner row per outer row, so replacing the join with a membership test cannot change a count
+/// (`docs/plans/phase-16-mpp.md` §J3).
+const JOIN_QUERIES_THAT_MUST_ROUTE: &[&str] = &[
+    "SELECT count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1",
+    "SELECT count(*), sum(amount) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1 AND f.amount > 20",
+    "SELECT f.region, count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1 \
+     GROUP BY f.region ORDER BY f.region",
+    "SELECT count(*), min(amount), max(amount) FROM f JOIN d ON f.dk = d.k",
+];
+
+/// Joins that must **not** reach it, each failing a different one of §J3's conditions.
+///
+/// They are here for the same reason the routed ones are: over-routing is the failure this whole
+/// milestone has to avoid, and a rewrite that quietly answered one of these would return a wrong
+/// number rather than a slow one.
+const JOIN_QUERIES_THAT_MUST_REFUSE: &[(&str, &str)] = &[
+    (
+        "SELECT d.label, count(*) FROM f JOIN d ON f.dk = d.k GROUP BY d.label ORDER BY d.label",
+        "an inner column is grouped by, and a filter yields no dimension values",
+    ),
+    (
+        "SELECT count(*) FROM f LEFT JOIN d ON f.dk = d.k",
+        "a LEFT JOIN keeps unmatched outer rows, and a filter removes them",
+    ),
+    (
+        "SELECT count(*) FROM f JOIN d ON f.dk = d.bucket",
+        "the inner side is joined on a non-unique column, so one outer row may match many",
+    ),
+];
+
+/// **The join differential, red until the join fragment lands.**
+///
+/// `docs/plans/phase-16-mpp.md` §J8.1. Two assertions, and the second is the one that is red:
+/// every query agrees with the row engine (true today, trivially, because every one of them *is*
+/// the row engine), and every query in [`JOIN_QUERIES_THAT_MUST_ROUTE`] was actually answered by
+/// the columns (false today, because `exec::mod`'s guard excludes any select with joins).
+///
+/// The first assertion without the second is worth nothing: a query that fell back agrees with the
+/// row engine for free. That is ADR 0040 Decision 5's lesson — its bug surfaced as *"this query
+/// was not answered by the columns"* rather than as a wrong number — and it is why this test
+/// asserts its own denominator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_over_columnar_tables_answers_what_the_row_engine_answers() {
+    let gate = Gate::start().await;
+    gate.fill_join().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        for query in JOIN_QUERIES_THAT_MUST_ROUTE {
+            assert!(
+                compare(&gate, &mut session, query, " (join)"),
+                "`{query}` was not answered by the columns, so its agreement is free"
+            );
+        }
+    });
+
+    gate.stop().await;
+}
+
+/// The other half: a join the rewrite must not take, and does not.
+///
+/// Green today and green afterwards, which is the point — it is the guard that says the join
+/// fragment did not become a wrong answer while it was becoming a fast one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_the_rewrite_cannot_express_stays_on_the_rows() {
+    let gate = Gate::start().await;
+    gate.fill_join().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        for (query, why) in JOIN_QUERIES_THAT_MUST_REFUSE {
+            let answered_by_columns = compare(&gate, &mut session, query, " (refused join)");
+            assert!(
+                !answered_by_columns,
+                "`{query}` ran on the columns and must not have: {why}"
+            );
+        }
+    });
+
+    gate.stop().await;
+}
+
 /// **The differential.** Every query, both engines, one snapshot, and they agree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_routed_query_answers_what_the_row_engine_answers() {
@@ -428,6 +514,60 @@ impl Gate {
 
     /// The table, its rows, its columnar copy — and a wait on the **observable** that the copy can
     /// answer, never on a sleep.
+    /// A fact table with a columnar copy and a dimension keyed by its primary key.
+    ///
+    /// Six columns on the fact table so that a query projecting two passes the ratio
+    /// (`esker_sql::plan::routing::RATIO`), and a dimension whose `bucket` repeats — which is the
+    /// case a careless uniqueness argument gets wrong. The probe is on `d.k`, the primary key, so
+    /// each fact row matches at most one dimension row however many share a bucket.
+    ///
+    /// Some `dk` are NULL and some match no dimension row, because an inner join drops both and a
+    /// membership test must drop exactly the same ones.
+    async fn fill_join(&self) {
+        tokio::task::block_in_place(|| {
+            let mut session = self.session();
+            settle(
+                &mut session,
+                "CREATE TABLE f (id int8 PRIMARY KEY, dk int8, region text, amount int8, \
+                 rate double precision, note text)",
+            );
+            settle(
+                &mut session,
+                "CREATE TABLE d (k int8 PRIMARY KEY, bucket int8, label text)",
+            );
+            settle(&mut session, "ALTER TABLE f SET (columnar_replicas = 1)");
+            for k in 1..=4_i64 {
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO d VALUES ({k}, {}, 'label-{k}')", k % 2),
+                );
+            }
+            for id in 1..=12_i64 {
+                let region = if id % 3 == 0 { "north" } else { "south" };
+                // `dk` cycles 1..=4 over the dimension, then NULL, then 99 which matches nothing:
+                // an inner join drops the last two and so must the filter.
+                let dk = match id % 6 {
+                    4 => "NULL".to_owned(),
+                    5 => "99".to_owned(),
+                    other => (other + 1).to_string(),
+                };
+                let amount = if id % 4 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    (id * 7).to_string()
+                };
+                settle(
+                    &mut session,
+                    &format!(
+                        "INSERT INTO f VALUES ({id}, {dk}, '{region}', {amount}, {id}.0, 'n{id}')"
+                    ),
+                );
+            }
+        });
+
+        self.wait_for_a_learner_that_answers("f").await;
+    }
+
     async fn fill(&self) {
         tokio::task::block_in_place(|| {
             let mut session = self.session();
@@ -453,6 +593,15 @@ impl Gate {
             }
         });
 
+        self.wait_for_a_learner_that_answers("t").await;
+    }
+
+    /// Waits until a columnar learner is placed **and has answered a fragment over `table`**.
+    ///
+    /// Factored out of [`Gate::fill`] unchanged so a second fixture can use it. The observable is
+    /// an answer, not a placement: a learner that exists and has not caught up refuses, and a test
+    /// that started comparing then would be comparing the row engine with itself.
+    async fn wait_for_a_learner_that_answers(&self, table: &str) {
         wait_for("PD to place a columnar learner", 60, || {
             self.pd.regions().is_ok_and(|regions| {
                 regions.iter().any(|record| {
@@ -466,22 +615,22 @@ impl Gate {
         })
         .await;
 
-        // **The observable is an answer, not a placement.** A learner that exists and has not
-        // caught up refuses, and a test that started comparing then would be comparing the row
-        // engine with itself.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let answered = tokio::task::block_in_place(|| {
                 let mut session = self.session();
-                explain(&mut session, "EXPLAIN ANALYZE SELECT count(*) FROM t")
-                    .contains("Fragments: 1 asked, 1 answered")
+                explain(
+                    &mut session,
+                    &format!("EXPLAIN ANALYZE SELECT count(*) FROM {table}"),
+                )
+                .contains("Fragments: 1 asked, 1 answered")
             });
             if answered {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "the columnar learner never answered a fragment"
+                "the columnar learner never answered a fragment over {table}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

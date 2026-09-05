@@ -573,12 +573,42 @@ engine's, compared as a `Result` so an error is an answer too.
 * **The bound is a magic number** until a measurement moves it. It is recorded in one place with
   its reasoning, and the bench in test 5 is what will move it.
 
-## J10. One path question for the coordinator
+## J10. Where the differential stands, and what is actually deferred
 
-The cluster-level differential in §J8.1 belongs beside `crates/esker-sql/tests/routing_differential.rs`,
-which is the harness it models — and this lane's paths stop at `crates/esker-sql/src/exec/**`. A
-**new** file (`tests/routing_join_differential.rs`) conflicts with nobody, but it is outside what
-this lane was given. Asked rather than assumed. Until it is answered the red test lives as far in as
-it can reach — the rewrite's decision and the `In` evaluator have unit tests in `src/exec` and
-`esker-columnar` — and those cannot exercise a real cluster, which is where ADR 0022 says this
-defence has to stand.
+**Granted and taken:** the join differential lives in
+`crates/esker-sql/tests/routing_differential.rs`, extending the harness it models rather than
+copying four hundred lines of it. Two tests, and the first is red:
+
+```text
+test a_join_over_columnar_tables_answers_what_the_row_engine_answers ... FAILED
+     `SELECT count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1` was not answered by
+     the columns, so its agreement is free
+test a_join_the_rewrite_cannot_express_stays_on_the_rows ... ok
+```
+
+It fails at the **second** assertion, which is the one that matters: the answers already agree,
+trivially, because both are the row engine. What is missing is the routing. The second test — the
+three joins that must *never* route — passes today and must still pass afterwards; over-routing is
+the failure that returns a wrong number rather than a slow one.
+
+### The harness is more real than "in-process", and the record should say so
+
+This was handed over as an *"in-process harness [that] cannot exercise a real cluster"*. That
+undersells what is there, and the difference decides what is genuinely deferred.
+`routing_differential.rs` binds real `TcpListener`s on ephemeral ports, runs a real `esker-pd` and
+`STORES` real stores over real sockets, issues a real `ALTER TABLE … SET (columnar_replicas = 1)`,
+waits for PD to place a real `PeerRole::ColumnarLearner`, and waits again until that learner has
+**answered a fragment** — it even has `stop_the_learner` and a test that kills it mid-flight. Its
+own module docs say the one thing that is not separate is the OS process boundary.
+
+So what this join differential does exercise: a real columnar learner, placed by PD, answering real
+fragments over real sockets, compared against the row engine at one snapshot.
+
+What is **actually** deferred, named so nobody assumes it is covered:
+
+* **The multi-process form.** `esker bench-mpp` starts PD, stores and the SQL node as separate
+  processes; the join is measured there (§J8.5) rather than asserted there.
+* **Multi-region.** One region per table until the `split` lane lands, so one fragment. A semi-join
+  fragment to *each* region of the outer table, with the partials merged as they already are, needs
+  no new mechanism — which is a point in this design's favour and is still not built or tested here.
+* **A join whose outer table spans regions**, which is the same gate.
