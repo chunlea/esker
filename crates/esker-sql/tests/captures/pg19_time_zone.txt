@@ -1,0 +1,103 @@
+# **What a named time zone has to produce** — PostgreSQL 19beta1, 2026-09-05.
+#
+# Captured before any decision about where the zone table comes from
+# (`docs/adr/0079-the-time-zone-table-is-data-the-reader-is-ours.md`), because the shape of the
+# answers is what says how much of a TZif file has to be read. One `BEGIN … ROLLBACK`, a
+# `SAVEPOINT` around every probe.
+#
+# Today `SET TIME ZONE 'America/New_York'` is `0A000 the time zone "America/New_York"` on this
+# node: `crates/esker-sql/src/parameter.rs` refuses every zone that is not a spelling of UTC,
+# because a `timestamptz` is printed in UTC and nowhere else and a setting honoured in `SHOW` and
+# ignored in every row would be a setting that lies.
+#
+# ## The offset is not a constant, and four of these rows say so in four different ways
+#
+#     SET TIME ZONE 'America/New_York'
+#       '2020-01-01 00:00:00+00'  ->  2019-12-31 19:00:00-05      standard
+#       '2020-07-01 00:00:00+00'  ->  2020-06-30 20:00:00-04      daylight
+#       '2020-01-01 12:00:00'::timestamp -> 2020-01-01 12:00:00   a naive timestamp is untouched
+#     SET TIME ZONE 'Asia/Kathmandu'
+#       '2020-01-01 00:00:00+00'  ->  2020-01-01 05:45:00+05:45   a quarter-hour offset
+#     SET TIME ZONE 'Australia/Lord_Howe'
+#       '2020-01-01 00:00:00+00'  ->  2020-01-01 11:00:00+11      a half-hour DST step
+#     SET TIME ZONE 'Asia/Shanghai'
+#       '2020-01-01 00:00:00+00'  ->  2020-01-01 08:00:00+08
+#
+# **And an offset can carry seconds.** Before New York had a standard time at all it kept Local
+# Mean Time, and PostgreSQL prints it:
+#
+#     '1880-01-01 00:00:00+00'    ->  1879-12-31 19:03:58-04:56:02
+#
+# So the offset is a signed number of *seconds*, and the rendering of a `timestamptz` has to be
+# able to write `-04:56:02`. A reader that stored offsets in minutes would be wrong for every
+# instant before 1883.
+#
+# ## The transitions, from both sides
+#
+#     SET TIME ZONE 'America/New_York'
+#       '2020-03-08 06:59:59+00'  ->  2020-03-08 01:59:59-05
+#       '2020-03-08 07:00:00+00'  ->  2020-03-08 03:00:00-04     02:00-02:59 local never happens
+#       '2020-11-01 05:59:59+00'  ->  2020-11-01 01:59:59-04
+#       '2020-11-01 06:00:00+00'  ->  2020-11-01 01:00:00-05     01:00-01:59 local happens twice
+#
+# And the two local times that are not instants, converted with `AT TIME ZONE`:
+#
+#     '2020-03-08 02:30:00'::timestamp AT TIME ZONE 'America/New_York' -> 2020-03-08 03:30:00-04
+#     '2020-11-01 01:30:00'::timestamp AT TIME ZONE 'America/New_York' -> 2020-11-01 01:30:00-05
+#
+# A local time that does not exist is pushed **forward** by the gap; one that happens twice takes
+# the **second**, standard-time occurrence. Neither raises.
+#
+# ## Past the last transition in the file: the POSIX rule is not optional
+#
+#     SET TIME ZONE 'America/New_York'
+#       '2099-07-01 00:00:00+00'  ->  2099-06-30 20:00:00-04
+#       '2099-01-01 00:00:00+00'  ->  2098-12-31 19:00:00-05
+#
+# TZif tables stop in 2037 (or wherever the publisher stopped); everything after that comes from
+# the `TZ` footer string — `EST5EDT,M3.2.0,M11.1.0` — which is a rule with month/week/day
+# arithmetic in it, and is the half of the format that is a parser rather than a lookup.
+#
+# ## `AT TIME ZONE` changes the type, and which way depends on the operand
+#
+#     '2020-07-01 12:00:00'::timestamp   AT TIME ZONE 'America/New_York'
+#         -> 2020-07-01 16:00:00+00      timestamp with time zone
+#     '2020-07-01 12:00:00+00'::timestamptz AT TIME ZONE 'America/New_York'
+#         -> 2020-07-01 08:00:00         timestamp without time zone
+#
+# ## What the setting accepts, measured rather than assumed
+#
+#     SET TIME ZONE 'Nowhere/Notreal'   22023 invalid value for parameter "TimeZone": "Nowhere/Notreal"
+#     SET TIME ZONE 'EST'               22023 invalid value for parameter "TimeZone": "EST"
+#     SET TIME ZONE 'EST5EDT'           accepted; '2020-07-01 00:00:00+00' -> 2020-06-30 20:00:00-04
+#     SET TIME ZONE -5                  accepted; SHOW TimeZone -> <-05>+05
+#     SET TIME ZONE INTERVAL '-5:00' HOUR TO MINUTE   accepted; SHOW TimeZone -> <-05>+05
+#
+# **`EST` is refused and `EST5EDT` is not**, on this server, which is the row that would have been
+# got wrong by reasoning: the three-letter abbreviations are a separate table
+# (`pg_timezone_abbrevs`, 195 rows) from the zone names (`pg_timezone_names`, 487 rows), and only
+# the names are values for the setting. A numeric offset is accepted and read back as a POSIX `TZ`
+# string with the sign **inverted** — `-5` becomes `<-05>+05` — because POSIX writes the offset to
+# add to local time, not the one to add to UTC.
+#
+# ## The catalog
+#
+#     SELECT count(*) FROM pg_timezone_names     487
+#     SELECT count(*) FROM pg_timezone_abbrevs   195
+#     name              abbrev  utc_offset  is_dst
+#     America/New_York  EDT     -04:00:00   t          <- as of the moment of the query
+#     Asia/Kathmandu    +0545   05:45:00    f
+#     Asia/Shanghai     CST     08:00:00    f
+#     UTC               UTC     00:00:00    f
+#
+# `pg_timezone_names.abbrev` and `is_dst` are the zone's state **now**, not a constant of the zone.
+#
+# ## Where else the setting reaches
+#
+#     SET TIME ZONE 'America/New_York'
+#       '2020-07-01 00:00:00+00'::timestamptz::date       ->  2020-06-30    the date shifts
+#       '2020-07-01 00:00:00+00'::timestamptz::timestamp  ->  2020-06-30 20:00:00
+#       extract(hour FROM '2020-07-01 00:00:00+00'::timestamptz)  ->  20
+#
+# So the zone is not only a rendering: a cast to `date` and an `extract` both read it, which is
+# what makes `current_date` a different day either side of midnight local.

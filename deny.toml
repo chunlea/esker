@@ -21,7 +21,9 @@
 #
 #   * `dep_budget.rs` walks `resolve.nodes[].deps` without cross-referencing
 #     `resolve.nodes[].features`, so it counts optional dependencies that are never compiled. It
-#     reports 36 for the default set that `cargo tree -e normal` puts at 34.
+#     over-counts by three: measured again on 2026-09-05 it prints `33 of 37 allowed` where
+#     `cargo tree -e normal --workspace` puts the same graph at 30. (The figures first written here
+#     were 36 and 34; both moved as crates left, the gap did not.)
 #   * Worse, `rustls-webpki` *declares* an optional `ring` — unused, never built, and not in
 #     `cargo tree` or in cargo-deny's graph — which that same walk would report as a banned crate
 #     the moment the feature was measured. A false positive, in the one test whose job is to have
