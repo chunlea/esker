@@ -1,0 +1,273 @@
+crates/esker-sql/tests/activerecord_schema_dump.rs
+  s_609bbbdbf3c419::t_ef10a168c4a057 60,69
+crates/esker-sql/tests/add_column_not_null.rs
+  s_609bbbdbf3c419::t_a07e38fad4d07f 31
+crates/esker-sql/tests/advisory_lock.rs
+  s_609bbbdbf3c419::t_8f948c277f22d6 34,42,47,53,58,63,69,80,85
+crates/esker-sql/tests/aggregate_parity.rs
+  s_609bbbdbf3c419::t_5231e21b75a1e9 58,66,72,79,84-89,94,99,104,106-107,111,117
+crates/esker-sql/tests/aggregate_type.rs
+  s_609bbbdbf3c419::t_98380168a1ad0f 49,54,59,64,69,77,84,89,96,112
+crates/esker-sql/tests/alias.rs
+  s_609bbbdbf3c419::t_6f99af47eab0b3 42,47,53,58
+crates/esker-sql/tests/alter_column_type.rs
+  s_609bbbdbf3c419::t_f2248cd12e0b70 41
+crates/esker-sql/tests/alter_index.rs
+  s_609bbbdbf3c419::t_3ecbfe83a76364 41,48,55,61,72
+crates/esker-sql/tests/alter_type.rs
+  s_609bbbdbf3c419::t_0d55589b4d0a5f 51
+crates/esker-sql/tests/any.rs
+  s_609bbbdbf3c419::t_a691e764835338 34,40
+crates/esker-sql/tests/arithmetic.rs
+  s_609bbbdbf3c419::t_1c80e8eb317b29 36,41
+crates/esker-sql/tests/array.rs
+  s_609bbbdbf3c419::t_79cd4544d41b5c 42,47,52,57,62,67,72,77,82,87,92,97,102,107,112,117,122
+crates/esker-sql/tests/array_subquery.rs
+  s_609bbbdbf3c419::t_697c6d8dee2916 39,44,49,54,59
+crates/esker-sql/tests/array_type_map.rs
+  s_609bbbdbf3c419::t_7016f3146b80b4 62,68,75,84,95,102,108,120,131,137
+crates/esker-sql/tests/assignment_cast_date.rs
+  s_609bbbdbf3c419::t_11ab5ed1df4909 26,37,43,49,60,65,79
+crates/esker-sql/tests/between.rs
+  s_609bbbdbf3c419::t_4386e5ceefa7c9 33,38,47
+crates/esker-sql/tests/bind_harness/mod.rs
+  s_609bbbdbf3c419::t_6bf666d7e0e316 18-20,73,259-260,282,348
+crates/esker-sql/tests/bind_parameters.rs
+  s_609bbbdbf3c419::t_4aac4cd0e4c026 19,24,40
+crates/esker-sql/tests/bit_string.rs
+  s_609bbbdbf3c419::t_962e06bad31444 60,67,74,79,84
+crates/esker-sql/tests/boolean_argument.rs
+  s_609bbbdbf3c419::t_69a354a5401c3b 33
+crates/esker-sql/tests/case_expression.rs
+  s_609bbbdbf3c419::t_e9a7936917bcae 27,32
+crates/esker-sql/tests/catalog_vectors.rs
+  s_609bbbdbf3c419::t_25f0d97a9d04ff 38,48,63
+crates/esker-sql/tests/check_constraint.rs
+  s_609bbbdbf3c419::t_3ad4c354adf804 34,41
+crates/esker-sql/tests/citext.rs
+  s_609bbbdbf3c419::t_fbda75befecfe5 37,47,52,58,69
+crates/esker-sql/tests/coalesce.rs
+  s_609bbbdbf3c419::t_acc46ae5e2ea73 36,41,49,61,69,74
+crates/esker-sql/tests/comment.rs
+  s_609bbbdbf3c419::t_4f78cd2f258f6e 47,52
+crates/esker-sql/tests/concat.rs
+  s_609bbbdbf3c419::t_406afc342bcfab 29,38,46
+crates/esker-sql/tests/create_database_options.rs
+  s_609bbbdbf3c419::t_70b015069b90b6 30,42,51
+crates/esker-sql/tests/create_schema_elements.rs
+  s_609bbbdbf3c419::t_581f718f4e4814 38,47,53,64
+crates/esker-sql/tests/create_sequence.rs
+  s_609bbbdbf3c419::t_e5f1a89323e9b4 23,32,43
+crates/esker-sql/tests/create_type.rs
+  s_609bbbdbf3c419::t_1df343f0b207ba 28
+crates/esker-sql/tests/cte.rs
+  s_609bbbdbf3c419::t_5e954e14705541 53,59,66,71,76
+crates/esker-sql/tests/current_schemas.rs
+  s_609bbbdbf3c419::t_fb9b40b898b71f 43,48,56,61,67,73,79,84
+crates/esker-sql/tests/date.rs
+  s_609bbbdbf3c419::t_83cff6aefdd942 22,27,32,37,42,47-52,57,62,67,72,77
+crates/esker-sql/tests/default_expression.rs
+  s_609bbbdbf3c419::t_b35f29e173fc14 28,36,44,60
+crates/esker-sql/tests/default_now.rs
+  s_609bbbdbf3c419::t_150a1bfb5e23fc 36,43
+crates/esker-sql/tests/desc_index.rs
+  s_609bbbdbf3c419::t_bc80bfb8ca8171 25,30
+crates/esker-sql/tests/discard_all.rs
+  s_609bbbdbf3c419::t_f7b5cc67467ed2 38-48,53,59,64,69-74,88,95,105,117,126
+crates/esker-sql/tests/do_block.rs
+  s_609bbbdbf3c419::t_a4ed309660f5d2 48,53
+crates/esker-sql/tests/domain.rs
+  s_609bbbdbf3c419::t_2198fc51590086 42,54
+crates/esker-sql/tests/domain_schema.rs
+  s_609bbbdbf3c419::t_35e9cd3fc47158 42-44
+crates/esker-sql/tests/drop_constraint.rs
+  s_609bbbdbf3c419::t_422b4b9f78966e 36
+crates/esker-sql/tests/drop_extension.rs
+  s_609bbbdbf3c419::t_ced93bcda4fbe6 40,47,57
+crates/esker-sql/tests/drop_function.rs
+  s_609bbbdbf3c419::t_fc1937bd304db1 27,34
+crates/esker-sql/tests/enum_value.rs
+  s_609bbbdbf3c419::t_d68828f4afaa31 69,84,96,110,116,127,137,142,147
+crates/esker-sql/tests/exclusion_constraint.rs
+  s_609bbbdbf3c419::t_c84d5423d6d5c2 48
+crates/esker-sql/tests/expression_index.rs
+  s_609bbbdbf3c419::t_aefe97f3f50066 34,40,45
+crates/esker-sql/tests/extension_inherits.rs
+  s_609bbbdbf3c419::t_e657085e48e40c 38,43
+crates/esker-sql/tests/floatrange.rs
+  s_609bbbdbf3c419::t_e4ad585da63704 42,53,58,68,80
+crates/esker-sql/tests/function_language.rs
+  s_609bbbdbf3c419::t_62c6c0060e25dd 45,54
+crates/esker-sql/tests/generate_subscripts.rs
+  s_609bbbdbf3c419::t_4689a3c3d05e02 28,33,38
+crates/esker-sql/tests/geometric.rs
+  s_609bbbdbf3c419::t_e590bb226ed2bd 42
+crates/esker-sql/tests/hstore.rs
+  s_609bbbdbf3c419::t_aff2c701453c72 42
+crates/esker-sql/tests/in_list.rs
+  s_609bbbdbf3c419::t_f626a8026ba8e7 47,60
+crates/esker-sql/tests/include_index.rs
+  s_609bbbdbf3c419::t_8849c305a5144b 26,33,42,51,58
+crates/esker-sql/tests/inet.rs
+  s_609bbbdbf3c419::t_1f2df35209cfa7 45,51,57,66
+crates/esker-sql/tests/inherits.rs
+  s_609bbbdbf3c419::t_27d95bea8a8d2f 31,44
+crates/esker-sql/tests/inline_unique.rs
+  s_609bbbdbf3c419::t_e709f547de65d6 33,42,51
+crates/esker-sql/tests/insert_default_values.rs
+  s_609bbbdbf3c419::t_d80c0aa9f749c4 35
+crates/esker-sql/tests/int4.rs
+  s_609bbbdbf3c419::t_96c43560ec5d6c 33
+crates/esker-sql/tests/integer_plus_text.rs
+  s_609bbbdbf3c419::t_a21d83bcbc2b9a 43,60,65,70-75,81,91
+crates/esker-sql/tests/interval.rs
+  s_609bbbdbf3c419::t_2b22ff3ce5bcf7 76,82-92,98,103,108,113-123,125-146,150,155-160,166,171,177,182-192,198
+crates/esker-sql/tests/join_chain.rs
+  s_609bbbdbf3c419::t_8585b9bbbe4b52 31
+crates/esker-sql/tests/json.rs
+  s_609bbbdbf3c419::t_d8b684d7ea897c 103,108,114-139,144-149,154,159-164,170,175,180,185,190,196,201-216,222,228,233-238,244-249,255,261,267,272,277,282,287,292,294,298
+crates/esker-sql/tests/lateral.rs
+  s_609bbbdbf3c419::t_45e61b2af6b08d 30,40
+crates/esker-sql/tests/like.rs
+  s_609bbbdbf3c419::t_95687bfc365d9e 20
+crates/esker-sql/tests/lower_upper.rs
+  s_609bbbdbf3c419::t_12706d56a9c084 42
+crates/esker-sql/tests/ltree.rs
+  s_609bbbdbf3c419::t_71bb4569147b5b 42,47
+crates/esker-sql/tests/money.rs
+  s_609bbbdbf3c419::t_ce8ec62ae35d8a 48,53,58
+crates/esker-sql/tests/numeric.rs
+  s_609bbbdbf3c419::t_aa473fe5ba46b8 50,55,60,65,70,75,80,85,90,95,100,105,115
+crates/esker-sql/tests/numeric_arithmetic.rs
+  s_609bbbdbf3c419::t_4afa351e5b2686 22,27,32,37,42,47,52,57
+crates/esker-sql/tests/on_conflict.rs
+  s_609bbbdbf3c419::t_68ba9724ea7ae1 26,32
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_609bbbdbf3c419::t_7e9295a5435f1b 33-35,248,477-479,505,619
+crates/esker-sql/tests/partition.rs
+  s_609bbbdbf3c419::t_cf184d0c64eafb 32,45,54,61
+crates/esker-sql/tests/partition_suite.rs
+  s_609bbbdbf3c419::t_e50ad8a9630a86 67
+crates/esker-sql/tests/pg_available_extensions.rs
+  s_609bbbdbf3c419::t_04d150ba3c2a0f 38,49,60,68
+crates/esker-sql/tests/pg_catalog.rs
+  s_609bbbdbf3c419::t_e4b322da57f575 85,91,101,110,115
+crates/esker-sql/tests/pg_catalog_attribute.rs
+  s_609bbbdbf3c419::t_7069ff4c0cedcd 56,61,69
+crates/esker-sql/tests/pg_catalog_constraint.rs
+  s_609bbbdbf3c419::t_2c86416c5fd40b 54,60,72,78
+crates/esker-sql/tests/pg_catalog_format_type.rs
+  s_609bbbdbf3c419::t_769e61f2992652 43
+crates/esker-sql/tests/pg_catalog_index.rs
+  s_609bbbdbf3c419::t_5080d51dbc9a4a 42,49
+crates/esker-sql/tests/pg_catalog_information.rs
+  s_609bbbdbf3c419::t_04a3b2b9e59095 55,61,71,83,88,93,100
+crates/esker-sql/tests/pg_catalog_namespace.rs
+  s_609bbbdbf3c419::t_7cd659efae8c03 65,77,92,106,116
+crates/esker-sql/tests/pg_trgm.rs
+  s_609bbbdbf3c419::t_9a8ab234fb0754 46,58,63,73
+crates/esker-sql/tests/point.rs
+  s_609bbbdbf3c419::t_c0eedb53710bbb 47,56
+crates/esker-sql/tests/provenance/mod.rs
+  s_609bbbdbf3c419::t_472cf92a3deef2 1-85
+crates/esker-sql/tests/provenance_budget.rs
+  s_609bbbdbf3c419::t_751497b1bc362f 1-69
+crates/esker-sql/tests/qualified_type.rs
+  s_609bbbdbf3c419::t_709f5d4d578a8d 42,52
+crates/esker-sql/tests/real.rs
+  s_609bbbdbf3c419::t_67690fdab00a5f 33
+crates/esker-sql/tests/regex_match.rs
+  s_609bbbdbf3c419::t_83c184d19d2145 25,33,41
+crates/esker-sql/tests/regtype.rs
+  s_609bbbdbf3c419::t_bdb19e2670d75c 100,106-116,121,127,132,138,144-154,156,162,170,175,184
+crates/esker-sql/tests/regtype_user.rs
+  s_609bbbdbf3c419::t_80bd921fac1c6c 28,36
+crates/esker-sql/tests/relation_resolution.rs
+  s_609bbbdbf3c419::t_b4820fa4e80ceb 58,67,81
+crates/esker-sql/tests/rename_column.rs
+  s_609bbbdbf3c419::t_c7d1478bcda2e0 32,44,57
+crates/esker-sql/tests/row_locking.rs
+  s_609bbbdbf3c419::t_186c24cdce13e1 41,51
+crates/esker-sql/tests/scalar_functions.rs
+  s_609bbbdbf3c419::t_aeaf220d7b8edb 26,31,36,41,46,51,56
+crates/esker-sql/tests/schema_namespace.rs
+  s_609bbbdbf3c419::t_6a1a530de4ee49 44,51
+crates/esker-sql/tests/search_path.rs
+  s_609bbbdbf3c419::t_c42505b5b7a497 30
+crates/esker-sql/tests/sequence.rs
+  s_609bbbdbf3c419::t_e4ccd81cd2be48 22,37
+crates/esker-sql/tests/serial_name.rs
+  s_609bbbdbf3c419::t_a5a04db1b57747 61
+crates/esker-sql/tests/set_parameters.rs
+  s_609bbbdbf3c419::t_450000028e3d65 35,45
+crates/esker-sql/tests/set_session.rs
+  s_609bbbdbf3c419::t_538571b596e369 32,40,49,60,68
+crates/esker-sql/tests/srf_target_list.rs
+  s_609bbbdbf3c419::t_4c016e4b611cba 43
+crates/esker-sql/tests/subquery.rs
+  s_609bbbdbf3c419::t_23def062df1afb 79
+crates/esker-sql/tests/temp_table.rs
+  s_609bbbdbf3c419::t_8baf78e224963b 48
+crates/esker-sql/tests/temporal_arithmetic.rs
+  s_609bbbdbf3c419::t_5507dd6ee36029 25,35
+crates/esker-sql/tests/time.rs
+  s_609bbbdbf3c419::t_a10aa189d98630 84,86-92,98,107,112-127,136,141-151,160,166,171
+crates/esker-sql/tests/to_text.rs
+  s_609bbbdbf3c419::t_a37eb593f2a8ae 23
+crates/esker-sql/tests/trigger_function.rs
+  s_609bbbdbf3c419::t_0ea8b72e408f68 39
+crates/esker-sql/tests/tsrange.rs
+  s_609bbbdbf3c419::t_f504eea624755f 46,59,64,71,80,92,102,114,119
+crates/esker-sql/tests/tsvector.rs
+  s_609bbbdbf3c419::t_9bf4bd9df96e28 79,88,99,105
+crates/esker-sql/tests/two_database_dogs.rs
+  s_609bbbdbf3c419::t_bd0bdf925e2663 36
+crates/esker-sql/tests/typmod.rs
+  s_609bbbdbf3c419::t_e7a828904bfc3b 31
+crates/esker-sql/tests/unique_constraint.rs
+  s_609bbbdbf3c419::t_29aba0e59c4234 44
+crates/esker-sql/tests/unique_over_existing_rows.rs
+  s_609bbbdbf3c419::t_ca192ba5fc25e3 28
+crates/esker-sql/tests/unknown_literal.rs
+  s_609bbbdbf3c419::t_65f56c19c5fe65 62,68,75,80,85,91,97,104,111,118,124,135,140,151,157,174,176,185
+crates/esker-sql/tests/unlogged_table.rs
+  s_609bbbdbf3c419::t_08a66224298172 46,52
+crates/esker-sql/tests/update_from.rs
+  s_609bbbdbf3c419::t_a08bed0a58f27f 21
+crates/esker-sql/tests/uuid.rs
+  s_609bbbdbf3c419::t_454cfa0fe32f08 36,44,55,61,69,78
+crates/esker-sql/tests/uuid_functions.rs
+  s_609bbbdbf3c419::t_42bea78334f16c 30,39,44,49
+crates/esker-sql/tests/values_catalog_function.rs
+  s_609bbbdbf3c419::t_5fdab4fb97c035 28,33,43
+crates/esker-sql/tests/values_relation.rs
+  s_609bbbdbf3c419::t_184f33cbd872a4 57,64,72,80
+crates/esker-sql/tests/view.rs
+  s_609bbbdbf3c419::t_5a515250043c33 43,54,66
+crates/esker-sql/tests/view_debts.rs
+  s_609bbbdbf3c419::t_a539ecda505168 29
+crates/esker-sql/tests/virtual_generated_column.rs
+  s_609bbbdbf3c419::t_44fe3e1ea2ad20 39
+crates/esker-sql/tests/write_in_subquery.rs
+  s_609bbbdbf3c419::t_dc1bb015c1d973 22,39,48
+crates/esker-sql/tests/xml.rs
+  s_609bbbdbf3c419::t_4bd5e3cd9b9dd4 56,69,74,89
+docs/plans/divergence-provenance.md
+  s_609bbbdbf3c419::t_7dfa1044948e17 43-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "15b620dc7d515f11ddd59a79767d81f59397911a",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
