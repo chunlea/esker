@@ -1,0 +1,25 @@
+# `replace(text, from, to)`, against PostgreSQL 19beta1.
+#
+# Run 89's `the function REPLACE is not supported` — 4 tests across `relations_test.rb` and
+# `unsafe_raw_sql_test.rb`, every one of them inside an `ORDER BY`, and between them they put a
+# column, a constant and a bind in each of the three argument positions.
+#
+# **An empty `from` is a no-op.** `replace('abc','','X')` is `abc`, where Rust's `str::replace`
+# matches between every character and answers `XaXbXcX`. That is the one rule this cannot delegate,
+# and it is the only reason the implementation is more than one line.
+#
+# The rest a reader would get right and a reader should still see measured: left to right and
+# **non-overlapping** (`replace('aaa','aa','b')` is `ba`, not `bb`), **case-sensitive**, strict on
+# NULL in any position, and `text` out whatever went in — a `varchar` argument comes back `text`.
+SELECT 'r', replace('abcabc','b','X'), replace('abc','',''), replace('abc','','X')		r|aXcaXc|abc|abc
+SELECT 'r', replace('aaa','aa','b'), replace('abc','ABC','x'), replace('abc','abc','')		r|ba|abc|
+SELECT 'r', replace(NULL,'a','b') IS NULL, replace('abc',NULL,'b') IS NULL, replace('abc','a',NULL) IS NULL		r|t|t|t
+SELECT 'r', pg_typeof(replace('a','b','c')), length(replace('abc','b',''))		r|text|2
+SELECT 'r', replace('abc'::varchar,'b','X'), pg_typeof(replace('abc'::varchar,'b','X'))		r|aXc|text
+SELECT 'r', REPLACE('abc','b','X') AS upper_case_name		r|aXc
+CREATE TABLE rp (id int8, title text)		-
+INSERT INTO rp VALUES (1,'misc a'), (2,'misc b'), (3,'aaa')		-
+SELECT 'r', id FROM rp ORDER BY REPLACE(title, 'misc', 'zzzz') ASC, id		r|3 ; r|1 ; r|2
+SELECT 'r', id FROM rp ORDER BY REPLACE(title, '', '') ASC		r|3 ; r|1 ; r|2
+SELECT 'r', REPLACE('abc', title, title) FROM rp ORDER BY id LIMIT 1		r|abc
+DROP TABLE rp		-

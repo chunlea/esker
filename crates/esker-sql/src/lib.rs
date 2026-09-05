@@ -49,6 +49,7 @@ pub mod catalog;
 pub mod error;
 pub mod exec;
 pub mod fragment;
+pub mod node;
 pub mod parameter;
 pub mod parse;
 pub mod pd;
