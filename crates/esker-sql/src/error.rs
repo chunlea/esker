@@ -924,6 +924,14 @@ pub enum SqlError {
     /// `RAISE NOTICE | WARNING | INFO '<text>'` inside a `DO` block: the raised text, verbatim.
     ///
     /// Its severity is the level that was written, which is the whole of what a client sees —
+
+    /// `DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$` — the raised text is the whole message.
+    ///
+    /// **An error and not a notice**, which is the distinction ADR 0058 refused to blur: routing
+    /// it through the notice path would turn a failed statement into a successful one, and inside
+    /// a transaction block a real server aborts here. `P0001`, measured.
+    #[error("{0}")]
+    RaisedException(String),
     /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
     /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
     #[error("{message}")]
@@ -2462,6 +2470,7 @@ impl SqlError {
             | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_)
             | SqlError::UndefinedTextSearchConfig(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::RaisedException(_) => sqlstate::RAISE_EXCEPTION,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
