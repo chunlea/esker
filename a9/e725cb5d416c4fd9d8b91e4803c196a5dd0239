@@ -1,0 +1,46 @@
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_48ff5696b03835 1731-1735,1741-1746
+crates/esker-sql/src/exec/aggregate.rs
+  s_e5c0c6e78b5662::t_4128e56cb70d5d 171-176,248-252,916-924,1047-1081,1092-1100,1169-1186,1250-1254,1257-1278,1330
+crates/esker-sql/src/value/temporal.rs
+  s_e5c0c6e78b5662::t_f4234ab6b041c9 290-299,301-305,337,346-359,363,369,393-399,401-420,424-480,482-517
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_1a9188348b4a3c 663-664,669-674,736,740-755
+crates/esker-sql/tests/captures/pg19_interval_aggregate.txt
+  s_2bed4ac2b1c944::t_5f0bbc3fcbbee2 44-93
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_101640fadb76c1 968-970
+docs/plans/phase-9-rails.md
+  s_e5c0c6e78b5662::t_9245ff4fd9498b 1618
+crates/esker-sql/tests/corpus/pg19_interval_aggregate.txt
+  s_e5c0c6e78b5662::t_90c5e4d612bdd4 47-48
+  s_2bed4ac2b1c944::t_22916e36ba94d6 18-22
+crates/esker-sql/tests/time.rs
+  s_e5c0c6e78b5662::t_cdd2460d5ed5bd 22-29
+crates/esker-sql/tests/interval_aggregate.rs
+  s_2bed4ac2b1c944::t_ae589de8b26daa 9-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a9e725cb5d416c4fd9d8b91e4803c196a5dd0239",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
