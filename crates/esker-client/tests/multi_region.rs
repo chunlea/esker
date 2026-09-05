@@ -323,7 +323,7 @@ fn scans(transport: &FakeTransport) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
 ///
 /// It sent one request for the caller's whole range, which a store refuses as soon as the range
 /// leaves its region — the same defect `Transaction::scan` had, and the reason it was invisible is
-/// that nothing scans a large RawKV range today. Asserted on the **requests**, because a
+/// that nothing scans a large `RawKV` range today. Asserted on the **requests**, because a
 /// `FakeTransport` answers whatever it is scripted to and would never refuse.
 #[test]
 fn a_raw_scan_asks_each_region_only_for_the_keys_it_holds() {
