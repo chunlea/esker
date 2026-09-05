@@ -66,6 +66,7 @@ impl Drop for Supervisor {
 pub struct Cluster {
     dir: tempfile::TempDir,
     _store: Supervisor,
+    _others: Vec<Supervisor>,
     _pd: Supervisor,
     _sql: Supervisor,
     pd_port: u16,
@@ -78,10 +79,19 @@ impl Cluster {
     /// One store, because a split is the *leader's* own decision and needs only PD's id allocator
     /// — the replica target is another matter and not what this harness is about.
     pub fn start(split_size: u64) -> Self {
+        Self::start_with(1, split_size)
+    }
+
+    /// Starts `stores` stores, a driver and a SQL node.
+    ///
+    /// **Four is the minimum that can hold a columnar learner** — a region has three voters and PD
+    /// places a learner on a store with no peer of that region — and it is also what makes a SQL
+    /// node see more than one *shard*, which is what the region-count guard turns on.
+    pub fn start_with(stores: u16, split_size: u64) -> Self {
         let dir = tempfile::TempDir::new().unwrap();
         eprintln!("harness: logs in {}", dir.path().display());
-        let base = free_ports(3);
-        let (store_port, pd_port, sql_port) = (base, base + 1, base + 2);
+        let base = free_ports(stores + 2);
+        let (store_port, pd_port, sql_port) = (base, base + stores, base + stores + 1);
         warm(esker_cli());
         warm(esker_sql());
 
@@ -98,34 +108,57 @@ impl Cluster {
         );
         wait_for_port("the driver", pd_port, &mut pd, STARTUP_SECONDS, dir.path());
 
-        let (store_out, store_err) = log_into(dir.path(), "store");
-        let mut store = Supervisor(
-            Command::new(esker_cli())
+        let mut others: Vec<Supervisor> = Vec::new();
+        let mut store: Option<Supervisor> = None;
+        for id in 1..=stores {
+            let (store_out, store_err) = log_into(dir.path(), &format!("store{id}"));
+            let mut spawn = Command::new(esker_cli());
+            spawn
                 .args(["server", "--data-dir"])
-                .arg(dir.path().join("store"))
-                .args(["--listen", &format!("127.0.0.1:{store_port}")])
-                .args(["--store-id", "1"])
+                .arg(dir.path().join(format!("store{id}")))
+                .args(["--listen", &format!("127.0.0.1:{}", store_port + id - 1)])
+                .args(["--store-id", &id.to_string()])
                 .args(["--pd", &format!("127.0.0.1:{pd_port}")])
                 .args(["--region-split-size", &split_size.to_string()])
-                .args(["--peer", &format!("1@127.0.0.1:{store_port}")])
-                .stdout(store_out)
-                .stderr(store_err)
-                .spawn()
-                .expect("the store starts"),
-        );
-        wait_for_port(
-            "the store",
-            store_port,
-            &mut store,
-            STARTUP_SECONDS,
-            dir.path(),
-        );
+                // Placement costs one region heartbeat an operator, so a test that waits for a
+                // learner shortens it rather than waiting a minute each.
+                .args(["--region-heartbeat-ms", "2000"])
+                .args(["--heartbeat-tick-ms", "500"]);
+            // `--peer` as well as `--pd`, which is what `crate::cluster` does: without it PD's
+            // `AddPeer` has no address to reach and times out at its ceiling, for ever.
+            for peer in 1..=stores {
+                spawn.args([
+                    "--peer",
+                    &format!("{peer}@127.0.0.1:{}", store_port + peer - 1),
+                ]);
+            }
+            let mut child = Supervisor(
+                spawn
+                    .stdout(store_out)
+                    .stderr(store_err)
+                    .spawn()
+                    .expect("the store starts"),
+            );
+            wait_for_port(
+                &format!("store {id}"),
+                store_port + id - 1,
+                &mut child,
+                STARTUP_SECONDS,
+                dir.path(),
+            );
+            if store.is_none() {
+                store = Some(child);
+            } else {
+                others.push(child);
+            }
+        }
+        let store = store.expect("at least one store");
 
         let (sql_out, sql_err) = log_into(dir.path(), "sql");
         let mut sql = Supervisor(
             Command::new(esker_sql())
                 .arg(format!("127.0.0.1:{sql_port}"))
-                .arg(format!("127.0.0.1:{store_port}"))
+                .args((1..=stores).map(|id| format!("127.0.0.1:{}", store_port + id - 1)))
                 .args(["--pd", &format!("127.0.0.1:{pd_port}")])
                 .stdout(sql_out)
                 .stderr(sql_err)
@@ -143,6 +176,7 @@ impl Cluster {
         let cluster = Cluster {
             dir,
             _store: store,
+            _others: others,
             _pd: pd,
             _sql: sql,
             pd_port,
@@ -168,6 +202,17 @@ impl Cluster {
     /// Runs a statement and returns the server's reply as text, errors included.
     pub fn query(&self, sql: &str) -> String {
         one_query(self.sql_port, sql)
+    }
+
+    /// Runs a statement on a named engine.
+    ///
+    /// The `SET` travels **in the same simple-query message**, because every call here opens its
+    /// own connection and session state would not survive one.
+    pub fn query_on(&self, engine: &str, sql: &str) -> String {
+        one_query(
+            self.sql_port,
+            &format!("SET esker.engine = '{engine}'; {sql}"),
+        )
     }
 
     /// Runs a statement and fails the test if the server refused it.
