@@ -1,0 +1,103 @@
+# A **composite type** — its column, its `ROW(…)` constructor and its two I/O functions, as
+# PostgreSQL 19beta1 answers them.
+#
+# **Run 97: `a column of the composite type full_address is not supported`, 4 tests in
+# `adapters/postgresql/composite_test.rb`** — the largest actionable row on that board. The plan is
+# `docs/plans/composite-type.md`; this is the measurement it said to take **before** writing the
+# parser, and taking it changed what the parser has to do.
+#
+# Things reasoning would get wrong — and the first three are why this was captured first:
+#
+#   * **Whitespace inside the parens is part of the value; outside it is not.**
+#     `'( Paris , Rue Basse )'` is `(" Paris "," Rue Basse ")` — the spaces survive and then force
+#     quotes — while `' (a,b) '` is plain `(a,b)`. A parser that trims fields is wrong; one that
+#     refuses outer padding is wrong too.
+#   * **`NULL` written out is the string `NULL`.** `'(NULL,x)'` reads back `(NULL,x)`, four
+#     characters. Only an **empty unquoted** field is a NULL.
+#   * **An empty *quoted* field is the empty string, not NULL** — `'("",x)'` keeps `""`, and
+#     `.city IS NULL` is `f` for it and `t` for `'(,x)'`. That pair is the whole reason the text
+#     form is lossless, and it is the pair a naive renderer collapses.
+#   * A backslash escapes **inside quotes and outside them**: `'("a\"b",y)'` is `("a""b",y)` and
+#     `'(a\,b,y)'` is `("a,b",y)`. Note the output function always re-renders with **doubled
+#     quotes**, never with the backslash it accepted.
+#   * A field is quoted when it holds a comma, a quote, a paren, a backslash or **any** space —
+#     including a leading or trailing one — and not otherwise: `Champs-Élysées` is bare.
+#   * **Every malformed input is one message**, `22P02 malformed record literal: "<the input>"`:
+#     too few fields, too many, unterminated, and no parens at all.
+#
+# Every probe sits in its own `SAVEPOINT` — including the ones expected to succeed, which is how
+# `'()'` being an error rather than an empty record was found without losing the rest of the file.
+# `c3` after the `ROLLBACK` proves nothing persisted.
+
+BEGIN;		-
+CREATE TYPE full_address AS (city VARCHAR(90), street VARCHAR(90));		-
+CREATE TABLE pc (id int8, address full_address);		-
+
+-- ------------------------------------------------- the output function		-
+INSERT INTO pc VALUES (1, ROW('Paris', 'Champs-Élysées'));		-
+INSERT INTO pc VALUES (2, ROW('a,b', 'c"d'));		-
+INSERT INTO pc VALUES (3, ROW(NULL, 'x'));		-
+INSERT INTO pc VALUES (4, ROW('', ' '));		-
+INSERT INTO pc VALUES (5, ROW('a(b)c', 'd\\e'));		-
+INSERT INTO pc VALUES (6, ROW('  lead', 'trail  '));		-
+SELECT 'o1', id, address FROM pc ORDER BY id;		o1|1|(Paris,Champs-Élysées) ; o1|2|("a,b","c""d") ; o1|3|(,x) ; o1|4|(""," ") ; o1|5|("a(b)c","d\\e") ; o1|6|("  lead","trail  ")
+
+-- ------------------------------------------------- the input function, each probe guarded		-
+SAVEPOINT p1;		-
+SELECT 'i1', '(Paris,Rue Basse)'::full_address;		i1|(Paris,"Rue Basse")
+ROLLBACK TO p1;		-
+SAVEPOINT p2;		-
+SELECT 'i2', '( Paris , Rue Basse )'::full_address;		i2|(" Paris "," Rue Basse ")
+ROLLBACK TO p2;		-
+SAVEPOINT p3;		-
+SELECT 'i3', '("a,b","c""d")'::full_address;		i3|("a,b","c""d")
+ROLLBACK TO p3;		-
+SAVEPOINT p4;		-
+SELECT 'i4', '(,x)'::full_address;		i4|(,x)
+ROLLBACK TO p4;		-
+SAVEPOINT p5;		-
+SELECT 'i5', '("",x)'::full_address;		i5|("",x)
+ROLLBACK TO p5;		-
+SAVEPOINT p8;		-
+SELECT 'i8', '("a)b",y)'::full_address;		i8|("a)b",y)
+ROLLBACK TO p8;		-
+SAVEPOINT p13;		-
+SELECT 'i13', '(a,b) '::full_address;		i13|(a,b)
+ROLLBACK TO p13;		-
+SAVEPOINT p14;		-
+SELECT 'i14', ' (a,b)'::full_address;		i14|(a,b)
+ROLLBACK TO p14;		-
+SAVEPOINT p15;		-
+SELECT 'i15', '(a,)'::full_address;		i15|(a,)
+ROLLBACK TO p15;		-
+SAVEPOINT p16;		-
+SELECT 'i16', '(NULL,x)'::full_address;		i16|(NULL,x)
+ROLLBACK TO p16;		-
+
+-- ------------------------------------------------- NULL and the empty string are different		-
+SAVEPOINT p17;		-
+SELECT 'i17', ('(,x)'::full_address).city IS NULL;		i17|t
+ROLLBACK TO p17;		-
+SAVEPOINT p18;		-
+SELECT 'i18', ('("",x)'::full_address).city IS NULL;		i18|f
+ROLLBACK TO p18;		-
+
+-- ------------------------------------------------- what it refuses, all one message		-
+SAVEPOINT p9;		-
+SELECT 'i9', '()'::full_address;	!22P02 malformed record literal: "()"
+ROLLBACK TO p9;		-
+SAVEPOINT p10;		-
+SELECT 'i10', '(a,b,c)'::full_address;	!22P02 malformed record literal: "(a,b,c)"
+ROLLBACK TO p10;		-
+SAVEPOINT p11;		-
+SELECT 'i11', '(a'::full_address;	!22P02 malformed record literal: "(a"
+ROLLBACK TO p11;		-
+SAVEPOINT p12;		-
+SELECT 'i12', 'a,b'::full_address;	!22P02 malformed record literal: "a,b"
+ROLLBACK TO p12;		-
+
+-- ------------------------------------------------- the catalog side		-
+SELECT 'c1', typname, typtype FROM pg_type WHERE typname='full_address';		c1|full_address|c
+SELECT 'c2', attname, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid='pc'::regclass AND attnum>0 ORDER BY attnum;		c2|id|bigint ; c2|address|full_address
+ROLLBACK;		-
+SELECT 'c3', count(*) FROM pg_type WHERE typname='full_address';		c3|0
