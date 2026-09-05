@@ -816,12 +816,19 @@ fn lower_statement(
             format,
             options,
         } => {
-            refuse_if(*verbose, "EXPLAIN VERBOSE")?;
             refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
             refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
             refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
-            refuse_if(options.is_some(), "EXPLAIN with options")?;
             let _ = describe_alias;
+            // **The parenthesised option list**, which is the only form `ActiveRecord` sends:
+            // `explain(:analyze, :buffers)` and `explain("VERBOSE", "ANALYZE", "FORMAT JSON")`
+            // become `EXPLAIN (ANALYZE, BUFFERS) …` and `EXPLAIN (VERBOSE, ANALYZE, FORMAT JSON) …`
+            // (`explain_test.rb`). The whole list was refused, so three of that file's five tests
+            // could not run at all.
+            let analyze = explain_options(*analyze, options)?;
+            // `EXPLAIN VERBOSE` without parentheses asks for the same extra detail `(VERBOSE)`
+            // does, and is accepted and ignored for the same reason.
+            let _ = verbose;
             // A nested statement carries no storage parameter of its own.
             let inner = lower_statement(statement, None)?;
             // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
@@ -829,10 +836,10 @@ fn lower_statement(
             // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
             // `EXPLAIN ANALYZE INSERT` that ran would be an insert.
             refuse_if(
-                *analyze && !matches!(inner, plan::Statement::Select(_)),
+                analyze && !matches!(inner, plan::Statement::Select(_)),
                 "EXPLAIN ANALYZE of a statement that is not a SELECT",
             )?;
-            Ok(plan::Statement::Explain(Box::new(inner), *analyze))
+            Ok(plan::Statement::Explain(Box::new(inner), analyze))
         }
         // **A domain lowers into a `CREATE TYPE`**, because that is what it is: a fourth
         // `TypeKind` beside the range, the composite and the enum
@@ -1474,6 +1481,55 @@ fn guc_list_item(value: &Expr) -> String {
         },
         other => other.to_string(),
     }
+}
+
+/// The flags an `EXPLAIN (…)` list turns on, and the refusal for one this node cannot honour.
+///
+/// **What is accepted and ignored, and why that is not a wrong answer.** `VERBOSE`, `COSTS`,
+/// `BUFFERS`, `SETTINGS`, `WAL`, `TIMING`, `SUMMARY`, `GENERIC_PLAN` and `MEMORY` all ask a real
+/// server for *more detail about the same plan*. This node's plan is its own — the corpus records
+/// the whole of `EXPLAIN`'s output as a divergence already — so honouring them would mean inventing
+/// detail rather than reporting it, and refusing them would refuse a statement PostgreSQL runs.
+/// They are accepted and change nothing, which is the truthful reading: there is no extra detail to
+/// show.
+///
+/// **`FORMAT` is different and is refused.** `FORMAT JSON` changes the *shape* of the answer, and a
+/// client that asked for JSON and got plan text has been given a wrong answer rather than a plainer
+/// one. Producing it means a node tree — `Node Type`, `Startup Cost`, `Plans` — which this planner
+/// does not have and which would be fabricated. So `0A000`, which ADR 0031 ranks above the
+/// alternative, and `explain_test.rb`'s `test_explain_with_options_as_strings` stays red on a
+/// refusal that says what is missing.
+fn explain_options(
+    already: bool,
+    options: &Option<Vec<sqlparser::ast::UtilityOption>>,
+) -> Result<bool> {
+    let mut analyze = already;
+    let Some(options) = options else {
+        return Ok(analyze);
+    };
+    for option in options {
+        let name = option.name.value.to_ascii_uppercase();
+        let arg = option
+            .arg
+            .as_ref()
+            .map(|arg| arg.to_string().to_ascii_uppercase());
+        match (name.as_str(), arg.as_deref()) {
+            // `ANALYZE` and `ANALYZE true` run the statement; `ANALYZE false` does not.
+            ("ANALYZE", None | Some("TRUE")) => analyze = true,
+            ("ANALYZE", Some("FALSE")) => {}
+            (
+                "VERBOSE" | "COSTS" | "BUFFERS" | "SETTINGS" | "WAL" | "TIMING" | "SUMMARY"
+                | "GENERIC_PLAN" | "MEMORY",
+                _,
+            ) => {}
+            ("FORMAT", None | Some("TEXT")) => {}
+            ("FORMAT", Some(other)) => {
+                return Err(SqlError::unsupported(format!("EXPLAIN (FORMAT {other})")));
+            }
+            (other, _) => return Err(SqlError::unsupported(format!("EXPLAIN ({other})"))),
+        }
+    }
+    Ok(analyze)
 }
 
 /// Whether a `SET` names a run-time parameter at all, known or not.
