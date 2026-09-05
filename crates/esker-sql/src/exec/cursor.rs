@@ -1209,6 +1209,50 @@ fn is_jsonb_typed(expr: &Expr) -> bool {
     )
 }
 
+/// `doc -> key` / `doc ->> key`, on a value whose text is already canonical.
+///
+/// A NULL on either side is NULL, which is what makes the operator usable on a nullable column
+/// without a guard. A key that is neither a string nor an integer is the `42883` a real server
+/// gives for an operator it has no overload of.
+fn json_fetch(doc: Option<&Datum>, key: Option<&Datum>, as_text: bool) -> Result<Datum> {
+    use crate::value::json;
+    let (Some(doc), Some(key)) = (doc, key) else {
+        return Ok(Datum::Null);
+    };
+    let text = match doc {
+        Datum::Text(text) => text.as_str(),
+        Datum::Null => return Ok(Datum::Null),
+        other => {
+            return Err(SqlError::UndefinedOperator {
+                left: other
+                    .column_type()
+                    .map_or("unknown", PgType::name)
+                    .to_owned(),
+                op: if as_text { "->>" } else { "->" },
+                right: "text".to_owned(),
+            });
+        }
+    };
+    let key = match key {
+        Datum::Text(name) => json::Key::Member(name),
+        Datum::Int8(at) => json::Key::At(*at),
+        Datum::Int4(at) => json::Key::At(i64::from(*at)),
+        Datum::Int2(at) => json::Key::At(i64::from(*at)),
+        Datum::Null => return Ok(Datum::Null),
+        other => {
+            return Err(SqlError::UndefinedOperator {
+                left: "jsonb".to_owned(),
+                op: if as_text { "->>" } else { "->" },
+                right: other
+                    .column_type()
+                    .map_or("unknown", PgType::name)
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(json::fetch(text, Some(&key), as_text)?.map_or(Datum::Null, Datum::Text))
+}
+
 /// `jsonb || jsonb`, on two values whose text is already canonical.
 ///
 /// **Both** operands, never one: there is no `jsonb || text` on a real server, so a jsonb column
@@ -3035,6 +3079,15 @@ fn catalog_function(
         // when a cast told the lowerer the type, and as an ordinary `||` whose operand is a jsonb
         // *column*, which still carries its type in `Expr::Ordinal`. A jsonb literal is
         // canonicalised into a `Datum::Text` long before this, so the values cannot decide it.
+        // `doc -> key` and `doc ->> key`. The **key** decides which member is asked for: a string
+        // names one, an integer indexes an array from either end.
+        CatalogFunc::JsonFetch | CatalogFunc::JsonbFetch | CatalogFunc::JsonFetchText => {
+            json_fetch(
+                args.first(),
+                args.get(1),
+                call.func == CatalogFunc::JsonFetchText,
+            )?
+        }
         CatalogFunc::JsonbConcat => jsonb_concat(args.first(), args.get(1))?,
         CatalogFunc::HstoreConcat if call.args.iter().all(is_jsonb_typed) => {
             jsonb_concat(args.first(), args.get(1))?

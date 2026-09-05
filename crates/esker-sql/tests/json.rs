@@ -81,11 +81,12 @@ const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather 
      only if it shares its comparison. `json` has no comparison operators at all on a \
      real server, so refusing there is closer still than refusing `jsonb`.";
 /// One of `DIVERGENCES`' eight reasons.
-const OPERATORS: &str = "The extraction operators are not built yet. This unit is the **format addition** — \
-     the two types, their storage, and the canonical form `jsonb` prints — and `->`, \
-     `->>`, `#>` and `#>>` are the next commit, with these lines as their specification. \
-     `0A000` naming the operator is contract C2's answer for a construct that parses and \
-     does not run.";
+const OPERATORS: &str = "**`#>` and `#>>` are what is left of this reason.** `->` and `->>` were \
+     here too and are built now, and the nine lines that declared them agreed the moment they \
+     were — which is what these rows are for: they were written as the specification of a unit \
+     that had not happened, and the ratchet said when it had. The path operators take an array of \
+     keys rather than one, so they are their own unit; `0A000` naming the operator is contract \
+     C2's answer for a construct that parses and does not run.";
 /// One of `DIVERGENCES`' eight reasons.
 const FUNCTIONS: &str = "A `json` function this node does not have, named under contract C2. None is in this \
      unit's scope; the corpus carries them so the unit that adds them starts from the \
@@ -168,52 +169,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
              > '{}'::jsonb",
         COMPARISON,
         "pg19_json.txt:105",
-    ),
-    (
-        "SELECT '{\"a\":1}'::json -> 'a', '{\"a\":1}'::json ->> 'a'",
-        OPERATORS,
-        "pg19_json.txt:106",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb -> 'a', '{\"a\":1}'::jsonb ->> 'a'",
-        OPERATORS,
-        "pg19_json.txt:107",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb -> 'z', '{\"a\":1}'::jsonb ->> 'z'",
-        OPERATORS,
-        "pg19_json.txt:108",
-    ),
-    (
-        "SELECT '{\"a\":null}'::jsonb ->> 'a', '{\"a\":null}'::jsonb -> 'a'",
-        OPERATORS,
-        "pg19_json.txt:109",
-    ),
-    (
-        "SELECT ('{\"a\":null}'::jsonb -> 'a') IS NULL, ('{\"a\":null}'::jsonb ->> \
-             'a') IS NULL",
-        OPERATORS,
-        "pg19_json.txt:110",
-    ),
-    (
-        "SELECT '[1,2,3]'::json -> 0, '[1,2,3]'::json ->> 0, '[1,2,3]'::json -> -1",
-        OPERATORS,
-        "pg19_json.txt:111",
-    ),
-    (
-        "SELECT '[1,2,3]'::jsonb -> 5",
-        OPERATORS,
-        "pg19_json.txt:112",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb -> 0",
-        OPERATORS,
-        "pg19_json.txt:113",
-    ),
-    (
-        "SELECT '[1,2]'::jsonb -> 'a'",
-        OPERATORS,
-        "pg19_json.txt:114",
     ),
     (
         "SELECT '{\"a\":{\"b\":2}}'::json #> '{a,b}', '{\"a\":{\"b\":2}}'::json #>> \

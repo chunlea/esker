@@ -116,6 +116,61 @@ pub(crate) fn concat(left: &str, right: &str) -> Result<String> {
     Ok(out)
 }
 
+/// `doc -> key` and `doc ->> key`: one member of an object, or one element of an array.
+///
+/// `None` is SQL NULL. **The two operators differ in exactly two places**, both measured on
+/// 19beta1 (`captures/pg19_json_fetch.txt`):
+///
+/// * a JSON **null** member is the string `null` through `->` and SQL NULL through `->>` — so
+///   `->>` cannot tell a missing key from a null one and `->` can;
+/// * a **string** member loses its quotes through `->>` and keeps them through `->`. Every other
+///   kind of value renders the same both ways, which is why this is one function with a flag
+///   rather than two that would drift.
+///
+/// A subscript indexes an array, **counting from the end when it is negative** (`'[10,20]' ->> -1`
+/// is `20`), and is out of range rather than an error when it does not land. A key against an
+/// array, a subscript against an object, or either against a scalar is NULL and never an error —
+/// `'{"b":"b"}'::jsonb -> 'b' -> 'x'` is NULL, not `22023`.
+pub(crate) fn fetch(text: &str, key: Option<&Key<'_>>, as_text: bool) -> Result<Option<String>> {
+    let Some(key) = key else { return Ok(None) };
+    let found = match (parse(text, Nulls::Allow)?, key) {
+        (Json::Object(members), Key::Member(name)) => members
+            .into_iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, value)| value),
+        (Json::Array(items), Key::At(at)) => {
+            let len = i64::try_from(items.len()).unwrap_or(i64::MAX);
+            // Negative counts back from the end; `-len` is the first element and anything below
+            // it misses, exactly as anything at or above `len` does.
+            let at = if *at < 0 { len + at } else { *at };
+            usize::try_from(at)
+                .ok()
+                .and_then(|at| items.into_iter().nth(at))
+        }
+        // A key against an array, a subscript against an object, and either against a scalar.
+        _ => None,
+    };
+    Ok(match found {
+        None => None,
+        // The two differences, and the whole of them.
+        Some(Json::Null) if as_text => None,
+        Some(Json::Str(value)) if as_text => Some(value),
+        Some(value) => {
+            let mut out = String::new();
+            write_canonical(&value, &mut out);
+            Some(out)
+        }
+    })
+}
+
+/// Which member a fetch is asking for: a name, or a position in an array.
+pub(crate) enum Key<'a> {
+    /// `doc -> 'name'`.
+    Member(&'a str),
+    /// `doc -> 2`, which counts from the end when negative.
+    At(i64),
+}
+
 /// What one side contributes to an array concatenation: an array's own elements, or itself.
 fn elements(value: Json) -> Vec<Json> {
     match value {

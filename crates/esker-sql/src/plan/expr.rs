@@ -1007,6 +1007,26 @@ pub enum CatalogFunc {
     /// oid **0** — PostgreSQL's rendering of `InvalidOid`, which every non-array row of `pg_type`
     /// has in `typelem` — and the number back for an oid this node does not know.
     RegTypeName,
+    /// `doc -> key` over a **`json`**: one member, as a `json`.
+    ///
+    /// Its own variant beside [`Self::JsonbFetch`] because the two answer different declared
+    /// types — `pg_typeof(doc->'a')` is `json` for a `json` column and `jsonb` for a `jsonb` one,
+    /// measured — and the *value* cannot say which, both being a `Datum::Text`.
+    JsonFetch,
+    /// `doc -> key` over a `jsonb`: one member, **as a document**.
+    ///
+    /// Its own variant rather than `HstoreFetch`'s because `->` means two things and the values
+    /// cannot tell them apart — a `jsonb` is a `Datum::Text` here, canonicalised, and so is a
+    /// string. This is the spelling a **cast** produced, where the lowerer could still read the
+    /// type; a jsonb *column* reaches `HstoreFetch` and is told apart there by `Expr::Ordinal`'s
+    /// declared type, exactly as `||` is.
+    JsonbFetch,
+    /// `doc ->> key`: the same member **as text**.
+    ///
+    /// **No dispatch and no variant of its own needed for the column case**: `->>` is not an
+    /// hstore operator, so every `->>` is this one. The two differences from [`Self::JsonFetch`]
+    /// are a JSON null (SQL NULL here, the string `null` there) and a string (unquoted here).
+    JsonFetchText,
     /// `ARRAY[…]::oidvector`: the elements' **oids**, space separated.
     ///
     /// **Digits, not names** — measured, `ARRAY['text'::regtype]::oidvector` is `25`, which is
@@ -1328,7 +1348,9 @@ impl CatalogFunc {
             CatalogFunc::RangeLowerInf => "lower_inf",
             CatalogFunc::RangeUpperInf => "upper_inf",
             CatalogFunc::RangeBuild => "tsrange",
-            CatalogFunc::HstoreFetch => "->",
+            // One symbol, two fetches — an hstore's and a document's — told apart by the cast at
+            // lowering and by the operand's declared type at resolution, never by the values.
+            CatalogFunc::HstoreFetch | CatalogFunc::JsonFetch | CatalogFunc::JsonbFetch => "->",
             CatalogFunc::HstoreHasKey => "?",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
@@ -1356,6 +1378,7 @@ impl CatalogFunc {
             // the other reads a name and answers its oid.
             CatalogFunc::RegTypeName | CatalogFunc::UserRegType => "regtype",
             CatalogFunc::OidVector => "oidvector",
+            CatalogFunc::JsonFetchText => "->>",
             // What a `42883` would call it, and nothing reaches one: the pass either
             // resolves it or raises about the type by name.
             CatalogFunc::UserCast => "cast",
@@ -1460,6 +1483,9 @@ impl CatalogFunc {
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
             | CatalogFunc::OidVector
+            | CatalogFunc::JsonFetch
+            | CatalogFunc::JsonbFetch
+            | CatalogFunc::JsonFetchText
             | CatalogFunc::ToRegClass
             | CatalogFunc::IsEmpty
             | CatalogFunc::PathIsOpen
@@ -1517,6 +1543,7 @@ impl CatalogFunc {
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
             | CatalogFunc::OidVector
+            | CatalogFunc::JsonFetchText
             | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
@@ -1579,7 +1606,10 @@ impl CatalogFunc {
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
-            CatalogFunc::JsonbConcat => ColumnType::Jsonb,
+            // `->` keeps the document type and `->>` is text — measured,
+            // `pg_typeof(payload->'b')` is `jsonb` and `pg_typeof(payload->>'b')` is `text`.
+            CatalogFunc::JsonbConcat | CatalogFunc::JsonbFetch => ColumnType::Jsonb,
+            CatalogFunc::JsonFetch => ColumnType::Json,
             CatalogFunc::ToTsVector | CatalogFunc::TsStrip | CatalogFunc::SetWeight => {
                 ColumnType::TsVector
             }
