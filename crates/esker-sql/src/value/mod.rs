@@ -73,6 +73,42 @@ use std::cmp::Ordering;
 use crate::error::{Result, SqlError};
 
 pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f64};
+
+/// One value's text **under the session's `IntervalStyle`**.
+///
+/// [`PgDatum::to_text`] is the output function under the boot style, which is what an index key,
+/// an error message and a stored catalog default all want: none of them belongs to a session and
+/// none of them may change when one runs a `SET`. This is the other half — what a **client** is
+/// sent — and the two differ for exactly one type, so everything else forwards.
+///
+/// Every path that reaches a client goes through one of the two, and which one is not a detail:
+/// `ActiveRecord` reads an interval by parsing the text, and returns `nil` rather than an error
+/// when the parse fails (`tests/interval_style.rs`).
+#[must_use]
+pub fn to_text_under(value: &Datum, style: IntervalStyle) -> Option<String> {
+    use PgDatum as _;
+    if style == IntervalStyle::Postgres {
+        return value.to_text();
+    }
+    match value {
+        Datum::Interval {
+            months,
+            days,
+            micros,
+        } => Some(interval::to_text_under(
+            &interval::Interval {
+                months: *months,
+                days: *days,
+                micros: *micros,
+            },
+            style,
+        )),
+        // An array of intervals prints its elements the same way, which is what `all_terms` is.
+        Datum::Array(array) => Some(array::to_text_under(array, style)),
+        _ => value.to_text(),
+    }
+}
+pub use interval::Style as IntervalStyle;
 pub use timestamp::{MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
 
 /// The four bytes a varlena's header takes, which PostgreSQL adds to a declared length to make a

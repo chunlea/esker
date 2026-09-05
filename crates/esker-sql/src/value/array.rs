@@ -246,13 +246,20 @@ impl Parser<'_> {
 /// `array_out`: the text PostgreSQL prints for this value.
 #[must_use]
 pub fn to_text(value: &ArrayValue) -> String {
+    to_text_under(value, crate::value::IntervalStyle::Postgres)
+}
+
+/// The same, with the session's `IntervalStyle` handed to every element — which matters for one
+/// element type and is threaded rather than special-cased so that a nested array gets it too.
+#[must_use]
+pub fn to_text_under(value: &ArrayValue, style: crate::value::IntervalStyle) -> String {
     let mut out = String::new();
     // The bound is part of the value, so a value that does not start at one says where it starts.
     if value.lower != 1 && !value.values.is_empty() {
         let upper = value.lower + i32::try_from(value.values.len()).unwrap_or(0) - 1;
         let _ = write!(out, "[{}:{upper}]=", value.lower);
     }
-    write_dimension(value, &value.dims, 0, &mut 0, &mut out);
+    write_dimension(value, &value.dims, 0, &mut 0, style, &mut out);
     out
 }
 
@@ -262,6 +269,7 @@ fn write_dimension(
     dims: &[i32],
     depth: usize,
     next: &mut usize,
+    style: crate::value::IntervalStyle,
     out: &mut String,
 ) {
     out.push('{');
@@ -274,10 +282,14 @@ fn write_dimension(
             out.push(',');
         }
         if depth + 1 < dims.len() {
-            write_dimension(value, dims, depth + 1, next, out);
+            write_dimension(value, dims, depth + 1, next, style, out);
         } else {
             let element = match value.values.get(*next) {
-                Some(Some(element)) => quoted(element.to_text().unwrap_or_default().as_str()),
+                Some(Some(element)) => quoted(
+                    crate::value::to_text_under(element, style)
+                        .unwrap_or_default()
+                        .as_str(),
+                ),
                 // An unquoted `NULL` is how a NULL element prints, which is what makes it read
                 // back as one.
                 _ => "NULL".to_owned(),

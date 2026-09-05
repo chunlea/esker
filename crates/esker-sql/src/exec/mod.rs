@@ -1232,6 +1232,20 @@ impl Executor {
             .unwrap_or_else(|| parameter.boot.to_owned())
     }
 
+    /// The style an `interval` is printed to a client under.
+    ///
+    /// **A setting this node stored and ignored until run 100.** `ActiveRecord` sends
+    /// `SET intervalstyle = iso_8601` when it connects and then *parses* what comes back; its
+    /// `OID::Interval#cast_value` rescues a parse failure by returning `nil`, so a server that
+    /// answers the wrong dialect hands the client no value and no error. Two `interval_test.rb`
+    /// failures were that and nothing else (`tests/interval_style.rs`).
+    pub(super) fn interval_style(&self) -> crate::value::IntervalStyle {
+        self.parameters
+            .get("intervalstyle")
+            .and_then(|value| crate::value::IntervalStyle::parse(value))
+            .unwrap_or_default()
+    }
+
     /// Whether `client_min_messages` lets a message of this severity out.
     ///
     /// PostgreSQL's ordering, and the two levels this node actually raises are `NOTICE` and
@@ -1550,6 +1564,7 @@ impl Executor {
         // produced. Running it inside the plan would run it once per row, which is what
         // PostgreSQL does over a `FROM` and is why that shape is refused rather than approximated.
         let (planned, raw) = self.planned_rows(txn, select)?;
+        let style = self.interval_style();
         let mut rows = Vec::new();
         for row in raw {
             let row = &row[..row.len() - planned.junk];
@@ -1562,7 +1577,12 @@ impl Executor {
                         // label is what a client is told, which is the whole shape ADR 0050 chose.
                         match planned.columns.get(at).and_then(|c| c.user_type.as_ref()) {
                             Some(def) => assign::from_enum(value, def).to_text(),
-                            None => value.to_text(),
+                            // **The session's `IntervalStyle` applies here and not in
+                            // `to_text`**, because this is the line that faces a client: an index
+                            // key, an error message and a stored catalog default all want the
+                            // output function under the boot style and must not move when
+                            // somebody runs a `SET`.
+                            None => crate::value::to_text_under(value, style),
                         }
                         .map(String::into_bytes)
                     })

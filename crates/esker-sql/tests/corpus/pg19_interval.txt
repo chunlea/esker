@@ -137,3 +137,11 @@ SET IntervalStyle TO 'sql_standard'		-
 SET IntervalStyle TO 'postgres_verbose'		-
 RESET IntervalStyle		-
 SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	1 year 2 mons 3 days 04:05:06|1 day|-1 days
+SELECT '5'::interval, '0'::interval, '1.5'::interval, '90'::interval	interval,interval,interval,interval	00:00:05|00:00:00|00:00:01.5|00:01:30
+SELECT '-5'::interval, '+3'::interval, '  7  '::interval, '100000'::interval	interval,interval,interval,interval	-00:00:05|00:00:03|00:00:07|27:46:40
+SELECT '5 days 3'::interval, '1-2 3'::interval, '5 1:00'::interval	interval,interval,interval	5 days 00:00:03|1 year 2 mons 00:00:03|5 days 01:00:00
+SELECT '3 5 days'::interval	!22007 invalid input syntax for type interval: "3 5 days"
+SELECT '1:00 5'::interval	!22007 invalid input syntax for type interval: "1:00 5"
+SELECT '3 ago'::interval	!22007 invalid input syntax for type interval: "3 ago"
+SELECT '3e2'::interval	!22007 invalid input syntax for type interval: "3e2"
+SELECT '1 2'::interval	!22007 invalid input syntax for type interval: "1 2"
