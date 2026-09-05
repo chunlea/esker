@@ -2429,6 +2429,30 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             func: *func,
             operand: Box::new(resolve(operand, scope)?),
         },
+        // **Permission is checked here and not at lowering**, because the operand's type is not
+        // known until it is resolved against a scope: `'2020-01-01'::date::int` folds and is
+        // `42846` already, and `d::int` over a `timestamptz` column has to reach the same answer.
+        // `pg_cast` is the table, so the two paths cannot disagree.
+        Expr::Cast {
+            operand,
+            to,
+            typmod,
+        } => {
+            let operand = resolve(operand, scope)?;
+            if let Ok(from) = expr_type(&operand, scope)
+                && !pg_catalog::casts_to(from, *to)
+            {
+                return Err(SqlError::CannotCast {
+                    from: from.name(),
+                    to: to.name(),
+                });
+            }
+            Expr::Cast {
+                operand: Box::new(operand),
+                to: *to,
+                typmod: *typmod,
+            }
+        }
         Expr::ToText { operand, .. } => {
             let operand = resolve(operand, scope)?;
             let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
@@ -3341,6 +3365,8 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
         Expr::Ordinal { ty, .. } | Expr::Outer { ty, .. } => Some(*ty),
         Expr::Arithmetic { ty, .. } => *ty,
         Expr::ToText { .. } => Some(ColumnType::Text),
+        // The type the cast named, which is the whole point of carrying it.
+        Expr::Cast { to, .. } => Some(*to),
         // **An `unknown` stops being one the moment it passes through a constructor.** Measured,
         // one constructor at a time: `pg_typeof((SELECT '1'))`, `pg_typeof(CASE WHEN true THEN
         // '1' ELSE '2' END)` and `pg_typeof(COALESCE('1','2'))` are each **`text`** on a real
@@ -3995,6 +4021,8 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
 
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
+        // The type the cast named. Settled at lowering, where the permission was checked too.
+        Expr::Cast { to, .. } => *to,
         // Both operands, then the promotion table — the same table the evaluator uses, so the
         // type a client is told matches the values it is sent.
         Expr::Negate(operand) => crate::value::arith::negate_type(expr_type(operand, scope)?)?,

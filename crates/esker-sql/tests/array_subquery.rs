@@ -18,6 +18,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_typeof` answers a `regtype` on a real server and `text` here — the same trade
     // `'x'::regtype` makes, and the same characters either way. The row agrees.
     types: &[
+        // Surfaced with the two below it when the runtime cast stopped aborting this file. The
+        // rows agree; what differs is the standing integer-width trade — a small constant is
+        // `integer` on a real server and `bigint` here — seen through `ARRAY(VALUES …)`.
+        "SELECT 'r', ARRAY(VALUES (1),(2))",
         "SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))",
         // The three below are reached for the first time now that a bare `VALUES` list runs; they
         // were swallowed by the aborted block before. Their rows are right and two facts show in
@@ -29,6 +33,23 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x), array_agg(x ORDER BY x) FROM generate_series(1,3) AS x",
     ],
     answers: &[
+        // **Both of these were swallowed until the runtime cast landed.** The line above them,
+        // `ARRAY(SELECT 1)::int8[]`, was `0A000 a cast to INT8[]`, and its abort took the rest of
+        // the file with it — which is exactly what the harness's third ratchet rule exists to
+        // catch, and what closing one refusal surfaces. Neither is about casts; both are about
+        // `ARRAY(subquery)` and belong to whoever takes that back up.
+        (
+            "SELECT 'r', ARRAY(SELECT ARRAY(SELECT 1))",
+            "a nested `ARRAY(subquery)` flattens on a real server -- `{{1}}` of type `integer[]`, \
+             not an array of arrays -- and is an array of the inner array's *text* here",
+            "pg19_array_subquery.txt:75",
+        ),
+        (
+            "SELECT ARRAY(SELECT)",
+            "a subquery with no column at all is `42601` on a real server and `0A000` naming \
+             `ARRAY` here: the refusal fires before the subquery's shape is looked at",
+            "pg19_array_subquery.txt:80",
+        ),
         // Reached for the first time now that a bare `VALUES` list runs: this statement used to be
         // one of the eight the aborted block swallowed. The refusal is the crate's standing one
         // for a **per-row** cast — a cast of anything but a constant has only `text` as a target —

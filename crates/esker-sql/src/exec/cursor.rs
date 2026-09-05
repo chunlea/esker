@@ -2051,6 +2051,25 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 )));
             }
         },
+        // **The target's input function over the value's text**, which is PostgreSQL's own I/O
+        // conversion for a cast with no binary function — and the reason a cast that folds at plan
+        // time and one that runs per row give the same answer: both go through `from_text`.
+        // Permission was decided at lowering, from `pg_cast`.
+        Expr::Cast {
+            operand,
+            to,
+            typmod,
+        } => match evaluate_in(operand, row, env)? {
+            Datum::Null => Datum::Null,
+            value => {
+                let text = value
+                    .to_text()
+                    .ok_or_else(|| SqlError::DatatypeMismatch("a value with no text".to_owned()))?;
+                // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)`
+                // bounds the string exactly as a `varchar(3)` column would.
+                crate::value::truncate_to_typmod(Datum::from_text(*to, &text)?, *to, *typmod)?
+            }
+        },
         Expr::ToText {
             operand,
             strip_blanks,

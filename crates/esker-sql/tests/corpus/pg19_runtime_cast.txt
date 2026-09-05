@@ -1,0 +1,52 @@
+# A cast whose operand is **not a constant** — as PostgreSQL 19beta1 answers it.
+#
+# **Run 95: `a cast to INTEGER is not supported`, 2 tests in `connection_test.rb`.** Both send
+# `SELECT $1::integer`, which is a cast of a **bind parameter** — so the board's row is not about
+# a spelling of `integer` at all, and reading the statement is what said so. `text` had
+# `Expr::ToText` and every other target had nothing, so a cast folded when its operand was a
+# constant and was `0A000` otherwise.
+#
+# Things reasoning would get wrong:
+#
+#   * **A cast truncates where an assignment refuses.** `'42'::varchar(1)` is `4` (`c11`) and
+#     writing `'42'` into a `varchar(1)` column is `22001`. One rule per side, and
+#     `value::fit_to_typmod` already documented the same split for `bit`.
+#   * **A `pg_cast` row is not the whole permission rule.** There is **no** row for
+#     `text -> integer` and `'42'::text::integer` works anyway — PostgreSQL's *I/O conversion*,
+#     which applies whenever either end is a string type. Without it `txt::integer`, the commonest
+#     cast in any suite, is refused. `date -> integer` has no row either and **does** fail
+#     (`c10`), because neither end is a string.
+#   * `char(n)` **pads** as well as truncating: `'abc'::char(5)` is `abc  ` (`c5`).
+#   * A value that will not read is the *input function's* error and not the cast's — `txt::date`
+#     over `'42'` is `22008`, not `42846` (`c8` beside `c9`).
+#
+# Error probes sit in a `SAVEPOINT` taken before them; the whole capture is one
+# `BEGIN … ROLLBACK`.
+
+BEGIN;		-
+CREATE TABLE ct (id int8, txt text, n integer, d timestamptz, v varchar(9));		-
+INSERT INTO ct VALUES (1, '42', 7, '2010-01-01 02:00:00+00', 'abc');		-
+
+-- ------------------------------------------------- a cast whose operand is a column		-
+SELECT 'c1', txt::integer, txt::bigint, txt::numeric FROM ct;		c1|42|42|42
+SELECT 'c2', n::text, n::bigint, n::numeric, n::real FROM ct;		c2|7|7|7|7
+SELECT 'c3', d::date, d::timestamp FROM ct;		c3|2010-01-01|2010-01-01 02:00:00
+SELECT 'c4', pg_typeof(txt::integer), pg_typeof(n::bigint), pg_typeof(d::date) FROM ct;		c4|integer|bigint|date
+SELECT 'c6', 'true'::text::boolean, txt::int2 FROM ct;		c6|t|42
+SELECT 'c7', NULL::text::integer;		c7|\N
+
+-- ------------------------------------------------- a cast truncates where an assignment refuses		-
+SELECT 'c5', v::varchar(2), v::char(5) FROM ct;		c5|ab|abc  
+SELECT 'c11', txt::varchar(1) FROM ct;		c11|4
+
+-- ------------------------------------------------- and the pairs with no cast at all		-
+SAVEPOINT s1;		-
+SELECT 'c8', txt::date FROM ct;	!22008 date/time field value out of range: "42"
+ROLLBACK TO s1;		-
+SAVEPOINT s2;		-
+SELECT 'c9', d::integer FROM ct;	!42846 cannot cast type timestamp with time zone to integer
+ROLLBACK TO s2;		-
+SAVEPOINT s3;		-
+SELECT 'c10', '2020-01-01'::date::integer;	!42846 cannot cast type date to integer
+ROLLBACK TO s3;		-
+ROLLBACK;		-
