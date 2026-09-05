@@ -2609,6 +2609,20 @@ fn catalog_function(
         }
         // **Not strict**: a NULL argument is skipped, not propagated, so `concat(NULL, NULL)` is
         // the empty string. Each argument is rendered by its own output function.
+        // **An empty `from` is a no-op**, which is the one rule `str::replace` does not share:
+        // it matches between every character and answers `XaXbXcX` where PostgreSQL answers
+        // `abc`. Everything else — left to right, non-overlapping, case-sensitive — is the same.
+        CatalogFunc::Replace => match (args.first(), args.get(1), args.get(2)) {
+            (Some(Datum::Text(text)), Some(Datum::Text(from)), Some(Datum::Text(to))) => {
+                if from.is_empty() {
+                    Datum::Text(text.clone())
+                } else {
+                    Datum::Text(text.replace(from.as_str(), to))
+                }
+            }
+            // Strict: any NULL argument is a NULL answer, and a non-text one has no `replace`.
+            _ => Datum::Null,
+        },
         CatalogFunc::Concat => Datum::Text(
             args.iter()
                 .filter(|arg| !matches!(arg, Datum::Null))
