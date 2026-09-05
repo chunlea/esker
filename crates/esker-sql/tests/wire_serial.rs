@@ -121,7 +121,7 @@ impl Wire {
         let (client, server) = tokio::io::duplex(256 * 1024);
         tokio::spawn(async move {
             let mut connection = Connection::new(server, Config::default());
-            let _ = connection.run(&*node).await;
+            let _ = connection.run(node).await;
         });
         let mut wire = Wire { client };
         wire.client.write_all(&startup_packet()).await.unwrap();
