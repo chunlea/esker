@@ -2387,16 +2387,10 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // PostgreSQL's order, which is the same rule the folded path applies to literals.
         Expr::Array { elements, .. } => {
             let mut resolved = Vec::with_capacity(elements.len());
-            let mut element = None;
             for expr in elements {
-                let expr = resolve(expr, scope)?;
-                let ty = expr_type(&expr, scope)?;
-                element = Some(match element {
-                    None => ty,
-                    Some(so_far) => wider_element(so_far, ty),
-                });
-                resolved.push(expr);
+                resolved.push(resolve(expr, scope)?);
             }
+            let element = array_element_type(&resolved, None, scope)?;
             Expr::Array {
                 elements: resolved,
                 element,
@@ -4030,6 +4024,32 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
 /// it handed back the string `"{}"` instead of a Hash. `pg_typeof` could not see it (it folds at
 /// resolution, off the rewritten call) and neither could a rendered value, because `text` and
 /// `json` print identically. Only `ftype()` off the wire can, which is what the test asserts.
+/// The element type of an `ARRAY[…]`, from the type it was resolved with or from its elements.
+///
+/// **Two askers, and the second is why this is a function.** `resolve` settles the type and stores
+/// it on the node; `expr_type` is asked by `output_columns` on the **unresolved** projection, where
+/// the stored type is still `None`. Reading `None` as `text[]` there is the same wrong-declaration
+/// bug `->` had — the rows would be an `integer[]` and the client would be told `text[]`, and
+/// `ActiveRecord` decodes an array by that oid exactly as it decodes a document by `->`'s.
+fn array_element_type(
+    elements: &[Expr],
+    settled: Option<ColumnType>,
+    scope: &Scope<'_>,
+) -> Result<Option<ColumnType>> {
+    if settled.is_some() {
+        return Ok(settled);
+    }
+    let mut widest = None;
+    for element in elements {
+        let ty = expr_type(element, scope)?;
+        widest = Some(match widest {
+            None => ty,
+            Some(so_far) => wider_element(so_far, ty),
+        });
+    }
+    Ok(widest)
+}
+
 fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFunc {
     if func != CatalogFunc::HstoreFetch {
         return func;
@@ -4049,9 +4069,11 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // type a client is told matches the values it is sent.
         Expr::Negate(operand) => crate::value::arith::negate_type(expr_type(operand, scope)?)?,
         // Settled at resolution and carried, for the reason `Arithmetic::ty` is: a client is told
-        // the column's type before any row is read. An unresolved one has no element type yet, and
-        // `text[]` is what an all-`unknown` constructor would have been anyway.
-        Expr::Array { element, .. } => element
+        // the column's type before any row is read. **And computed from the elements when it is
+        // not settled**, because `output_columns` asks this of the *unresolved* projection —
+        // answering `text[]` there is a right value under a wrong declared type, which is what
+        // `->` was doing one arm below.
+        Expr::Array { elements, element } => array_element_type(elements, *element, scope)?
             .and_then(esker_keys::array::ArrayValue::array_of)
             .unwrap_or(ColumnType::TextArray),
         Expr::Arithmetic {

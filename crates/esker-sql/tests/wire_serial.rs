@@ -225,6 +225,45 @@ async fn an_arrow_over_a_column_describes_the_document_type() {
     }
 }
 
+/// **`ARRAY[…]` over a column describes its element type**, which is the same bug one node over.
+///
+/// `output_columns` types the projection from the **unresolved** expression, and the constructor's
+/// element type is settled at *resolution* — so a `SELECT ARRAY[n]` over an `integer` column was
+/// described as `text[]` (oid 1009) where a real server says `integer[]` (1007). Found by looking
+/// for the shape r1-harness found in `->`, not by a failing test: the rows are identical either
+/// way, so nothing but the wire can see it, and `pg_typeof` reads the resolved call and was right.
+///
+/// The oids are PostgreSQL's own: `_int4` 1007, `_int8` 1016, `_text` 1009, `_numeric` 1231.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_array_constructor_over_a_column_describes_its_element_type() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE a (n integer, m bigint, t text, d numeric)")
+        .await;
+    wire.run("INSERT INTO a VALUES (7, 8, 'x', 1.5)").await;
+
+    for (sql, want) in [
+        ("SELECT ARRAY[n] FROM a", vec![1007]),
+        ("SELECT ARRAY[m] FROM a", vec![1016]),
+        // The widening, which the corpus already pins by value — here by declared type.
+        ("SELECT ARRAY[n, m] FROM a", vec![1016]),
+        ("SELECT ARRAY[d, n] FROM a", vec![1231]),
+        ("SELECT ARRAY[t, 'lit'] FROM a", vec![1009]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong element type"
+        );
+    }
+}
+
 /// The first column of the first `DataRow` in a reply, as text.
 fn first_value(reply: &[u8]) -> Option<String> {
     let (_, body) = frames(reply).into_iter().find(|(tag, _)| *tag == 'D')?;
