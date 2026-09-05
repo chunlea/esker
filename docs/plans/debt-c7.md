@@ -984,3 +984,60 @@ One arm, 14 threads, GNU `timeout` proved both ways first. It aborted itself bef
 incident. Spinners were killed and verified with `ps -p` — the check that works. The guard cost
 seven runs and prevented a repeat of the 196 that stopped the previous arm; the finding arrived on
 run 1 regardless.
+
+## 20. `txn_crash_boundaries` settled: the same ambiguous result, one crate over
+
+The record said "not settled either way; no message exists". The message existed as soon as anyone
+asked for it — one arm, 14 busy threads, **3 of 9 runs failed**, and the five tests that fail
+together fail for one reason:
+
+```
+:87  the call reaches a store: AmbiguousResult { method: TxnPrewrite,
+       source: Closed { detail: "region 1 stopped leading with this proposal in its log; it may still commit" } }
+:168 the secondary reads:     AmbiguousResult { method: TxnRollback, source: Closed { …it may still commit } }
+:167 the primary reads:       RetriesExhausted { attempts: 9, source: NotLeader { region_id: 1, leader_hint: Some(2) } }
+:168 the secondary reads:     RetriesExhausted { attempts: 9, source: NotLeader { region_id: 2, leader_hint: None } }
+:346 the owner commits:       Any { .. }
+```
+
+`Closed { "region 1 stopped leading with this proposal in its log; it may still commit" }` is
+**the same string, verbatim**, as the durability item at `esker-store/tests/cluster.rs:509` (§13).
+The coordinator's question — *do they have the same ambiguous-result shape before calling them
+load-only* — is answered: yes, one crate over, and it was never load-only.
+
+Three details worth keeping:
+
+* **A read is not exempt.** `read_both` does `txn.get`, and it came back
+  `AmbiguousResult { method: TxnRollback }`: a read that meets an abandoned transaction *resolves*
+  it, and that resolution is a mutation the office can move under. The retry therefore wraps the
+  whole read — begin and both gets — because retrying one half against a snapshot whose other half
+  already failed compares two different instants.
+* **`Any { .. }` was not a separate failure.** The live-lock test's owner thread calls the same
+  `call()`, so its panic was that expect propagating through `join`. One fix, three sites.
+* **`RetriesExhausted { attempts: 9, .. NotLeader { leader_hint: None } }`** is the router giving up
+  while *nobody* held the office — the same state as §19's region 77, seen from the client.
+
+### What was changed, and what deliberately was not
+
+`retrying` re-asks while `the_office_moved(&error)` — `AmbiguousResult` or `RetriesExhausted`, and
+**nothing else**. A `TxnConflict`, a `LockNotCleared`, any refusal, is the store *answering*, and
+this file exists to assert on those; retrying one would turn a finding into thirty seconds of
+silence. Repeating is safe here because every verb is idempotent at a fixed timestamp — a prewrite
+for one `start_ts`, a commit for one `(start_ts, commit_ts)`, a rollback of one `start_ts`, a read
+— so a second apply cannot be observed. A caller that must not double-apply branches on
+`Error::changed_nothing` instead, as its doc comment says; these tests are not that caller.
+
+### Before and after, same arm shape
+
+| | runs | failed | loads seen |
+|---|---|---|---|
+| before | 9 | **3** | failing from load 36 upward |
+| after | 6 | **0** | clean at 51, 64 and 74 |
+
+Small denominators, and said so — but the after-arm ran clean at loads where the before-arm was
+already failing. Both arms stopped themselves on the load ceiling rather than on a count.
+
+Solo timing is unchanged: 6 tests in 1.12 s, exactly as before the retry.
+
+**Ten sightings. Still none fixed by changing a budget** — and the one deadline this wave did add
+(§18's 30 s) replaced a stopwatch on an event, leaving the negative proof's clock untouched.

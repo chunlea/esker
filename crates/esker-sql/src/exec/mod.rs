@@ -91,6 +91,14 @@ pub struct Executor {
     /// view would need a second code path for the ones it cannot — which is the thing this change
     /// exists to remove.
     identity: crate::session::Backend,
+    /// The role this session authenticated as, which `serving_user` sets.
+    user: String,
+    /// The role `SET SESSION AUTHORIZATION` put it in, or `None` for the one it connected as.
+    ///
+    /// **A session's, not a transaction's**, which is why it lives here and not on the open
+    /// block: PostgreSQL keeps it across `COMMIT` and `ROLLBACK`, and only `RESET` or a new
+    /// connection undoes it.
+    authorization: Option<String>,
 
     pub(crate) tenant: u64,
     /// The database this session is connected to, which is the tenant above under its name.
@@ -281,6 +289,12 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     // ADR 0057, and is why the levels that already worked cannot regress.
     let waits = executor.isolation().waits();
     let deadline = executor.lock_deadline();
+    // **Real elapsed time, not a count of turns round the loop.** This used to add `WAIT_STEP_MS`
+    // per iteration and compare that to the timeout — which assumes each iteration really takes two
+    // milliseconds. On a loaded box it does not, so `lock_timeout = '150ms'` meant *seventy-five
+    // iterations* and could wait for seconds: a duration a client set and the node did not keep.
+    // It also made every test of these timeouts a wall-clock lottery under a parallel suite.
+    let began = std::time::Instant::now();
     let mut waited = 0_u64;
     loop {
         match txn.lock(key)? {
@@ -348,7 +362,7 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 // back-off relieves — it is an event, and the only cost of asking again is a lock
                 // on a map.
                 std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
-                waited += WAIT_STEP_MS;
+                waited = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
             }
         }
     }
@@ -646,6 +660,8 @@ impl Executor {
             identity,
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
+            user: crate::parse::DATABASE_NAME.to_owned(),
+            authorization: None,
             open: None,
             written: Written::default(),
             constraints: std::cell::RefCell::default(),
@@ -687,6 +703,17 @@ impl Executor {
     #[must_use]
     pub fn serving_database(mut self, name: impl Into<String>) -> Self {
         self.database = name.into();
+        self
+    }
+
+    /// The same executor, serving a named role.
+    ///
+    /// The role the client authenticated as, which is what `current_user` answers until a
+    /// `SET SESSION AUTHORIZATION` says otherwise. A session that never says has the role it
+    /// connected as, which is a real server's rule.
+    #[must_use]
+    pub fn serving_user(mut self, name: impl Into<String>) -> Self {
+        self.user = name.into();
         self
     }
 
@@ -982,9 +1009,22 @@ impl Executor {
         use crate::plan::SessionStatement;
 
         match statement {
-            // Nothing to switch away from: this node has no roles, so `DEFAULT` is what the
-            // session already is. A named role never reaches here — it is `22023` in the lowering.
-            SessionStatement::SetSessionAuthorization => Ok(Outcome::done("SET")),
+            // **The catalog decides, and only here can it be asked.** A name that is not a role
+            // is `22023` — a *parameter value* that is wrong, which is the code PostgreSQL uses
+            // for this and not the `42704` an undefined object gets. `DEFAULT` puts the session
+            // back to the role it connected as.
+            SessionStatement::SetSessionAuthorization(name) => {
+                if let Some(role) = name {
+                    let txn = self.backend.begin()?;
+                    let known = crate::catalog::role_by_name(&*txn, role)?.is_some();
+                    let _ = txn.rollback();
+                    if !known {
+                        return Err(SqlError::UndefinedRoleForAuthorization(role.clone()));
+                    }
+                }
+                self.authorization.clone_from(name);
+                Ok(Outcome::done("SET"))
+            }
             SessionStatement::SetReadAsOf { value, local } => {
                 self.set_read_as_of(value.as_deref(), *local)?;
                 Ok(Outcome::done("SET"))

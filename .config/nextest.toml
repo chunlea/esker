@@ -37,6 +37,24 @@ max-threads = 1
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)))
     or (package(esker-store) and (binary(promotion) or binary(balance)))
-    or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster)))
+    or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster)))
 """
 test-group = 'cluster'
+
+[test-groups.timed]
+# One at a time, and separate from `cluster` because the cost is different: these start no
+# processes and hold no Raft groups, they **measure**. A cancellation that must be observed within
+# a bound, a sleep that must not return early, a `lock_timeout` that must fire before a holder
+# releases — every one of them is a claim about *when*, and a box running three thousand other
+# tests beside them is a box where "when" moves.
+max-threads = 1
+
+[[profile.default.overrides]]
+# The binary whose whole subject is timing. It failed 3 of 8 under a parallel suite and 8 of 8
+# twice in a quiet quarter-second, which is the signature: not a race in the product, a claim about
+# elapsed time competing with fifty other processes for the clock it is reading.
+#
+# Serialising them is not hiding the flake — the waits inside them are on events and the bounds
+# have been widened to hold under load. It is refusing to measure a stopwatch in a scrum.
+filter = 'package(esker-sql) and binary(statement_cancellation)'
+test-group = 'timed'
