@@ -163,6 +163,13 @@ struct Run {
 /// How long a columnar copy has to appear and catch up before the run gives up.
 const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long placement is watched before the run reports what it saw.
+///
+/// Long, because the thing being distinguished is latency from absence and the shipped region
+/// heartbeat is 60 s: a window of one interval could not tell them apart, which is the mistake
+/// this constant exists to stop repeating.
+const PLACEMENT_SAMPLE_WINDOW: Duration = Duration::from_secs(300);
+
 /// How long the SQL node has to become writable before the run gives up.
 const WRITABLE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -378,6 +385,42 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
 /// **Nothing here fails the run.** A statement that errors is the result; the point is to say what
 /// the path does across a region boundary, and a harness that stopped at the first error would
 /// report one fact where there are several.
+/// Watches columnar placement until every region has a learner or the window closes.
+///
+/// **Sampled over minutes, not read once.** PD reaches a store only by answering its region
+/// heartbeat and gives a region one operator at a time, so at the shipped 60 s interval a reading
+/// taken straight after the `ALTER` is consistent with "not yet" and with "never" alike. A series
+/// separates them: a count that climbs was latency, a count that sits is a defect.
+fn watch_placement(cluster: &Cluster) -> Result<(), String> {
+    println!("## Columnar placement, sampled");
+    println!();
+    println!("| at | regions | with a columnar learner |");
+    println!("|---|---|---|");
+    let watch = Instant::now();
+    let mut last = (0, 0);
+    while watch.elapsed() < PLACEMENT_SAMPLE_WINDOW {
+        let regions = cluster.regions()?;
+        let (with_a_learner, _) = topology::columnar_spread(&regions);
+        let now = (regions.len(), with_a_learner);
+        if now != last || watch.elapsed() < Duration::from_secs(1) {
+            println!(
+                "| {:>4.0?} | {} | {with_a_learner} |",
+                watch.elapsed(),
+                regions.len()
+            );
+            last = now;
+        }
+        if with_a_learner == regions.len() && !regions.is_empty() {
+            println!();
+            println!("Every region has one after {:.0?}.", watch.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+
+    Ok(())
+}
+
 fn diagnose(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result<(), String> {
     wait_for_the_replica_target(cluster)?;
     let mut pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
@@ -396,10 +439,16 @@ fn diagnose(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Resul
         shape.rows,
         started.elapsed()
     );
-    let _ = pg.run(&format!(
-        "ALTER TABLE {} SET (columnar_replicas = 1)",
-        workload::FACT
-    ));
+    // **The ALTER's outcome, not a swallowed result.** A previous run wrote `let _ =` here and
+    // then reported "0 of 10 regions had a columnar learner" — a sentence that cannot be read,
+    // because a refused `ALTER` and a working one that PD had not acted on yet produce it alike.
+    let asked = format!("ALTER TABLE {} SET (columnar_replicas = 1)", workload::FACT);
+    match pg.run(&asked) {
+        Ok(()) => println!("`{asked}` committed"),
+        Err(why) => println!("`{asked}` was REFUSED: {}", first_line(&why)),
+    }
+
+    watch_placement(cluster)?;
 
     println!();
     println!("## The region map, from each region's own leader");
