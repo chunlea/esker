@@ -194,11 +194,13 @@ pub fn is_legal_boundary(key: &[u8], region: &Region) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SplitOptions, choose_split_key, is_legal_boundary};
+    use super::{SplitOptions, approximate_size, choose_split_key, is_legal_boundary};
     use bytes::Bytes;
     use esker_engine::{Db, LocalFileSystem, Options, WriteBatch, WriteOptions, cf};
     use esker_keys::prefix;
     use esker_proto::{Epoch, Peer, Region};
+    use esker_txn::key as txn_key;
+    use esker_txn::{Kind, LockRecord, SHORT_VALUE_MAX_LEN, WriteRecord};
     use std::sync::Arc;
 
     fn open() -> (tempfile::TempDir, Arc<Db>) {
@@ -401,5 +403,204 @@ mod tests {
             split.starts_with(b"aaa"),
             "the middle by key count is inside the dense prefix: {split:?}"
         );
+    }
+
+    // -- what a region holds when it holds a table ----------------------------------------
+
+    /// The user key of row `n` of one SQL table — what `esker-sql` hands the transaction layer,
+    /// built by `esker-keys` rather than spelled out here (`CLAUDE.md` invariant 7).
+    fn row_key(n: u32) -> Vec<u8> {
+        let mut key = prefix::table_row_prefix(1, 7);
+        key.extend_from_slice(&n.to_be_bytes());
+        key
+    }
+
+    /// Writes `keys` as a **committed** transaction leaves them: a `write` record per key, with
+    /// the value inline when it is short enough and its own `default` entry when it is not.
+    ///
+    /// This is the shape the mpp lane found in a WAL dump of a real SQL table
+    /// (`docs/bench/columnar-learner.md`, `cf=2 Put "xt…"`), reproduced without going through
+    /// `esker-sql`: the defect is in this module's measurement and belongs to a test of it.
+    fn commit_rows(
+        db: &Db,
+        keys: impl IntoIterator<Item = Vec<u8>>,
+        value_len: usize,
+        commit_ts: u64,
+    ) {
+        let write_cf = db.cf_id(cf::WRITE).unwrap();
+        let default_cf = db.cf_id(cf::DEFAULT).unwrap();
+        let start_ts = commit_ts - 1;
+        let value = vec![b'v'; value_len];
+        let mut batch = WriteBatch::new();
+        for key in keys {
+            let mut record = WriteRecord::new(Kind::Put, start_ts);
+            if value_len <= SHORT_VALUE_MAX_LEN {
+                record.short_value = Some(Bytes::from(value.clone()));
+            } else {
+                batch.put(default_cf, &txn_key::value(&key, start_ts), &value);
+            }
+            batch.put(write_cf, &txn_key::write(&key, commit_ts), &record.encode());
+        }
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
+    }
+
+    /// **The finding of `docs/plans/phase-16-mpp.md` §10.** A region holding a SQL table reported
+    /// `~0 bytes` to PD and so never crossed a split threshold at any setting — 4 MiB over ~20 MB
+    /// of table produced exactly the one region a 512 MiB threshold did.
+    ///
+    /// The rows here are short, which is the case that decides the fix: a value of
+    /// `SHORT_VALUE_MAX_LEN` or under is inlined into the `write` record and costs no `default`
+    /// entry at all, so a measurement that reads only `default` reports zero however wide its
+    /// range is.
+    #[test]
+    fn a_region_of_committed_rows_is_not_zero_bytes() {
+        let (_dir, db) = open();
+        const ROWS: u32 = 5_000;
+        const VALUE_LEN: usize = 200;
+        commit_rows(&db, (0..ROWS).map(row_key), VALUE_LEN, 20);
+
+        let whole = region(b"", b"");
+        let written = u64::from(ROWS) * VALUE_LEN as u64;
+        let size = approximate_size(&db, &whole).unwrap();
+        assert!(
+            size >= written / 2,
+            "{ROWS} committed rows of {VALUE_LEN} bytes report {size} bytes, \
+             which is not a table PD can see"
+        );
+    }
+
+    /// A region of committed rows has a boundary, and it is one of the rows.
+    ///
+    /// The size saying "split" and the scan saying "there is nothing here" is worse than either
+    /// alone: `Store::spawn_split_checker` records the region as refused and does not look at it
+    /// again until it has grown by another whole threshold.
+    #[test]
+    fn a_boundary_is_found_in_committed_rows() {
+        let (_dir, db) = open();
+        const ROWS: u32 = 5_000;
+        commit_rows(&db, (0..ROWS).map(row_key), 200, 20);
+
+        let whole = region(b"", b"");
+        let split = choose_split_key(&db, &whole, 1024)
+            .unwrap()
+            .expect("five thousand rows can be split");
+        assert!(is_legal_boundary(&split, &whole));
+
+        let at = (0..ROWS)
+            .position(|n| row_key(n) == split)
+            .expect("the boundary is a row that exists, not a synthesised key");
+        assert!(
+            (1_000..=4_000).contains(&(at as u32)),
+            "the boundary landed at row {at} of {ROWS}"
+        );
+    }
+
+    /// A key's versions are one key. Without that the sample is weighted by how often a row was
+    /// updated rather than by how many rows there are, and a table where one row is rewritten a
+    /// thousand times splits inside that row's versions — a boundary that divides no rows at all.
+    #[test]
+    fn the_versions_of_one_row_count_once() {
+        let (_dir, db) = open();
+        const ROWS: u32 = 10;
+        for version in 0..100 {
+            commit_rows(&db, (0..ROWS).map(row_key), 32, 20 + version);
+        }
+
+        let whole = region(b"", b"");
+        let split = choose_split_key(&db, &whole, 1024)
+            .unwrap()
+            .expect("ten rows can be split");
+        let at = (0..ROWS)
+            .position(|n| row_key(n) == split)
+            .expect("the boundary is one of the ten rows");
+        assert!(
+            (2..=8).contains(&(at as u32)),
+            "the boundary landed at row {at} of {ROWS}, so versions were sampled as keys"
+        );
+    }
+
+    /// A value too long to inline lives in `default` under `'x'`, keyed by `start_ts`. Both its
+    /// bytes and its key have to be visible, or a table of large rows is the same bug again.
+    #[test]
+    fn a_value_too_long_to_inline_is_counted_and_can_be_split_at() {
+        let (_dir, db) = open();
+        const ROWS: u32 = 500;
+        const VALUE_LEN: usize = SHORT_VALUE_MAX_LEN + 1_000;
+        commit_rows(&db, (0..ROWS).map(row_key), VALUE_LEN, 20);
+
+        let whole = region(b"", b"");
+        let size = approximate_size(&db, &whole).unwrap();
+        let written = u64::from(ROWS) * VALUE_LEN as u64;
+        assert!(
+            size >= written / 2,
+            "{ROWS} rows of {VALUE_LEN} bytes in the `default` CF report {size} bytes"
+        );
+        let split = choose_split_key(&db, &whole, 1024)
+            .unwrap()
+            .expect("five hundred long rows can be split");
+        assert!(
+            (0..ROWS).any(|n| row_key(n) == split),
+            "the boundary is not one of the rows: {split:?}"
+        );
+    }
+
+    /// **A lock is not a region's size.** It is one in-flight transaction's state, cleared at
+    /// commit or rollback, so counting it would make a region's size a function of concurrency
+    /// and let a burst of prewrites split data that has not been written
+    /// ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+    ///
+    /// It is the one test in this group that passes **before** the fix, and it passes for the
+    /// wrong reason: everything reported zero. What makes it mean something is the four tests
+    /// beside it — once `write` and the `'x'` half of `default` are counted, a zero here is a
+    /// decision rather than a blind spot.
+    #[test]
+    fn a_lock_is_not_a_regions_size() {
+        let (_dir, db) = open();
+        let lock_cf = db.cf_id(cf::LOCK).unwrap();
+        let mut batch = WriteBatch::new();
+        let mut record = LockRecord::new(Kind::Put, 19, Bytes::from_static(b"primary"));
+        record.short_value = Some(Bytes::from(vec![b'v'; 200]));
+        let encoded = record.encode();
+        for n in 0..5_000 {
+            batch.put(lock_cf, &txn_key::lock(&row_key(n)), &encoded);
+        }
+        db.write(batch, &WriteOptions::unsynced()).unwrap();
+
+        let whole = region(b"", b"");
+        assert_eq!(
+            approximate_size(&db, &whole).unwrap(),
+            0,
+            "five thousand held locks are not five thousand rows of data"
+        );
+    }
+
+    /// Only the region's own rows are measured and sampled. The `'x'` bound is
+    /// `esker_txn::key::prefix`, and the group encoding is order-preserving and prefix-free, so a
+    /// user key is inside the region exactly when its engine key is inside the bounds.
+    #[test]
+    fn the_transactional_scan_stays_inside_the_regions_range() {
+        let (_dir, db) = open();
+        commit_rows(&db, (0..2_000).map(row_key), 200, 20);
+
+        // A region covering the second half of the table by row key.
+        let half = region(&row_key(1_000), &row_key(2_000));
+        let whole = region(b"", b"");
+        let part = approximate_size(&db, &half).unwrap();
+        let all = approximate_size(&db, &whole).unwrap();
+        assert!(part > 0, "the half of the table it owns reports nothing");
+        assert!(
+            part < all,
+            "half the table ({part}) is not less than all of it ({all})"
+        );
+
+        let split = choose_split_key(&db, &half, 1024)
+            .unwrap()
+            .expect("a thousand rows can be split");
+        assert!(is_legal_boundary(&split, &half), "{split:?}");
+
+        // A region covering rows that were never written has nothing of its own to split.
+        let empty = region(&row_key(5_000), &row_key(6_000));
+        assert_eq!(approximate_size(&db, &empty).unwrap(), 0);
+        assert_eq!(choose_split_key(&db, &empty, 1024).unwrap(), None);
     }
 }
