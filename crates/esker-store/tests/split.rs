@@ -457,6 +457,8 @@ async fn ten_splits_under_continuous_writes_lose_nothing() {
 /// and the boundary is a row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_region_of_committed_rows_splits() {
+    const ROWS: u32 = 128;
+
     let harness = tiny();
     harness.wait_for_leader().await;
     assert_eq!(harness.store.regions().len(), 1);
@@ -465,7 +467,6 @@ async fn a_region_of_committed_rows_splits() {
     // `esker_txn::SHORT_VALUE_MAX_LEN` is 255 and this is under it, so `default` stays empty and
     // every byte of the region is in `write`.
     let value = vec![b'v'; 200];
-    const ROWS: u32 = 128;
     for n in 0..ROWS {
         harness
             .commit(&row_key(n), &value, 10 + u64::from(n) * 2)
@@ -529,11 +530,12 @@ async fn a_region_of_committed_rows_splits() {
 /// `split::approximate_size` — through the public path the store reports on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_region_of_committed_rows_reports_its_bytes() {
+    const ROWS: u32 = 64;
+
     let harness = never();
     harness.wait_for_leader().await;
 
     let value = vec![b'v'; 200];
-    const ROWS: u32 = 64;
     for n in 0..ROWS {
         harness
             .commit(&row_key(n), &value, 10 + u64::from(n) * 2)

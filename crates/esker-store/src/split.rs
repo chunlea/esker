@@ -26,7 +26,8 @@
 //! two physical shapes, in more than one column family: `'r' ++ key` for `RawKV`, and
 //! `'x' ++ enc(key) ++ !ts` in `default` and `write` for anything transactional — which is every
 //! SQL row, since a row is the user key a transaction writes. Both functions here read every one
-//! of those ranges, through [`crate::keyspace`], the same mapping a snapshot ships a region by.
+//! of those ranges, through this crate's `keyspace` module (`crates/esker-store/src/keyspace.rs`,
+//! private, so it is named rather than linked) — the same mapping a snapshot ships a region by.
 //!
 //! Until [ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md) they read
 //! `['r' ++ start, 's')` in `default` alone, so a region holding a SQL table reported `~0` bytes
@@ -281,7 +282,7 @@ impl Source {
 /// The bounds keep each scan inside its own namespace, so a key that does not fit its shape means
 /// the namespace itself is wrong — which is not something to guess about, and not something to
 /// panic on either (`CLAUDE.md` invariant 9). A third physical namespace has to be given a decoder
-/// here as well as a range in [`crate::keyspace`].
+/// here as well as a range in the `keyspace` module.
 fn user_key(namespace: u8, engine_key: &[u8]) -> Result<Vec<u8>, ProtoError> {
     match namespace {
         prefix::RAW => engine_key
@@ -341,8 +342,8 @@ fn midpoint(samples: &[Bytes], region: &Region) -> Option<Bytes> {
 /// # Every family the region spans, and every namespace in it
 ///
 /// One [`Db::approximate_size`] per (data column family × physical namespace), summed. The
-/// families are [`DATA_CFS`] and the ranges are [`crate::keyspace::physical_ranges`], the mapping
-/// a snapshot ships a region by.
+/// families are `DATA_CFS` and the ranges are `keyspace::physical_ranges`, the mapping a snapshot
+/// ships a region by. Both are private, so they are named here rather than linked.
 ///
 /// Both namespaces are asked of both families rather than kept in a table of which family may hold
 /// which — `write` holds only `'x'` today, and asking it for `['r', 's')` costs an overlap check
@@ -637,9 +638,10 @@ mod tests {
     /// range is.
     #[test]
     fn a_region_of_committed_rows_is_not_zero_bytes() {
-        let (_dir, db) = open();
         const ROWS: u32 = 5_000;
         const VALUE_LEN: usize = 200;
+
+        let (_dir, db) = open();
         commit_rows(&db, (0..ROWS).map(row_key), VALUE_LEN, 20);
 
         let whole = region(b"", b"");
@@ -659,8 +661,9 @@ mod tests {
     /// again until it has grown by another whole threshold.
     #[test]
     fn a_boundary_is_found_in_committed_rows() {
-        let (_dir, db) = open();
         const ROWS: u32 = 5_000;
+
+        let (_dir, db) = open();
         commit_rows(&db, (0..ROWS).map(row_key), 200, 20);
 
         let whole = region(b"", b"");
@@ -673,7 +676,7 @@ mod tests {
             .position(|n| row_key(n) == split)
             .expect("the boundary is a row that exists, not a synthesised key");
         assert!(
-            (1_000..=4_000).contains(&(at as u32)),
+            (1_000..=4_000).contains(&at),
             "the boundary landed at row {at} of {ROWS}"
         );
     }
@@ -681,24 +684,37 @@ mod tests {
     /// A key's versions are one key. Without that the sample is weighted by how often a row was
     /// updated rather than by how many rows there are, and a table where one row is rewritten a
     /// thousand times splits inside that row's versions — a boundary that divides no rows at all.
+    ///
+    /// **The versions are deliberately lopsided**, and the first shape of this test is why: ten
+    /// rows of a hundred versions each cannot tell the two apart, because the 500th *version* is
+    /// row five's and row five is also the answer counting *keys* gives. One row carrying almost
+    /// every version is the distribution where the two answers differ — row zero without the
+    /// deduplication (checked by taking it out: "the boundary landed at row 0 of 10"), the middle
+    /// row with it.
     #[test]
     fn the_versions_of_one_row_count_once() {
-        let (_dir, db) = open();
         const ROWS: u32 = 10;
-        for version in 0..100 {
-            commit_rows(&db, (0..ROWS).map(row_key), 32, 20 + version);
+        const REWRITES: u64 = 1_000;
+
+        let (_dir, db) = open();
+        commit_rows(&db, (0..ROWS).map(row_key), 32, 20);
+        for version in 0..REWRITES {
+            commit_rows(&db, [row_key(0)], 32, 22 + version * 2);
         }
 
         let whole = region(b"", b"");
-        let split = choose_split_key(&db, &whole, 1024)
+        // A cap above the version count, so nothing but the deduplication decides the answer.
+        let split = choose_split_key(&db, &whole, 4 * 1024)
             .unwrap()
             .expect("ten rows can be split");
         let at = (0..ROWS)
             .position(|n| row_key(n) == split)
             .expect("the boundary is one of the ten rows");
         assert!(
-            (2..=8).contains(&(at as u32)),
-            "the boundary landed at row {at} of {ROWS}, so versions were sampled as keys"
+            (2..=8).contains(&at),
+            "the boundary landed at row {at} of {ROWS}: row 0 holds {REWRITES} of the {} versions \
+             in this region, so versions were sampled as keys",
+            REWRITES + u64::from(ROWS)
         );
     }
 
@@ -706,9 +722,10 @@ mod tests {
     /// bytes and its key have to be visible, or a table of large rows is the same bug again.
     #[test]
     fn a_value_too_long_to_inline_is_counted_and_can_be_split_at() {
-        let (_dir, db) = open();
         const ROWS: u32 = 500;
         const VALUE_LEN: usize = SHORT_VALUE_MAX_LEN + 1_000;
+
+        let (_dir, db) = open();
         commit_rows(&db, (0..ROWS).map(row_key), VALUE_LEN, 20);
 
         let whole = region(b"", b"");
