@@ -1,4 +1,4 @@
-# 0073 — A fragment expression node is added by tag, not by a version bump
+# 0074 — A fragment expression node is added by tag, not by a version bump
 
 Status: **accepted**, and built with the join fragment —
 [`docs/plans/phase-16-mpp.md`](../plans/phase-16-mpp.md) §J4.

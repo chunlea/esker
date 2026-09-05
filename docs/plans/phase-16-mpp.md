@@ -345,6 +345,22 @@ would be an argument for instrumenting it too.
 
 ## 10. The verdict
 
+> **Amended 2026-09-05: the first of this verdict's two gates has been lifted.** The `split` lane
+> fixed what §8 found — `esker_store::split::approximate_size` measured the RawKV namespace while
+> SQL rows live under `'x'`, so a SQL table never split at any threshold. It measures the SQL
+> keyspace now ([ADR 0073](../adr/0073-a-regions-size-is-the-data-families-it-spans.md),
+> `crates/esker-store/src/keyspace.rs`), and a SQL table occupies more than one region. **ADR 0022
+> milestone 5's structural blocker is therefore gone**: a query can now have more than one
+> fragment, so an exchange would have something to shuffle between.
+>
+> The verdict below is **not** thereby reversed, and the reason is its second half, which never
+> depended on splitting: at 200,000 rows and 20,000 groups the whole cardinality-dependent cost on
+> the SQL node was 36 ms of a 55 ms query. What changes is that the question is now *measurable* —
+> the fragment-count axis §9 could not produce is reachable — and §10's "what would change this
+> verdict" is now a list of two rather than three. **Re-measuring on the multi-region cluster is
+> the next thing this file owes**, and until that is done the numbers below are single-region and
+> say so.
+
 **Not yet — and not because the finish is cheap, though it is. Because there is nothing to shuffle.**
 
 MPP exchange moves intermediate results *between* columnar nodes, and a fragment is one per region
@@ -376,9 +392,9 @@ already says this; the numbers now say it too.
 
 Named so the next person can check them rather than re-derive them:
 
-1. **A SQL table that splits.** Until then every other line here is moot. It is also the cheapest of
-   the three: the size estimate and the boundary scan both need to see the `'x'` namespace and the
-   Percolator column families.
+1. ~~**A SQL table that splits.**~~ **Done, 2026-09-05, by the `split` lane** (ADR 0073). The size
+   estimate and the boundary scan see the SQL keyspace now. This was called "the cheapest of the
+   three" and it was; what it unblocks is the *measurement*, not the exchange.
 2. **A finishing cost that grows past the scan.** The shape to watch is `regions × groups`: at 50
    bytes and, say, 40 µs a group (36 ms over ~900 groups' worth of measurable difference — an upper
    bound, since the tick hides the rest), a hundred regions each holding 100,000 groups would ship
@@ -528,10 +544,11 @@ is correct.
 
 * **No exchange, no shuffle, no spill.** Unchanged from §8, and now doubly gated: on the `split`
   lane, and on this unit existing at all.
-* **No multi-region join parallelism.** One region per table today, so one fragment. When the
-  `split` lane lands, a semi-join fragment goes to *each* region of the outer table and the
-  partials merge exactly as they do now — no new mechanism, which is a point in this design's
-  favour and is deliberately not built or measured here.
+* **No multi-region join parallelism.** The `split` lane has landed (ADR 0073), so a table *can*
+  now span regions — which makes this a deliberate scope line rather than a fact about the system.
+  A semi-join fragment goes to *each* region of the outer table and the partials merge exactly as
+  they do now, needing no new mechanism; that it needs none is a point in this design's favour and
+  is still not built or measured in this unit.
 * **No columnar join fragment (option A) and no rows-output fragment (option B).** Both need
   something this lane does not own.
 * **No `LEFT JOIN`, no `Materialize` probe, no join whose inner columns are projected.** All
@@ -611,4 +628,28 @@ What is **actually** deferred, named so nobody assumes it is covered:
 * **Multi-region.** One region per table until the `split` lane lands, so one fragment. A semi-join
   fragment to *each* region of the outer table, with the partials merged as they already are, needs
   no new mechanism — which is a point in this design's favour and is still not built or tested here.
-* **A join whose outer table spans regions**, which is the same gate.
+* **A join whose outer table spans regions.** No longer gated on `split`; gated on this unit's
+  own scope line above.
+
+### The `In` node's ADR is 0074, not 0073
+
+Claimed as 0073 against main's then-highest 0072, and the `split` lane landed its own 0073 first.
+Later committer renumbers, so this one moved to
+[0074](../adr/0074-a-fragment-expression-node-is-added-by-tag-not-by-version.md). The commit that
+introduced it (`68bfdf02`) names 0073 in its message and that is now wrong; it is recorded here
+rather than rewritten, because the history is what a reader greps and a message that silently
+disagreed with the file would be worse than one that is corrected in the open.
+
+### J11. What is left, and the one thing it needs
+
+Built: the red differential, `Expr::In` with its ADR, and `EXPLAIN` naming an engine for every join
+with the rule that refused it. Left: the rewrite itself — collect the inner side's key set at
+resolve time, in the same transaction at the same snapshot, and put it into the outer fragment's
+filter as an `In`.
+
+That needs the plan to carry **which inner table and column to read**, and the node that carries a
+routing decision is `routing::Columnar` in `crates/esker-sql/src/plan/routing.rs` — one field, in a
+directory this lane was told to stay out of. The seam itself has a precedent in the same call site:
+`subquery::resolve(&mut planned.node, &*txn, tenant)` already does exactly this shape of work with a
+transaction in hand. Asked of the coordinator and not yet answered; until it is, this file is the
+specification and the red test is the acceptance.
