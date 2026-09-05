@@ -1,0 +1,19 @@
+crates/esker-engine/tests/db.rs
+  s_2bed4ac2b1c944::t_80e08781cc5ea1 1902-1905
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "efaad124eb65290322ff2a59b9586dfc722c5470",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
