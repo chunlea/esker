@@ -1,0 +1,14 @@
+docs/bench/mpp-baseline.md
+  h_44076b318daf9c 288-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fd30c9e9789f8c828cc1a51628d48a4cc3310778",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
