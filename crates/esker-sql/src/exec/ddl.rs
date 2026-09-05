@@ -3829,15 +3829,39 @@ pub(super) fn drop_schema(
                 detail,
             });
         }
-        // Only the **tables** are dropped, and each takes its own indexes, sequences and primary
-        // key with it — the same path `DROP TABLE ... CASCADE` walks, so nothing is left behind
-        // and nothing is dropped twice.
+        // The **tables** first, each taking its own indexes, sequences and primary key with it —
+        // the same path `DROP TABLE ... CASCADE` walks, so nothing is dropped twice.
         for stored in &held {
             if let Some(catalog::Relation::Table { table_id }) =
                 executor.catalog_view(&*txn)?.relation(stored)?
             {
                 let table = executor.table_by_id(txn, table_id)?;
                 forgotten.extend(drop_one_table(executor, txn, &table)?);
+            }
+        }
+        // **Then whatever is left, which used to be nothing and is not.** This loop dropped only
+        // `Relation::Table` and skipped every other kind in silence, so a sequence created on its
+        // own — `CREATE SEQUENCE test_schema.s`, owned by no column — kept its name record while
+        // the schema record went. The next `CREATE SEQUENCE` of that name then answered
+        // `42P07 relation "test_schema.s" already exists` naming a schema that no longer existed:
+        // 51 tests of `schema_test.rb`, whose `setup` ends with exactly that statement and whose
+        // `teardown` is `DROP SCHEMA … CASCADE`.
+        //
+        // A name resolved here is one the table loop did not take, so re-reading is what tells
+        // "owned by a table, already gone" from "standalone, still here" without tracking either.
+        for stored in &held {
+            let Some(catalog::Relation::Sequence {
+                table_id,
+                sequence_id,
+            }) = executor.catalog_view(&*txn)?.relation(stored)?
+            else {
+                continue;
+            };
+            if let Some(sequence) =
+                catalog::sequence_by_id(txn, executor.tenant, table_id, sequence_id)?
+            {
+                catalog::drop_sequence(txn, executor.tenant, table_id, &sequence);
+                forgotten.push(sequence_id);
             }
         }
         // The types go too, and after the tables: a column declared as one of them has already
