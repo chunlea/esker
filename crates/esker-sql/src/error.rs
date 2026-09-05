@@ -2021,6 +2021,13 @@ pub enum SqlError {
         existing: String,
     },
 
+    /// A second `PRIMARY KEY` on a table that already has one: `42P16`.
+    ///
+    /// Measured: `multiple primary keys for table "mpk" are not allowed`, which a real server says
+    /// for `ALTER TABLE … ADD COLUMN … PRIMARY KEY` as well as for two in one `CREATE TABLE`.
+    #[error("multiple primary keys for table \"{0}\" are not allowed")]
+    MultiplePrimaryKeys(String),
+
     /// A row an `EXCLUDE` constraint refuses: `23P01`.
     ///
     /// The `DETAIL` prints **both** keys — the one being written and the one already stored — as
@@ -2700,6 +2707,7 @@ impl SqlError {
             SqlError::ExclusionViolation { .. } | SqlError::ExclusionNotCreatable { .. } => {
                 sqlstate::EXCLUSION_VIOLATION
             }
+            SqlError::MultiplePrimaryKeys(_) => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }

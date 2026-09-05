@@ -1,0 +1,52 @@
+# What PostgreSQL 19beta1 does with a primary key added to a table that already exists.
+#
+# Taken by the g1-ddl lane for `compatibility_test.rb`, which builds a table with no key and then
+# adds one two ways:
+#
+#   create_table :legacy_primary_keys, id: false do |t| t.integer :dummy end
+#   add_column :legacy_primary_keys, :id, :primary_key      -> ALTER TABLE … ADD "id" serial primary key
+#   change_table(:legacy_primary_keys) { |t| t.primary_key :id }
+#
+# The adapter's type map is `primary_key: "bigserial primary key"`; a legacy migration writes
+# `serial`. Both spellings are below because they give different column types.
+#
+# THE ROW THAT DECIDES THE SCOPE is the last group: on a table that already holds rows, PostgreSQL
+# **fills the new column from the sequence** — two rows get 1 and 2. That is a table rewrite, and
+# this node does not do it; the empty-table case is what the suite sends and what is implemented.
+#
+#   statement <tab> <tab> -            accepted, no result set
+#   statement <tab> types <tab> rows   a query and its answer
+#   statement <tab> !SQLSTATE msg      refused
+
+BEGIN		-
+CREATE TABLE g1_apk (dummy integer)		-
+ALTER TABLE "g1_apk" ADD "id" serial primary key		-
+# ---- integer, NOT NULL, a sequence default, and a derived constraint name ----
+SELECT 'r', a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid='g1_apk'::regclass AND a.attnum>0 ORDER BY a.attnum	text,name,text,boolean	r|dummy|integer|f ; r|id|integer|t
+SELECT 'r', c.conname, c.contype FROM pg_constraint c WHERE c.conrelid='g1_apk'::regclass AND c.contype='p'	text,name,"char"	r|g1_apk_pkey|p
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='g1_apk'::regclass	text,text	r|nextval('g1_apk_id_seq'::regclass)
+# ---- bigserial is the other spelling and gives bigint ----
+SAVEPOINT s1		-
+CREATE TABLE g1_apk2 (dummy integer)		-
+ALTER TABLE g1_apk2 ADD "id" bigserial primary key		-
+SELECT 'r', format_type(a.atttypid,a.atttypmod) FROM pg_attribute a WHERE a.attrelid='g1_apk2'::regclass AND a.attname='id'	text,text	r|bigint
+ROLLBACK TO s1		-
+# ---- the constraint form, over a column that is already there ----
+SAVEPOINT s2		-
+CREATE TABLE g1_apk3 (id bigint, dummy integer)		-
+ALTER TABLE g1_apk3 ADD CONSTRAINT g1_apk3_pkey PRIMARY KEY (id)		-
+SELECT 'r', c.conname FROM pg_constraint c WHERE c.conrelid='g1_apk3'::regclass AND c.contype='p'	text,name	r|g1_apk3_pkey
+ROLLBACK TO s2		-
+# ---- and the one this node does not do: the rows are filled from the sequence ----
+SAVEPOINT s3		-
+CREATE TABLE g1_apk4 (dummy integer)		-
+INSERT INTO g1_apk4 VALUES (1),(2)		-
+ALTER TABLE g1_apk4 ADD "id" serial primary key		-
+SELECT 'r', dummy, id FROM g1_apk4 ORDER BY dummy	text,integer,integer	r|1|1 ; r|2|2
+ROLLBACK TO s3		-
+# ---- a second primary key is refused, and this node must say the same ----
+SAVEPOINT s4		-
+CREATE TABLE g1_apk5 (a int primary key)		-
+ALTER TABLE g1_apk5 ADD COLUMN b int PRIMARY KEY	!42P16 multiple primary keys for table "g1_apk5" are not allowed
+ROLLBACK TO s4		-
+ROLLBACK		-

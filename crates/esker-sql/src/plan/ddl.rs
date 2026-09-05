@@ -1200,10 +1200,18 @@ pub enum AlterTableAction {
     /// `ADD [COLUMN] [IF NOT EXISTS] <column> <type>`, nullable and with no default — the only
     /// shape that needs no row rewritten.
     AddColumn {
-        /// The column to append. Always nullable: `NOT NULL` and `DEFAULT` are refused by name.
+        /// The column to append, with its `NOT NULL`, its `DEFAULT` and — since the legacy
+        /// primary-key unit — its sequence, if it was declared `serial`.
         column: Column,
         /// `IF NOT EXISTS`: a column that is already there is a notice rather than a `42701`.
         if_not_exists: bool,
+        /// `PRIMARY KEY` written on the column.
+        ///
+        /// The table keeps whatever identity its rows already have — a table created without a key
+        /// has a hidden row-id column and goes on using it, which is a fact about the *stored
+        /// rows* and not about whether a key is declared ([`crate::catalog::TableDef::row_id`]).
+        /// So this declares a key rather than re-keying anything.
+        primary_key: bool,
     },
     /// `DROP [COLUMN] [IF EXISTS] <name> [CASCADE|RESTRICT]`.
     ///
@@ -1385,6 +1393,17 @@ pub enum AlterTableAction {
         /// How many, or `None` for `RESET`, which forgets the setting. Zero is legal and means
         /// the same as forgetting it to every reader.
         replicas: Option<u8>,
+    },
+    /// `ADD CONSTRAINT … PRIMARY KEY (…)` over columns the table already has.
+    ///
+    /// The other half of `ADD COLUMN … PRIMARY KEY`, and the spelling `change_table`'s
+    /// `t.primary_key :id` sends when the column is already there. It declares a key and re-keys
+    /// nothing — see [`AlterTableAction::AddColumn`]'s `primary_key` for why that is sound.
+    AddPrimaryKey {
+        /// The constraint's name, or `None` for the one a real server derives (`<table>_pkey`).
+        name: Option<String>,
+        /// The key's columns, by name, in the order written.
+        columns: Vec<String>,
     },
     /// `ADD CONSTRAINT … EXCLUDE (…)` on a table that already exists.
     ///
