@@ -33,9 +33,9 @@ pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AddValuePosition, AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, AlterType,
     AlterTypeAction, Column, ColumnDefault, Comment, CommentObject, CreateDatabase,
-    CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateSchema,
+    CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateRole, CreateSchema,
     CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
-    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropSchema, DropSequence,
+    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole, DropSchema, DropSequence,
     DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName,
     PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint, foreign_key_name,
     index_name, primary_key_name, sequence_name, unique_constraint_name,
@@ -106,6 +106,8 @@ pub enum Statement {
     AlterIndexRename(AlterIndexRename),
     /// `CREATE SCHEMA` — a second namespace, which is a catalog object like any other here.
     CreateSchema(CreateSchema),
+    /// `CREATE ROLE` / `CREATE USER`.
+    CreateRole(CreateRole),
     /// `CREATE VIEW` — a stored `SELECT`, expanded where it is read.
     CreateView(CreateView),
     /// `DROP VIEW`.
@@ -125,6 +127,8 @@ pub enum Statement {
     DropDatabase(DropDatabase),
     /// `DROP SCHEMA [CASCADE]`.
     DropSchema(DropSchema),
+    /// `DROP ROLE` / `DROP USER`.
+    DropRole(DropRole),
     /// `ALTER SCHEMA … RENAME TO …`.
     AlterSchemaRename(AlterSchemaRename),
     /// `CREATE INDEX`, and the `UNIQUE` variant.
@@ -233,6 +237,8 @@ impl Statement {
             Statement::DropExtension(_) => Some("DROP EXTENSION"),
             Statement::AlterIndexRename(_) => Some("ALTER INDEX"),
             Statement::CreateSchema(_) => Some("CREATE SCHEMA"),
+            Statement::CreateRole(_) => Some("CREATE ROLE"),
+            Statement::DropRole(_) => Some("DROP ROLE"),
             Statement::CreateView(_) => Some("CREATE VIEW"),
             Statement::DropView(_) => Some("DROP VIEW"),
             Statement::CreateDatabase(_) => Some("CREATE DATABASE"),
@@ -298,6 +304,8 @@ impl Statement {
             Statement::DropExtension(_) => "DROP EXTENSION",
             Statement::AlterIndexRename(_) => "ALTER INDEX",
             Statement::CreateSchema(_) => "CREATE SCHEMA",
+            Statement::CreateRole(_) => "CREATE ROLE",
+            Statement::DropRole(_) => "DROP ROLE",
             Statement::DropSchema(_) => "DROP SCHEMA",
             Statement::CreateView(_) => "CREATE VIEW",
             Statement::DropView(_) => "DROP VIEW",

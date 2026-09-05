@@ -185,6 +185,10 @@ pub enum CatalogView {
     /// asking. That row is **true**: it is `active`, because it is running the query that reads
     /// the view, and its `datname` is the database it is serving.
     PgStatActivity,
+    /// `pg_roles`, the readable view of the cluster's roles.
+    PgRoles,
+    /// `pg_authid`, the same rows with the columns `pg_roles` hides behind NULL.
+    PgAuthid,
     /// **Who holds a row lock on this node, and who is waiting for one** — the view a stuck
     /// session's counterpart can be found in.
     ///
@@ -244,7 +248,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 34] = [
+    pub const ALL: [CatalogView; 36] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -266,6 +270,8 @@ impl CatalogView {
         CatalogView::PgViews,
         CatalogView::PgMatviews,
         CatalogView::PgStatActivity,
+        CatalogView::PgRoles,
+        CatalogView::PgAuthid,
         CatalogView::PgLocks,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
@@ -307,6 +313,8 @@ impl CatalogView {
             CatalogView::PgViews => "pg_views",
             CatalogView::PgMatviews => "pg_matviews",
             CatalogView::PgStatActivity => "pg_stat_activity",
+            CatalogView::PgRoles => "pg_roles",
+            CatalogView::PgAuthid => "pg_authid",
             CatalogView::PgLocks => "pg_locks",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
@@ -415,6 +423,11 @@ impl CatalogView {
                 // above records.
                 CatalogView::PgMatviews => 29,
                 CatalogView::PgStatActivity => 28,
+                // **34 and 35, claimed out loud.** The last id this lane took collided with g1's,
+                // because we both read the array at our own HEAD and both saw the same next
+                // number free (`no_two_views_share_a_relation_id_or_a_name` is the guard).
+                CatalogView::PgRoles => 34,
+                CatalogView::PgAuthid => 35,
                 // **31, because 30 is `InformationSchemaDomains`'s.** This view and g1's
                 // domains view were written in parallel and both took 30, which git merged
                 // without a word: the arrays combined cleanly and the id collided. Two views
@@ -672,6 +685,25 @@ impl CatalogView {
                 ("fastpath", ColumnType::Bool),
                 ("waitstart", ColumnType::TimestampTz),
             ],
+            // **`pg_roles` and `pg_authid` are the same rows.** On a real server `pg_roles` is a
+            // view over `pg_authid` that replaces the password with `********` and is readable by
+            // everyone, where `pg_authid` is superuser-only. This node stores no password and
+            // enforces no privilege, so the two differ in exactly one column and that is honest
+            // rather than lazy: `rolpassword` is NULL here either way.
+            CatalogView::PgRoles | CatalogView::PgAuthid => &[
+                ("oid", ColumnType::Oid),
+                ("rolname", ColumnType::Text),
+                ("rolsuper", ColumnType::Bool),
+                ("rolinherit", ColumnType::Bool),
+                ("rolcreaterole", ColumnType::Bool),
+                ("rolcreatedb", ColumnType::Bool),
+                ("rolcanlogin", ColumnType::Bool),
+                ("rolreplication", ColumnType::Bool),
+                ("rolbypassrls", ColumnType::Bool),
+                ("rolconnlimit", ColumnType::Int4),
+                ("rolpassword", ColumnType::Text),
+                ("rolvaliduntil", ColumnType::TimestampTz),
+            ],
             CatalogView::PgStatActivity => &[
                 ("datid", ColumnType::Oid),
                 ("datname", ColumnType::Text),
@@ -827,6 +859,8 @@ impl CatalogView {
             CatalogView::PgViews => views_rows(txn, tenant),
             CatalogView::PgMatviews => matviews_rows(txn, tenant),
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
+            CatalogView::PgRoles => role_rows(txn, false),
+            CatalogView::PgAuthid => role_rows(txn, true),
             CatalogView::PgLocks => Ok(locks_rows(txn, tenant)),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             // **The standard's views delegate as a group**, in their own function: they are six
@@ -973,6 +1007,8 @@ impl CatalogView {
             | CatalogView::PgAm
             | CatalogView::PgTsConfig
             | CatalogView::PgProc
+            | CatalogView::PgRoles
+            | CatalogView::PgAuthid
             | CatalogView::PgTrigger
             | CatalogView::PgLanguage
             | CatalogView::PgPartitionedTable
@@ -1452,6 +1488,39 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
         ]);
     }
     rows
+}
+
+/// Every role, for `pg_roles` and `pg_authid`.
+///
+/// One function for both, because the rows are the same: see the column list. `_authid` is there
+/// so the difference has a name if this node ever stores a password.
+fn role_rows(txn: &dyn crate::backend::Txn, _authid: bool) -> Result<Vec<Vec<Datum>>> {
+    Ok(super::roles(txn)?
+        .into_iter()
+        .map(|role| {
+            vec![
+                Datum::Int8(i64::try_from(role.oid).unwrap_or(i64::MAX)),
+                Datum::Text(role.name),
+                // Six attributes this node does not grant and does not enforce, false for every
+                // role it can make. `rolinherit` is the exception and is `true`, which is what
+                // `CREATE ROLE` defaults to on a real server (measured).
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                // **The one attribute that is real**: `CREATE USER` implies it, `CREATE ROLE` does
+                // not, and nothing else about the two statements differs.
+                Datum::Bool(role.can_login),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                // No connection limit, which is `-1` rather than NULL.
+                Datum::Int4(-1),
+                // No password is stored, so there is none to hide.
+                Datum::Null,
+                Datum::Null,
+            ]
+        })
+        .collect())
 }
 
 fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
