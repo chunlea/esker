@@ -1,0 +1,14 @@
+crates/esker-store/tests/snapshot.rs
+  h_44076b318daf9c 241-275,304,306-309,311-313,381-407,431-461,1233-1236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "42950b3a232f90a73fcfb2094e2ce45df4e64f19",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
