@@ -1,0 +1,21 @@
+crates/esker-cli/tests/pgwire_cluster.rs
+  s_6f7019c05b578b::t_c7c7450a94bebb 63,73-76,86,201-215,223-224,226,252-259,261-272
+crates/esker-sql/tests/statement_cancellation.rs
+  s_6f7019c05b578b::t_0955847293c4d2 231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "366f77cf843a7e9258cf4d905c44359659875bd9",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
