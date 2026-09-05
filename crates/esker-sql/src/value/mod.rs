@@ -36,6 +36,7 @@ pub mod arith;
 /// `array_in` and `array_out`: an array literal read, and an array value printed.
 pub mod array;
 pub mod bit;
+pub mod composite;
 pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
