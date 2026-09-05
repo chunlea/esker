@@ -431,13 +431,10 @@ mod tests {
         // The shipped default is 12,500, past it — the planner refuses and the run must expect
         // rows rather than call the refusal a fault.
         assert_eq!(expects_columnar(100_000), (12_500, false));
-        // The boundary itself, from both sides: a fragment carries exactly MAX_IN_VALUES.
-        assert_eq!(
-            expects_columnar(32_768).1,
-            true,
-            "8 * 4,096 keys is the cap exactly"
-        );
-        assert_eq!(expects_columnar(32_776).1, false, "one key past it");
+        // The boundary itself, from both sides, with the key count pinned and not just the
+        // verdict: 8 * 4,096 groups is exactly the cap, and eight more groups is one key past it.
+        assert_eq!(expects_columnar(32_768), (4_096, true));
+        assert_eq!(expects_columnar(32_776), (4_097, false));
     }
 
     #[test]
