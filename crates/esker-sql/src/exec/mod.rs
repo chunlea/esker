@@ -1508,7 +1508,11 @@ impl Executor {
         self.fill_sequence_reads(&mut planned.node)?;
         let mut raw = Vec::new();
         {
-            let mut cursor = cursor::Cursor::open(&*txn, self.tenant, &planned.node)?;
+            // Resolved once, before the cursor opens: `::regclass::text` prints a relation's name
+            // qualified only when its schema is off the path, so the answer is a property of this
+            // session and has to travel with the plan.
+            let path = self.resolved_search_path(&*txn)?;
+            let mut cursor = cursor::Cursor::open(&*txn, self.tenant, &path, &planned.node)?;
             while let Some(row) = cursor.next()? {
                 raw.push(row);
             }
@@ -1941,7 +1945,8 @@ impl Executor {
                         );
                     }
                     subquery::resolve(&mut planned.node, txn, self.tenant)?;
-                    let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;
+                    let path = self.resolved_search_path(txn)?;
+                    let mut cursor = cursor::Cursor::open(txn, self.tenant, &path, &planned.node)?;
                     while cursor.next()?.is_some() {}
                 }
                 planned.node.explain(

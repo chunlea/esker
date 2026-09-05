@@ -809,7 +809,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
 /// `EXISTS` stops at one, a scalar at two, because the second row *is* the `21000` and a third
 /// would be read for nobody.
 fn rows_of(plan: &Node, kind: SubqueryKind, txn: &dyn Txn, tenant: u64) -> Result<Vec<Datum>> {
-    let mut cursor = Cursor::open(txn, tenant, plan)?;
+    let mut cursor = Cursor::open(txn, tenant, &[], plan)?;
     let wanted = kind.rows_needed();
     let mut values = Vec::new();
     while let Some(row) = cursor.next()? {
