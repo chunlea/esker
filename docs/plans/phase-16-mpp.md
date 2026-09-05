@@ -414,6 +414,24 @@ Named so the next person can check them rather than re-derive them:
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
    parallel dispatch, not before.**
 
+### Agreement is not correctness
+
+The sentence this whole thread reduces to, kept here because it was learned three times in one
+night and each time it cost a wrong conclusion.
+
+Two engines returning the same rows is not evidence that either is right. The defect that started
+this returned **four times** the correct count with both arms internally consistent — and twice
+before that, a matrix headed `columnar` reported "0 disagreements" while both arms were in fact the
+row engine: once because no learner had been placed so every fragment refused, and once because the
+interim guard had deliberately put them there. A comparison is worth exactly what its denominator
+is worth.
+
+So the acceptance test computes its expected values **from the fixture** — two hundred rows,
+`bucket = id % 4`, `amount = id`, so every count and sum is known without asking anything — and
+asserts the engine that answered **before** it compares. Nothing is asked of an engine to validate
+an engine. `routing_differential` had the same rule first, in the other direction, for the same
+reason: *"a query that fell back agrees with the row engine for free"*.
+
 ### The guard, retired by the flip — and what re-arms it
 
 A multi-region columnar query returned **N times** the right answer (measured 2026-09-05,
@@ -693,3 +711,145 @@ directory this lane was told to stay out of. The seam itself has a precedent in 
 `subquery::resolve(&mut planned.node, &*txn, tenant)` already does exactly this shape of work with a
 transaction in hand. Asked of the coordinator and not yet answered; until it is, this file is the
 specification and the red test is the acceptance.
+
+## J12. `08006 … key is not in region 0`, and what a fragment may do about it
+
+The join differential went red on the ci-tree with a message that looks like a routing bug and is
+one — but not the one it was first read as. This section records what the error is, because the
+repair that fixes it is not the repair the symptom suggests, and two lanes were briefly about to
+build the wrong one.
+
+### What the message is
+
+`region 0` is not a region. It is synthesised by the **client's own router**, in
+`crates/esker-client/src/router.rs`:
+
+```rust
+let route = self.resolver.locate(key)?.ok_or_else(|| {
+    ProtoError::KeyNotInRegion {
+        key: Bytes::copy_from_slice(key),
+        region_id: 0,
+        start_key: Bytes::new(),
+        end_key: Bytes::new(),
+    }
+})?;
+```
+
+So the error means **the placement driver answered "no region covers this key"** —
+`PdReq::GetRegion` returning `region: None` (`crates/esker-pd/src/service.rs`), which is
+`pd.get_region` finding nothing in the range index (`crates/esker-pd/src/pd/mod.rs`). No store was
+asked and no store refused. Three consequences follow, and each one contradicts a reasonable first
+reading:
+
+1. **It is not invariant 5 firing.** A store refusing a stale epoch answers `EpochNotMatch`, and a
+   store refusing a key outside its range answers `KeyNotInRegion` carrying *its own* region id and
+   *its own* bounds (`crates/esker-store/src/region.rs`, `not_in_region`). A real region id and
+   real bounds are the signature of a store refusal; `0` with two empty bounds is the signature of
+   the driver having no answer.
+2. **"Believe the refusal's bounds" cannot be done here.** The bounds are empty by construction.
+   This matters because the repair already exists twice — `txn.rs`'s scan loop and `raw.rs`'s, both
+   spending `SCAN_ROUTE_REFRESHES` on it — and **both guard on `owns(&start_key, &end_key, cursor)`**,
+   which is false for an empty range. That is precisely why the existing repair does not catch this
+   case and the error reaches the client: not a missing repair, a repair whose precondition this
+   error cannot meet.
+3. **It is transient, and classified terminal.** `KeyNotInRegion` is `Verdict::Surface` — correct
+   for a key that belongs to no region, wrong for a key whose region was created a moment ago and
+   whose driver has not caught up. A split is applied by the store immediately and reaches PD at
+   the next region heartbeat, so there is a window in which the driver's routing table is behind
+   the cluster. `cross_region_scan.rs` hits it on **"the last row, in the last region"**, which is
+   exactly where a freshly split upper half lives.
+
+So the half of the shared helper that fixes this is the half written as *"bounded retries against a
+stale driver"*, not the half written as *"believe the refusal's bounds"*. The second half is
+already built, twice, and is being unified; the first is the new work, and `region 0` is its test
+case.
+
+### What the fragment path needed, and what it did not
+
+The fragment dispatch never surfaced this error and could not have: `exec::fragment::evaluate`
+treats every `Err` from a source the same way the module docs promise — fall back to the row plan
+at the same snapshot — so an `08006` seen by a client on a routed query came from the **row
+fallback**, not from the dispatch. There was therefore no second copy of the repair to write here,
+and none was written.
+
+What was missing is different, and is this unit: **a fragment refused for a stale route gave up on
+the columnar path entirely.** On a cluster that is actively splitting, every routed query paid a
+full fallback. `evaluate` now asks the source for the regions that cover the refused shard's range
+and walks them in its place — one call to the trait's existing `shards`, so h1's helper lands
+underneath it and needs no signature here.
+
+### The rule, and why it is stricter than the row path's
+
+**A fragment is not a cursor.** The scan paths repair a route by believing the store's bounds and
+*continuing* from where they stopped, which is safe because a resumed walk covers each key once
+however the boundaries moved. A fragment is an aggregate over the whole of one region's columnar
+copy with no key range applied — `esker_columnar` refuses a `KeyRange`, because a columnar file
+records none — so a re-dispatch changes not where a walk resumes but **which rows are counted**. A
+replacement set covering one byte more than the shard it replaces counts that byte twice: once
+here, once against whichever original shard also holds it.
+
+So the replacement is followed only when it **tiles the refused range exactly** — equal at both
+ends, no gap between:
+
+| what happened | replacement | followed? |
+|---|---|---|
+| split | re-tiles the range exactly | yes |
+| merge | reaches past the refused end | no — rows |
+| gap | covers less than the range | no — rows |
+| store down | the same shard back, unchanged | no — rows, and the budget is not spent |
+| region keeps moving | legal every time | up to `MAX_ROUTE_REPAIRS` (4), then rows |
+
+Each row is a test in `crates/esker-sql/tests/fragment_route_repair.rs`. Three of the five assert
+the **fallback and the requests sent**, not the answer, and that is the point: the row engine is
+correct, so agreeing with it proves nothing about which rule produced the agreement — the sentence
+this whole thread turns on. The two that do assert an answer assert **12** against a table holding
+**2**, so a dispatch that quietly stopped routing cannot pass them.
+
+The budget is four, matching the scan paths' `SCAN_ROUTE_REFRESHES`, and for the same reason: each
+repair leaves the query aimed better, but a region that moves on every attempt is one this
+statement cannot read at this snapshot, and the row plan answers it correctly while an unbounded
+walk would not answer it at all.
+
+One operator-facing consequence, deliberate: `EXPLAIN ANALYZE` counts the fragments **sent**, so a
+query that followed a split reads `Fragments: 4 asked, 3 answered` and still answers completely.
+That is not a lost fragment — it is the one visible sign that this query met a region that was
+moving, and flattening it to `3 asked` would hide the only evidence the repair ever runs.
+
+### The driver-side half, and the one line that still connects it
+
+`esker-client`'s `router::repair_route` (h1, `50fbad88`) is the shared repair, and it reaches the
+same reading of `region 0` independently: *"a fact about the driver's knowledge, not about the
+cluster"*. It believes the refusal's bounds when they contain the key and otherwise re-resolves on
+the router's own jittered backoff before giving up.
+
+**The fragment path reaches it through the enumeration it already calls.** `FragmentClient::shards`
+was the one walk of the three that mapped `Router::route`'s error straight to its caller, which is
+where `region 0` actually surfaced; h1's v47 made it a third caller of `repair_route`. So:
+
+```rust
+let mut route = match self.router.route(&key) {
+    Ok(route) => route,
+    Err(refusal) => crate::router::repair_route(&self.router, &key, &refusal)?,
+};
+```
+
+**Nothing further is owed in `esker-sql`, and `repair_route` should stay `pub(crate)`.** It was
+offered to be widened for this dispatch; it does not need to be. `re_routed` asks the trait's
+`shards`, which *is* that function, so the repair arrives underneath with no new seam and no second
+copy — and a planner reaching into the client's concrete types is precisely the coupling
+`crate::fragment`'s trait exists to prevent (`crates/esker-sql/src/fragment.rs`, module docs).
+
+It also keeps this dispatch clear of the trap the helper turns on. `repair_route` believes a
+refusal's bounds when they contain the key — but `owns(b"", b"", key)` is **true for every key**, so
+the driver's own empty-bounded refusal would be believed as if it were a store's, and an empty range
+would come to mean the opposite of what it says. `re_routed` never reads a refusal's bounds at all:
+it re-enumerates and checks the tiling of what comes back, so the distinction is one it cannot get
+wrong because it never makes it.
+
+### Whether `region 0` deserves its own error
+
+Flattening "no region covers this key" into `KeyNotInRegion` is what makes it indistinguishable
+from a store's refusal at every call site that matches on the variant — and what made a repair
+guarded on `owns(&start_key, &end_key, ..)` silently skip it, since the synthesised bounds are
+empty. Naming it separately is an `esker-proto` change and an ADR, and is the coordinator's to
+sequence — recorded here rather than improvised.
