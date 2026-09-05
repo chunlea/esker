@@ -292,14 +292,13 @@ fn a_scan_never_asks_a_region_for_keys_it_does_not_hold() {
             .iter()
             .find(|(id, _)| id == store)
             .expect("a scripted store");
-        match boundary {
-            // A bounded region: the request must stop at the boundary, not at the caller's end.
-            Some(edge) => assert!(
+        // A bounded region: the request must stop at the boundary, not at the caller's end. The
+        // last region has none, and an unbounded request there is the caller's own range.
+        if let Some(edge) = boundary {
+            assert!(
                 !end.is_empty() && end.as_ref() <= *edge,
                 "store {store} was asked for [{start:?}, {end:?}), past its own {edge:?}"
-            ),
-            // The last region: an unbounded request is the caller's own range and is correct.
-            None => {}
+            );
         }
     }
 }
