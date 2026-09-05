@@ -57,6 +57,37 @@ fn startup_packet(minor: u16, extra: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// Reads until a `ReadyForQuery` has arrived, or gives up rather than hanging the suite.
+/// Reads until an `ErrorResponse` arrives or the server hangs up.
+///
+/// **Not `read_until_ready`, and the difference is a real ordering.** A database this cluster does
+/// not have is refused by `for_session`, which runs *after* the handshake — so the `3D000` arrives
+/// **after** the `ReadyForQuery` the startup burst already sent, in a later write. A reader that
+/// stops at the first `Z` returns before the error exists; it only ever saw one because a
+/// synchronous `for_session` sometimes wrote both within a single poll, and moving that call to
+/// the blocking pool (where it belongs — it does store I/O) lost that race.
+///
+/// The ordering itself is worth a second look one day: a real server refuses a missing database
+/// *instead of* the burst, not after it.
+async fn read_until_error(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if frames(&buffer).iter().any(|(tag, _)| *tag == 'E') {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the server did not answer within five seconds");
+    buffer
+}
+
 async fn read_until_ready(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
     let mut buffer = Vec::new();
     let deadline = Duration::from_secs(5);
@@ -129,7 +160,7 @@ async fn a_database_the_cluster_does_not_have_is_refused_at_startup() {
     client.write_all(&startup_packet(0, &[])).await.unwrap();
     client.flush().await.unwrap();
 
-    let reply = read_until_ready(&mut client).await;
+    let reply = read_until_error(&mut client).await;
     let error = frames(&reply)
         .into_iter()
         .find(|(tag, _)| *tag == 'E')

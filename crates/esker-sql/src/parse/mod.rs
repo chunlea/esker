@@ -1261,9 +1261,17 @@ fn rewrite_user_as_role(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     kept.push_str("ROLE");
     kept.push_str(sql.get(at + "USER".len()..)?);
     if creating {
-        // Appended rather than inserted, so a `CREATE USER x` with options keeps them and the
-        // implied attribute is simply one more.
-        kept.push_str(" LOGIN");
+        // **Before the terminator, not after it.** Appended to the whole string, `CREATE USER bob
+        // SUPERUSER;` became `CREATE ROLE bob SUPERUSER; LOGIN` — a second statement consisting of
+        // one keyword, and a `42601` about correct SQL. The syntax corpus caught it, which is what
+        // that corpus is for: it replays everything PG19 accepts and refuses to let any of it come
+        // back a syntax error.
+        //
+        // The option order is free on a real server, so the end of the statement is a fine place
+        // for it; the end of the *source* is not.
+        let end = kept.trim_end();
+        let insert_at = end.strip_suffix(';').map_or(end.len(), str::len);
+        kept.insert_str(insert_at, " LOGIN");
     }
     Some(kept)
 }

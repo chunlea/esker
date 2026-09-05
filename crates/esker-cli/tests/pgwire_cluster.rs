@@ -43,6 +43,15 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+/// How long a process may take to open its port before this is a wedge rather than a slow box.
+///
+/// **A bound on a hang, not a performance claim.** Every wait here is on an event — the port
+/// accepting — and this is only the outer edge. Alone the whole test is under three seconds; in a
+/// full workspace run, with three thousand other tests on the machine, it once took seventy and
+/// tripped a sixty-second edge. That was load, not a wedge, and a bound that fires on load is a
+/// bound that teaches people to re-run.
+const STARTUP_SECONDS: u64 = 180;
+
 #[test]
 fn a_client_runs_one_statement_against_a_real_cluster() {
     let data_dir = TempDir::new().unwrap();
@@ -61,10 +70,10 @@ fn a_client_runs_one_statement_against_a_real_cluster() {
             .spawn()
             .expect("the cluster starts"),
     );
-    wait_for("the store to listen", 60, || {
+    wait_for("the store to listen", STARTUP_SECONDS, || {
         TcpStream::connect(("127.0.0.1", store_port)).is_ok()
     });
-    wait_for("the driver to listen", 60, || {
+    wait_for("the driver to listen", STARTUP_SECONDS, || {
         TcpStream::connect(("127.0.0.1", pd_port)).is_ok()
     });
 
@@ -78,7 +87,7 @@ fn a_client_runs_one_statement_against_a_real_cluster() {
             .spawn()
             .expect("`esker-sql` runs"),
     );
-    wait_for("the SQL node to listen", 60, || {
+    wait_for("the SQL node to listen", STARTUP_SECONDS, || {
         TcpStream::connect(("127.0.0.1", sql_port)).is_ok()
     });
 
