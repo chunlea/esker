@@ -1,0 +1,47 @@
+crates/esker-sql/src/catalog/def_functions.rs
+  s_2bed4ac2b1c944::t_074b47859d9d3f 43,141,147-153
+crates/esker-sql/src/catalog/information_schema.rs
+  s_2bed4ac2b1c944::t_abcfd05d35c33d 39,197,226
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_2bed4ac2b1c944::t_bbd21f3237ec60 182-186,194,360-364,473-478,540-542
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_d960cc4a825750 880,889,909-920,929,947
+crates/esker-sql/src/exec/cursor.rs
+  s_2bed4ac2b1c944::t_ee271616e3cc1d 42-70,74-75,305,313,325,329,364,371-374,439,456,475,479,484,489,496,498,518,530,538,556,1087,1093,1096,1151-1153,1163,1176,2120-2126,2988
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_0088dc1a43232b 1520,1522
+crates/esker-sql/src/exec/dml.rs
+  s_2bed4ac2b1c944::t_ce3f44d867fa69 1997,2155
+crates/esker-sql/src/exec/fragment.rs
+  s_2bed4ac2b1c944::t_2654e1899f5a04 1384-1390
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_8323e1dc0ff105 1249-1260,1561-1562,2004-2009
+crates/esker-sql/src/exec/subquery.rs
+  s_2bed4ac2b1c944::t_c1ba30ad5a6e3d 813
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_5f7780a2e39f1d 1697-1719,1723,1783,2537,2904
+crates/esker-sql/src/parse/mod.rs
+  s_2bed4ac2b1c944::t_9c80ac5ee3970c 2185,2196
+crates/esker-sql/tests/corpus/pg19_interval.txt
+  s_2bed4ac2b1c944::t_1953b0dc805f49 58,61-66,137,139,141
+crates/esker-sql/tests/interval.rs
+  s_2bed4ac2b1c944::t_8cdd594999e26e 3,7-10,12-17
+crates/esker-sql/tests/interval_style.rs
+  s_2bed4ac2b1c944::t_a102b7158b73ef 114-118,127-131,136-138,286-364
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "8d680481280694c4c48f9d82a2f3fdc1615852e1",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
