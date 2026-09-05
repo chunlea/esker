@@ -1,0 +1,25 @@
+# A **schema-qualified type name**, which `schema_test.rb`'s
+# `DefaultsUsingMultipleSchemasAndDomainTest` writes: a `CREATE DOMAIN schema_1.text AS text`
+# and then `'some text'::schema_1.text`. Run 81's residual, and the other half of the unit
+# that made the type-name *parser* one: the parser is shared and the **lookups behind it**
+# were not — a column type resolved the qualification, a cast did not, and a `regtype`
+# failed differently again.
+CREATE SCHEMA schema_9		-
+CREATE DOMAIN schema_9.text AS text		-
+CREATE TABLE d (id int8 primary key, v schema_9.text)		-
+SELECT 'r', column_name, data_type, udt_name, udt_schema FROM information_schema.columns WHERE table_name = 'd' ORDER BY ordinal_position	text,name,character varying,name,name	r|id|bigint|int8|pg_catalog ; r|v|text|text|pg_catalog
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"d"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|id|bigint ; r|v|schema_9.text
+INSERT INTO d VALUES (1, 'some text')		-
+SELECT 'r', id, v FROM d ORDER BY id		r|1|some text
+SELECT 'r', 'some text'::schema_9.text		r|some text
+SELECT 'r', pg_typeof('some text'::schema_9.text)		r|schema_9.text
+ALTER TABLE d ALTER COLUMN v SET DEFAULT 'x'::schema_9.text		-
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = '"d"'::regclass		r|('x'::text)::schema_9.text
+INSERT INTO d (id) VALUES (2)		-
+SELECT 'r', id, v FROM d ORDER BY id		r|1|some text ; r|2|x
+SELECT 'r', 'schema_9.text'::regtype		r|schema_9.text
+SELECT 'r', 'schema_9.text'::regtype::oid > 16383		r|t
+SELECT 'r', format_type('schema_9.text'::regtype, NULL)		r|schema_9.text
+SELECT 'r', typname, typtype FROM pg_type WHERE typname = 'text' AND typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'schema_9')	text,name,"char"	r|text|d
+DROP TABLE d		-
+DROP SCHEMA schema_9 CASCADE		-

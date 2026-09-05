@@ -303,6 +303,20 @@ pub fn columns(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
                     Some(name) => Datum::Text(name.clone()),
                     None => Datum::Null,
                 },
+                // **`pg_catalog` for a built-in, and for a domain over one too** — measured: a
+                // column of `schema_9.text` reports `udt_name` `text` and `udt_schema`
+                // `pg_catalog`, because both describe the *base* type. An enum or a range is a
+                // user type and lives where it was declared.
+                Datum::Text(
+                    column
+                        .user_type
+                        .filter(|oid| !domains.contains_key(oid))
+                        .and_then(|oid| table.enums.get(&oid))
+                        .map_or_else(
+                            || PG_CATALOG_SCHEMA.to_owned(),
+                            |def| super::split_qualified(&def.name).0.to_owned(),
+                        ),
+                ),
             ]);
         }
     }
@@ -409,6 +423,9 @@ fn constraint_type(contype: &str) -> &'static str {
 
 /// What `data_type` says for a column of a user-defined type — the name is in `udt_name`.
 const USER_DEFINED: &str = "USER-DEFINED";
+
+/// Where every built-in type lives, which is what `udt_schema` reports for one.
+const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
 /// `data_type`: the type's name with no modifier on it.
 ///
@@ -529,6 +546,11 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     // here: `data_type` and `udt_name` both report the *base* type — measured, a `custom_money`
     // column over `numeric(8,2)` says `numeric` for both and `dm_money` only here.
     ("domain_name", ColumnType::Text),
+    // **Last again.** The schema the `udt_name` type lives in — `pg_catalog` for every built-in,
+    // which is what a column of a domain over one reports too, because `udt_name` is the *base*
+    // type's. A client that qualifies a type name reads it, and asking for a column this view
+    // does not have is `42703`.
+    ("udt_schema", ColumnType::Text),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.
