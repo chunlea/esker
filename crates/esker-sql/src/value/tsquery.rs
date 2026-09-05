@@ -346,6 +346,28 @@ fn phrase_positions(vector: &[Lexeme], node: &Node) -> Vec<u16> {
     }
 }
 
+/// Every lexeme a query mentions, in no particular order — what `ts_headline` marks up.
+///
+/// A `!` operand is included: `ts_headline` marks what the query *names*, and a real server does
+/// the same, which is the sort of thing only a measurement settles.
+#[must_use]
+pub fn lexemes(node: &Node) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_lexemes(node, &mut out);
+    out
+}
+
+fn collect_lexemes(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Lexeme(word) => out.push(word.clone()),
+        Node::Not(inner) => collect_lexemes(inner, out),
+        Node::Phrase(a, b) | Node::And(a, b) | Node::Or(a, b) => {
+            collect_lexemes(a, out);
+            collect_lexemes(b, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

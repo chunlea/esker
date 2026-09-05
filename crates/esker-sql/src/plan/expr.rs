@@ -834,6 +834,8 @@ pub enum CatalogFunc {
     SetWeight,
     /// `numnode(tsquery)`: the nodes in the tree, operators included — `'fat' & 'cat'` is **3**.
     NumNode,
+    /// `ts_headline(config, text, query)`: the text with every matching token wrapped in `<b>`.
+    TsHeadline,
     /// `lower_inc(range)`, `upper_inc`, `lower_inf`, `upper_inf`: the four bracket questions.
     ///
     /// `lower`/`upper` are **not** here — they are the text functions of the same name, overloaded
@@ -1084,6 +1086,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("strip") => Some(CatalogFunc::TsStrip),
             () if name.eq_ignore_ascii_case("setweight") => Some(CatalogFunc::SetWeight),
             () if name.eq_ignore_ascii_case("numnode") => Some(CatalogFunc::NumNode),
+            () if name.eq_ignore_ascii_case("ts_headline") => Some(CatalogFunc::TsHeadline),
             // The three `ltree` functions the corpus asks for. `nlevel('')` is 0, which is what
             // makes the empty path a value rather than a hole.
             () if name.eq_ignore_ascii_case("nlevel") => Some(CatalogFunc::LtreeNlevel),
@@ -1170,6 +1173,7 @@ impl CatalogFunc {
             CatalogFunc::TsStrip => "strip",
             CatalogFunc::SetWeight => "setweight",
             CatalogFunc::NumNode => "numnode",
+            CatalogFunc::TsHeadline => "ts_headline",
             CatalogFunc::LtreeNlevel => "nlevel",
             CatalogFunc::LtreeToText => "ltree2text",
             CatalogFunc::TextToLtree => "text2ltree",
@@ -1241,7 +1245,12 @@ impl CatalogFunc {
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well. A `UserRegType` is always two:
             // the name and the flag saying which half of the `regtype` was asked for.
-            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr | CatalogFunc::UserRegType => &[2, 3],
+            // `ts_headline` joins them: `(config, text, query)`, or two arguments taking
+            // `default_text_search_config`.
+            CatalogFunc::RangeBuild
+            | CatalogFunc::PgGetExpr
+            | CatalogFunc::UserRegType
+            | CatalogFunc::TsHeadline => &[2, 3],
 
             CatalogFunc::PgGetIndexdef => &[1, 3],
             // The text-search four take one argument with `default_text_search_config`, or two
@@ -1325,7 +1334,9 @@ impl CatalogFunc {
             // this node has no `regtype`, and what it prints is the name either way.
             | CatalogFunc::PgTypeof
             | CatalogFunc::HstoreFetch
-            | CatalogFunc::LtreeToText => ColumnType::Text,
+            | CatalogFunc::LtreeToText
+            // `ts_headline` answers the marked-up text.
+            | CatalogFunc::TsHeadline => ColumnType::Text,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
             // **The storage, which is what an enum's value is** (ADR 0050) — and the label

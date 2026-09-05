@@ -126,3 +126,45 @@ with the oracle the moment a value arrives unsorted.
 remaining failures are the four other shapes already recorded in handover v19 — none above four
 tests. The board's largest row is expected to fall to `full_text_test.rb`'s 3 plus whatever the
 capture shows the functions owe.
+
+## 5. `ts_rank` — measured, and deliberately not implemented yet
+
+`ts_headline` landed with the wiring because the capture determines it completely. **`ts_rank` does
+not, and the difference is worth writing down rather than guessing across.**
+
+Captured on 19beta1 in one rolled-back session, with controlled inputs chosen to separate the
+factors:
+
+| input | `ts_rank` |
+|---|---|
+| `'a'` / `a` | 0.06079271 |
+| `'a':1` / `a` | 0.06079271 |
+| `'a':5` / `a` | 0.06079271 |
+| `'a':1,2` / `a` | 0.075990885 |
+| `'a':1A` / `a` | 0.6079271 |
+| `'a':1B` / `a` | 0.24317084 |
+| `'a':1C` / `a` | 0.12158542 |
+| `'a':1 'b':2` / `a & b` | 0.09910322 |
+| `'a':1 'b':2` / `a | b` | 0.06079271 |
+| type | `real` |
+
+Most of the shape falls out. The weights are PostgreSQL's documented `{A 1.0, B 0.4, C 0.2, D 0.1}`
+— the A/B/C rows are exactly 10×, 4× and 2× the D row. **Position does not matter**, only how many
+positions there are: two positions give 1.25× one, which is `Σ w/(j+1)²` over `j = 0,1`. And
+**`0.6079271` is `6/π²`**, the normalisation PostgreSQL divides an OR-rank by, so a single term is
+`resj × 6/π²`.
+
+**One row refuses the derivation, which is why this is not implemented.** `'a':1 'b':2` matched
+against `a | b` answers `0.06079271` — the *same* as a single term. Accumulating two operands the
+way the shape above implies gives `1 − (1−0.1)(1−0.1) = 0.19`, and `0.19 × 6/π² = 0.1155`. The
+`a & b` row (`0.09910322`) is consistent with a `sqrt(w₁·w₂·word_distance(1))` term and **no**
+`6/π²` division, which is a second asymmetry the table does not explain either.
+
+> A ranking function is judged to eight significant figures by the corpus. **Implementing it from a
+> derivation that already contradicts one of nine measured rows is how a plausible wrong number
+> ships** — and a wrong rank is the kind of answer nothing in the suite would catch, because
+> `full_text_test.rb` never calls it and the capture only asserts `ts_rank(...) > 0`.
+
+The unit that implements it starts by capturing the OR and AND cases across two and three operands,
+several weights and both normalisation flags, and only then writes code. Until it does, `ts_rank` is
+refused by name, and `tests/tsvector.rs` declares that refusal where the capture reaches it.
