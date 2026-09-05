@@ -152,6 +152,27 @@ pub enum Lock {
 }
 
 /// One transaction's view of storage.
+///
+/// # Every method is required, on purpose
+///
+/// **A wrapper must forward every method, and the compiler is the test.** Seven of these once had
+/// defaults, so that a backend which had not learned a method stayed honest — `lock` answered
+/// `Taken`, `locks` answered empty, `changed_since_statement` answered `false`. A *wrapper* is not
+/// such a backend: it has a real transaction one field away, so a default is exactly the wrong
+/// answer there, and forgetting one compiles silently.
+///
+/// This repository paid for that three times. `savepoint::Recording` swallowed `lock` (the holder
+/// never held and the waiter never waited), then `validate_reads` and `changed_since_statement`
+/// (a SERIALIZABLE transaction with a savepoint open recorded and validated nothing), and then
+/// **`locks`, which shipped**: every `pg_locks` read taken while a savepoint was open answered
+/// "nothing is held on this node" — a different claim from "I cannot tell you" — and Rails opens a
+/// savepoint for every nested `transaction do`. A fourth wrapper, `GatedTxn` in `tests/redrive.rs`,
+/// had opted its own tests out of row locking without anyone noticing.
+///
+/// So there are no defaults left. A backend that takes no locks writes `Ok(Lock::Taken)` and
+/// `LockView::default()` itself, in one line, having decided to; and every future wrapper that
+/// forgets a method is a compile error rather than a wrong answer. Adding a method here is meant to
+/// break all four implementors — that break is the feature.
 pub trait Txn: fmt::Debug + Send {
     /// Reads one key at this transaction's snapshot, its own buffered writes merged in.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
@@ -180,23 +201,19 @@ pub trait Txn: fmt::Debug + Send {
     /// Idempotent for the holder: a transaction that locks a key twice gets [`Lock::Taken`] both
     /// times, which is what makes a statement re-run cost nothing.
     ///
-    /// The default takes every lock, which is what a backend with no notion of them was already
-    /// doing implicitly. It keeps a backend that has not been taught this honest rather than
-    /// silently blocking.
-    fn lock(&mut self, key: &[u8]) -> Result<Lock> {
-        let _ = key;
-        Ok(Lock::Taken)
-    }
+    /// A backend with no notion of locks answers `Ok(Lock::Taken)`, which is what it was already
+    /// doing implicitly. It writes that itself — see the trait's own docs for why none of this is
+    /// defaulted.
+    fn lock(&mut self, key: &[u8]) -> Result<Lock>;
 
     /// Every row lock **this node** holds, and every session waiting for one, for `pg_locks`.
     ///
     /// On the trait rather than on the backend because a catalog view is handed a transaction and
-    /// nothing else. The default is empty, which is the truthful answer for a backend that takes no
-    /// locks — and an empty `pg_locks` on such a node says "nothing is held here", not "this node
-    /// cannot tell you".
-    fn locks(&self) -> LockView {
-        LockView::default()
-    }
+    /// nothing else. A backend that takes no locks answers `LockView::default()`, and an empty
+    /// `pg_locks` on such a node says "nothing is held here" — **but only a node that decided to
+    /// say it**. This was the one defaulted method that shipped a wrong answer, through a wrapper
+    /// that never chose anything (`tests/pg_locks.rs`), which is why it is required now.
+    fn locks(&self) -> LockView;
 
     /// Records what this transaction reads, so that its commit can be validated
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
@@ -208,9 +225,7 @@ pub trait Txn: fmt::Debug + Send {
     /// Turning it on is one-way within a transaction. A transaction that has already recorded reads
     /// cannot un-record them, and a level that moved under it would otherwise validate half of what
     /// it read — which is not a weaker guarantee, it is an arbitrary one.
-    fn validate_reads(&mut self, on: bool) {
-        let _ = on;
-    }
+    fn validate_reads(&mut self, on: bool);
 
     /// Whether `key` has a committed version this statement's snapshot does not include.
     ///
@@ -221,12 +236,9 @@ pub trait Txn: fmt::Debug + Send {
     /// concurrent writers raised `40001` a hundred times in twelve hundred transactions, where
     /// PostgreSQL re-reads and proceeds.
     ///
-    /// The default is `false`, which is right for a backend that takes no locks: nothing there
-    /// ever waited, so nothing there has a statement snapshot to be behind.
-    fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
-        let _ = key;
-        Ok(false)
-    }
+    /// `false` is right for a backend that takes no locks: nothing there ever waited, so nothing
+    /// there has a statement snapshot to be behind. It says so itself.
+    fn changed_since_statement(&self, key: &[u8]) -> Result<bool>;
 
     /// Takes a fresh read timestamp for the statement that is about to be re-run
     /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
@@ -239,11 +251,9 @@ pub trait Txn: fmt::Debug + Send {
     /// so waiters classify it exactly as before and every key an *earlier* statement wrote keeps
     /// its own, older stamp and still conflicts.
     ///
-    /// The default does nothing, which is right for a backend with no locks: nothing there ever
-    /// waits, so nothing there ever restarts.
-    fn restart_statement(&mut self) -> Result<()> {
-        Ok(())
-    }
+    /// Doing nothing is right for a backend with no locks: nothing there ever waits, so nothing
+    /// there ever restarts.
+    fn restart_statement(&mut self) -> Result<()>;
 
     /// Begins a statement: a fresh read timestamp, and the previous statement's undo **discarded**
     /// rather than applied.
@@ -255,17 +265,15 @@ pub trait Txn: fmt::Debug + Send {
     ///
     /// The fresh timestamp is what READ COMMITTED means for reads: each statement sees what was
     /// committed when it began. A transaction at a level that keeps its snapshot never calls this.
-    fn begin_statement(&mut self) -> Result<()> {
-        Ok(())
-    }
+    fn begin_statement(&mut self) -> Result<()>;
 
     /// Gives back every row lock this transaction holds, without ending it.
     ///
     /// **One caller: the deadlock victim.** A real server ends the loser's transaction with the
     /// `40P01`, so its rows are free the instant the survivor asks again; keeping them until this
     /// block's `ROLLBACK` would deadlock the survivor against a transaction that is already dead.
-    /// The default does nothing, which is right for a backend that takes no locks.
-    fn abandon_locks(&mut self) {}
+    /// Doing nothing is right for a backend that takes no locks.
+    fn abandon_locks(&mut self);
 
     /// Buffers a write. Nothing can fail here — the conflict, if there is one, comes from
     /// [`Txn::commit`].

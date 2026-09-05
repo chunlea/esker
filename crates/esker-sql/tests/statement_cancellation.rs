@@ -25,6 +25,32 @@ mod parity;
 
 use parity::Pair;
 
+/// **Serialises this file under plain `cargo test`, which is where the nextest group does not
+/// reach.**
+///
+/// `.config/nextest.toml` puts this binary in the `timed` group at `max-threads = 1`, and that is
+/// the contract these tests are written against: every one of them is a claim about *when* — a
+/// cancellation observed within a bound, a sleep that must not return early, a `lock_timeout` that
+/// must fire before a holder releases — and a box running three thousand other tests beside them is
+/// a box where "when" moves.
+///
+/// But the group only binds `cargo nextest`. Under `cargo test` these eight are **threads in one
+/// process**, all racing each other for the clock, and a test that passes only under the runner the
+/// author happened to use is a test that fails for the next person on a busy machine. So the
+/// contract is enforced twice, and the two do not overlap: nextest gives each test its own process,
+/// where this mutex is uncontended and free.
+///
+/// **Poisoning is deliberately ignored.** A panicking test would otherwise poison the mutex and
+/// fail the other seven, turning one real failure into eight and hiding which one broke.
+static CLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Held for the body of a timing test. See [`CLOCK`].
+fn alone() -> std::sync::MutexGuard<'static, ()> {
+    CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// **A wait bounded by `statement_timeout` answers `57014`.**
 ///
 /// The same interleaving the `lock_timeout` tests use, with the other parameter — so the only thing
@@ -33,6 +59,7 @@ use parity::Pair;
 /// of the wait.
 #[test]
 fn a_wait_that_runs_out_of_statement_timeout_is_57014() {
+    let _alone = alone();
     let pair = Pair::new(&[
         "CREATE TABLE t (id bigint primary key, v bigint)",
         "INSERT INTO t VALUES (1, 0)",
@@ -56,6 +83,7 @@ fn a_wait_that_runs_out_of_statement_timeout_is_57014() {
 /// the cheap way to make the test above pass is to answer `57014` for both.
 #[test]
 fn a_wait_that_runs_out_of_lock_timeout_is_still_55p03() {
+    let _alone = alone();
     let pair = Pair::new(&[
         "CREATE TABLE t (id bigint primary key, v bigint)",
         "INSERT INTO t VALUES (1, 0)",
@@ -79,6 +107,7 @@ fn a_wait_that_runs_out_of_lock_timeout_is_still_55p03() {
 /// statement that is *working* rather than waiting, so that cancelling one can be tested at all.
 #[test]
 fn pg_sleep_takes_about_as_long_as_it_is_asked_to() {
+    let _alone = alone();
     let pair = Pair::new(&[]);
     let mut session = pair.session();
 
@@ -102,6 +131,7 @@ fn pg_sleep_takes_about_as_long_as_it_is_asked_to() {
 /// row, rather than answering `57014`. It is the test that says the cancellation is general.
 #[test]
 fn statement_timeout_cancels_a_statement_that_is_working() {
+    let _alone = alone();
     let pair = Pair::new(&[]);
     let mut session = pair.session();
     session.run("SET statement_timeout = '150ms'").unwrap();
@@ -129,6 +159,7 @@ fn statement_timeout_cancels_a_statement_that_is_working() {
 /// without a second transaction to arrange.
 #[test]
 fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
+    let _alone = alone();
     let pair = Pair::new(&[]);
 
     let mut victim = pair.session();
@@ -194,6 +225,7 @@ fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
 /// rather than returning a row.
 #[test]
 fn a_session_can_cancel_itself_and_the_statement_is_the_one_that_dies() {
+    let _alone = alone();
     let pair = Pair::new(&[]);
     let mut session = pair.session();
 
@@ -218,6 +250,7 @@ fn a_session_can_cancel_itself_and_the_statement_is_the_one_that_dies() {
 /// The boolean, which is what a caller branches on, is the same.
 #[test]
 fn cancelling_a_pid_that_is_not_here_is_false() {
+    let _alone = alone();
     let pair = Pair::new(&[]);
     let mut session = pair.session();
     assert_eq!(
@@ -236,6 +269,7 @@ fn cancelling_a_pid_that_is_not_here_is_false() {
 /// application actually cancels: a statement stuck behind somebody else's lock.
 #[test]
 fn a_statement_waiting_for_a_row_lock_is_cancellable() {
+    let _alone = alone();
     let pair = Pair::new(&[
         "CREATE TABLE t (id bigint primary key, v bigint)",
         "INSERT INTO t VALUES (1, 0)",
