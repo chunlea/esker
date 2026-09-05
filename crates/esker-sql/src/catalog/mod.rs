@@ -3449,6 +3449,83 @@ pub struct ViewDef {
     pub columns: Vec<ViewColumn>,
 }
 
+impl ViewDef {
+    /// The view's published columns as a `TableDef`, for the passes that need column **types**
+    /// rather than rows — today that is parameter inference (`exec::bind`).
+    ///
+    /// **A view is planned as a derived table**, so nothing on the read path needs this: `FROM v`
+    /// becomes `FROM (<definition>) AS v` and the columns come out of the lowered `SELECT`. But
+    /// that rewrite happens *after* `Bind`, and `bind::infer` is handed catalog relations by name.
+    /// `View::table` does not answer for a view, so a statement naming one was typed against an
+    /// empty list and every `$n` in it kept the `text` fallback — `operator does not exist:
+    /// bigint = text` for an ordinary `SELECT … WHERE id = $1`, and
+    /// `column "status" is of type integer but expression is of type text` for the `INSERT`
+    /// `view_test.rb` writes through a view. With `prepared_statements: true` that is every
+    /// parameterised statement against a view, not only the writes that noticed it.
+    ///
+    /// **`None` for a view stored before record version 30**, which kept names without types: the
+    /// columns cannot be typed, and answering with untyped ones would put `text` in the catalog's
+    /// mouth instead of leaving it as the fallback it is. Those views keep exactly the behaviour
+    /// they have today.
+    ///
+    /// Synthetic and never stored. It carries the view's own id — its `pg_class` oid — because
+    /// that is what the relation *is*, and no key is ever built from it: the only consumer reads
+    /// `columns`.
+    #[must_use]
+    pub fn as_table(&self) -> Option<TableDef> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| ColumnDef {
+                name: column.name.clone(),
+                ty: column.ty,
+                typmod: column.typmod,
+                // Three facts about the *view*: it stores nothing, so it has no default and no
+                // missing value, and it cannot promise a column is not null.
+                collation: None,
+                not_null: false,
+                default_expr: None,
+                default: None,
+                missing: None,
+                generated: None,
+                generated_virtual: false,
+                comment: None,
+                dropped: false,
+                user_type: None,
+            })
+            .collect();
+        Some(TableDef {
+            id: self.id,
+            name: self.name.clone(),
+            columns,
+            matview: None,
+            on_commit: OnCommit::default(),
+            persistence: Persistence::Permanent,
+            primary_key: Vec::new(),
+            indexes: Vec::new(),
+            primary_key_name: String::new(),
+            schema_version: 1,
+            sequences: Vec::new(),
+            enums: BTreeMap::new(),
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            triggers_disabled: false,
+            parents: Vec::new(),
+            children: Vec::new(),
+            excludes: Vec::new(),
+            triggers: Vec::new(),
+            partition_by: None,
+            partition_bound: None,
+            child_scans: Vec::new(),
+            comment: None,
+            primary_key_comment: None,
+        })
+    }
+}
+
 /// Every view of one tenant, by stored name.
 pub fn views(txn: &dyn Txn, tenant: u64) -> Result<Vec<ViewDef>> {
     let (start, end) = record::view_range(tenant);
