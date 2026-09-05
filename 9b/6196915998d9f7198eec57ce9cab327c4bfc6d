@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_cadcb61c2989e0 320-343,378-412
+crates/esker-sql/tests/cte_bind_typing.rs
+  s_6f7019c05b578b::t_68e04e8bc52a60 1-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "9b6196915998d9f7198eec57ce9cab327c4bfc6d",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
