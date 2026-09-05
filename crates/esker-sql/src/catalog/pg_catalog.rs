@@ -1587,11 +1587,15 @@ fn stat_activity_row(
         // ADR 0031's permanent caveat and is why both wait columns are NULL rather than empty.
         Datum::Null,
         Datum::Null,
-        // **`active` only while something is running**, which is the distinction a client reads:
-        // a session between statements is `idle` on a real server and was `active` here always.
+        // **Three states, measured side by side with PG19.** `active` while a statement runs;
+        // `idle in transaction` between statements inside an open block — the state that tells an
+        // operator a session is holding locks and doing nothing — and `idle` otherwise. This node
+        // answered `active` always, and then `idle`/`active` with no third case.
         Datum::Text(
-            if activity.query.is_some() {
+            if activity.running {
                 "active"
+            } else if activity.in_transaction {
+                "idle in transaction"
             } else {
                 "idle"
             }

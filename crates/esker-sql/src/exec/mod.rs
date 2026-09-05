@@ -330,6 +330,13 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 });
             }
             crate::backend::Lock::Held { by, .. } => {
+                // **A waiter is cancellable, and this loop is the only place that can notice.**
+                // `pg_sleep` polls `cancel` between its steps and stops; this loop watched only
+                // its own deadline, so a `pg_cancel_backend` from another session set a flag
+                // nothing on this path read — the function answered `true` and the waiter waited
+                // on. It is the shape an application actually cancels: a statement stuck behind
+                // somebody else's lock, which is `transaction_test.rb`'s last failure.
+                cancel::check()?;
                 if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
@@ -3368,6 +3375,9 @@ impl Execute for Executor {
     }
 
     fn begin(&mut self, read_only: bool) -> Result<()> {
+        // `idle in transaction` from here until the block ends — the state that tells an
+        // operator this session is holding locks and doing nothing (`pg_stat_activity`).
+        self.identity.in_transaction(true);
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
         self.savepoints.clear();
@@ -3435,6 +3445,7 @@ impl Execute for Executor {
     }
 
     fn commit(&mut self) -> Result<()> {
+        self.identity.in_transaction(false);
         // **Before anything else the commit does**, because a check that fails means the
         // transaction does not commit at all. A real server rolls it back and this does too: the
         // rows the block wrote are not there afterwards, measured.
@@ -3482,6 +3493,7 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.identity.in_transaction(false);
         // A check owed by a transaction that is not committing is a check nobody will ever run,
         // and `SET CONSTRAINTS` is undone with everything else the block did.
         self.constraints.borrow_mut().clear();
