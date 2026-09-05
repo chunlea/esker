@@ -150,6 +150,13 @@ pub enum CatalogView {
     /// A real server has hundreds, and the `hash` halves of the two `_pattern_ops` are among the
     /// ones missing here because `USING hash` is refused.
     PgOpclass,
+    /// `pg_cast`, which a client reads to find out whether one type reaches another.
+    ///
+    /// 100 rows: every cast PostgreSQL 19 has whose **source and target are both types this node
+    /// has**. `ActiveRecord` joins it to `pg_proc` to decide whether `LOWER()` applies to a
+    /// column's type, and that join is the only reason `character varying` answers `true` — there
+    /// is no `lower(varchar)`, only a cast to the `text` the one overload takes.
+    PgCast,
     /// The text-search configurations this node has, which is **not** the thirty-two a real
     /// server's `initdb` creates.
     ///
@@ -260,7 +267,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 37] = [
+    pub const ALL: [CatalogView; 38] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -274,6 +281,7 @@ impl CatalogView {
         CatalogView::PgInherits,
         CatalogView::PgAm,
         CatalogView::PgOpclass,
+        CatalogView::PgCast,
         CatalogView::PgTsConfig,
         CatalogView::PgProc,
         CatalogView::PgTrigger,
@@ -318,6 +326,7 @@ impl CatalogView {
             CatalogView::PgInherits => "pg_inherits",
             CatalogView::PgAm => "pg_am",
             CatalogView::PgOpclass => "pg_opclass",
+            CatalogView::PgCast => "pg_cast",
             CatalogView::PgTsConfig => "pg_ts_config",
             CatalogView::PgProc => "pg_proc",
             CatalogView::PgTrigger => "pg_trigger",
@@ -426,6 +435,7 @@ impl CatalogView {
                 // claimed at HEAD or it is claimed twice, and two views sharing one id is
                 // the failure `Relations` exists to prevent.
                 CatalogView::PgOpclass => 36,
+                CatalogView::PgCast => 37,
                 CatalogView::PgTsConfig => 32,
                 CatalogView::PgProc => 18,
                 CatalogView::PgTrigger => 19,
@@ -575,6 +585,14 @@ impl CatalogView {
             // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
             // `opcdefault` a boolean; the three oids are `oid` there and this node's own types
             // here, the trade every `pg_catalog` column makes.
+            // `castsource` and `casttarget` are `oid` on a real server and `castcontext` and
+            // `castmethod` are `"char"` — all `text`/`bigint` here, the standing catalog trade.
+            CatalogView::PgCast => &[
+                ("castsource", ColumnType::Int8),
+                ("casttarget", ColumnType::Int8),
+                ("castcontext", ColumnType::Text),
+                ("castmethod", ColumnType::Text),
+            ],
             CatalogView::PgOpclass => &[
                 ("oid", ColumnType::Int8),
                 ("opcname", ColumnType::Text),
@@ -641,6 +659,15 @@ impl CatalogView {
                 // `42883 operator does not exist: bigint = text` — a join that reads as a type
                 // error about a catalog rather than as a missing column.
                 ("prolang", ColumnType::Int8),
+                // `oidvector` on a real server: the argument types, space separated. Rendered as
+                // text here, which is order-sensitive and so compares exactly as an `oidvector`
+                // does — the same trade `regtype` and `name` make in every other view.
+                //
+                // **Last, because the row builder appends it there.** Declaring it beside `prosrc`
+                // where it reads best put it in `prolang`'s slot, and the misalignment surfaced as
+                // `pg_proc JOIN pg_language` returning nothing for a user's function — a column
+                // order is a contract with the row builder, not a matter of taste.
+                ("proargtypes", ColumnType::Text),
             ],
             // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
             // DDL used.
@@ -921,6 +948,7 @@ impl CatalogView {
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
             CatalogView::PgOpclass => Ok(pg_opclass_rows()),
+            CatalogView::PgCast => Ok(pg_cast_rows()),
             CatalogView::PgAm => Ok(pg_am_rows()),
             CatalogView::PgTsConfig => Ok(pg_ts_config_rows()),
             // **One row per schema**, `public` included — and `public` is not a record: it is a
@@ -1022,6 +1050,7 @@ impl CatalogView {
             | CatalogView::PgRange
             | CatalogView::PgCollation
             | CatalogView::PgOpclass
+            | CatalogView::PgCast
             | CatalogView::PgExtension
             | CatalogView::PgInherits
             | CatalogView::PgAm
@@ -1348,8 +1377,36 @@ fn proc_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum
                 Datum::Text("v".to_owned()),
                 Datum::Text(function.body),
                 Datum::Int8(language_oid(&function.language)),
+                // A user's function takes whatever it was declared with, and this node does not
+                // record argument *types* — only their count — so the list is empty rather than
+                // guessed. Empty is what an `oidvector` of no arguments prints as.
+                Datum::Text(String::new()),
             ]
         })
+        // **The built-ins too**, which this view never listed: it mapped `catalog::functions`,
+        // which is what `CREATE FUNCTION` made. So `lower` was not in `pg_proc` at all and
+        // `ActiveRecord`'s case-insensitivity probe could not have answered `true` for any type —
+        // it would have answered `false`, which is a wrong answer where a refusal was honest.
+        .chain(
+            BUILTIN_FUNCTIONS
+                .iter()
+                .map(|(oid, name, args, _ret, volatile)| {
+                    vec![
+                        Datum::Int8(*oid),
+                        Datum::Text((*name).to_owned()),
+                        Datum::Int8(PUBLIC_NAMESPACE_OID),
+                        Datum::Text("f".to_owned()),
+                        Datum::Int2(1),
+                        Datum::Text((*volatile).to_owned()),
+                        // A built-in has no SQL body to show; `prosrc` on a real server names the C
+                        // symbol, and naming one this node does not have would be a claim.
+                        Datum::Text(String::new()),
+                        // `internal` is the language a real server reports for these.
+                        Datum::Int8(language_oid("internal")),
+                        Datum::Text((*args).to_owned()),
+                    ]
+                }),
+        )
         .collect())
 }
 
@@ -1786,6 +1843,158 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 /// written. The oid is this node's own, in the extension range for the same reason
 /// hstore's is: a real server allocates an extension's classes at `CREATE EXTENSION`
 /// time and a client reads them by `opcname`.
+/// Every cast PostgreSQL 19 has whose **source and target are both types this node has** —
+/// 100 of its 249, captured to `tests/captures/pg19_pg_cast.txt`. The pairs that are missing
+/// are the ones whose ends this node does not have, so a row for one would name a type
+/// `pg_type` does not list.
+///
+/// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
+/// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
+pub const CASTS: [(i64, i64, &str, &str); 100] = [
+    (16, 23, "e", "f"),
+    (16, 25, "a", "f"),
+    (16, 1042, "a", "f"),
+    (16, 1043, "a", "f"),
+    (17, 20, "e", "f"),
+    (17, 21, "e", "f"),
+    (17, 23, "e", "f"),
+    (17, 2950, "e", "f"),
+    (18, 23, "e", "f"),
+    (18, 25, "i", "f"),
+    (18, 1042, "a", "f"),
+    (18, 1043, "a", "f"),
+    (19, 25, "i", "f"),
+    (19, 1042, "a", "f"),
+    (19, 1043, "a", "f"),
+    (20, 17, "e", "f"),
+    (20, 21, "a", "f"),
+    (20, 23, "a", "f"),
+    (20, 26, "i", "f"),
+    (20, 700, "i", "f"),
+    (20, 701, "i", "f"),
+    (20, 1700, "i", "f"),
+    (21, 17, "e", "f"),
+    (21, 20, "i", "f"),
+    (21, 23, "i", "f"),
+    (21, 26, "i", "f"),
+    (21, 700, "i", "f"),
+    (21, 701, "i", "f"),
+    (21, 1700, "i", "f"),
+    (23, 16, "e", "f"),
+    (23, 17, "e", "f"),
+    (23, 18, "e", "f"),
+    (23, 20, "i", "f"),
+    (23, 21, "a", "f"),
+    (23, 26, "i", "b"),
+    (23, 700, "i", "f"),
+    (23, 701, "i", "f"),
+    (23, 1700, "i", "f"),
+    (25, 18, "a", "f"),
+    (25, 19, "i", "f"),
+    (25, 142, "e", "f"),
+    (25, 1042, "i", "b"),
+    (25, 1043, "i", "b"),
+    (26, 20, "a", "f"),
+    (26, 23, "a", "b"),
+    (114, 3802, "a", "i"),
+    (142, 25, "a", "b"),
+    (142, 1042, "a", "b"),
+    (142, 1043, "a", "b"),
+    (700, 20, "a", "f"),
+    (700, 21, "a", "f"),
+    (700, 23, "a", "f"),
+    (700, 701, "i", "f"),
+    (700, 1700, "a", "f"),
+    (701, 20, "a", "f"),
+    (701, 21, "a", "f"),
+    (701, 23, "a", "f"),
+    (701, 700, "a", "f"),
+    (701, 1700, "a", "f"),
+    (1042, 18, "a", "f"),
+    (1042, 19, "i", "f"),
+    (1042, 25, "i", "f"),
+    (1042, 142, "e", "f"),
+    (1042, 1042, "i", "f"),
+    (1042, 1043, "i", "f"),
+    (1043, 18, "a", "f"),
+    (1043, 19, "i", "f"),
+    (1043, 25, "i", "b"),
+    (1043, 142, "e", "f"),
+    (1043, 1042, "i", "b"),
+    (1043, 1043, "i", "f"),
+    (1082, 1114, "i", "f"),
+    (1082, 1184, "i", "f"),
+    (1083, 1083, "i", "f"),
+    (1083, 1186, "i", "f"),
+    (1114, 1082, "a", "f"),
+    (1114, 1083, "a", "f"),
+    (1114, 1114, "i", "f"),
+    (1114, 1184, "i", "f"),
+    (1184, 1082, "a", "f"),
+    (1184, 1083, "a", "f"),
+    (1184, 1114, "a", "f"),
+    (1184, 1184, "i", "f"),
+    (1186, 1083, "a", "f"),
+    (1186, 1186, "i", "f"),
+    (1700, 20, "a", "f"),
+    (1700, 21, "a", "f"),
+    (1700, 23, "a", "f"),
+    (1700, 700, "i", "f"),
+    (1700, 701, "i", "f"),
+    (1700, 1700, "i", "f"),
+    (2950, 17, "e", "f"),
+    (3802, 16, "e", "f"),
+    (3802, 20, "e", "f"),
+    (3802, 21, "e", "f"),
+    (3802, 23, "e", "f"),
+    (3802, 114, "a", "i"),
+    (3802, 700, "e", "f"),
+    (3802, 701, "e", "f"),
+    (3802, 1700, "e", "f"),
+];
+
+/// The built-in functions this node has, as PostgreSQL numbers them.
+///
+/// `pg_proc` listed only what `CREATE FUNCTION` made, so `lower` was not in it and
+/// `ActiveRecord`'s case-insensitivity probe could not have answered `true` for any type.
+/// The oids are PostgreSQL's own and so are the argument lists, which is what lets
+/// `proargtypes = ARRAY['text'::regtype]::oidvector` compare true for the right reason —
+/// this node already uses PostgreSQL's type oids, so `text` really is 25 on both sides.
+///
+/// `(oid, name, proargtypes, prorettype, provolatile)`.
+pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 15] = [
+    (1705, "abs", "1700", 1700, "i"),
+    (1396, "abs", "20", 20, "i"),
+    (1398, "abs", "21", 21, "i"),
+    (1397, "abs", "23", 23, "i"),
+    (1394, "abs", "700", 700, "i"),
+    (1395, "abs", "701", 701, "i"),
+    (1620, "ascii", "25", 23, "i"),
+    (2010, "length", "17", 23, "i"),
+    (1317, "length", "25", 23, "i"),
+    (870, "lower", "25", 25, "i"),
+    (720, "octet_length", "17", 23, "i"),
+    (1374, "octet_length", "25", 23, "i"),
+    (6382, "reverse", "17", 17, "i"),
+    (3062, "reverse", "25", 25, "i"),
+    (871, "upper", "25", 25, "i"),
+];
+
+/// One `pg_cast` row per cast this node's types have between them.
+fn pg_cast_rows() -> Vec<Vec<Datum>> {
+    CASTS
+        .iter()
+        .map(|(source, target, context, method)| {
+            vec![
+                Datum::Int8(*source),
+                Datum::Int8(*target),
+                Datum::Text((*context).to_owned()),
+                Datum::Text((*method).to_owned()),
+            ]
+        })
+        .collect()
+}
+
 fn pg_opclass_rows() -> Vec<Vec<Datum>> {
     super::OPERATOR_CLASSES
         .iter()

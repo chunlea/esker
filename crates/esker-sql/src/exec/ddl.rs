@@ -610,6 +610,44 @@ fn add_check(
     catalog::replace_table(txn, executor.tenant, table, updated)
 }
 
+/// `ADD CONSTRAINT … PRIMARY KEY (…)` over columns the table already has.
+///
+/// It **declares** a key: the rows keep whatever identity they were created with, because whether
+/// a table has a hidden row-id column is a fact about the stored rows and is read by that column's
+/// own name ([`catalog::TableDef::row_id`]). The same property is what lets `DROP CONSTRAINT` take
+/// a primary key away.
+///
+/// The derived name is `<table>_pkey` on the **unqualified** relation, measured:
+/// `g1_apk3_pkey` for `g1_apk3` (`tests/captures/pg19_add_column_primary_key.txt`).
+fn add_primary_key(updated: &mut TableDef, name: Option<&str>, columns: &[String]) -> Result<()> {
+    if !updated.primary_key_name.is_empty() {
+        return Err(SqlError::MultiplePrimaryKeys(updated.name.clone()));
+    }
+    let mut positions = Vec::with_capacity(columns.len());
+    for column in columns {
+        let at = updated
+            .column(column)
+            .ok_or_else(|| SqlError::UndefinedColumnInRelation {
+                column: column.clone(),
+                relation: updated.name.clone(),
+            })?;
+        positions.push(at);
+    }
+    // A key column is `NOT NULL` on a real server whether or not the word was written.
+    for &at in &positions {
+        if let Some(column) = updated.columns.get_mut(at) {
+            column.not_null = true;
+        }
+    }
+    updated.primary_key = positions;
+    updated.primary_key_name = name.map_or_else(
+        || format!("{}_pkey", catalog::split_qualified(&updated.name).1),
+        ToOwned::to_owned,
+    );
+    updated.schema_version += 1;
+    Ok(())
+}
+
 /// Adds an `EXCLUDE` to a table that already exists, after checking the rows already in it.
 ///
 /// The constraint itself is the one a `CREATE TABLE` builds, from the same clause parser — the
@@ -5298,6 +5336,11 @@ pub(super) fn alter_table(
             add_exclude(txn, executor, &table, &mut updated, exclude)?;
             continue;
         }
+        if let AlterTableAction::AddPrimaryKey { name, columns } = action {
+            add_primary_key(&mut updated, name.as_deref(), columns)?;
+            changed = true;
+            continue;
+        }
         if let AlterTableAction::AddForeignKey(key) = action {
             add_foreign_key(txn, executor, &table, &mut updated, key)?;
             continue;
@@ -5403,6 +5446,7 @@ pub(super) fn alter_table(
         let AlterTableAction::AddColumn {
             column,
             if_not_exists,
+            primary_key,
         } = action
         else {
             let AlterTableAction::SetRetention { retention_ms } = action else {
@@ -5446,6 +5490,17 @@ pub(super) fn alter_table(
                 column: column.name.clone(),
                 relation: updated.name.clone(),
             });
+        }
+        // **A `serial` on a table that already holds rows is the one half still refused.** A real
+        // server fills the column from the sequence — measured, two rows get `1` and `2` — and
+        // that is the table rewrite this `ALTER` does not do
+        // (`tests/captures/pg19_add_column_primary_key.txt`). On an empty table there is nothing
+        // to fill, which is the case `compatibility_test.rb` sends and the same shape the
+        // `NOT NULL` rule above already had.
+        if column.sequence.is_some() && has_any_row(&*txn, executor, &updated)? {
+            return Err(SqlError::unsupported(
+                "ALTER TABLE ... ADD COLUMN ... serial on a table with rows, which PostgreSQL                  fills from the sequence",
+            ));
         }
         // The catalog decides what the declared name is, exactly as it does at `CREATE TABLE`,
         // and the default is folded against the answer rather than against the placeholder.
@@ -5505,6 +5560,56 @@ pub(super) fn alter_table(
         // this one cannot, because the value is a function of the row rather than a constant.
         if column.generated.is_some() {
             fill_generated_for_existing_rows(txn, executor, &updated)?;
+        }
+        // **The sequence, named the way `CREATE TABLE` names one and taking a relation name of its
+        // own.** `column: Some(ordinal)` is the whole of the default wiring — a `serial` column's
+        // `nextval` is read from the sequence that fills it rather than stored as column text —
+        // and `owner_column` is what makes it go when the column does, which is the bookkeeping
+        // `DROP TABLE` and now `DROP SCHEMA` walk.
+        let ordinal = updated.columns.len() - 1;
+        if let Some(identity) = column.sequence {
+            let name = plan::choose_relation_name(
+                &updated.name,
+                Some(&column.name),
+                "seq",
+                |candidate| catalog::name_exists(&*txn, executor.tenant, candidate),
+            )?;
+            let sequence = catalog::SequenceDef {
+                id: catalog::allocate_id(txn, executor.tenant)?,
+                name,
+                table_id: updated.id,
+                column: Some(ordinal),
+                owner_column: Some(ordinal),
+                identity,
+                start: 1,
+                increment: 1,
+            };
+            catalog::create_sequence(txn, executor.tenant, &sequence)?;
+            updated.sequences.push(sequence);
+            // A `serial` is `NOT NULL` on a real server whether or not the word was written.
+            if let Some(added) = updated.columns.last_mut() {
+                added.not_null = true;
+            }
+        }
+        // **`PRIMARY KEY` declares a key; it does not re-key the rows.** A table created without
+        // one has a hidden row-id column and keeps using it — that is a fact about the stored rows
+        // and is read by the column's own name, not derived from whether a key is declared
+        // (`catalog::TableDef::row_id`). The same property is what lets `DROP CONSTRAINT` take a
+        // primary key away.
+        if *primary_key {
+            // **`primary_key_name` is the test, not `primary_key`.** A keyless table's
+            // `primary_key` points at its hidden row-id column, so it is never empty; the *name*
+            // is what a real server would quote back and what is empty when the user declared no
+            // key (`catalog::TableDef::primary_key_name`).
+            if !updated.primary_key_name.is_empty() {
+                return Err(SqlError::MultiplePrimaryKeys(updated.name.clone()));
+            }
+            updated.primary_key = vec![ordinal];
+            updated.primary_key_name =
+                format!("{}_pkey", catalog::split_qualified(&updated.name).1);
+            if let Some(added) = updated.columns.last_mut() {
+                added.not_null = true;
+            }
         }
         changed = true;
     }

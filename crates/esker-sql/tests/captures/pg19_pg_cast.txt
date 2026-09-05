@@ -1,0 +1,149 @@
+# `pg_cast`, `pg_proc.proargtypes` and `oidvector` — against PostgreSQL 19beta1 at 127.0.0.1:55432.
+#
+# Run 89's `an ARRAY constructor over anything but constants is not supported`, 6 tests across
+# `uniqueness_validation_test.rb` (3), `case_insensitive_test.rb`, `postgresql_adapter_test.rb` and
+# `uuid_test.rb`. All six are **one statement** — `ActiveRecord`'s
+# `can_perform_case_insensitive_comparison_for?`, which asks whether `LOWER()` applies to a type:
+#
+#   SELECT exists(SELECT * FROM pg_proc WHERE proname = 'lower'
+#                 AND proargtypes = ARRAY[<type>::regtype]::oidvector)
+#       OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast
+#                 ON ARRAY[casttarget]::oidvector = proargtypes
+#                 WHERE proname = 'lower' AND castsource = <type>::regtype)
+#
+# The ARRAY refusal is the first thing the lowerer trips on, not the cause: the query needs
+# `pg_cast` (which did not exist), `pg_proc.proargtypes` (which did not exist), and `oidvector`
+# equality.
+#
+# **It is the SECOND `exists` that carries `character varying`.** There is no `lower(varchar)` —
+# `lower` has one text overload, oid 870, `proargtypes` `25` — so varchar answers true only because
+# a cast to text exists and `lower`'s argument list equals `[casttarget]`. `integer` answers false,
+# which is what makes the query discriminating rather than always-true.
+#
+# Captured by b4-types on 2026-09-05 in one rolled-back session.
+SELECT 'r', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['character varying'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='character varying'::regtype)		r|t
+SELECT 'r', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['text'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='text'::regtype)		r|t
+SELECT 'r', exists(SELECT * FROM pg_proc WHERE proname='lower' AND proargtypes = ARRAY['integer'::regtype]::oidvector) OR exists(SELECT * FROM pg_proc INNER JOIN pg_cast ON ARRAY[casttarget]::oidvector = proargtypes WHERE proname='lower' AND castsource='integer'::regtype)		r|f
+# --- oidvector: space separated, order-sensitive, empty renders as the empty string
+SELECT 'r', ARRAY[25]::oidvector::text, ARRAY[25,1043]::oidvector::text		r|25|25 1043
+SELECT 'r', ARRAY[25,1043]::oidvector = ARRAY[1043,25]::oidvector, ''::oidvector::text = ''		r|f|t
+SELECT 'r', ARRAY['text'::regtype]::oidvector = ARRAY[25]::oidvector		r|t
+SELECT 'x'::oidvector	!22P02 invalid input syntax for type oid: "x"
+SELECT ARRAY[]::oid[]::oidvector	!42846 cannot cast type oid[] to oidvector
+# --- the seven built-ins this node has, with their real oids
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1705		r|1705|abs|1700|1700|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1396		r|1396|abs|20|20|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1398		r|1398|abs|21|21|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1397		r|1397|abs|23|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1394		r|1394|abs|700|700|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1395		r|1395|abs|701|701|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1620		r|1620|ascii|25|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 2010		r|2010|length|17|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1317		r|1317|length|25|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 870		r|870|lower|25|25|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 720		r|720|octet_length|17|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 1374		r|1374|octet_length|25|23|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 6382		r|6382|reverse|17|17|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 3062		r|3062|reverse|25|25|i
+SELECT 'r', oid, proname, proargtypes::text, prorettype, provolatile FROM pg_proc WHERE oid = 871		r|871|upper|25|25|i
+# --- pg_cast, every row whose source and target are both types this node has (99 of 249)
+# cast	16	23	e	f
+# cast	16	25	a	f
+# cast	16	1042	a	f
+# cast	16	1043	a	f
+# cast	17	20	e	f
+# cast	17	21	e	f
+# cast	17	23	e	f
+# cast	17	2950	e	f
+# cast	18	23	e	f
+# cast	18	25	i	f
+# cast	18	1042	a	f
+# cast	18	1043	a	f
+# cast	19	25	i	f
+# cast	19	1042	a	f
+# cast	19	1043	a	f
+# cast	20	17	e	f
+# cast	20	21	a	f
+# cast	20	23	a	f
+# cast	20	26	i	f
+# cast	20	700	i	f
+# cast	20	701	i	f
+# cast	20	1700	i	f
+# cast	21	17	e	f
+# cast	21	20	i	f
+# cast	21	23	i	f
+# cast	21	26	i	f
+# cast	21	700	i	f
+# cast	21	701	i	f
+# cast	21	1700	i	f
+# cast	23	16	e	f
+# cast	23	17	e	f
+# cast	23	18	e	f
+# cast	23	20	i	f
+# cast	23	21	a	f
+# cast	23	26	i	b
+# cast	23	700	i	f
+# cast	23	701	i	f
+# cast	23	1700	i	f
+# cast	25	18	a	f
+# cast	25	19	i	f
+# cast	25	142	e	f
+# cast	25	1042	i	b
+# cast	25	1043	i	b
+# cast	26	20	a	f
+# cast	26	23	a	b
+# cast	114	3802	a	i
+# cast	142	25	a	b
+# cast	142	1042	a	b
+# cast	142	1043	a	b
+# cast	700	20	a	f
+# cast	700	21	a	f
+# cast	700	23	a	f
+# cast	700	701	i	f
+# cast	700	1700	a	f
+# cast	701	20	a	f
+# cast	701	21	a	f
+# cast	701	23	a	f
+# cast	701	700	a	f
+# cast	701	1700	a	f
+# cast	1042	18	a	f
+# cast	1042	19	i	f
+# cast	1042	25	i	f
+# cast	1042	142	e	f
+# cast	1042	1042	i	f
+# cast	1042	1043	i	f
+# cast	1043	18	a	f
+# cast	1043	19	i	f
+# cast	1043	25	i	b
+# cast	1043	142	e	f
+# cast	1043	1042	i	b
+# cast	1043	1043	i	f
+# cast	1082	1114	i	f
+# cast	1082	1184	i	f
+# cast	1083	1083	i	f
+# cast	1083	1186	i	f
+# cast	1114	1082	a	f
+# cast	1114	1083	a	f
+# cast	1114	1114	i	f
+# cast	1114	1184	i	f
+# cast	1184	1082	a	f
+# cast	1184	1083	a	f
+# cast	1184	1114	a	f
+# cast	1184	1184	i	f
+# cast	1186	1083	a	f
+# cast	1186	1186	i	f
+# cast	1700	20	a	f
+# cast	1700	21	a	f
+# cast	1700	23	a	f
+# cast	1700	700	i	f
+# cast	1700	701	i	f
+# cast	1700	1700	i	f
+# cast	2950	17	e	f
+# cast	3802	16	e	f
+# cast	3802	20	e	f
+# cast	3802	21	e	f
+# cast	3802	23	e	f
+# cast	3802	114	a	i
+# cast	3802	700	e	f
+# cast	3802	701	e	f
+# cast	3802	1700	e	f
