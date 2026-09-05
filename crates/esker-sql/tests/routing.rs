@@ -141,6 +141,29 @@ const EXPLAIN_DIVERGENCES: &[(&str, &str)] = &[
         "EXPLAIN ANALYZE DELETE FROM t",
         "The same rule, and the same reason.",
     ),
+    // **`EXPLAIN VERBOSE` and `EXPLAIN (FORMAT JSON)` were both here and neither is any more**,
+    // and the two entries' own arguments are worth answering rather than deleting in silence.
+    //
+    // `VERBOSE`'s said that honouring it "would mean printing the same plan and calling it
+    // verbose", and preferred a refusal. That weighs the wrong two things: the choice is not
+    // between an honest refusal and a dishonest plan — it is between refusing a statement
+    // **PostgreSQL runs** and answering it with the detail this node has. `explain_test.rb` sends
+    // `VERBOSE` in a list with `ANALYZE`, so the refusal cost three of that file's five tests, and
+    // it cost them at the *parser*: nothing downstream ever ran. Printing the same plan is not a
+    // wrong answer, because what a plan contains is already a declared divergence on every line;
+    // there is simply no extra detail to show, and saying so by showing none is truthful.
+    //
+    // `(FORMAT JSON)`'s was sharper and was right as far as it went: `FORMAT` changes the *shape* a
+    // client parses, so answering it with **text** would be a wrong answer rather than a plainer
+    // one — and the entry went further, arguing that "producing JSON with our fields in it would
+    // look like PostgreSQL's schema and not be it". What it did not consider is the third option
+    // that was taken instead: a JSON document whose keys are the ones this node can honestly fill
+    // and whose absent keys — every cost, every buffer count — are absent rather than zeroed, in a
+    // column declared `json` (114) as `\gdesc` says. A client that finds no `Total Cost` is being
+    // told the truth; one that reads `"Total Cost": 0.00` is not, and one that is handed text
+    // through a `json` OID cannot read it at all. That last is what `connection_test.rb`'s
+    // `test_statement_key_is_logged` does — `column_types["QUERY PLAN"].deserialize` — which is why
+    // the wire type is asserted beside the value in `tests/explain_options.rs`.
 ];
 
 /// The plan surface, replayed: which `EXPLAIN` spellings both servers accept.

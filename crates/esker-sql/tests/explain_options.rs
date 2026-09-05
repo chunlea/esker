@@ -337,3 +337,36 @@ fn analyze_of_a_write_is_still_refused() {
         [["2".to_owned()]]
     );
 }
+
+/// **An option this node does not honour must not change the plan** — which is the other half of
+/// "accepted and ignored", and the half a reader has to be able to check.
+///
+/// Carried over from h1's version of this unit, which was written in parallel with this one and
+/// landed in main first (`580da5fa`). Its own doc comment records why it is an equality rather
+/// than a search for an `Engine:` line: the first version asserted a line that a plain `SELECT *`
+/// never has, and the second guarded it into asserting nothing at all. Equality covers what it was
+/// for and more — whatever a plan says, an option list must not move it.
+#[test]
+fn an_option_list_does_not_change_the_plan() {
+    let mut node = parity::Node::new(FIXTURE);
+    for query in [
+        "SELECT * FROM authors",
+        "SELECT count(*) FROM authors",
+        "SELECT name, count(*) FROM authors GROUP BY name",
+    ] {
+        let plain = node.rows(&format!("EXPLAIN {query}"));
+        for options in [
+            "(VERBOSE)",
+            "(COSTS, BUFFERS)",
+            "(FORMAT TEXT)",
+            "(ANALYZE false)",
+            "(SETTINGS, SUMMARY, MEMORY, GENERIC_PLAN)",
+        ] {
+            assert_eq!(
+                node.rows(&format!("EXPLAIN {options} {query}")),
+                plain,
+                "EXPLAIN {options} changed the plan of `{query}`"
+            );
+        }
+    }
+}
