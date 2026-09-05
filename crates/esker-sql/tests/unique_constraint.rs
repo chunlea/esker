@@ -71,8 +71,9 @@ fn set_constraints_switches_the_mode_for_the_transaction() {
         "INSERT INTO sc VALUES (1, 1, 1)",
     ]);
 
-    // **Not deferrable is `42809`**, and it is raised for `IMMEDIATE` too — which would change
-    // nothing — because PostgreSQL refuses the statement either way.
+    // **Not deferrable is `42809`** — for `DEFERRED`. It is *not* raised for `IMMEDIATE`, which
+    // asks for what is already true; this comment claimed otherwise and the capture beside it has
+    // no such row. `set_constraints_by_name.rs` holds the measurement of both directions.
     let error = node.run("SET CONSTRAINTS sc_plain DEFERRED").unwrap_err();
     assert_eq!(error.sqlstate(), "42809");
     assert_eq!(
