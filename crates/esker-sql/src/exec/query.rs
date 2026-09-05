@@ -3471,13 +3471,26 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         // through to the arm below so that `WHERE (SELECT max(id) FROM a)` gets PostgreSQL's own
         // sentence with the subquery's type in it — measured, `not type bigint`.
         Expr::Subquery(sub) if sub.value_type() == ColumnType::Bool => Ok(()),
+        // **A boolean is a predicate whatever shape it arrived in**, so the last word belongs to
+        // the type and not to the list above — which is the shapes whose type needs no lookup.
+        // PostgreSQL's rule is `coerce_to_boolean` over the resolved type and nothing else, and
+        // `Aggregation::check_boolean` already writes the same rule for `HAVING`.
+        //
+        // Without the lookup this arm refused every boolean-valued **catalog function** — twelve
+        // of them, `@@`, `&&`, `@>` and `?` among the spellings — with a sentence that is its own
+        // disproof: `argument of WHERE must be type boolean, not type boolean`. A server cannot
+        // refuse a boolean for not being one.
+        //
         // PostgreSQL names the type it got, and a user reading "must be type boolean" without it
         // has to work out which of their columns was the problem. Measured, both clauses:
         // `argument of WHERE must be type boolean, not type bigint`.
-        other => Err(SqlError::DatatypeMismatch(format!(
-            "argument of {clause} must be type boolean, not type {}",
-            expr_type(other, scope).map_or("unknown", ColumnType::name)
-        ))),
+        other => match expr_type(other, scope) {
+            Ok(ColumnType::Bool) => Ok(()),
+            ty => Err(SqlError::DatatypeMismatch(format!(
+                "argument of {clause} must be type boolean, not type {}",
+                ty.as_ref().map_or("unknown", |ty| ty.name())
+            ))),
+        },
     }
 }
 
