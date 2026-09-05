@@ -65,7 +65,7 @@ use bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::region_cache::RegionResolver;
 use crate::retry::backoff_ms;
-use crate::router::{ClientOptions, Router, clamp_end, fan_out, owns, repair_route};
+use crate::router::{ClientOptions, Router, clamp_end, fan_out, repair_route};
 use crate::transport::StoreTransport;
 use crate::wire::{
     Body, DEFAULT_SCAN_LIMIT, LockInfo, Method, ProtoError, Response, TxnKvReq, TxnKvResp,

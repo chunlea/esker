@@ -473,10 +473,10 @@ pub(crate) fn repair_route(
             Ok(Some(route)) if owns(&route.region.start_key, &route.region.end_key, key) => {
                 return Ok(route.region.end_key);
             }
-            // It answered, and still does not cover the key: it is behind, not authoritative.
-            Ok(_) => {}
-            // It could not answer at all, which is the same kind of "not yet".
-            Err(_) => {}
+            // Either it answered and still does not cover the key, or it could not answer at
+            // all. **The two are one case here**: both mean the driver does not yet know where
+            // this key lives, which is a fact about its knowledge and not about the cluster.
+            Ok(_) | Err(_) => {}
         }
         router
             .clock()
