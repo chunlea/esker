@@ -300,14 +300,23 @@ fn one(pg: &mut Pg, cluster: &Cluster, query: &Query, arm: Arm) -> Result<Run, S
 
     let plan = pg.query(&format!("EXPLAIN ANALYZE {}", query.sql))?.text();
     let engine = engine_of(&plan);
-    let expected = match (arm, query.columnar_is_possible) {
-        (Arm::Columnar, true) => "columnar",
-        _ => "rows",
-    };
-    if engine != expected {
+    // **Asked for columnar, or asked for anything but.** Not an equality against one spelling:
+    // a plan that never reaches the router prints no `Engine:` line at all, and a join is one.
+    // `crates/esker-sql/src/exec/mod.rs`'s guard is `inners.is_empty()`, so `route` is not called
+    // for a join and `EXPLAIN` says nothing about an engine — which is correct behaviour and
+    // *not* one of the two silences ADR 0040 Decision 3 lists. An equality against "rows" here
+    // would fail the join arm of every run and report it as a routing fault.
+    let must_be_columnar = arm == Arm::Columnar && query.columnar_is_possible;
+    if must_be_columnar != (engine == "columnar") {
+        let wanted = if must_be_columnar {
+            "the columns"
+        } else {
+            "the rows"
+        };
         return Err(format!(
-            "{} on the {} arm ran on {engine} and not {expected}, so every number in this run \
-             would be about a plan nobody asked for. The plan said:\n{plan}",
+            "{} on the {} arm did not run on {wanted} — the plan's engine line says `{engine}`, \
+             so every number in this run would be about a plan nobody asked for. The plan \
+             said:\n{plan}",
             query.name,
             arm.setting()
         ));
@@ -394,6 +403,18 @@ fn fragments_of(plan: &str) -> (u64, u64) {
     }
 }
 
+/// What the engine column prints.
+///
+/// A plan that never reached the router ran on the rows and said nothing about it, which is a
+/// true and unhelpful thing to put in a table cell.
+fn engine_text(engine: &str) -> String {
+    if engine == "no engine line" {
+        "rows (not routed)".to_owned()
+    } else {
+        engine.to_owned()
+    }
+}
+
 /// The kernel's one-minute load average, or why it could not be read.
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg").map_or_else(
@@ -431,7 +452,7 @@ fn report(runs: &[Run], queries: &[Query]) {
                 "| {} | {} | {} of {} | {} | {:.3} s | {:.3}–{:.3} s | {sql_cpu:.2} s | \
                  {store_cpu:.2} s | {:.0}% | {} |",
                 query.name,
-                first.engine,
+                engine_text(&first.engine),
                 first.fragments_answered,
                 first.fragments_asked,
                 first.rows,
@@ -501,7 +522,7 @@ fn bytes_text(bytes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{engine_of, fragments_of, middle};
+    use super::{engine_of, engine_text, fragments_of, middle};
 
     const COLUMNAR: &str = "\
 Columnar Aggregate on ledger  (4 fragments)
@@ -530,6 +551,18 @@ Columnar Aggregate on ledger  (4 fragments)
     fn the_fragment_counts_are_the_two_numbers_on_their_own_line() {
         assert_eq!(fragments_of(COLUMNAR), (4, 4));
         assert_eq!(fragments_of("Aggregate on ledger"), (0, 0));
+    }
+
+    #[test]
+    fn a_join_is_not_read_as_a_routing_fault() {
+        // `exec/mod.rs` only calls `route` when the select has no joins, so a join's plan carries
+        // no engine line. That is the rows, not a failure, and the report says so.
+        assert_eq!(
+            engine_of("Aggregate\n  Nested Loop\n    Seq Scan on ledger"),
+            "no engine line"
+        );
+        assert_eq!(engine_text("no engine line"), "rows (not routed)");
+        assert_eq!(engine_text("columnar"), "columnar");
     }
 
     #[test]

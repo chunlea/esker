@@ -47,6 +47,15 @@ the measurement will see and because it changes what §10 can conclude — see �
 needs first**; a join fragment is, and that is a larger and separate piece of work than the
 exchange — see §8.
 
+> A small thing found while asserting the engine on every benchmark run, for whoever owns ADR
+> 0040. `crates/esker-sql/src/exec/mod.rs` calls `fragment::route` only when the select has no
+> joins and no derived table, so a joined plan never reaches the router and `EXPLAIN` prints **no
+> `Engine:` line at all** — while a `SELECT *` over the same table prints `Engine: rows` with
+> `Reason::Shape`. That is a **third** deliberate silence, and Decision 3 lists two. It is
+> defensible on Decision 3's own rule — there was no choice to describe — but it is not what the
+> ADR says, and a reader debugging "why is my join not on the columns" gets nothing. Recorded, not
+> acted on: `esker-sql` is not this lane's.
+
 ## 2. What an exchange is, in this system's own terms
 
 The two-level aggregate finishes like this today:
