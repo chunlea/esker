@@ -57,15 +57,39 @@ the suite actually sends.
 
 ### What is deliberately not implemented, and why each
 
-* **`RAISE EXCEPTION`** — an error (`P0001` with the raised text as the whole message), not a
-  notice. Routing it through the notice path would turn a failed statement into a successful one.
+* ~~**`RAISE EXCEPTION`**~~ — **implemented 2026-09-04**, and the reason it was deferred is the
+  reason it now has its **own** path: it is an error, `P0001` with the raised text as the whole
+  message, and it leaves lowering as a `SqlError` rather than reaching the notice path at all.
+  Deferring it was right; routing it through the notice path would have turned a failed statement
+  into a successful one, which is what that path does.
 * **`RAISE INFO` / `LOG` / `DEBUG`** — there is no severity token for them on this wire
   (`error::Severity` has four). Downgrading one to `NOTICE` would print the wrong word to a client
   that is reading exactly that word.
-* **`DO LANGUAGE plpgsql $$ … $$`** and a trailing `LANGUAGE` — a body that says which language it
-  is in is not one to guess at.
+* ~~**`DO LANGUAGE plpgsql $$ … $$`** and a trailing `LANGUAGE`~~ — **both spellings implemented
+  2026-09-04.** The reason given here holds for an *unknown* language and not for `plpgsql`, which
+  is the one a `DO` already means. A language this node does not run is now `42704 language "…"
+  does not exist`, decided where the parse failure becomes a refusal — because the refusal table
+  can only say `DO`, and what is wrong is the language.
+
+  The named dollar tag `$do$ … $do$` was **never** a gap: the tag is read from the source. A probe
+  that used a non-template body made it look like one.
 * **`check_all_foreign_keys_valid!`** — variables, loops, dynamic SQL, and a write straight into
   `pg_catalog`. This is the case the "it is a language" reading was right about, and it is 2 tests.
+
+## Amendment, 2026-09-04
+
+Two of the four deferrals above are implemented and struck through; the other two stand. Measured
+since: **the `DO` row was 36 tests at run 57 and 2 from run 70 onwards**, so the two templates were
+the whole of it. The 2 that remain are `check_all_foreign_keys_valid!`, which is general PL/pgSQL
+and refused by ruling rather than by absence — recorded as a closed question in
+[`docs/plans/do-blocks.md`](../plans/do-blocks.md).
+
+**`corpus/pg19_do_block.txt` cannot be replayed as it stands.** It is one `BEGIN … ROLLBACK` block
+with savepoints only around the statements PostgreSQL errors on, so every form this node refuses
+where PostgreSQL succeeds aborts the transaction and hides the sixteen statements after it.
+Declaring a divergence does not prevent the abort. Re-capturing it with a savepoint per statement is
+the harness lane's to do; until then `tests/do_block.rs` asserts those answers directly, line by
+line from that file.
 
 ## Consequences
 
