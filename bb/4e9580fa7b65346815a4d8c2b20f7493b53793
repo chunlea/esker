@@ -1,0 +1,16 @@
+crates/esker-cli/src/args.rs
+  h_44076b318daf9c 266-269,1289
+crates/esker-cli/src/bench_mpp/mod.rs
+  h_44076b318daf9c 75-80,105,158-160,261-267,269-283,303-307,331-336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bb4e9580fa7b65346815a4d8c2b20f7493b53793",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
