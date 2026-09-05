@@ -88,6 +88,21 @@ impl Cluster {
     /// places a learner on a store with no peer of that region — and it is also what makes a SQL
     /// node see more than one *shard*, which is what the region-count guard turns on.
     pub fn start_with(stores: u16, split_size: u64) -> Self {
+        for attempt in 1..=4 {
+            if let Some(cluster) = Self::try_start(stores, split_size) {
+                return cluster;
+            }
+            eprintln!("harness: attempt {attempt} lost a port before its child bound; retrying");
+        }
+        panic!("four starts in a row lost a port before a child could bind");
+    }
+
+    /// One attempt, or `None` if a child lost its port.
+    ///
+    /// Long, and deliberately not split: it is sequential process setup where every step depends
+    /// on the last, and two attempts at cutting it produced worse code than the length it saved.
+    #[allow(clippy::too_many_lines)]
+    fn try_start(stores: u16, split_size: u64) -> Option<Self> {
         let dir = tempfile::TempDir::new().unwrap();
         eprintln!("harness: logs in {}", dir.path().display());
         let base = free_ports(stores + 2);
@@ -106,7 +121,9 @@ impl Cluster {
                 .spawn()
                 .expect("the placement driver starts"),
         );
-        wait_for_port("the driver", pd_port, &mut pd, STARTUP_SECONDS, dir.path());
+        if !wait_for_port("the driver", pd_port, &mut pd, STARTUP_SECONDS, dir.path()) {
+            return None;
+        }
 
         let mut others: Vec<Supervisor> = Vec::new();
         let mut store: Option<Supervisor> = None;
@@ -139,13 +156,15 @@ impl Cluster {
                     .spawn()
                     .expect("the store starts"),
             );
-            wait_for_port(
+            if !wait_for_port(
                 &format!("store {id}"),
                 store_port + id - 1,
                 &mut child,
                 STARTUP_SECONDS,
                 dir.path(),
-            );
+            ) {
+                return None;
+            }
             if store.is_none() {
                 store = Some(child);
             } else {
@@ -188,13 +207,12 @@ impl Cluster {
         loop {
             let answer = cluster.query("SELECT 1");
             if rows_of(&answer) == vec!["1".to_owned()] {
-                return cluster;
+                return Some(cluster);
             }
-            assert!(
-                Instant::now() < deadline,
-                "the SQL node never answered `SELECT 1`: {answer}{}",
-                tails(cluster.dir.path())
-            );
+            if Instant::now() >= deadline {
+                eprintln!("harness: the SQL node never answered `SELECT 1`: {answer}");
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -248,6 +266,28 @@ impl Cluster {
         self.region_lines()
             .filter(|line| line.contains('C'))
             .count()
+    }
+
+    /// Waits until the cluster holds more than one region, and answers how many.
+    ///
+    /// **A wait, not an assertion.** A split is the leader's own decision, taken on its region
+    /// heartbeat after the size estimate crosses the threshold — so "did it split" straight after
+    /// a load is a question about timing, and under a loaded machine the answer is "not yet".
+    /// Asserting it there made this test fail in a full gate and pass alone.
+    pub fn wait_for_a_split(&self, seconds: u64) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let regions = self.regions();
+            if regions > 1 {
+                eprintln!("harness: the table is in {regions} regions");
+                return regions;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the table did not split within {seconds}s, so nothing here is about a boundary"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
     }
 
     /// Waits until every region has a columnar learner.
@@ -480,24 +520,28 @@ fn wait_for_port(
     child: &mut Supervisor,
     seconds: u64,
     dir: &std::path::Path,
-) {
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         if let Ok(Some(status)) = child.0.try_wait() {
-            panic!(
-                "{what} exited with {status} before it listened on {port}{}",
-                tails(dir)
-            );
+            // **Not a panic: a lost port is a retry, not a result.** `free_ports` reserves a run
+            // and releases it before the children bind, so a cluster test starting beside another
+            // can lose one in that window — the child exits, and panicking here reports a harness
+            // race as a product failure. It did, twice, in one gate.
+            eprintln!("harness: {what} exited with {status} before listening on {port}");
+            return false;
         }
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             eprintln!("harness: {what} is listening on {port}");
-            return;
+            return true;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what} did not listen on {port} within {seconds}s{}",
-            tails(dir)
-        );
+        if Instant::now() >= deadline {
+            eprintln!(
+                "harness: {what} did not listen on {port} within {seconds}s{}",
+                tails(dir)
+            );
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }

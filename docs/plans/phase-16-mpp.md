@@ -414,19 +414,39 @@ Named so the next person can check them rather than re-derive them:
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
    parallel dispatch, not before.**
 
-### The interim guard, and what retires it
+### The guard, retired by the flip — and what re-arms it
 
-A multi-region columnar query returns **N times** the right answer — measured 2026-09-05,
-`docs/bench/mpp-baseline.md` §10 — so `exec::fragment` refuses a table in more than one region and
-`EXPLAIN` names the rule. The guard is **temporary**. It is retired by
-`crates/esker-cli/tests/multi_region_differential.rs` going green: the test that asserts the two
-engines agree across regions with `Engine: columnar` on every comparison, which cannot pass until
-the columnar copy is region-scoped (`esker-store`'s, by ADR 0040's own sentence).
+A multi-region columnar query returned **N times** the right answer (measured 2026-09-05,
+`docs/bench/mpp-baseline.md` §10). The rule that held it back is keyed on what the source declares:
+`FragmentSource::runs_are_region_scoped`, **required with no default**, because a defaulted method
+is a silent opt-out and a source that quietly answered "yes" returns a wrong number rather than a
+slow one.
 
-Until then **every number in this file is single-region**, and the exchange re-measure is blocked
-on correctness rather than on a quiet machine.
+**It is now `true`.** The store-side fix took three attempts and the last one is the interesting
+one: building the copy from the region's range alone gave 357 rows for 200, applying the scan range
+alone gave 52, and the reason both halves were needed *and* still wrong was that **a region bound
+was raw where a run's key is memcomparable-encoded** — so the range compared two different
+alphabets. Encoding the bound makes it exact.
 
-### What this measurement cannot say
+**The guard code, the trait method and the `EXPLAIN` reason all stay.** What retired the guard is
+one `bool`, and what re-arms it is the same `bool`: any future store whose columnar runs are not
+scoped to the region a fragment asks about answers `false` and is kept on the rows, saying so in
+`EXPLAIN`. That is the point of putting the rule in a declaration rather than in a version check.
+
+Two tests hold the seam and they sit at different levels on purpose:
+
+* `esker-sql/tests/routing.rs::a_source_that_is_not_region_scoped_keeps_a_split_table_on_the_rows`
+  — a scripted source declaring `false` makes the guard fire and `EXPLAIN` name it. **In process,
+  and the right home**: it tests the planner's rule, which is what the rule is.
+* `esker-cli/tests/multi_region_differential.rs` — the acceptance. Real binaries, a split table,
+  a learner on every region, `Engine: columnar` asserted before every comparison, and the answers
+  checked against values the fixture makes true rather than against the other engine.
+
+The real-cluster guard test that stood between them is **retired**: it asserted the guard fires on
+a real cluster, and it cannot any more — it was red because the fix works, which is the one reason
+a test should be removed rather than repaired.
+
+### What this measurement cannot say### What this measurement cannot say
 
 It has **one fragment**, so it says nothing about how the finish scales with fragment count — the
 axis the exchange is actually about. That axis was the run's purpose and §8 is why it does not

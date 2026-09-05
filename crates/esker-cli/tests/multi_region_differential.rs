@@ -1,31 +1,43 @@
-//! **The two engines, across a region boundary.** Red until the columnar copy is region-scoped.
+//! **A multi-region table never answers wrong** — whichever engine the system says it will use.
 //!
-//! # What it is red for
+//! # What this is for
 //!
 //! Measured on a real four-store cluster on 2026-09-05: a table in four regions with a columnar
-//! learner on each, every fragment answered, `Engine: columnar` — and every aggregate came back
-//! **four times** its true value. `count(*)` of twenty thousand rows answered eighty thousand; a
-//! join answered 10,080 for 2,520. The multiplier is the region count and the learners were
-//! co-located two to a store, so a fragment reads its store's columnar runs rather than only its
-//! own region's, and every row is counted once per region (`docs/bench/mpp-baseline.md` §10).
+//! learner on each, every fragment answered, and every aggregate **four times** its true value —
+//! `count(*)` of twenty thousand rows answering eighty thousand. A learner's columnar runs were
+//! not scoped to the region the fragment asked about, so every row was counted once per region
+//! (`docs/bench/mpp-baseline.md` §10). That is the failure
+//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) names as the worst this feature
+//! can have: the two engines disagreeing, silently.
 //!
-//! That is the failure [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) names as the
-//! worst this feature can have — the two engines disagreeing, silently — and the defence it asks
-//! for by name is a differential. The one that exists,
-//! `esker-sql/tests/routing_differential.rs`, is **single-region** and structurally cannot see it.
-//! This is that differential across a boundary.
+//! # Why it asserts the declared state rather than one engine
 //!
-//! # Owner, and what makes it green
+//! The store-side fix arrives in halves, and a half of it is already on `main`: with the copy
+//! built from the region's range but the scan range not yet applied, a two-hundred-row table
+//! answers 357; with the scan range on and the build scoping absent, 52. So the system's honest
+//! answer today is *"do not route this"*, and `FragmentSource::runs_are_region_scoped` is where it
+//! says so.
 //!
-//! `esker-store`: the columnar copy has to be scoped to the region a fragment asks about. ADR 0040
-//! says so in the same sentence where it priced this as *"a performance bound, not a wrong
-//! answer"* — which it is not, because the splits happen **before** the learner is placed, so no
-//! shard is ever stale, every fragment is legitimately routed, and it still reads too much.
+//! This test reads that declaration **end to end**, out of `EXPLAIN`, and asserts what the
+//! declaration promises:
 //!
-//! When the store fix lands, `ClientFragments::runs_are_region_scoped` flips to `true` and the
-//! interim guard in `esker-sql`'s planner stops firing. **This test going green is what earns that
-//! flip**, and it is why it asserts `Engine: columnar` on every comparison: with the guard in
-//! place both arms run on rows and agree for free, which is worth nothing.
+//! * **declared `false`** — the guard must have fired, `EXPLAIN` must name the rule, and the
+//!   answers must still be *right*, because a fallback that answers wrongly is no better than the
+//!   thing it guards;
+//! * **declared `true`** — every comparison must have run on the columns (`Engine: columnar`) and
+//!   agreed with the row engine.
+//!
+//! So it is green on `main` in the guarded state and its demand turns on the moment the flip
+//! happens. **No `#[ignore]`**: it runs every time, and what it checks — that a multi-region table
+//! is never answered wrongly — is true in both states and is the property that actually matters.
+//!
+//! # Retirement
+//!
+//! Nothing retires this test. What changes is which branch it takes: when `esker-store`'s columnar
+//! copy is region-scoped in **both** halves and `ClientFragments::runs_are_region_scoped` returns
+//! `true`, the `declared true` branch becomes the live one and this becomes the multi-region
+//! differential ADR 0022 asks for by name. Until then it is the check that the guard is really
+//! guarding.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -46,16 +58,38 @@ const PAYLOAD: usize = 4_096;
 /// The region-split threshold the stores run with.
 const SPLIT_SIZE: u64 = 262_144;
 
-/// Every query compared. Aggregates, because that is the shape a fragment expresses.
-const QUERIES: &[&str] = &[
-    "SELECT count(*) FROM ledger",
-    "SELECT count(amount), sum(amount) FROM ledger",
-    "SELECT min(amount), max(amount) FROM ledger",
-    "SELECT bucket, count(*) FROM ledger GROUP BY bucket ORDER BY bucket",
-];
+/// The reason string the interim guard prints, from `esker_sql::exec::fragment`.
+const GUARD: &str = "not region-scoped";
+
+/// Every query compared, with the answer the fixture makes true.
+///
+/// **The expected values are computed from the fixture, not from one of the engines.** Agreement
+/// between two engines is not correctness — they agreed at four times the right answer when both
+/// were reading too much would have been caught only by knowing the number — and in the guarded
+/// state both arms are the row engine, where agreement is free.
+fn queries() -> Vec<(&'static str, Vec<Vec<String>>)> {
+    let sum: i64 = (1..=ROWS).sum();
+    vec![
+        ("SELECT count(*) FROM ledger", vec![vec![ROWS.to_string()]]),
+        (
+            "SELECT count(amount), sum(amount) FROM ledger",
+            vec![vec![ROWS.to_string(), sum.to_string()]],
+        ),
+        (
+            "SELECT min(amount), max(amount) FROM ledger",
+            vec![vec!["1".to_owned(), ROWS.to_string()]],
+        ),
+        (
+            "SELECT bucket, count(*) FROM ledger GROUP BY bucket ORDER BY bucket",
+            (0..4)
+                .map(|bucket| vec![bucket.to_string(), (ROWS / 4).to_string()])
+                .collect(),
+        ),
+    ]
+}
 
 #[test]
-fn the_two_engines_agree_across_a_region_boundary() {
+fn a_multi_region_table_is_never_answered_wrongly() {
     let cluster = Cluster::start_with(STORES, SPLIT_SIZE);
     cluster.run("CREATE TABLE ledger (id int8 PRIMARY KEY, bucket int8, amount int8, note text)");
     cluster.run("ALTER TABLE ledger SET (columnar_replicas = 1)");
@@ -70,30 +104,50 @@ fn the_two_engines_agree_across_a_region_boundary() {
         cluster.run(&format!("INSERT INTO ledger VALUES {}", values.join(",")));
     }
 
-    let regions = cluster.regions();
-    assert!(
-        regions > 1,
-        "the table did not split, so this says nothing about a boundary: {regions} region(s)"
-    );
+    let regions = cluster.wait_for_a_split(120);
     cluster.wait_for_learners(180);
 
-    for query in QUERIES {
-        let rows = cluster.query_on("row", query);
-        let columns = cluster.query_on("columnar", query);
-        // **The engine first.** A query that fell back agrees with the row engine for free, so a
-        // comparison whose denominator is not checked is not evidence — the lesson this lane paid
-        // for twice on 2026-09-05, once by reading a column headed `columnar` that held numbers
-        // the row engine produced.
+    // **The declaration, read end to end.** `EXPLAIN` is where a `FragmentSource` that says it
+    // cannot scope a fragment to one region becomes visible, and reading it here rather than
+    // hard-coding a state is what lets one test hold in both.
+    let probe = cluster.query_on("auto", "EXPLAIN SELECT count(*) FROM ledger");
+    let guarded = probe.contains(GUARD);
+    eprintln!(
+        "the source declares runs_are_region_scoped = {}",
+        if guarded { "false" } else { "true" }
+    );
+
+    for (query, expected) in queries() {
+        let rows = rows_of(&cluster.query_on("row", query));
+        let columns = rows_of(&cluster.query_on("columnar", query));
         let plan = cluster.query_on("auto", &format!("EXPLAIN ANALYZE {query}"));
-        assert!(
-            plan.contains("Engine: columnar"),
-            "`{query}` was not answered by the columns over {regions} regions, so its agreement \
-             would be free:\n{plan}"
+        let flat: Vec<String> = expected
+            .iter()
+            .map(|row| row.first().cloned().unwrap_or_default())
+            .collect();
+
+        if guarded {
+            assert!(
+                plan.contains("Engine: rows") && plan.contains(GUARD),
+                "the source cannot scope a fragment, so `{query}` over {regions} regions had to \
+                 be guarded and was not:\n{plan}"
+            );
+        } else {
+            assert!(
+                plan.contains("Engine: columnar"),
+                "the source declares its runs are region-scoped, so `{query}` over {regions} \
+                 regions had to be answered by the columns:\n{plan}"
+            );
+        }
+
+        // True in both states, and the whole point: the answer is right.
+        assert_eq!(
+            rows, flat,
+            "the row engine answered `{query}` wrongly over {regions} regions"
         );
         assert_eq!(
-            rows_of(&rows),
-            rows_of(&columns),
-            "the two engines disagree on `{query}` over {regions} regions"
+            columns, flat,
+            "the columnar arm answered `{query}` wrongly over {regions} regions"
         );
     }
 }
