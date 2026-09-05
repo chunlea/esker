@@ -749,9 +749,19 @@ fn a_re_created_sequence_starts_at_one_under_concurrency() {
         let cycles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ddl = cluster.session();
             for round in 0..40 {
-                ddl.run("DROP TABLE IF EXISTS cyc").unwrap();
-                ddl.run("CREATE TABLE cyc (id bigserial PRIMARY KEY, note text)")
-                    .unwrap();
+                // **The schema change is tolerated too, not only the probe below.** Four writers
+                // hammering the same table make every catalog write a race this connection can
+                // lose, and a `DROP` that came back `40001` used to panic here — the test
+                // manufacturing its own failure out of the load it exists to create. A round
+                // whose table was never re-created has no id to judge, so it is skipped for the
+                // same reason a round whose insert lost is.
+                if ddl.run("DROP TABLE IF EXISTS cyc").is_err()
+                    || ddl
+                        .run("CREATE TABLE cyc (id bigserial PRIMARY KEY, note text)")
+                        .is_err()
+                {
+                    continue;
+                }
                 // Tolerated, not asserted: with four writers churning the same table this
                 // connection's own statement can lose a race on the catalog and come back
                 // `42P01`. A round that could not be measured is skipped rather than failed —
