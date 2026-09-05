@@ -1,0 +1,23 @@
+crates/esker-cli/tests/cross_region_scan.rs
+  s_6f7019c05b578b::t_c5ffbf02826974 104-171
+crates/esker-client/src/txn.rs
+  s_6f7019c05b578b::t_6711928607a0d7 139-169,811,816-818,820,822-823,839-917
+crates/esker-client/tests/txn.rs
+  s_6f7019c05b578b::t_7528af40181087 259-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b3572d3b7df2f3f18d192cf3d03dca04af2fac36",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
