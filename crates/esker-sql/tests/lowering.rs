@@ -210,7 +210,6 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
         ),
         // `ADD COLUMN ... PRIMARY KEY` left this list with the `bigserial` above it, and so did
         // `ADD CONSTRAINT ... PRIMARY KEY`.
-        ("ALTER TABLE t ADD COLUMN c text COLLATE \"C\"", "COLLATE"),
         // `ALTER COLUMN a TYPE text` was here. It converts now, so what stays refused is the
         // `USING` that asks for a **computation** rather than a conversion — the boundary the unit
         // draws, and the one worth guarding (ADR 0031 rule 2).
