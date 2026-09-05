@@ -224,7 +224,11 @@ impl RawClient {
             // the same test passed alone.
             let boundary = match self.router.route(&cursor) {
                 Ok(route) => route.region.end_key,
-                Err(refusal) => repair_route(&self.router, &cursor, &refusal)?,
+                Err(refusal) => {
+                    repair_route(&self.router, &cursor, &refusal)?
+                        .region
+                        .end_key
+                }
             };
             let piece_end = clamp_end(end, &boundary);
             pieces.push((cursor.clone(), piece_end));
@@ -275,7 +279,10 @@ impl RawClient {
                     // The same repair the transactional scan uses, and the same one the fragment
                     // dispatch must: one place, so the ordering of "believe the store" against
                     // "ask the driver" cannot differ between them.
-                    to = clamp_end(&to, &repair_route(&self.router, from, &refusal)?);
+                    to = clamp_end(
+                        &to,
+                        &repair_route(&self.router, from, &refusal)?.region.end_key,
+                    );
                 }
                 Err(other) => return Err(other),
             }

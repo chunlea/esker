@@ -859,7 +859,7 @@ impl Transaction {
         // driver being behind rather than an answer about the cluster.
         let mut boundary = match self.router.route(cursor) {
             Ok(route) => route.region.end_key,
-            Err(refusal) => repair_route(&self.router, cursor, &refusal)?,
+            Err(refusal) => repair_route(&self.router, cursor, &refusal)?.region.end_key,
         };
         let mut refreshes = 0;
         loop {
@@ -872,7 +872,7 @@ impl Transaction {
                     refreshes += 1;
                     // **The shared repair**, not a copy of it: the fragment dispatch meets the same
                     // stale routing and must resolve it the same way (`router::repair_route`).
-                    boundary = repair_route(&self.router, cursor, &refusal)?;
+                    boundary = repair_route(&self.router, cursor, &refusal)?.region.end_key;
                 }
                 Err(other) => return Err(other),
             }
