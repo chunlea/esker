@@ -396,3 +396,189 @@ It has **one fragment**, so it says nothing about how the finish scales with fra
 axis the exchange is actually about. That axis was the run's purpose and §8 is why it does not
 exist. Everything above about multi-region behaviour is arithmetic on a single-region measurement,
 and is labelled as such wherever it appears.
+
+
+---
+
+# The join fragment — getting a join onto the columnar path
+
+§10 named this the next question worth asking, and the measurement is why: a join does not reach
+the columnar path *at all*, so at 40,000 rows it costs 8 s where the aggregates cost 55 ms, and
+`SET esker.engine = 'columnar'` cannot move it. This section is that unit's plan. It is deliberately
+**not** the exchange: one region, one fragment, no shuffle, no spill — multi-region join
+parallelism is gated on the `split` lane's work and is named as such in §J7.
+
+## J1. Why a join is not routed today, in one line of code
+
+`crates/esker-sql/src/exec/mod.rs` guards the call:
+
+```rust
+if let Some(table) = table.as_deref()
+    && inners.is_empty()          // <- no joins
+    && !derived_from
+{ fragment::route(…) }
+```
+
+so a joined plan never reaches the router, `planned.engine` stays `None`, and `EXPLAIN` prints no
+`Engine:` line at all — the **third** deliberate silence where
+[ADR 0040](../adr/0040-the-engine-a-query-runs-on.md) Decision 3 lists two. Closing that silence is
+half of this unit and is not optional: a reader debugging *"why is my join not on the columns"*
+gets nothing back today.
+
+## J2. Where the join runs — three options, and the one that needs no wire change
+
+| | Shape | Verdict |
+|---|---|---|
+| **A** | A **columnar join fragment**: both tables in one fragment, joined on the learner | **No, not yet.** A fragment is evaluated against *one region's* columnar files (DESIGN §16.2), and two tables occupy two key ranges and therefore two regions, on stores nothing co-locates. It needs either co-location PD does not schedule or a shuffle, which is the exchange this file has already deferred. |
+| **B** | **Two scan fragments, joined on the SQL node** | **No, not yet.** It needs a *rows*-output fragment, which ADR 0040 Decision 4 refuses precisely because a fragment answers in one framed message and would materialise a whole region on the SQL node. Lifting that is the streamed response of §3.2 — a wire change, an ADR, and `esker-proto`, which this lane does not own. |
+| **C** | **A semi-join pushed down as a filter**: the SQL node evaluates the small side, and the large side's fragment carries the join keys as a predicate | **Yes.** No wire change, no new output kind, and it attacks exactly the measured query. |
+
+**C**, then. `SELECT count(*) FROM ledger JOIN dim ON ledger.ghigh = dim.k WHERE dim.bucket = 3`
+becomes: read `dim` (small, filtered) on the SQL node at the statement's snapshot; collect the join
+keys; send **one existing-shape fragment** over `ledger` whose filter is the outer filter `AND
+ghigh ∈ {keys}`, with the aggregate it already carries; finish as the two-level aggregate already
+finishes. The join disappears into a predicate.
+
+## J3. When the rewrite is exact, which is the whole of its correctness
+
+A semi-join is not a join. Replacing one with the other is exact only under conditions that must be
+*checked*, not hoped for, and each maps onto something the planner already knows:
+
+1. **`left_join == false`.** A `LEFT JOIN` keeps unmatched outer rows NULL-extended; a filter
+   removes them.
+2. **`probe` is `Probe::PrimaryKey` or `Probe::UniqueIndex`** (`plan/query.rs:316`). This is the
+   condition that matters and the reason this slice is small: those two variants mean *at most one
+   inner row per outer row*, so replacing the join with a membership test cannot change any
+   aggregate's count. `Probe::Materialize` gives no such guarantee — one outer row may match many
+   inner rows and `count(*)` must count it many times — so it is **refused**.
+3. **No inner column is referenced above the join** — not in the aggregates, the grouping keys, the
+   `HAVING` or the projection. A filter yields no `dim` values to project.
+4. **`residual` is `None`, or reads only outer columns.** A probe answers its equality exactly, so
+   a residual here is the part the probe did not express.
+5. **The key set is bounded** (§J5). Above the bound the estimate refuses and says so.
+
+Any of these failing is a refusal with a reason, never a partial honouring — ADR 0022 Decision 3's
+rule, and the same one `esker_sql::plan`'s "reject, do not ignore" states.
+
+NULLs need no special case: `a.x = b.k` is never true for a NULL on either side, and a key set
+collected from `dim` contains no NULL, so `x ∈ keys` is false exactly where the join matched
+nothing.
+
+## J4. The fragment shape — one new expression node, and nothing else
+
+The filter tree has `Column`, `Literal`, `Compare`, `And`, `Or`, `Not`, `IsNull`
+(`esker-columnar/src/fragment/expr.rs`, tags 1–7). A membership test can already be written as an
+`Or` chain of `Compare(Eq)`, and for a handful of keys that is what this will do. It does not scale:
+2,500 keys against 200,000 rows is 500 million comparisons, which would lose to the row engine it
+is replacing.
+
+So: **`Expr::In { operand, values }`, tag 8**, values held sorted and probed by binary search (or a
+small hash set) so a row costs `log n` rather than `n`.
+
+**This is additive and needs no format-version bump.** An older evaluator meeting tag 8 refuses the
+whole fragment — the behaviour DESIGN §16.2 already specifies for an unknown expression node — and
+a refusal is a fall back to a row scan, which is the answer that was always there. It gets an
+**ADR** regardless, because `CLAUDE.md` says a format change does, and the decision worth recording
+is exactly that one: *additive tag, refusal as forward compatibility, no version bump*, with the
+golden that pins it.
+
+`MAX_EXPR_DEPTH` already bounds the tree; the value list needs a bound of its own (§J5).
+
+## J5. The cost rule, and the bound
+
+Routing a join needs one more comparison than routing a scan, because the SQL node does work
+*before* the fragment goes out — it reads the inner side. So:
+
+* **refuse above `JOIN_KEYS_MAX` keys** (start at 4,096, recorded and tunable, not a magic number
+  in a branch);
+* the inner side is read at the statement's own snapshot, through the row path, so it is the same
+  read the join would have done anyway — the rewrite does not add a read, it *removes* the outer
+  scan's row-wise pass;
+* the existing ratio rule still applies to the outer table's projection.
+
+## J6. What `EXPLAIN` says — closing the third silence
+
+Every joined plan gets an `Engine:` line. Routed:
+
+```text
+Aggregate on ledger
+  Engine: columnar  (join pushed down as a semi-join over 2500 keys)
+  Columnar Aggregate on ledger  (1 fragment)
+    Semi Join Filter: ghigh in dim.k  (2500 keys, from dim)
+```
+
+Refused, naming which of §J3 said no:
+
+```text
+Aggregate on ledger
+  Engine: rows  (join not pushed down: the inner side is materialised, so one outer row may
+                 match many)
+  Nested Loop
+    …
+```
+
+The reasons are the conditions in §J3, one string each, so a reader is told *which* rule refused
+rather than that some rule did. This needs a new `Reason` variant (or a `Reason::Shape` refinement)
+in `plan/routing.rs` — which is in this lane's `exec`-and-routing boundary — and it must print for
+**every** join over a table with a columnar copy, including the ones that refuse. A join over a
+table nobody asked for a copy of stays silent, which is Decision 3's first deliberate silence and
+is correct.
+
+## J7. What this unit will NOT do
+
+* **No exchange, no shuffle, no spill.** Unchanged from §8, and now doubly gated: on the `split`
+  lane, and on this unit existing at all.
+* **No multi-region join parallelism.** One region per table today, so one fragment. When the
+  `split` lane lands, a semi-join fragment goes to *each* region of the outer table and the
+  partials merge exactly as they do now — no new mechanism, which is a point in this design's
+  favour and is deliberately not built or measured here.
+* **No columnar join fragment (option A) and no rows-output fragment (option B).** Both need
+  something this lane does not own.
+* **No `LEFT JOIN`, no `Materialize` probe, no join whose inner columns are projected.** All
+  refuse, and `EXPLAIN` says which.
+* **No three-way joins** in this slice: one inner side, checked, or refuse.
+* **No new dependency.**
+
+## J8. Test list, red first
+
+The differential is the spec — every join answer from the columnar path must equal the row
+engine's, compared as a `Result` so an error is an answer too.
+
+1. **RED, first, before any of the rest:** a join over columnar-eligible tables asserted equal to
+   the row engine and asserted to have *run on the columns*. It fails today at the second assertion,
+   because the join never routes. This is the test the unit is written against, and it must assert
+   its own denominator — `docs/bench/columnar-m2.md`'s lesson and ADR 0040 Decision 5's, where the
+   differential found a bug as *"this query was not answered by the columns"* rather than as a
+   wrong number.
+2. `esker-columnar`: `Expr::In` round-trips through the codec; a golden pins tag 8; an unknown tag
+   still refuses the whole fragment; the evaluator agrees with an `Or` chain of `Eq` over the same
+   values, including NULLs and `-0.0`/`NaN` under `pg_cmp`.
+3. `exec`: each condition in §J3 refuses, one test per condition, asserting the **reason** and not
+   merely the fallback — a refusal for the wrong reason is a bug that passes a fallback test.
+4. `exec`: the rewrite preserves the answer when the inner side has duplicate *non-key* columns,
+   which is the case a careless uniqueness argument gets wrong.
+5. Bench: the join measured before and after on `esker bench-mpp`, both engines, engine asserted
+   from `EXPLAIN` on every run, recorded in `docs/bench/` beside the aggregate numbers with the
+   absolute seconds and never a ratio alone.
+
+## J9. Risks
+
+* **The uniqueness argument is the whole correctness story**, and it rests on `Probe` meaning what
+  it says. If a `PrimaryKey` probe can ever pair one outer row with two inner rows, this rewrite
+  returns wrong counts silently. Test 4 exists for that, and the differential is the backstop.
+* **The inner side is read twice** in the fallback case — once to collect keys, once by the row
+  join — if the fragment then refuses. Collect *after* the routing decision, not before.
+* **A large key set makes the fragment large.** `JOIN_KEYS_MAX` bounds it; the encoded fragment
+  should be checked against `max_frame_size` (16 MiB) rather than assumed under it.
+* **The bound is a magic number** until a measurement moves it. It is recorded in one place with
+  its reasoning, and the bench in test 5 is what will move it.
+
+## J10. One path question for the coordinator
+
+The cluster-level differential in §J8.1 belongs beside `crates/esker-sql/tests/routing_differential.rs`,
+which is the harness it models — and this lane's paths stop at `crates/esker-sql/src/exec/**`. A
+**new** file (`tests/routing_join_differential.rs`) conflicts with nobody, but it is outside what
+this lane was given. Asked rather than assumed. Until it is answered the red test lives as far in as
+it can reach — the rewrite's decision and the `In` evaluator have unit tests in `src/exec` and
+`esker-columnar` — and those cannot exercise a real cluster, which is where ADR 0022 says this
+defence has to stand.
