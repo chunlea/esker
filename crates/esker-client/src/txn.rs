@@ -516,6 +516,44 @@ impl Transaction {
         self.buffer.keys().next()
     }
 
+    /// What this transaction has buffered for `key`, in the three states a buffer really has:
+    /// `None` for nothing at all, `Some(None)` for a buffered delete, `Some(Some(value))` for a
+    /// buffered value.
+    ///
+    /// **"Nothing" and "a tombstone" are different things**, and the caller that needs this — a
+    /// savepoint rollback — leaves a stray delete behind if it cannot tell them apart.
+    #[must_use]
+    pub fn buffered(&self, key: &[u8]) -> Option<Option<Bytes>> {
+        self.buffer.get(key).map(|write| match write {
+            Write::Put(value) => Some(value.clone()),
+            Write::Delete => None,
+        })
+    }
+
+    /// Puts `key`'s buffer entry back to what [`Transaction::buffered`] returned earlier, and
+    /// **removes it entirely** when that was `None`.
+    ///
+    /// The removal is the point. Undoing a write by writing its old value back leaves the key in
+    /// the write set, so the commit still prewrites it and a concurrent commit on that key refuses
+    /// the whole transaction — for a write it no longer intends to make. The key's per-key read
+    /// stamp goes with it, so a later write of the same key reads it fresh rather than inheriting
+    /// the snapshot of the write that was undone.
+    pub fn restore(&mut self, key: &[u8], prior: Option<Option<Bytes>>) {
+        let key = Bytes::copy_from_slice(key);
+        match prior {
+            Some(Some(value)) => {
+                self.buffer.insert(key, Write::Put(value));
+            }
+            Some(None) => {
+                self.buffer.insert(key, Write::Delete);
+            }
+            None => {
+                self.buffer.remove(&key);
+                self.read_ts.remove(&key);
+            }
+        }
+    }
+
     /// Buffers a write. No I/O: the whole set goes out at `commit()`.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         if self.refuse_write(key) {

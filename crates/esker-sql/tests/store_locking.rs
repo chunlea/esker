@@ -362,3 +362,48 @@ fn a_row_the_transaction_never_read_does_not_refuse_it_against_real_stores() {
     a.run("COMMIT")
         .expect("row 2 is not a row A read, and its table is not what A recorded");
 }
+
+/// **The savepoint's undo reaches the client's write buffer, against real stores.**
+///
+/// The node-local version of this is in `tests/savepoint_rollback.rs`; this is the half a fake
+/// cannot answer, because the buffer that has to forget the row lives in `esker-client` and the
+/// conflict that would refuse the commit is a real prewrite against a real `write` column family.
+///
+/// Rails' shape exactly (`transaction_nested_test.rb`): the other session finishes first, the
+/// statement inside the savepoint legitimately answers `40001`, and the **outer** `COMMIT` must
+/// still succeed — that commit is where the escaping error was raised.
+#[test]
+fn a_savepoint_rollback_leaves_no_write_to_conflict_against_real_stores() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE t (id bigint primary key, v bigint)")
+        .unwrap();
+    setup.run("INSERT INTO t VALUES (1, 0), (2, 0)").unwrap();
+
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    a.run("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+    a.run("SAVEPOINT s1").unwrap();
+
+    let mut other = cluster.session();
+    other.run("UPDATE t SET v = 9 WHERE id = 2").unwrap();
+
+    let refused = a
+        .run("UPDATE t SET v = 2 WHERE id = 2")
+        .expect_err("the row moved under a SERIALIZABLE statement");
+    assert_eq!(refused.sqlstate(), "40001", "{refused}");
+
+    a.run("ROLLBACK TO SAVEPOINT s1").unwrap();
+    a.run("COMMIT")
+        .expect("after the rollback A neither writes row 2 nor depends on having read it");
+
+    let mut reader = cluster.session();
+    assert_eq!(
+        reader.rows("SELECT v FROM t ORDER BY id"),
+        [[Some("1".to_owned())], [Some("9".to_owned())]],
+        "A's row 1 committed and the other session's row 2 stands"
+    );
+}
