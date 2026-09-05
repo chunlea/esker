@@ -800,6 +800,52 @@ impl Node {
         }
     }
 
+    /// The same plan as a tree of named fields, for the three structured `FORMAT`s.
+    ///
+    /// **It reads the same `describe` the text form does**, which is the point: two walks over one
+    /// description can disagree about layout and can never disagree about the plan. See
+    /// [`crate::plan::explain`] for what the fields are and what a real server has that they do
+    /// not.
+    #[must_use]
+    pub fn plan_tree(
+        &self,
+        table: &str,
+        columns: &[String],
+        engine: Option<&crate::plan::routing::Decision>,
+    ) -> crate::plan::PlanNode {
+        // A derived table changes both names on the way down, exactly as in `explain_into`, and
+        // for the same reason: below it the relation is the sub-select's.
+        if let Node::Derived {
+            input,
+            alias,
+            input_table,
+            input_columns,
+        } = self
+        {
+            let line = match alias.as_str() {
+                "" => "Subquery Scan".to_owned(),
+                name => format!("Subquery Scan on {name}"),
+            };
+            let mut node = crate::plan::PlanNode::new(&line, None);
+            node.children
+                .push(input.plan_tree(input_table, input_columns, None));
+            return node;
+        }
+        let (line, child, extra) = self.describe(table, columns, engine, "");
+        let mut node = crate::plan::PlanNode::new(&line, extra.as_deref());
+        if let Some(child) = child {
+            // A columnar node's subtree is the *fallback* and is not given the decision, which is
+            // the rule `explain_into` prints by.
+            let below = if matches!(self, Node::Columnar(_)) {
+                None
+            } else {
+                engine
+            };
+            node.children.push(child.plan_tree(table, columns, below));
+        }
+        node
+    }
+
     /// One node's own line, its child, and the extra lines that belong to it — split out of
     /// [`Node::explain_into`] so that the walk and the per-node description are two readable
     /// things rather than one long one.

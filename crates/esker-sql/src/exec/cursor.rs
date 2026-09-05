@@ -39,17 +39,40 @@ pub(super) const SORT_LIMIT: usize = 1_000_000;
 /// This is what makes `LIMIT` cheap. A `SELECT * FROM big LIMIT 10` opens a scan, reads one chunk
 /// of keys, and stops — it never asks the store for the rest. Materialising the input and slicing
 /// it afterwards would give the same answer and read the whole table to do it.
+/// The session settings a cursor and everything under it read.
+///
+/// **Not a bag of options: these are the answers that are a property of the session rather than of
+/// the snapshot**, and there is no other way for them to arrive. `search_path` was the first —
+/// `'x'::regclass::text` qualifies a name only when its schema is not on the path, measured:
+/// `g1_rc.t` under the default path and `t` after `SET search_path = g1_rc, public`.
+/// `IntervalStyle` is the second, and it arrived with the same argument from the other end: a
+/// client that set `iso_8601` and is answered `1 mon` cannot read the value at all
+/// (`tests/interval_style.rs`). They are one struct so that the third does not need seventeen call
+/// sites changed again.
+#[derive(Clone, Copy)]
+pub(super) struct Settings<'a> {
+    /// The session's **resolved** `search_path`; empty for an evaluator that has no session behind
+    /// it, which prints every name qualified — the answer that cannot mislead.
+    pub(super) search_path: &'a [String],
+    /// How an `interval` is rendered for a client.
+    pub(super) interval_style: crate::value::IntervalStyle,
+}
+
+impl Settings<'_> {
+    /// No session at all: what a column `DEFAULT` and an index key are evaluated under.
+    pub(super) fn none() -> Self {
+        Settings {
+            search_path: &[],
+            interval_style: crate::value::IntervalStyle::Postgres,
+        }
+    }
+}
+
 pub(super) struct Cursor<'a> {
     txn: &'a dyn Txn,
     tenant: u64,
-    /// The session's **resolved** `search_path`, for the catalog functions that print a relation's
-    /// name.
-    ///
-    /// `'x'::regclass::text` qualifies a name only when its schema is not on the path — measured:
-    /// `g1_rc.t` under the default path and `t` after `SET search_path = g1_rc, public`. That is a
-    /// property of the *session*, not of the catalog, so it cannot be read out of the snapshot
-    /// beside it and has to arrive with the cursor.
-    search_path: &'a [String],
+    /// What the session decides about the rows this cursor produces.
+    settings: Settings<'a>,
     /// The tenant's relations, read at most once and only if something asks.
     ///
     /// `pg_get_indexdef(d.indexrelid)` is a function of the **catalog**, and its argument is a
@@ -279,7 +302,7 @@ fn equi_positions(on: &Expr, boundary: usize) -> Option<(usize, usize)> {
 fn inner_side(
     txn: &dyn Txn,
     tenant: u64,
-    search_path: &[String],
+    settings: Settings<'_>,
     inner_table_id: u64,
     inner_view: Option<&crate::plan::CatalogView>,
     inner_plan: Option<&Node>,
@@ -287,7 +310,7 @@ fn inner_side(
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
-        return view.rows_of(txn, tenant);
+        return view.rows_of(txn, tenant, settings.interval_style);
     }
     if !matches!(probe, Probe::Materialize) {
         return Ok(Vec::new());
@@ -299,11 +322,11 @@ fn inner_side(
     // unchanged — the bound and the `53400` past it — because what makes a materialised inner side
     // expensive is the same either way: a whole relation held in memory for one query.
     let mut scan = match inner_plan {
-        Some(plan) => Cursor::open(txn, tenant, search_path, plan)?,
+        Some(plan) => Cursor::open(txn, tenant, settings, plan)?,
         None => Cursor {
             txn,
             tenant,
-            search_path,
+            settings,
             catalog: std::cell::OnceCell::new(),
             kind: Kind::Scan {
                 columns: inner_columns.clone(),
@@ -338,14 +361,17 @@ impl<'a> Cursor<'a> {
     pub(super) fn open(
         txn: &'a dyn Txn,
         tenant: u64,
-        search_path: &'a [String],
+        settings: Settings<'a>,
         node: &Node,
     ) -> Result<Self> {
         let kind = match node {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
-            Node::CatalogView { view, .. } => Kind::Rows(view.rows_of(txn, tenant)?.into_iter()),
+            Node::CatalogView { view, .. } => Kind::Rows(
+                view.rows_of(txn, tenant, settings.interval_style)?
+                    .into_iter(),
+            ),
             // Rows written into the statement, evaluated here for the same reason a catalog view's
             // are: nothing is stored, so there is no key range to seek in and the row count is the
             // length of the list.
@@ -410,7 +436,7 @@ impl<'a> Cursor<'a> {
                 let materialized = inner_side(
                     txn,
                     tenant,
-                    search_path,
+                    settings,
                     *inner_table_id,
                     inner_view.as_ref(),
                     inner_plan.as_deref(),
@@ -427,7 +453,7 @@ impl<'a> Cursor<'a> {
                         Some(Node::TableFunction { call, .. }) => Some(call.clone()),
                         _ => None,
                     },
-                    outer: Box::new(Cursor::open(txn, tenant, search_path, outer)?),
+                    outer: Box::new(Cursor::open(txn, tenant, settings, outer)?),
                     left_join: *left_join,
                     inner_table_id: *inner_table_id,
                     inner_columns: inner_columns.clone(),
@@ -446,30 +472,30 @@ impl<'a> Cursor<'a> {
                 }
             }
             Node::Filter { input, predicate } => Kind::Filter {
-                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
+                input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 predicate: predicate.clone(),
             },
             Node::Project { input, exprs } => Kind::Project {
-                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
+                input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 exprs: exprs.clone(),
                 pending: Vec::new().into_iter(),
             },
             Node::Sort { input, keys } => Kind::Sort {
-                input: Some(Box::new(Cursor::open(txn, tenant, search_path, input)?)),
+                input: Some(Box::new(Cursor::open(txn, tenant, settings, input)?)),
                 keys: keys.clone(),
                 sorted: Vec::new().into_iter(),
             },
             Node::Aggregate { input, .. } => Kind::Aggregate {
-                input: Some(Box::new(Cursor::open(txn, tenant, search_path, input)?)),
+                input: Some(Box::new(Cursor::open(txn, tenant, settings, input)?)),
                 spec: node.clone(),
                 groups: Vec::new().into_iter(),
             },
             // It computes nothing: the sub-select's plan already produced the rows, and the name
             // and column names this node carries are for `EXPLAIN`. Opening the input directly is
             // what makes that true rather than merely intended.
-            Node::Derived { input, .. } => return Cursor::open(txn, tenant, search_path, input),
+            Node::Derived { input, .. } => return Cursor::open(txn, tenant, settings, input),
             Node::Distinct { input } => Kind::Distinct {
-                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
+                input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 seen: BTreeSet::new(),
             },
             // **Resolved before the cursor is opened, never here.** A columnar node's rows come
@@ -489,7 +515,7 @@ impl<'a> Cursor<'a> {
                 // Something refused, so the rows answer — **in this transaction, at this
                 // snapshot**, which is what makes the fallback silent to the client and correct.
                 // The node stays in the plan so `EXPLAIN` can still say what was tried.
-                Some(_) => return Cursor::open(txn, tenant, search_path, &columnar.fallback),
+                Some(_) => return Cursor::open(txn, tenant, settings, &columnar.fallback),
                 None => {
                     return Err(SqlError::Internal(
                         "a columnar node reached the cursor without being resolved".to_owned(),
@@ -501,7 +527,7 @@ impl<'a> Cursor<'a> {
                 offset,
                 limit,
             } => Kind::Limit {
-                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
+                input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 to_skip: *offset,
                 remaining: *limit,
             },
@@ -509,7 +535,7 @@ impl<'a> Cursor<'a> {
         Ok(Cursor {
             txn,
             tenant,
-            search_path,
+            settings,
             catalog: std::cell::OnceCell::new(),
             kind,
         })
@@ -527,7 +553,7 @@ impl<'a> Cursor<'a> {
         let env = Env {
             txn: Some(self.txn),
             tenant: self.tenant,
-            search_path: self.search_path,
+            settings: self.settings,
             catalog: Some(&self.catalog),
         };
         match &mut self.kind {
@@ -1058,16 +1084,16 @@ fn compare_rows(
 /// case wants `test_schema.test_table` and the `test_schema` case wants `test_table`, from one
 /// database.
 fn qualified_for(
-    search_path: &[String],
+    settings: Settings<'_>,
     relation: &crate::catalog::pg_relations::RelationRow,
 ) -> String {
     // An **unknown** path is the default one, on which `public` sits — so a caller with no session
     // behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
     // every statement outside a session wants.
-    let visible = if search_path.is_empty() {
+    let visible = if settings.search_path.is_empty() {
         relation.schema == crate::catalog::PUBLIC_SCHEMA
     } else {
-        search_path.contains(&relation.schema)
+        settings.search_path.contains(&relation.schema)
     };
     if visible {
         return relation.name.clone();
@@ -1122,9 +1148,9 @@ pub(super) struct Env<'a> {
     /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
     /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
     catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
-    /// The session's resolved `search_path`; empty for an evaluator that has no session behind it,
-    /// which prints every name qualified — the answer that cannot mislead.
-    search_path: &'a [String],
+    /// What the session decides: the resolved `search_path` a catalog function prints a name
+    /// against, and the `IntervalStyle` a value is rendered in.
+    settings: Settings<'a>,
 }
 
 impl Env<'_> {
@@ -1134,7 +1160,7 @@ impl Env<'_> {
             txn: None,
             tenant: 0,
             catalog: None,
-            search_path: &[],
+            settings: Settings::none(),
         }
     }
 
@@ -1147,7 +1173,7 @@ impl Env<'_> {
             txn: Some(txn),
             tenant: 0,
             catalog: None,
-            search_path: &[],
+            settings: Settings::none(),
         }
     }
 
@@ -2091,7 +2117,13 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // for the cast. Measured — every other type here casts to exactly what it prints.
             Datum::Bool(flag) => Datum::Text(if flag { "true" } else { "false" }.to_owned()),
             value => {
-                let text = value.to_text().unwrap_or_default();
+                // **The output function, which is the session's for an `interval`** — the same
+                // rule the `SELECT` funnel applies to a column, applied here so that
+                // `SELECT term` and `SELECT term::text` cannot answer in two dialects in one
+                // session. Measured on 19beta1: under `iso_8601` the cast, `||`, `format`,
+                // `::varchar`, `array_to_string` and `jsonb_build_object` all say `P1Y`.
+                let text = crate::value::to_text_under(&value, env.settings.interval_style)
+                    .unwrap_or_default();
                 Datum::Text(if *strip_blanks {
                     text.trim_end_matches(' ').to_owned()
                 } else {
@@ -2953,7 +2985,7 @@ fn catalog_function(
                     // name with the schema beside it, so printing `name` alone dropped the schema
                     // for every relation outside `public` and `ActiveRecord`'s schema dump lost
                     // the qualifier its two `dump_schemas` tests disagree about.
-                    Some(relation) => Datum::Text(qualified_for(env.search_path, relation)),
+                    Some(relation) => Datum::Text(qualified_for(env.settings, relation)),
                     None if oid == 0 => Datum::Text("-".to_owned()),
                     None => Datum::Text(oid.to_string()),
                 },

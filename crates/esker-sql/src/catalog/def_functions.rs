@@ -40,7 +40,7 @@
 //! differs. `format_type(1082, NULL)` is `date` there and `???` here, declared in the corpus, and
 //! it closes one type at a time as types arrive.
 
-use crate::value::{self, ColumnType, Datum, PgType};
+use crate::value::{self, ColumnType, Datum, IntervalStyle, PgType, to_text_under};
 
 /// What a real server prints for an oid that has no `pg_type` row.
 ///
@@ -138,15 +138,19 @@ pub fn type_of_oid(oid: i64) -> Option<ColumnType> {
 /// `'10000000000'::bigint` here, because reaching `numeric` needs a `numeric`. The digits inside
 /// the quotes — the half every client parses — are identical.
 #[must_use]
-pub fn constant_expression(value: &Datum, ty: ColumnType) -> String {
-    use crate::value::PgDatum as _;
-
+pub fn constant_expression(value: &Datum, ty: ColumnType, style: IntervalStyle) -> String {
     // A boolean prints as the word, where its *output function* writes one character. The two are
     // different functions and this is the one that a `::text` cast and a stored default share.
     if let Datum::Bool(flag) = value {
         return (if *flag { "true" } else { "false" }).to_owned();
     }
-    let Some(text) = value.to_text() else {
+    // **The output function, under the session's `IntervalStyle`.** `pg_get_expr`
+    // renders a stored constant by printing it, so an `interval` default reads
+    // `'3 years'::interval` under the boot style and `'P3Y'::interval` under the one
+    // `ActiveRecord` sets — same catalog row, two texts, and only the second one
+    // `Duration.parse` can read. Measured; it is the whole of
+    // `test_schema_dump_with_default_value`.
+    let Some(text) = to_text_under(value, style) else {
         return "NULL".to_owned();
     };
     // **Only a number prints as one.** The unquoted form is decided by what the constant *is*, the
