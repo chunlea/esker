@@ -852,7 +852,7 @@ async fn idling_inside_a_block_terminates_the_session() {
             server,
             esker_sql::pgwire::server::Config::default(),
         );
-        let _ = connection.run(&executors).await;
+        let _ = connection.run(std::sync::Arc::new(executors)).await;
     });
 
     let mut input = startup_packet();
@@ -926,7 +926,7 @@ async fn idling_outside_a_block_is_not_a_timeout() {
             server,
             esker_sql::pgwire::server::Config::default(),
         );
-        let _ = connection.run(&executors).await;
+        let _ = connection.run(std::sync::Arc::new(executors)).await;
     });
 
     client.write_all(&startup_packet()).await.unwrap();

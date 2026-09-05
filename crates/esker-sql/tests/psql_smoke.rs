@@ -124,7 +124,7 @@ async fn a_database_the_cluster_does_not_have_is_refused_at_startup() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(&NoSuchDatabase).await;
+        let _ = connection.run(std::sync::Arc::new(NoSuchDatabase)).await;
     });
     client.write_all(&startup_packet(0, &[])).await.unwrap();
     client.flush().await.unwrap();
@@ -147,7 +147,7 @@ async fn over_a_pipe(input: Vec<u8>) -> Vec<u8> {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(&Sessions).await;
+        let _ = connection.run(std::sync::Arc::new(Sessions)).await;
     });
     client.write_all(&input).await.unwrap();
     client.flush().await.unwrap();
@@ -211,7 +211,7 @@ async fn an_ssl_request_is_refused_and_the_connection_continues() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(&Sessions).await;
+        let _ = connection.run(std::sync::Arc::new(Sessions)).await;
     });
 
     let mut ssl_request = 8u32.to_be_bytes().to_vec();
@@ -235,7 +235,7 @@ async fn a_statement_is_refused_by_name_and_the_session_carries_on() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut connection = Connection::new(server, Config::default());
-        let _ = connection.run(&Sessions).await;
+        let _ = connection.run(std::sync::Arc::new(Sessions)).await;
     });
     client.write_all(&startup_packet(0, &[])).await.unwrap();
     read_until_ready(&mut client).await;
