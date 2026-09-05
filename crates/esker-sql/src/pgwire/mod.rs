@@ -20,7 +20,6 @@
 //! The same message reports `_pq_.`-prefixed protocol options the client asked for and the server
 //! does not know; PostgreSQL 19 lists them by name, and so does [`negotiation`].
 
-pub(crate) mod backends;
 pub mod message;
 pub mod server;
 pub mod session;

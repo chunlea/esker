@@ -81,7 +81,19 @@ pub trait Executors: Send + Sync + 'static {
     ///
     /// `3D000` when the cluster has no such database, which is the answer a real server gives and
     /// the one `rake db:create` reads to know it must create one.
-    fn for_session(&self, database: &str) -> Result<Box<dyn Execute + Send>>;
+    /// `identity` is **the session this executor is**, and it is a parameter rather than
+    /// something the implementor makes for itself.
+    ///
+    /// The connection has already announced this pid and key in `BackendKeyData`, so an
+    /// implementor that registered its own would give the executor an identity no client was ever
+    /// told — a `CancelRequest` would name the announced one and reach nobody, and
+    /// `pg_stat_activity` would show a session the client cannot cancel. Passing it in is what
+    /// makes those the same session.
+    fn for_session(
+        &self,
+        database: &str,
+        identity: crate::session::Backend,
+    ) -> Result<Box<dyn Execute + Send>>;
 }
 
 /// Accepts connections until the process ends.
@@ -117,7 +129,7 @@ impl<S> Drop for Connection<S> {
     /// hand out pids that answer for nobody.
     fn drop(&mut self) {
         if let Some(backend) = &self.backend {
-            crate::pgwire::backends::deregister(backend.pid);
+            crate::session::deregister(backend.pid);
         }
     }
 }
@@ -149,7 +161,7 @@ pub struct Connection<S> {
     /// `None` before then and for a connection that never got that far — a `CancelRequest` is
     /// itself a connection that never completes a startup, and registering one would put a
     /// session in the table that can never run a statement.
-    backend: Option<crate::pgwire::backends::Backend>,
+    backend: Option<crate::session::Backend>,
 }
 
 /// What one message's worth of work owns while it runs.
@@ -207,7 +219,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // **After the startup packet, because the database it names is what decides the tenant.**
         // A name the directory does not have is `3D000` here and the connection ends, which is
         // what tells `rake db:create` it has work to do.
-        let executor = match executors.for_session(&self.database) {
+        // The identity announced at startup, not a fresh one: `BackendKeyData` already told the
+        // client this pid and key.
+        let identity = self
+            .backend
+            .clone()
+            .unwrap_or_else(crate::session::register);
+        let executor = match executors.for_session(&self.database, identity) {
             Ok(executor) => executor,
             Err(error) => {
                 self.send_error(&error).await?;
@@ -329,7 +347,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 // from a right one from the client's side, which is what leaves nothing to guess
                 // against.
                 Startup::Cancel { pid, key } => {
-                    crate::pgwire::backends::cancel(pid, key);
+                    crate::session::cancel(pid, key);
                     return Ok(false);
                 }
                 Startup::Parameters { .. } => {
@@ -395,7 +413,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // **A real pid and a real secret.** They were `0, 0` while nothing could cancel: a key
         // that is a constant is worse than no key, because it looks like one. The pair is what a
         // `CancelRequest` on another connection must present to stop this session's statement.
-        let backend = crate::pgwire::backends::register();
+        let backend = crate::session::register();
         self.backend = Some(backend.clone());
         Message::BackendKeyData {
             pid: backend.pid,
@@ -505,20 +523,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
 /// Convenience for the common case: one backend, and an executor per session built from it.
 ///
-/// The executor itself lands in unit 6; until then this exists so the listener can be stood up and
-/// pointed at something.
+/// **Nothing in this workspace constructs one.** Its doc said "the executor itself lands in unit 6;
+/// until then this exists so the listener can be stood up and pointed at something", and unit 6
+/// landed long ago — so this is scaffolding whose stated deadline has passed and is a deletion
+/// candidate. Kept and updated here rather than removed, because removing a `pub` item is not what
+/// this change was asked to do.
 #[derive(Debug)]
 pub struct SharedBackend<F> {
-    /// Builds a session executor. Takes the backend so each session gets its own.
+    /// Builds a session executor from the identity that session was announced under.
     pub make: F,
 }
 
 impl<F> Executors for SharedBackend<F>
 where
-    F: Fn() -> Box<dyn Execute + Send> + Send + Sync + 'static,
+    F: Fn(crate::session::Backend) -> Box<dyn Execute + Send> + Send + Sync + 'static,
 {
-    fn for_session(&self, _database: &str) -> Result<Box<dyn Execute + Send>> {
-        Ok((self.make)())
+    fn for_session(
+        &self,
+        _database: &str,
+        identity: crate::session::Backend,
+    ) -> Result<Box<dyn Execute + Send>> {
+        Ok((self.make)(identity))
     }
 }
 

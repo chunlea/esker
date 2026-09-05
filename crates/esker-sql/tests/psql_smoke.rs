@@ -25,7 +25,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Sessions;
 
 impl Executors for Sessions {
-    fn for_session(&self, _database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        _database: &str,
+        _identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         Ok(Box::new(NotYetExecuting))
     }
 }
@@ -100,7 +104,11 @@ fn tags(bytes: &[u8]) -> String {
 struct NoSuchDatabase;
 
 impl Executors for NoSuchDatabase {
-    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        database: &str,
+        __identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         Err(esker_sql::SqlError::UndefinedDatabase(database.to_owned()))
     }
 }
@@ -556,10 +564,19 @@ impl RealSessions {
 }
 
 impl Executors for RealSessions {
-    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        database: &str,
+        identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         Ok(Box::new(
-            esker_sql::exec::Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), 1)
-                .serving_database(database),
+            esker_sql::exec::Executor::new(
+                Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                1,
+                identity,
+            )
+            .serving_database(database),
         ))
     }
 }

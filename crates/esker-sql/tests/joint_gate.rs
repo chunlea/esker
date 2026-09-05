@@ -377,8 +377,13 @@ impl Gate {
 
     fn session(&self) -> Session {
         Session {
-            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT)
-                .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>),
+            executor: Executor::new(
+                Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                TENANT,
+                esker_sql::session::register(),
+            )
+            .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>),
         }
     }
 

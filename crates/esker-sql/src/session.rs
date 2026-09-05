@@ -1,5 +1,11 @@
 //! Which session is which, so that a cancellation can name one.
 //!
+//! **Top level rather than under `pgwire`, because a session is not a pgwire idea.** Every
+//! `Executor` has one — a connection's, a `Pair`'s, a `Cluster`'s — and `pg_stat_activity` reads
+//! them all from here. Putting the registry under the protocol module would have made the catalog
+//! depend on the wire, and would have left the in-process harnesses without an identity, which is
+//! how a view ends up with one code path for tests and another for clients.
+//!
 //! A `CancelRequest` arrives on its **own connection** — the client opens a second socket, sends
 //! the pid and secret key it was handed at startup, and the server closes it without a reply. So
 //! the session being cancelled cannot be found from the connection asking: there has to be a
@@ -12,16 +18,66 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// One live session's cancellation handle.
 #[derive(Clone, Debug)]
-pub(crate) struct Backend {
+pub struct Backend {
     /// What `BackendKeyData` announced and `pg_stat_activity` will report.
     ///
     /// `u32` because that is what the protocol carries; `pg_stat_activity`'s column is `int4` and
     /// converts at that boundary, which is the only place the sign means anything.
-    pub(crate) pid: u32,
+    pub pid: u32,
     /// The secret that makes a `CancelRequest` for this pid this client's to send.
-    pub(crate) key: u32,
+    pub key: u32,
     /// Set by a cancellation, read by `crate::exec::cancel` between units of work.
-    pub(crate) cancel: Arc<AtomicBool>,
+    pub cancel: Arc<AtomicBool>,
+    /// What this session is doing, for `pg_stat_activity` to report.
+    pub activity: Arc<Mutex<Activity>>,
+}
+
+/// What a session is doing right now.
+#[derive(Debug, Default, Clone)]
+pub struct Activity {
+    /// The database it connected to, or empty before it has said.
+    pub database: String,
+    /// The statement it is running, or `None` while it is idle — which is exactly the distinction
+    /// `pg_stat_activity` draws between `active` and `idle`.
+    pub query: Option<String>,
+}
+
+impl Backend {
+    /// Records the database this session is on.
+    pub fn on_database(&self, database: &str) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.database = database.to_owned();
+        }
+    }
+
+    /// Marks this session as running `sql` until the guard is dropped.
+    ///
+    /// A guard rather than a pair of calls, because the statement can leave by an error, a panic
+    /// or a return, and a session left reading `active` forever would be a lie that grows: the
+    /// Rails test that wants this asks `WHERE query LIKE '% FOR UPDATE'`, and a stale row would
+    /// make it cancel a statement that finished long ago.
+    /// **Owns a handle rather than borrowing the backend**: the guard lives for the whole
+    /// statement, and a borrow of `self.identity` would hold the executor immutably borrowed for
+    /// exactly as long — which the statement, needing `&mut self`, cannot allow.
+    #[must_use]
+    pub fn running(&self, sql: &str) -> Running {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.query = Some(sql.to_owned());
+        }
+        Running(Arc::clone(&self.activity))
+    }
+}
+
+/// Clears the running statement when it ends, however it ends.
+#[derive(Debug)]
+pub struct Running(Arc<Mutex<Activity>>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(mut activity) = self.0.lock() {
+            activity.query = None;
+        }
+    }
 }
 
 fn backends() -> &'static Mutex<HashMap<u32, Backend>> {
@@ -58,7 +114,8 @@ fn fresh_key() -> u32 {
 }
 
 /// Registers a new session and gives it the pid and key its `BackendKeyData` will announce.
-pub(crate) fn register() -> Backend {
+#[must_use]
+pub fn register() -> Backend {
     // Small positive integers, as a real server's pids are. Uniqueness within this process is all
     // a `CancelRequest` needs, since the key is what proves the right to use one.
     static NEXT_PID: AtomicU32 = AtomicU32::new(1);
@@ -66,6 +123,7 @@ pub(crate) fn register() -> Backend {
         pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
         key: fresh_key(),
         cancel: Arc::new(AtomicBool::new(false)),
+        activity: Arc::new(Mutex::new(Activity::default())),
     };
     if let Ok(mut live) = backends().lock() {
         live.insert(backend.pid, backend.clone());
@@ -73,8 +131,34 @@ pub(crate) fn register() -> Backend {
     backend
 }
 
+/// Every live session, for `pg_stat_activity`.
+///
+/// **One code path for every session**, which is the property this module exists for: a connection,
+/// a `Pair` and a `Cluster` all register here, so the view has no second answer for the ones that
+/// did not arrive over a socket.
+#[must_use]
+pub fn snapshot() -> Vec<(u32, Activity)> {
+    let Ok(live) = backends().lock() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(u32, Activity)> = live
+        .values()
+        .map(|backend| {
+            let activity = backend
+                .activity
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            (backend.pid, activity)
+        })
+        .collect();
+    // By pid, so the view is stable between calls rather than in hash order.
+    rows.sort_by_key(|(pid, _)| *pid);
+    rows
+}
+
 /// Forgets a session that has gone.
-pub(crate) fn deregister(pid: u32) {
+pub fn deregister(pid: u32) {
     if let Ok(mut live) = backends().lock() {
         live.remove(&pid);
     }
@@ -86,7 +170,7 @@ pub(crate) fn deregister(pid: u32) {
 /// to a `CancelRequest`, so there is no channel to report a refusal on and no oracle for guessing.
 /// The bool is for callers that have one — `pg_cancel_backend` returns false for a pid that is not
 /// there.
-pub(crate) fn cancel(pid: u32, key: u32) -> bool {
+pub fn cancel(pid: u32, key: u32) -> bool {
     let Ok(live) = backends().lock() else {
         return false;
     };

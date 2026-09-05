@@ -276,7 +276,8 @@ impl Node {
         fixture: &[&str],
     ) -> Self {
         let mut node = Node {
-            executor: Executor::new(backend, catalog, tenant).serving_database(database),
+            executor: Executor::new(backend, catalog, tenant, esker_sql::session::register())
+                .serving_database(database),
             in_block: false,
             failed: false,
         };
