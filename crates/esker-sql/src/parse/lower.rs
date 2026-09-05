@@ -5599,14 +5599,26 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 args: vec![lower_expr(expr)?],
             })))
         }
+        // `ARRAY[…]::oidvector`, which `ActiveRecord`'s case-insensitivity probe compares against
+        // `pg_proc.proargtypes`. The elements' oids, space separated — digits and not names.
+        (CastTarget::OidVector, _) => {
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::OidVector,
+                args: vec![lower_expr(expr)?],
+            })))
+        }
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
             let Some(named) = value::named_type(&name)? else {
                 return Ok(user_regtype(&name, false));
             };
+            // **A `regtype`, not the text of one** (ADR 0077). It prints identically — the name
+            // — so every answer that only reads the value is unchanged; what moves is
+            // `pg_typeof`, which now says `regtype` as a real server does, and the comparison,
+            // which is the oid's and so meets `castsource` and `proargtypes` where they are.
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(named.printed()),
+                value::regtype_of_oid(named.oid()),
             ))))
         }
         // `'23'::oid`. **This is a cast to a real type now**, not a special form that happens to
@@ -6031,6 +6043,8 @@ enum CastTarget {
     RegType,
     /// PostgreSQL's `oid`.
     Oid,
+    /// PostgreSQL's `oidvector`: a list of oids, printed space separated.
+    OidVector,
 }
 
 /// `sqlparser` files both as custom type names, since neither is in its `DataType`.
@@ -6048,6 +6062,7 @@ fn cast_target(data_type: &DataType) -> Option<CastTarget> {
     }
     match name.to_string().to_ascii_lowercase().as_str() {
         "regtype" => Some(CastTarget::RegType),
+        "oidvector" => Some(CastTarget::OidVector),
         "regclass" => Some(CastTarget::RegClass),
         "oid" => Some(CastTarget::Oid),
         _ => None,

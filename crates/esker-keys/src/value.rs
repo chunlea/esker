@@ -1048,6 +1048,15 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
                 | ColumnType::Xml
                 | ColumnType::LQuery
         )
+        // **A `regtype` fits an `oid` column and the reverse**, which is ADR 0042's rule met in
+        // full: the two share a representation *and* a comparison — the oid, in both directions —
+        // and differ only in the output function. That is what makes
+        // `castsource = 'character varying'::regtype` the comparison a real server makes.
+        | (
+            ColumnType::RegType,
+            ColumnType::Oid
+        )
+        | (ColumnType::Oid, ColumnType::RegType)
     )
 }
 

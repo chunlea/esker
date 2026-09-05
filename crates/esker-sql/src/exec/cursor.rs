@@ -2825,6 +2825,45 @@ fn catalog_function(
                 None => Datum::Text(oid.to_string()),
             },
         },
+        // Every element's oid, space separated: what `pg_proc.proargtypes` holds, so the two
+        // compare exactly. A NULL array is NULL, and an element that is not an oid-shaped value
+        // has no number to render, which is the `42804` a real server gives the same cast.
+        CatalogFunc::OidVector => match args.first() {
+            Some(Datum::Array(array)) => {
+                let mut out = String::new();
+                for value in &array.values {
+                    let oid = match value {
+                        Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => u64::from(*oid),
+                        Some(Datum::Int8(value)) => u64::try_from(*value).unwrap_or(0),
+                        Some(Datum::Int4(value)) => u64::try_from(*value).unwrap_or(0),
+                        // An element with no oid to render. `42846`, the class a cast that does
+                        // not exist gets, and not the array's own error: the array is fine and
+                        // the *cast* is what has no meaning for it.
+                        other => {
+                            return Err(SqlError::CannotCast {
+                                from: other.as_ref().map_or("unknown", |value| {
+                                    value.column_type().map_or("unknown", |ty| ty.name())
+                                }),
+                                to: "oidvector",
+                            });
+                        }
+                    };
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&oid.to_string());
+                }
+                Datum::Text(out)
+            }
+            Some(Datum::Null) | None => Datum::Null,
+            // `x::oidvector` where `x` is not an array at all.
+            Some(other) => {
+                return Err(SqlError::CannotCast {
+                    from: other.column_type().map_or("unknown", |ty| ty.name()),
+                    to: "oidvector",
+                });
+            }
+        },
         // The one encoding this node speaks. Anything else is the empty string, which is what a
         // real server answers for a number that names no encoding.
         CatalogFunc::PgEncodingToChar => match oid_argument(args.first())? {
@@ -3041,10 +3080,10 @@ fn catalog_function(
 ///
 /// **Text is taken as a type name**, and that is not a liberty — it is the one coercion this node
 /// cannot express any other way. A real server writes `format_type('integer'::regtype, NULL)` and
-/// coerces `regtype` to `oid` for free; here `'integer'::regtype` lowers to the *name as text*
-/// (`crate::parse::lower::lower_cast`), so the same statement arrives with a string in it and
-/// resolving it is what makes the answer identical. A name that is no type of this server's is
-/// `42704`, which is what `'x'::regtype` itself answers.
+/// coerces `regtype` to `oid` for free, **and so does this node now** — a `regtype` is an oid here
+/// too (ADR 0077). The `Text` arm below is what the old `regtype`-is-text model needed and stays
+/// because `format_type` is also written with a bare name in this suite; a name that is no type of
+/// this server's is `42704`, which is what `'x'::regtype` itself answers.
 fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
     Ok(match arg {
         None | Some(Datum::Null) => None,
@@ -3053,8 +3092,10 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
         // **And a real `oid`**, which is what `'integer'::regtype::oid` folds to now: the two
         // spellings of that question had drifted, and this had only ever been handed the
-        // integer one.
-        Some(Datum::Oid(oid)) => Some(i64::from(*oid)),
+        // integer one. **A `regtype` is one too** since ADR 0077, which is what makes
+        // `format_type('integer'::regtype, NULL)` the free coercion a real server makes rather
+        // than the string this used to be handed.
+        Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
             let ty = crate::value::type_by_name(name)?
@@ -3076,8 +3117,11 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         Some(Datum::Int8(oid)) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
-        // An `oid` is what a catalog column really holds; `23::oid::regtype` sends one.
-        Some(Datum::Oid(oid)) => Some(i64::from(*oid)),
+        // An `oid` is what a catalog column really holds; `23::oid::regtype` sends one. **A
+        // `regtype` is one too** — that is the whole model (ADR 0077), and it is what makes
+        // `format_type('integer'::regtype, NULL)` the statement a real server answers rather than
+        // a type error.
+        Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "an oid is an integer, not {other:?}"

@@ -585,11 +585,15 @@ impl CatalogView {
             // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
             // `opcdefault` a boolean; the three oids are `oid` there and this node's own types
             // here, the trade every `pg_catalog` column makes.
-            // `castsource` and `casttarget` are `oid` on a real server and `castcontext` and
-            // `castmethod` are `"char"` — all `text`/`bigint` here, the standing catalog trade.
+            // **`castsource` and `casttarget` are `oid`, here as on a real server** — this pair
+            // steps out of the standing `bigint` trade because they are what a `regtype` is
+            // compared against: `castsource = 'character varying'::regtype` is the join
+            // `ActiveRecord`'s case-insensitivity probe makes, and an `oid` beside a `regtype` is
+            // one representation where a `bigint` beside one is not (ADR 0077). `castcontext` and
+            // `castmethod` are `"char"` there and `text` here, which is the trade unchanged.
             CatalogView::PgCast => &[
-                ("castsource", ColumnType::Int8),
-                ("casttarget", ColumnType::Int8),
+                ("castsource", ColumnType::Oid),
+                ("casttarget", ColumnType::Oid),
                 ("castcontext", ColumnType::Text),
                 ("castmethod", ColumnType::Text),
             ],
@@ -1989,8 +1993,10 @@ fn pg_cast_rows() -> Vec<Vec<Datum>> {
         .iter()
         .map(|(source, target, context, method)| {
             vec![
-                Datum::Int8(*source),
-                Datum::Int8(*target),
+                // The declared type, so the rows and the description agree: an `oid` renders the
+                // same digits a `bigint` did, and now compares with a `regtype` as well.
+                Datum::Oid(u32::try_from(*source).unwrap_or(0)),
+                Datum::Oid(u32::try_from(*target).unwrap_or(0)),
                 Datum::Text((*context).to_owned()),
                 Datum::Text((*method).to_owned()),
             ]

@@ -1001,6 +1001,14 @@ pub enum CatalogFunc {
     /// oid **0** — PostgreSQL's rendering of `InvalidOid`, which every non-array row of `pg_type`
     /// has in `typelem` — and the number back for an oid this node does not know.
     RegTypeName,
+    /// `ARRAY[…]::oidvector`: the elements' **oids**, space separated.
+    ///
+    /// **Digits, not names** — measured, `ARRAY['text'::regtype]::oidvector` is `25`, which is
+    /// exactly what `pg_proc.proargtypes` holds here. An `oidvector` is its own type on a real
+    /// server and text here, which is the representation `proargtypes` already uses and the
+    /// reason the comparison between them is order-sensitive and exact
+    /// ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+    OidVector,
     /// `'happy'::mood` — a cast to a **user-defined type**, which is a name until the catalog is
     /// read.
     ///
@@ -1311,6 +1319,7 @@ impl CatalogFunc {
             // Both halves of a `regtype` are called that: one reads an oid and prints a name,
             // the other reads a name and answers its oid.
             CatalogFunc::RegTypeName | CatalogFunc::UserRegType => "regtype",
+            CatalogFunc::OidVector => "oidvector",
             // What a `42883` would call it, and nothing reaches one: the pass either
             // resolves it or raises about the type by name.
             CatalogFunc::UserCast => "cast",
@@ -1407,6 +1416,7 @@ impl CatalogFunc {
             | CatalogFunc::RegClass
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
+            | CatalogFunc::OidVector
             | CatalogFunc::ToRegClass
             | CatalogFunc::IsEmpty
             | CatalogFunc::PathIsOpen
@@ -1463,6 +1473,7 @@ impl CatalogFunc {
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
             | CatalogFunc::RegTypeName
+            | CatalogFunc::OidVector
             | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
