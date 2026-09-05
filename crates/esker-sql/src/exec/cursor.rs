@@ -42,6 +42,14 @@ pub(super) const SORT_LIMIT: usize = 1_000_000;
 pub(super) struct Cursor<'a> {
     txn: &'a dyn Txn,
     tenant: u64,
+    /// The session's **resolved** `search_path`, for the catalog functions that print a relation's
+    /// name.
+    ///
+    /// `'x'::regclass::text` qualifies a name only when its schema is not on the path — measured:
+    /// `g1_rc.t` under the default path and `t` after `SET search_path = g1_rc, public`. That is a
+    /// property of the *session*, not of the catalog, so it cannot be read out of the snapshot
+    /// beside it and has to arrive with the cursor.
+    search_path: &'a [String],
     /// The tenant's relations, read at most once and only if something asks.
     ///
     /// `pg_get_indexdef(d.indexrelid)` is a function of the **catalog**, and its argument is a
@@ -263,9 +271,15 @@ fn equi_positions(on: &Expr, boundary: usize) -> Option<(usize, usize)> {
 /// A **catalog view** is materialised too, and where its rows come from is the difference: there
 /// is no key range to scan, so they are computed. Always [`Probe::Materialize`] —
 /// `exec::query::join_node` will not build any other probe over a relation that has no key.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inner side of a hash join is described by exactly these; grouping them into a \
+              struct would name the same fields twice"
+)]
 fn inner_side(
     txn: &dyn Txn,
     tenant: u64,
+    search_path: &[String],
     inner_table_id: u64,
     inner_view: Option<&crate::plan::CatalogView>,
     inner_plan: Option<&Node>,
@@ -285,10 +299,11 @@ fn inner_side(
     // unchanged — the bound and the `53400` past it — because what makes a materialised inner side
     // expensive is the same either way: a whole relation held in memory for one query.
     let mut scan = match inner_plan {
-        Some(plan) => Cursor::open(txn, tenant, plan)?,
+        Some(plan) => Cursor::open(txn, tenant, search_path, plan)?,
         None => Cursor {
             txn,
             tenant,
+            search_path,
             catalog: std::cell::OnceCell::new(),
             kind: Kind::Scan {
                 columns: inner_columns.clone(),
@@ -320,7 +335,12 @@ impl<'a> Cursor<'a> {
         clippy::too_many_lines,
         reason = "one arm per node kind, the same shape as `next`"
     )]
-    pub(super) fn open(txn: &'a dyn Txn, tenant: u64, node: &Node) -> Result<Self> {
+    pub(super) fn open(
+        txn: &'a dyn Txn,
+        tenant: u64,
+        search_path: &'a [String],
+        node: &Node,
+    ) -> Result<Self> {
         let kind = match node {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
@@ -390,6 +410,7 @@ impl<'a> Cursor<'a> {
                 let materialized = inner_side(
                     txn,
                     tenant,
+                    search_path,
                     *inner_table_id,
                     inner_view.as_ref(),
                     inner_plan.as_deref(),
@@ -406,7 +427,7 @@ impl<'a> Cursor<'a> {
                         Some(Node::TableFunction { call, .. }) => Some(call.clone()),
                         _ => None,
                     },
-                    outer: Box::new(Cursor::open(txn, tenant, outer)?),
+                    outer: Box::new(Cursor::open(txn, tenant, search_path, outer)?),
                     left_join: *left_join,
                     inner_table_id: *inner_table_id,
                     inner_columns: inner_columns.clone(),
@@ -425,30 +446,30 @@ impl<'a> Cursor<'a> {
                 }
             }
             Node::Filter { input, predicate } => Kind::Filter {
-                input: Box::new(Cursor::open(txn, tenant, input)?),
+                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
                 predicate: predicate.clone(),
             },
             Node::Project { input, exprs } => Kind::Project {
-                input: Box::new(Cursor::open(txn, tenant, input)?),
+                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
                 exprs: exprs.clone(),
                 pending: Vec::new().into_iter(),
             },
             Node::Sort { input, keys } => Kind::Sort {
-                input: Some(Box::new(Cursor::open(txn, tenant, input)?)),
+                input: Some(Box::new(Cursor::open(txn, tenant, search_path, input)?)),
                 keys: keys.clone(),
                 sorted: Vec::new().into_iter(),
             },
             Node::Aggregate { input, .. } => Kind::Aggregate {
-                input: Some(Box::new(Cursor::open(txn, tenant, input)?)),
+                input: Some(Box::new(Cursor::open(txn, tenant, search_path, input)?)),
                 spec: node.clone(),
                 groups: Vec::new().into_iter(),
             },
             // It computes nothing: the sub-select's plan already produced the rows, and the name
             // and column names this node carries are for `EXPLAIN`. Opening the input directly is
             // what makes that true rather than merely intended.
-            Node::Derived { input, .. } => return Cursor::open(txn, tenant, input),
+            Node::Derived { input, .. } => return Cursor::open(txn, tenant, search_path, input),
             Node::Distinct { input } => Kind::Distinct {
-                input: Box::new(Cursor::open(txn, tenant, input)?),
+                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
                 seen: BTreeSet::new(),
             },
             // **Resolved before the cursor is opened, never here.** A columnar node's rows come
@@ -468,7 +489,7 @@ impl<'a> Cursor<'a> {
                 // Something refused, so the rows answer — **in this transaction, at this
                 // snapshot**, which is what makes the fallback silent to the client and correct.
                 // The node stays in the plan so `EXPLAIN` can still say what was tried.
-                Some(_) => return Cursor::open(txn, tenant, &columnar.fallback),
+                Some(_) => return Cursor::open(txn, tenant, search_path, &columnar.fallback),
                 None => {
                     return Err(SqlError::Internal(
                         "a columnar node reached the cursor without being resolved".to_owned(),
@@ -480,7 +501,7 @@ impl<'a> Cursor<'a> {
                 offset,
                 limit,
             } => Kind::Limit {
-                input: Box::new(Cursor::open(txn, tenant, input)?),
+                input: Box::new(Cursor::open(txn, tenant, search_path, input)?),
                 to_skip: *offset,
                 remaining: *limit,
             },
@@ -488,6 +509,7 @@ impl<'a> Cursor<'a> {
         Ok(Cursor {
             txn,
             tenant,
+            search_path,
             catalog: std::cell::OnceCell::new(),
             kind,
         })
@@ -505,6 +527,7 @@ impl<'a> Cursor<'a> {
         let env = Env {
             txn: Some(self.txn),
             tenant: self.tenant,
+            search_path: self.search_path,
             catalog: Some(&self.catalog),
         };
         match &mut self.kind {
@@ -1028,6 +1051,30 @@ fn compare_rows(
 /// null placement follows the direction. `array_agg(n ORDER BY n)` is `{10,20,30,NULL}` and
 /// `ORDER BY n DESC` is `{NULL,30,20,10}`; measured, and it falls out of this function rather than
 /// being asserted twice.
+/// A relation's name as `::regclass::text` prints it for this session.
+///
+/// PostgreSQL qualifies a name exactly when its schema is **not** on the `search_path`, so the
+/// same oid prints two ways in two sessions — which is what `DumpSchemasTest` turns on: the `:all`
+/// case wants `test_schema.test_table` and the `test_schema` case wants `test_table`, from one
+/// database.
+fn qualified_for(
+    search_path: &[String],
+    relation: &crate::catalog::pg_relations::RelationRow,
+) -> String {
+    // An **unknown** path is the default one, on which `public` sits — so a caller with no session
+    // behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
+    // every statement outside a session wants.
+    let visible = if search_path.is_empty() {
+        relation.schema == crate::catalog::PUBLIC_SCHEMA
+    } else {
+        search_path.contains(&relation.schema)
+    };
+    if visible {
+        return relation.name.clone();
+    }
+    crate::catalog::display_name(&crate::catalog::qualify(&relation.schema, &relation.name))
+}
+
 pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Ordering {
     for (at, key) in keys.iter().enumerate() {
         let (a, b) = (
@@ -1075,6 +1122,9 @@ pub(super) struct Env<'a> {
     /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
     /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
     catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
+    /// The session's resolved `search_path`; empty for an evaluator that has no session behind it,
+    /// which prints every name qualified — the answer that cannot mislead.
+    search_path: &'a [String],
 }
 
 impl Env<'_> {
@@ -1084,6 +1134,7 @@ impl Env<'_> {
             txn: None,
             tenant: 0,
             catalog: None,
+            search_path: &[],
         }
     }
 
@@ -1096,6 +1147,7 @@ impl Env<'_> {
             txn: Some(txn),
             tenant: 0,
             catalog: None,
+            search_path: &[],
         }
     }
 
@@ -2731,7 +2783,13 @@ fn catalog_function(
             Some(oid) => match crate::catalog::pg_catalog::view_by_oid(oid) {
                 Some(view) => Datum::Text(view.name().to_owned()),
                 None => match env.relations()?.by_oid(oid) {
-                    Some(relation) => Datum::Text(crate::catalog::display_name(&relation.name)),
+                    // **Qualified only when the schema is not on the `search_path`** — measured:
+                    // `'g1_rc.t'::regclass::text` is `g1_rc.t` under the default path and `t`
+                    // after `SET search_path = g1_rc, public`. `RelationRow::name` is the bare
+                    // name with the schema beside it, so printing `name` alone dropped the schema
+                    // for every relation outside `public` and `ActiveRecord`'s schema dump lost
+                    // the qualifier its two `dump_schemas` tests disagree about.
+                    Some(relation) => Datum::Text(qualified_for(env.search_path, relation)),
                     None if oid == 0 => Datum::Text("-".to_owned()),
                     None => Datum::Text(oid.to_string()),
                 },
