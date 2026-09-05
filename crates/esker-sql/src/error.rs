@@ -260,6 +260,16 @@ pub enum SqlError {
     #[error("canceling statement due to lock timeout")]
     LockTimeout,
 
+    /// A statement that ran out of `statement_timeout`.
+    ///
+    /// **`57014`, not `55P03`**, even when what it was doing was waiting for a row: the code says
+    /// *why the statement stopped*, and the two parameters stop it for different reasons.
+    /// `lock_timeout` is "a lock was not available"; `statement_timeout` is "this statement was
+    /// cancelled", which is what Rails maps to `QueryCanceled`. So a wait bounded by both has to
+    /// report which one fired, and cannot answer with whichever is convenient.
+    #[error("canceling statement due to statement timeout")]
+    StatementTimeout,
+
     /// Two transactions waiting for each other's rows. **`40P01`**, and exactly one of them gets
     /// it — measured on PostgreSQL 19, where the survivor's *both* updates landed.
     ///
@@ -2448,6 +2458,7 @@ impl SqlError {
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
             SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
+            SqlError::StatementTimeout => sqlstate::QUERY_CANCELED,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::CannotChangeMatview(_)

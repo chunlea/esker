@@ -268,6 +268,13 @@ pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
 /// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
 pub const LOCK_NOT_AVAILABLE: &str = "55P03";
 
+/// `57014` — a statement stopped because something asked it to stop, rather than because it could
+/// not proceed. `statement_timeout`, `pg_cancel_backend()` and the protocol's `CancelRequest` all
+/// answer this one code with three sentences, and it is the code a client maps to "cancelled"
+/// rather than to "retry": `55P03` says a lock was unavailable, `57014` says the statement was
+/// **cancelled**, and Rails raises `QueryCanceled` for the second and not the first.
+pub const QUERY_CANCELED: &str = "57014";
+
 /// `40P01` — two transactions waiting for each other. In class 40 with `40001`, which is what says
 /// a client should retry it, and a **different** condition: a serialization failure is one
 /// transaction losing a race, a deadlock is two that cannot both proceed

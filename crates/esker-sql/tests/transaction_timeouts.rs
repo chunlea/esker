@@ -242,25 +242,7 @@ const DIVERGENCES: &[(char, &str, &str)] = &[
          the same thing. The detection is right and the *lifetime* is not; ending a transaction on \
          a deadlock belongs with the isolation levels in unit 3 (ADR 0057).",
     ),
-    // --- (1) the timeouts, refused by name rather than accepted -------------------------------
-    (
-        'A',
-        "SET statement_timeout = '150ms'",
-        "`0A000` naming the parameter. Nothing here cancels a running statement: the executor \
-         runs one to completion on a blocking thread and no clock interrupts it. Accepting the \
-         value would be the answer `crate::parameter` exists to refuse — a setting a client asked \
-         for, was told it got, and did not get — and a client that believes it holds a 150 ms \
-         cancellation waits for one for ever. `SET statement_timeout = 0` succeeds, because that \
-         asks for what is already true.",
-    ),
-    (
-        'A',
-        "SELECT pg_sleep(2)",
-        "`pg_sleep` is not a function this node has, so this is `42883` rather than a statement \
-         that runs for two seconds and is cancelled. The line is kept because it is the oracle's \
-         own proof that `statement_timeout` fires at all, which is the fact the refusal above is \
-         about.",
-    ),
+    // --- (1) the timeouts, honoured now: the two entries that were here agree ---------------
     (
         'A',
         "SET LOCAL lock_timeout = '150ms'",
@@ -437,9 +419,12 @@ fn corpus() -> Vec<(usize, char, String, String)> {
         .collect()
 }
 
-/// **`0` is the truth and it is accepted; anything else is refused by name.**
+/// **Both boot at `0`, as a real server does, and both are honoured for a real value.**
 ///
-/// **Both boot at `0`, as a real server does**, and one of them is now honoured for a real value.
+/// This test spent most of its life asserting the opposite — that a non-zero value was `0A000`
+/// naming the parameter — because nothing here could act on one. `lock_timeout` earned its value
+/// first (a waiter is a loop the SQL layer drives) and `statement_timeout` second, once
+/// `crate::exec::cancel` existed to cut a working statement short.
 ///
 /// A non-zero `lock_timeout` default was tried and reverted: a long-held lock in another worker is
 /// normal in a Rails application and PostgreSQL waits for it, so a node that gives up after some
@@ -447,7 +432,7 @@ fn corpus() -> Vec<(usize, char, String, String)> {
 /// the incompatibility documented rather than absent
 /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
 #[test]
-fn a_timeout_of_zero_is_accepted_and_a_real_one_is_refused_by_name() {
+fn both_timeouts_boot_at_zero_and_take_a_real_value() {
     let mut cluster = Cluster::new(&['A']);
     let session = cluster.session('A');
 
@@ -477,17 +462,21 @@ fn a_timeout_of_zero_is_accepted_and_a_real_one_is_refused_by_name() {
             "after 0: {name}"
         );
 
-        let error = session.run(&format!("SET {name} = '150ms'")).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "for {name}");
-        assert!(
-            error.to_string().contains(name),
-            "the refusal must name the parameter, got: {error}"
+        // **A real value is accepted now**, and the order that got here matters more than the
+        // assertion: `exec::cancel` gives the statement a deadline first, and only then does the
+        // parameter stop being refused. Accepting it while nothing could act on it is what this
+        // file measured as a twenty-minute hang.
+        session.run(&format!("SET {name} = '150ms'")).unwrap();
+        assert_eq!(
+            session.rows(&format!("SHOW {name}")),
+            [["150ms"]],
+            "accepted and reported back: {name}"
         );
-        // The refusal did not change the value: a `SET` that failed leaves the old one.
+        session.run(&format!("SET {name} = 0")).unwrap();
         assert_eq!(
             session.rows(&format!("SHOW {name}")),
             [["0"]],
-            "unchanged: {name}"
+            "and back off again: {name}"
         );
     }
 }

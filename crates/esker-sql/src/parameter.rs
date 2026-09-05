@@ -25,11 +25,12 @@
 //!   *skipped* rather than refused, which is what makes the default `"$user", public` resolve to
 //!   `{public}`. `SHOW` gives the path as **set** and `current_schemas` gives it as **resolved**,
 //!   and the resolving is `crate::exec::Executor`'s, where the catalog is.
-//! * `statement_timeout` and `lock_timeout` are honoured **only at `0`**, which is what they
-//!   permanently are here: nothing cancels a running statement and nothing waits for a row lock,
-//!   so `SHOW` answering `0` is exact. A non-zero value is `0A000` naming the parameter — the one
-//!   entry in this table whose absence was measured as a *hang* rather than a wrong answer
-//!   (`tests/transaction_timeouts.rs`).
+//! * `statement_timeout` and `lock_timeout` are **honoured**, and were not always: `lock_timeout`
+//!   bounds the row wait (ADR 0057) and `statement_timeout` bounds the statement, through the
+//!   thread's deadline in `crate::exec::cancel`. Until that existed both were accepted only at
+//!   `0`, and that refusal is the one entry in this table whose absence was measured as a *hang*
+//!   rather than a wrong answer (`tests/transaction_timeouts.rs`) — which is why the cancellation
+//!   landed before the parameter did.
 //! * `max_identifier_length` is **read-only**, as it is on a real server — `55P02`, which is a
 //!   different answer from `42704` and means a different thing.
 //! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
@@ -487,25 +488,16 @@ impl Parameter {
             ("timezone", zone) if !is_utc(zone) => {
                 Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
             }
-            // **A timeout this node cannot enforce, and `0` is the one value it can.** Nothing
-            // here cancels a running statement — the executor runs one to completion on a
-            // blocking thread and no clock interrupts it — and nothing here waits for a row lock,
-            // because a Percolator prewrite that meets a live lock is `40001` after a bounded
-            // backoff rather than a wait. So there is no wait for `lock_timeout` to bound and no
-            // cancellation for `statement_timeout` to schedule.
+            // **`lock_timeout` was honoured first** — a waiter is a loop the SQL layer drives —
+            // and `statement_timeout` is honoured now too: `exec::cancel` gives the statement a
+            // deadline this thread carries, and the loops long enough to matter check it. Both
+            // fall through to the catch-all below rather than having an arm of their own.
             //
-            // This is the one refusal in this table whose *absence* was measured as a hang rather
-            // than as a wrong answer: a client told it holds a 150 ms cancellation waits for one,
-            // and `adapters/postgresql/transaction_test.rb` waited twenty minutes. `0` is
-            // accepted because it asks for what is already the case.
-            // **`lock_timeout` is honoured now** — it is the first timeout this node can keep,
-            // because a waiter is a loop the SQL layer drives and is cancellable in a way a
-            // statement that is *working* is not (ADR 0057). It therefore falls through to the
-            // catch-all below rather than having an arm of its own. `statement_timeout` stays
-            // refused, and the refusal is narrower rather than gone.
-            ("statement_timeout", value) if !is_no_timeout(value) => Err(SqlError::unsupported(
-                format!("a non-zero {} ({value})", self.reported),
-            )),
+            // **The refusal came off only after the cancellation went in, and that order was not
+            // a preference.** Its absence was measured as a *hang* rather than a wrong answer: a
+            // client told it holds a 150 ms cancellation waits for one, and
+            // `adapters/postgresql/transaction_test.rb` waited twenty minutes. Accepting the
+            // parameter while nothing could act on it would have bought that back.
             // **A `search_path` is not validated**, on a real server or here: an entry naming no
             // schema is *skipped* rather than refused, which is what makes the default
             // `"$user", public` mean `{public}`. `SHOW` gives the path as **set** and
@@ -540,15 +532,6 @@ pub fn duration_ms(value: &str) -> Option<u64> {
     #[allow(clippy::cast_sign_loss)]
     let scaled = count.checked_mul(*numerator as u64)?;
     (scaled != 0).then_some(scaled)
-}
-
-/// Whether a duration means "no timeout", which is the only value the two timeouts can honour.
-///
-/// [`Values::Duration`] has already normalised the value, and its rule is that **zero loses its
-/// unit** — `'0ms'` and `0` both store `0` — so one comparison covers every spelling PostgreSQL
-/// accepts for off.
-fn is_no_timeout(value: &str) -> bool {
-    value == "0"
 }
 
 /// The spellings of UTC this node can print in. `Etc/UTC` is the same instant offset and reads

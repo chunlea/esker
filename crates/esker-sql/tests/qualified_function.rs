@@ -11,15 +11,16 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // One, and it is not about the qualifier: `length` is a scalar function this node does not
-    // have, and the line is here **because** it proves the qualifier is stripped before the name
-    // is resolved — the refusal names `length` and not `pg_catalog.length`.
-    answers: &[(
-        "SELECT pg_catalog.length('abc')",
-        "`length` is not implemented — `lower` and `upper` are the two scalar functions this node \
-         has. The qualifier is handled: the refusal names the bare name, which is the one a \
-         reader can act on.",
-    )],
+    // **Empty, and it was not.** This held one entry saying `length` "is a scalar function this
+    // node does not have". That stopped being true when `length` was implemented, and the row kept
+    // diverging for a *different* reason than the one written down — the declared type was `text`
+    // where a real server says `integer`. Typing the counting functions correctly closed the gap
+    // and the harness demanded the entry go, which is ADR 0031 rule 2 doing its job: a declared
+    // divergence that starts agreeing is deleted, not kept.
+    //
+    // What the entry was really for is tested directly below: a missing function is refused under
+    // its **bare** name, with the qualifier stripped first.
+    answers: &[],
 };
 
 #[test]

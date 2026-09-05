@@ -27,6 +27,7 @@
 pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
+mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
@@ -321,10 +322,10 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 });
             }
             crate::backend::Lock::Held { by, .. } => {
-                if let Some(limit) = deadline
+                if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
-                    return Err(SqlError::LockTimeout);
+                    return Err(which.expired());
                 }
                 let _ = by;
                 // A fixed step rather than an exponential one: the thing being waited for is
@@ -335,6 +336,92 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 waited += WAIT_STEP_MS;
             }
         }
+    }
+}
+
+/// Which parameter bounded a wait, because the two answer **different SQLSTATEs** for the same
+/// observable event.
+///
+/// `lock_deadline` used to return a bare `Option<u64>` — a number with no provenance — and the wait
+/// loop then reported `55P03` whichever parameter produced it. That is right for `lock_timeout` and
+/// wrong for `statement_timeout`, whose `57014` is the code a client maps to "cancelled" rather
+/// than "a lock was busy". `transaction_test.rb` asserts `QueryCanceled`, so it can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    /// `lock_timeout` — `55P03`, `canceling statement due to lock timeout`.
+    Lock,
+    /// `statement_timeout` — `57014`, `canceling statement due to statement timeout`.
+    Statement,
+}
+
+impl Deadline {
+    /// The error this deadline raises when it runs out.
+    fn expired(self) -> SqlError {
+        match self {
+            Deadline::Lock => SqlError::LockTimeout,
+            Deadline::Statement => SqlError::StatementTimeout,
+        }
+    }
+}
+
+/// How long a wait may last and **which parameter said so**, from the two parameters' values.
+///
+/// `lock_timeout` first and `statement_timeout` behind it, which is the order PostgreSQL applies
+/// them in — measured: with both set, the lock timeout is the one that fires. Zero means no limit
+/// for both, which is a real server's default.
+///
+/// A free function rather than a method so the precedence and the provenance can be tested without
+/// standing up an `Executor`: the arm that returns [`Deadline::Statement`] is unreachable through a
+/// session until a non-zero `statement_timeout` is accepted, and an untestable arm is how a wrong
+/// SQLSTATE would sit here unnoticed.
+fn deadline_from(lock_timeout: &str, statement_timeout: &str) -> Option<(u64, Deadline)> {
+    for (value, which) in [
+        (lock_timeout, Deadline::Lock),
+        (statement_timeout, Deadline::Statement),
+    ] {
+        if let Some(ms) = crate::parameter::timeout_ms(value)
+            && ms > 0
+        {
+            return Some((ms, which));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{Deadline, deadline_from};
+
+    /// **The provenance, which is the whole reason this returns a pair.** A wait bounded by
+    /// `statement_timeout` must answer `57014`, and one bounded by `lock_timeout` `55P03`; before
+    /// this the caller had a bare number and answered `55P03` for both.
+    #[test]
+    fn each_parameter_names_itself() {
+        assert_eq!(deadline_from("100ms", "0"), Some((100, Deadline::Lock)));
+        assert_eq!(
+            deadline_from("0", "100ms"),
+            Some((100, Deadline::Statement))
+        );
+    }
+
+    /// With both set the **lock** timeout fires, which is PostgreSQL's order and was measured
+    /// before this function existed. Asserted here so the order cannot be swapped silently.
+    #[test]
+    fn the_lock_timeout_wins_when_both_are_set() {
+        assert_eq!(deadline_from("50ms", "10ms"), Some((50, Deadline::Lock)));
+    }
+
+    /// Zero is "no limit" for both, and two zeroes are not a zero-length deadline.
+    #[test]
+    fn zero_is_no_limit_rather_than_an_instant_one() {
+        assert_eq!(deadline_from("0", "0"), None);
+    }
+
+    /// The two SQLSTATEs, at the point where they are chosen.
+    #[test]
+    fn the_expired_error_differs_by_parameter() {
+        assert_eq!(Deadline::Lock.expired().sqlstate(), "55P03");
+        assert_eq!(Deadline::Statement.expired().sqlstate(), "57014");
     }
 }
 
@@ -1017,19 +1104,23 @@ impl Executor {
         )
     }
 
-    fn lock_deadline(&self) -> Option<u64> {
-        for parameter in [
-            crate::parameter::lock_timeout(),
-            crate::parameter::statement_timeout(),
-        ] {
-            let value = self.parameter(parameter);
-            if let Some(ms) = crate::parameter::timeout_ms(&value)
-                && ms > 0
-            {
-                return Some(ms);
-            }
-        }
-        None
+    /// When the statement about to run must stop, from `statement_timeout`.
+    ///
+    /// **Not `lock_timeout`**, which bounds one wait rather than the statement: a session with a
+    /// 50 ms lock timeout and no statement timeout may run a five-second scan, and cutting it off
+    /// would be this node inventing a limit nobody set.
+    fn statement_deadline(&self) -> Option<std::time::Instant> {
+        let value = self.parameter(crate::parameter::statement_timeout());
+        crate::parameter::timeout_ms(&value)
+            .filter(|ms| *ms > 0)
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms))
+    }
+
+    fn lock_deadline(&self) -> Option<(u64, Deadline)> {
+        deadline_from(
+            &self.parameter(crate::parameter::lock_timeout()),
+            &self.parameter(crate::parameter::statement_timeout()),
+        )
     }
 
     fn parameter(&self, parameter: &crate::parameter::Parameter) -> String {
@@ -2899,6 +2990,10 @@ pub(crate) fn for_each_page(
 ) -> Result<()> {
     let mut next = start.to_vec();
     loop {
+        // **Where a long statement actually spends its time.** A page boundary is the natural
+        // check point: fine enough that `statement_timeout` means something on a big table, coarse
+        // enough to cost nothing.
+        cancel::check()?;
         let read = txn.scan(&next, end, SCAN_CHUNK)?;
         let Some((last, _)) = read.last() else {
             return Ok(());
@@ -3161,6 +3256,11 @@ impl Execute for Executor {
     }
 
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
+        // **The statement's clock starts here**, at the one boundary every statement crosses, and
+        // stops when this call returns however it returns (`cancel::Guard`). `statement_timeout`
+        // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
+        // the precedence `deadline_from` keeps.
+        let _clock = cancel::until(self.statement_deadline());
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
         if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {

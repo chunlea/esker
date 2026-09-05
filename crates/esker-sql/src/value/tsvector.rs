@@ -46,7 +46,10 @@ impl Weight {
         }
     }
 
-    fn of(letter: char) -> Option<Self> {
+    /// The weight a letter names, or `None` for anything that is not one — `setweight`'s second
+    /// argument is a `"char"` and a real server refuses a letter outside `A`–`D`.
+    #[must_use]
+    pub fn of(letter: char) -> Option<Self> {
         match letter {
             'A' | 'a' => Some(Weight::A),
             'B' | 'b' => Some(Weight::B),
@@ -285,6 +288,32 @@ pub fn to_lexemes(config: Config, text: &str) -> Vec<Lexeme> {
         });
     }
     lexemes
+}
+
+/// `a || b`: the two lexeme sets, with **`b`'s positions shifted by `a`'s maximum**.
+///
+/// Measured both ways round, and they differ — which is the whole reason a tsvector needed a
+/// `Datum` of its own rather than riding on `Text`:
+///
+/// ```text
+/// to_tsvector('english','fat cat') || to_tsvector('english','thin dog') -> 'cat':2 'dog':4 'fat':1 'thin':3
+/// to_tsvector('english','thin dog') || to_tsvector('english','fat cat') -> 'cat':4 'dog':2 'fat':3 'thin':1
+/// ```
+pub fn concat(left: &str, right: &str) -> Result<String> {
+    let left = from_text(left)?;
+    let shift = left
+        .iter()
+        .flat_map(|lexeme| lexeme.positions.iter().map(|(at, _)| *at))
+        .max()
+        .unwrap_or(0);
+    let mut merged = left;
+    for mut lexeme in from_text(right)? {
+        for position in &mut lexeme.positions {
+            position.0 = position.0.saturating_add(shift);
+        }
+        merged.push(lexeme);
+    }
+    Ok(to_text(&canonical(merged)))
 }
 
 /// The word tokens of a text, numbered from one.

@@ -3809,10 +3809,15 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
                     .iter()
                     .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
             };
+            // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
+            // already right — it was only the *declared* type that said `text`, which a client
+            // binds against.
             if of(ColumnType::Hstore) {
                 ColumnType::Hstore
             } else if of(ColumnType::Ltree) {
                 ColumnType::Ltree
+            } else if of(ColumnType::TsVector) {
+                ColumnType::TsVector
             } else {
                 ColumnType::Text
             }
@@ -3834,6 +3839,19 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             Expr::Aggregate(_) => ColumnType::Text,
             operand => expr_type(operand, scope)?,
         },
+        // **The three counting functions answer `integer`, whatever they count.** Measured on
+        // 19beta1: `pg_typeof(length('abc'))`, `char_length` and `octet_length` are all `integer`,
+        // and this node declared `text` for every one of them — the *values* were always right, so
+        // only a client that binds by the declared type could see it, which is exactly what
+        // `ActiveRecord` does. Found while wiring `length(tsvector)`, which is the same function
+        // over a fourth operand.
+        Expr::Scalar {
+            func:
+                crate::plan::ScalarFunc::Length
+                | crate::plan::ScalarFunc::OctetLength
+                | crate::plan::ScalarFunc::Ascii,
+            ..
+        } => ColumnType::Int4,
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
         // The two text functions take text and answer text.
         Expr::Scalar { .. }

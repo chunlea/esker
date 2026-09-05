@@ -15,10 +15,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT length(concat('a', NULL, 'b'))",
-            "`length` is a different function and not one statement 738 calls. The line is in the corpus because it is what pins `concat`'s NULL rule as a *length* — `concat('a', NULL, 'b')` is two characters, not four and not NULL — and that half agrees: the string this node builds is the string PostgreSQL builds.",
-        ),
+        // **`SELECT length(concat('a', NULL, 'b'))` used to be here** and now agrees, deleted
+        // under ADR 0031 rule 2. Its reason said `length` "is a different function"; what actually
+        // kept it diverging by the end was the **declared type** — this node said `text` where a
+        // real server says `integer`, with the value always right. Typing the counting functions
+        // closed it. The `convert_to` line below is a different gap and stays.
         (
             "SELECT length(convert_to('Ruby on Rails', 'UTF8'))",
             "`length` is a different function and not one statement 738 calls. The line is in the corpus because it is what pins `concat`'s NULL rule as a *length* — `concat('a', NULL, 'b')` is two characters, not four and not NULL — and that half agrees: the string this node builds is the string PostgreSQL builds.",

@@ -3501,6 +3501,14 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                         args: vec![lower_expr(right)?, lower_expr(left)?],
                     })));
                 }
+                // **`@@` in both argument orders is one call**, and the evaluator decides which
+                // operand is the vector — the rule this match already states for `||` and `@>`.
+                BinaryOperator::AtAt => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::TsMatch,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 BinaryOperator::StringConcat => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreConcat,
