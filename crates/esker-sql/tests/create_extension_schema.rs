@@ -25,7 +25,6 @@ mod parity;
 /// The two spellings answer the same thing, which is the whole claim.
 #[test]
 fn the_bare_and_with_spellings_agree() {
-    let mut node = parity::Node::new(&["CREATE SCHEMA custom_schema"]);
     for (bare, with) in [
         (
             "CREATE EXTENSION hstore SCHEMA custom_schema",
@@ -36,16 +35,27 @@ fn the_bare_and_with_spellings_agree() {
             "CREATE EXTENSION IF NOT EXISTS \"hstore\" WITH SCHEMA custom_schema",
         ),
     ] {
+        // **A node each, because the statement now succeeds.** This compared two *refusals* when
+        // it was written, so one node served both spellings; the day `SCHEMA` was implemented the
+        // first spelling installed the extension and the second answered
+        // `42710 extension "hstore" already exists`, and the test failed while its claim was still
+        // true. The claim is about the two spellings being one statement, so each gets a node in
+        // the same state.
+        let mut node = parity::Node::new(&["CREATE SCHEMA custom_schema"]);
         let bare_answer = node.answer(bare).to_string();
+        let mut node = parity::Node::new(&["CREATE SCHEMA custom_schema"]);
         assert_eq!(bare_answer, node.answer(with).to_string(), "{bare}");
         assert!(
             !bare_answer.contains("42601"),
             "a valid statement must not be a syntax error: {bare_answer}"
         );
-        assert_eq!(
-            bare_answer,
-            "!0A000 CREATE EXTENSION ... SCHEMA is not supported"
-        );
+        // **This asserted the `0A000` and now asserts the answer.** The clause was implemented in
+        // `tests/create_extension_in_schema.rs`, and a declared refusal that starts working is
+        // deleted rather than kept green against the old text (ADR 0031 rule 2). What this file
+        // is still for is C1 and the two spellings: `sqlparser` 0.62.0 reads the options only
+        // after a `WITH`, PostgreSQL makes the keyword optional, and both must reach the same
+        // statement.
+        assert_eq!(bare_answer, "(a command, no result set)");
     }
 }
 

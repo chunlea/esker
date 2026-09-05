@@ -960,7 +960,24 @@ pub(super) fn create_extension(
         }
         return Err(SqlError::DuplicateExtension(create.name.clone()));
     }
-    catalog::install_extension(txn, executor.tenant, &create.name, version);
+    // **The schema is resolved before anything is written, and a missing one is `3F000`** — not
+    // `42704`, and not a silent install into `public`. Measured:
+    // `CREATE EXTENSION hstore SCHEMA nosuchschema` is
+    // `3F000 schema "nosuchschema" does not exist`.
+    //
+    // Checked **after** the already-installed arms above, which is the order a real server uses:
+    // `CREATE EXTENSION IF NOT EXISTS hstore SCHEMA g1cs` on an installed `hstore` is a notice and
+    // **does not move it**, so the schema is never looked at on that path.
+    let schema = match &create.schema {
+        Some(name) => {
+            if !catalog::schema_exists(&*txn, executor.tenant, name)? {
+                return Err(SqlError::UndefinedSchema(name.clone()));
+            }
+            name.clone()
+        }
+        None => catalog::PUBLIC_SCHEMA.to_owned(),
+    };
+    catalog::install_extension(txn, executor.tenant, &create.name, version, &schema);
     done
 }
 

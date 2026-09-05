@@ -198,7 +198,7 @@ pub struct DropExtension {
     pub cascade: bool,
 }
 
-/// `CREATE EXTENSION [IF NOT EXISTS] name`.
+/// `CREATE EXTENSION [IF NOT EXISTS] name [[WITH] SCHEMA schema]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateExtension {
     /// The extension's name, as written — **case-sensitively**, because `ActiveRecord` quotes it
@@ -209,6 +209,14 @@ pub struct CreateExtension {
     /// It covers **existence only**. An extension this build does not have is `0A000 … is not
     /// available` with or without the clause — measured, both spellings.
     pub if_not_exists: bool,
+    /// `SCHEMA <name>`, or `None` for `public`.
+    ///
+    /// **Where the extension goes, which `pg_extension.extnamespace` reports and
+    /// `ActiveRecord#extensions` reads.** A name no schema answers to is `3F000`, checked when the
+    /// statement runs rather than here — the catalog is what knows, and the check happens *after*
+    /// the already-installed arms, because `IF NOT EXISTS` on an installed extension never looks
+    /// at the schema and never moves it.
+    pub schema: Option<String>,
 }
 
 /// What `SET DEFAULT` was given: a sequence to draw from, or an ordinary default.
