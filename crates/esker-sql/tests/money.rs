@@ -36,10 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `tests/integer_plus_text.rs` already declares three times over — not a money question.
         // It is in the corpus because it is the one place a money is *not* an integer: `money ||
         // text` is `text` on a real server and goes through the output function, symbol and all.
-        (
-            "SELECT 'r', '1.00'::money || 'x'",
-            "|| is not built for any type here",
-        ),
         // **Three refusals that agree except for the type named in them**, and all three name a
         // standing trade rather than anything about `money`: an integer literal is an `int8` here
         // and an `integer` there (the constant-width trade ADR 0033 records), and a decimal

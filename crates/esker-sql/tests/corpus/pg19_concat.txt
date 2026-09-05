@@ -1,0 +1,35 @@
+# **`||` over text** — PostgreSQL's string concatenation, against 19beta1.
+#
+# The symbol was already lowered here, and always to the *hstore* concatenation: the evaluator
+# told an hstore from an ltree from a tsvector by their operands and refused everything else with
+# `0A000 || over text is not supported`, while `exec::query`'s type dispatch had been answering
+# `text` for exactly that case all along. So the type was right and the value did not exist.
+#
+# Three rules that reasoning gets wrong, all measured here:
+#
+# * **The answer is `text` whatever went in.** `'x'::varchar || 'y'::varchar` is `text`, not
+#   `character varying`, and a date or a uuid contributes the characters it prints as.
+# * **It is strict, and `concat()` is not.** `'a' || NULL` is NULL; `concat('a', NULL, 'b')` is
+#   `ab`. The two are next to each other below so the difference is visible rather than assumed.
+# * **At least one side must be text.** `1 || 2` is not integer concatenation, it is
+#   `42883 operator does not exist: integer || integer`. PostgreSQL has `text || anynonarray` and
+#   `anynonarray || text` and no `anynonarray || anynonarray`, so neither does this node.
+#
+# The last two lines are the other two families the symbol names — arrays and `jsonb` — kept here
+# so that what `||` does *not* do on this node is written down beside what it does.
+SELECT 'r', 'a' || 'b', 'a' || 1, 1 || 'b', 'a' || 1.5, 'a' || true		r|ab|a1|1b|a1.5|atrue
+SELECT 'r', pg_typeof('a'::text || 'b'::text), pg_typeof('a'::text || 1), pg_typeof(1 || 'b'::text)		r|text|text|text
+SELECT 'r', 'a' || NULL IS NULL AS null_right, NULL || 'a' IS NULL AS null_left		r|t|t
+SELECT 'r', concat('a', NULL, 'b') AS concat_skips_null		r|ab
+SELECT 1 || 2	!42883 operator does not exist: integer || integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT true || false	!42883 operator does not exist: boolean || boolean DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'r', 'a' || 'b' || 'c' AS left_assoc, length('a' || 'b' || 'c')		r|abc|3
+SELECT 'r', 'x' || 'y'::varchar, pg_typeof('x'::varchar || 'y'::varchar)		r|xy|text
+SELECT 'r', 'd' || '2024-01-02'::date, 'n' || 3::numeric, 'u' || '11111111-1111-1111-1111-111111111111'::uuid		r|d2024-01-02|n3|u11111111-1111-1111-1111-111111111111
+CREATE TABLE cc (id int, title text, tag varchar(4))		-
+INSERT INTO cc VALUES (1, 'one', 'ab'), (2, NULL, NULL)		-
+SELECT 'r', id, title || '!', tag || '!' FROM cc ORDER BY id		r|1|one!|ab! ; r|2|\N|\N
+SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)		r|{1,2,3}|{1,2,3}|integer[]
+SELECT 'r', '{"a":1}'::jsonb || '{"b":2}'::jsonb		r|{"a": 1, "b": 2}
+SELECT 'r', '{"a":1}'::json || '{"b":2}'::json		r|{"a":1}{"b":2}
+DROP TABLE cc		-

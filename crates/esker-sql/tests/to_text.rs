@@ -15,20 +15,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "SELECT 42::text || '!', length(123::text)",
-            "`||` and `length` are not implemented; both are `0A000` naming themselves. The cast \
-             in each is done — this line is in the corpus because it is where the *typmod* unit's \
-             open pair will be pinned once either operator lands.",
-        ),
-        (
-            "SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1",
-            "The same two operators. The `f::text` in it is right — `tests/to_text.rs` asserts \
+    answers: &[(
+        "SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1",
+        "The same two operators. The `f::text` in it is right — `tests/to_text.rs` asserts \
              the padding strip directly — and the line stays here so the operator unit inherits \
              the whole statement rather than half of it.",
-        ),
-    ],
+    )],
 };
 
 #[test]
