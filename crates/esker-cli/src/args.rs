@@ -29,6 +29,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::bench::{Run as BenchOptions, Workload};
+use crate::bench_mpp::BenchMppOptions;
 use crate::cluster::ClusterOptions;
 use crate::manifest_dump::DumpOptions as ManifestDumpOptions;
 use crate::pd::{
@@ -49,6 +50,8 @@ pub(crate) enum Command {
     Help,
     /// Run the benchmark driver.
     Bench(BenchOptions),
+    /// Measure what a distributed aggregate costs and where its time goes.
+    BenchMpp(BenchMppOptions),
     /// Print the contents of a sorted string table.
     SstDump(DumpOptions),
     /// Print the contents of a write-ahead log segment.
@@ -164,6 +167,8 @@ Usage:
 
 Commands:
   bench                 Run the benchmark driver
+  bench-mpp             Measure a distributed aggregate on a cluster this command
+                        starts, and say what share of it one SQL node did
   sst-dump <path>       Print the contents of a sorted string table
   wal-dump <path>       Print the fragments and records of a log segment
   manifest-dump <dir>   Print a database's manifest and reconstructed version
@@ -233,6 +238,38 @@ Bench options:
                         there is no in-process form of one. Refused for tso and
                         allocid, which measure a placement driver in this
                         process.
+
+Bench-mpp options:
+      --stores N        Stores in the cluster (default 6). Four is the minimum: a
+                        region has three voters and a columnar learner goes on a
+                        store with no peer of it
+      --rows N          Rows in the fact table (default 2000000)
+      --groups-high N   Distinct values of the high-cardinality grouping key
+                        (default 100000). Groups approaching the row count is the
+                        case a two-level aggregate finishes worst
+      --region-split-size N
+                        Approximate region bytes before a leader splits (default
+                        32 MiB). This is what chooses the number of fragments: one
+                        per region
+      --repeats N       Timed repeats of the whole interleaved set (default 3)
+      --region-heartbeat-ms N, --heartbeat-tick-ms N
+                        How often a region's leader reports to PD, and the tick that
+                        interval is counted in (default 2000 / 250; the shipped
+                        defaults are 60000 / 1000). This decides how fast placement
+                        happens and how often PD acts on a region
+      --batch N         Rows per INSERT during the load (default 500)
+      --base-port P     The lowest port the cluster uses (default 24160); the driver
+                        sits above the stores and the SQL node above that
+      --seed N          Seed for the generated values (default 20260904)
+      --dir PATH        Where the cluster's data lives (default a temporary directory)
+      --keep            Keep the data directory after the run
+      --no-join         Leave the join out of the timed set. It costs tens of seconds
+                        where the aggregates cost tens of milliseconds and cannot reach
+                        the columnar path at all, so it is the first thing to drop under
+                        a time budget
+
+Linux only: the decomposition is read from /proc, per process. It needs an
+esker-sql binary beside this one.
 
 Sst-dump options:
   -v, --verbose         Print every key and value, not just the summary
@@ -406,6 +443,7 @@ where
         "--version" | "-V" => Ok(Command::Version),
         "--help" | "-h" | "help" => Ok(Command::Help),
         "bench" => parse_bench(&arguments[1..]),
+        "bench-mpp" => parse_bench_mpp(&arguments[1..]),
         "sst-dump" => parse_sst_dump(&arguments[1..]),
         "wal-dump" => parse_wal_dump(&arguments[1..]),
         "manifest-dump" => parse_manifest_dump(&arguments[1..]),
@@ -1185,6 +1223,74 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
     }
 
     Ok(Command::Server(options))
+}
+
+/// `esker bench-mpp [--stores N] [--rows N] …`.
+fn parse_bench_mpp(arguments: &[String]) -> Result<Command, ParseError> {
+    let mut options = BenchMppOptions::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        // Every count here must be positive: a zero would be a run with no rows, no repeats or no
+        // stores, which is a configuration error dressed as an empty report.
+        let positive = |flag: &'static str, index: &mut usize| -> Result<u64, ParseError> {
+            let raw = take_value(arguments, index, inline.clone(), flag)?;
+            raw.parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(ParseError::InvalidValue {
+                    flag,
+                    value: raw.clone(),
+                })
+        };
+        match flag {
+            "--stores" => options.stores = positive("--stores", &mut index)?,
+            "--rows" => options.rows = positive("--rows", &mut index)?,
+            "--groups-high" => options.groups_high = positive("--groups-high", &mut index)?,
+            "--region-split-size" => {
+                options.region_split_size = positive("--region-split-size", &mut index)?;
+            }
+            "--repeats" => options.repeats = positive("--repeats", &mut index)?,
+            "--region-heartbeat-ms" => {
+                options.region_heartbeat_ms = positive("--region-heartbeat-ms", &mut index)?;
+            }
+            "--heartbeat-tick-ms" => {
+                options.heartbeat_tick_ms = positive("--heartbeat-tick-ms", &mut index)?;
+            }
+            "--batch" => options.batch = positive("--batch", &mut index)?,
+            "--seed" => {
+                let raw = take_value(arguments, &mut index, inline, "--seed")?;
+                options.seed = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--seed",
+                    value: raw.clone(),
+                })?;
+            }
+            "--base-port" => {
+                let raw = take_value(arguments, &mut index, inline, "--base-port")?;
+                options.base_port = raw.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--base-port",
+                    value: raw.clone(),
+                })?;
+            }
+            "--dir" => {
+                options.dir = Some(PathBuf::from(take_value(
+                    arguments, &mut index, inline, "--dir",
+                )?));
+            }
+            "--keep" => options.keep = true,
+            "--no-join" => options.no_join = true,
+            other => return Err(ParseError::UnknownFlag(other.to_owned())),
+        }
+    }
+    Ok(Command::BenchMpp(options))
 }
 
 fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {

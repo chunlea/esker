@@ -4548,11 +4548,11 @@ pub(super) fn create_index(
     // would put a `CREATE INDEX` a real server rejects into this catalog, which is the half of
     // the decision that keeps the recording honest.
     for (key, part) in keys.iter().zip(&create.keys) {
-        let ty = key
-            .position()
-            .and_then(|at| table.columns.get(at))
-            .map_or(ColumnType::Text, |column| column.ty);
-        catalog::check_operator_class(&create.access_method, part.opclass.as_deref(), ty)?;
+        catalog::check_operator_class(
+            &create.access_method,
+            part.opclass.as_deref(),
+            key.key_type(&table),
+        )?;
     }
 
     // A predicate naming a column the table does not have is `42703` here, not an internal error
@@ -4862,9 +4862,13 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
             )),
             // A UUID function is the most volatile thing here: two calls give two values, so an
             // index built from one would be read back at a key nothing ever wrote.
-            Expr::Sequence(_) | Expr::CatalogFunc(_) | Expr::Uuid(_) => {
-                Some(SqlError::NotImmutableInIndex)
-            }
+            Expr::Sequence(_) | Expr::Uuid(_) => Some(SqlError::NotImmutableInIndex),
+            // **A catalog function is asked rather than assumed.** It used to be refused as a
+            // group, on the reasoning that every one of them either wrote or read the catalog —
+            // true when it was written and not once the text-search family arrived.
+            // `to_tsvector('english', …)` is `IMMUTABLE` on a real server and is exactly what
+            // `schema_test.rb` builds a GIN index over.
+            Expr::CatalogFunc(call) if !call.is_immutable() => Some(SqlError::NotImmutableInIndex),
             // A parameter has no value at `CREATE INDEX` time; a real server answers
             // `42P02 there is no parameter $1`, which is what this prints.
             Expr::Parameter(at) => Some(SqlError::UndefinedParameter(*at)),

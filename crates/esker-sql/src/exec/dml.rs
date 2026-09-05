@@ -991,7 +991,15 @@ pub(super) fn delete(
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
     // measured, and each row has to go through its own table's keys and indexes.
     for (table, project) in inheritance_targets(executor, txn, &named)? {
-        let rows = collect(executor, txn, delete.filter.as_ref(), &table, &table.name)?;
+        // `Delete` has no alias, so the name it is referred to by is always the implicit
+        // one — the relation's, without its schema.
+        let rows = collect(
+            executor,
+            txn,
+            delete.filter.as_ref(),
+            &table,
+            crate::catalog::split_qualified(&table.name).1,
+        )?;
         count += rows.len();
         for row in rows {
             // The row as it was, gathered before it goes: after `remove_row` there is nothing to
@@ -1501,21 +1509,25 @@ pub(super) fn rewrite_row(
     write_row(executor, txn, table, new, written)
 }
 
-/// The relations a write statement has in scope: the row it writes under the name the statement
-/// wrote, then its `FROM` chain under theirs.
-///
-/// The same table may appear twice under two names — which is exactly what the `update_all` shape
-/// does — so it is the *names* that have to be distinct and not the tables, which is the rule a
-/// `SELECT`'s `FROM` follows and is enforced where the chain is planned.
 /// **The name the statement refers to the row it writes by.** An alias *replaces* the table's
 /// name — `UPDATE t AS a … WHERE t.id = 1` is `42P01` with a `HINT` naming the alias, measured —
 /// and that is what frees the name for a `FROM` entry sharing it. Without an alias it is the name
 /// the statement wrote, which for a child reached through inheritance is still the parent's: a
 /// qualifier is about the query's text, not about which relation the row came from.
 pub(super) fn target_name(update: &Update, table: &TableDef) -> String {
-    update.alias.clone().unwrap_or_else(|| table.name.clone())
+    update.alias.clone().unwrap_or_else(|| {
+        // The implicit alias is the **unqualified** name, the same one a `FROM` item gets:
+        // `UPDATE s1.things SET … WHERE things.id = 1` is a statement a real server takes.
+        crate::catalog::split_qualified(&table.name).1.to_owned()
+    })
 }
 
+/// The relations a write statement has in scope: the row it writes under the name the statement
+/// wrote, then its `FROM` chain under theirs.
+///
+/// The same table may appear twice under two names — which is exactly what the `update_all` shape
+/// does — so it is the *names* that have to be distinct and not the tables, which is the rule a
+/// `SELECT`'s `FROM` follows and is enforced where the chain is planned.
 pub(super) fn scope_entries<'a>(
     table: &'a TableDef,
     target_name: &str,

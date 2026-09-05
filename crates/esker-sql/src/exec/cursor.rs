@@ -1147,14 +1147,28 @@ impl Env<'_> {
 ///
 /// The real fix is `docs/plans/jsonb-representation.md`: `jsonb` gets a `Datum` and `||` becomes
 /// document merge.
-fn is_json_typed(expr: &Expr) -> bool {
+fn is_jsonb_typed(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Ordinal {
-            ty: ColumnType::Json | ColumnType::Jsonb,
+            ty: ColumnType::Jsonb,
             ..
         }
     )
+}
+
+/// `jsonb || jsonb`, on two values whose text is already canonical.
+///
+/// **Both** operands, never one: there is no `jsonb || text` on a real server, so a jsonb column
+/// beside a text one is `text || text` and answers `{"a": 1}x` rather than merging or refusing.
+///
+/// Strict like every other `||`: a NULL operand is a NULL answer, which is what `value::json`'s
+/// own rule cannot say because it never sees one.
+fn jsonb_concat(left: Option<&Datum>, right: Option<&Datum>) -> Result<Datum> {
+    let (Some(Datum::Text(left)), Some(Datum::Text(right))) = (left, right) else {
+        return Ok(Datum::Null);
+    };
+    crate::value::json::concat(left, right).map(Datum::Text)
 }
 
 /// `text || anynonarray`, `anynonarray || text` and `text || text` — PostgreSQL's string
@@ -2805,13 +2819,21 @@ fn catalog_function(
         // are). Told apart by the operands like the four above it: this arm is reached only when
         // **no** operand is an hstore, an ltree or a tsvector, because a bare `Datum::Text` beside
         // one of those is the `unknown` literal that belongs to *that* type's operator.
+        // **`jsonb || jsonb` merges documents**, and it reaches here two ways: as its own variant
+        // when a cast told the lowerer the type, and as an ordinary `||` whose operand is a jsonb
+        // *column*, which still carries its type in `Expr::Ordinal`. A jsonb literal is
+        // canonicalised into a `Datum::Text` long before this, so the values cannot decide it.
+        CatalogFunc::JsonbConcat => jsonb_concat(args.first(), args.get(1))?,
+        CatalogFunc::HstoreConcat if call.args.iter().all(is_jsonb_typed) => {
+            jsonb_concat(args.first(), args.get(1))?
+        }
         CatalogFunc::HstoreConcat
             if !args.iter().any(|value| {
                 matches!(
                     value,
                     Datum::Hstore(_) | Datum::Ltree(_) | Datum::TsVector(_)
                 )
-            }) && !call.args.iter().any(is_json_typed) =>
+            }) =>
         {
             text_concat(args.first(), args.get(1))?
         }

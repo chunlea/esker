@@ -3689,13 +3689,43 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     // PostgreSQL's answer is document **merge**, right operand winning a
                     // duplicate key. Building it needs a representation of its own —
                     // `docs/plans/jsonb-representation.md`, and ADR 0042's rule is why.
-                    for operand in [left.as_ref(), right.as_ref()] {
-                        if let Some(name) = json_cast_name(operand) {
-                            return Err(SqlError::unsupported(format!("|| over {name}")));
-                        }
+                    // **`json` has no `||` at all** — `42883 operator does not exist: json ||
+                    // json`, measured — and `jsonb` has one that merges documents, which is
+                    // `value::json::concat`. So the two spellings part company here, where the
+                    // cast is still written down: a `json` operand is the undefined operator a
+                    // real server names, and a `jsonb` one goes through to the evaluator.
+                    if let (Some(left_ty), Some(right_ty)) =
+                        (json_cast_name(left), json_cast_name(right))
+                        && (left_ty == "json" || right_ty == "json")
+                    {
+                        return Err(SqlError::UndefinedOperator {
+                            left: left_ty.to_owned(),
+                            op: "||",
+                            right: right_ty.to_owned(),
+                        });
                     }
+                    // A cast that says `jsonb` on either side makes this the merge rather than
+                    // any of the five concatenations, and it is the only layer that can see one:
+                    // the literal is canonicalised into a `Datum::Text` before the executor runs.
+                    // **Both sides must be `jsonb`**, and an unadorned literal counts as one.
+                    // There is no `jsonb || text` operator, so a jsonb column beside a *text*
+                    // column falls back to `text || text` — measured, `body || plain` is
+                    // `{"a": 1}x` and not a merge. What a bare literal does instead is get
+                    // coerced: `'{"a":1}'::jsonb || 'tail'` is
+                    // `22P02 invalid input syntax for type json`, because `tail` was read as a
+                    // document and is not one.
+                    let jsonb_side = |expr: &Expr| json_cast_name(expr) == Some("jsonb");
+                    let coercible =
+                        |expr: &Expr| jsonb_side(expr) || matches!(unwrap_nested(expr), Expr::Value(_));
+                    let func = if (jsonb_side(left) && coercible(right))
+                        || (jsonb_side(right) && coercible(left))
+                    {
+                        plan::CatalogFunc::JsonbConcat
+                    } else {
+                        plan::CatalogFunc::HstoreConcat
+                    };
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
-                        func: plan::CatalogFunc::HstoreConcat,
+                        func,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
                     })));
                 }

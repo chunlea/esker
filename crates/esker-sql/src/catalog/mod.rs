@@ -488,6 +488,23 @@ impl IndexKey {
         }
     }
 
+    /// The type an operator class is judged against: the column's, or the **expression's own**.
+    ///
+    /// An expression part carries the type `index_expression` resolved for it, which is the only
+    /// place it exists — the table has no column to read it off. Guessing here is what made
+    /// `USING gin ((to_tsvector('english', …)))` answer `data type text has no default operator
+    /// class`: the answer is `tsvector`, and it was three lines away.
+    #[must_use]
+    pub fn key_type(&self, table: &TableDef) -> ColumnType {
+        match &self.part {
+            KeyPart::Column(at) => table
+                .columns
+                .get(*at)
+                .map_or(ColumnType::Text, |column| column.ty),
+            KeyPart::Expression { ty, .. } => *ty,
+        }
+    }
+
     /// The name the index **relation**'s own column carries: the table's column name for a column
     /// part, and for an expression the function it calls, or `expr`.
     ///
@@ -728,6 +745,10 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// structure every index here actually has (ADR 0070).
 pub const BTREE_ACCESS_METHOD: &str = "btree";
 
+/// The access method a `USING gin` index records, and the only other one with a default
+/// operator class this node resolves.
+pub const GIN_ACCESS_METHOD: &str = "gin";
+
 /// Every operator class this node knows: its name, the access method it belongs to, and the type
 /// it accepts.
 ///
@@ -746,6 +767,17 @@ pub const OPERATOR_CLASSES: [(&str, &str, ColumnType); 4] = [
     ("varchar_pattern_ops", "btree", ColumnType::Varchar),
 ];
 
+/// The three types `gin` indexes with no operator class written, measured on 19beta1.
+///
+/// An **array** of any element type (`array_ops`), `jsonb` (`jsonb_ops`) and `tsvector`
+/// (`tsvector_ops`). Only the first is reachable today: `jsonb` and `tsvector` are not index keys
+/// here at all ([`esker_keys::row::is_index_key`]), and that gate answers before this one — so the
+/// two are listed for the rule's sake and refused a layer down, with their own sentence.
+fn has_a_gin_default(ty: ColumnType) -> bool {
+    esker_keys::array::ArrayValue::element_of(ty).is_some()
+        || matches!(ty, ColumnType::Jsonb | ColumnType::TsVector)
+}
+
 /// Whether a column of `ty` may be indexed with `class` under `method`, and the sentence a real
 /// server gives when it may not.
 ///
@@ -762,9 +794,22 @@ pub const OPERATOR_CLASSES: [(&str, &str, ColumnType); 4] = [
 pub fn check_operator_class(method: &str, class: Option<&str>, ty: ColumnType) -> Result<()> {
     use crate::value::PgType as _;
     let Some(class) = class else {
-        // **Only `btree` has a default here**, which is the ordered key encoding itself. A `gin`
-        // or `gist` index with no class named has nothing to record and nothing to build.
+        // `btree`'s default is the ordered key encoding itself, and every index this node had
+        // before ADR 0070 is one.
         if method == BTREE_ACCESS_METHOD {
+            return Ok(());
+        }
+        // **`gin` has three defaults and they are measured, not reasoned.** ADR 0070 landed with
+        // "only `btree` has a default", which is right for the type it was written against —
+        // `character varying` really has none — and wrong for these. From 19beta1's `pg_opclass`
+        // joined to `pg_am` and `pg_type` where `opcdefault`:
+        //
+        //     gin  anyarray  array_ops      gin  jsonb  jsonb_ops      gin  tsvector  tsvector_ops
+        //
+        // `gist` has its own longer list (`box`, `point`, `ltree`, the ranges, `tsquery`,
+        // `tsvector`); none of it is reachable here yet, so it is recorded in
+        // `tests/gin_default_opclass.rs` rather than encoded as a rule nothing exercises.
+        if method == GIN_ACCESS_METHOD && has_a_gin_default(ty) {
             return Ok(());
         }
         return Err(SqlError::NoDefaultOperatorClassFor {
