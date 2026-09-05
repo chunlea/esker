@@ -686,6 +686,52 @@ pub struct CatalogFuncCall {
     pub args: Vec<Expr>,
 }
 
+impl CatalogFuncCall {
+    /// Whether this call is a function of its arguments alone, the way PostgreSQL's `provolatile`
+    /// means it — which is what decides whether it may be an **index key**.
+    ///
+    /// **One rule covers the text-search family, and it is the argument count.** A function that
+    /// names its configuration is `IMMUTABLE`; the form that omits it is `STABLE`, because the
+    /// omitted one reads `default_text_search_config`, a session setting. Measured against
+    /// 19beta1's `pg_proc`, every pair:
+    ///
+    /// ```text
+    /// to_tsvector(regconfig, text)  i     to_tsvector(text)  s
+    /// to_tsquery(regconfig, text)   i     to_tsquery(text)   s
+    /// plainto_tsquery(…)            i     plainto_tsquery    s
+    /// phraseto_tsquery(…)           i     phraseto_tsquery   s
+    /// websearch_to_tsquery(…)       i     websearch_to_tsquery s
+    /// ts_headline(regconfig, …)     i     ts_headline(text, tsquery) s
+    /// ```
+    ///
+    /// The ones with no configuration argument at all are immutable outright — `strip`,
+    /// `setweight`, `ts_rank`, and `@@` (`ts_match_vq`), all measured `i`.
+    ///
+    /// **Everything else answers `false`**, which is the conservative direction and the behaviour
+    /// this crate had for every catalog function before: an index whose key is not a function of
+    /// the row is not a slow index, it is a wrong one. A function measured immutable is added
+    /// here; nothing is added by reasoning.
+    #[must_use]
+    pub fn is_immutable(&self) -> bool {
+        match self.func {
+            // The five that take `(config, …)` or `(…)`, immutable in the first spelling only.
+            CatalogFunc::ToTsVector
+            | CatalogFunc::ToTsQuery
+            | CatalogFunc::PlainToTsQuery
+            | CatalogFunc::PhraseToTsQuery
+            | CatalogFunc::WebsearchToTsQuery => self.args.len() == 2,
+            // `ts_headline(config, text, query)` against `ts_headline(text, query)`.
+            CatalogFunc::TsHeadline => self.args.len() == 3,
+            // No configuration to omit.
+            CatalogFunc::TsStrip
+            | CatalogFunc::SetWeight
+            | CatalogFunc::TsRank
+            | CatalogFunc::TsMatch => true,
+            _ => false,
+        }
+    }
+}
+
 /// The `pg_catalog` functions this node answers.
 ///
 /// Every one of them is read-only and is a function of its arguments alone — the two properties
@@ -821,6 +867,15 @@ pub enum CatalogFunc {
     /// `a || b`: the two hstores merged, **the right winning a shared key** — which is the
     /// opposite of what a repeated key inside one literal does (`crate::value::hstore`).
     HstoreConcat,
+    /// `jsonb || jsonb`: **document merge**, which is a different operator from every other
+    /// spelling of `||` and not a concatenation at all.
+    ///
+    /// Its own variant because the operand cannot decide it: `jsonb` is stored canonicalised as a
+    /// `Datum::Text` (`value::json::canonicalise`), so by the time the evaluator holds two values
+    /// a document and a string are the same bytes. The **lowerer** emits this when a cast says
+    /// `jsonb`, and a jsonb *column* is caught in the evaluator by its `Expr::Ordinal` type —
+    /// the two places the declared type still exists.
+    JsonbConcat,
     /// `akeys(h)` and `avals(h)`: the keys and the values as `text[]`, in canonical order.
     HstoreAkeys,
     /// See [`CatalogFunc::HstoreAkeys`].
@@ -1191,7 +1246,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreHasKey => "?",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
-            CatalogFunc::HstoreConcat => "||",
+            CatalogFunc::HstoreConcat | CatalogFunc::JsonbConcat => "||",
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
@@ -1267,6 +1322,7 @@ impl CatalogFunc {
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
+            | CatalogFunc::JsonbConcat
             | CatalogFunc::HstoreBuild
             | CatalogFunc::TsMatch
             | CatalogFunc::TsRank
@@ -1419,6 +1475,7 @@ impl CatalogFunc {
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
+            CatalogFunc::JsonbConcat => ColumnType::Jsonb,
             CatalogFunc::ToTsVector | CatalogFunc::TsStrip | CatalogFunc::SetWeight => {
                 ColumnType::TsVector
             }

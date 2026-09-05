@@ -35,28 +35,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)",
             "|| over arrays is not built; it refuses rather than answering",
         ),
-        // **`jsonb || jsonb` is refused, not answered.** PostgreSQL merges the two documents;
-        // this node has no `Datum` for a `jsonb` — it is a `Datum::Text`, where `hstore`, `ltree`,
-        // `citext` and `tsvector` each have a variant — so by the time `||` has two values in
-        // hand a document and a string are the same thing, and concatenating them would produce a
-        // string that is not a document. That is a **wrong answer** where refusing is a gap, and
-        // [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) ranks a wrong
-        // answer worse, so the operator gives back the `0A000` it gave before `||` over text
-        // existed. `tests/concat_refuses_json.rs` pins the refusal itself.
-        //
-        // `json` is refused beside it and is **not the same type**: it keeps key order,
-        // whitespace and duplicate keys, so `'{"a":1}'::json || '{"b":2}'::json` really is the
-        // two documents' text run together on a real server. Refusing it too is the conservative
-        // half — telling the two apart is part of the unit that gives `jsonb` a representation,
-        // `docs/plans/jsonb-representation.md`, and guessing which of them this node's
-        // `Datum::Text` is standing for is exactly what got the operator into this.
+        // **`pg_typeof` of the merge**: `jsonb` on both, and it is the one line here whose
+        // *column type* still differs — a `regtype` there and `text` here, the standing catalog
+        // trade. The value agrees.
         (
-            "SELECT 'r', '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb",
-            "jsonb has no representation of its own here, so || refuses rather than concatenating",
-        ),
-        (
-            "SELECT 'r', '{\"a\":1}'::json || '{\"b\":2}'::json",
-            "json is refused beside jsonb until the two have representations that tell them apart",
+            "SELECT 'r', pg_typeof('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)",
+            "pg_typeof answers a regtype on a real server and text here; the value is jsonb on both",
         ),
     ],
 };

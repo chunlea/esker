@@ -187,7 +187,6 @@ const ANSWERS: &[(&str, &str)] = &[
              - 'a'",
         CONTAINMENT,
     ),
-    ("SELECT '[1,2]'::jsonb || '[3]'::jsonb", CONTAINMENT),
     ("SELECT '{\"a\":1}'::jsonb #- '{a}'", CONTAINMENT),
     (
         "SELECT json_typeof('1'::json), jsonb_typeof('\"s\"'::jsonb), \

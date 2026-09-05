@@ -59,6 +59,71 @@ pub(crate) fn canonicalise(text: &str) -> Result<String> {
     Ok(out)
 }
 
+/// PostgreSQL's `jsonb` key order: **length first, then bytes**.
+///
+/// Not the lexicographic order a reader expects — `{"z":1,"aa":2}` stores as `{"z": 1, "aa": 2}`
+/// because `z` is shorter. One function so the parser's sort and [`concat`]'s insertion agree by
+/// construction: a merge that inserted in a different order from the one the parser produced would
+/// write a document that no longer round-trips.
+fn key_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// `jsonb || jsonb`: PostgreSQL's document concatenation.
+///
+/// **Two objects merge; anything else concatenates as arrays.** Measured on 19beta1, every
+/// combination:
+///
+/// | left | right | answer |
+/// |---|---|---|
+/// | `{"a":1,"b":2}` | `{"b":3,"c":4}` | `{"a": 1, "b": 3, "c": 4}` — the **right** wins a shared key |
+/// | `{"a":{"x":1}}` | `{"a":{"y":2}}` | `{"a": {"y": 2}}` — **not** a deep merge |
+/// | `[1,2]` | `[3]` | `[1, 2, 3]` |
+/// | `[1,2]` | `3` | `[1, 2, 3]` — a scalar is a one-element array |
+/// | `{"a":1}` | `[1]` | `[{"a": 1}, 1]` — an object beside an array is an *element* |
+/// | `"x"` | `"y"` | `["x", "y"]` — two scalars make an array rather than an error |
+/// | `null` | `null` | `[null, null]` |
+///
+/// So there is exactly one special case and one rule: both objects, or both sides read as arrays.
+/// Reasoning would put the object case last and make `{"a":1} || [1]` a merge of a key into a
+/// list; measurement puts it first and makes everything else a concatenation.
+///
+/// Both arguments are already canonical — this is only ever called on stored `jsonb` — so parsing
+/// cannot fail on anything a caller can reach, and a failure is returned rather than assumed away.
+pub(crate) fn concat(left: &str, right: &str) -> Result<String> {
+    let left = parse(left, Nulls::Refuse)?;
+    let right = parse(right, Nulls::Refuse)?;
+    let merged = match (left, right) {
+        (Json::Object(mut into), Json::Object(from)) => {
+            for (key, value) in from {
+                match into.binary_search_by(|(existing, _)| key_order(existing, &key)) {
+                    // **The right operand wins**, which is the half of the rule a set union would
+                    // get backwards.
+                    Ok(at) => into[at].1 = value,
+                    Err(at) => into.insert(at, (key, value)),
+                }
+            }
+            Json::Object(into)
+        }
+        (left, right) => {
+            let mut out = elements(left);
+            out.extend(elements(right));
+            Json::Array(out)
+        }
+    };
+    let mut out = String::new();
+    write_canonical(&merged, &mut out);
+    Ok(out)
+}
+
+/// What one side contributes to an array concatenation: an array's own elements, or itself.
+fn elements(value: Json) -> Vec<Json> {
+    match value {
+        Json::Array(items) => items,
+        other => vec![other],
+    }
+}
+
 /// Whether a NUL escape is a value or an error, which is the one input that splits the types.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nulls {
@@ -244,9 +309,7 @@ impl Parser<'_> {
                 Some(',') => self.rest = &self.rest[1..],
                 Some('}') => {
                     self.rest = &self.rest[1..];
-                    entries.sort_by(|(left, _), (right, _)| {
-                        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
-                    });
+                    entries.sort_by(|(left, _), (right, _)| key_order(left, right));
                     return Ok(Json::Object(entries));
                 }
                 _ => return Err(self.fail()),
