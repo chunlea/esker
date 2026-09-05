@@ -268,6 +268,28 @@ impl Cluster {
             .count()
     }
 
+    /// Waits until the cluster holds more than one region, and answers how many.
+    ///
+    /// **A wait, not an assertion.** A split is the leader's own decision, taken on its region
+    /// heartbeat after the size estimate crosses the threshold — so "did it split" straight after
+    /// a load is a question about timing, and under a loaded machine the answer is "not yet".
+    /// Asserting it there made this test fail in a full gate and pass alone.
+    pub fn wait_for_a_split(&self, seconds: u64) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let regions = self.regions();
+            if regions > 1 {
+                eprintln!("harness: the table is in {regions} regions");
+                return regions;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the table did not split within {seconds}s, so nothing here is about a boundary"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
     /// Waits until every region has a columnar learner.
     ///
     /// A series and not a reading: placement costs one region heartbeat an operator and PD does

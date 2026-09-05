@@ -104,11 +104,7 @@ fn a_multi_region_table_is_never_answered_wrongly() {
         cluster.run(&format!("INSERT INTO ledger VALUES {}", values.join(",")));
     }
 
-    let regions = cluster.regions();
-    assert!(
-        regions > 1,
-        "the table did not split, so this says nothing about a boundary: {regions} region(s)"
-    );
+    let regions = cluster.wait_for_a_split(120);
     cluster.wait_for_learners(180);
 
     // **The declaration, read end to end.** `EXPLAIN` is where a `FragmentSource` that says it

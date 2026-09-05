@@ -64,11 +64,7 @@ fn a_table_in_more_than_one_region_reads_rows_and_says_why() {
         cluster.run(&format!("INSERT INTO ledger VALUES {}", values.join(",")));
     }
 
-    let regions = cluster.regions();
-    assert!(
-        regions > 1,
-        "the table did not split, so the guard has nothing to fire on: {regions} region(s)"
-    );
+    let regions = cluster.wait_for_a_split(120);
 
     // The answer is still right — that is the point of falling back — but it is not the assertion.
     let answer = cluster.query_on("auto", "SELECT count(*) FROM ledger");
