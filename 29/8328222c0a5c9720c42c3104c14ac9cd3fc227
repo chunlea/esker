@@ -1,0 +1,20 @@
+crates/esker-sim/src/mech/sweep.rs
+  h_44076b318daf9c 154-155,157-160,204-210
+crates/esker-store/tests/sim_sweep.rs
+  h_44076b318daf9c 183-195,427-492,583
+crates/esker-store/tests/snapshot.rs
+  h_44076b318daf9c 313,381,406,454,456-485
+docs/plans/debt-c7.md
+  h_44076b318daf9c 883-931
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "298328222c0a5c9720c42c3104c14ac9cd3fc227",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
