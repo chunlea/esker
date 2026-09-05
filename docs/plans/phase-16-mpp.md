@@ -414,6 +414,24 @@ Named so the next person can check them rather than re-derive them:
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
    parallel dispatch, not before.**
 
+### Agreement is not correctness
+
+The sentence this whole thread reduces to, kept here because it was learned three times in one
+night and each time it cost a wrong conclusion.
+
+Two engines returning the same rows is not evidence that either is right. The defect that started
+this returned **four times** the correct count with both arms internally consistent — and twice
+before that, a matrix headed `columnar` reported "0 disagreements" while both arms were in fact the
+row engine: once because no learner had been placed so every fragment refused, and once because the
+interim guard had deliberately put them there. A comparison is worth exactly what its denominator
+is worth.
+
+So the acceptance test computes its expected values **from the fixture** — two hundred rows,
+`bucket = id % 4`, `amount = id`, so every count and sum is known without asking anything — and
+asserts the engine that answered **before** it compares. Nothing is asked of an engine to validate
+an engine. `routing_differential` had the same rule first, in the other direction, for the same
+reason: *"a query that fell back agrees with the row engine for free"*.
+
 ### The guard, retired by the flip — and what re-arms it
 
 A multi-region columnar query returned **N times** the right answer (measured 2026-09-05,
