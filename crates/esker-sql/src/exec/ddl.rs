@@ -11,9 +11,13 @@
 //! the whole feature. A **constant** `DEFAULT` is admitted on the same argument, one step further
 //! on: the value is stored on the column as its *missing value* and the decoder pads with that
 //! instead of with NULL, which is PostgreSQL 11's `attmissingval` and is why `ADD COLUMN ... NOT
-//! NULL DEFAULT 7` is instant there too. What stays refused is what would need a row rewritten —
-//! a **volatile** default like `random()`, whose value differs per row and so cannot be one
-//! constant in the catalog, and bare `NOT NULL` with no default, which has no value to pad with.
+//! NULL DEFAULT 7` is instant there too.
+//!
+//! A **volatile** default — `gen_random_uuid()`, `random()` — cannot be one constant in the
+//! catalog, so it is the case that does rewrite: every row already stored is read, given its own
+//! value from the expression, and written back, which is what PostgreSQL does for it and what
+//! `ADD COLUMN … GENERATED ALWAYS AS` here already did. What stays refused is bare `NOT NULL` with
+//! no default, which has no value to pad *or* to compute, and `serial` on a table with rows.
 //!
 //! # A table with no primary key gets a hidden one
 //!
@@ -4206,6 +4210,51 @@ fn has_any_row(txn: &dyn Txn, executor: &Executor, table: &TableDef) -> Result<b
 /// The whole table is read and written in the statement's own transaction — the trade `backfill`
 /// and `set_column_type` already make, and for the same reason: the value is a function of each
 /// row, so there is no constant to pad with.
+/// **Every row already stored gets its own value from an expression `DEFAULT`.**
+///
+/// The twin of [`fill_generated_for_existing_rows`], and for the same reason: the value is a
+/// function of nothing the catalog can hold once, so it has to be written per row.
+/// [`super::dml::column_default_value`] parses and evaluates the stored text each time it is
+/// called, which is what makes three rows three different uuids rather than one repeated.
+///
+/// The values are computed before any of them is written, because computing one reads the
+/// transaction and writing borrows it.
+fn fill_default_for_existing_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    ordinal: usize,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+    super::for_each_page(txn, &start, &end, |_, page| {
+        for (key, value) in page {
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+        }
+        Ok(())
+    })?;
+    let types = table.column_types();
+    let Some(column) = table.columns.get(ordinal).cloned() else {
+        return Err(SqlError::Internal(format!(
+            "the column just added to {} is not at {ordinal}",
+            table.name
+        )));
+    };
+    let mut filled: Vec<(Vec<u8>, Vec<Datum>)> = Vec::with_capacity(rows.len());
+    for (key, mut row) in rows {
+        // A row written before the column exists is narrower than the schema; `decode_row` has
+        // already padded it, so the slot is there to fill.
+        row.resize(types.len(), Datum::Null);
+        row[ordinal] = super::dml::column_default_value(table, &column, &*txn, executor.tenant)?;
+        filled.push((key, row));
+    }
+    for (key, row) in filled {
+        txn.put(&key, &crate::row::encode_row(&types, &row)?);
+    }
+    Ok(())
+}
+
 fn fill_generated_for_existing_rows(
     txn: &mut dyn Txn,
     executor: &Executor,
@@ -5529,7 +5578,14 @@ pub(super) fn alter_table(
         // value to give a row that predates the column, so a table holding one is `23502` — with
         // the sentence `SET NOT NULL` uses, because no constraint exists yet to name. A table with
         // no rows has nothing to refuse, and that is the case every test in the suite sends.
-        if column.not_null && column.default.is_none() && has_any_row(&*txn, executor, &updated)? {
+        if column.not_null
+            && column.default.is_none()
+            // **An expression default counts as a value.** It is not one constant, but every row
+            // gets one from the backfill below, which is exactly what `NOT NULL` needs and what
+            // `ADD COLUMN thingy uuid NOT NULL DEFAULT gen_random_uuid()` asks for.
+            && column.default_expr.is_none()
+            && has_any_row(&*txn, executor, &updated)?
+        {
             return Err(SqlError::ColumnContainsNulls {
                 column: column.name.clone(),
                 relation: updated.name.clone(),
@@ -5606,6 +5662,15 @@ pub(super) fn alter_table(
         // this one cannot, because the value is a function of the row rather than a constant.
         if column.generated.is_some() {
             fill_generated_for_existing_rows(txn, executor, &updated)?;
+        }
+        // **And a volatile default is the same problem with the same answer.** `DEFAULT 7` is one
+        // constant and lives on the column as its missing value, touching no row;
+        // `DEFAULT gen_random_uuid()` is a different value per row and cannot. PostgreSQL rewrites
+        // the table for it — measured, three rows get three distinct uuids and the column's
+        // recorded default stays the expression — and so does this.
+        if column.default_expr.is_some() {
+            let ordinal = updated.columns.len() - 1;
+            fill_default_for_existing_rows(txn, executor, &updated, ordinal)?;
         }
         // **The sequence, named the way `CREATE TABLE` names one and taking a relation name of its
         // own.** `column: Some(ordinal)` is the whole of the default wiring — a `serial` column's

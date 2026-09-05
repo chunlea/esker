@@ -2426,7 +2426,22 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 // the text for everything else, evaluated once per row. Folding the rest would
                 // give every row the instant `CREATE TABLE` ran, or every row the same UUID and a
                 // primary key that refuses the second insert.
-                ColumnOption::Default(expr) => (default, default_expr) = column_default(expr, ty)?,
+                //
+                // **A user-defined type's default is folded by the executor, not here** — the
+                // same guard `ALTER TABLE … ADD COLUMN` has, and this statement did not. The
+                // column's `ty` is an `int2` placeholder until the catalog has been read (ADR
+                // 0050), so folding `'blue'` against it hands a label to the `int2` input
+                // function: `invalid input syntax for type smallint: "blue"`, which is exactly
+                // what `t.enum … default: "blue"` produced. `text` keeps the label as written and
+                // `exec::ddl` turns it into the ordinal, where the type's labels are known.
+                ColumnOption::Default(expr) => {
+                    let written = if user_type_name.is_some() {
+                        ColumnType::Text
+                    } else {
+                        ty
+                    };
+                    (default, default_expr) = column_default(expr, written)?;
+                }
                 ColumnOption::Unique(constraint) => {
                     let (deferrable, deferred) =
                         unique_deferrable(constraint.characteristics.as_ref())?;
@@ -2769,19 +2784,19 @@ fn lower_alter_table(
         let mut primary_key = false;
         let mut generated: Option<String> = None;
         let mut default = None;
+        let mut default_expr: Option<String> = None;
         for option in &column_def.options {
             let named = match &option.option {
                 // A **folded** default is stored as the column's missing value and the decoder
                 // pads with it, so no row is rewritten (ADR 0019's pad rule generalised;
                 // `catalog::ColumnDef::missing`).
                 //
-                // An **expression** default is refused here, and this is the one place where
-                // generalising the `DEFAULT` clause did not widen what is accepted. PostgreSQL
-                // takes it and **rewrites the table**, so every row already stored gets its own
-                // value — measured: `atthasmissing` comes back false for one. This `ALTER` is
-                // defined not to rewrite, so honouring the clause would leave those rows NULL
-                // where a real server gives them values, which is a wrong answer rather than a
-                // gap. `CREATE TABLE` has no rows to rewrite and takes the same expression.
+                // An **expression** default is carried through to the executor, which does
+                // rewrite the rows. This was refused here on the argument that accepting it and
+                // padding NULL would be a wrong answer rather than a gap — right about the
+                // consequence, and the answer was to stop padding rather than to keep refusing.
+                // The executor can see the rows and fills each one from the expression, which is
+                // the road `ADD COLUMN … GENERATED ALWAYS AS` already took.
                 ColumnOption::Default(expr) => {
                     // **A user-defined type's default is folded by the executor, not here.** The
                     // column's `ty` is a placeholder until the catalog has been read, so folding
@@ -2792,14 +2807,7 @@ fn lower_alter_table(
                     } else {
                         ty
                     };
-                    let (folded, unfolded) = column_default(expr, ty)?;
-                    if let Some(unfolded) = unfolded {
-                        return Err(SqlError::unsupported(format!(
-                            "ALTER TABLE ... ADD COLUMN ... DEFAULT {unfolded}, which would \
-                             rewrite every row"
-                        )));
-                    }
-                    default = folded;
+                    (default, default_expr) = column_default(expr, ty)?;
                     continue;
                 }
                 ColumnOption::NotNull => {
@@ -2869,9 +2877,11 @@ fn lower_alter_table(
                 ty,
                 user_type_name,
                 typmod,
-                // Always: an expression default is refused above, because this `ALTER` cannot
-                // rewrite the rows a real server would.
-                default_expr: None,
+                // **Carried, and the executor backfills from it.** A volatile default cannot
+                // be one constant in the catalog, so a row that predates the column has to be
+                // written — which is a fact about the rows and therefore the executor's, like the
+                // `NOT NULL` and `serial` decisions above.
+                default_expr,
                 not_null,
                 default,
                 sequence: serial_identity(&column_def.data_type),
@@ -3840,9 +3850,27 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                         escape: None,
                     });
                 }
+                // **`->` means two things** — an hstore's fetch and a JSON document's — and the
+                // values cannot tell them apart, because a `jsonb` is a canonical `Datum::Text`
+                // and so is a string. Told apart the way `||` is: here when a **cast** wrote the
+                // type down, and in the evaluator by `Expr::Ordinal`'s declared type when the
+                // operand is a column.
                 BinaryOperator::Arrow => {
+                    let func = match json_cast_type(left) {
+                        Some(ColumnType::Json) => plan::CatalogFunc::JsonFetch,
+                        Some(_) => plan::CatalogFunc::JsonbFetch,
+                        None => plan::CatalogFunc::HstoreFetch,
+                    };
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
-                        func: plan::CatalogFunc::HstoreFetch,
+                        func,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                // **`->>` needs no dispatch**: it is not an hstore operator, so every one of them
+                // is a JSON fetch whatever the operand was declared.
+                BinaryOperator::LongArrow => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::JsonFetchText,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
                     })));
                 }
@@ -5701,6 +5729,23 @@ fn refuse_json_comparison(op: &BinaryOperator) -> SqlError {
 /// Syntactic, and it has to be: after lowering, a `jsonb` is a `Datum::Text` like any other.
 fn either_is_json(left: &Expr, right: &Expr) -> bool {
     is_json_expr(left) || is_json_expr(right)
+}
+
+/// Which of `json` and `jsonb` a cast wrote, for the `->` that has to answer one of them.
+///
+/// The **outermost** cast wins, which is what `'{"a":1}'::json::jsonb -> 'a'` asks for.
+fn json_cast_type(expr: &Expr) -> Option<ColumnType> {
+    match expr {
+        Expr::Nested(inner) => json_cast_type(inner),
+        Expr::Cast {
+            expr, data_type, ..
+        } => match data_type {
+            DataType::JSON => Some(ColumnType::Json),
+            DataType::JSONB => Some(ColumnType::Jsonb),
+            _ => json_cast_type(expr),
+        },
+        _ => None,
+    }
 }
 
 fn is_json_expr(expr: &Expr) -> bool {

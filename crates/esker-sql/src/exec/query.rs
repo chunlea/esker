@@ -2604,14 +2604,33 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // does `citext`, which is why the list is one entry rather than three.
                 (crate::plan::CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     match expr_type(arg, scope) {
-                        Ok(ty @ ColumnType::HstoreArray) => {
-                            Expr::Literal(Literal::String(ty.name().to_owned()))
-                        }
+                        // **`json` and `jsonb` join it, and for exactly the same reason**: both
+                        // are a canonical `Datum::Text`, so the evaluator would answer `text` for
+                        // `pg_typeof(payload->'b')` where a real server says `jsonb`. The static
+                        // type knows and the value does not.
+                        Ok(
+                            ty @ (ColumnType::HstoreArray | ColumnType::Json | ColumnType::Jsonb),
+                        ) => Expr::Literal(Literal::String(ty.name().to_owned())),
                         _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
                             func: call.func,
                             args,
                         })),
                     }
+                }
+                // **A `->` over a json or jsonb column**, which lowered to the hstore spelling
+                // because only the plan knows the type — a `jsonb` is a canonical `Datum::Text`
+                // here and so is a string, so the values cannot decide it. Rewritten to the
+                // document operator *here* rather than dispatched in the evaluator, so that the
+                // declared type follows from the same decision: `pg_typeof(payload->'b')` is
+                // `jsonb` and `pg_typeof(doc->'a')` is `json`, measured, and an evaluator-only
+                // dispatch answered `text` for both.
+                (crate::plan::CatalogFunc::HstoreFetch, Some(operand)) => {
+                    let func = match expr_type(operand, scope) {
+                        Ok(ColumnType::Jsonb) => crate::plan::CatalogFunc::JsonbFetch,
+                        Ok(ColumnType::Json) => crate::plan::CatalogFunc::JsonFetch,
+                        _ => call.func,
+                    };
+                    Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall { func, args }))
                 }
                 _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
                     func: call.func,

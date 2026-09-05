@@ -88,15 +88,12 @@ CREATE TABLE other_schema.q (id int8 PRIMARY KEY)
 # `23502` — a wrong value, not a missing feature — so it belongs in `tests/add_column_not_null.rs`
 # rather than in this file.
 
-# Still refused on ADD COLUMN, and for the rewrite rather than for volatility: PostgreSQL gives
-# every row already stored its own value, and this ALTER is defined not to touch them.
-statement error (0A000)
-ALTER TABLE t ADD COLUMN r float8 DEFAULT random()
-
-# PostgreSQL does not fold this one either — it stores and prints `(1 + 1)`. What stops it here is
-# that there is no `+` operator at any width.
-statement error (0A000)
-ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)
+# `ADD COLUMN ... DEFAULT random()` and `... DEFAULT (1+1)` were both here, refused for the table
+# rewrite PostgreSQL does and this ALTER did not. It does it now: every row already stored is read,
+# given its own value from the expression, and written back (`tests/add_column_volatile_default.rs`).
+# Measured on 19beta1, both of these have `atthasmissing = f` — a rewrite, not a missing value —
+# so agreeing meant rewriting rather than padding. What is still refused is bare `NOT NULL` with no
+# default, which has no value to pad *or* to compute, and `serial` on a table with rows.
 
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 UNIQUE

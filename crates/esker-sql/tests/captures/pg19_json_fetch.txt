@@ -1,0 +1,54 @@
+# `->` and `->>` over `json` and `jsonb` — as PostgreSQL 19beta1 answers them.
+#
+# **Run 92: `the operator ->> is not supported`, 2 tests in `json_test.rb`.** Both are one
+# statement — `test_noname_columns_of_different_types` sends
+# `payload->'a', payload->>'b'` — so the pair is one unit and there was **no `->` to add `->>`
+# beside**: `'{"a":1}'::jsonb -> 'a'` was `0A000 -> over text` for a literal as well as a column.
+#
+# Things reasoning would get wrong:
+#
+#   * **The two operators differ in exactly two places.** A JSON **null** member is the string
+#     `null` through `->` and SQL NULL through `->>` (`j4`) — so `->>` cannot tell a missing key
+#     from a null one and `->` can (`j4` beside `j5`). And a **string** loses its quotes through
+#     `->>` and keeps them through `->` (`j1`). Everything else renders the same both ways
+#     (`j2`, `j3`, `j11`), which is why one function with a flag is right and two would drift.
+#   * **`->>` on an object or array is that value's JSON text**, not NULL: `payload->>'a'` where
+#     the member is `{}` is `{}` (`j11`).
+#   * **A negative subscript counts from the end** (`j10`), and one that lands nowhere is NULL
+#     rather than an error — as is a key against an array, a subscript against an object, or
+#     either against a scalar (`j12`).
+#   * `->` keeps the document type — `jsonb` for a `jsonb` and `json` for a `json` (`j6`, `j7`) —
+#     and `->>` is always `text`.
+#   * **`->>-1` and `->> -1` are one statement to PostgreSQL** (`j10` and `j10b`, both
+#     `20`) and two to `sqlparser` 0.62.0, whose tokenizer reads `->>-` as a single
+#     operator. Kept as its own row so the ratchet says when that stops being true.
+#   * The rendering is `jsonb`'s canonical one, so an array member comes back `[1, 2]` **with the
+#     space** (`j2`).
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`.
+
+BEGIN;		-
+CREATE TABLE j (id int8, payload jsonb, doc json);		-
+INSERT INTO j VALUES (1, '{"a":{},"b":"b","c":[1,2],"d":1,"e":null,"f":true}', '{"a":1,"b":"x"}');		-
+
+-- ------------------------------------------------- the statement json_test.rb sends		-
+SELECT 'j1', payload->'a', payload->>'b' FROM j;		j1|{}|b
+SELECT 'j2', payload->'c', payload->>'c' FROM j;		j2|[1, 2]|[1, 2]
+SELECT 'j3', payload->'d', payload->>'d', payload->'f', payload->>'f' FROM j;		j3|1|1|true|true
+SELECT 'j11', payload->>'a' FROM j;		j11|{}
+
+-- ------------------------------------------------- the two places the operators differ		-
+SELECT 'j4', payload->'e', payload->>'e' FROM j;		j4|null|\N
+SELECT 'j5', payload->'zz', payload->>'zz' FROM j;		j5|\N|\N
+SELECT 'j6', pg_typeof(payload->'b'), pg_typeof(payload->>'b') FROM j;		j6|jsonb|text
+
+-- ------------------------------------------------- a json column, a chain, and a subscript		-
+SELECT 'j7', doc->'a', doc->>'b', pg_typeof(doc->'a') FROM j;		j7|1|x|json
+SELECT 'j8', payload->'c'->0, payload->'c'->>1 FROM j;		j8|1|2
+SELECT 'j9', '{"a":1}'::jsonb->'a', '{"a":1}'::jsonb->>'a';		j9|1|1
+SELECT 'j10', '[10,20]'::jsonb->1, '[10,20]'::jsonb->> -1, '[10,20]'::jsonb->5;		j10|20|20|\N
+SAVEPOINT s1;		-
+SELECT 'j10b', '[10,20]'::jsonb->>-1;		j10b|20
+ROLLBACK TO s1;		-
+SELECT 'j12', payload->'b'->'x' FROM j;		j12|\N
+ROLLBACK;		-

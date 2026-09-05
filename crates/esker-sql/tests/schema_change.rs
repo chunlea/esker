@@ -269,48 +269,50 @@ fn not_null_without_a_default_depends_on_whether_there_are_rows() {
     assert_eq!(error.sqlstate(), "23502");
 }
 
-/// An **expression** default on `ADD COLUMN` is refused, and the reason is the rewrite.
+/// An **expression** default on `ADD COLUMN` fills every row already stored.
 ///
-/// PostgreSQL rewrites the table for one — measured, `atthasmissing` comes back false — so every
-/// row already stored gets its own value. This `ALTER` is defined not to rewrite, so taking the
-/// clause would leave those rows NULL where a real server fills them: a wrong answer rather than a
-/// gap, and refused by name.
+/// This pair of tests named three reasons for a refusal across three units, and none of them is
+/// left. "It is not a constant" was a rule this node invented; "there is no `+` operator at any
+/// width" was true until arithmetic landed; the table rewrite was real and is now done. The arc is
+/// kept because it is the useful part: each reason was believed, written down as a divergence, and
+/// outlived by the code.
 ///
-/// **The same expression is accepted by `CREATE TABLE`**, which has no rows to rewrite. That is
-/// the whole difference, and it is why the refusal names the statement and not the function.
+/// Measured on 19beta1, for both `random()` and `(1 + 1)`: `atthasmissing` comes back **false**,
+/// so PostgreSQL rewrites for these rather than padding, and agreeing meant rewriting too. The
+/// behaviour is covered end to end in `tests/add_column_volatile_default.rs`; what these two keep
+/// is the boundary against the *constant* case beside them, which still pads.
 #[test]
-fn an_expression_default_on_add_column_is_refused_by_name() {
+fn an_expression_default_on_add_column_fills_the_rows() {
     let mut node = Node::new();
     a_populated_table(&mut node);
-    let error = node.fails("ALTER TABLE t ADD COLUMN r float8 DEFAULT random()");
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    node.run("ALTER TABLE t ADD COLUMN r float8 DEFAULT random()")
+        .unwrap();
+    // Two rows, two draws — which is what says the expression was evaluated per row rather than
+    // once and padded.
     assert_eq!(
-        error.to_string(),
-        "ALTER TABLE ... ADD COLUMN ... DEFAULT random(), which would rewrite every row is not \
-         supported"
+        node.rows("SELECT count(DISTINCT r), count(r) FROM t"),
+        [[Some("2".to_owned()), Some("2".to_owned())]]
     );
-    // And the folded half is still taken, because a constant pads without a rewrite.
+    // And the folded half still pads, without a rewrite.
     node.run("ALTER TABLE t ADD COLUMN k int8 DEFAULT 7")
         .unwrap();
+    assert_eq!(
+        node.rows("SELECT DISTINCT k FROM t"),
+        [[Some("7".to_owned())]]
+    );
 }
 
 /// **PostgreSQL does not fold `(1+1)`** — it prints the default back as `(1 + 1)`, unevaluated —
-/// so this node does not either, and what stops it on `ADD COLUMN` is the rewrite.
-///
-/// This test has named three reasons across three units and only the last is a real server's:
-/// "is not a constant" (a rule this node invented), then "the operator +" (true until arithmetic
-/// landed), and now the table rewrite — the one thing about `ADD COLUMN` that is genuinely this
-/// node's limit rather than a gap in the expression language.
+/// so this node does not either. It is still an expression, and every row gets it computed.
 #[test]
-fn an_arithmetic_default_on_add_column_is_refused_for_the_rewrite() {
+fn an_arithmetic_default_on_add_column_is_computed_per_row() {
     let mut node = Node::new();
     a_populated_table(&mut node);
-    let error = node.fails("ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)");
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    node.run("ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)")
+        .unwrap();
     assert_eq!(
-        error.to_string(),
-        "ALTER TABLE ... ADD COLUMN ... DEFAULT 1 + 1, which would rewrite every row is not \
-         supported"
+        node.rows("SELECT DISTINCT e FROM t"),
+        [[Some("2".to_owned())]]
     );
     // And `CREATE TABLE`, which has no rows to rewrite, takes the same expression.
     node.run("CREATE TABLE plus (a int8 DEFAULT (1+1))")
