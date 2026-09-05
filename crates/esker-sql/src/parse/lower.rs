@@ -114,6 +114,9 @@ impl Parsed {
                 },
             ));
         }
+        if let Some(reset) = self.alter_table_reset() {
+            return Ok(plan::Statement::AlterTable(lower_alter_table_reset(reset)?));
+        }
         let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
         // `WITH [NO] DATA` was cut off the source so the statement would parse.
         if let plan::Statement::CreateMaterializedView(create) = &mut lowered
@@ -1329,6 +1332,39 @@ fn set_feature_name(set: &sqlparser::ast::Set) -> String {
         Set::SetTransaction { .. } => "SET TRANSACTION".to_owned(),
         other => feature_name(&Statement::Set(other.clone())),
     }
+}
+
+/// `ALTER TABLE … RESET (…)`, which is accepted for every name there is.
+///
+/// A real server validates nothing here — not the parameter, not even its namespace (measured; the
+/// matching `SET` refuses both) — so this maps names to actions and refuses none of them. Only one
+/// name has anywhere to be forgotten from, and `columnar_replicas` is Esker's own
+/// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+///
+/// **`ONLY` is refused with the sentence it gets on every other `ALTER TABLE`.** A real server
+/// takes it; this node does not implement inheritance and says so by name rather than letting the
+/// refusal table name `RESET` for it.
+fn lower_alter_table_reset(reset: &crate::parse::AlterTableReset) -> Result<plan::AlterTable> {
+    refuse_if(reset.only, "ALTER TABLE ONLY")?;
+    Ok(plan::AlterTable {
+        name: fold_identifier(&reset.name, reset.quoted).0,
+        if_exists: reset.if_exists,
+        actions: reset
+            .parameters
+            .iter()
+            .map(|parameter| {
+                if parameter == "columnar_replicas" {
+                    // The one that forgets something. Zero and absent are different histories to a
+                    // placement driver, so this deletes the record rather than storing a zero.
+                    plan::AlterTableAction::SetColumnarReplicas { replicas: None }
+                } else if parameter == "retention" {
+                    plan::AlterTableAction::SetRetention { retention_ms: None }
+                } else {
+                    plan::AlterTableAction::AcceptStorageParameter
+                }
+            })
+            .collect(),
+    })
 }
 
 /// `ALTER TABLE t SET (<parameter> = <value>)`, of which this node has exactly one.

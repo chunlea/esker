@@ -5,7 +5,8 @@ was the last unclaimed capture that nothing replayed.
 
 ## 1. The census
 
-Eight statements, no transaction, so the file is replayable. Probed against the node:
+Eight statements, no transaction, so the file is replayable. Probed against the node **before
+this unit** — the third, fourth, fifth and sixth rows have since changed, and §5 says how:
 
 | statement | PostgreSQL 19beta1 | this node |
 |---|---|---|
@@ -74,3 +75,62 @@ estimate is now from the parser's own vocabulary rather than from a guess.
 Out: the storage-parameter surface itself (`autovacuum_enabled`, `WITH` at creation). Declared, with
 the note that nothing in the Rails suite reaches them — this file is `ALTER TABLE` shape work, not a
 parameter catalogue.
+
+## 5. What landed
+
+Three commits, in the order the work forced.
+
+### 5a. The C1 breach
+
+`crate::parse::strip_parameter_namespace` lifts `toast.` / `esker.` off the source before
+`sqlparser` sees it — it cannot read the dot inside `SetOptionsParens` — and the namespace travels
+on `Parsed::parameter_namespace` to `lower_storage_parameters`, which decides where the names are
+known. `toast.<anything>` is accepted, every other namespace is
+`22023 unrecognized parameter namespace "X"`. Both answers are a real server's, measured.
+
+### 5b. The bug the fix shipped with, and the shape that caused it
+
+The first version spelled "accepted and applied to nothing" as
+`AlterTableAction::SetColumnarReplicas { replicas: None }` — reusing the variant that was already
+there rather than adding one. **`replicas: None` is not nothing: it is `RESET`, and it deletes the
+table's columnar setting.** So `ALTER TABLE t SET (toast.autovacuum_enabled = false)` on a table
+with `columnar_replicas = 2` silently took its columnar copies away and told the placement driver
+to act on it.
+
+Nothing caught it. The command tag is identical either way, the three tests in the unit all passed,
+and clippy has no opinion about a no-op spelled as a delete. What found it was re-reading the
+lowering to size `RESET` — the next item — and noticing that the two would return the *same value*
+for opposite meanings.
+
+`AlterTableAction::AcceptStorageParameter` is the missing state: a parameter a real server takes
+and this node has nowhere to put. The regression test asserts the *listing*
+(`esker_columnar_replicas()`), because that is the only surface on which the two spellings differ.
+
+### 5c. `RESET`, and what it does not validate
+
+Measured on 19beta1 rather than read (`ALTER TABLE t RESET (…)`, all `ok`): a list of several, the
+same name twice, a quoted name, an unknown name, `toast.autovacuum_enabled` — **and
+`esker.whatever`, where the matching `SET` is `22023 unrecognized parameter namespace "esker"`.**
+The capture's headline was that `RESET` does not validate names; it does not validate the namespace
+either. It refuses exactly two things, both grammatical: `RESET ()` and a second dot (`a.b.c`), each
+`42601`.
+
+`sqlparser` 0.62.0 has no table-level `RESET` — `parse_options(Keyword::SET)` is the only door, and
+`parse_sql_option` requires `=` after the name, so no rewrite into `SET` exists. It is read from the
+source instead, the way `REFRESH MATERIALIZED VIEW` is (`read_alter_table_reset`), and the statement
+that reaches `sqlparser` is the placeholder the lowering throws away.
+
+Only one name has anywhere to be forgotten from, so only one does anything:
+`RESET (columnar_replicas)` deletes the record, and every other name is `AcceptStorageParameter`.
+
+The refusal-table row stays. A spelling the reader does not take — `ONLY`, an empty list, two dots —
+still reaches it and is named, which is `0A000` where a real server says `42601` for the last two.
+That is this module's standing choice of C2 over C1's shortfall, and it is asserted rather than
+implied.
+
+## 6. Still out
+
+`autovacuum_enabled` and the storage-parameter surface behind it, and `CREATE TABLE … WITH (…)`,
+which is the same surface at creation time. Nothing in the Rails suite reaches either. Both are a
+real catalogue with per-parameter types and validation (`'banana'` is
+`22023 invalid value for boolean option`), which is a unit of its own and not this one.

@@ -307,6 +307,10 @@ pub struct Parsed {
     /// statement in disguise, so the source is replaced by one that parses and the lowering throws
     /// that tree away for this ([`Parsed::lower`]).
     refresh: Option<Refresh>,
+    /// The table and the parameter names of an `ALTER TABLE … RESET (…)`, if that is what this
+    /// was — **the parsed tree is a placeholder**, the third and last of that exception
+    /// ([`read_alter_table_reset`]).
+    alter_table_reset: Option<AlterTableReset>,
 }
 
 /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`, read out of the source.
@@ -321,6 +325,37 @@ pub struct Refresh {
     pub concurrently: bool,
     /// `WITH NO DATA` on a refresh, which **empties** the relation and marks it unpopulated.
     pub with_data: bool,
+}
+
+/// `ALTER TABLE [IF EXISTS] [ONLY] <name> RESET (<parameter> [, …])`, read out of the source.
+///
+/// `sqlparser` 0.62.0 has no table-level `RESET`: `parse_options(Keyword::SET)` is the only door
+/// into a parenthesised option list, and `parse_sql_option` demands `=` after the name, so there
+/// is no rewrite into a statement it can read. The statement is read here instead, the way
+/// `REFRESH MATERIALIZED VIEW` is, and the tree the parser is handed is a placeholder the lowering
+/// throws away.
+///
+/// **Only the shape the capture holds.** A qualified table name, a second action after a comma, a
+/// parameter name with a comma inside its quotes — none of those is read, and each still reaches
+/// the refusal table and is named. That is `0A000` about valid PostgreSQL, which is contract C2's
+/// answer and not C1's break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTableReset {
+    /// The table named, exactly as written — folded where the lowering folds every other name.
+    pub name: String,
+    /// Whether it was written `"quoted"`, which is the only thing that decides whether it folds.
+    pub quoted: bool,
+    /// `IF EXISTS`: a missing table is a notice rather than a `42P01`, measured on 19beta1.
+    pub if_exists: bool,
+    /// `ONLY`, which a real server takes here and this node refuses on every `ALTER TABLE`. It is
+    /// read so that the refusal names `ONLY` rather than naming `RESET` for it.
+    pub only: bool,
+    /// The parameters named, lower-cased, each keeping its namespace if it had one.
+    ///
+    /// **A namespace is kept and not checked.** `SET (esker.x = 1)` is
+    /// `22023 unrecognized parameter namespace "esker"` and `RESET (esker.x)` is *accepted* —
+    /// measured, both — so a namespaced name here simply is not this node's `columnar_replicas`.
+    pub parameters: Vec<String>,
 }
 
 impl Parsed {
@@ -397,6 +432,12 @@ impl Parsed {
     #[must_use]
     pub fn refresh(&self) -> Option<&Refresh> {
         self.refresh.as_ref()
+    }
+
+    /// The `ALTER TABLE … RESET (…)` this was, if it was one.
+    #[must_use]
+    pub fn alter_table_reset(&self) -> Option<&AlterTableReset> {
+        self.alter_table_reset.as_ref()
     }
 
     /// Whether this `BEGIN` asked for a **read-only** transaction.
@@ -518,14 +559,18 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let namespaced = strip_parameter_namespace(sql, &scanned);
     let sql = namespaced.as_ref().map_or(sql, |(text, _)| text.as_str());
     let refresh = read_refresh(sql);
-    let sql = match (&guarded, &raise, &refresh) {
-        (Some(rewritten), _, _) => rewritten.as_str(),
-        // **Parsed and thrown away**, both of them: what a `DO … RAISE` is travels in
-        // `Parsed::raise`, and what a `REFRESH MATERIALIZED VIEW` is travels in `Parsed::refresh`.
-        // `sqlparser` can read neither statement — it has no `DO` and no `REFRESH` — so the source
-        // is replaced by one that parses and the lowering throws that tree away for each.
-        (None, Some(_), _) | (None, None, Some(_)) => "SELECT 1",
-        (None, None, None) => sql,
+    let reset = read_alter_table_reset(sql, &scanned);
+    let sql = match (&guarded, &raise, &refresh, &reset) {
+        (Some(rewritten), ..) => rewritten.as_str(),
+        // **Parsed and thrown away**, all three: what a `DO … RAISE` is travels in
+        // `Parsed::raise`, a `REFRESH MATERIALIZED VIEW` in `Parsed::refresh`, and an
+        // `ALTER TABLE … RESET` in `Parsed::alter_table_reset`. `sqlparser` can read none of the
+        // three — it has no `DO`, no `REFRESH`, and no table-level `RESET` — so the source is
+        // replaced by one that parses and the lowering throws that tree away for each.
+        (None, Some(_), _, _) | (None, None, Some(_), _) | (None, None, None, Some(_)) => {
+            "SELECT 1"
+        }
+        (None, None, None, None) => sql,
     };
     Ok(parse(sql)?
         .into_iter()
@@ -550,6 +595,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 domain_not_null: domain_not_null_rewrite.is_some(),
                 with_data: with_data_rewrite.as_ref().map(|(_, data)| *data),
                 refresh: refresh.clone(),
+                alter_table_reset: reset.clone(),
             }
         })
         .collect())
@@ -781,6 +827,76 @@ fn read_refresh(sql: &str) -> Option<Refresh> {
         quoted,
         concurrently,
         with_data,
+    })
+}
+
+/// Reads a whole `ALTER TABLE [IF EXISTS] [ONLY] <name> RESET (<parameter> [, …])`.
+///
+/// **`RESET` validates nothing**, which is what the capture exists to record and what reading the
+/// documentation would have got wrong: `SET` of a name no server knows is `22023` and `RESET` of
+/// that same name is accepted. Measured on 19beta1, all `ok` — a list of several, the same name
+/// twice, a quoted name, an unknown name, and a namespace no server has. So this reader's job is
+/// to establish the *shape*; the names it collects are not judged here or anywhere.
+///
+/// What it refuses is what the grammar refuses, and both were measured: an empty list, and a
+/// second dot (`a.b.c`), each `42601` on a real server.
+fn read_alter_table_reset(sql: &str, scanned: &Scan<'_>) -> Option<AlterTableReset> {
+    if !starts_with_words(&scanned.words, &["ALTER", "TABLE"]) {
+        return None;
+    }
+    let mut rest = sql.trim().trim_end_matches(';').trim_end();
+    for keyword in ["ALTER", "TABLE"] {
+        rest = strip_leading_word(rest, keyword)?;
+    }
+    let if_exists =
+        match strip_leading_word(rest, "IF").and_then(|t| strip_leading_word(t, "EXISTS")) {
+            Some(tail) => {
+                rest = tail;
+                true
+            }
+            None => false,
+        };
+    let only = match strip_leading_word(rest, "ONLY") {
+        Some(tail) => {
+            rest = tail;
+            true
+        }
+        None => false,
+    };
+    let (name, quoted, tail) = read_identifier(rest)?;
+    let after = strip_leading_word(tail, "RESET")?.trim();
+    // Nothing may follow the closing parenthesis, which is what keeps a second action —
+    // `RESET (a), SET (b = 1)` — out rather than reading half of it.
+    let inside = after.strip_prefix('(')?.strip_suffix(')')?;
+
+    let mut parameters = Vec::new();
+    let mut rest = inside;
+    loop {
+        let (first, _, tail) = read_identifier(rest)?;
+        let mut tail = tail.trim_start();
+        // One dot is a namespace and a second is a syntax error, on a real server too.
+        let parameter = match tail.strip_prefix('.') {
+            Some(after_dot) => {
+                let (second, _, next) = read_identifier(after_dot)?;
+                tail = next.trim_start();
+                format!("{first}.{second}")
+            }
+            None => first,
+        };
+        parameters.push(parameter.to_ascii_lowercase());
+        match tail.strip_prefix(',') {
+            Some(next) => rest = next,
+            None if tail.is_empty() => break,
+            None => return None,
+        }
+    }
+
+    Some(AlterTableReset {
+        name,
+        quoted,
+        if_exists,
+        only,
+        parameters,
     })
 }
 
@@ -1914,7 +2030,9 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     // contract C1 exists to prevent. What the statement *is* still travels on `Parsed::refresh`;
     // a spelling `read_refresh` does not recognise still fails here and is named by the refusal
     // table, which is the honest `0A000`.
-    let refresh_placeholder = read_refresh(sql).map(|_| "SELECT 1");
+    let refresh_placeholder = read_refresh(sql)
+        .map(|_| "SELECT 1")
+        .or_else(|| read_alter_table_reset(sql, &scanned).map(|_| "SELECT 1"));
     let text = refresh_placeholder.or(rewritten.as_deref()).unwrap_or(sql);
 
     let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
