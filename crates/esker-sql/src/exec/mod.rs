@@ -924,6 +924,8 @@ impl Executor {
             Statement::DropExtension(drop) => ddl::drop_extension(self, txn, drop),
             Statement::AlterIndexRename(rename) => ddl::alter_index_rename(self, txn, rename),
             Statement::CreateSchema(create) => ddl::create_schema(self, txn, create),
+            Statement::CreateRole(create) => ddl::create_role(self, txn, create),
+            Statement::DropRole(drop) => ddl::drop_role(self, txn, drop),
             Statement::CreateView(create) => ddl::create_view(self, txn, create),
             Statement::DropView(drop) => ddl::drop_view(self, txn, drop),
             Statement::CreateMaterializedView(create) => {
@@ -3123,6 +3125,8 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
             vec![format!("Alter Index on {}", rename.name)]
         }
         Statement::CreateSchema(create) => vec![format!("Create Schema on {}", create.name)],
+        Statement::CreateRole(create) => vec![format!("Create Role on {}", create.name)],
+        Statement::DropRole(drop) => vec![format!("Drop Role on {}", drop.names.join(", "))],
         Statement::CreateView(create) => vec![format!("Create View on {}", create.name)],
         Statement::DropView(drop) => vec![format!("Drop View on {}", drop.names.join(", "))],
         Statement::CreateMaterializedView(create) => {

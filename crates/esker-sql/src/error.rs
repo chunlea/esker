@@ -314,6 +314,11 @@ pub enum SqlError {
     #[error("role \"{0}\" does not exist")]
     UndefinedRoleForAuthorization(String),
 
+    /// `CREATE ROLE`/`CREATE USER` for a name that is taken. **`42710`**, the code every
+    /// "already exists" in this catalog answers.
+    #[error("role \"{0}\" already exists")]
+    RoleAlreadyExists(String),
+
     /// A condition that is not a boolean: `WHERE name AND true`, `CASE WHEN name THEN …`.
     ///
     /// **The type, never the value.** PostgreSQL says `argument of AND must be type boolean, not
@@ -1475,7 +1480,14 @@ pub enum SqlError {
     #[error("{0} is not a valid encoding name")]
     InvalidEncodingName(String),
 
-    /// `OWNER = x`. This node has no roles at all, so every name is this.
+    /// A role name that is not a role: `OWNER = x`, and `DROP ROLE`/`DROP USER` for one that is
+    /// not there.
+    ///
+    /// **`42704`, an undefined *object*** — where `SET SESSION AUTHORIZATION` answers `22023` for
+    /// the same sentence, because it reads the name as a parameter value rather than an object.
+    /// One sentence, two codes, and the statement decides which. Measured, both.
+    ///
+    /// Its doc said "this node has no roles at all, so every name is this" until roles existed.
     #[error("role \"{0}\" does not exist")]
     UndefinedRole(String),
 
@@ -2479,7 +2491,8 @@ impl SqlError {
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
-            | SqlError::DuplicateEnumLabel(_) => sqlstate::DUPLICATE_OBJECT,
+            | SqlError::DuplicateEnumLabel(_)
+            | SqlError::RoleAlreadyExists(_) => sqlstate::DUPLICATE_OBJECT,
 
             // `42P17 invalid_object_definition`, not `42P16` — measured, and the two are one
             // digit apart.

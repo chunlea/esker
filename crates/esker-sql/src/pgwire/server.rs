@@ -113,7 +113,7 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
             // Nagle would add a round trip's worth of latency to every small reply, and almost
             // every reply in this protocol is small.
             let _ = stream.set_nodelay(true);
-            if let Err(error) = accept(stream, config, executors.as_ref()).await {
+            if let Err(error) = accept(stream, config, Arc::clone(&executors)).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });
@@ -205,7 +205,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// Any I/O failure. A *protocol* failure is reported to the client and ends the connection
     /// cleanly rather than surfacing here.
-    pub async fn run(&mut self, executors: &dyn Executors) -> std::io::Result<()> {
+    pub async fn run(&mut self, executors: Arc<dyn Executors>) -> std::io::Result<()> {
         if !self.startup().await? {
             return Ok(());
         }
@@ -218,7 +218,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             .backend
             .clone()
             .unwrap_or_else(crate::session::register);
-        let executor = match executors.for_session(&self.database, identity) {
+        // **Onto a blocking thread, and this is the second time this class of bug has been found
+        // in this file.** `for_session` looks like bookkeeping and is not: against a real cluster
+        // it begins a transaction and reads the catalog, which goes `StoreTxn` -> `Router` ->
+        // `TcpStores` -> `BlockingTransport::call` -> `Runtime::block_on`, and building a runtime
+        // inside `#[tokio::main]`'s panics with "Cannot start a runtime from within a runtime".
+        // Every connection completed its startup burst and then died, on every real cluster, from
+        // 0510b44e (the startup packet selects the database) onwards — v1.0.0 included.
+        //
+        // The statement path sixty lines below has been on the blocking pool since it was written,
+        // with a comment saying why; session *creation* was not, and no test started a real node
+        // from a shell until the mpp lane did.
+        let database = self.database.clone();
+        let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
+            .await
+            .map_err(std::io::Error::other)?;
+        let executor = match made {
             Ok(executor) => executor,
             Err(error) => {
                 self.send_error(&error).await?;
@@ -252,8 +267,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     Err(_elapsed) => {
                         // The block is abandoned before the socket goes, so nothing it wrote is
                         // left half-open behind a connection nobody can reach any more.
-                        let _ = work.executor.rollback();
-                        work.executor.release_advisory_locks();
+                        //
+                        // **On the blocking pool, for the same reason session creation is**:
+                        // `rollback` is a Percolator rollback against the stores on a real
+                        // cluster, so it reaches `BlockingTransport` exactly as the catalog read
+                        // does. This is the second site the audit for that bug turned up; the
+                        // `release_advisory_locks` beside it is in-process
+                        // (`crate::advisory::Locks`) and needs no thread of its own.
+                        let mut ending = work;
+                        tokio::task::spawn_blocking(move || {
+                            let _ = ending.executor.rollback();
+                            ending.executor.release_advisory_locks();
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
                         self.send_error(&SqlError::IdleInTransactionTimeout).await?;
                         return Ok(());
                     }
@@ -539,7 +566,7 @@ where
 ///
 /// The one place both listeners meet, so `SSLRequest` is answered identically whether the node was
 /// started by [`serve`] or by a test through [`serve_on`].
-async fn accept<S>(stream: S, config: Config, executors: &dyn Executors) -> std::io::Result<()>
+async fn accept<S>(stream: S, config: Config, executors: Arc<dyn Executors>) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -690,7 +717,7 @@ pub async fn serve_on(
         let executors = Arc::clone(&executors);
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            if let Err(error) = accept(stream, config, executors.as_ref()).await {
+            if let Err(error) = accept(stream, config, Arc::clone(&executors)).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });
