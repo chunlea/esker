@@ -1,0 +1,33 @@
+crates/esker-sql/src/exec/cancel.rs
+  s_6f7019c05b578b::t_deb9f83edf71f3 1-49
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_e46a25c6c75f4f 2279-2307
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_3697c3e993b017 30,1100-1111,2920-2923,3186-3190
+crates/esker-sql/src/parameter.rs
+  s_6f7019c05b578b::t_2fa4c35f54cde8 28-33,479-482,484-488
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_f9f897fa722c98 757-764,1084,1112,1178,1260-1262
+crates/esker-sql/tests/discard_all.rs
+  s_6f7019c05b578b::t_b5cda646c732c3 87-92
+crates/esker-sql/tests/statement_cancellation.rs
+  s_6f7019c05b578b::t_fdafb3f9592f17 1-118
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_6f7019c05b578b::t_99c77dd4268169 245,422,424-427,435,465-473,475,479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5b1e224f676d40a6c7a4ee8921aed18897376378",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
