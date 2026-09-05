@@ -1,0 +1,68 @@
+# Every `interval` this lane measured, under all four `IntervalStyle` settings — PostgreSQL
+# 19beta1, 2026-09-05. Why the setting is not cosmetic, and what each style does with a sign, are
+# in `tests/captures/pg19_interval_style.txt`.
+#
+#   written <tab> postgres <tab> iso_8601 <tab> postgres_verbose <tab> sql_standard
+#
+# **Every value is parsed under `postgres` and only then rendered four ways**, because the setting
+# changes how a leading sign is *read* as well as how a value prints: under `sql_standard`,
+# `'-1 month 1 day'` is minus one month and minus one **day**, where under `postgres` the day is
+# positive. A corpus that parsed each string under the style it renders in would be measuring two
+# rules at once, and the first version of this file did exactly that — the disagreement between it
+# and a hand-taken probe is what found the input rule.
+#
+# Replayed by `tests/interval_style.rs`, which runs `SELECT '<written>'::interval` under each
+# style and requires the answer. There is no divergence column: every line here agrees.
+6 years 5 mons 4 days 3 hours 2 mins 1 sec	6 years 5 mons 4 days 03:02:01	P6Y5M4DT3H2M1S	@ 6 years 5 mons 4 days 3 hours 2 mins 1 sec	+6-5 +4 +3:02:01
+1 year 2 mons 3 days 4 hours 5 mins 6.234567 secs	1 year 2 mons 3 days 04:05:06.234567	P1Y2M3DT4H5M6.234567S	@ 1 year 2 mons 3 days 4 hours 5 mins 6.234567 secs	+1-2 +3 +4:05:06.234567
+P3Y	3 years	P3Y	@ 3 years	3-0
+36000 seconds	10:00:00	PT10H	@ 10 hours	10:00:00
+1 month	1 mon	P1M	@ 1 mon	0-1
+1 hour	01:00:00	PT1H	@ 1 hour	1:00:00
+33 years	33 years	P33Y	@ 33 years	33-0
+0	00:00:00	PT0S	@ 0	0
+-1 year -2 mons -3 days -4 hours -5 mins -6.5 secs	-1 years -2 mons -3 days -04:05:06.5	P-1Y-2M-3DT-4H-5M-6.5S	@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs ago	-1-2 -3 -4:05:06.5
+1 year -2 mons 3 days -4 hours	10 mons 3 days -04:00:00	P10M3DT-4H	@ 10 mons 3 days -4 hours	+0-10 +3 -4:00:00
+90 seconds	00:01:30	PT1M30S	@ 1 min 30 secs	0:01:30
+0.5 seconds	00:00:00.5	PT0.5S	@ 0.5 secs	0:00:00.5
+400 days	400 days	P400D	@ 400 days	400 0:00:00
+-14 months	-1 years -2 mons	P-1Y-2M	@ 1 year 2 mons ago	-1-2
+1 day ago	-1 days	P-1D	@ 1 day ago	-1 0:00:00
+3 weeks	21 days	P21D	@ 21 days	21 0:00:00
+1.001 seconds	00:00:01.001	PT1.001S	@ 1.001 secs	0:00:01.001
+-2 hours	-02:00:00	PT-2H	@ 2 hours ago	-2:00:00
+-0.5 seconds	-00:00:00.5	PT-0.5S	@ 0.5 secs ago	-0:00:00.5
+-0.001 seconds	-00:00:00.001	PT-0.001S	@ 0.001 secs ago	-0:00:00.001
+1 second	00:00:01	PT1S	@ 1 sec	0:00:01
+1 minute	00:01:00	PT1M	@ 1 min	0:01:00
+1 day	1 day	P1D	@ 1 day	1 0:00:00
+1 year	1 year	P1Y	@ 1 year	1-0
+12 months	1 year	P1Y	@ 1 year	1-0
+13 months	1 year 1 mon	P1Y1M	@ 1 year 1 mon	1-1
+-1 month	-1 mons	P-1M	@ 1 mon ago	-0-1
+-1 year	-1 years	P-1Y	@ 1 year ago	-1-0
+3 days 4 hours	3 days 04:00:00	P3DT4H	@ 3 days 4 hours	3 4:00:00
+1 year 2 months	1 year 2 mons	P1Y2M	@ 1 year 2 mons	1-2
+1 year 2 months 3 days	1 year 2 mons 3 days	P1Y2M3D	@ 1 year 2 mons 3 days	+1-2 +3 +0:00:00
+1 year 2 months 4 hours	1 year 2 mons 04:00:00	P1Y2MT4H	@ 1 year 2 mons 4 hours	+1-2 +0 +4:00:00
+5 days	5 days	P5D	@ 5 days	5 0:00:00
+-4:05:06	-04:05:06	PT-4H-5M-6S	@ 4 hours 5 mins 6 secs ago	-4:05:06
+-1 month 1 day	-1 mons +1 day	P-1M1D	@ 1 mon -1 days ago	-0-1 +1 +0:00:00
+100 hours	100:00:00	PT100H	@ 100 hours	100:00:00
+59.9999999 seconds	00:01:00	PT1M	@ 1 min	0:01:00
+0.000001 seconds	00:00:00.000001	PT0.000001S	@ 0.000001 secs	0:00:00.000001
+-0.000001 seconds	-00:00:00.000001	PT-0.000001S	@ 0.000001 secs ago	-0:00:00.000001
+1 day -1 hour	1 day -01:00:00	P1DT-1H	@ 1 day -1 hours	+0-0 +1 -1:00:00
+1 hour -1 second	00:59:59	PT59M59S	@ 59 mins 59 secs	0:59:59
+1 month -1 day	1 mon -1 days	P1M-1D	@ 1 mon -1 days	+0-1 -1 +0:00:00
+1 year -1 month	11 mons	P11M	@ 11 mons	0-11
+1 month 1 hour	1 mon 01:00:00	P1MT1H	@ 1 mon 1 hour	+0-1 +0 +1:00:00
+-1 month 1 hour	-1 mons +01:00:00	P-1MT1H	@ 1 mon -1 hours ago	-0-1 +0 +1:00:00
+2 days 0 hours	2 days	P2D	@ 2 days	2 0:00:00
+-1 day 1 second	-1 days +00:00:01	P-1DT1S	@ 1 day -1 sec ago	+0-0 -1 +0:00:01
+1 day -1 second	1 day -00:00:01	P1DT-1S	@ 1 day -1 sec	+0-0 +1 -0:00:01
+1 year -1 second	1 year -00:00:01	P1YT-1S	@ 1 year -1 sec	+1-0 +0 -0:00:01
+-2 months -3 hours	-2 mons -03:00:00	P-2MT-3H	@ 2 mons 3 hours ago	-0-2 +0 -3:00:00
+5	00:00:05	PT5S	@ 5 secs	0:00:05
+5 days 3	5 days 00:00:03	P5DT3S	@ 5 days 3 secs	5 0:00:03
+1-2 3	1 year 2 mons 00:00:03	P1Y2MT3S	@ 1 year 2 mons 3 secs	+1-2 +0 +0:00:03

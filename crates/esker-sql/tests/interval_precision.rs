@@ -116,37 +116,89 @@ fn a_precision_past_six_is_reduced_with_a_warning() {
     );
 }
 
-/// **A declared divergence, and the half this unit does not do**: the precision is now reported
-/// and is not yet *applied* to the value.
+/// **The precision is applied to the value now**, which is what g1's placeholder was waiting for.
 ///
-/// Measured on 19beta1 — `'1.23456789 seconds'` into an `interval(3)` column is stored as
-/// `00:00:01.235`, **rounded** to three fractional digits, not truncated. This node keeps all six:
-/// `00:00:01.234568`.
+/// That test asserted this node's *unrounded* answer on purpose and named PostgreSQL's in its
+/// message, so rounding turned it red and it was deleted rather than edited — ADR 0031 rule 2.
+/// What replaces it is the family, measured on 19beta1 in one rolled-back session.
 ///
-/// Recorded here rather than fixed, because applying a typmod to a value is the type surface's
-/// rule and not the catalog's — the same shape `numeric(p,s)` rounding and `varchar(n)` refusal
-/// already have — and it is `b4-types`'. What this unit closed is the *reporting*, which is what
-/// all seven `interval_test.rb` failures were.
+/// Three things a plausible implementation gets wrong:
 ///
-/// **This test asserts the wrong answer on purpose.** When the value starts being rounded it goes
-/// red and must be deleted, which is ADR 0031 rule 2 doing its job rather than a test to update.
+/// * **half away from zero, and symmetric** — `0.0005` at `interval(3)` is `0.001`, and the
+///   negative is `-0.001`, not `-0.000`;
+/// * **the carry stops at days** — `1 mon 2 days 00:00:59.9999` at `interval(0)` is
+///   `1 mon 2 days 00:01:00`: it reaches minutes and never touches the days or months, because an
+///   interval's three fields do not carry into one another;
+/// * a fraction that rounds away leaves **no fractional digits at all** — `0.9995` at
+///   `interval(3)` prints `00:00:01`, not `00:00:01.000`.
 #[test]
-fn the_precision_is_reported_but_not_yet_applied_to_the_value() {
-    let mut node = parity::Node::new(&["CREATE TABLE g1_v (a interval(3))"]);
-    node.run("INSERT INTO g1_v VALUES ('1.23456789 seconds')")
+fn the_precision_is_applied_to_the_value() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE b4_iv (p0 interval(0), p1 interval(1), p3 interval(3), p6 interval(6), plain interval)",
+    ]);
+    let write = |node: &mut parity::Node, text: &str| {
+        node.run(&format!(
+            "DELETE FROM b4_iv; INSERT INTO b4_iv VALUES ('{text}','{text}','{text}','{text}','{text}')"
+        ))
         .unwrap();
+    };
+
+    write(&mut node, "1.23456789 seconds");
     assert_eq!(
-        node.rows("SELECT a FROM g1_v"),
-        [["00:00:01.234568".to_owned()]],
-        "PostgreSQL stores 00:00:01.235; when this agrees, delete the test"
+        node.rows("SELECT p0, p1, p3, p6, plain FROM b4_iv"),
+        [[
+            "00:00:01".to_owned(),
+            "00:00:01.2".to_owned(),
+            "00:00:01.235".to_owned(),
+            "00:00:01.234568".to_owned(),
+            "00:00:01.234568".to_owned(),
+        ]],
+        "a plain interval keeps all six digits; a precision rounds to it"
     );
-    // The reporting half, in the same breath, so the divergence cannot be mistaken for the column
-    // having lost its precision.
+
+    write(&mut node, "-1.23456789 seconds");
     assert_eq!(
-        node.rows(
-            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
-             WHERE attrelid = 'g1_v'::regclass AND attnum > 0"
-        ),
-        [["interval(3)".to_owned()]]
+        node.rows("SELECT p3 FROM b4_iv"),
+        [["-00:00:01.235".to_owned()]],
+        "and the negative rounds by the same rule, away from zero"
+    );
+
+    write(&mut node, "0.0005 seconds");
+    assert_eq!(
+        node.rows("SELECT p3 FROM b4_iv"),
+        [["00:00:00.001".to_owned()]],
+        "exactly half goes away from zero"
+    );
+
+    write(&mut node, "0.9995 seconds");
+    assert_eq!(
+        node.rows("SELECT p3 FROM b4_iv"),
+        [["00:00:01".to_owned()]],
+        "a fraction that rounds away leaves no fractional digits"
+    );
+
+    write(&mut node, "1 mon 2 days 00:00:59.9999");
+    assert_eq!(
+        node.rows("SELECT p0, p3 FROM b4_iv"),
+        [[
+            "1 mon 2 days 00:01:00".to_owned(),
+            "1 mon 2 days 00:01:00".to_owned()
+        ]],
+        "the carry reaches minutes and stops at days"
+    );
+}
+
+/// The same rule through a **cast**, which is the other way a precision meets a value.
+#[test]
+fn a_cast_to_an_interval_precision_rounds_too() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows("SELECT '1.23456789 seconds'::interval(3)"),
+        [["00:00:01.235".to_owned()]]
+    );
+    // `pg_typeof` of one is the bare name — a typmod is not part of what it reports. Measured.
+    assert_eq!(
+        node.rows("SELECT pg_typeof('1.5 seconds'::interval(3))"),
+        [["interval".to_owned()]]
     );
 }

@@ -914,7 +914,15 @@ fn finish_plan(
     Ok(Planned {
         node,
         columns,
-        table: outer_table.map_or_else(|| "-".to_owned(), |table| table.name.clone()),
+        // **The bare name, not the stored one.** Outside `public` a relation is stored as
+        // `schema ++ NUL ++ name` (ADR 0071), and this field is read only by `EXPLAIN` — so
+        // handing it on unsplit put a NUL byte in the middle of a `QUERY PLAN` row. PostgreSQL
+        // prints the bare name here and qualifies it only under `VERBOSE`, which this node does
+        // not honour (measured, `tests/alias.rs`).
+        table: outer_table.map_or_else(
+            || "-".to_owned(),
+            |table| crate::catalog::split_qualified(&table.name).1.to_owned(),
+        ),
         column_names: scope_column_names(scope),
         engine: None,
         junk,

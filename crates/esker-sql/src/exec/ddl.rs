@@ -1517,8 +1517,9 @@ fn set_column_default(
             // type and a plan is built without the catalog — which is also where `22P02` for a
             // literal the type will not take comes from, exactly as a `CREATE TABLE` default does.
             let ty = updated.columns[at].ty;
+            let typmod = updated.columns[at].typmod;
             let written = expr.as_deref().unwrap_or("NULL");
-            let (folded, unfolded) = crate::parse::fold_column_default(written, ty)?;
+            let (folded, unfolded) = crate::parse::fold_column_default(written, ty, typmod)?;
             updated.columns[at].default = folded;
             updated.columns[at].default_expr = unfolded;
         }

@@ -22,7 +22,7 @@ use sqlparser::ast::{
     GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
     LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
     SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TimezoneInfo, UnaryOperator, Value,
+    TableObject, TimezoneInfo, UnaryOperator, UtilityOption, Value,
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
@@ -864,17 +864,31 @@ fn lower_statement(
         } => {
             refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
             refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
-            refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
             let _ = describe_alias;
-            // **The parenthesised option list**, which is the only form `ActiveRecord` sends:
-            // `explain(:analyze, :buffers)` and `explain("VERBOSE", "ANALYZE", "FORMAT JSON")`
-            // become `EXPLAIN (ANALYZE, BUFFERS) …` and `EXPLAIN (VERBOSE, ANALYZE, FORMAT JSON) …`
-            // (`explain_test.rb`). The whole list was refused, so three of that file's five tests
-            // could not run at all.
-            let analyze = explain_options(*analyze, options.as_deref())?;
-            // `EXPLAIN VERBOSE` without parentheses asks for the same extra detail `(VERBOSE)`
-            // does, and is accepted and ignored for the same reason.
+            // **The two spellings are one vocabulary.** `EXPLAIN ANALYZE VERBOSE` and
+            // `EXPLAIN (ANALYZE, VERBOSE)` mean the same thing on a real server, so the legacy
+            // keywords are folded into the option list rather than handled beside it — and
+            // `FORMAT` outside parentheses is a syntax error there, which is why only the
+            // parenthesised list can carry one (measured, `EXPLAIN FORMAT JSON SELECT 1`).
+            // `VERBOSE` is accepted and ignored here as it is inside the parentheses, so the
+            // legacy keyword needs no field of its own.
             let _ = verbose;
+            let mut settings = ExplainOptions {
+                analyze: *analyze,
+                ..ExplainOptions::default()
+            };
+            // **`FORMAT` outside the parentheses is a syntax error on a real server**, and
+            // `sqlparser` parses it only for the dialects where it is not. Answering a plan here
+            // would be answering where PostgreSQL raises, which ADR 0031 calls the worst class of
+            // divergence — so it is refused in PostgreSQL's own words. Measured:
+            // `EXPLAIN FORMAT JSON SELECT 1` and `EXPLAIN ANALYZE FORMAT JSON SELECT 1`.
+            if format.is_some() {
+                return Err(SqlError::SyntaxAtOrNear("FORMAT".to_owned()));
+            }
+            for option in options.iter().flatten() {
+                settings.set(option)?;
+            }
+            settings.validate()?;
             // A nested statement carries no storage parameter of its own.
             let inner = lower_statement(statement, None)?;
             // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
@@ -882,10 +896,14 @@ fn lower_statement(
             // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
             // `EXPLAIN ANALYZE INSERT` that ran would be an insert.
             refuse_if(
-                analyze && !matches!(inner, plan::Statement::Select(_)),
+                settings.analyze && !matches!(inner, plan::Statement::Select(_)),
                 "EXPLAIN ANALYZE of a statement that is not a SELECT",
             )?;
-            Ok(plan::Statement::Explain(Box::new(inner), analyze))
+            Ok(plan::Statement::Explain(Box::new(plan::Explain {
+                statement: Box::new(inner),
+                analyze: settings.analyze,
+                format: settings.format,
+            })))
         }
         // **A domain lowers into a `CREATE TYPE`**, because that is what it is: a fourth
         // `TypeKind` beside the range, the composite and the enum
@@ -1529,57 +1547,6 @@ fn guc_list_item(value: &Expr) -> String {
     }
 }
 
-/// The flags an `EXPLAIN (…)` list turns on, and the refusal for one this node cannot honour.
-///
-/// **What is accepted and ignored, and why that is not a wrong answer.** `VERBOSE`, `COSTS`,
-/// `BUFFERS`, `SETTINGS`, `WAL`, `TIMING`, `SUMMARY`, `GENERIC_PLAN` and `MEMORY` all ask a real
-/// server for *more detail about the same plan*. This node's plan is its own — the corpus records
-/// the whole of `EXPLAIN`'s output as a divergence already — so honouring them would mean inventing
-/// detail rather than reporting it, and refusing them would refuse a statement PostgreSQL runs.
-/// They are accepted and change nothing, which is the truthful reading: there is no extra detail to
-/// show.
-///
-/// **`FORMAT` is different and is refused.** `FORMAT JSON` changes the *shape* of the answer, and a
-/// client that asked for JSON and got plan text has been given a wrong answer rather than a plainer
-/// one. Producing it means a node tree — `Node Type`, `Startup Cost`, `Plans` — which this planner
-/// does not have and which would be fabricated. So `0A000`, which ADR 0031 ranks above the
-/// alternative, and `explain_test.rb`'s `test_explain_with_options_as_strings` stays red on a
-/// refusal that says what is missing.
-fn explain_options(
-    already: bool,
-    options: Option<&[sqlparser::ast::UtilityOption]>,
-) -> Result<bool> {
-    let mut analyze = already;
-    let Some(options) = options else {
-        return Ok(analyze);
-    };
-    for option in options {
-        let name = option.name.value.to_ascii_uppercase();
-        let arg = option
-            .arg
-            .as_ref()
-            .map(|arg| arg.to_string().to_ascii_uppercase());
-        match (name.as_str(), arg.as_deref()) {
-            // `ANALYZE` and `ANALYZE true` run the statement; `ANALYZE false` does not.
-            ("ANALYZE", None | Some("TRUE")) => analyze = true,
-            // `ANALYZE false` joins the options that change nothing, for the same reason they do:
-            // there is no extra detail to show and no statement to run.
-            ("ANALYZE", Some("FALSE"))
-            | (
-                "VERBOSE" | "COSTS" | "BUFFERS" | "SETTINGS" | "WAL" | "TIMING" | "SUMMARY"
-                | "GENERIC_PLAN" | "MEMORY",
-                _,
-            )
-            | ("FORMAT", None | Some("TEXT")) => {}
-            ("FORMAT", Some(other)) => {
-                return Err(SqlError::unsupported(format!("EXPLAIN (FORMAT {other})")));
-            }
-            (other, _) => return Err(SqlError::unsupported(format!("EXPLAIN ({other})"))),
-        }
-    }
-    Ok(analyze)
-}
-
 /// Whether a `SET` names a run-time parameter at all, known or not.
 ///
 /// **A name this node has never heard of is still a `SET`**, and its answer is `42704` from the
@@ -1727,9 +1694,33 @@ fn lower_storage_parameters(
 ///
 /// `DEFAULT NULL` normalises to neither — the same thing as no default, which is what PostgreSQL
 /// makes of it too.
+/// A stored `DEFAULT` under the column's typmod — **for an `interval` and for nothing else**.
+///
+/// Every other parameterised type stores the literal it was written with, unmodified, and only
+/// meets its typmod when a row is inserted. Measured on 19beta1, one table, and the last row is
+/// the proof that this is not caution:
+///
+/// ```text
+/// a interval(3)  DEFAULT '1.23456 seconds'      'PT1.235S'::interval(3)   <- rounded
+/// b time(2)      DEFAULT '01:02:03.456'         '01:02:03.456'::time without time zone
+/// c timestamp(1) DEFAULT '2020-01-01 00:00:00.55'
+///                        '2020-01-01 00:00:00.55'::timestamp without time zone
+/// d numeric(6,2) DEFAULT 1.555                  1.555
+/// e varchar(3)   DEFAULT 'abcdef'               'abcdef'::character varying
+///                                               -- accepted at CREATE TABLE, and
+///                                               -- `INSERT ... DEFAULT VALUES` is then 22001
+/// ```
+fn fit_default(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
+    match ty {
+        ColumnType::Interval => value::fit_to_typmod(value, ty, typmod),
+        _ => Ok(value),
+    }
+}
+
 pub(super) fn column_default(
     expr: &Expr,
     ty: ColumnType,
+    typmod: i32,
 ) -> Result<(Option<Datum>, Option<String>)> {
     let expr = unwrap_nested(expr);
     refuse_default_shapes(expr)?;
@@ -1789,7 +1780,7 @@ pub(super) fn column_default(
         // `int4`, because the cast is one step of a coercion that ends at the column. A literal
         // the type cannot take is that type's own input error, exactly as it would be in a
         // `VALUES` list — `DEFAULT 'not a date'` on a `date` column is `22007` here and there.
-        let value = Datum::from_text(ty, &text)?;
+        let value = fit_default(Datum::from_text(ty, &text)?, ty, typmod)?;
         return Ok((
             Some(value),
             cast.map(|to| cast_default_text(&text, literal, to)),
@@ -2543,7 +2534,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                     } else {
                         ty
                     };
-                    (default, default_expr) = column_default(expr, written)?;
+                    (default, default_expr) = column_default(expr, written, typmod)?;
                 }
                 ColumnOption::Unique(constraint) => {
                     let (deferrable, deferred) =
@@ -2910,7 +2901,7 @@ fn lower_alter_table(
                     } else {
                         ty
                     };
-                    (default, default_expr) = column_default(expr, ty)?;
+                    (default, default_expr) = column_default(expr, ty, typmod)?;
                     continue;
                 }
                 ColumnOption::NotNull => {
@@ -8276,6 +8267,108 @@ fn object_name(name: &ObjectName) -> Result<String> {
             .map(ident)
             .ok_or_else(|| SqlError::unsupported(format!("the name {name}"))),
         _ => Err(SqlError::unsupported(format!("the qualified name {name}"))),
+    }
+}
+
+/// The `EXPLAIN` option list, as it accumulates.
+///
+/// # Why every option is *accepted* and only two of them are honoured
+///
+/// This server has no cost model, no buffer accounting and no per-node timing, so `COSTS`,
+/// `BUFFERS`, `TIMING`, `WAL`, `MEMORY`, `SETTINGS`, `SUMMARY`, `GENERIC_PLAN` and `SERIALIZE`
+/// change nothing about what comes back. Accepting them anyway is the [ADR
+/// 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) call: the plan text here
+/// already differs from a real server's in every line, so a client that asks for buffer counts is
+/// getting a different answer either way — and one of the two answers is a plan and the other is
+/// a `0A000` that stops the statement. What is *not* acceptable is answering where PostgreSQL
+/// raises, which is why the option names, their values and the three "requires `ANALYZE`" checks
+/// are reproduced exactly (`tests/captures/pg19_explain_options.txt`, replayed by
+/// `tests/corpus/pg19_routing_explain.txt`).
+#[derive(Debug, Default)]
+struct ExplainOptions {
+    analyze: bool,
+    /// One flag per name in [`RUN_ONLY`], which is why it is an array and not three fields: the
+    /// order is PostgreSQL's own check order, and the checks happen **after** the whole list is
+    /// read rather than where each option is met — `EXPLAIN (TIMING, ANALYZE)` is legal.
+    run_only: [bool; RUN_ONLY.len()],
+    format: plan::ExplainFormat,
+}
+
+/// The options that are only meaningful about a run, in the order PostgreSQL checks them.
+const RUN_ONLY: [&str; 3] = ["WAL", "TIMING", "SERIALIZE"];
+
+impl ExplainOptions {
+    /// Reads one `name [value]` pair.
+    fn set(&mut self, option: &UtilityOption) -> Result<()> {
+        // PostgreSQL's grammar downcases an unquoted option name before it reaches either the
+        // dispatch or the message that refuses it, so this does too.
+        let name = ident(&option.name).to_ascii_lowercase();
+        let slot = match name.as_str() {
+            "analyze" => &mut self.analyze,
+            "timing" => &mut self.run_only[1],
+            "wal" => &mut self.run_only[0],
+            "serialize" => &mut self.run_only[2],
+            // Read and discarded: see the type's own note on why these are not refusals.
+            "verbose" | "costs" | "buffers" | "settings" | "summary" | "memory"
+            | "generic_plan" => {
+                option_boolean(&name, option.arg.as_ref())?;
+                return Ok(());
+            }
+            "format" => {
+                let Some(value) = option.arg.as_ref().and_then(option_word) else {
+                    return Err(SqlError::OptionRequiresParameter(name));
+                };
+                let Some(format) = plan::ExplainFormat::parse(&value) else {
+                    return Err(SqlError::UnrecognizedExplainOptionValue {
+                        option: "format",
+                        value: value.to_ascii_lowercase(),
+                    });
+                };
+                self.format = format;
+                return Ok(());
+            }
+            _ => return Err(SqlError::UnrecognizedExplainOption(name)),
+        };
+        *slot = option_boolean(&name, option.arg.as_ref())?;
+        Ok(())
+    }
+
+    /// The three checks PostgreSQL makes *after* reading the whole list, in its order.
+    fn validate(&self) -> Result<()> {
+        for (asked, name) in self.run_only.iter().zip(RUN_ONLY) {
+            if *asked && !self.analyze {
+                return Err(SqlError::ExplainOptionRequiresAnalyze(name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An option's value read as a boolean, PostgreSQL's `defGetBoolean` rules: no argument at all is
+/// `true`, and `true`/`false`/`on`/`off`/`1`/`0` are what it will read, quoted or not.
+fn option_boolean(name: &str, arg: Option<&Expr>) -> Result<bool> {
+    let Some(arg) = arg else { return Ok(true) };
+    let word = option_word(arg).ok_or_else(|| SqlError::NonBooleanOption(name.to_owned()))?;
+    match word.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "t" | "y" | "yes" => Ok(true),
+        "false" | "off" | "0" | "f" | "n" | "no" => Ok(false),
+        _ => Err(SqlError::NonBooleanOption(name.to_owned())),
+    }
+}
+
+/// The one word an option's argument is, however it was spelled: a bare identifier, a number, a
+/// quoted string or a boolean literal. Anything else — an expression, a function call — is not an
+/// option value at all and answers `None`.
+fn option_word(arg: &Expr) -> Option<String> {
+    match arg {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::Value(value) => match &value.value {
+            Value::Number(digits, _) => Some(digits.clone()),
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Some(text.clone()),
+            Value::Boolean(flag) => Some(flag.to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

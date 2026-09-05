@@ -194,7 +194,7 @@ fn write_canonical(value: &Json, out: &mut String) {
         Json::Bool(true) => out.push_str("true"),
         Json::Bool(false) => out.push_str("false"),
         Json::Number(digits) => out.push_str(digits),
-        Json::Str(text) => write_json_string(text, out),
+        Json::Str(text) => write_string(text, out),
         Json::Array(items) => {
             out.push('[');
             for (at, item) in items.iter().enumerate() {
@@ -211,7 +211,7 @@ fn write_canonical(value: &Json, out: &mut String) {
                 if at > 0 {
                     out.push_str(", ");
                 }
-                write_json_string(key, out);
+                write_string(key, out);
                 out.push_str(": ");
                 write_canonical(item, out);
             }
@@ -223,7 +223,11 @@ fn write_canonical(value: &Json, out: &mut String) {
 /// A string, escaped the way PostgreSQL prints one: the six named escapes, `\uXXXX` for the other
 /// control characters, and everything else as itself — an `e`-acute in the input comes back as
 /// itself rather than as an escape.
-fn write_json_string(text: &str, out: &mut String) {
+/// One JSON string literal, quotes and escapes included.
+///
+/// Shared with `EXPLAIN (FORMAT JSON)`, which builds a document rather than parsing one and needs
+/// exactly this escaping and no other.
+pub(crate) fn write_string(text: &str, out: &mut String) {
     out.push('"');
     for character in text.chars() {
         match character {
