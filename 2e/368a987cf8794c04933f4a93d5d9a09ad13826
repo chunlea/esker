@@ -1,0 +1,22 @@
+crates/esker-sql/src/exec/explain.rs
+  h_44076b318daf9c 78-92,174-188
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 50,102,107,172-173,183,188,191,196,199,201,286,292-572,577,603-610,615-616,637-640,690,1284-1290,1292-1305,1320,1325-1380
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 1486-1492,1907,1928-1934
+crates/esker-sql/src/plan/routing.rs
+  h_44076b318daf9c 287-311
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 190-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2e368a987cf8794c04933f4a93d5d9a09ad13826",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
