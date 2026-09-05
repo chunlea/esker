@@ -834,6 +834,13 @@ pub enum CatalogFunc {
     SetWeight,
     /// `numnode(tsquery)`: the nodes in the tree, operators included — `'fat' & 'cat'` is **3**.
     NumNode,
+    /// `websearch_to_tsquery([config,] text)`: the search-box syntax — quoted phrases, a
+    /// leading `-` for negation, and the bare word `or`.
+    WebsearchToTsQuery,
+    /// `ts_rank(tsvector, tsquery)`: how well a vector answers a query, as a `real`.
+    TsRank,
+    /// `ts_headline(config, text, query)`: the text with every matching token wrapped in `<b>`.
+    TsHeadline,
     /// `lower_inc(range)`, `upper_inc`, `lower_inf`, `upper_inf`: the four bracket questions.
     ///
     /// `lower`/`upper` are **not** here — they are the text functions of the same name, overloaded
@@ -1084,6 +1091,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("strip") => Some(CatalogFunc::TsStrip),
             () if name.eq_ignore_ascii_case("setweight") => Some(CatalogFunc::SetWeight),
             () if name.eq_ignore_ascii_case("numnode") => Some(CatalogFunc::NumNode),
+            () if name.eq_ignore_ascii_case("ts_rank") => Some(CatalogFunc::TsRank),
+            () if name.eq_ignore_ascii_case("ts_headline") => Some(CatalogFunc::TsHeadline),
+            () if name.eq_ignore_ascii_case("websearch_to_tsquery") => {
+                Some(CatalogFunc::WebsearchToTsQuery)
+            }
             // The three `ltree` functions the corpus asks for. `nlevel('')` is 0, which is what
             // makes the empty path a value rather than a hole.
             () if name.eq_ignore_ascii_case("nlevel") => Some(CatalogFunc::LtreeNlevel),
@@ -1170,6 +1182,9 @@ impl CatalogFunc {
             CatalogFunc::TsStrip => "strip",
             CatalogFunc::SetWeight => "setweight",
             CatalogFunc::NumNode => "numnode",
+            CatalogFunc::TsRank => "ts_rank",
+            CatalogFunc::TsHeadline => "ts_headline",
+            CatalogFunc::WebsearchToTsQuery => "websearch_to_tsquery",
             CatalogFunc::LtreeNlevel => "nlevel",
             CatalogFunc::LtreeToText => "ltree2text",
             CatalogFunc::TextToLtree => "text2ltree",
@@ -1233,6 +1248,7 @@ impl CatalogFunc {
             | CatalogFunc::HstoreConcat
             | CatalogFunc::HstoreBuild
             | CatalogFunc::TsMatch
+            | CatalogFunc::TsRank
             | CatalogFunc::SetWeight => &[2],
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
@@ -1241,7 +1257,12 @@ impl CatalogFunc {
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well. A `UserRegType` is always two:
             // the name and the flag saying which half of the `regtype` was asked for.
-            CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr | CatalogFunc::UserRegType => &[2, 3],
+            // `ts_headline` joins them: `(config, text, query)`, or two arguments taking
+            // `default_text_search_config`.
+            CatalogFunc::RangeBuild
+            | CatalogFunc::PgGetExpr
+            | CatalogFunc::UserRegType
+            | CatalogFunc::TsHeadline => &[2, 3],
 
             CatalogFunc::PgGetIndexdef => &[1, 3],
             // The text-search four take one argument with `default_text_search_config`, or two
@@ -1252,6 +1273,7 @@ impl CatalogFunc {
             | CatalogFunc::ToTsQuery
             | CatalogFunc::PlainToTsQuery
             | CatalogFunc::PhraseToTsQuery
+            | CatalogFunc::WebsearchToTsQuery
             | CatalogFunc::ObjDescription => &[1, 2],
             CatalogFunc::RangeLowerInc
             | CatalogFunc::RangeUpperInc
@@ -1325,7 +1347,11 @@ impl CatalogFunc {
             // this node has no `regtype`, and what it prints is the name either way.
             | CatalogFunc::PgTypeof
             | CatalogFunc::HstoreFetch
-            | CatalogFunc::LtreeToText => ColumnType::Text,
+            | CatalogFunc::LtreeToText
+            // `ts_headline` answers the marked-up text.
+            | CatalogFunc::TsHeadline => ColumnType::Text,
+            // `ts_rank` answers a `real`, measured with `pg_typeof`.
+            CatalogFunc::TsRank => ColumnType::Real,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
             CatalogFunc::RegClass => ColumnType::Int8,
             // **The storage, which is what an enum's value is** (ADR 0050) — and the label
@@ -1372,7 +1398,8 @@ impl CatalogFunc {
             }
             CatalogFunc::ToTsQuery
             | CatalogFunc::PlainToTsQuery
-            | CatalogFunc::PhraseToTsQuery => ColumnType::TsQuery,
+            | CatalogFunc::PhraseToTsQuery
+            | CatalogFunc::WebsearchToTsQuery => ColumnType::TsQuery,
             CatalogFunc::RangeBuild => ColumnType::TsRange,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.
