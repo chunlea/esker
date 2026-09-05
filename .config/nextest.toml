@@ -53,6 +53,37 @@ max-threads = 1
 # the cost is Raft ticks competing with each other, and one at a time is the whole fix. They are
 # **deliberately not** given `threads-required` for the reason the next override states.
 #
+# **Eight more, and the way to find them is written down here because naming them by hand leaked.**
+# `esker-sql::composite` failed a full gate at **21.043 s** on
+# `OutcomeUnknown("the TxnPrewrite may or may not have been applied: timed out: the deadline passed
+# before the peer answered")` — an RPC deadline, not a wrong answer — and ran in **0.076 s** alone.
+# It calls `Cluster::start()` like every binary above it and was in no group, which is exactly the
+# failure this comment predicted: "a test that belongs in this group and is not in it fails
+# intermittently and blames the system."
+#
+# So the membership question was asked of the whole directory rather than of the one that broke:
+#
+# ```sh
+# grep -l 'cluster::Cluster' crates/esker-sql/tests/*.rs
+# ```
+#
+# Fifteen binaries; six were listed. The eight added here are the rest (`store_locking` is the
+# ninth and has its own by-test override at the bottom of this file). And a non-member does
+# not only suffer the contention — it **causes** it, because this group bounds its members
+# against each other and not against the rest of the run, so each one left out is load on the
+# ones that are in. Only `composite` has a
+# sighting; the other seven join on the **mechanism** — they hold three stores with real Raft
+# groups over real sockets, which is the whole membership rule — and on the cost of being wrong
+# about them, which is measured and is nothing:
+#
+# ```text
+# all 27 tests across the eight, run alone, together   0.328 s
+# the slowest single test among them                   0.314 s
+# ```
+#
+# A third of a second of serial time against a 21-second red. Run that `grep` when adding a test
+# that starts a cluster.
+#
 # **`esker-store::snapshot` joined on the same argument, and on two sightings rather than one.** It
 # holds regions like its neighbours `promotion` and `balance`, and it was the only member of that
 # family left out. Two different tests in it have now stretched by the same factor in two different
@@ -69,25 +100,12 @@ max-threads = 1
 # it measures nothing (that was learned the expensive way in v47). The proof is later gates
 # staying green.
 #
-# **`esker-sql::composite` joined on a third sighting of the same shape.** It calls
-# `Cluster::start()` in all five of its tests — the same `tests/cluster/mod.rs` as `joint_gate`
-# above — and in one loaded gate three of the five ended as `OutcomeUnknown … timed out` at
-# ~11.8 s each with a peer-deadline message, where all five pass alone in 0.055-0.073 s. A 200x
-# stretch ending in a deadline is the starvation signature, not a race.
-#
-# **It is not the only cluster-starting binary outside this group**, and that is worth writing down
-# where the next reader will find it. Nine `esker-sql` binaries start a cluster and are in no group
-# at all — `case_insensitive_probe` (2 clusters), `collation` (6), `composite` (5),
-# `derived_name_in_a_schema` (1), `enum_default` (2), `jsonb_concat` (1), `psql_smoke` (1),
-# `regtype_user_probe` (1) and `store_locking` (9): twenty-eight clusters between them. A
-# non-member does not only suffer the contention, it **causes** it — this group bounds its members
-# against each other, not against the rest of the run. Only `composite` is added here, because only
-# `composite` has the wall clocks, and because serialising the other eight lengthens every lane's
-# gate and is not one lane's call to make.
-#
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)
-        or binary(real_backend) or binary(real_corpus) or binary(redrive_live) or binary(composite)))
+        or binary(real_backend) or binary(real_corpus) or binary(redrive_live)
+        or binary(case_insensitive_probe) or binary(collation) or binary(composite)
+        or binary(derived_name_in_a_schema) or binary(enum_default) or binary(jsonb_concat)
+        or binary(psql_smoke) or binary(regtype_user_probe)))
     or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
