@@ -2918,7 +2918,6 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
-            SqlError::ViewNotUpdatable { detail, .. } => Some(detail.clone()),
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
             }
@@ -2992,7 +2991,10 @@ impl SqlError {
             // `crate::value::xml` builds it, because only it knows which line the parser stopped
             // on. Merged with the arms above because the body is theirs: the detail *is* the
             // payload, which is what every variant on this arm has in common.
-            | SqlError::InvalidXmlContent(detail) => Some(detail.clone()),
+            | SqlError::InvalidXmlContent(detail)
+            // The detail *is* the payload here too, and it is PostgreSQL's own sentence naming
+            // which property makes the view non-updatable.
+            | SqlError::ViewNotUpdatable { detail, .. } => Some(detail.clone()),
             SqlError::OnConflictMovesPartition => Some(
                 "The result tuple would appear in a different partition than the original tuple."
                     .to_owned(),
