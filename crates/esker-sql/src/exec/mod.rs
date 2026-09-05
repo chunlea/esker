@@ -1022,7 +1022,7 @@ impl Executor {
                         return Err(SqlError::UndefinedRoleForAuthorization(role.clone()));
                     }
                 }
-                self.authorization = name.clone();
+                self.authorization.clone_from(name);
                 Ok(Outcome::done("SET"))
             }
             SessionStatement::SetReadAsOf { value, local } => {
