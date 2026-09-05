@@ -117,6 +117,23 @@ impl Parsed {
         if let Some(reset) = self.alter_table_reset() {
             return Ok(plan::Statement::AlterTable(lower_alter_table_reset(reset)?));
         }
+        if let Some(clause) = self.alter_exclude() {
+            // The parser was handed `CHECK (true)` in the clause's place, so the `ALTER` itself —
+            // its table, its `IF EXISTS`, its `ONLY` — is lowered normally and only the one action
+            // is swapped. There is exactly one placeholder, because the rewrite makes exactly one.
+            let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
+            let plan::Statement::AlterTable(alter) = &mut lowered else {
+                return Err(SqlError::unsupported("an EXCLUDE constraint"));
+            };
+            let exclude = crate::parse::parse_exclude_constraint(clause, &alter.name)?;
+            let placeholder = alter
+                .actions
+                .iter()
+                .position(|action| matches!(action, plan::AlterTableAction::AddCheck(_)))
+                .ok_or_else(|| SqlError::unsupported("an EXCLUDE constraint"))?;
+            alter.actions[placeholder] = plan::AlterTableAction::AddExclude(exclude);
+            return Ok(lowered);
+        }
         let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
         // `WITH [NO] DATA` was cut off the source so the statement would parse.
         if let plan::Statement::CreateMaterializedView(create) = &mut lowered
@@ -2620,6 +2637,7 @@ fn lower_alter_table(
         )?;
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
+        let mut primary_key = false;
         let mut generated: Option<String> = None;
         let mut default = None;
         for option in &column_def.options {
@@ -2686,7 +2704,12 @@ fn lower_alter_table(
                     }
                     continue;
                 }
-                ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
+                // `PRIMARY KEY` is carried rather than refused; the executor decides, because
+                // whether it can be added is a question about the rows.
+                ColumnOption::PrimaryKey(_) => {
+                    primary_key = true;
+                    continue;
+                }
                 ColumnOption::Unique(_) => "ALTER TABLE ... ADD COLUMN ... UNIQUE",
                 // `NULL` is the default and says nothing; honouring it is honouring nothing.
                 ColumnOption::Null => continue,
@@ -2699,14 +2722,11 @@ fn lower_alter_table(
         // rule**: an *empty* table has no row to hold a NULL, so there is nothing to refuse — and
         // every test in the suite that sends this adds a column to an empty table. The question is
         // about the rows, so it is asked by the executor, which can see them.
-        // `ALTER TABLE ... ADD COLUMN id bigserial` would have to create a sequence *and* fill
-        // every row already stored from it, which is the table rewrite this `ALTER` is defined not
-        // to do. Refused by name rather than half-done.
-        refuse_if(
-            serial_identity(&column_def.data_type).is_some(),
-            "ALTER TABLE ... ADD COLUMN ... bigserial",
-        )?;
+        // **A `serial` is carried too, for the reason `NOT NULL` above it is.** It would have to
+        // create a sequence *and* fill every row already stored from it, and the second half is
+        // only true of a table that has rows — which the executor can see and this cannot.
         actions.push(plan::AlterTableAction::AddColumn {
+            primary_key,
             column: plan::Column {
                 name: ident(&column_def.name),
                 ty,
@@ -2717,7 +2737,7 @@ fn lower_alter_table(
                 default_expr: None,
                 not_null,
                 default,
-                sequence: None,
+                sequence: serial_identity(&column_def.data_type),
                 // `ADD COLUMN … GENERATED ALWAYS AS (…) STORED` would have to compute the
                 // expression for every row already there, which is a backfill and not a catalog
                 // write — refused by name with every other option this action does not take.
@@ -2916,6 +2936,16 @@ fn lower_added_constraint(
             deferrable,
             deferred,
         }));
+    }
+    // `PRIMARY KEY` over columns the table already has, which is what `change_table`'s
+    // `t.primary_key :id` sends when the column is there. It declares a key and re-keys nothing:
+    // the rows keep whatever identity they were created with
+    // (`crate::catalog::TableDef::row_id`).
+    if let TableConstraint::PrimaryKey(key) = constraint {
+        return Ok(plan::AlterTableAction::AddPrimaryKey {
+            name: key.name.as_ref().map(ident),
+            columns: index_columns(&key.columns)?,
+        });
     }
     let TableConstraint::Check(check) = constraint else {
         return Err(SqlError::unsupported(format!(

@@ -2002,6 +2002,32 @@ pub enum SqlError {
         family: String,
     },
 
+    /// A row already in the table that an `ALTER TABLE … ADD CONSTRAINT … EXCLUDE` would refuse.
+    ///
+    /// **A different sentence from [`Self::ExclusionViolation`]**, and measured as one: creating
+    /// the constraint says `could not create exclusion constraint "c"` where writing a row says
+    /// `conflicting key value violates …`. The `DETAIL` differs too — "conflicts with key" against
+    /// the write path's "conflicts with existing key" — because at creation neither row is the new
+    /// one.
+    #[error("could not create exclusion constraint \"{constraint}\"")]
+    ExclusionNotCreatable {
+        /// The constraint's name, given or derived.
+        constraint: String,
+        /// The key expression as written.
+        key: String,
+        /// One of the two conflicting values.
+        value: String,
+        /// The other.
+        existing: String,
+    },
+
+    /// A second `PRIMARY KEY` on a table that already has one: `42P16`.
+    ///
+    /// Measured: `multiple primary keys for table "mpk" are not allowed`, which a real server says
+    /// for `ALTER TABLE … ADD COLUMN … PRIMARY KEY` as well as for two in one `CREATE TABLE`.
+    #[error("multiple primary keys for table \"{0}\" are not allowed")]
+    MultiplePrimaryKeys(String),
+
     /// A row an `EXCLUDE` constraint refuses: `23P01`.
     ///
     /// The `DETAIL` prints **both** keys — the one being written and the one already stored — as
@@ -2678,7 +2704,10 @@ impl SqlError {
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
 
-            SqlError::ExclusionViolation { .. } => sqlstate::EXCLUSION_VIOLATION,
+            SqlError::ExclusionViolation { .. } | SqlError::ExclusionNotCreatable { .. } => {
+                sqlstate::EXCLUSION_VIOLATION
+            }
+            SqlError::MultiplePrimaryKeys(_) => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
@@ -2834,6 +2863,16 @@ impl SqlError {
                 ..
             } => Some(format!(
                 "Key ({key})=({value}) conflicts with existing key ({key})=({existing})."
+            )),
+            // **"with key", not "with existing key"** — measured. At creation neither row is the
+            // new one, so a real server does not call either of them existing.
+            SqlError::ExclusionNotCreatable {
+                key,
+                value,
+                existing,
+                ..
+            } => Some(format!(
+                "Key ({key})=({value}) conflicts with key ({key})=({existing})."
             )),
             SqlError::MalformedRangeLiteral { detail, .. } => Some((*detail).to_owned()),
             SqlError::CannotTruncateReferenced { relation, child } => {

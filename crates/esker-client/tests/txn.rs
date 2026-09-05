@@ -256,6 +256,106 @@ fn a_scan_across_a_split_boundary_reads_both_regions() {
     }
 }
 
+/// **A scan never asks a region for keys it does not hold.**
+///
+/// The half the test above did not assert, and the whole of the P0: it checked where the second
+/// request *started* and never what it asked for, so a walk that sent the caller's own `end` to
+/// every region passed it. A real store refuses that — `RegionMeta::check_range` requires the
+/// region to *contain* the range, and refusing is correct (invariant 5) — so on a cluster where a
+/// SQL table had grown past the split threshold, every `SELECT` that was not a point read answered
+/// `08006 key is not in region 1`.
+///
+/// A `FakeTransport` answers whatever it is scripted to and would never have said so, which is why
+/// the assertion here is on the **requests the client sent** rather than on the answers it got.
+/// The end-to-end proof against stores that really refuse is
+/// `esker-cli/tests/cross_region_scan.rs`.
+#[test]
+fn a_scan_never_asks_a_region_for_keys_it_does_not_hold() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan { pairs: Vec::new() }));
+    let client = client_on(
+        &transport,
+        two_regions() as Arc<dyn esker_client::RegionResolver>,
+    );
+    let txn = client.begin().unwrap();
+    txn.scan(b"a", b"", 100).unwrap();
+
+    // Region 1 is `..m`, region 2 is `m..` and unbounded above.
+    let bounds: Vec<(u64, Option<&[u8]>)> = vec![(1, Some(b"m".as_slice())), (2, None)];
+    let stores = transport.stores();
+    assert!(stores.len() >= 2, "one request per region: {stores:?}");
+    for (at, store) in stores.iter().enumerate() {
+        let TxnKvReq::Scan { start, end, .. } = nth_txn(&transport, at) else {
+            continue;
+        };
+        let (_, boundary) = bounds
+            .iter()
+            .find(|(id, _)| id == store)
+            .expect("a scripted store");
+        // A bounded region: the request must stop at the boundary, not at the caller's end. The
+        // last region has none, and an unbounded request there is the caller's own range.
+        if let Some(edge) = boundary {
+            assert!(
+                !end.is_empty() && end.as_ref() <= *edge,
+                "store {store} was asked for [{start:?}, {end:?}), past its own {edge:?}"
+            );
+        }
+    }
+}
+
+/// **A route that a split has made stale is repaired from the authority, and the scan finishes.**
+///
+/// The region cache is a hint, so the clamp can be computed from a boundary that has already
+/// moved — and the store refuses again. `KeyNotInRegion` is terminal for the router, correctly:
+/// no amount of waiting fixes routing. What fixes it is asking the resolver, which is what the
+/// second attempt does.
+#[test]
+fn a_scan_repairs_a_route_a_split_has_moved_under_it() {
+    let transport = Arc::new(FakeTransport::new());
+    // The first thing store 1 is asked is refused the way a store whose region has just split
+    // refuses it; everything after that answers.
+    transport
+        .script(Rule::new(
+            Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
+            Outcome::Fail(ProtoError::KeyNotInRegion {
+                key: key(b"a"),
+                region_id: 1,
+                start_key: Bytes::new(),
+                end_key: key(b"f"),
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
+                Outcome::TxnReply(TxnKvResp::Scan {
+                    pairs: vec![(key(b"a"), key(b"1"))],
+                }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
+                Outcome::TxnReply(TxnKvResp::Scan {
+                    pairs: vec![(key(b"n"), key(b"2"))],
+                }),
+            )
+            .forever(),
+        );
+    let client = client_on(
+        &transport,
+        two_regions() as Arc<dyn esker_client::RegionResolver>,
+    );
+    let txn = client.begin().unwrap();
+
+    let pairs = txn.scan(b"a", b"", 100).unwrap();
+    assert_eq!(
+        pairs,
+        vec![(key(b"a"), key(b"1")), (key(b"n"), key(b"2"))],
+        "the refusal is repaired rather than returned"
+    );
+}
+
 /// The walk stops at the range the caller asked for, rather than running on into regions
 /// beyond it.
 #[test]

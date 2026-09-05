@@ -3089,6 +3089,31 @@ impl Executor {
     /// much as it is `Execute`. The first version of this returned one, and a prepared `SELECT`
     /// over a join could not be described at all: every driver that prepares its statements, which
     /// is most of them, would have failed on the first join it sent.
+    /// What `pg_stat_activity` shows for a statement the **session** dispatches rather than
+    /// [`Executor::execute`].
+    ///
+    /// **`COMMIT` is a statement and it replaces the query text.** Measured on PostgreSQL 19 — a
+    /// session that ran `SELECT … FOR UPDATE` and committed reports `idle|COMMIT;` — and the node
+    /// reported the `SELECT`, for ever, because transaction control is the one family that never
+    /// reaches `execute` and `execute` is where `Backend::running` was called.
+    ///
+    /// That is not cosmetic. `transaction_test.rb` hunts its cancellation target with
+    /// `WHERE query LIKE '% FOR UPDATE'`, so **every pooled connection an earlier `lock.find`
+    /// touched kept answering that hunt** — with a lower pid than the live waiter, and
+    /// `pg_stat_activity` is ordered by pid. Rails cancelled a session that was doing nothing,
+    /// `pg_cancel_backend` answered `true` because it exists, and the waiter ran to completion:
+    /// `QueryCanceled expected but nothing was raised`.
+    ///
+    /// **The text is canonical rather than the client's own bytes**, which is the one way this
+    /// differs from a real server: a client that sends `commit;` is reported as `COMMIT` here and
+    /// as `commit;` there. The session layer holds the source and cannot reach a session's identity
+    /// to pass it down without a trait method on every implementor of `Execute`, and the difference
+    /// is a trailing semicolon on a display column — `ActiveRecord` sends these words bare, so its
+    /// traffic is reported byte for byte.
+    fn dispatched(&self, sql: &str) -> crate::session::Running {
+        self.identity.running(sql)
+    }
+
     fn tables_for(
         &self,
         txn: &dyn Txn,
@@ -3573,6 +3598,7 @@ impl Execute for Executor {
     }
 
     fn begin(&mut self, read_only: bool) -> Result<()> {
+        let _running = self.dispatched("BEGIN");
         // `idle in transaction` from here until the block ends — the state that tells an
         // operator this session is holding locks and doing nothing (`pg_stat_activity`).
         self.identity.in_transaction(true);
@@ -3608,6 +3634,7 @@ impl Execute for Executor {
     }
 
     fn savepoint(&mut self, name: &str) -> Result<()> {
+        let _running = self.dispatched(&format!("SAVEPOINT {name}"));
         // The read set is copied here, with the parameters: a `ROLLBACK TO` has to put back what
         // the transaction had *read* as well as what it had written, or the commit is validated
         // against a dependency on a statement that no longer exists (ADR 0062).
@@ -3629,6 +3656,7 @@ impl Execute for Executor {
     /// compensating for exist. A `ROLLBACK TO` with no block open never reaches here — the session
     /// answers `25P01` first — so a missing transaction is a bug rather than a user's mistake.
     fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let _running = self.dispatched(&format!("ROLLBACK TO SAVEPOINT {name}"));
         let mut txn = self
             .open
             .take()
@@ -3646,10 +3674,12 @@ impl Execute for Executor {
     }
 
     fn release(&mut self, name: &str) -> Result<()> {
+        let _running = self.dispatched(&format!("RELEASE SAVEPOINT {name}"));
         self.savepoints.release(name)
     }
 
     fn commit(&mut self) -> Result<()> {
+        let _running = self.dispatched("COMMIT");
         self.identity.in_transaction(false);
         // **Before anything else the commit does**, because a check that fails means the
         // transaction does not commit at all. A real server rolls it back and this does too: the
@@ -3699,6 +3729,7 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        let _running = self.dispatched("ROLLBACK");
         self.identity.in_transaction(false);
         // A check owed by a transaction that is not committing is a check nobody will ever run,
         // and `SET CONSTRAINTS` is undone with everything else the block did.
