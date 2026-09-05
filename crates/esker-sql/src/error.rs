@@ -110,6 +110,35 @@ pub enum SqlError {
     #[error("set-returning functions are not allowed in DEFAULT expressions")]
     DefaultSetReturning,
 
+    /// `CREATE OR REPLACE VIEW` that renames a column the view already publishes.
+    ///
+    /// **A replacement may append and may not rename.** Measured on 19beta1, and surfaced by the
+    /// view corpus once writing through a view stopped aborting the block:
+    ///
+    /// ```text
+    /// ERROR:  cannot change name of view column "name" to "title"
+    /// HINT:  Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.
+    /// ```
+    ///
+    /// This node accepted it, which is a wrong answer rather than a missing feature: a replacement
+    /// that silently renames a column breaks every query written against the old name, and
+    /// [ADR 0031](../../docs/adr/0031-a-refusal-outranks-a-wrong-answer.md) ranks that below a
+    /// refusal.
+    #[error("cannot change name of view column \"{from}\" to \"{to}\"")]
+    CannotRenameViewColumn {
+        /// The name the view already publishes.
+        from: String,
+        /// The name the replacement would give it.
+        to: String,
+    },
+
+    /// `CREATE OR REPLACE VIEW` that publishes fewer columns than the view already does.
+    ///
+    /// The other half of the same rule, and PostgreSQL's whole sentence — it names no column,
+    /// because the replacement's shortness is the fault and not any one column.
+    #[error("cannot drop columns from view")]
+    CannotDropViewColumns,
+
     /// A write on a view that is not **auto-updatable**, in PostgreSQL's own three sentences.
     ///
     /// A simple view — one relation, no `DISTINCT`, no grouping, no `LIMIT`, every projection a
@@ -2522,6 +2551,11 @@ impl SqlError {
             // reads like a missing feature ("not automatically updatable") is spelled by
             // PostgreSQL as an object that is not in the state the statement needs.
             SqlError::ViewNotUpdatable { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            // `42P16` for both: a replacement that renames or drops a column is an invalid *table
+            // definition*, which is the class PostgreSQL puts a view's shape rules in.
+            SqlError::CannotRenameViewColumn { .. } | SqlError::CannotDropViewColumns => {
+                sqlstate::INVALID_TABLE_DEFINITION
+            }
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference
@@ -3077,6 +3111,11 @@ impl SqlError {
     )]
     pub fn hint(&self) -> Option<String> {
         match self {
+            // PostgreSQL's own, and it names the statement that *does* rename a view column.
+            SqlError::CannotRenameViewColumn { .. } => Some(
+                "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead."
+                    .to_owned(),
+            ),
             SqlError::ViewNotUpdatable { hint, .. } => Some(hint.clone()),
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
             SqlError::RangeSubtypeNotOrdered(_) => Some(

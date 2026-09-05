@@ -75,22 +75,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              comparable at all now that the insert before it stopped aborting the block.",
             "pg19_view.txt:72",
         ),
-        (
-            "CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name AS title, cover, status, \
-             format, 'x'::text AS extra FROM books WHERE format = 'ebook'",
-            "**A gap, not a choice.** PostgreSQL refuses `42P16 cannot change name of view column \
-             \"name\" to \"title\"` and this node accepts the replacement — a wrong answer, which \
-             ADR 0031 ranks below a refusal. `CREATE OR REPLACE VIEW` must keep the existing \
-             columns' names and may only append. Surfaced by closing the insert above.",
-            "pg19_view.txt:76",
-        ),
-        (
-            "CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name FROM books WHERE format = \
-             'ebook'",
-            "The other half of the same gap: PostgreSQL refuses `42P16 cannot drop columns from \
-             view` and this node accepts it. One unit with the entry above.",
-            "pg19_view.txt:79",
-        ),
+        // **Both `CREATE OR REPLACE VIEW` entries are gone**, because the rule they recorded as a
+        // gap is implemented: a replacement may append columns and may not rename or drop one,
+        // `42P16` either way. Rule 2 would fail this file for leaving them.
         (
             "DROP TABLE books",
             "Two differences in one dependency message, both in the `DETAIL` and neither about \
