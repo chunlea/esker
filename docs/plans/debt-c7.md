@@ -929,3 +929,58 @@ re-establishes the office and retries, bounded, and says so if it never got a cl
 > reached and this test asserted nothing
 
 **Nine sightings in this wave; the count of them fixed by changing a budget is still zero.**
+
+## 19. A region with no leader for ninety seconds
+
+The instrument fixed in §17 answered on the **first run** of the next arm, and the answer is not a
+test defect.
+
+```
+writing b"k000733" never succeeded in 90.001262152s; the last refusal was: None
+  store 1: peer of region 77, is_leader=false, believes leader=None
+  store 2: peer of region 77, is_leader=false, believes leader=None
+  store 3: peer of region 77, is_leader=false, believes leader=None
+```
+
+Read it against the three gates the old message could not distinguish:
+
+* **not** "no store holds a region containing this key" — all three hold region 77;
+* **not** "holds the region but has no peer of it" — all three have a peer;
+* every peer says `is_leader=false`, and every peer says `believes leader=None`.
+
+Nobody leads, and nobody believes anybody else does, for **ninety seconds**. This is region 77,
+which the test's own load created by splitting. `put` is not failing to find the leader; there is
+no leader to find.
+
+That is a liveness finding in the store, not in the test. It is not invariant 1 — nothing
+acknowledged was lost, the writes simply never happened — but a range that cannot elect anybody is
+a range that cannot be written to, and `regions_reach_a_store_that_joins_and_none_is_left_without_a_leader`
+is a sibling test whose whole subject is that this must not happen.
+
+### What is not yet known, and how the next occurrence will say it
+
+`leader=None` everywhere is still ambiguous between two very different states, and the message
+could not separate them:
+
+* every peer is a **follower** whose election timer keeps being reset, so nobody ever campaigns;
+* every peer is a **candidate**, campaigning and losing, over and over.
+
+And a third possibility the membership settles: a freshly split range whose peers are still
+**learners** has no voters, and a group with no voters cannot elect anyone however long it waits.
+
+So the diagnostic now carries, per store, the peer's `term`, its Raft `role`, its `voted_for`, and
+the region's full membership with each member's Voter/Learner role. The next occurrence says which
+of the three it is in one line, without another arm to set it up.
+
+**This is handed over rather than fixed.** Diagnosing a leaderless region is store work — the apply
+loop, the campaign path, or the split's conf state — and this lane's remit was the tests around it.
+The reproduction is cheap: 14 busy threads, `a_learner_on_a_fresh_store_becomes_a_voter_under_load`,
+1 of 1 on the arm that found it and 2 of 4 on the arm before.
+
+### The arm, and the guard that stopped it
+
+One arm, 14 threads, GNU `timeout` proved both ways first. It aborted itself before run 2: the
+1-minute load average reached 108 against the ceiling of 80 written into the script after §17's
+incident. Spinners were killed and verified with `ps -p` — the check that works. The guard cost
+seven runs and prevented a repeat of the 196 that stopped the previous arm; the finding arrived on
+run 1 regardless.
