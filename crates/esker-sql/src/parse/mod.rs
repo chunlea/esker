@@ -648,15 +648,6 @@ impl DoLanguage<'_> {
     }
 }
 
-/// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's other `DO` body.
-///
-/// `postgresql_adapter_test.rb` raises one in seven tests to exercise `db_warnings_action`, and
-/// what those tests read is the severity word and the message `libpq` prints. So this is one
-/// `RAISE` of one literal and nothing else: no format arguments, no `USING`, no second statement.
-///
-/// **`EXCEPTION` is deliberately not here.** It is an error — `P0001` with the raised text as the
-/// whole message — and routing it through the notice path would turn a failed statement into a
-/// successful one. It stays refused by name until something needs it.
 /// Lifts the **namespace** off a storage parameter, returning the rewritten statement and the
 /// namespace that was there.
 ///
@@ -837,6 +828,15 @@ fn read_identifier(text: &str) -> Option<(String, bool, &str)> {
     Some((text.get(..end)?.to_owned(), false, text.get(end..)?))
 }
 
+/// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's other `DO` body.
+///
+/// `postgresql_adapter_test.rb` raises one in seven tests to exercise `db_warnings_action`, and
+/// what those tests read is the severity word and the message `libpq` prints. So this is one
+/// `RAISE` of one literal and nothing else: no format arguments, no `USING`, no second statement.
+///
+/// **`EXCEPTION` is here and travels as an error**, not as a notice — the arm below says why.
+/// `INFO`, `LOG` and `DEBUG` are the ones that are not: there is no severity token for them on
+/// this wire, and downgrading one would print a client the wrong word.
 fn strip_do_raise(sql: &str, scanned: &Scan<'_>) -> Option<(String, crate::error::Severity)> {
     let [first, ..] = scanned.words.as_slice() else {
         return None;
