@@ -1,0 +1,359 @@
+# Phase 16 — MPP exchange: the design, and the measurement that decides whether to build it
+
+[ADR 0022](../adr/0022-columnar-learner-replica.md) **milestone 5**, the last one, and the only
+one the ADR gates on a number:
+
+> **MPP exchange — last, and only if measured.** Shuffling intermediate results *between* columnar
+> nodes so that a join or a high-cardinality `GROUP BY` runs distributed rather than finishing on
+> one SQL node. It is the largest piece of work in this ADR, it needs a shuffle protocol,
+> spill-to-disk and its own failure handling, and two-level aggregation without it already covers
+> the queries that motivated the feature. Building it before the numbers say it is the bottleneck
+> would be optimising before profiling, which `CLAUDE.md` forbids for smaller reasons than this.
+
+So this file is in two halves and they are not equal. The **design** below is what milestone 5
+would be if it is built, worked out far enough that the verdict is a decision about a known thing
+rather than about a guess. The **verdict** is what decides whether any of it is built, and it is
+written from `docs/bench/mpp-baseline.md` and from nothing else.
+
+> **Status: design drafted, verdict open.** §9 and §10 are `TODO` and are the two sections that
+> matter. The benchmark that fills them is built and committed (`esker bench-mpp`, 961d7ba0); the
+> run is blocked on a defect outside this lane, recorded in §9.
+
+## 1. What is already true, and is easy to misread
+
+Four of ADR 0022's five milestones are built, and three facts about *what they built* decide most
+of what follows.
+
+**A fragment is one region's whole answer, in one framed message.** The request carries a plan
+subtree and the response carries groups (`docs/DESIGN.md` §16.2). There is no streamed fragment
+response, and [ADR 0040](../adr/0040-the-engine-a-query-runs-on.md) Decision 4 turns that into a
+routing rule: a bare projection scan is **not** routed, because a rows-output fragment would
+materialise a whole region on the SQL node where the row path streams a page at a time.
+
+**The SQL node asks its fragments one at a time.** `crates/esker-sql/src/exec/fragment.rs`:
+
+```rust
+for shard in &shards {
+    let Ok(answer) = source.evaluate(shard, &bytes, ts, 0) else { … };
+```
+
+and `FragmentSource::evaluate` takes a single shard, so the serialism is in the trait's shape and
+not only in the loop. **R regions cost R round trips end to end however many stores answer them.**
+This is not MPP's problem and MPP does not fix it; it is named here because it is the first thing
+the measurement will see and because it changes what §10 can conclude — see §10's second question.
+
+**Exactly one plan shape is substituted**, `Aggregate { [Filter] { SeqScan } }` (ADR 0040 Decision
+4). A join never reaches the columnar path at all today. **A shuffle is therefore not what a join
+needs first**; a join fragment is, and that is a larger and separate piece of work than the
+exchange — see §8.
+
+## 2. What an exchange is, in this system's own terms
+
+The two-level aggregate finishes like this today:
+
+```
+region 1 learner ──partials──┐
+region 2 learner ──partials──┼──▶ SQL node: merge every partial into one BTreeMap, finish
+region 3 learner ──partials──┘
+```
+
+The SQL node receives `regions × groups` partials and merges them into `groups`. With an exchange
+it finishes like this:
+
+```
+region 1 learner ──┐          ┌──▶ node A: merges the partials for its share of the keys ──┐
+region 2 learner ──┼─shuffle──┼──▶ node B: merges the partials for its share of the keys ──┼──▶ SQL node
+region 3 learner ──┘          └──▶ node C: merges the partials for its share of the keys ──┘
+```
+
+Two things change and only two. The merge is **parallel** — each consumer sees `regions ×
+groups/consumers` partials instead of all of them. And the SQL node stops being on the path for
+intermediate results: it receives `groups` rows, once, instead of `regions × groups` partials.
+
+What does **not** change: the bytes leaving the stores, and the scan. An exchange moves the same
+partials the stores already produce; it moves them somewhere else. That is why §10's question is
+about the *share* the finish takes and not about the total.
+
+## 3. The shuffle protocol — a wire change, and its own ADR
+
+New messages on the hand-rolled wire (`docs/DESIGN.md` §9), so this needs an ADR of its own before
+a byte is written. **The number is claimed when unit 2 starts, not now**: main's highest is 0072
+and lands several ADRs a day, and holding a number across a design that may never be built is how
+two lanes end up with one number.
+
+### 3.1 The thing being addressed is not a region
+
+This is the crux, and everything awkward in the design comes from it. Every message on this wire
+today is *about a region*: `{ region_id, epoch, peer }` is the header, and `esker-client`'s router
+resolves a region to a peer. A shuffle message is about **an instance of a plan fragment running
+on a node** — `(query, fragment, partition)` — which no existing header can name.
+
+So a new service namespace, alongside the five in DESIGN §9:
+
+```
+0x06 Exchange   0x0601 Open   0x0602 Push   0x0603 Finish   0x0604 Cancel
+```
+
+and a new identity that is not a region:
+
+```
+exchange_id := coordinator_id:u64 ++ query_seq:u64      unique in the cluster, allocated by the
+                                                        SQL node from PD's id allocator
+stream_id   := exchange_id ++ producer:u32 ++ partition:u32
+```
+
+`coordinator_id` from `Pd::AllocId`, which already exists and already guarantees cluster-unique
+ids — the same source a split uses.
+
+### 3.2 A partition is a stream, not a message
+
+`max_frame_size` is 16 MiB and a partition can be larger, so a partition **must** be streamed. The
+wire already has the frame kinds: `Stream` and `StreamEnd`, used today by exactly one method,
+`RaftTransport::Snapshot` (DESIGN §9). An exchange partition is the second, and it is the same
+shape — a run of `Stream` frames ended by a `StreamEnd`.
+
+**This is a prerequisite, and it is shared work.** ADR 0040 Decision 4 keeps a bare projection scan
+off the columnar path *because* a fragment answers in one message, and says lifting it "needs a
+paged or streamed fragment response, which is a wire change". That wire change is this one. So
+milestone 5's first unit pays for a restriction milestone 4 recorded, whether or not the exchange
+itself is built — which is worth knowing before §10 decides.
+
+### 3.3 The body
+
+```
+open   := version:u8 ++ exchange_id ++ fragment ++ producers ++ consumers ++ partitioning ++ crc32c
+push   := version:u8 ++ stream_id ++ sequence:varint ++ payload ++ crc32c
+finish := version:u8 ++ stream_id ++ rows:varint ++ messages:varint ++ crc32c
+```
+
+Versioned and golden-tested like every other message (ADR 0002), and every byte checksummed
+(invariant 2). `payload` is `esker_proto::fragment::result`'s existing body — the format the
+partials already cross in — so the exchange carries what a fragment already produces rather than
+inventing a second encoding of it. `esker-proto` still does not link `esker-columnar`.
+
+**`finish` carries the counts, and that is the whole of the completeness argument.** A consumer
+that has not received a `Finish` from every declared producer, whose `rows` and `messages` match
+what it actually received, **must not produce an answer**. A short partition is otherwise
+indistinguishable from a complete one, and a partial answer that looks complete is the one failure
+this feature must not have — the same sentence `esker-sql`'s shard list already turns on.
+
+### 3.4 The epoch rule, which invariant 5 forces and which is not obvious
+
+> **Every request carries a region epoch. A stale epoch is rejected with a redirect hint; a store
+> never serves a request for a range it no longer owns.** — `CLAUDE.md` invariant 5
+
+A `Push` is not about a range, so "the range it no longer owns" needs a reading. The one this plan
+takes:
+
+* **`Open` declares the producer set as `(region_id, epoch)` pairs** — the epochs the *planner*
+  saw, exactly as `Columnar::shards` carries them today.
+* **Each producer checks its own pair before it produces anything**, and refuses a stale one
+  exactly as `Store::serve_fragment` refuses a stale shard today. No new refusal semantics.
+* **A consumer accepts a `Push` only for a `stream_id` whose producer is in the `Open` it was
+  given.** An unknown stream is an error, never a buffered "maybe it is coming".
+* **A stale epoch anywhere aborts the whole exchange. It is never retried into.** This is ADR
+  0040's existing consequence, restated for many producers: *"re-routing after a split asks about
+  a different set of rows and returns a partial answer that looks complete"*. With N producers the
+  same hazard is N times more likely and exactly as silent.
+
+An abort is cheap because the fallback is free: the routed plan already carries the row plan it
+falls back to, at the same `ts`, and the client sees the answer the snapshot always had.
+
+### 3.5 The partitioning function, and the trap in it
+
+Consumers are chosen by hashing the grouping key. The constraint is not "spread evenly" — it is:
+
+> **Two keys that are `pg_cmp`-equal must land on the same consumer.**
+
+`GROUP BY` here groups by `pg_cmp` equality everywhere (`exec/fragment.rs`'s `GroupKey`, and
+DESIGN §16.2), so `-0.0` and `0.0` are one group and two `NaN`s are one group. **Hashing the
+encoded bytes would split a group the row engine keeps together** — a wrong answer, silently, and
+the exact defect class ADR 0040 Decision 5 exists to prevent on the comparison side.
+
+So: hash a **canonical form** of the datum, not its wire bytes, with one canonicaliser shared by
+every node, tested against `pg_cmp` as a property — *for all pairs, `pg_cmp(a, b) == Equal`
+implies `hash(a) == hash(b)`*. `esker-base`'s hash is the function; the canonicaliser is new and
+belongs beside `pg_cmp`.
+
+## 4. Where the exchange operator lives
+
+Three placements, and the choice decides whether this is MPP or a rearrangement.
+
+| | Where the shuffle runs | What the SQL node does | Verdict |
+|---|---|---|---|
+| **A** | The SQL-node executor | receives every partial, redistributes | **No.** It is today's bottleneck with two extra copies through the node that was already the bottleneck. |
+| **B** | A store-side fragment executor on each columnar learner | plans, allocates the exchange id, declares the sets, receives the final gather | **Yes.** |
+| **C** | Store-side first level, SQL-node last level | as B, plus a final merge | This is B. C is B's gather described twice. |
+
+**B**, then: the SQL node is the **coordinator and not a data path**. It sends one `Open` to each
+participant, and receives `groups` rows once. Intermediate results never touch it.
+
+The consumers are the columnar learners themselves — the nodes that already hold the data and
+already have a fragment executor. A separate pool of exchange nodes would be a second thing to
+place, size and fail over, and PD has no operator for it.
+
+**How a fragment names its consumers**: it does not — `Open` does. The consumer set is
+`(store_id, address, partition_range)`, resolved by the SQL node from the same region cache that
+already tells it which peer of a region is the columnar learner (`esker-client`'s
+`PeerRole::ColumnarLearner`). A producer is told where to push; it never resolves anything itself,
+because a producer that resolved its own consumers could disagree with the coordinator about the
+consumer set, and two producers with different consumer sets is a lost partition.
+
+## 5. Spill to disk
+
+A consumer merging `regions × groups/consumers` partials can exceed memory, and the answer must
+not be "the node dies". Spill is the escape, and three invariants shape it before any performance
+question does.
+
+* **Above `esker-engine`** (invariant 7). The engine is byte-opaque and knows nothing of plans;
+  a spill file holds partials, which are key semantics. It goes in the columnar/exchange crate,
+  through `esker_engine::FileSystem` — the same seam a columnar file and a tiered SST use — and
+  the engine's own code is untouched.
+* **Every byte checksummed, magic and version header** (invariant 2). The format is the one this
+  project already writes four times over:
+
+  ```
+  spill  := header ++ block* ++ trailer
+  header := magic "ESKERSPL" ++ version:u32
+  block  := length:u32 ++ payload ++ crc32c(length ++ payload)
+  trailer:= blocks:u32 ++ rows:u64 ++ crc32c(itself) ++ magic
+  ```
+
+  **The trailer's magic is the commit point**, as in a columnar file (DESIGN §16.1): a file a
+  crash left half-written lacks it and is *unsealed* — deleted — rather than corrupt, which is a
+  different operational answer.
+* **Immutable, and renamed into place** (invariant 3). Written to a temporary, fsynced, renamed.
+  Never appended to after sealing.
+
+Spill is **bounded and accounted**: a per-exchange byte budget, and an exchange that would exceed
+it aborts to the row plan rather than filling a disk. A shuffle that turns a memory problem into a
+disk problem has moved the failure, not removed it.
+
+Lifetime: one directory per `exchange_id`, deleted when the exchange ends however it ends, and
+swept at store startup — an orphan directory from a `kill -9` is a leak that grows.
+
+## 6. Failure handling — what is retried, what is aborted, what is never double-counted
+
+The governing property, inherited from milestone 4 and not weakened here:
+
+> **An exchange is all-or-nothing at one `ts`, and its failure is the row plan that was already
+> there.**
+
+| What happens | What the exchange does | Why |
+|---|---|---|
+| a producer dies mid-shuffle | **abort**, fall back to rows at the same `ts` | its partitions are incomplete and a short partition looks like a complete one |
+| a consumer dies mid-shuffle | **abort** | its share of the keys has no other home; re-partitioning mid-flight would need every producer to replay |
+| a region splits under a producer | **abort**, never re-route | ADR 0040's rule: the halves answer about a different set of rows |
+| a leader moves | **retry the `ReadIndex` round only** | the round is the leader's business; the fragment is a learner's, and the learner did not move |
+| a `Push` is duplicated | **discard by `(stream_id, sequence)`** | the wire redelivers; a partial that was added twice is a wrong number with no symptom |
+| a `Push` is lost | caught at `Finish` by the count, then **abort** | this is what the counts are for |
+| the whole exchange times out | **abort** | a deadline that falls back beats one that hangs, which is Decision 4's own trade |
+| the coordinator re-asks after any abort | **safe** | a read at a fixed `ts` is repeatable; `esker_client::retry::may_ask_again` already draws this line by method |
+
+**Never double-counted** has exactly two mechanisms and they are both above: dedupe by
+`(stream_id, sequence)` on the way in, and a per-stream row count checked at `Finish`. Anything
+that gets past both is a bug the simulator's checker (§7) is written to find.
+
+## 7. The simulator, and the checker that would catch a lost partition
+
+`esker-sim` drives this deterministically or it is not testable: an exchange has N producers, M
+consumers and a network, and the interesting states are the ones a real cluster reaches once a
+week. What makes it drivable is the property `CLAUDE.md` invariant 4 already buys for Raft — the
+exchange operator gets the same shape: **no threads, no timers, no sockets**, time in through
+`tick()`, messages in through `step()`, effects out through a `Ready`-like batch.
+
+Driven by `esker-sim`'s seeded network with reordering, duplication, delay and drop, and with
+producers and consumers killed at chosen steps.
+
+**The checker is conservation, and it has three clauses:**
+
+1. **Every input row is in exactly one partition.** Sum the per-partition input counts; it equals
+   the rows the producers scanned. Not "at least" and not "about".
+2. **The answer equals the single-node answer.** The same fragments, merged by today's two-level
+   finish on one node, at the same `ts`, compared as a `Result` so an error is an answer too —
+   which is exactly the shape milestone 2's differential already has (DESIGN §16.3), and it is
+   reused rather than re-invented.
+3. **A lost partition is an error, never a short answer.** The checker injects the loss and
+   asserts the exchange *fails*. A checker that only compares answers passes a system that loses
+   a partition and reports fewer groups, because it has nothing to compare the missing groups to.
+
+Clause 3 is the one that pays for the counts in §3.3, and it must be written **before** the
+protocol, red, so that the protocol is what makes it green.
+
+## 8. What this phase will NOT do
+
+* **No join push-down.** A shuffle for a join needs a join fragment first, and there is none: ADR
+  0040 Decision 4 substitutes one plan shape and a join is not it. A distributed join is
+  *build-side broadcast or shuffle-both-sides* on top of a fragment that can express a join at
+  all, and that fragment is a bigger piece of work than this whole phase. If the numbers say joins
+  are what hurts, the next phase is the join fragment and **not** this one.
+* **No cost model.** Nothing here estimates whether an exchange is worth it. The trigger is a
+  session variable and a threshold on the planner's existing group estimate, or it is nothing.
+* **No repartitioning mid-flight**, no adaptive consumer counts, no skew handling. A skewed key
+  puts one consumer under all the load, and this phase records that rather than fixing it.
+* **No exchange for anything but the two-level aggregate's second level.** `ORDER BY`, `DISTINCT`
+  and window functions all want a shuffle eventually and none of them get one here.
+* **No new dependency.** Pure Rust, allowlist only, and nothing on this page needs anything that
+  is not already in the workspace.
+* **No change to `esker-raft` or `esker-engine`.** Same as ADR 0022's own list: the exchange is a
+  plan-layer thing on a wire, and neither of those crates learns what a partition is.
+
+## 9. TODO — the measurement
+
+**Blocked, not skipped.** The driver is built, gated and committed (`esker bench-mpp`, 961d7ba0):
+it starts a placement driver, N stores and a SQL node, loads a seeded seven-column table, asks for
+a columnar copy with the user's own `ALTER TABLE`, and times four queries on both engines,
+interleaved — a filtered scan with one output row (the control that no exchange can help), a
+`GROUP BY` at 32 groups, a `GROUP BY` at high cardinality, and a join. The engine is asserted from
+`EXPLAIN ANALYZE` on every run and the row count on both arms.
+
+It cannot run yet: **`esker-sql` panics on every connection when it has real store addresses**, at
+`pgwire/server.rs`'s `for_session` on a tokio worker thread. Present at `v1.0.0` by inspection,
+introduced 2026-09-03 by `0510b44e`. Owned by the `h1` lane; the reproduction is
+`scratchpad/pgwire-cluster-repro.md`.
+
+`docs/bench/mpp-baseline.md` is where the numbers go, and it is written before this section is.
+
+### 9a. What the measurement cannot see, and what milestone 5 owes it
+
+The instrument this ADR's own gate needs **does not exist**, in any crate, for anybody:
+
+| what is missing | where it would go | what it would expose |
+|---|---|---|
+| any clock at all on a routed plan | `esker_proto::fragment::ScanStats` (`crates/esker-proto/src/fragment/mod.rs:133`) | the learner's own evaluate time, so a reader can tell a slow scan from a slow network |
+| bytes on a fragment response | the same, or `esker_client::fragment::FragmentAnswer` | `result.len()` is known at `exec/fragment.rs` and thrown away |
+| an execution time on `EXPLAIN ANALYZE` | `esker_sql::exec::explain` | PostgreSQL prints `Execution Time:`; this node prints none, for any plan, routed or not |
+| a store address distinct from its bind address | `esker-cli`'s `--listen` (`server.rs:279` registers the listen string verbatim) | a proxy between a SQL node and a store, which is how bytes and per-answer timing would be observed without touching either binary |
+
+`esker bench-mpp` works around all four by reading each process's `utime + stime`, `rchar` and
+`VmHWM` from `/proc` — which is honest and is *not* a substitute: it says what a process spent,
+not what a fragment cost. **If milestone 5 is built, the first three rows are part of it**, because
+an exchange nobody can measure is an exchange nobody can tune, and the argument for building it
+would be an argument for instrumenting it too.
+
+## 10. TODO — the verdict
+
+Written from `docs/bench/mpp-baseline.md` and from nothing else, and it is what the coordinator and
+the user decide unit 2 from — **not the length of §1 to §8**. It answers, in order:
+
+1. **What share of a high-cardinality `GROUP BY`'s wall time is the SQL node's finishing step**,
+   with the absolute seconds beside every share, at each N and each cardinality; and does the
+   control move with it, which is what says the run measured the query and not the machine.
+2. **Is the share the exchange's to take?** §1's second fact says fragments are dispatched
+   serially, so part of what looks like "the SQL node is the bottleneck" is R round trips the SQL
+   node spends *waiting*, which an exchange does not remove and **parallel dispatch does** —
+   a change in `esker-sql` and `esker-client`, no wire change, no shuffle, no spill, and perhaps a
+   day. If the numbers can be explained by the round trips, the answer to milestone 5 is *not
+   yet, and here is a much smaller thing to do first*. Separating the two is what the R-axis and
+   the low-versus-high-cardinality pair are in the benchmark for: the low-cardinality slope in R is
+   the round trips, and what the high-cardinality slope has on top of it is the finish.
+3. **At what scale does it become the exchange's?** A share that is small at 2 million rows and
+   four regions and growing with both is a *later*, with the crossing point named in rows and
+   groups.
+4. **What the join says**, which is a different question with a different answer: it does not run
+   on the columnar path at all today, so its number is about the row engine, and if it is the
+   thing that hurts then §8's first bullet is the next phase and this one is not.
+
+The three answers this section may reach are **build it**, **build parallel dispatch instead and
+re-measure**, and **not yet, at this scale, and here is the scale**. It must say which, in a
+paragraph, in plain words.
