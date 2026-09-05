@@ -48,13 +48,20 @@ struct Returned {
     columns: Vec<query::OutputColumn>,
     exprs: Vec<crate::plan::Expr>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// The session's `IntervalStyle`. `RETURNING` is a second path to a client and had to be told
+    /// about it separately, exactly as it had to be told that an enum leaves as its label.
+    style: crate::value::IntervalStyle,
 }
 
 impl Returned {
     /// Resolves the target list against the table, or `None` when the statement has no
     /// `RETURNING`. Resolution happens **before** the first row is written, so `RETURNING nope`
     /// is `42703` with nothing written rather than after half the statement has run.
-    fn open(returning: Option<&Returning>, table: &TableDef) -> Result<Option<Self>> {
+    fn open(
+        returning: Option<&Returning>,
+        table: &TableDef,
+        style: crate::value::IntervalStyle,
+    ) -> Result<Option<Self>> {
         let Some(items) = returning else {
             return Ok(None);
         };
@@ -63,6 +70,7 @@ impl Returned {
             columns,
             exprs,
             rows: Vec::new(),
+            style,
         }))
     }
 
@@ -77,6 +85,7 @@ impl Returned {
         from: crate::plan::TableRef,
         joins: &[crate::plan::Join],
         scope: &query::Scope<'_>,
+        style: crate::value::IntervalStyle,
     ) -> Result<Option<Self>> {
         let Some(items) = returning else {
             return Ok(None);
@@ -86,6 +95,7 @@ impl Returned {
             columns,
             exprs,
             rows: Vec::new(),
+            style,
         }))
     }
 
@@ -104,7 +114,7 @@ impl Returned {
                     // two output paths, and only the `SELECT` one used it.
                     match self.columns.get(at).and_then(|c| c.user_type.as_ref()) {
                         Some(def) => super::assign::from_enum(&value, def).to_text(),
-                        None => value.to_text(),
+                        None => crate::value::to_text_under(&value, self.style),
                     }
                     .map(String::into_bytes)
                 })
@@ -573,7 +583,8 @@ pub(super) fn insert(
     let table = executor.require_table(txn, &insert.table)?;
     refuse_matview_write(&table, &insert.table)?;
     let targets = target_columns(&table, insert)?;
-    let mut returned = Returned::open(insert.returning.as_ref(), &table)?;
+    let mut returned =
+        Returned::open(insert.returning.as_ref(), &table, executor.interval_style())?;
     // The row keys this statement has written, for the `21000` above. Only `ON CONFLICT` fills it:
     // without the clause a second write to one key is the ordinary `23505`.
     let mut touched: Vec<Vec<u8>> = Vec::new();
@@ -1008,6 +1019,32 @@ fn render_key(table: &TableDef, ordinals: &[usize], values: &[Datum]) -> String 
 /// further along the scan and updated twice. That is the Halloween problem, and materialising the
 /// matching rows first is the cheap way out of it: what the statement writes can no longer change
 /// what it is about to read.
+/// An `UPDATE`'s `RETURNING`, resolved against the target and everything its `FROM` chain adds.
+///
+/// Split out of [`update`] because that function is at the line limit and this is the part of it
+/// that is about one clause rather than about the statement.
+fn update_returning(
+    executor: &Executor,
+    update: &Update,
+    named: &TableDef,
+    target_name: &str,
+    chain: &[crate::plan::Join],
+    sources: &[std::sync::Arc<TableDef>],
+) -> Result<Option<Returned>> {
+    let target_ref = crate::plan::TableRef {
+        alias: update.alias.clone(),
+        ..crate::plan::TableRef::bare(named.name.clone())
+    };
+    let entries = scope_entries(named, target_name, chain, sources);
+    Returned::open_over(
+        update.returning.as_ref(),
+        target_ref,
+        chain,
+        &query::Scope::chain(&entries),
+        executor.interval_style(),
+    )
+}
+
 pub(super) fn update(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -1037,19 +1074,7 @@ pub(super) fn update(
             .collect::<Result<Vec<_>>>()?
     };
     let target_name = target_name(update, &named);
-    let target_ref = crate::plan::TableRef {
-        alias: update.alias.clone(),
-        ..crate::plan::TableRef::bare(named.name.clone())
-    };
-    let mut returned = {
-        let entries = scope_entries(&named, &target_name, &chain, &sources);
-        Returned::open_over(
-            update.returning.as_ref(),
-            target_ref,
-            &chain,
-            &query::Scope::chain(&entries),
-        )?
-    };
+    let mut returned = update_returning(executor, update, &named, &target_name, &chain, &sources)?;
     let targets = inheritance_targets(executor, txn, &named)?;
     let mut count = 0;
 
@@ -1164,7 +1189,8 @@ pub(super) fn delete(
     }
     let named = executor.require_table(txn, &delete.table)?;
     refuse_matview_write(&named, &delete.table)?;
-    let mut returned = Returned::open(delete.returning.as_ref(), &named)?;
+    let mut returned =
+        Returned::open(delete.returning.as_ref(), &named, executor.interval_style())?;
     let mut count = 0;
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
     // measured, and each row has to go through its own table's keys and indexes.
@@ -1866,7 +1892,7 @@ fn drain(
     // not loop, and its rows are the ones that were there when it started.
     super::subquery::resolve(&mut node, txn, executor.tenant)?;
     let path = executor.resolved_search_path(txn)?;
-    let mut cursor = cursor::Cursor::open(txn, executor.tenant, &path, &node)?;
+    let mut cursor = cursor::Cursor::open(txn, executor.tenant, executor.settings(&path), &node)?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {
         rows.push(row);
@@ -2024,7 +2050,7 @@ pub(super) fn exclusion_conflict(
     };
     let mine = identity(row);
     let node = query::matching_rows(None, tenant, table)?;
-    let mut scan = cursor::Cursor::open(txn, tenant, &[], &node)?;
+    let mut scan = cursor::Cursor::open(txn, tenant, cursor::Settings::none(), &node)?;
     while let Some(existing) = scan.next()? {
         if identity(&existing) == mine || !indexed(&existing)? {
             continue;

@@ -2438,6 +2438,53 @@ pub enum SqlError {
     #[error("parameter \"{0}\" requires a Boolean value")]
     NonBooleanParameter(&'static str),
 
+    /// An `EXPLAIN (...)` option this server has never heard of: `EXPLAIN (NOSUCH) SELECT 1`.
+    ///
+    /// **A `42601` and not the `0A000` a refusal would be** — the option list is a closed
+    /// vocabulary, so a name outside it is not a feature this server has yet to grow, it is a
+    /// word that means nothing anywhere. PostgreSQL's grammar downcases an unquoted option name
+    /// before it reaches the message, and so does the lowering. Measured,
+    /// `tests/captures/pg19_explain_options.txt`.
+    #[error("unrecognized EXPLAIN option \"{0}\"")]
+    UnrecognizedExplainOption(String),
+
+    /// An option whose argument is not a boolean: `EXPLAIN (ANALYZE MAYBE) SELECT 1`.
+    ///
+    /// PostgreSQL's `defGetBoolean` writes this sentence for every statement that takes an option
+    /// list, which is why the name here is not `Explain`'s. The option's name is unquoted, unlike
+    /// [`SqlError::NonBooleanParameter`]'s — the two sentences are a `SET`'s and an option list's
+    /// and they are not the same one.
+    #[error("{0} requires a Boolean value")]
+    NonBooleanOption(String),
+
+    /// An option that takes a value and was given none: `EXPLAIN (FORMAT) SELECT 1`.
+    ///
+    /// PostgreSQL's `defGetString`, and generic for the same reason as
+    /// [`SqlError::NonBooleanOption`].
+    #[error("{0} requires a parameter")]
+    OptionRequiresParameter(String),
+
+    /// `EXPLAIN (FORMAT NOSUCHFORMAT)`: the option is real, the value is not.
+    ///
+    /// **`22023` where an unrecognized option *name* is `42601`** — measured, and the difference
+    /// is PostgreSQL's own: a name outside the vocabulary is a syntax error, a value outside an
+    /// option's range is a parameter that will not read.
+    #[error("unrecognized value for EXPLAIN option \"{option}\": \"{value}\"")]
+    UnrecognizedExplainOptionValue {
+        /// The option, downcased as PostgreSQL's grammar leaves it.
+        option: &'static str,
+        /// The value it would not take, as written.
+        value: String,
+    },
+
+    /// `EXPLAIN (TIMING)` with no `ANALYZE`: an option about a run, asked of a plan.
+    ///
+    /// The three PostgreSQL checks after its option loop — `TIMING`, `WAL`, `SERIALIZE` — and the
+    /// name is **uppercase** in the sentence where every other option message downcases it.
+    /// Measured, all three.
+    #[error("EXPLAIN option {0} requires ANALYZE")]
+    ExplainOptionRequiresAnalyze(&'static str),
+
     /// A `SET` of a duration parameter whose count, converted to the parameter's base unit, will
     /// not fit a C `int`: `'2147483648'`, `'25d'`.
     ///
@@ -2606,7 +2653,7 @@ impl SqlError {
             // A ragged `VALUES` list is a **syntax** error and not a type one, which is worth
             // saying out loud: the rows have no common shape, so there is nothing to type.
             | SqlError::ValuesRowLength
-            | SqlError::SyntaxAtOrNear(_)
+            | SqlError::SetValueSyntax(_)
             | SqlError::UnloggedView
             // **PostgreSQL's own class for this**: an option its `CREATE DATABASE` does not have
             // is a syntax error there and not a feature refusal. Measured.
@@ -2618,7 +2665,10 @@ impl SqlError {
             // server: the input function reports where the path stopped being a path.
             | SqlError::LtreeSyntax(_)
             | SqlError::LQuerySyntax(_)
-            | SqlError::SetValueSyntax(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::SyntaxAtOrNear(_)
+            | SqlError::UnrecognizedExplainOption(_)
+            | SqlError::NonBooleanOption(_)
+            | SqlError::OptionRequiresParameter(_) => sqlstate::SYNTAX_ERROR,
             // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
             // the one place PostgreSQL spends that class on something it will never implement
             // rather than on something it has not implemented yet.
@@ -2910,7 +2960,9 @@ impl SqlError {
             // object reference. Measured, both.
             | SqlError::UndefinedRoleForAuthorization(_)
             | SqlError::UnrecognizedParameterNamespace(_)
-            | SqlError::InvalidFunctionArgument(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::InvalidFunctionArgument(_)
+            | SqlError::UnrecognizedExplainOptionValue { .. }
+            | SqlError::ExplainOptionRequiresAnalyze(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT

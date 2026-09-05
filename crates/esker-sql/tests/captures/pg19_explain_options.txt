@@ -1,0 +1,166 @@
+# **`EXPLAIN (...)`** — the option list, its five errors, and the four documents `FORMAT` chooses
+# between, as PostgreSQL 19beta1 answers them.
+#
+# Run 100's board carries four tests behind this: `explain_test.rb`'s three option-list cases and
+# `connection_test.rb`'s `test_statement_key_is_logged`. The first three assert only that the
+# statement was accepted; the fourth reads the answer back **through the column's type OID**, which
+# is why the `\gdesc` block below is the decisive part of this capture and not a detail.
+#
+# Taken 2026-09-05 against 127.0.0.1:55432 (user/db `esker`), `\set VERBOSITY verbose`, everything
+# inside one `BEGIN … ROLLBACK` with **every** probe in its own `SAVEPOINT` — including the ones
+# expected to succeed, which is the rule that stopped an unexpected error from swallowing the rest
+# of the file. The counts after the rollback prove nothing persisted.
+#
+# WHAT REASONING WOULD HAVE GOT WRONG
+#
+#   * **`BUFFERS` does not require `ANALYZE`** on 19 — it reports planning buffers. `TIMING`, `WAL`
+#     and `SERIALIZE` do, and they are checked *after* the whole list is read, so
+#     `(TIMING, ANALYZE)` is legal and `(TIMING)` is not.
+#   * **An unrecognized option NAME is `42601` and an unrecognized option VALUE is `22023`.** Two
+#     classes, one statement, and no family resemblance to guess from.
+#   * **`FORMAT YAML` declares `text`, not some yaml type.** `FORMAT XML` declares `xml`.
+#   * **`FORMAT` outside the parentheses is a syntax error.** `sqlparser` parses it for the
+#     dialects where it is not, so accepting it here would answer where a real server raises.
+#   * A structured document is **one row**, not one row per line.
+#   * A non-`public` relation is named **bare** without `VERBOSE` and qualified with it — which is
+#     what found the NUL byte this node had been printing in that position (`tests/alias.rs`).
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 1. THE THREE STATEMENTS `explain_test.rb` SENDS — all accepted
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM posts;
+#    Seq Scan on posts  (cost=0.00..14.80 rows=480 width=140) (actual time=0.003..0.004 rows=0.00 loops=1)
+#    Planning:
+#      Buffers: shared hit=42 read=2
+#    Planning Time: 3.486 ms
+#    Execution Time: 0.017 ms
+#   (5 rows)
+#
+#   EXPLAIN (ANALYZE) SELECT * FROM posts;                     -- the same, without the read= line
+#   EXPLAIN (VERBOSE, ANALYZE, FORMAT JSON) SELECT * FROM posts;   -- see §3 for the shape
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 2. THE DECLARED COLUMN TYPE, PER FORMAT (\gdesc) — the wire fact
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   EXPLAIN SELECT * FROM posts                     QUERY PLAN | text
+#   EXPLAIN (FORMAT TEXT) SELECT * FROM posts       QUERY PLAN | text
+#   EXPLAIN (FORMAT JSON) SELECT * FROM posts       QUERY PLAN | json
+#   EXPLAIN (FORMAT XML)  SELECT * FROM posts       QUERY PLAN | xml
+#   EXPLAIN (FORMAT YAML) SELECT * FROM posts       QUERY PLAN | text
+#   EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM posts  QUERY PLAN | text
+#
+# The column is named `QUERY PLAN` in every one, and every structured format answers `(1 row)`.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 3. THE THREE STRUCTURED DOCUMENTS, over one join, verbatim
+#    EXPLAIN (COSTS FALSE, FORMAT <f>) SELECT p.title FROM posts p JOIN authors a ON a.id = p.author_id
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   JSON                                     YAML                              XML
+#   ────                                     ────                              ───
+#   [                                        - Plan:                           <explain xmlns="http://www.postgresql.org/2009/explain">
+#     {                                          Node Type: "Hash Join"          <Query>
+#       "Plan": {                                Parallel Aware: false             <Plan>
+#         "Node Type": "Hash Join",              Join Type: "Inner"                  <Node-Type>Hash Join</Node-Type>
+#         "Join Type": "Inner",                  Hash Cond: "(p.author_id = a.id)"   <Join-Type>Inner</Join-Type>
+#         "Hash Cond": "(p.author_id = a.id)",   Plans:                              <Hash-Cond>(p.author_id = a.id)</Hash-Cond>
+#         "Plans": [                               - Node Type: "Seq Scan"           <Plans>
+#           {                                        Parent Relationship: "Outer"      <Plan>
+#             "Node Type": "Seq Scan",               Relation Name: "posts"              <Node-Type>Seq Scan</Node-Type>
+#             "Parent Relationship": "Outer",        Alias: "p"                          <Relation-Name>posts</Relation-Name>
+#             "Relation Name": "posts",            - Node Type: "Hash"                 </Plan>
+#             "Alias": "p"                           Plans:                            <Plan>
+#           },                                         - Node Type: "Seq Scan"           <Node-Type>Hash</Node-Type>
+#           { "Node Type": "Hash", … }                   Relation Name: "authors"        <Plans> … </Plans>
+#         ]                                                                           </Plan>
+#       }                                                                           </Plans>
+#     }                                                                           </Plan>
+#   ]                                                                           </Query>
+#                                                                             </explain>
+#
+# (Keys elided above for width; the full documents are in the session log. Field ORDER is
+# PostgreSQL's own and is what this node's renderers copy: node type, relation, the node's own
+# details, then `Plans`.)
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 4. EVERY OPTION, ACCEPTED OR NOT (fixture `b4_t (id int8 PRIMARY KEY, name text, amount int8)`)
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   accepted with no ANALYZE:  ANALYZE VERBOSE COSTS BUFFERS SETTINGS SUMMARY MEMORY GENERIC_PLAN FORMAT
+#   requires ANALYZE:          TIMING WAL SERIALIZE
+#
+#   EXPLAIN (TIMING) …            ERROR:  22023: EXPLAIN option TIMING requires ANALYZE
+#   EXPLAIN (WAL) …               ERROR:  22023: EXPLAIN option WAL requires ANALYZE
+#   EXPLAIN (SERIALIZE) …         ERROR:  22023: EXPLAIN option SERIALIZE requires ANALYZE
+#   EXPLAIN (TIMING, ANALYZE) …   accepted -- the check is after the whole list
+#
+#   EXPLAIN (NOSUCHOPTION) …      ERROR:  42601: unrecognized EXPLAIN option "nosuchoption"
+#                                 LOCATION:  ParseExplainOptionList, explain_state.c:168
+#   EXPLAIN (FORMAT NOSUCHFORMAT) ERROR:  22023: unrecognized value for EXPLAIN option "format": "nosuchformat"
+#                                 LOCATION:  ParseExplainOptionList, explain_state.c:159
+#   EXPLAIN (ANALYZE MAYBE) …     ERROR:  42601: analyze requires a Boolean value
+#                                 LOCATION:  defGetBoolean, define.c:137
+#   EXPLAIN (COSTS 2) …           ERROR:  42601: costs requires a Boolean value
+#   EXPLAIN (FORMAT) …            ERROR:  42601: format requires a parameter
+#                                 LOCATION:  defGetString, define.c:37
+#   EXPLAIN () …                  ERROR:  42601: syntax error at or near ")"     -- the grammar, not the loop
+#
+#   The option name is DOWNCASED in every message but the "requires ANALYZE" one, which uppercases
+#   it -- PostgreSQL's grammar folds the identifier and that sentence writes the flag's own name.
+#
+#   Booleans read: no argument at all (true), TRUE/FALSE, on/off, 1/0. `EXPLAIN (analyze 1)` and
+#   `EXPLAIN (ANALYZE on, TIMING off)` are both accepted. A second `ANALYZE` wins rather than
+#   raising: `EXPLAIN (ANALYZE, ANALYZE)` is accepted.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 5. THE LEGACY SPELLINGS
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   EXPLAIN VERBOSE SELECT 1                accepted   (adds an `Output:` line)
+#   EXPLAIN ANALYZE VERBOSE SELECT 1        accepted
+#   EXPLAIN VERBOSE ANALYZE SELECT 1        ERROR:  42601: syntax error at or near "ANALYZE"
+#   EXPLAIN FORMAT JSON SELECT 1            ERROR:  42601: syntax error at or near "FORMAT"
+#   EXPLAIN ANALYZE FORMAT JSON SELECT 1    ERROR:  42601: syntax error at or near "FORMAT"
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 6. A RELATION OUTSIDE `public` — where the schema goes, and where it does not
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   CREATE SCHEMA b4_other; CREATE TABLE b4_other.t (a int8 PRIMARY KEY);
+#
+#   EXPLAIN (COSTS FALSE) SELECT * FROM b4_other.t
+#    Seq Scan on t
+#
+#   EXPLAIN (COSTS FALSE, VERBOSE) SELECT * FROM b4_other.t
+#    Seq Scan on b4_other.t
+#      Output: a
+#
+#   EXPLAIN (COSTS FALSE, FORMAT JSON) SELECT * FROM b4_other.t
+#      "Relation Name": "t",           -- and NO "Schema" key
+#      "Alias": "t",
+#
+#   EXPLAIN (COSTS FALSE, FORMAT JSON, VERBOSE) SELECT * FROM b4_other.t
+#      "Relation Name": "t",
+#      "Schema": "b4_other",           -- the schema arrives only with VERBOSE
+#      "Output": ["a"]
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# 7. WHAT WAS NOT TAKEN, and is a gap rather than a divergence
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   * `EXPLAIN EXECUTE <name>(args)` — accepted there (protocol-level and SQL-level prepared
+#     statements share one namespace); `26000 prepared statement "x" does not exist` for a name
+#     nobody prepared. This node has no `EXECUTE` at all, so `connection_test.rb`'s
+#     `test_statement_key_is_logged` still fails on that half. Sized separately.
+#   * `EXPLAIN ANALYZE INSERT/UPDATE/DELETE` — PostgreSQL **runs** it (the probe here failed on a
+#     not-null constraint, which is the proof it ran). Still `0A000` by name here, and still a
+#     listed divergence in `tests/routing.rs`.
+#   * `EXPLAIN CREATE TABLE t (a int8)` — a syntax error on 19 (`EXPLAIN` takes only the
+#     row-producing statements plus `CREATE TABLE AS`/`DECLARE`/`EXECUTE`). Accepted here, which is
+#     a divergence older than this unit.
+#
+# NOTHING PERSISTED: `SELECT count(*) FROM posts` inside the block, then `ROLLBACK`, then
+# `count(*) FROM pg_class WHERE relname = 'b4_t'` = 0 and `pg_namespace WHERE nspname = 'b4_other'`
+# = 0.

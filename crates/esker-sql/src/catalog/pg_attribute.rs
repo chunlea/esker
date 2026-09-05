@@ -179,7 +179,11 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
 }
 
 /// Every `pg_attrdef` row this tenant has: one per column that has a default, and no others.
-pub fn default_rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+pub fn default_rows(
+    txn: &dyn Txn,
+    tenant: u64,
+    style: crate::value::IntervalStyle,
+) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
@@ -187,7 +191,7 @@ pub fn default_rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             continue;
         };
         for (attnum, (position, column)) in table.user_columns().enumerate() {
-            let Some(expression) = default_expression(column, table, position) else {
+            let Some(expression) = default_expression(column, table, position, style) else {
                 continue;
             };
             rows.push(vec![
@@ -353,7 +357,11 @@ fn attribute(
     };
     let has_default = own
         && !column.dropped
-        && position.is_some_and(|at| default_expression(column, table, at).is_some())
+        // **The boot style, deliberately**: this asks only *whether* there is a default, and
+        // whether one exists cannot depend on how it prints.
+        && position.is_some_and(|at| {
+            default_expression(column, table, at, crate::value::IntervalStyle::Postgres).is_some()
+        })
         && identity == NOT_IDENTITY;
     // **A tombstone answers about itself, not about the column it was.** Measured on 19beta1:
     // the name becomes `........pg.dropped.N........` with the attnum in it, `atttypid` becomes
@@ -462,7 +470,12 @@ pub(crate) fn collatable(ty: ColumnType) -> bool {
 /// Three sources, and the order matters: an **identity** column has no default expression at all
 /// (measured — no `pg_attrdef` row and `atthasdef` `f`), a **`bigserial`** column's default is the
 /// `nextval` its sequence makes, and everything else is the stored constant.
-pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Option<String> {
+pub fn default_expression(
+    column: &ColumnDef,
+    table: &TableDef,
+    at: usize,
+    style: crate::value::IntervalStyle,
+) -> Option<String> {
     // A **volatile** default, which catalog record v5 records as a flag rather than a value
     // (`ColumnDef::default_now`) because a constant cannot express it. It prints unparenthesised,
     // exactly as written — measured, and unlike a computed default such as `DEFAULT 1 + 1`, which
@@ -524,7 +537,9 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
         let label = super::enum_label(labels, *ordinal)?;
         return Some(format!("'{label}'::{}", def.name));
     }
-    Some(super::def_functions::constant_expression(value, column.ty))
+    Some(super::def_functions::constant_expression(
+        value, column.ty, style,
+    ))
 }
 
 /// The columns of `pg_attribute`, in PostgreSQL's own order.

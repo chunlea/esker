@@ -16,8 +16,12 @@
 //!   answer**: a real server refuses `off` with `0A000 non-standard string literals are not
 //!   supported`. This crate's lexer is standard-conforming, so `on` is exact and `off` is the same
 //!   refusal from the same class.
-//! * `IntervalStyle` is **inert here and says so**: it decides how an `interval` prints, and this
-//!   node has no `interval`. All four of PostgreSQL's values are stored and read back.
+//! * `IntervalStyle` is **honoured**, and was inert until run 100 said what that cost. It decides
+//!   how an `interval` prints; the note here used to read "and this node has no `interval`", which
+//!   stopped being true two phases ago. `ActiveRecord` sends `SET intervalstyle = iso_8601` at
+//!   connect and *parses* what comes back, returning `nil` rather than an error when the parse
+//!   fails — so the wrong dialect is a value that vanishes with nothing said. All four styles
+//!   render (`crate::value::interval::Style`), applied where a row leaves for a client.
 //! * `TimeZone` is honoured **only where it means UTC**, because `timestamptz` is printed in UTC
 //!   and nowhere else (`crate::value::timestamp`). A real server takes `America/New_York`; this
 //!   one refuses it by name rather than print an instant in the wrong zone.
