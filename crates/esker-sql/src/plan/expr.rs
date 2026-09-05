@@ -874,6 +874,19 @@ pub enum CatalogFunc {
     /// it one is a wider change than this function; the boolean, which is what a caller branches
     /// on, is the same.
     PgCancelBackend,
+    /// `pg_terminate_backend(pid)`: ends the *session* at `pid`, and answers whether there was one
+    /// to end.
+    ///
+    /// The pair to `pg_cancel_backend` and not a louder version of it: a cancellation stops the
+    /// statement and the session carries on, while this closes the connection — the victim's next
+    /// message is answered `57P01 terminating connection due to administrator command` and the
+    /// socket goes. Two Rails tests turn on exactly that difference; both terminate a connection
+    /// and then use it, expecting to be told it is gone.
+    ///
+    /// **`false` for an unknown pid, and no `WARNING` with it — the same declared divergence as
+    /// `PgCancelBackend` above**, for the same reason and closed by the same change: `Env` has no
+    /// notice channel, so one channel would serve both.
+    PgTerminateBackend,
     /// `pg_backend_pid()`: the pid of the session asking.
     ///
     /// Wanted because `pg_stat_activity` now lists **every** session in the process, so "my
@@ -1325,6 +1338,9 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("pg_cancel_backend") => {
                 Some(CatalogFunc::PgCancelBackend)
             }
+            () if name.eq_ignore_ascii_case("pg_terminate_backend") => {
+                Some(CatalogFunc::PgTerminateBackend)
+            }
             () if name.eq_ignore_ascii_case("pg_backend_pid") => Some(CatalogFunc::PgBackendPid),
             () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
             () if name.eq_ignore_ascii_case("array_position") => Some(CatalogFunc::ArrayPosition),
@@ -1355,6 +1371,7 @@ impl CatalogFunc {
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::PgSleep => "pg_sleep",
             CatalogFunc::PgCancelBackend => "pg_cancel_backend",
+            CatalogFunc::PgTerminateBackend => "pg_terminate_backend",
             CatalogFunc::PgBackendPid => "pg_backend_pid",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
@@ -1520,7 +1537,8 @@ impl CatalogFunc {
             | CatalogFunc::TsStrip
             | CatalogFunc::NumNode
             | CatalogFunc::PgSleep
-            | CatalogFunc::PgCancelBackend => &[1],
+            | CatalogFunc::PgCancelBackend
+            | CatalogFunc::PgTerminateBackend => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
@@ -1621,7 +1639,8 @@ impl CatalogFunc {
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::TsMatch
-            | CatalogFunc::PgCancelBackend => ColumnType::Bool,
+            | CatalogFunc::PgCancelBackend
+            | CatalogFunc::PgTerminateBackend => ColumnType::Bool,
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.

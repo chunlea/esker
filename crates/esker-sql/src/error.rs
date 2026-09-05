@@ -2573,6 +2573,18 @@ pub enum SqlError {
     #[error("terminating connection due to idle-in-transaction timeout")]
     IdleInTransactionTimeout,
 
+    /// Another session called `pg_terminate_backend` on this one.
+    ///
+    /// `FATAL` for the reason above it, and the message is PostgreSQL's own. **The victim learns
+    /// of it the next time it uses the connection**, where a real server signals the backend and
+    /// closes even while it sits idle. The difference is declared rather than hidden: it is
+    /// invisible to a client that is doing anything at all, which is every client either Rails
+    /// test has — both terminate a connection and then *use* it — and closing an idle socket from
+    /// another session's thread needs a handle on the victim's stream that the registry does not
+    /// keep.
+    #[error("terminating connection due to administrator command")]
+    TerminatedByAdministrator,
+
     /// The frontend sent something the protocol does not allow.
     #[error("{0}")]
     ProtocolViolation(String),
@@ -2969,6 +2981,7 @@ impl SqlError {
             }
             SqlError::LockNotHeld(_) => sqlstate::WARNING,
             SqlError::IdleInTransactionTimeout => sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+            SqlError::TerminatedByAdministrator => sqlstate::ADMIN_SHUTDOWN,
             SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
             }
@@ -3008,7 +3021,8 @@ impl SqlError {
             | SqlError::LockNotHeld(_) => Severity::Warning,
             SqlError::ProtocolViolation(_)
             | SqlError::InvalidPassword(_)
-            | SqlError::IdleInTransactionTimeout => Severity::Fatal,
+            | SqlError::IdleInTransactionTimeout
+            | SqlError::TerminatedByAdministrator => Severity::Fatal,
             _ => Severity::Error,
         }
     }
