@@ -39,10 +39,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', path FROM ltrees ORDER BY path::text COLLATE \"C\"",
             "COLLATE is not lowered here, for any type",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', 'a.b'::ltree < 'a-b'::ltree, 'a.b' < 'a-b' COLLATE \"C\"",
             "COLLATE is not lowered here, for any type",
+            "UNMEASURED",
         ),
     ],
 };

@@ -25,10 +25,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('c', CURRENT_DATE, CURRENT_TIME) RETURNING id",
             NO_TIMETZ,
+            "pg19_values_catalog_function.txt:64",
         ),
         (
             "SELECT 'r', pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), pg_typeof(CURRENT_DATE), pg_typeof(CURRENT_TIME)",
             NO_TIMETZ,
+            "pg19_values_catalog_function.txt:71",
         ),
         (
             "INSERT INTO vl_posts (title, created_at, updated_at) VALUES ('bad', nosuchfunction(), CURRENT_TIMESTAMP)",
@@ -38,6 +40,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              implemented yet, and nothing here can tell the two apart without PostgreSQL's whole \
              function catalogue. **Both refuse, and both leave the row unwritten** — which is \
              what the `count(*)` two lines down checks.",
+            "pg19_values_catalog_function.txt:76",
         ),
     ],
 };

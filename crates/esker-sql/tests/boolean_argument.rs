@@ -30,6 +30,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          the expression is resolved rather than where a row is evaluated — the path `CASE/WHEN` \
          already takes for every shape whose type is known then, and this is the one that is not. \
          The class, the construct's name and the shape of the sentence all agree.",
+        "pg19_boolean_argument.txt:49",
     )],
 };
 

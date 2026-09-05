@@ -31,12 +31,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              keeping the text, which would also mean the catalog holds a serialised tree; the \
              text is what `pg_get_constraintdef` needs anyway, so the trade was made deliberately \
              (`catalog::CheckDef`). Semantics and values are identical; one string differs.",
+            "UNMEASURED",
         ),
         (
             "SELECT conname FROM pg_constraint WHERE conrelid = 'ck'::regclass ORDER BY conname",
             "The same statement without the `contype` filter, so it also lists the `NOT NULL` and \
              primary-key rows. Those are e2-catalog's and already agree; it is here only because \
              the `CHECK` rows had to join them in one ordering.",
+            "UNMEASURED",
         ),
     ],
 };

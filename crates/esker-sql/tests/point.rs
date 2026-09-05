@@ -44,6 +44,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              pg_typeof(('(1,2)'::point)[0])",
             "a subscript of a point is not an array subscript; the geometric operators are their \
              own unit",
+            "UNMEASURED",
         ),
         // **The two operators a point *does* have.** `=` and `<` do not exist for one — that is
         // the whole shape of this type and the corpus pins both refusals — and what exists instead
@@ -52,6 +53,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '(1,2)'::point ~= '(1,2)'::point, '(1,2)'::point <-> '(4,6)'::point",
             "~= and <-> are the geometric operators, which are their own unit",
+            "UNMEASURED",
         ),
     ],
 };

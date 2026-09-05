@@ -42,16 +42,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', host('192.168.1.5/24'::inet), masklen('192.168.1.5/24'::inet), \
              network('192.168.1.5/24'::inet), broadcast('192.168.1.5/24'::inet)",
             "the network functions are their own unit",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', abbrev('192.168.1.0/24'::cidr), family('192.168.1.1'::inet), \
              family('::1'::inet), text('192.168.1.5/24'::inet)",
             "the network functions are their own unit",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', '192.168.1.5'::inet << '192.168.1.0/24'::inet, '192.168.1.0/24'::inet \
              >> '192.168.1.5'::inet, '192.168.1.5'::inet <<= '192.168.1.5/32'::inet",
             "the containment operators are their own unit",
+            "UNMEASURED",
         ),
         // **Address arithmetic**, which is the same unit seen from the other side: `inet + 1` is
         // the next address and `inet - inet` is a `bigint` count of them. The refusal is the
@@ -60,6 +63,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '192.168.1.1'::inet + 1, '192.168.1.2'::inet - '192.168.1.1'::inet",
             "address arithmetic is part of the network-operator unit",
+            "UNMEASURED",
         ),
     ],
 };

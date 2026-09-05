@@ -35,6 +35,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_typeof(indkey), pg_typeof(indoption) FROM pg_index WHERE indexrelid = \
              'vt_ab'::regclass",
             "int2vector is a type this node does not have; indkey and indoption are text",
+            "UNMEASURED",
         ),
         // `confkey` is NULL on a primary key, and `pg_typeof` here reads the **value** rather than
         // the static type — the standing divergence of that function. `conkey` beside it in the
@@ -44,6 +45,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              'vt_pkey'",
             "pg_typeof reads the value, and confkey is NULL on a constraint that is not a foreign \
              key",
+            "UNMEASURED",
         ),
         // A set-returning function in the **target list** is a different feature from one in
         // `FROM`, which is where `generate_subscripts` is implemented. Both lines below are that
@@ -58,6 +60,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              pg_attribute a ON a.attnum = k.elem AND a.attrelid = 'vt'::regclass ORDER BY idx",
             "a set-returning function in a comma FROM list cannot see the entry to its left \
              (implicit LATERAL)",
+            "UNMEASURED",
         ),
     ],
 };

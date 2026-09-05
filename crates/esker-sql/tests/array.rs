@@ -39,70 +39,87 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT pg_typeof('{1,2}'::int[]), pg_typeof(ARRAY[1,2]), format_type(1007, -1), format_type(1009, -1)",
             "`pg_typeof` is not built. What it would report is asserted directly instead: the four array types' OIDs and names are pinned in `crate::value`'s own tests and in `tests/pg_catalog.rs`, where `ActiveRecord`'s array type-map query now answers with all four.",
+            "pg19_array.txt:73",
         ),
         (
             "SELECT id FROM ar WHERE n @> '{1}' ORDER BY id",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
+            "pg19_array.txt:86",
         ),
         (
             "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
             "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
+            "pg19_array.txt:96",
         ),
         (
             "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
             "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
+            "pg19_array.txt:99",
         ),
         (
             "SELECT array_length('{}'::int[], 1), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality('{}'::int[])",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
+            "pg19_array.txt:118",
         ),
         (
             "SELECT array_dims('{1,2,3}'::int[]), array_dims('{{1,2},{3,4}}'::int[])",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
+            "pg19_array.txt:121",
         ),
         (
             "SELECT cardinality('{1,2,3}'::int[]), cardinality('{{1,2},{3,4}}'::int[]), array_ndims('{1,2,3}'::int[])",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
+            "pg19_array.txt:122",
         ),
         (
             "SELECT ('{1,2,3}'::int[])[1:2]",
             "A **slice** (`a[1:2]`) and a second subscript (`a[1][2]`). One subscript of a one-dimensional array answers now; a slice returns an array, which is the constructor's slice, and `a[1]` of a two-dimensional array is NULL rather than a row — measured, and the line is here so it stays measured.",
+            "pg19_array.txt:124",
         ),
         (
             "SELECT ('{{1,2},{3,4}}'::int[])[1][2], ('{{1,2},{3,4}}'::int[])[1]",
             "A **slice** (`a[1:2]`) and a second subscript (`a[1][2]`). One subscript of a one-dimensional array answers now; a slice returns an array, which is the constructor's slice, and `a[1]` of a two-dimensional array is NULL rather than a row — measured, and the line is here so it stays measured.",
+            "pg19_array.txt:125",
         ),
         (
             "SELECT 1 = ALL('{1,1}'::int[]), 1 = ALL('{1,2}'::int[])",
             "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
+            "pg19_array.txt:133",
         ),
         (
             "SELECT 1 = ANY('{}'::int[]), 1 = ALL('{}'::int[])",
             "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
+            "pg19_array.txt:137",
         ),
         (
             "SELECT '{1,2}'::int[] @> '{1}'::int[], '{1}'::int[] <@ '{1,2}'::int[], '{1,2}'::int[] && '{2,3}'::int[]",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
+            "pg19_array.txt:145",
         ),
         (
             "SELECT '{1,2}'::int[] @> '{}'::int[]",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
+            "pg19_array.txt:146",
         ),
         (
             "SELECT NULL::int[] @> '{1}'::int[]",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
+            "pg19_array.txt:147",
         ),
         (
             "SELECT '{1,2}'::int[] || '{3}'::int[], 3 || '{1,2}'::int[], '{1,2}'::int[] || 3",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
+            "pg19_array.txt:148",
         ),
         (
             "SELECT array_position('{a,b,c}'::text[], 'b'), array_remove('{1,2,1}'::int[], 1)",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
+            "pg19_array.txt:149",
         ),
         (
             "SELECT array_to_string('{1,2,3}'::int[], ','), string_to_array('1,2,3', ',')",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
+            "pg19_array.txt:150",
         ),
         // **`'{a}'::varchar[]` used to be here** and the entry said a fifth array type would be
         // "a variant, a tag and an ordering fixture, added when a schema asks for one". Sixteen

@@ -39,12 +39,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              counted under ADR 0031 (c), and it is the array lane's to close — the rows behind it \
              are all here and agree. `information_schema.key_column_usage` answers the same \
              question in a shape this node has, and unit 4 provides it.",
+            "UNMEASURED",
         ),
         (
             "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
             "`pg_typeof` is a function this node does not have, so the statement is `0A000` \
              naming it rather than answering `int2vector`. What it would have said is the type \
              divergence above, which is declared there.",
+            "UNMEASURED",
         ),
     ],
 };

@@ -33,10 +33,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'a' + 1",
             "**This node's integer constants are `int8` where a real server's are `int4`** — the divergence `tests/unknown_literal.rs` declares — and it is visible here in the type the message names: PostgreSQL resolves the `unknown` beside a constant to `integer` and this node to `bigint`. Same SQLSTATE, same failure, one word apart. The values agree everywhere; only a constant's *width* differs, and closing it means changing what a bare integer is everywhere rather than anything arithmetic does.",
+            "UNMEASURED",
         ),
         (
             "SELECT true + 1",
             "**This node's integer constants are `int8` where a real server's are `int4`** — the divergence `tests/unknown_literal.rs` declares — and it is visible here in the type the message names: PostgreSQL resolves the `unknown` beside a constant to `integer` and this node to `bigint`. Same SQLSTATE, same failure, one word apart. The values agree everywhere; only a constant's *width* differs, and closing it means changing what a bare integer is everywhere rather than anything arithmetic does.",
+            "UNMEASURED",
         ),
     ],
 };

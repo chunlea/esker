@@ -76,6 +76,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              deparsed instead). Closing it means a deparser that reproduces PostgreSQL's own \
              coercion, which is a unit of its own and reaches every stored expression, not just \
              this one. The `name`-versus-`text` column type is the standing catalog choice on top.",
+            "pg19_tsvector.txt:117",
         ),
         // **Two configurations, not thirty-two.** `pg_am`'s own comment states the rule this
         // follows: a row for a configuration nothing can be tokenised with would be a claim
@@ -84,6 +85,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', cfgname, nspname FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace ORDER BY cfgname",
             "this node has the configurations it can tokenise with, which is simple and, once the \
              stemmer lands, english",
+            "pg19_tsvector.txt:52",
         ),
         // One type short of the four: there is no `regconfig` here, because nothing takes a text
         // search configuration as a *value*. The three tsvector rows match exactly — `typtype`,
@@ -94,11 +96,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              operator is `|`, so the expected side parses into three fields where the answer is \
              two. Both print the same characters. Covered by \
              `value::tsquery::tests::the_operators_print_the_way_postgresql_prints_them`",
+            "pg19_tsvector.txt:84",
         ),
         (
             "SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname",
             "no regconfig type: a configuration is named by a string argument here, never held as \
              a value",
+            "pg19_tsvector.txt:53",
         ),
     ],
 };

@@ -29,6 +29,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_get_viewdef('rc_view'::regclass, true)",
             "It answers with the stored text now; what differs is PostgreSQL's layout, one column \
              per line with its own indentation. Declared identically in `tests/view.rs`.",
+            "pg19_rename_column.txt:43",
         ),
         // **Un-swallowed by the line above**, which used to abort the block — the same shape this
         // file already records for `CREATE VIEW` seven lines further up.
@@ -40,6 +41,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              first place. Fixing it means resolving a view's body to ordinals at `CREATE VIEW` \
              time and re-rendering it on demand — the same shape as the row codec's positional \
              columns (ADR 0030), and its own unit.",
+            "pg19_rename_column.txt:45",
         ),
         // **A pre-existing bug this unit made visible, and not a view divergence.** `CREATE VIEW`
         // used to abort the transaction seven lines above, so everything after it was swallowed
@@ -52,6 +54,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              also moves it in a `conname` ordering. A constraint's name is a name a user chose or \
              the server generated *once* — it is not a function of the column, and renaming it is a \
              second rename nobody asked for. Reproduced with no view in the statement.",
+            "pg19_rename_column.txt:41",
         ),
     ],
 };

@@ -54,12 +54,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
             "a bare integer constant is int8 here and int4 there, and pg_typeof answers text",
+            "UNMEASURED",
         ),
         // The same divergence for the other constant: a decimal constant is `double precision`
         // here and `numeric` there, which `Literal::Decimal` already chooses everywhere else.
         (
             "SELECT 'r', pg_typeof(column1) FROM (VALUES (1.5)) AS t LIMIT 1",
             "a decimal constant is double precision here and numeric there",
+            "UNMEASURED",
         ),
         // The rule is right and the type in the message is the constant-width divergence: the
         // second row is read as the first row's type and fails to parse as it, which is the whole
@@ -67,6 +69,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "VALUES (1),('a')",
             "the type named in the message is bigint here and integer there",
+            "UNMEASURED",
         ),
         // **Not a `VALUES` gap.** A comma-separated `FROM` list is refused for every relation in
         // this crate; the `CROSS JOIN` spelling of this same statement is the line above it and it
@@ -74,6 +77,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)",
             "a comma-separated FROM list is refused for every relation, not only for VALUES",
+            "UNMEASURED",
         ),
     ],
 };

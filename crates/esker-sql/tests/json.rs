@@ -100,133 +100,202 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      this reason also covered now agree: `::text` landed with the json unit and `::numeric` \
      with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
-const ANSWERS: &[(&str, &str)] = &[
+const ANSWERS: &[(&str, &str, &str)] = &[
     (
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE \
              typname IN ('json','jsonb') ORDER BY oid",
         CATALOG,
+        "pg19_json.txt:59",
     ),
     (
         "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
              format_type(3802, -1)",
         CATALOG,
+        "pg19_json.txt:60",
     ),
-    ("SELECT id, b FROM js ORDER BY b", ORDER),
-    ("SELECT id FROM js WHERE b @> '{\"a\":2}'", CONTAINMENT),
-    ("SELECT '{bad}'::json", MESSAGES),
-    ("SELECT ''::json", MESSAGES),
-    ("SELECT '{bad}'::jsonb", MESSAGES),
-    ("SELECT '\"\\u0000\"'::jsonb", MESSAGES),
-    ("SELECT ('\"\\u0000\"'::json)::jsonb", MESSAGES),
-    ("SELECT '{\"a\":1}'::json = '{\"a\":1}'::json", COMPARISON),
-    ("SELECT '{\"a\":1}'::json = '{\"a\":1}'::jsonb", COMPARISON),
+    ("SELECT id, b FROM js ORDER BY b", ORDER, "pg19_json.txt:69"),
+    (
+        "SELECT id FROM js WHERE b @> '{\"a\":2}'",
+        CONTAINMENT,
+        "pg19_json.txt:72",
+    ),
+    ("SELECT '{bad}'::json", MESSAGES, "pg19_json.txt:90"),
+    ("SELECT ''::json", MESSAGES, "pg19_json.txt:91"),
+    ("SELECT '{bad}'::jsonb", MESSAGES, "pg19_json.txt:92"),
+    ("SELECT '\"\\u0000\"'::jsonb", MESSAGES, "pg19_json.txt:96"),
+    (
+        "SELECT ('\"\\u0000\"'::json)::jsonb",
+        MESSAGES,
+        "pg19_json.txt:97",
+    ),
+    (
+        "SELECT '{\"a\":1}'::json = '{\"a\":1}'::json",
+        COMPARISON,
+        "pg19_concat.txt:42",
+    ),
+    (
+        "SELECT '{\"a\":1}'::json = '{\"a\":1}'::jsonb",
+        COMPARISON,
+        "pg19_json.txt:99",
+    ),
     (
         "SELECT '{\"a\":1}'::jsonb = '{\"a\": 1}'::jsonb",
         COMPARISON,
+        "pg19_json.txt:100",
     ),
-    ("SELECT '1.0'::jsonb = '1.00'::jsonb", COMPARISON),
+    (
+        "SELECT '1.0'::jsonb = '1.00'::jsonb",
+        COMPARISON,
+        "pg19_json.txt:101",
+    ),
     (
         "SELECT '{\"a\":1}'::jsonb = '{\"a\":1.0}'::jsonb",
         COMPARISON,
+        "pg19_json.txt:102",
     ),
     (
         "SELECT '{\"a\":1}'::jsonb <> '{\"a\":2}'::jsonb",
         COMPARISON,
+        "pg19_json.txt:103",
     ),
-    ("SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb", COMPARISON),
+    (
+        "SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb",
+        COMPARISON,
+        "pg19_json.txt:104",
+    ),
     (
         "SELECT 'true'::jsonb > '1'::jsonb, '\"s\"'::jsonb > '1'::jsonb, '[]'::jsonb \
              > '{}'::jsonb",
         COMPARISON,
+        "pg19_json.txt:105",
     ),
     (
         "SELECT '{\"a\":1}'::json -> 'a', '{\"a\":1}'::json ->> 'a'",
         OPERATORS,
+        "pg19_json.txt:106",
     ),
     (
         "SELECT '{\"a\":1}'::jsonb -> 'a', '{\"a\":1}'::jsonb ->> 'a'",
         OPERATORS,
+        "pg19_json.txt:107",
     ),
     (
         "SELECT '{\"a\":1}'::jsonb -> 'z', '{\"a\":1}'::jsonb ->> 'z'",
         OPERATORS,
+        "pg19_json.txt:108",
     ),
     (
         "SELECT '{\"a\":null}'::jsonb ->> 'a', '{\"a\":null}'::jsonb -> 'a'",
         OPERATORS,
+        "pg19_json.txt:109",
     ),
     (
         "SELECT ('{\"a\":null}'::jsonb -> 'a') IS NULL, ('{\"a\":null}'::jsonb ->> \
              'a') IS NULL",
         OPERATORS,
+        "pg19_json.txt:110",
     ),
     (
         "SELECT '[1,2,3]'::json -> 0, '[1,2,3]'::json ->> 0, '[1,2,3]'::json -> -1",
         OPERATORS,
+        "pg19_json.txt:111",
     ),
-    ("SELECT '[1,2,3]'::jsonb -> 5", OPERATORS),
-    ("SELECT '{\"a\":1}'::jsonb -> 0", OPERATORS),
-    ("SELECT '[1,2]'::jsonb -> 'a'", OPERATORS),
+    (
+        "SELECT '[1,2,3]'::jsonb -> 5",
+        OPERATORS,
+        "pg19_json.txt:112",
+    ),
+    (
+        "SELECT '{\"a\":1}'::jsonb -> 0",
+        OPERATORS,
+        "pg19_json.txt:113",
+    ),
+    (
+        "SELECT '[1,2]'::jsonb -> 'a'",
+        OPERATORS,
+        "pg19_json.txt:114",
+    ),
     (
         "SELECT '{\"a\":{\"b\":2}}'::json #> '{a,b}', '{\"a\":{\"b\":2}}'::json #>> \
              '{a,b}'",
         OPERATORS,
+        "pg19_json.txt:115",
     ),
     (
         "SELECT '{\"a\":1,\"b\":2}'::jsonb @> '{\"a\":1}'::jsonb, '{\"a\":1}'::jsonb \
              <@ '{\"a\":1,\"b\":2}'::jsonb",
         CONTAINMENT,
+        "pg19_json.txt:116",
     ),
     (
         "SELECT '{\"a\":1,\"b\":2}'::json @> '{\"a\":1}'::json",
         CONTAINMENT,
+        "pg19_json.txt:117",
     ),
-    ("SELECT '{\"a\":1}'::jsonb ? 'a'", CONTAINMENT),
+    (
+        "SELECT '{\"a\":1}'::jsonb ? 'a'",
+        CONTAINMENT,
+        "pg19_json.txt:118",
+    ),
     (
         "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb, '{\"a\":1,\"b\":2}'::jsonb \
              - 'a'",
         CONTAINMENT,
+        "pg19_json.txt:119",
     ),
-    ("SELECT '{\"a\":1}'::jsonb #- '{a}'", CONTAINMENT),
+    (
+        "SELECT '{\"a\":1}'::jsonb #- '{a}'",
+        CONTAINMENT,
+        "pg19_json.txt:121",
+    ),
     (
         "SELECT json_typeof('1'::json), jsonb_typeof('\"s\"'::jsonb), \
              jsonb_typeof('null'::jsonb)",
         FUNCTIONS,
+        "pg19_json.txt:122",
     ),
     (
         "SELECT jsonb_typeof('[]'::jsonb), jsonb_typeof('{}'::jsonb), \
              jsonb_typeof('1.0'::jsonb)",
         FUNCTIONS,
+        "pg19_json.txt:123",
     ),
     (
         "SELECT jsonb_array_length('[1,2,3]'::jsonb), \
              json_array_length('[1,2,3]'::json)",
         FUNCTIONS,
+        "pg19_json.txt:124",
     ),
     (
         "SELECT jsonb_object_keys('{\"b\":1,\"a\":2}'::jsonb)",
         FUNCTIONS,
+        "pg19_json.txt:125",
     ),
     (
         "SELECT jsonb_strip_nulls('{\"a\":null,\"b\":1}'::jsonb)",
         FUNCTIONS,
+        "pg19_json.txt:126",
     ),
     (
         "SELECT jsonb_build_object('b',1,'a',2), jsonb_build_array(1,'x')",
         FUNCTIONS,
+        "pg19_json.txt:127",
     ),
     (
         "SELECT to_jsonb('1 day'::interval), to_json('2020-01-01'::date)",
         FUNCTIONS,
+        "pg19_json.txt:128",
     ),
     (
         "SELECT json_agg(x), jsonb_agg(x) FROM (VALUES (1), (2)) v(x)",
         FUNCTIONS,
+        "pg19_json.txt:129",
     ),
-    ("SELECT '{\"a\":1}'::jsonb::int", CASTS),
+    ("SELECT '{\"a\":1}'::jsonb::int", CASTS, "pg19_json.txt:134"),
     (
         "SELECT NULL::jsonb IS NULL, '{\"a\":1}'::jsonb = NULL",
         COMPARISON,
+        "pg19_json.txt:137",
     ),
 ];
 

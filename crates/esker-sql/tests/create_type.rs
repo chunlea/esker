@@ -25,6 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "CREATE TYPE badrange AS RANGE ( subtype = nosuchtype )",
             "an unknown type name is 0A000 here and 42704 there, everywhere a type is named",
+            "pg19_create_type.txt:87",
         ),
     ],
 };

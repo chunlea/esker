@@ -42,6 +42,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              refusal lands one step earlier, at the language, with `42704`.\n\nA node that \
              answered `58P01` would be claiming to have looked for a file, which is a worse lie \
              than refusing the language it cannot load.",
+            "pg19_function_language.txt:27",
         ),
         (
             "CREATE OR REPLACE FUNCTION fl_plain(a integer) RETURNS integer AS $$ SELECT a + 1 $$ LANGUAGE SQL",
@@ -50,6 +51,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `uuid_test.rb`'s function takes none. Its own unit, and the same one that would give \
              a body an evaluator — a parameter list is only worth reading by something that can \
              use it.",
+            "pg19_function_language.txt:19",
         ),
     ],
 };

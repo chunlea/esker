@@ -48,6 +48,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          corpus. A client comparing an `enumsortorder` against a remembered number would see the \
          difference, and nothing in `ActiveRecord` does: it sorts inside `array_agg` and never \
          reads the value.",
+        "pg19_alter_type.txt:6",
     )],
 };
 

@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = '\"d\"'::regclass",
             "PostgreSQL deparses the coercion it inserted; this node prints the cast as written",
+            "UNMEASURED",
         ),
         // **A user type's oid is this node's own number**, which is the standing trade every
         // relation id makes: PostgreSQL puts everything a user creates above 16383 and this
@@ -48,6 +49,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', 'schema_9.text'::regtype::oid > 16383",
             "a user type's oid is a relation id here, and relation ids start at 1",
+            "UNMEASURED",
         ),
     ],
 };

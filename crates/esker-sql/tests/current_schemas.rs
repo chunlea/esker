@@ -40,10 +40,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT current_schemas(false)",
             "The first read agrees exactly but for `name[]` against `text`. The second follows a \
              `SET search_path` this node refuses, so it answers for the path that is still set.",
+            "pg19_current_schemas.txt:50",
         ),
         (
             "SELECT current_schemas(true)",
             "The same, for the form that also lists `pg_catalog`.",
+            "pg19_current_schemas.txt:51",
         ),
         (
             "SELECT current_schemas(NULL)",
@@ -51,29 +53,35 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              array. This node names it instead, because the argument is neither `true` nor \
              `false` and an array it cannot represent is not worth a third answer. It closes with \
              stored arrays.",
+            "pg19_current_schemas.txt:65",
         ),
         (
             "SELECT pg_typeof(current_schemas(false)), pg_typeof(current_schema)",
             "`pg_typeof` is not implemented, `0A000` naming it.",
+            "pg19_current_schemas.txt:54",
         ),
         (
             "SELECT current_catalog, current_database()",
             "The database's own name, which this node does not model: it serves one database and \
              has no name for it. A session-identity unit, not this one.",
+            "pg19_current_schemas.txt:55",
         ),
         (
             "SELECT current_user, session_user, user",
             "The same — there are no roles here, which is already the declared divergence behind \
              `pg_catalog`'s `42501`.",
+            "pg19_current_schemas.txt:56",
         ),
         (
             "SELECT version() IS NOT NULL",
             "`version()` is not implemented. It is the one line here a client actually reads, and \
              it belongs with the session-identity unit beside `current_user`.",
+            "pg19_current_schemas.txt:57",
         ),
         (
             "SELECT unnest(current_schemas(true))",
             "`unnest` likewise, and it is set-returning, which is a second feature again.",
+            "pg19_current_schemas.txt:63",
         ),
     ],
 };

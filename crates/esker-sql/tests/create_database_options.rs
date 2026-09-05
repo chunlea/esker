@@ -27,6 +27,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the template's — to two different templates. The refusal returns the moment the \
              collation asked for is not the one this node has, which is the line below it here \
              and the `LC_COLLATE = 'en_US.utf8'` case in `tests/database.rs`.",
+            "UNMEASURED",
         ),
         (
             "CREATE DATABASE vlcapE7 ENCODING = 'SQL_ASCII'",
@@ -38,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              answered is the encoding by name. `SQL_ASCII` is on PostgreSQL's list of encodings, \
              which is why it is this rather than the `42704` a name nobody has would get — the \
              line above measures that half and agrees.",
+            "UNMEASURED",
         ),
         (
             "SELECT count(*) FROM pg_database WHERE datname LIKE 'vlca%' OR datname LIKE 'vlq%'",
@@ -46,6 +48,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the oracle never made. `vlcapE2` is that database, and it is the one this count is \
              over. It is deleted when the collation rule above stops depending on the container's \
              locale — which is to say when the corpus is recaptured on a `C` cluster.",
+            "UNMEASURED",
         ),
     ],
 };

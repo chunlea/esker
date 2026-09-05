@@ -45,6 +45,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `btree_gist`. This node names the *operator*, because `&&` over a range is the only \
              exclusion it enforces and the refusal is raised where the constraint is read, before \
              any column type is in reach. Same outcome, different half of the sentence.",
+            "UNMEASURED",
         ),
         // **`daterange` as a column type was the last of three here and it is gone.** Two went
         // when ADR 0050's `user_type_name` moved the "no such type" refusal from *lowering* to the

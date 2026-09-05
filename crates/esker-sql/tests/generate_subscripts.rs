@@ -25,14 +25,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'g', generate_subscripts('{a,b,c}'::text[])",
             "**A set-returning function in the SELECT list**, which is a second mechanism and not this one: there it multiplies the rows of the query it is written in, and two of them run in lockstep rather than as a cross product (line 68: the shorter is padded with NULL, not cycled). This node has the `FROM` form, which is what the schema dump and boot statements 35 and 36 use; the target-list form is refused by name and counted here. Its two `42883`s (lines 69 and 70) carry the same refusal for the same reason — the arity and argument types are checked by the `FROM` path, which these never reach.",
+            "pg19_generate_subscripts.txt:69",
         ),
         (
             "SELECT 'g', generate_subscripts(1, 1)",
             "**A set-returning function in the SELECT list**, which is a second mechanism and not this one: there it multiplies the rows of the query it is written in, and two of them run in lockstep rather than as a cross product (line 68: the shorter is padded with NULL, not cycled). This node has the `FROM` form, which is what the schema dump and boot statements 35 and 36 use; the target-list form is refused by name and counted here. Its two `42883`s (lines 69 and 70) carry the same refusal for the same reason — the arity and argument types are checked by the `FROM` path, which these never reach.",
+            "pg19_generate_subscripts.txt:70",
         ),
         (
             "SELECT pg_typeof(generate_subscripts('{a}'::text[], 1))",
             "`pg_typeof` is not built. It would answer `integer` here — the function's rows are `int4`, which the `FROM` form already reports — but the function itself is a separate unit and is refused by name rather than special-cased for one argument.",
+            "pg19_generate_subscripts.txt:62",
         ),
     ],
 };

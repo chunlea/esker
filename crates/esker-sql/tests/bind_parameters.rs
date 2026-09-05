@@ -16,10 +16,12 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              it is substituted, which happens later. Making `$n::T` work means carrying the type \
              on the parameter so the inference reads it, and nothing `ActiveRecord` sends writes \
              one: the adapter emits `$1` bare and lets the column decide",
+            "pg19_bind_parameters.txt:67",
         ),
         (
             "SELECT pg_typeof($1::int8)",
             "The same cast, and the same unit",
+            "pg19_bind_parameters.txt:79",
         ),
         // **An entry stood here and is deleted** (ADR 0031, rule 2): `IS NOT DISTINCT FROM` was
         // an operator this node did not have. It arrived with the `upsert_all` template that
@@ -35,6 +37,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              list resolves to `text` and works, two lines above. Answering `text` here is the \
              fallback being applied where a real server refuses; closing it needs a function \
              signature table, not a parameter rule",
+            "pg19_bind_parameters.txt:78",
         ),
     ],
 };

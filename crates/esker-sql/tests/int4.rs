@@ -30,6 +30,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          because it is the evidence that `int4` and `int8` compare — a real server has an \
          `integer = bigint` operator and answers this with the row. `the_two_integer_widths_compare` \
          asserts the same thing in a shape this node can write, over two columns rather than a cast.",
+        "UNMEASURED",
     )],
 };
 

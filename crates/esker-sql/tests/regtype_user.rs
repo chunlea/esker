@@ -25,6 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof('mood'::regtype), pg_typeof('mood'::regtype::oid)",
             "a regtype is text here; the ::oid half is a real oid and agrees",
+            "UNMEASURED",
         ),
         // The comparison half of the same fact. It is also `pg19_do_create_enum.txt`'s swallowed
         // statement, which is on `SWALLOWING_DEBT` as g1's.
@@ -32,6 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY \
              enumsortorder",
             "a regtype in a comparison wants the oid and the position cannot say so",
+            "pg19_do_block.txt:51",
         ),
     ],
 };

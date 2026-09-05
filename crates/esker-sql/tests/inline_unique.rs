@@ -30,6 +30,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              NULLS NOT DISTINCT on a column`. The table-constraint form — which is what \
              `ActiveRecord` writes, and what statement 779 uses — parses and runs, and the two \
              build the same index.",
+            "UNMEASURED",
         ),
         (
             "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
@@ -38,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              would show — `UNIQUE NULLS NOT DISTINCT (a)`, with the clause **before** the column \
              list — is checked on the table-constraint form instead, which reaches it by the \
              same code.",
+            "UNMEASURED",
         ),
         (
             "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
@@ -46,6 +48,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              because it is what `condeferred` being `t` looks like — the only row in this file \
              where it is not `f`, and the fact that makes the refusal above necessary rather than \
              conservative.",
+            "UNMEASURED",
         ),
     ],
 };

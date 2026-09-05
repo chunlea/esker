@@ -35,6 +35,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "empty, and it follows from the `CREATE VIEW` element below: the statement that would \
              have built `a`, `b` and `v` is the one this node answers `42601` to, so the schema \
              has no relations to report",
+            "pg19_create_schema_elements.txt:67",
         ),
         (
             "CREATE SCHEMA se_bad CREATE TABLE t (i nosuchtype)",
@@ -43,11 +44,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              atomicity the corpus is testing holds; the *code* differs because the element path \
              reaches the unknown name through lowering rather than through the catalog. A gap in \
              the message, recorded rather than papered over",
+            "pg19_create_schema_elements.txt:78",
         ),
         (
             "SELECT 'r', pg_typeof(current_schema()), pg_typeof(nspname) FROM pg_namespace LIMIT 1",
             "`text` where a real server says `name`: this node has no `name` type, which is the \
              standing choice every catalog column here makes",
+            "pg19_create_schema_elements.txt:97",
         ),
         (
             "CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one",
@@ -58,6 +61,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the elements this node **does** have: a `CREATE SEQUENCE` would land in `public` \
              where a real server puts it in the schema, which is a wrong answer rather than a gap. \
              `TABLE`, `INDEX` and `SEQUENCE` elements are qualified and run",
+            "pg19_create_schema_elements.txt:66",
         ),
     ],
 };

@@ -33,6 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              one fact: a `name` cannot be *reported* and cannot be *cast to*. It compares \
              identically, which is why the row this line asks for is right on both sides and only \
              the cast is refused. A type-surface item, not a database one.",
+        "pg19_two_database_dogs.txt:76",
     )],
 };
 

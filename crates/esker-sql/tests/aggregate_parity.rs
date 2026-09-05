@@ -55,7 +55,7 @@ const TYPE_DIVERGENCES: &[&str] = &[
 /// A `0A000` here is contract C2 working — the construct is named rather than approximated — and
 /// the two that are *not* `0A000` are the ones to read: `sum` overflowing, which is the visible
 /// edge of ADR 0031, and the group order, which PostgreSQL does not promise and this node does.
-const DIVERGENCES: &[(&str, &str)] = &[
+const DIVERGENCES: &[(&str, &str, &str)] = &[
     // ADR 0031, and the whole of what an int8 sum costs.
     // avg over an integer column: numeric with sixteen fractional digits, which no float8 renders.
     // The group order, which is a promise PostgreSQL does not make and this node does.
@@ -63,45 +63,58 @@ const DIVERGENCES: &[(&str, &str)] = &[
         "SELECT g, count(*) FROM agg GROUP BY g",
         "with no ORDER BY, PostgreSQL returns groups in hash order and this node returns them in \
          pg_cmp order of the key — deterministic, and a superset of what PostgreSQL guarantees",
+        "UNMEASURED",
     ),
     (
         "SELECT count(*) FROM agg GROUP BY g LIMIT 1",
         "the same: with no ORDER BY, which group is first is PostgreSQL's hash order and ours is \
          the smallest key",
+        "UNMEASURED",
     ),
     // Contract C2: parsed, named, not executed. Each is a unit of its own or explicitly out of
     // scope in `docs/plans/phase-9-rails.md` §5.
     (
         "SELECT g, count(*) FROM agg GROUP BY GROUPING SETS ((g), ())",
         "GROUP BY GROUPING SETS",
+        "UNMEASURED",
     ),
     (
         "SELECT count(*) FILTER (WHERE n > 0) FROM agg",
         "an aggregate FILTER clause",
+        "UNMEASURED",
     ),
-    ("SELECT count(*) OVER () FROM agg", "a window function"),
+    (
+        "SELECT count(*) OVER () FROM agg",
+        "a window function",
+        "UNMEASURED",
+    ),
     (
         "SELECT count(*) FROM wide GROUP BY 'x'",
         "a non-integer constant in GROUP BY is 42601 there and an ordinary one-group key here",
+        "UNMEASURED",
     ),
     (
         "SELECT bool_and(b), bool_or(b) FROM agg",
         "bool_and and bool_or are not among the five aggregates",
+        "UNMEASURED",
     ),
     (
         "SELECT string_agg(g, ',') FROM agg",
         "string_agg is not among the five aggregates",
+        "UNMEASURED",
     ),
-    ("SELECT count(*) + 1 FROM agg", "arithmetic"),
-    ("SELECT sum(n) + 0 FROM agg", "arithmetic"),
+    ("SELECT count(*) + 1 FROM agg", "arithmetic", "UNMEASURED"),
+    ("SELECT sum(n) + 0 FROM agg", "arithmetic", "UNMEASURED"),
     (
         "SELECT DISTINCT ON (g) g, n FROM agg ORDER BY g, n",
         "SELECT DISTINCT ON",
+        "UNMEASURED",
     ),
     (
         "SELECT pg_typeof(count(*)), pg_typeof(sum(n)), pg_typeof(avg(n)), pg_typeof(sum(f)), \
          pg_typeof(avg(f)) FROM agg",
         "pg_typeof, which needs the catalog unit",
+        "UNMEASURED",
     ),
 ];
 

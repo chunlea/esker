@@ -25,6 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "ALTER TABLE uoe ADD CONSTRAINT uoe_a_pk PRIMARY KEY (a);",
         "`0A000` naming the construct: adding a `PRIMARY KEY` by `ALTER TABLE` is not implemented, \
          so this node never reaches the `42P16` about the one the table already has.",
+        "pg19_unique_over_existing_rows.txt:53",
     )],
 };
 

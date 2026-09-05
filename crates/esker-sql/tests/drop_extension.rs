@@ -37,12 +37,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('hstore','citext','ltree','postgres_fdw') ORDER BY name",
             "Three rows here rather than four: `postgres_fdw` is not on the allowlist, so it is \
              not available and the view does not claim it is.",
+            "pg19_extensions.txt:62",
         ),
         (
             "CREATE EXTENSION IF NOT EXISTS \"postgres_fdw\"",
             "`0A000 extension \"postgres_fdw\" is not available`, with PostgreSQL's own HINT — \
              the answer a real server gives for an extension its *system* does not have, which is \
              exactly this node's position.",
+            "pg19_extensions.txt:77",
         ),
         // A C1 gap rather than a refusal: `sqlparser` 0.62.0 cannot read the clause at all, so
         // this is `42601` where a real server runs the statement. The lowering already refuses
@@ -52,6 +54,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`42601` from `sqlparser`, which stops at `SCHEMA`. This node has one schema per \
              tenant, so the clause is refused by name in `parse::lower` once a parser can reach \
              it — a C1 gap in the parser rather than a C2 refusal of ours.",
+            "pg19_extensions.txt:86",
         ),
     ],
 };

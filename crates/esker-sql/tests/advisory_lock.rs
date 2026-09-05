@@ -31,6 +31,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              locktype = 'advisory'",
             "`42P01`: this node has no `pg_locks`. The lock is held — the line before this one \
              says so — and there is nothing here that reports it.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', (classid::bigint << 32) | objid::bigint AS lock_id FROM pg_locks WHERE \
@@ -38,28 +39,34 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "The same. `advisory::Key` packs and splits on exactly this expression and its own \
              test pins it against the same literal the suite uses, so what is untested here is \
              the view and not the arithmetic.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'",
             "The same, four times over — the corpus counts the locks after each step.",
+            "pg19_advisory_lock.txt:33",
         ),
         (
             "SELECT 'r', classid, objid, objsubid FROM pg_locks WHERE locktype = 'advisory'",
             "The same. `objsubid` 1 against 2 is what tells the two key spaces apart, and \
              `advisory::Space` carries it for when the view exists.",
+            "pg19_advisory_lock.txt:48",
         ),
         (
             "SELECT 'r', objsubid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objsubid",
             "The same.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', mode FROM pg_locks WHERE locktype = 'advisory'",
             "The same.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', objid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objid",
             "The same — and this is the line that proves a session lock survives `ROLLBACK`, \
              which `a_session_lock_outlives_the_transaction_that_took_it` asserts instead.",
+            "UNMEASURED",
         ),
         // **`pg_advisory_unlock_all()` needs a `void`**, which this node has no type for: every
         // function here answers a value. `ActiveRecord` never calls it — the migrator unlocks the
@@ -70,10 +77,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_advisory_unlock_all() IS NULL",
             "`0A000` naming the function: it returns `void` and this node has no such type. The \
              session-end release it exists for is done by the connection instead.",
+            "pg19_advisory_lock.txt:79",
         ),
         (
             "SELECT 'r', pg_typeof(pg_advisory_unlock_all())::text",
             "The same refusal, and the line that says why: the answer is `void`.",
+            "UNMEASURED",
         ),
     ],
 };

@@ -40,6 +40,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the definition agrees and its *formatting* does not. Reproducing `pg_get_viewdef`'s \
              layout is a pretty-printer for the whole expression language — a unit of its own, and \
              one that buys formatting rather than meaning.",
+            "pg19_view.txt:44",
         ),
         (
             r#"SELECT 'r', pg_get_viewdef('"ebooks''"'::regclass, true)"#,
@@ -50,6 +51,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              not compare equal. That is true of the *formatting* either way; what refusing added \
              was an error where PostgreSQL has a value, which aborted the block and hid every \
              statement after it. Two of those are now measured and one was a real gap.",
+            "pg19_view.txt:45",
         ),
         // **Un-swallowed by the line above.** `information_schema.views` did not exist, so the
         // statement before this one aborted the transaction and this was never compared. It is a
@@ -61,6 +63,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`42P01`: writing **through** a view is its own feature. `is_updatable` now answers \
              `YES` for this view, which is the right answer about the *query* — PostgreSQL would \
              accept the insert and this node does not. Its own unit; the read side is complete.",
+            "pg19_view.txt:58",
         ),
     ],
 };

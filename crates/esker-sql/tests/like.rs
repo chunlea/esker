@@ -17,6 +17,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          `bigint ~~ unknown` here, because an unsuffixed integer literal is an `int4` on a real \
          server and an `int8` on this one. The standing literal-width divergence, not a `LIKE` \
          one — the operator, the code, the DETAIL and the HINT all agree.",
+        "UNMEASURED",
     )],
 };
 

@@ -39,7 +39,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          `WHERE enumtypid = 'mood'::regtype`: the oid form is chosen when `::oid` is written, and a \
          comparison is a position that wants the oid without saying so. Deciding it from the \
          column being compared against is its own unit and would close both.",
-    )],
+
+"pg19_domain_schema.txt:33",
+)],
 };
 
 #[test]

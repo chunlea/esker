@@ -28,6 +28,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              columns are the parent's, with their types and their `NOT NULL` — is asserted \
              directly in the test below, and the plain `attname` form of the same query agrees \
              two lines further down.",
+            "UNMEASURED",
         ),
         (
             "SELECT tag FROM ONLY ip ORDER BY tag",
@@ -40,6 +41,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              them, and nothing would report it. Registered in the plan's C1 register with \
              `GENERATED … VIRTUAL` and `DROP INDEX CONCURRENTLY`; the fix is the same rewrite \
              mechanism `CONCURRENTLY` already uses.",
+            "UNMEASURED",
         ),
     ],
 };

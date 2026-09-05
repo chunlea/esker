@@ -19,6 +19,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              it**: every one of the 39 tests writes the one-column form, which is the line above \
              this one and passes. It is in the capture because it is legal, not because it is \
              used",
+            "pg19_write_in_subquery.txt:67",
         ),
         // **Two entries left here in the same round, from two lanes.** The `UPDATE … FROM` with
         // a self-alias landed on `main` (`tests/update_from.rs`), and
@@ -35,6 +36,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
         (
             "SELECT count(*) FROM vl_comments",
             "A follow-on of the row constructor above: the `DELETE` it names removed a comment              there and none here",
+            "pg19_write_in_subquery.txt:66",
         ),
         (
             "SELECT id, body FROM vl_comments ORDER BY id",
@@ -43,6 +45,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
              answers with one row too many. The `UPDATE … FROM` this file used to declare landed \
              (`tests/update_from.rs`) and both sides set `body` to `joined`, which is why the \
              values agree and only the count does not",
+            "pg19_write_in_subquery.txt:70",
         ),
     ],
 };

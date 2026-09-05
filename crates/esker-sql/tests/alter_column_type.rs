@@ -38,6 +38,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "`0A000` naming the expression: a `USING` that computes rather than converts needs a \
              per-row evaluator this node does not have, and ignoring it would silently store a \
              different value in every row.",
+        "pg19_alter_column_type.txt:120",
     )],
 };
 
