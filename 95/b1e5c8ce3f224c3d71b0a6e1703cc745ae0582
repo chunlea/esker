@@ -1,0 +1,19 @@
+crates/esker-sql/tests/real_backend.rs
+  s_609bbbdbf3c419::t_196a491cc14d7a 752-764
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "95b1e5c8ce3f224c3d71b0a6e1703cc745ae0582",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
