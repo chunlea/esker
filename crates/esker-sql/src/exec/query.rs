@@ -570,7 +570,16 @@ pub(super) struct LockTarget {
 /// is not changing still have to be written back, and the index entries it is replacing were built
 /// from the old ones.
 pub(super) fn matching_rows(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
-    matching_rows_as(filter, tenant, table, table.name.clone())
+    // The implicit alias, which is the bare relation name — `UPDATE s1.things SET … WHERE
+    // things.id = 1` is a statement a real server takes. This is the `UPDATE`/`DELETE` half of
+    // `plan::TableRef::referred_as`; the aliased case comes through `matching_rows_as` and is
+    // already the alias.
+    matching_rows_as(
+        filter,
+        tenant,
+        table,
+        crate::catalog::split_qualified(&table.name).1.to_owned(),
+    )
 }
 
 /// The same, under the name the statement refers to the table by.
