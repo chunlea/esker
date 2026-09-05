@@ -4812,10 +4812,20 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             texts.push(Some(text.clone()));
             continue;
         }
+        // **Not a constant, so the whole constructor becomes a runtime one.** `ARRAY[casttarget]`
+        // is what `ActiveRecord`'s case-insensitivity probe sends, and an element that is a column
+        // has no value until there is a row — so the elements are lowered as expressions and the
+        // element type is settled where a scope exists (`exec::query::resolve`). Everything
+        // already folded above is discarded rather than mixed in: one constructor is built one
+        // way, and a half-folded one would have two rules for what its type is.
         let Expr::Value(value) = strip_nesting(expr) else {
-            return Err(SqlError::unsupported(
-                "an ARRAY constructor over anything but constants",
-            ));
+            return Ok(plan::Expr::Array {
+                elements: elements
+                    .iter()
+                    .map(lower_expr)
+                    .collect::<Result<Vec<_>>>()?,
+                element: None,
+            });
         };
         // The widest element type wins, in PostgreSQL's own order: a string makes the whole array
         // `text`, a decimal makes it `numeric`, and integers alone leave it an integer array.

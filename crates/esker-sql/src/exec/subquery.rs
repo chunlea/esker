@@ -687,6 +687,11 @@ fn substitute_outer(node: &mut Node, outer: &[Datum], depth: usize) {
 
 fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                substitute_in_expr(element, outer, depth);
+            }
+        }
         Expr::Outer { level, at, .. } if *level == depth => {
             *expr = Expr::Literal(match outer.get(*at) {
                 // A NULL has no type to carry and needs none: every comparison with one is NULL.
@@ -1185,6 +1190,11 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
 pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                walk(element, visit);
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk(left, visit);
             walk(right, visit);
@@ -1280,6 +1290,11 @@ pub(super) fn walk_mut(
     visit: &mut impl FnMut(&mut Expr) -> Result<()>,
 ) -> Result<()> {
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                walk_mut(element, visit)?;
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk_mut(left, visit)?;
             walk_mut(right, visit)?;

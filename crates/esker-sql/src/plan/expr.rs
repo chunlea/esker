@@ -150,6 +150,24 @@ pub enum Expr {
         /// `1 = ANY(NULL::int[])` is NULL where `1 = ANY('{}')` is false.
         array: Box<Expr>,
     },
+    /// `ARRAY[a, b, …]` whose elements are not all constants, so it is built per row.
+    ///
+    /// **A constructor over constants never reaches here**: it folds to a `Datum::Array` at
+    /// lowering, which is where the element type is settled from what was written
+    /// (`lower_array_constructor`). This is the other case — `ARRAY[casttarget]`, which
+    /// `ActiveRecord`'s case-insensitivity probe sends — where an element is a column and the
+    /// value cannot exist until there is a row.
+    ///
+    /// The element type is settled at **resolution**, from the resolved elements, and carried here
+    /// so a client is told the column's type before any row is read. `None` until then, which is a
+    /// state and not a default: an unresolved constructor has no type yet, and guessing one would
+    /// make the DDL path disagree with the `SELECT` path the way `Arithmetic::ty` documents.
+    Array {
+        /// The elements, in order, each evaluated per row.
+        elements: Vec<Expr>,
+        /// The element type, once a scope has settled it.
+        element: Option<ColumnType>,
+    },
     /// `a[i]` — one element of an array, by **absolute** subscript.
     ///
     /// Not an offset: it follows the array's own lower bound, so `indkey[0]` is an index's first
@@ -2245,6 +2263,7 @@ pub fn regex_operator(negated: bool, case_insensitive: bool) -> &'static str {
 fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::ToText { .. } => "a cast to text",
+        Expr::Array { .. } => "an ARRAY constructor",
         Expr::Scalar { func, .. } => func.name(),
         Expr::Literal(_) => "a literal",
         Expr::Parameter(_) => "a parameter",

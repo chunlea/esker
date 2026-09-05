@@ -4857,6 +4857,12 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             .get(*at)
             .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        Expr::Array { elements, .. } => {
+            format!(
+                "ARRAY[{}]",
+                elements.iter().map(sub).collect::<Vec<_>>().join(", ")
+            )
+        }
         Expr::Like {
             operand,
             pattern,
