@@ -2314,6 +2314,10 @@ fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
             Some(text) => query_datum(tsquery::phraseto_tsquery(config, &text)),
             None => Datum::Null,
         },
+        CatalogFunc::WebsearchToTsQuery => match text_of(subject) {
+            Some(text) => query_datum(tsquery::websearch_to_tsquery(config, &text)),
+            None => Datum::Null,
+        },
         // **`@@` exists in both argument orders**, so the operands decide which is the vector and
         // which the query rather than the position doing it.
         CatalogFunc::TsMatch => match (args.first(), args.get(1)) {
@@ -2365,6 +2369,12 @@ fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
             let lexemes = tsquery::lexemes(&tsquery::from_text(query)?);
             Datum::Text(tsvector::headline(config, text, &lexemes))
         }
+        CatalogFunc::TsRank => match (args.first(), args.get(1)) {
+            (Some(Datum::TsVector(vector)), Some(Datum::TsQuery(query))) => Datum::Real(
+                tsquery::rank(&tsvector::from_text(vector)?, &tsquery::from_text(query)?),
+            ),
+            _ => Datum::Null,
+        },
         CatalogFunc::NumNode => match args.first() {
             Some(Datum::TsQuery(query)) => Datum::Int4(
                 i32::try_from(tsquery::numnode(&tsquery::from_text(query)?)).unwrap_or(i32::MAX),
@@ -2703,7 +2713,9 @@ fn catalog_function(
         | CatalogFunc::TsStrip
         | CatalogFunc::SetWeight
         | CatalogFunc::NumNode
-        | CatalogFunc::TsHeadline => text_search_function(call.func, &args)?,
+        | CatalogFunc::TsHeadline
+        | CatalogFunc::WebsearchToTsQuery
+        | CatalogFunc::TsRank => text_search_function(call.func, &args)?,
         // **Strict, each of them**, and `text2ltree` validates: a path that is not a path is
         // `ltree`'s own `42601` here exactly as it is through the cast.
         CatalogFunc::LtreeNlevel => match args.first() {

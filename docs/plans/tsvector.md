@@ -127,7 +127,7 @@ remaining failures are the four other shapes already recorded in handover v19 �
 tests. The board's largest row is expected to fall to `full_text_test.rb`'s 3 plus whatever the
 capture shows the functions owe.
 
-## 5. `ts_rank` — measured, and deliberately not implemented yet
+## 5. `ts_rank` — measured first, then implemented
 
 `ts_headline` landed with the wiring because the capture determines it completely. **`ts_rank` does
 not, and the difference is worth writing down rather than guessing across.**
@@ -165,6 +165,30 @@ way the shape above implies gives `1 − (1−0.1)(1−0.1) = 0.19`, and `0.19 �
 > ships** — and a wrong rank is the kind of answer nothing in the suite would catch, because
 > `full_text_test.rb` never calls it and the capture only asserts `ts_rank(...) > 0`.
 
-The unit that implements it starts by capturing the OR and AND cases across two and three operands,
-several weights and both normalisation flags, and only then writes code. Until it does, `ts_rank` is
-refused by name, and `tests/tsvector.rs` declares that refusal where the capture reaches it.
+### What one more probe settled
+
+Seven more rows, chosen so that unequal weights could tell the candidate rules apart:
+
+| input | `ts_rank` |
+|---|---|
+| `'a':1B 'b':2C` / `a \| b` | 0.18237813 |
+| `'a':1B` / `a \| b` | 0.12158542 |
+| `'b':2C` / `a \| b` | 0.06079271 |
+| `'a':1 'b':2 'c':3` / `a \| b \| c` | 0.06079271 |
+| `'a':1B 'b':2C` / `a & b` | 0.28030625 |
+| `'a':1 'b':4` / `a & b` | 0.09735848 |
+| `'a':1 'b':11` / `a & b` | 0.03977115 |
+
+**An OR is the mean over the query's operands**, not an accumulation: `0.4/2`, then
+`(0.4 + 0.2)/2`, then `(0.1 × 3)/3`. An operand the vector lacks contributes zero and still counts
+in the denominator. That is the rule the first derivation got wrong, and only unequal weights could
+show it — with two equal operands, the mean and the accumulation differ by a factor the D-weight
+rows hide.
+
+**An AND is `sqrt(w1 · w2 · word_distance(d))`** with no `6/π²`, and
+`word_distance(w) = 1/(1.005 + 0.05·e^(w/1.5 − 2))` reproduces all three distances: 0.98214 at 1,
+0.947867 at 3, 0.15823 at 10.
+
+Implemented in `value::tsquery::rank`, with all **sixteen** rows as its golden test. Beyond two
+operands an AND accumulates pairwise as PostgreSQL spells it, which the capture does not reach and
+the code says so.

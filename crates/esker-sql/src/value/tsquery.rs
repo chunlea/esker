@@ -233,7 +233,7 @@ impl Parser<'_> {
     }
 }
 
-use super::tsvector::{self, Config, Lexeme};
+use super::tsvector::{self, Config, Lexeme, Weight};
 
 /// `to_tsquery(config, text)`: the grammar, then the configuration over each lexeme.
 ///
@@ -263,6 +263,182 @@ pub fn phraseto_tsquery(config: Config, text: &str) -> Option<Node> {
     join(config, text, |left, right| {
         Node::Phrase(Box::new(left), Box::new(right))
     })
+}
+
+/// `ts_rank(tsvector, tsquery)`.
+///
+/// **Derived from sixteen controlled rows rather than from the source**, because a rank is judged
+/// to eight significant figures and a plausible formula is not a measured one. The rows are in
+/// `docs/plans/tsvector.md` §5; what they settle:
+///
+/// * the weights are `{A 1.0, B 0.4, C 0.2, D 0.1}` — the A/B/C rows are exactly 10x, 4x and 2x D;
+/// * **position does not matter, but the number of positions does**: `Σ w/(j+1)²`, so two
+///   positions are 1.25x one;
+/// * **an OR is the mean over the query's operands**, not an accumulation — `'a':1B` against
+///   `a | b` is `0.4/2`, and an operand the vector lacks contributes zero and still counts. This is
+///   the row that refused the first derivation, and one probe with unequal weights settled it;
+/// * an OR is then divided by `π²/6`, so the constant `0.6079271` in every single-term answer is
+///   `6/π²`;
+/// * **an AND is `√(w₁·w₂·word_distance(d))` with no such division**, which is the second
+///   asymmetry the first derivation could not explain.
+#[must_use]
+pub fn rank(vector: &[Lexeme], query: &Node) -> f32 {
+    /// `6/π²`, the value every single-term rank is a multiple of.
+    const OR_NORM: f32 = 0.607_927_1;
+
+    let operands = lexemes(query);
+    if operands.is_empty() {
+        return 0.0;
+    }
+    // The top operator chooses the rule, which is what makes `a & b` and `a | b` different
+    // questions over the same two lexemes.
+    if matches!(query, Node::And(..)) {
+        return and_rank(vector, &operands);
+    }
+    let total: f32 = operands
+        .iter()
+        .map(|word| weighted_positions(vector, word))
+        .sum();
+    // A query with more operands than an `f32` can count is not one anybody writes; saturating
+    // keeps the cast honest rather than silently rounding a huge one.
+    let count = u16::try_from(operands.len()).unwrap_or(u16::MAX);
+    total / f32::from(count) * OR_NORM
+}
+
+/// `Σ w/(j+1)²` over a lexeme's positions, zero when the vector does not hold it.
+fn weighted_positions(vector: &[Lexeme], word: &str) -> f32 {
+    let Some(lexeme) = vector.iter().find(|lexeme| lexeme.word == word) else {
+        return 0.0;
+    };
+    if lexeme.positions.is_empty() {
+        // A stripped vector has no positions and still matches; `D` is the weight it carries.
+        return weight_of(Weight::D);
+    }
+    lexeme
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(at, (_, weight))| {
+            let rank = f32::from(u16::try_from(at + 1).unwrap_or(u16::MAX));
+            weight_of(*weight) / (rank * rank)
+        })
+        .sum()
+}
+
+/// **Every pair of operands, at their closest.** `1 - (1 - res)(1 - curw)` is how a third operand
+/// would join, which the capture does not reach and is left as PostgreSQL spells it.
+fn and_rank(vector: &[Lexeme], operands: &[String]) -> f32 {
+    let mut res: f32 = -1.0;
+    for (i, left) in operands.iter().enumerate() {
+        for right in operands.iter().skip(i + 1) {
+            for (left_at, left_weight) in positions_of(vector, left) {
+                for (right_at, right_weight) in positions_of(vector, right) {
+                    let distance = left_at.abs_diff(right_at);
+                    let curw = (weight_of(left_weight)
+                        * weight_of(right_weight)
+                        * word_distance(distance))
+                    .sqrt();
+                    res = if res < 0.0 {
+                        curw
+                    } else {
+                        1.0 - (1.0 - res) * (1.0 - curw)
+                    };
+                }
+            }
+        }
+    }
+    res.max(0.0)
+}
+
+fn positions_of(vector: &[Lexeme], word: &str) -> Vec<(u16, Weight)> {
+    vector
+        .iter()
+        .find(|lexeme| lexeme.word == word)
+        .map(|lexeme| lexeme.positions.clone())
+        .unwrap_or_default()
+}
+
+fn weight_of(weight: Weight) -> f32 {
+    match weight {
+        Weight::A => 1.0,
+        Weight::B => 0.4,
+        Weight::C => 0.2,
+        Weight::D => 0.1,
+    }
+}
+
+/// How much two lexemes `w` tokens apart count for.
+///
+/// Reproduces the three distances captured — `0.98214` at 1, `0.947867` at 3, `0.15823` at 10 —
+/// and PostgreSQL's own cut-off past a hundred, where the term stops mattering at all.
+fn word_distance(distance: u16) -> f32 {
+    if distance > 100 {
+        return 1e-30;
+    }
+    1.0 / (1.005 + 0.05 * (f32::from(distance) / 1.5 - 2.0).exp())
+}
+
+/// `websearch_to_tsquery(config, text)`: the search-box syntax.
+///
+/// Measured on 19beta1:
+///
+/// ```text
+/// websearch_to_tsquery('english', '"fat cat" -dog')  ->  'fat' <-> 'cat' & !'dog'
+/// websearch_to_tsquery('english', 'fat or cat')      ->  'fat' | 'cat'
+/// ```
+///
+/// Four rules: a **quoted run** becomes a phrase, a leading `-` negates the word that follows,
+/// the bare word `or` is the `|` operator, and everything else is joined with `&`.
+#[must_use]
+pub fn websearch_to_tsquery(config: Config, text: &str) -> Option<Node> {
+    let mut built: Option<Node> = None;
+    let mut or_next = false;
+    for token in websearch_tokens(text) {
+        let (negated, body) = match token.strip_prefix('-') {
+            Some(rest) => (true, rest.to_owned()),
+            None => (false, token.clone()),
+        };
+        if !negated && body.eq_ignore_ascii_case("or") {
+            or_next = true;
+            continue;
+        }
+        // A quoted run is a phrase; a bare word is one lexeme, which `phraseto` also gives.
+        let Some(mut next) = phraseto_tsquery(config, &body) else {
+            continue;
+        };
+        if negated {
+            next = Node::Not(Box::new(next));
+        }
+        built = Some(match built.take() {
+            None => next,
+            Some(left) if or_next => Node::Or(Box::new(left), Box::new(next)),
+            Some(left) => Node::And(Box::new(left), Box::new(next)),
+        });
+        or_next = false;
+    }
+    built
+}
+
+/// Splits on whitespace, except that a double-quoted run is one token with its quotes removed.
+fn websearch_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn join(config: Config, text: &str, with: fn(Node, Node) -> Node) -> Option<Node> {
@@ -438,6 +614,45 @@ mod tests {
             !matches(&backwards, &phrase),
             "both lexemes are present and the order is wrong, which is the whole point of <->"
         );
+    }
+
+    /// **All sixteen captured rows**, from `docs/plans/tsvector.md` §5 and the probe that
+    /// settled the OR rule. A rank is judged to eight significant figures, so these are compared
+    /// to a tolerance that would catch a wrong constant and not a rounding difference.
+    #[test]
+    fn every_rank_is_the_one_postgresql_gave() {
+        let rank_of = |vector: &str, query: &str| {
+            rank(
+                &tsvector::from_text(vector).unwrap(),
+                &from_text(query).unwrap(),
+            )
+        };
+        for (vector, query, want) in [
+            ("'a'", "a", 0.060_792_71_f32),
+            ("'a':1", "a", 0.060_792_71),
+            ("'a':5", "a", 0.060_792_71),
+            ("'a':1,2", "a", 0.075_990_885),
+            ("'a':1A", "a", 0.607_927_1),
+            ("'a':1B", "a", 0.243_170_84),
+            ("'a':1C", "a", 0.121_585_42),
+            // The rows that decided the OR rule: a mean over the operands, absent ones included.
+            ("'a':1 'b':2", "a | b", 0.060_792_71),
+            ("'a':1B 'b':2C", "a | b", 0.182_378_13),
+            ("'a':1B", "a | b", 0.121_585_42),
+            ("'b':2C", "a | b", 0.060_792_71),
+            ("'a':1 'b':2 'c':3", "a | b | c", 0.060_792_71),
+            // And the rows that decided the AND rule and `word_distance`.
+            ("'a':1 'b':2", "a & b", 0.099_103_22),
+            ("'a':1B 'b':2C", "a & b", 0.280_306_25),
+            ("'a':1 'b':4", "a & b", 0.097_358_48),
+            ("'a':1 'b':11", "a & b", 0.039_771_15),
+        ] {
+            let got = rank_of(vector, query);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "ts_rank({vector}, {query}) is {got}, PostgreSQL says {want}"
+            );
+        }
     }
 
     #[test]
