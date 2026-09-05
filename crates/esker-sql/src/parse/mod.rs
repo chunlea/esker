@@ -1414,7 +1414,8 @@ fn strip_virtual_generated(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec
 /// nothing has to travel beside the tree. On PostgreSQL `CREATE USER` **is** `CREATE ROLE … LOGIN`
 /// — one implies the login attribute and the other does not, and that is the only thing the two
 /// statements disagree about (measured against PG19: `rolcanlogin` is `t` and `f`).
-/// `RESET SESSION AUTHORIZATION` → `SET SESSION AUTHORIZATION DEFAULT`.
+/// `RESET SESSION AUTHORIZATION` → `SET SESSION AUTHORIZATION DEFAULT`, and
+/// `SET LOCAL SESSION AUTHORIZATION x` → `SET LOCAL AUTHORIZATION x`.
 ///
 /// **Faithful, not a workaround**: PostgreSQL documents the two as the same statement, and
 /// `sqlparser` 0.62 reads the second and not the first — its `RESET` takes one parameter name and
@@ -1424,14 +1425,39 @@ fn rewrite_reset_authorization(sql: &str, scanned: &Scan<'_>) -> Option<String> 
     let [first, second, third, ..] = scanned.words.as_slice() else {
         return None;
     };
-    if !first.eq_ignore_ascii_case("RESET")
-        || !second.eq_ignore_ascii_case("SESSION")
-        || !third.eq_ignore_ascii_case("AUTHORIZATION")
+    if first.eq_ignore_ascii_case("RESET")
+        && second.eq_ignore_ascii_case("SESSION")
+        && third.eq_ignore_ascii_case("AUTHORIZATION")
+    {
+        let trailing = sql.trim_end().strip_suffix(';').map_or("", |_| ";");
+        return Some(format!("SET SESSION AUTHORIZATION DEFAULT{trailing}"));
+    }
+    // **`SET LOCAL SESSION AUTHORIZATION` is two scope words and `sqlparser` reads one.** It takes
+    // a single modifier and then expects the parameter — `SET LOCAL SESSION …` dies on
+    // "Expected: equals sign or TO, found: AUTHORIZATION". Dropping the redundant `SESSION` gives
+    // `SET LOCAL AUTHORIZATION`, which its grammar does read, with `scope` already `Local`.
+    //
+    // Redundant is the right word: `LOCAL` and `SESSION` are the *same* modifier slot on a real
+    // server, and PostgreSQL's own grammar spells this statement with both only because
+    // `SESSION AUTHORIZATION` is the parameter's name. Nothing is lost, which is the test this
+    // mechanism has to pass every time it is used.
+    let [first, second, third, fourth, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("SET")
+        || !second.eq_ignore_ascii_case("LOCAL")
+        || !third.eq_ignore_ascii_case("SESSION")
+        || !fourth.eq_ignore_ascii_case("AUTHORIZATION")
     {
         return None;
     }
-    let trailing = sql.trim_end().strip_suffix(';').map_or("", |_| ";");
-    Some(format!("SET SESSION AUTHORIZATION DEFAULT{trailing}"))
+    let upper = sql.to_ascii_uppercase();
+    let at = upper.find("SESSION")?;
+    let mut kept = String::with_capacity(sql.len());
+    kept.push_str(sql.get(..at)?);
+    let rest = sql.get(at + "SESSION".len()..)?;
+    kept.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+    Some(kept)
 }
 
 fn rewrite_user_as_role(sql: &str, scanned: &Scan<'_>) -> Option<String> {
