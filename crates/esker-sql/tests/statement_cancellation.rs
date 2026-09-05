@@ -228,7 +228,7 @@ fn cancelling_a_pid_that_is_not_here_is_false() {
 /// loop that watched only its deadline, so a cancel from another session set a flag nothing on that
 /// path ever read: `pg_cancel_backend` answered `true` and the waiter went on waiting. That is what
 /// `transaction_test.rb`'s last failure is —
-/// "ActiveRecord::QueryCanceled expected but nothing was raised" — and it is the shape a real
+/// `ActiveRecord::QueryCanceled expected but nothing was raised` — and it is the shape a real
 /// application actually cancels: a statement stuck behind somebody else's lock.
 #[test]
 fn a_statement_waiting_for_a_row_lock_is_cancellable() {
