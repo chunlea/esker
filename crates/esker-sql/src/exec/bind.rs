@@ -442,11 +442,6 @@ fn static_type(expr: &Expr, named: &[Named<'_>]) -> Option<ColumnType> {
 /// `named` is what the statement calls its relations — aliases included — and `tables` is every
 /// relation it resolved. Both are needed: a qualifier is matched against the first, and a subquery
 /// builds its own `named` list out of the second.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per expression a parameter can sit in, and a clause missing from it is a \
-              parameter that keeps the text fallback — which is the bug this function exists for"
-)]
 fn walk_predicate(
     expr: &Expr,
     named: &[Named<'_>],
