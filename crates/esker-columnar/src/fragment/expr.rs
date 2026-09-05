@@ -126,6 +126,26 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     /// `NOT`, which is unknown when its operand is.
     Not(Box<Expr>),
+    /// `x IN (v1, v2, …)` over a **strictly ascending, NULL-free** value list.
+    ///
+    /// It exists for one caller: a join pushed down as a semi-join, where the values are the inner
+    /// side's key set (`docs/plans/phase-16-mpp.md` §J4). Writing that as an `Or` chain of `Eq` is
+    /// already possible and does not scale — a few thousand keys against a few hundred thousand
+    /// rows is hundreds of millions of comparisons, which loses to the row engine the push-down is
+    /// replacing. Ascending order is required rather than sorted on arrival, so the wire form is
+    /// canonical, duplicates are refused rather than silently kept, and a row costs a binary
+    /// search.
+    ///
+    /// Three-valued like every other comparison here: **unknown** when the operand is NULL, true
+    /// on a `pg_cmp` match, false otherwise. The list itself holds no NULL — `x IN (NULL)` is
+    /// unknown for every `x` and is a shape no caller of this wants, so it is refused at decode
+    /// rather than evaluated.
+    In {
+        /// What is being tested.
+        operand: Box<Expr>,
+        /// The values, strictly ascending in [`Value::pg_cmp`] order.
+        values: Vec<Value>,
+    },
     /// `x IS NULL`, or `IS NOT NULL` when negated. Never unknown itself.
     IsNull {
         /// What is being tested.
@@ -164,7 +184,7 @@ impl Expr {
                     stack.push((left, depth + 1));
                     stack.push((right, depth + 1));
                 }
-                Expr::Not(operand) | Expr::IsNull { operand, .. } => {
+                Expr::Not(operand) | Expr::IsNull { operand, .. } | Expr::In { operand, .. } => {
                     stack.push((operand, depth + 1));
                 }
             }
@@ -186,7 +206,8 @@ impl Expr {
             | Expr::And(..)
             | Expr::Or(..)
             | Expr::Not(_)
-            | Expr::IsNull { .. } => Some(ColumnType::Bool),
+            | Expr::IsNull { .. }
+            | Expr::In { .. } => Some(ColumnType::Bool),
         }
     }
 
@@ -203,6 +224,22 @@ impl Expr {
 
             Expr::IsNull { operand, negated } => {
                 ValueRef::Bool(operand.evaluate(row).is_null() != *negated)
+            }
+
+            // **Binary search, which is the whole reason this node exists.** The values are
+            // strictly ascending in `pg_cmp` order — refused at decode if they are not — so this
+            // is `log n` where the `Or` chain it replaces is `n`.
+            Expr::In { operand, values } => {
+                let probe = operand.evaluate(row);
+                if probe.is_null() {
+                    // Unknown, exactly as `x = NULL` is: a NULL is in no list.
+                    return ValueRef::Null;
+                }
+                ValueRef::Bool(
+                    values
+                        .binary_search_by(|value| value.as_ref().pg_cmp(&probe))
+                        .is_ok(),
+                )
             }
 
             Expr::Not(operand) => match truth(operand.evaluate(row)) {
@@ -438,5 +475,75 @@ mod tests {
             Some(ColumnType::Bool)
         );
         assert_eq!(truth(ValueRef::Int(1)), None, "a non-boolean is unknown");
+    }
+
+    /// `IN` and the `Or` chain of `Eq` it replaces must answer identically, including on the
+    /// values `pg_cmp` treats specially. The whole point of the node is speed, and a faster
+    /// answer that differs is not the same answer.
+    #[test]
+    fn an_in_list_agrees_with_the_or_chain_it_replaces() {
+        let values = vec![Value::Int8(1), Value::Int8(4), Value::Int8(9)];
+        let in_list = Expr::In {
+            operand: Box::new(Expr::Column(0)),
+            values: values.clone(),
+        };
+        let chain = values
+            .iter()
+            .map(|value| Expr::compare(0, CompareOp::Eq, value.clone()))
+            .reduce(|left, right| Expr::Or(Box::new(left), Box::new(right)))
+            .expect("three values reduce");
+        for probe in [-1_i64, 0, 1, 2, 4, 5, 9, 10] {
+            let row = [ValueRef::Int(probe)];
+            assert_eq!(
+                in_list.evaluate(&row),
+                chain.evaluate(&row),
+                "IN and the OR chain disagree at {probe}"
+            );
+        }
+        // A NULL operand is unknown in both, which is what keeps the row out.
+        let row = [ValueRef::Null];
+        assert!(in_list.evaluate(&row).is_null());
+        assert!(chain.evaluate(&row).is_null());
+    }
+
+    /// `-0.0` and `0.0` are one value under `pg_cmp` and two under IEEE bit equality, and two
+    /// `NaN`s are one value here and never equal under IEEE. A membership test that used bit
+    /// equality would split a group the row engine keeps together — the defect class ADR 0040
+    /// Decision 5 exists to prevent.
+    #[test]
+    fn an_in_list_is_pg_cmp_and_not_bit_equality() {
+        let zero = Expr::In {
+            operand: Box::new(Expr::Column(0)),
+            values: vec![Value::Double(0.0)],
+        };
+        assert_eq!(
+            zero.evaluate(&[ValueRef::Double(-0.0)]),
+            ValueRef::Bool(true),
+            "-0.0 is 0.0 under pg_cmp"
+        );
+        let nan = Expr::In {
+            operand: Box::new(Expr::Column(0)),
+            values: vec![Value::Double(f64::NAN)],
+        };
+        assert_eq!(
+            nan.evaluate(&[ValueRef::Double(f64::NAN)]),
+            ValueRef::Bool(true),
+            "two NaNs are one value under pg_cmp"
+        );
+    }
+
+    /// The node counts as one level, like every other operand-taking node.
+    #[test]
+    fn an_in_list_nests_like_its_neighbours() {
+        let expr = Expr::In {
+            operand: Box::new(Expr::Column(0)),
+            values: vec![Value::Int8(1)],
+        };
+        assert_eq!(expr.depth(), 2);
+        assert_eq!(
+            Expr::Not(Box::new(expr)).depth(),
+            3,
+            "a list under a NOT is one deeper"
+        );
     }
 }

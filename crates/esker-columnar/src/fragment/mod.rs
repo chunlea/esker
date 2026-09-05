@@ -49,6 +49,15 @@ pub const MAX_AGGREGATES: usize = 256;
 /// Most grouping columns one fragment may ask for.
 pub const MAX_GROUP_BY: usize = 64;
 
+/// Most values an [`expr::Expr::In`] list may carry.
+///
+/// A bound because the list arrives on the wire and every bound here is one a hostile or broken
+/// peer cannot exceed. 4,096 is chosen against two things and neither is a guess: an `int8` list
+/// that long encodes to well under a tenth of `max_frame_size` (16 MiB, `docs/DESIGN.md` §9), and
+/// a binary search over it is twelve comparisons a row, against the four thousand an `Or` chain
+/// would cost. What moves it is a measurement, not a preference.
+pub const MAX_IN_VALUES: usize = 4_096;
+
 /// Longest key-range bound a fragment may carry.
 pub const MAX_KEY_BOUND: usize = 64 * 1024;
 
@@ -338,6 +347,31 @@ fn check(expr: &Expr, slots: &[ColumnType]) -> Result<Option<ColumnType>> {
                     op.symbol(),
                     right.name()
                 )));
+            }
+            Some(ColumnType::Bool)
+        }
+
+        // **The same type rule the comparison has, for the same reason.** Two implementations of
+        // this system's ordering agree about values of one type by construction and about values
+        // of two only by luck (ADR 0040 Decision 5), so a list whose values are not all the
+        // operand's type is refused rather than compared.
+        Expr::In { operand, values } => {
+            let operand = check(operand, slots)?;
+            for value in values {
+                let Some(value_type) = value.column_type() else {
+                    // A NULL in the list; the decoder refuses these, and a hand-built expression
+                    // that has one is refused here rather than evaluated.
+                    return Err(Error::refused("a NULL in an IN list".to_owned()));
+                };
+                if let Some(operand) = operand
+                    && operand != value_type
+                {
+                    return Err(Error::refused(format!(
+                        "operator does not exist: {} = {}",
+                        operand.name(),
+                        value_type.name()
+                    )));
+                }
             }
             Some(ColumnType::Bool)
         }

@@ -58,8 +58,8 @@ use crate::error::{Error, Result};
 use crate::format::MAX_VALUE_LEN;
 use crate::fragment::expr::{CompareOp, Expr};
 use crate::fragment::{
-    Aggregate, Fragment, KeyRange, MAX_AGGREGATES, MAX_EXPR_DEPTH, MAX_GROUP_BY, MAX_KEY_BOUND,
-    Output, TableRef,
+    Aggregate, Fragment, KeyRange, MAX_AGGREGATES, MAX_EXPR_DEPTH, MAX_GROUP_BY, MAX_IN_VALUES,
+    MAX_KEY_BOUND, Output, TableRef,
 };
 use crate::value::{ColumnType, MAX_COLUMNS, Value};
 
@@ -320,6 +320,14 @@ fn put_expr(expr: &Expr, out: &mut Vec<u8>) {
             out.push(u8::from(*negated));
             put_expr(operand, out);
         }
+        Expr::In { operand, values } => {
+            out.push(8);
+            varint::put_u64(values.len() as u64, out);
+            for value in values {
+                put_literal(value, out);
+            }
+            put_expr(operand, out);
+        }
     }
 }
 
@@ -365,6 +373,40 @@ fn take_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<Expr> {
             },
             operand: Box::new(take_expr(cursor, depth + 1)?),
         },
+        8 => {
+            let count = cursor.count("in-list length", 1)?;
+            if count == 0 || count > MAX_IN_VALUES {
+                return Err(Error::refused(format!(
+                    "an IN list of {count} values, outside 1..={MAX_IN_VALUES}"
+                )));
+            }
+            let mut values: Vec<Value> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let value = take_literal(cursor)?;
+                if value == Value::Null {
+                    // `x IN (NULL)` is unknown for every `x`: a shape no producer of this node
+                    // wants and one a reader would have to reason about, refused rather than
+                    // evaluated.
+                    return Err(Error::refused("a NULL in an IN list".to_owned()));
+                }
+                // **Strictly ascending, checked rather than sorted.** Sorting on arrival would
+                // accept two encodings of one predicate and hide a producer that had lost its
+                // ordering; refusing keeps the wire form canonical and is what makes the
+                // evaluator's binary search correct.
+                if let Some(previous) = values.last()
+                    && previous.pg_cmp(&value) != std::cmp::Ordering::Less
+                {
+                    return Err(Error::refused(
+                        "an IN list that is not strictly ascending in pg_cmp order".to_owned(),
+                    ));
+                }
+                values.push(value);
+            }
+            Expr::In {
+                values,
+                operand: Box::new(take_expr(cursor, depth + 1)?),
+            }
+        }
         other => return Err(Error::refused(format!("expression node {other}"))),
     })
 }
