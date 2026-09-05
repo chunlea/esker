@@ -810,6 +810,11 @@ repair leaves the query aimed better, but a region that moves on every attempt i
 statement cannot read at this snapshot, and the row plan answers it correctly while an unbounded
 walk would not answer it at all.
 
+One operator-facing consequence, deliberate: `EXPLAIN ANALYZE` counts the fragments **sent**, so a
+query that followed a split reads `Fragments: 4 asked, 3 answered` and still answers completely.
+That is not a lost fragment — it is the one visible sign that this query met a region that was
+moving, and flattening it to `3 asked` would hide the only evidence the repair ever runs.
+
 ### The driver-side half, and the one line that still connects it
 
 `esker-client`'s `router::repair_route` (h1, `50fbad88`) is the shared repair, and it reaches the
@@ -817,29 +822,29 @@ same reading of `region 0` independently: *"a fact about the driver's knowledge,
 cluster"*. It believes the refusal's bounds when they contain the key and otherwise re-resolves on
 the router's own jittered backoff before giving up.
 
-**The fragment path does not reach it yet, and the gap is one call site.**
-`FragmentClient::shards` — the enumeration this unit's repair calls — still ends its per-step
-lookup with
+**The fragment path reaches it through the enumeration it already calls.** `FragmentClient::shards`
+was the one walk of the three that mapped `Router::route`'s error straight to its caller, which is
+where `region 0` actually surfaced; h1's v47 made it a third caller of `repair_route`. So:
 
 ```rust
-let mut route = self.router.route(&key)
-    .map_err(|error| terminal(error, Method::FragmentEvaluate))?;
+let mut route = match self.router.route(&key) {
+    Ok(route) => route,
+    Err(refusal) => crate::router::repair_route(&self.router, &key, &refusal)?,
+};
 ```
 
-which is exactly the unrepaired first lookup h1's own commit message names as where `region 0`
-came from. Both scan walks were fixed; this third walk is in the same crate and was not. So:
+**Nothing further is owed in `esker-sql`, and `repair_route` should stay `pub(crate)`.** It was
+offered to be widened for this dispatch; it does not need to be. `re_routed` asks the trait's
+`shards`, which *is* that function, so the repair arrives underneath with no new seam and no second
+copy — and a planner reaching into the client's concrete types is precisely the coupling
+`crate::fragment`'s trait exists to prevent (`crates/esker-sql/src/fragment.rs`, module docs).
 
-* **Nothing further is owed in `esker-sql`.** `re_routed` asks the trait's `shards`, which is this
-  function, so the repair arrives underneath it with no new seam and no second copy — and
-  `repair_route` is `pub(crate)`, which is the right place for it: a planner reaching into the
-  client's internals is the coupling `crate::fragment`'s trait exists to prevent.
-* **Owed by the client:** `shards` calling `repair_route` on a failed `route`, and continuing the
-  walk from the end key it returns. It is h1's file and h1's helper; recorded here so the fragment
-  path's dependency on it is written down rather than assumed.
-
-Until that lands, a fragment whose range the driver cannot resolve falls back to rows — correct,
-and slow in exactly the window this section is about. The row path has no such fallback, which is
-why the same window is an error there and a cost here.
+It also keeps this dispatch clear of the trap the helper turns on. `repair_route` believes a
+refusal's bounds when they contain the key — but `owns(b"", b"", key)` is **true for every key**, so
+the driver's own empty-bounded refusal would be believed as if it were a store's, and an empty range
+would come to mean the opposite of what it says. `re_routed` never reads a refusal's bounds at all:
+it re-enumerates and checks the tiling of what comes back, so the distinction is one it cannot get
+wrong because it never makes it.
 
 ### Whether `region 0` deserves its own error
 
