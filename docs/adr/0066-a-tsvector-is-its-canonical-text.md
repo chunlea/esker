@@ -74,6 +74,33 @@ Three things follow, and they are the reason:
    > `tests/row_order.rs::encoded_keys_sort_the_way_postgresql_sorts_the_values`, whose message is
    > the whole argument: *a type whose key order is unchecked is a type whose range scans are
    > unchecked*. It was written for exactly this and it fired on the first type that needed it.
+
+   > **Amended 2026-09-05: under `gin` the ordering is unused, not absent, and a `tsvector` column
+   > is a `gin` index key.** The correction above is right about the order and drew one conclusion
+   > too many from it. What it establishes is that this node's byte order for a `tsvector` is not
+   > `tsvector_ops`' order — which matters wherever the order of the key *is* the index, and
+   > nowhere else. A `gin` index is not read in key order: nothing range-scans it, no `ORDER BY`
+   > is answered from it, and [ADR 0070](0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)
+   > already says nothing claims it accelerates a search. So the wrong order is never consulted.
+   >
+   > **The code was already inconsistent with itself, which is what forced this.** An *expression*
+   > index over `to_tsvector('english', …)` — a value of exactly this type — was accepted, because
+   > `crate::exec::ddl::index_expression` has no `is_index_key` gate, and it writes rows correctly;
+   > a *column* of the same type was refused. One of the two had to move, and admitting the column
+   > is the direction the capture points: `pg_opclass` gives `tsvector_ops` as the **default**
+   > class for `btree`, `gin` *and* `gist`, so a real server accepts all three
+   > (`tests/corpus/pg19_gin_tsvector.txt`, taken by the harness lane).
+   >
+   > **`btree` and `gist` stay refused and stay a declared divergence.** Under `btree` the order is
+   > the index, and this node's is not the server's — the paragraph above is why. `gist` is the
+   > same case as `gin` one word away and is left refused until something needs it, rather than
+   > widened on an argument nothing exercises. The refusal is this node's own `0A000` naming the
+   > construct, **not** `42704 has no default operator class`: that is an error a real server does
+   > not give for a `tsvector`, and the brief for this change assumed it did. Where PostgreSQL does
+   > give it is `hash` and `brin`, which have no default class for the type — also in the capture.
+   >
+   > What this buys: `corpus/pg19_tsvector.txt` replays **whole**, part 3 included, which is
+   > `schema_test.rb`'s `setup` — the 48 raises this ADR's Context opens with.
 2. **The round-trip is the feature** for the file that owns it. A parsed structure would have to
    reproduce the printed form exactly anyway, so the printed form is the shorter path to the same
    answer — and the only one whose correctness the suite can currently check.

@@ -10,20 +10,17 @@
 //! a value is its canonical text, so equality, ordering and an index over the column are the text
 //! machinery's.
 //!
-//! # This slice replays parts 1 and 2, and the corpus holds all of it
+//! # The whole capture replays
 //!
 //! `corpus/pg19_tsvector.txt` is `captures/pg19_tsvector.txt` **byte for byte** — the harness's
 //! captures directory is not in git, so this copy is the capture's only backup and it is kept
-//! whole. The replay takes the file in prefixes as the machinery underneath it lands: part 1 is
-//! the declaration and round trip, part 2 the value and operator surface once there was a stemmer.
-//!
-//! **Part 3 is one statement away.** `schema_test.rb`'s two schemas, `tsvector` column and two GIN
-//! indexes now all answer as a real server does except
-//! `CREATE INDEX … USING gin (name_vector)` — a `tsvector` **column** key, which
-//! [`esker_keys::row::is_index_key`] refuses because a `tsvector`'s byte order is not its printed
-//! order ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)). The *expression*
-//! index over `to_tsvector('english', …)` — the same type — is accepted and writes, so the two
-//! paths disagree with each other and reconciling them is an ADR decision rather than a fix.
+//! whole. The replay took the file in prefixes as the machinery underneath it landed: part 1 the
+//! declaration and round trip, part 2 the value and operator surface once there was a stemmer, and
+//! part 3 `schema_test.rb`'s two schemas and two GIN indexes — which needed the operator-class
+//! recording ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
+//! a catalog function's volatility read rather than assumed, and last a `tsvector` **column**
+//! admitted as a `gin` key ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md),
+//! amended: under `gin` the ordering is unused rather than absent). There is no prefix left.
 //!
 //! **Why it is a prefix and not a list of declared divergences**: a declared divergence over a
 //! statement that *raises* here and *succeeds* on PostgreSQL still aborts the transaction, and
@@ -39,14 +36,6 @@ mod parity;
 /// Nothing: the corpus builds its own table.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// Where the capture stops, which is now a single statement rather than a section.
-///
-/// Everything above this marker replays; inside part 3 the two schemas, the column, both
-/// expression indexes and every readback agree, and `USING gin (name_vector)` does not. The
-/// marker stays until that is decided, because the capture is one transaction and a refusal
-/// inside it swallows every statement after.
-const PART_3: &str = "# ---- part 3:";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `name` and `"char"` there, `text` here — the standing choice every catalog view in this
@@ -56,6 +45,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname",
         "SELECT 'r', a.typname AS array_of_tsvector FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'tsvector'",
         "SELECT 'r', c.relname, a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'tsv' AND a.attnum > 0 ORDER BY a.attnum",
+        // Part 3's catalog readback. `nspname`, `relname` and `amname` are all three of them
+        // `name` on a real server; the **rows** agree, which is what says both indexes were
+        // recorded with the access method the statement asked for and that the expression one
+        // reads `indkey` 0 with `indexprs` set.
+        "SELECT 'r', n.nspname, c.relname AS index_name, am.amname, i.indnatts, i.indkey::text, i.indexprs IS NOT NULL AS is_expression FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE c.relname IN ('c_index_full_text_search','e_index_things_on_name_vector') ORDER BY n.nspname, c.relname",
     ],
     // **The corpus format cannot express this row, and the answer is right.** A row's columns are
     // separated by `|` and a `tsquery`'s *or* operator **is** `|`, so the expected side parses
@@ -68,6 +62,21 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `to_tsquery("fat | cat")` renders `'fat' | 'cat'`. Declared here rather than silently
     // dropped from the corpus, because the corpus is the capture and the capture is right.
     answers: &[
+        (
+            "SELECT 'r', c.relname, pg_get_indexdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('c_index_full_text_search','e_index_things_on_name_vector') AND n.nspname = 'test_schema' ORDER BY c.relname",
+            "**The expression index prints as written here and as a deparsed parse tree there**, \
+             and the column index beside it agrees exactly — which is what says the difference is \
+             the printing and not the index. PostgreSQL stores `pg_node_tree` and reconstructs the \
+             text, so `to_tsvector('english', coalesce(things.name, ''))` comes back as \
+             `to_tsvector('english'::regconfig, (COALESCE(name, ''::character varying))::text)`: \
+             the configuration cast made explicit, the argument cast to the type the function \
+             takes, the qualifier dropped and the function name upper-cased to its catalog \
+             spelling. This node stores the text the user wrote (`crate::exec::ddl`'s \
+             `index_expression`, where a `CASE` is the one shape that cannot round-trip and is \
+             deparsed instead). Closing it means a deparser that reproduces PostgreSQL's own \
+             coercion, which is a unit of its own and reaches every stored expression, not just \
+             this one. The `name`-versus-`text` column type is the standing catalog choice on top.",
+        ),
         // **Two configurations, not thirty-two.** `pg_am`'s own comment states the rule this
         // follows: a row for a configuration nothing can be tokenised with would be a claim
         // rather than a report. `simple` is here now, `english` arrives with the stemmer.
@@ -97,10 +106,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 #[test]
 fn every_tsvector_value_and_operator_answer_is_postgresql_19_s() {
     let whole = include_str!("corpus/pg19_tsvector.txt");
-    let through_part_two = whole.split_once(PART_3).map_or(whole, |(before, _)| before);
-    let checked = parity::replay(through_part_two, CORPUS_FIXTURE, &DIVERGENCES);
+    let checked = parity::replay(whole, CORPUS_FIXTURE, &DIVERGENCES);
     assert!(
-        checked > 45,
+        checked > 70,
         "only {checked} statements ran; the corpus did not load"
     );
 }

@@ -524,8 +524,20 @@ pub(super) fn range_representation(subtype: ColumnType) -> Option<ColumnType> {
 /// It is `0A000` naming the type: a gap a client can read, rather than a table it cannot write
 /// to. The name is the **declared** one, so a `floatrange` column is refused as a `floatrange`
 /// and not as the representation holding it.
-fn refuse_unindexable(table: &TableDef, column: &ColumnDef) -> Result<()> {
+fn refuse_unindexable(table: &TableDef, column: &ColumnDef, method: &str) -> Result<()> {
     let ty = column.ty;
+    // **A `tsvector` column is a `gin` key.** `tsvector_ops` is `gin`'s default operator class for
+    // it — measured, `pg_opclass` where `opcdefault` — so `USING gin (tsv)` is exactly what a real
+    // server accepts and what `schema_test.rb` builds. It is admitted here and nowhere else:
+    // `is_index_key` still refuses it for `btree`, where the order of the key *is* the index, and
+    // this node's order for a `tsvector` is its bytes' and not `tsvector_ops`'
+    // ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
+    //
+    // An *expression* of this type was already accepted, because `index_expression` has no gate of
+    // its own; admitting the column is what makes the two paths agree.
+    if ty == ColumnType::TsVector && method == catalog::GIN_ACCESS_METHOD {
+        return Ok(());
+    }
     if matches!(
         ty,
         ColumnType::Json
@@ -4522,7 +4534,7 @@ pub(super) fn create_index(
                     let at = table
                         .column(column)
                         .ok_or_else(|| SqlError::UndefinedColumn(column.clone()))?;
-                    refuse_unindexable(&table, &table.columns[at])?;
+                    refuse_unindexable(&table, &table.columns[at], &create.access_method)?;
                     KeyPart::Column(at)
                 }
                 plan::KeyPartName::Expression { expr, shape } => {

@@ -17,6 +17,20 @@
 //! `schema_test.rb` writes both spellings this closes — `USING gin (name_vector)` over a
 //! `tsvector` column and `USING gin ((to_tsvector('english', coalesce(things.name, ''))))` over an
 //! expression of that type — and they are the last two rows of `corpus/pg19_tsvector.txt` part 3.
+//!
+//! # Provenance
+//!
+//! The access-method rows are `corpus/pg19_gin_tsvector.txt`, taken by the harness lane against
+//! PostgreSQL 19beta1 in one `BEGIN … ROLLBACK` at this lane's request — because the brief for
+//! this change assumed a `tsvector` under `USING btree` raised `42704`, and it does not. It is
+//! **not replayed** here: three of its rows are statements PostgreSQL accepts and this node
+//! refuses, and a refusal aborts the transaction and swallows the rest of the file. The rows are
+//! asserted one at a time instead, which is what `storage_parameters.rs` does and for the same
+//! reason.
+//!
+//! The capture also bounds the guard the brief wanted. The `42704` is real — it belongs to `hash`
+//! and `brin`, where a `tsvector` genuinely has no default class — and `tsquery` turns out to have
+//! a `btree` default as well, so it is not the counter-example either.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,44 +41,92 @@ const FIXTURE: &[&str] = &[
     "CREATE TABLE things (id int8, name character varying(50), name_vector tsvector, tags text[])",
 ];
 
-/// **A `tsvector` key gets past the operator class and is stopped one layer down**, which is the
-/// distinction this test exists to pin.
+/// **A `tsvector` column is a `gin` index key**, which is the shape `schema_test.rb` builds and
+/// the last statement `corpus/pg19_tsvector.txt` part 3 was stopping on.
 ///
-/// `tsvector` has a `gin` default and this node now resolves it — so the refusal is no longer
-/// `42704 … has no default operator class`. What refuses it is
-/// [`esker_keys::row::is_index_key`], because a `tsvector`'s byte order is not its printed order
-/// ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)), and an index key here
-/// is an ordered one whatever access method was recorded
-/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+/// Captured on PostgreSQL 19beta1 in one `BEGIN … ROLLBACK`, and the surprise is in the third row:
 ///
-/// **Both of `corpus/pg19_tsvector.txt` part 3's indexes are this shape** — one over the column
-/// and one over an expression of the same type — so part 3 cannot replay until the two ADRs are
-/// reconciled. That is a decision, not an omission, and it is not one to take inside a test.
+/// ```text
+/// CREATE INDEX gtv_gin_col   ON gtv USING gin (tsv)     ok
+/// CREATE INDEX gtv_gin_expr  ON gtv USING gin ((to_tsvector('english', coalesce(gtv.name, ''))))  ok
+/// CREATE INDEX gtv_btree_col ON gtv USING btree (tsv)   ok      <- accepted there, refused here
+/// ```
+///
+/// `pg_opclass` says why: `tsvector_ops` is the **default** class for `btree`, `gin` *and* `gist`,
+/// so a real server takes all three. This node takes only `gin`, and that is a **declared
+/// divergence rather than PostgreSQL's error**: under `btree` the order of the key is the index,
+/// and this node's order for a `tsvector` is its bytes' rather than `tsvector_ops`'
+/// ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)). Under `gin` the order
+/// is never read, which is what the amendment says and what makes the column safe there.
 #[test]
-fn a_tsvector_key_is_refused_by_the_key_rule_and_not_the_class_rule() {
+fn a_tsvector_column_is_a_gin_key_and_only_a_gin_key() {
     let mut node = parity::Node::new(FIXTURE);
-    let answer = node
-        .answer("CREATE INDEX i_col ON things USING gin (name_vector)")
-        .to_string();
-    assert!(
-        answer.contains("is not supported") && !answer.contains("operator class"),
-        "expected the key-type refusal, got {answer}"
-    );
-
-    // **The expression of that same type is accepted**, which is what a real server does — and is
-    // the asymmetry worth staring at: `index_expression` has no `is_index_key` gate, so a
-    // `tsvector` reaches the key encoding here where a column of it cannot. Whether that is the
-    // column rule being too strict or this path missing a gate is the question in the handover;
-    // what this asserts is that the row actually writes, because an index that refuses the first
-    // `INSERT` would be worse than one refused at `CREATE`.
-    node.run("CREATE INDEX i_expr ON things USING gin ((to_tsvector('english', coalesce(things.name, ''))))")
-        .unwrap();
-    node.run("INSERT INTO things (id, name) VALUES (1, 'the fat cat')")
+    // The two the capture accepts and this node now accepts: the column and the expression.
+    for sql in [
+        "CREATE INDEX i_col ON things USING gin (name_vector)",
+        "CREATE INDEX i_expr ON things USING gin ((to_tsvector('english', coalesce(things.name, ''))))",
+    ] {
+        assert_eq!(
+            node.answer(sql).to_string(),
+            "(a command, no result set)",
+            "{sql}"
+        );
+    }
+    // And the row that writes, because an index refused at the first `INSERT` would be worse than
+    // one refused at `CREATE`.
+    node.run("INSERT INTO things (id, name, name_vector) VALUES (1, 'the fat cat', to_tsvector('english', 'the fat cat'))")
         .unwrap();
     assert_eq!(
         node.rows("SELECT name FROM things"),
         [["the fat cat".to_owned()]]
     );
+}
+
+/// **`btree` and `gist` over a `tsvector` stay refused, and by our own sentence.**
+///
+/// PostgreSQL accepts both — `tsvector_ops` is their default class too — so this is a divergence
+/// and it says so with `0A000` naming the construct, contract C2. It must **not** be spelled
+/// `42704 … has no default operator class`, which is the error a real server does not give: the
+/// brief for this change assumed it did, and `pg_opclass` says otherwise.
+///
+/// `gist` is the same case as `gin` one word away — the order is unread there too — and is left
+/// refused deliberately until somebody needs it, rather than widened on the strength of an
+/// argument nothing exercises.
+///
+/// **`hash` and `brin` are where the `42704` really lives**, measured: a `tsvector` has no default
+/// class for either. This node refuses those methods outright, one statement earlier, so it never
+/// reaches the type — a different sentence for a different reason, and both are honest.
+#[test]
+fn btree_and_gist_over_a_tsvector_are_a_declared_divergence() {
+    let mut node = parity::Node::new(FIXTURE);
+    for sql in [
+        "CREATE INDEX i_bt ON things USING btree (name_vector)",
+        "CREATE INDEX i_bare ON things (name_vector)",
+        "CREATE INDEX i_gist ON things USING gist (name_vector)",
+    ] {
+        let answer = node.answer(sql).to_string();
+        assert_eq!(
+            answer, "!0A000 an index on a column of type tsvector is not supported",
+            "{sql}"
+        );
+        assert!(
+            !answer.contains("operator class"),
+            "PostgreSQL gives no operator-class error here: {answer}"
+        );
+    }
+    // `hash` and `brin` are refused for the method before the type is ever looked at, which is
+    // ADR 0070's rule and not this one's. PostgreSQL refuses them too, for the type — the same
+    // outcome by a different route, and the capture holds both sentences.
+    for sql in [
+        "CREATE INDEX i_h ON things USING hash (name_vector)",
+        "CREATE INDEX i_br ON things USING brin (name_vector)",
+    ] {
+        let answer = node.answer(sql).to_string();
+        assert!(
+            answer.starts_with("!0A000 an index USING"),
+            "expected the access-method refusal, got {answer} for {sql}"
+        );
+    }
 }
 
 /// An array is the second of the three, and `gist` keeps its own answer: it has **no** default for
