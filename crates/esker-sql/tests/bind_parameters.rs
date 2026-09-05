@@ -10,15 +10,6 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
     types: &[],
     answers: &[
         (
-            "SELECT $1::int4 + $2::int4",
-            "**A cast over a parameter is its own unit.** A cast to anything but `text` is done \
-             where the statement is lowered, over a *literal* — and a `$1` is not a literal until \
-             it is substituted, which happens later. Making `$n::T` work means carrying the type \
-             on the parameter so the inference reads it, and nothing `ActiveRecord` sends writes \
-             one: the adapter emits `$1` bare and lets the column decide",
-            "pg19_bind_parameters.txt:67",
-        ),
-        (
             "SELECT pg_typeof($1::int8)",
             "The same cast, and the same unit",
             "pg19_bind_parameters.txt:79",

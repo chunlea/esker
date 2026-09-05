@@ -36,11 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "UNMEASURED",
         ),
         (
-            "SELECT CURRENT_DATE = now()::date",
-            "A cast from `timestamptz` to `date`, which this node does not have. `CURRENT_DATE` itself answers and is that instant's date — the line beside it (`CURRENT_DATE` is never NULL) and the type assertion in this file cover what this one would.",
-            "UNMEASURED",
-        ),
-        (
             "SELECT CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)",
             "`CURRENT_TIMESTAMP(p)` and `date_trunc` are two more members of this family and neither is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; both are refused by name today. `LOCALTIMESTAMP` was in this list until `insert_all` needed it (`tests/values_catalog_function.rs`), which is what the list is for.",
             "UNMEASURED",

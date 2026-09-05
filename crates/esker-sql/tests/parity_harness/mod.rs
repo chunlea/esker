@@ -139,8 +139,10 @@ const SWALLOWING_DEBT: &[&str] = &[
     "ALTER TABLE \"pg_arrays\" ALTER COLUMN \"snippets\" TYPE text[] USING string_to_array(\"snippets\", ','), ALTER COLUMN \"snippets\" SET DEFAULT '{}';",
     // `tests/alter_index.rs`
     "ALTER INDEX \"ai\" RENAME TO \"ai_renamed\"",
-    // `tests/array_subquery.rs`
-    "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
+    // `tests/array_subquery.rs`'s entry was `ARRAY(SELECT 1)::int8[]` and is **gone**: the
+    // runtime cast made that statement answer, so it stops the file no more. Three statements
+    // came out from behind it — one that agrees and two that do not, both now declared with
+    // their capture lines. The list may only shrink, and this is what shrinking looks like.
     // `tests/assignment_cast_date.rs`
     "SET TimeZone = 'Pacific/Auckland'",
     // `tests/create_schema_elements.rs`

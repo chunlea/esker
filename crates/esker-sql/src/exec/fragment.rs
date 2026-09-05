@@ -792,6 +792,7 @@ fn push_filter(
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
         // A cast is not expressible in the fragment language, so the filter stays on the row side.
         Expr::ToText { .. } => return Err(refused("a cast to text")),
+        Expr::Cast { .. } => return Err(refused("a cast")),
         // The fragment language has no array value to build, so a constructor keeps its filter on
         // the row side rather than being half-pushed.
         Expr::Array { .. } => return Err(refused("an ARRAY constructor")),
@@ -1214,6 +1215,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         }
         Expr::Not(inner)
         | Expr::Negate(inner)
+        | Expr::Cast { operand: inner, .. }
         | Expr::ToText { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => collect_columns(inner, into),
         Expr::Like {

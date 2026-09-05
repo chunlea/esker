@@ -42,12 +42,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg_cast is not built",
             "pg19_assignment_cast_date.txt:43",
         ),
-        // **A per-row cast still has only `text` as a target**, which is the standing debt this
-        // lane has carried since the array unit — `'…'::date` on a *constant* folds at plan time
-        // and works, and `CURRENT_TIMESTAMP::date` cannot, because the value is not known until
-        // the row is. The conversion itself now exists (`crate::value::date::from_micros`) and
-        // what is missing is a plan node to apply it per row; that is a unit of its own and it
-        // would close both of these.
+        // **These two answer correctly now and are still listed, because nothing compares them.**
+        // The per-row cast landed (`plan::Expr::Cast`), and probed directly both give what a real
+        // server gives — `1` and `t`. They stay declared because `SET TimeZone =
+        // 'Pacific/Auckland'` earlier in this corpus is refused, aborts the transaction, and
+        // swallows every statement after it: this file's entry in the harness's `SWALLOWING_DEBT`.
+        //
+        // So the entries below are measuring the **time zone** gap and not a cast one, and they
+        // come off the moment a named zone is a thing this node has. Left in place rather than
+        // deleted, because rule 2 cannot fire on a statement it never ran, and a divergence
+        // nobody checks is exactly what the provenance rule exists to keep honest.
         (
             "SELECT 'r', count(*) FROM bk WHERE updated_on = CURRENT_TIMESTAMP::date",
             "a per-row cast has only text as a target",

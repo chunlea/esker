@@ -179,6 +179,7 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
             for_each_subquery_mut(pattern, visit);
         }
         Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
         | Expr::ToText { operand, .. }
         | Expr::Scalar { operand, .. } => {
             for_each_subquery_mut(operand, visit);
