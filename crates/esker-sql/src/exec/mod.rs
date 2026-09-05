@@ -3095,11 +3095,29 @@ impl Executor {
         statement: &Statement,
     ) -> Result<Vec<Arc<crate::catalog::TableDef>>> {
         let view = self.catalog_view(txn)?;
-        // A name that is not there is not this function's error to raise: the statement will
+        // **Along the `search_path`, exactly as running the statement resolves it.** This looked
+        // the name up in the catalog directly, so a table in any schema but the session's default
+        // was simply *not found* — and the two failures that produced are worth naming, because
+        // neither looks like a resolution bug:
+        //
+        // * `Describe` of an `INSERT … RETURNING` answered `NoData`, and `Execute` — which
+        //   resolves properly — then sent a `DataRow`. libpq calls that
+        //   `server sent data ("D" message) without prior row description ("T" message)` and
+        //   **drops the connection**, so one statement costs the session.
+        // * a `$1` compared with `id integer` was typed against nothing and defaulted to text,
+        //   giving `operator does not exist: integer = text` for a perfectly ordinary bind.
+        //
+        // Both came from `schema_authorization_test.rb`, where the table lives in the user's own
+        // schema and `search_path` is `'$user',public`.
+        //
+        // A name that is not there is still not this function's error to raise: the statement will
         // reach it and report it with the message that statement uses.
         bind::table_names(statement)
             .into_iter()
-            .filter_map(|name| view.table(name).transpose())
+            .map(|name| self.resolve_unqualified(txn, name))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|name| view.table(&name).transpose())
             .collect()
     }
 
