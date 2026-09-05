@@ -101,8 +101,9 @@ ALTER TABLE t ADD COLUMN e int8 DEFAULT (1+1)
 statement error (0A000)
 ALTER TABLE t ADD COLUMN c int8 UNIQUE
 
-statement error (0A000)
-ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY
+# `ADD COLUMN ... PRIMARY KEY` was here. It declares a key now, on a table that has none
+# (`tests/add_column_primary_key.rs`), and so does `ADD CONSTRAINT ... PRIMARY KEY`. What is still
+# refused is a `serial` added to a table with rows, which PostgreSQL fills from the sequence.
 
 # `ALTER COLUMN a TYPE text` converts now (`tests/alter_column_type.rs`). What is still refused is
 # a `USING` that computes rather than converts: there is no per-row expression evaluator, and

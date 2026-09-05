@@ -41,6 +41,7 @@ mod probe;
 mod topology;
 mod workload;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,12 @@ pub(crate) struct BenchMppOptions {
     pub(crate) seed: u64,
     /// Keep the data directory after the run.
     pub(crate) keep: bool,
+    /// Report what each statement does on each engine instead of timing anything.
+    ///
+    /// The correctness half of a multi-region run: it never fails on a statement, it records what
+    /// the statement did — an answer or an error, with the code — so a path that breaks across a
+    /// region boundary is *evidence* rather than a benchmark that stopped.
+    pub(crate) diagnose: bool,
     /// Leave the join out of the timed set.
     ///
     /// It costs tens of seconds where the aggregates cost tens of milliseconds, and it cannot
@@ -102,6 +109,7 @@ impl Default for BenchMppOptions {
             base_port: 24_160,
             seed: 20_260_904,
             keep: false,
+            diagnose: false,
             no_join: false,
             // **The shipped defaults, which is what the working reference uses.** Shortening
             // them to 2 s places a columnar learner in seconds rather than fifty, and asks PD to
@@ -154,6 +162,13 @@ struct Run {
 
 /// How long a columnar copy has to appear and catch up before the run gives up.
 const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long placement is watched before the run reports what it saw.
+///
+/// Long, because the thing being distinguished is latency from absence and the shipped region
+/// heartbeat is 60 s: a window of one interval could not tell them apart, which is the mistake
+/// this constant exists to stop repeating.
+const PLACEMENT_SAMPLE_WINDOW: Duration = Duration::from_secs(300);
 
 /// How long the SQL node has to become writable before the run gives up.
 const WRITABLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -249,6 +264,9 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     // silent: the SQL node answers, the load succeeds, and only the columnar wait -- five minutes
     // later, after the load -- says anything is wrong. It was wrong here for exactly that reason,
     // and this is the check that turns it into fifteen seconds and a topology.
+    if options.diagnose {
+        return diagnose(cluster, options, shape);
+    }
     let voters = wait_for_the_replica_target(cluster)?;
     // Said as "carries", not "reached": with `--peer` the leader has the membership in hand at
     // once, so a few milliseconds here is the peer list being honoured rather than PD having
@@ -360,6 +378,172 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     println!();
     report(&runs, &queries);
     Ok(())
+}
+
+/// Statements run on each engine, with what each did, and the region map they ran against.
+///
+/// **Nothing here fails the run.** A statement that errors is the result; the point is to say what
+/// the path does across a region boundary, and a harness that stopped at the first error would
+/// report one fact where there are several.
+/// Watches columnar placement until every region has a learner or the window closes.
+///
+/// **Sampled over minutes, not read once.** PD reaches a store only by answering its region
+/// heartbeat and gives a region one operator at a time, so at the shipped 60 s interval a reading
+/// taken straight after the `ALTER` is consistent with "not yet" and with "never" alike. A series
+/// separates them: a count that climbs was latency, a count that sits is a defect.
+fn watch_placement(cluster: &Cluster) -> Result<(), String> {
+    println!("## Columnar placement, sampled");
+    println!();
+    println!("| at | regions | with a columnar learner |");
+    println!("|---|---|---|");
+    let watch = Instant::now();
+    let mut last = (0, 0);
+    while watch.elapsed() < PLACEMENT_SAMPLE_WINDOW {
+        let regions = cluster.regions()?;
+        let (with_a_learner, _) = topology::columnar_spread(&regions);
+        let now = (regions.len(), with_a_learner);
+        if now != last || watch.elapsed() < Duration::from_secs(1) {
+            println!(
+                "| {:>4.0?} | {} | {with_a_learner} |",
+                watch.elapsed(),
+                regions.len()
+            );
+            last = now;
+        }
+        if with_a_learner == regions.len() && !regions.is_empty() {
+            println!();
+            println!("Every region has one after {:.0?}.", watch.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+
+    Ok(())
+}
+
+fn diagnose(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result<(), String> {
+    wait_for_the_replica_target(cluster)?;
+    let mut pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+    let writable = Instant::now();
+    while let Err(why) = workload::create(&mut pg) {
+        if !why.contains("25006") || writable.elapsed() >= WRITABLE_TIMEOUT {
+            return Err(why);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+    }
+    let started = Instant::now();
+    let statements = workload::load(&mut pg, shape)?;
+    println!(
+        "loaded {} rows in {statements} statements in {:.1?}",
+        shape.rows,
+        started.elapsed()
+    );
+    // **The ALTER's outcome, not a swallowed result.** A previous run wrote `let _ =` here and
+    // then reported "0 of 10 regions had a columnar learner" — a sentence that cannot be read,
+    // because a refused `ALTER` and a working one that PD had not acted on yet produce it alike.
+    let asked = format!("ALTER TABLE {} SET (columnar_replicas = 1)", workload::FACT);
+    match pg.run(&asked) {
+        Ok(()) => println!("`{asked}` committed"),
+        Err(why) => println!("`{asked}` was REFUSED: {}", first_line(&why)),
+    }
+
+    watch_placement(cluster)?;
+
+    println!();
+    println!("## The region map, from each region's own leader");
+    println!();
+    let regions = cluster.regions()?;
+    println!("| region | start | end | peers |");
+    println!("|---|---|---|---|");
+    for region in &regions {
+        let peers: Vec<String> = region
+            .peers
+            .iter()
+            .map(|peer| {
+                format!(
+                    "{}@store{}{}",
+                    peer.peer_id,
+                    peer.store_id,
+                    role_tag(peer.role)
+                )
+            })
+            .collect();
+        println!(
+            "| {} | {} | {} | {} |",
+            region.id,
+            hex_head(&region.start_key),
+            hex_head(&region.end_key),
+            peers.join(" ")
+        );
+    }
+    let (with_a_learner, on_stores) = topology::columnar_spread(&regions);
+    println!();
+    println!(
+        "**{} regions**, {with_a_learner} with a columnar learner, on {on_stores} distinct stores.",
+        regions.len()
+    );
+    if regions.len() < 2 {
+        println!();
+        println!(
+            "> The table did **not** split. Everything below is single-region and says nothing \
+             about a boundary."
+        );
+    }
+
+    println!();
+    println!("## What each statement does, on each engine");
+    println!();
+    println!("| statement | engine | outcome |");
+    println!("|---|---|---|");
+    for (label, sql) in workload::diagnostics(shape) {
+        for engine in ["row", "columnar"] {
+            let outcome = match pg.run(&format!("SET esker.engine = '{engine}'")) {
+                Ok(()) => match pg.query(&sql) {
+                    Ok(answer) => format!("{} row(s)", answer.rows.len()),
+                    Err(why) => format!("**{}**", first_line(&why)),
+                },
+                Err(why) => format!("**SET failed: {}**", first_line(&why)),
+            };
+            println!("| {label} | {engine} | {outcome} |");
+        }
+    }
+    println!();
+    println!("| load average at end | {} |", loadavg());
+    if options.keep {
+        println!("(the cluster's data was kept)");
+    }
+    Ok(())
+}
+
+/// The role letter `esker region ls` uses.
+fn role_tag(role: esker_proto::PeerRole) -> &'static str {
+    match role {
+        esker_proto::PeerRole::Voter => "",
+        esker_proto::PeerRole::Learner => "L",
+        esker_proto::PeerRole::ColumnarLearner => "C",
+    }
+}
+
+/// The first eight bytes of a region bound, as hex; `+inf` for the empty upper bound.
+fn hex_head(key: &[u8]) -> String {
+    if key.is_empty() {
+        return "(unbounded)".to_owned();
+    }
+    let head = key.iter().take(8).fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    });
+    if key.len() > 8 {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// One line of an error, so a table cell stays a table cell.
+fn first_line(text: &str) -> String {
+    text.lines().last().unwrap_or(text).trim().to_owned()
 }
 
 /// Waits until every region has the cluster's replica target in voters.

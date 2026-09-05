@@ -173,8 +173,31 @@ pub fn snapshot() -> Vec<(u32, Activity)> {
             (backend.pid, activity)
         })
         .collect();
-    // By pid, so the view is stable between calls rather than in hash order.
-    rows.sort_by_key(|(pid, _)| *pid);
+    // **Running sessions first, then by pid** — and the first half is a choice this node makes
+    // where PostgreSQL specifies no order at all, not an attempt to copy one.
+    //
+    // Measured, because the obvious answer is wrong. `pg_stat_activity` on a real server is read
+    // out of the `PGPROC` slot array, and slots are *reused*, so its order is neither pid order
+    // nor connection order. Three sessions opened one second apart on PG19:
+    //
+    // ```text
+    // connected  46822, then 46830, then 46838
+    // returned   46830 | 46822 | 46838
+    // ```
+    //
+    // So "return them in connection order, which is what PostgreSQL does" cannot be implemented,
+    // because that is not what PostgreSQL does — the run-86 capture that showed a waiter ahead of
+    // an older holder was slot reuse, not an order anything can reproduce.
+    //
+    // What that leaves is a *choice*, and this is the one that serves the only client known to
+    // depend on it. `transaction_test.rb` hunts a cancellation target with
+    // `SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'` and **no `ORDER BY`**,
+    // then cancels the first row. Both the holder and the waiter match. The useful answer — the
+    // one a person asking that question wants — is the session that is *running* the statement,
+    // not the one idle in a transaction that ran it earlier; PostgreSQL gives it by accident and
+    // this gives it on purpose. The pid tie-break keeps the view stable between calls, which is
+    // what the sort was here for in the first place.
+    rows.sort_by_key(|(pid, activity)| (!activity.running, *pid));
     rows
 }
 

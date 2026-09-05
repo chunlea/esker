@@ -64,15 +64,15 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "CREATE TABLE t (a int8 GENERATED ALWAYS AS IDENTITY (START WITH 100))",
             "a sequence option on an identity column",
         ),
-        (
-            "ALTER TABLE t ADD COLUMN b bigserial",
-            "ALTER TABLE ... ADD COLUMN ... bigserial",
-        ),
-        // `CREATE TABLE … COLLATE "C"` is **built** now, so it is not a C2 refusal any more —
-        // `C` and `POSIX` name byte order, which is the ordering this node has
-        // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
-        // A collation it does not have is still refused, and with `42704` rather than `0A000`,
-        // which is why it does not belong in this list either: `tests/collation.rs` holds both.
+        // `ADD COLUMN ... bigserial` left this list: it creates the sequence now, on an empty
+        // table (`tests/add_column_primary_key.rs`). What stays refused is the same statement over
+        // a table that has rows, which PostgreSQL fills from the sequence.
+        //
+        // `CREATE TABLE … COLLATE "C"` left it too, and for a different reason: it is **built**
+        // now, because `C` and `POSIX` name byte order and byte order is the ordering this node
+        // has ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+        // A collation it does not have is still refused, with `42704` rather than `0A000`, which
+        // is why it does not belong here either: `tests/collation.rs` holds both halves.
         // **`PARTITION BY LIST` and `RANGE` left this list** with statements 781-786; `HASH` is
         // what is still refused, because nothing captured how it routes and a strategy this node
         // guessed at would put rows in the wrong partition.
@@ -208,10 +208,8 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
             "ALTER TABLE t ADD COLUMN c int8 UNIQUE",
             "ADD COLUMN ... UNIQUE",
         ),
-        (
-            "ALTER TABLE t ADD COLUMN c int8 PRIMARY KEY",
-            "ADD COLUMN ... PRIMARY KEY",
-        ),
+        // `ADD COLUMN ... PRIMARY KEY` left this list with the `bigserial` above it, and so did
+        // `ADD CONSTRAINT ... PRIMARY KEY`.
         ("ALTER TABLE t ADD COLUMN c text COLLATE \"C\"", "COLLATE"),
         // `ALTER COLUMN a TYPE text` was here. It converts now, so what stays refused is the
         // `USING` that asks for a **computation** rather than a conversion — the boundary the unit
@@ -221,10 +219,15 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
             "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING",
         ),
         // Still refused, and this is the one that keeps the `ADD CONSTRAINT` arm honest now that
-        // `UNIQUE` and `FOREIGN KEY` and `CHECK` are through it: a kind it cannot build must still
-        // name itself rather than fall through.
+        // `UNIQUE`, `FOREIGN KEY`, `CHECK` and `PRIMARY KEY` are all through it: a kind it cannot
+        // build must still name itself rather than fall through.
+        //
+        // **It used to be the plain `PRIMARY KEY (a)`**, which this node builds now — so the guard
+        // moved to `USING INDEX`, a real PostgreSQL statement that adopts an existing index as the
+        // constraint's and that this node has no way to honour. A guard whose example became
+        // supported is a guard that stopped guarding.
         (
-            "ALTER TABLE t ADD CONSTRAINT c PRIMARY KEY (a)",
+            "ALTER TABLE t ADD CONSTRAINT c PRIMARY KEY USING INDEX i",
             "ALTER TABLE ... ADD CONSTRAINT",
         ),
         ("ALTER TABLE ONLY t ADD COLUMN c int8", "ALTER TABLE ONLY"),
@@ -468,6 +471,7 @@ fn alter_table_lowers_its_actions_in_order() {
     let esker_sql::plan::AlterTableAction::AddColumn {
         column,
         if_not_exists,
+        ..
     } = &alter.actions[0]
     else {
         panic!("not an ADD COLUMN");
@@ -480,6 +484,7 @@ fn alter_table_lowers_its_actions_in_order() {
     let esker_sql::plan::AlterTableAction::AddColumn {
         column,
         if_not_exists,
+        ..
     } = &alter.actions[1]
     else {
         panic!("not an ADD COLUMN");

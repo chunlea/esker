@@ -1249,6 +1249,8 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 matches!(scope, Some(ContextModifier::Local)),
                 format!("SET LOCAL {name}"),
             )?;
+            // Every item, list or not: `$user` is a syntax error wherever it appears unquoted.
+            refuse_placeholders(values)?;
             let [value] = values.as_slice() else {
                 // PostgreSQL takes a list for `search_path`, and one is what `ActiveRecord` sends:
                 // `SET search_path TO "$user", public`. It arrives as two values and is one path.
@@ -1418,6 +1420,23 @@ fn guc_name(name: &ObjectName) -> Option<String> {
 /// A bare identifier that is not `DEFAULT` is a value PostgreSQL would take unquoted; taking it
 /// here keeps `SET esker.read_as_of TO now` from being a syntax-shaped surprise, and the value
 /// grammar refuses it with `22023` a moment later, which is the right condition for it.
+/// Refuses a `SET` value that is a bare `$name`, the way a real server's parser does.
+///
+/// `$` outside a string starts a parameter, so `SET search_path = $user,public` never reaches a
+/// GUC at all on PostgreSQL — it is `syntax error at or near "$"`, and the working spelling is
+/// `'$user'`. `sqlparser` hands it to us as a placeholder instead of refusing it, so this is where
+/// the difference is made. See [`SqlError::SetValueSyntax`] for the capture.
+fn refuse_placeholders(values: &[Expr]) -> Result<()> {
+    for value in values {
+        if let Expr::Value(literal) = value
+            && let Value::Placeholder(_) = &literal.value
+        {
+            return Err(SqlError::SetValueSyntax("$".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn guc_value(value: &Expr) -> Option<String> {
     match value {
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT") => None,
@@ -2739,6 +2758,7 @@ fn lower_alter_table(
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
         let mut collation: Option<String> = None;
+        let mut primary_key = false;
         let mut generated: Option<String> = None;
         let mut default = None;
         for option in &column_def.options {
@@ -2805,7 +2825,12 @@ fn lower_alter_table(
                     }
                     continue;
                 }
-                ColumnOption::PrimaryKey(_) => "ALTER TABLE ... ADD COLUMN ... PRIMARY KEY",
+                // `PRIMARY KEY` is carried rather than refused; the executor decides, because
+                // whether it can be added is a question about the rows.
+                ColumnOption::PrimaryKey(_) => {
+                    primary_key = true;
+                    continue;
+                }
                 ColumnOption::Unique(_) => "ALTER TABLE ... ADD COLUMN ... UNIQUE",
                 // `NULL` is the default and says nothing; honouring it is honouring nothing.
                 ColumnOption::Null => continue,
@@ -2825,14 +2850,11 @@ fn lower_alter_table(
         // rule**: an *empty* table has no row to hold a NULL, so there is nothing to refuse — and
         // every test in the suite that sends this adds a column to an empty table. The question is
         // about the rows, so it is asked by the executor, which can see them.
-        // `ALTER TABLE ... ADD COLUMN id bigserial` would have to create a sequence *and* fill
-        // every row already stored from it, which is the table rewrite this `ALTER` is defined not
-        // to do. Refused by name rather than half-done.
-        refuse_if(
-            serial_identity(&column_def.data_type).is_some(),
-            "ALTER TABLE ... ADD COLUMN ... bigserial",
-        )?;
+        // **A `serial` is carried too, for the reason `NOT NULL` above it is.** It would have to
+        // create a sequence *and* fill every row already stored from it, and the second half is
+        // only true of a table that has rows — which the executor can see and this cannot.
         actions.push(plan::AlterTableAction::AddColumn {
+            primary_key,
             column: plan::Column {
                 collation,
                 name: ident(&column_def.name),
@@ -2844,7 +2866,7 @@ fn lower_alter_table(
                 default_expr: None,
                 not_null,
                 default,
-                sequence: None,
+                sequence: serial_identity(&column_def.data_type),
                 // `ADD COLUMN … GENERATED ALWAYS AS (…) STORED` would have to compute the
                 // expression for every row already there, which is a backfill and not a catalog
                 // write — refused by name with every other option this action does not take.
@@ -3043,6 +3065,16 @@ fn lower_added_constraint(
             deferrable,
             deferred,
         }));
+    }
+    // `PRIMARY KEY` over columns the table already has, which is what `change_table`'s
+    // `t.primary_key :id` sends when the column is there. It declares a key and re-keys nothing:
+    // the rows keep whatever identity they were created with
+    // (`crate::catalog::TableDef::row_id`).
+    if let TableConstraint::PrimaryKey(key) = constraint {
+        return Ok(plan::AlterTableAction::AddPrimaryKey {
+            name: key.name.as_ref().map(ident),
+            columns: index_columns(&key.columns)?,
+        });
     }
     let TableConstraint::Check(check) = constraint else {
         return Err(SqlError::unsupported(format!(
@@ -3643,6 +3675,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             // real server gives.
             [table, column] => Ok(plan::Expr::Column {
                 table: Some(ident(table)),
+                name: ident(column),
+            }),
+            // `s.t.c`. **The qualifier goes through `relation_name`**, which is the one place
+            // this crate decides what `schema.relation` means — `public` dropped because a public
+            // table's stored name is bare, `pg_temp` and `pg_catalog` kept as lookup prefixes.
+            // Comparing the text instead would refuse `public.t.c` over a bare `FROM t`, which a
+            // real server answers, and there would be a second parser of a grammar that already
+            // has one.
+            [schema, table, column] => Ok(plan::Expr::Column {
+                table: Some(relation_name(&ObjectName(vec![
+                    sqlparser::ast::ObjectNamePart::Identifier(schema.clone()),
+                    sqlparser::ast::ObjectNamePart::Identifier(table.clone()),
+                ]))?),
                 name: ident(column),
             }),
             _ => Err(SqlError::unsupported(format!(
@@ -6081,7 +6126,16 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
                 refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
                 match kind {
                     SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
+                        // `s.t.*` reaches the same rules a `FROM s.t` does, for the reason
+                        // above: one grammar, one parser. `object_name` refuses qualification by
+                        // design and is right to — it names extensions, schemas and databases,
+                        // which have no schema of their own.
+                        Ok(plan::SelectItem::QualifiedWildcard(
+                            match name.0.as_slice() {
+                                [_] => object_name(name)?,
+                                _ => relation_name(name)?,
+                            },
+                        ))
                     }
                     // `STRUCT('x').*` and friends: an expression, not a table.
                     SelectItemQualifiedWildcardKind::Expr(_) => {
