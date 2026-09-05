@@ -221,6 +221,37 @@ fn apply_alter_collation(lowered: &mut plan::Statement, written: &str) -> Result
     Ok(())
 }
 
+/// `ROW(a, b, …)` as the record literal it becomes.
+///
+/// **Constants only, and the refusal says so.** A field whose value is not known until there is a
+/// row would make this a runtime constructor — the shape `ARRAY[…]` needed — and nothing in the
+/// suite writes one: `composite_test.rb` sends string literals and its custom type sends the text
+/// form directly. Refused by name rather than half-built.
+fn lower_row_constructor(args: &[FunctionArg]) -> Result<plan::Expr> {
+    let mut fields = Vec::with_capacity(args.len());
+    for arg in args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+            return Err(SqlError::unsupported("ROW with a named argument"));
+        };
+        // Each field by its own output function, which for a constant is the text it was written
+        // as — the same rule the composite's renderer applies to every value.
+        fields.push(match lower_expr(expr)? {
+            plan::Expr::Literal(plan::Literal::Null) => None,
+            plan::Expr::Literal(plan::Literal::String(text)) => Some(text),
+            plan::Expr::Literal(plan::Literal::Integer(value)) => Some(value.to_string()),
+            plan::Expr::Literal(plan::Literal::Decimal(digits)) => Some(digits),
+            plan::Expr::Literal(plan::Literal::Bool(value)) => {
+                Some(if value { "t" } else { "f" }.to_owned())
+            }
+            plan::Expr::Literal(plan::Literal::Typed(value)) => value.to_text(),
+            _ => return Err(SqlError::unsupported("ROW over anything but constants")),
+        });
+    }
+    Ok(plan::Expr::Literal(plan::Literal::String(
+        value::composite::render(&fields),
+    )))
+}
+
 /// The collation a `COLLATE` names, if this node has it.
 ///
 /// `C` and `POSIX` are the same ordering under two names — byte order, which a memcomparable key
@@ -4443,6 +4474,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
                 .collect::<Result<Vec<_>>>()?,
             def: None,
         })));
+    }
+    // **`ROW(a, b, …)` is a record constructor, not a function**, and what it builds is the
+    // composite *text* — PostgreSQL's `ROW(…)` has no type of its own until it is assigned to a
+    // column that has one, and the assignment is where the arity is checked because that is where
+    // the catalog is. `INSERT … VALUES (1, ROW('Paris','Champs-Élysées'))` is what
+    // `composite_test.rb` sends.
+    if name.eq_ignore_ascii_case("row")
+        && let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args
+    {
+        return lower_row_constructor(args);
     }
     let Some(func) = plan::AggregateFunc::from_name(&name) else {
         // **A name this vocabulary lacks may be a function the catalog holds**, and lowering

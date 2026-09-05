@@ -37,7 +37,20 @@ pub(super) fn into_column(
     // below would be about the storage: `'angry'` would be `22P02 invalid input syntax for type
     // smallint` where a real server names the enum and the label it did not have.
     if let Some(def) = user_type {
-        return into_enum(value, column, def);
+        match &def.kind {
+            crate::catalog::TypeKind::Enum { .. } => return into_enum(value, column, def),
+            // **A composite arrives as text and is stored canonically**, so what a client wrote
+            // and what a real server would have printed are the same string by the time it is a
+            // row: `'(Paris,Rue Basse)'` becomes `(Paris,"Rue Basse")`, which is
+            // `composite_test.rb`'s fourth assertion. The arity is checked here because this is
+            // where the type's fields are known, and a count that does not match is the same
+            // `malformed record literal` every other fault gets.
+            crate::catalog::TypeKind::Composite { fields } => {
+                return into_composite(value, column, def, fields.len());
+            }
+            // A domain is its base type and a range is its own; neither wants anything here.
+            _ => {}
+        }
     }
     if value.fits(column.ty) {
         return Ok(value);
@@ -109,22 +122,34 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
     })
 }
 
-/// The enum a column was declared as, or `None` for a column that is not one.
+/// The user type a column was declared as **when that type rewrites its values**, or `None`.
 ///
-/// The labels are on the `TableDef` rather than on the column, because the type is its own catalog
-/// record and the column stores only its oid — see `crate::catalog::TableDef::enums`, which is
-/// where the read happens and where the "only when a column has one" guard lives.
-pub(super) fn enum_of<'a>(
+/// **Two kinds do, not one.** An enum's label becomes an ordinal on the way in and a label on the
+/// way out; a **composite**'s text is re-rendered canonically, so `'(Paris,Rue Basse)'` is stored
+/// as `(Paris,"Rue Basse")` and two spellings of one record become one string — which is what lets
+/// `text`'s comparison be the composite's (ADR 0042). A **range** and a **domain** are not in this
+/// set: they store their own value unchanged and need only the type's name and oid, which is what
+/// [`user_type_of`] answers.
+///
+/// The type is on the `TableDef` rather than on the column, because it is its own catalog record
+/// and the column stores only its oid — see `crate::catalog::TableDef::enums`, which is where the
+/// read happens and where the "only when a column has one" guard lives.
+pub(super) fn rewriting_type_of<'a>(
     table: &'a crate::catalog::TableDef,
     column: &ColumnDef,
 ) -> Option<&'a crate::catalog::TypeDef> {
     let def = user_type_of(table, column)?;
-    matches!(def.kind, crate::catalog::TypeKind::Enum { .. }).then_some(def)
+    matches!(
+        def.kind,
+        crate::catalog::TypeKind::Enum { .. } | crate::catalog::TypeKind::Composite { .. }
+    )
+    .then_some(def)
 }
 
 /// The user-defined type a column was declared as, **whatever kind it is**.
 ///
-/// [`enum_of`] narrows this to enums, and the two are not interchangeable: an enum is the kind
+/// [`rewriting_type_of`] narrows this to the kinds that rewrite a value, and the two are not
+/// interchangeable: an enum and a composite are the kinds whose *values* change shape
 /// whose *values* are rewritten — a label in, an ordinal stored, a label out — and everything
 /// keyed on that must ask the narrow question. A user-defined **range** stores its own value
 /// unchanged, and what it needs is only the type's *name and oid*: `pg_typeof`, the
@@ -196,6 +221,31 @@ pub(super) fn into_enum(
                 value: text,
             }),
         },
+        other => Err(SqlError::DatatypeMismatchInColumn {
+            column: column.name.clone(),
+            column_type: def.name.clone(),
+            expression_type: other.column_type().map_or("unknown", PgType::name),
+        }),
+    }
+}
+
+/// One value on its way into a **composite** column: the canonical record text, or the error
+/// PostgreSQL gives.
+///
+/// A composite's stored form is its text (`value::composite`), so this is a *re-rendering* and not
+/// a conversion — the point of it is that two clients writing the same record in different
+/// spellings store the same bytes, which is what lets `text`'s comparison be the composite's.
+fn into_composite(
+    value: Datum,
+    column: &ColumnDef,
+    def: &crate::catalog::TypeDef,
+    arity: usize,
+) -> Result<Datum> {
+    match value {
+        Datum::Null => Ok(Datum::Null),
+        Datum::Text(text) => Ok(Datum::Text(crate::value::composite::canonicalise(
+            &text, arity,
+        )?)),
         other => Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: def.name.clone(),

@@ -130,6 +130,8 @@ fn view_attribute(relation: &RelationRow, column: &super::ViewColumn, attnum: i1
         Datum::Int4(column.typmod),
         Datum::Bool(false),
         Datum::Bool(false),
+        // A view's column has no missing value: nothing pads it, the query does.
+        Datum::Bool(false),
         Datum::Text(NOT_IDENTITY.to_owned()),
         Datum::Text(NOT_IDENTITY.to_owned()),
         Datum::Bool(false),
@@ -163,6 +165,8 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
                 // own width, which is what `-1` says.
                 Datum::Int4(-1),
                 Datum::Bool(false),
+                Datum::Bool(false),
+                // No catalog column was ever added by an `ALTER`, so none pads.
                 Datum::Bool(false),
                 Datum::Text(NOT_IDENTITY.to_owned()),
                 Datum::Text(NOT_IDENTITY.to_owned()),
@@ -383,6 +387,13 @@ fn attribute(
         Datum::Int4(column.typmod),
         Datum::Bool(own && column.not_null && !column.dropped),
         Datum::Bool(has_default),
+        // **`ColumnDef::missing` is the flag.** It is written by `ADD COLUMN` with a *folded*
+        // default and is `None` everywhere else — including a `CREATE TABLE` default, an
+        // expression default that rewrote the rows, and every column of an index or a sequence —
+        // which is exactly PostgreSQL's rule, measured across all five shapes
+        // (`tests/att_has_missing.rs`). `own` because a column borrowed onto another relation's
+        // row carries none of its owner's defaults.
+        Datum::Bool(own && column.missing.is_some()),
         Datum::Text(identity.to_owned()),
         // **One character, and the empty string for a column that is neither** — the same shape
         // `attidentity` has. `s` and `v` are the two kinds of generated column, and this is the
@@ -525,6 +536,12 @@ pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType)] = &[
     ("atttypmod", ColumnType::Int4),
     ("attnotnull", ColumnType::Bool),
     ("atthasdef", ColumnType::Bool),
+    // **Whether the column has a *missing value*, which is not whether it has a default.** A
+    // default written at `CREATE TABLE` applies to rows written after it and there are no earlier
+    // rows to stand in for, so `atthasdef` is `t` and this is `f`; a constant default added by
+    // `ALTER TABLE … ADD COLUMN` is stored on the column and padded with, and both are `t`. It is
+    // the only way a client can ask whether that `ALTER` rewrote the table.
+    ("atthasmissing", ColumnType::Bool),
     ("attidentity", ColumnType::Text),
     ("attgenerated", ColumnType::Text),
     ("attisdropped", ColumnType::Bool),
