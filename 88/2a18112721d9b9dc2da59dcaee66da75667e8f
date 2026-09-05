@@ -1,0 +1,21 @@
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_642a06554e9ba5 346-369
+crates/esker-sql/tests/interval_precision.rs
+  s_e5c0c6e78b5662::t_813a0e6715e998 119,121-123,125,127-133,135-142,144-146,148-156,158-159,161-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "882a18112721d9b9dc2da59dcaee66da75667e8f",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
