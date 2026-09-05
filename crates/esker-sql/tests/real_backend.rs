@@ -578,3 +578,287 @@ fn consecutive_serial_ids_are_consecutive() {
         "a pooled client on one node sees one consecutive run, not a block per connection"
     );
 }
+
+/// **`range_test.rb`'s own shape**, 46 rounds of it, on a real cluster through a pool.
+///
+/// The residual after ADR 0072. r1's two measured endpoints from run 85 disagree with the three
+/// tests above, and this is the one that decides between them: in isolation their replay of the
+/// file's `setup` plus the five explicit-id fixtures answered **2** for the next
+/// `INSERT … RETURNING id`, and inside the file `PostgresqlRange.first` returns the id=101 fixture
+/// — so by `test_infinity_values` the created id has climbed **above 101**, which 46 rounds of one
+/// created row each cannot do unless something carries across a round.
+///
+/// So the round here is the file's, not a convenient one:
+///
+/// * `create_table force: true` is `DROP TABLE IF EXISTS` **then** `CREATE TABLE`, at the *start*
+///   of the round — the last round's table is left behind, which is what the next round drops;
+/// * the five fixtures carry **explicit** ids 101-105, which on a real server do not advance the
+///   sequence at all;
+/// * the created row is an `INSERT … RETURNING id`, and it is the returned value that is asserted
+///   rather than `min(id)` — a round that returns 2 is a failure the lowest-id check would miss,
+///   because 2 is still below 101;
+/// * the connection **rotates** through a pool of five, which is `ActiveRecord`'s default and the
+///   reason a per-connection block was visible at all.
+///
+/// Both halves match 19beta1: **1** every round, and **106** once `reset_pk_sequence!` has run.
+/// So the id cannot climb past 101 by this route, and the created row being above the fixtures is
+/// not what separates the two servers — PostgreSQL is above them too.
+#[test]
+fn the_range_files_own_round_gives_the_ids_postgresql_gives() {
+    let cluster = Cluster::start();
+    let mut ddl = cluster.session();
+    let mut pool: Vec<_> = (0..5).map(|_| cluster.session()).collect();
+
+    let mut returned = Vec::new();
+    for round in 0..46 {
+        ddl.run("DROP TABLE IF EXISTS postgresql_ranges").unwrap();
+        ddl.run("CREATE TABLE postgresql_ranges (id bigserial PRIMARY KEY, note text)")
+            .unwrap();
+        for id in 101..=105 {
+            ddl.run(&format!(
+                "INSERT INTO postgresql_ranges (id, note) VALUES ({id}, 'fixture')"
+            ))
+            .unwrap();
+        }
+        let at = round % pool.len();
+        let writer = &mut pool[at];
+        let created =
+            writer.rows("INSERT INTO postgresql_ranges (note) VALUES ('created') RETURNING id");
+        returned.push(created);
+
+        // **And the same round with the step `ActiveRecord` actually takes between them.**
+        // `reset_pk_sequence!` runs on every fixture load and sends
+        // `setval(pg_get_serial_sequence(…), max(id) + 1, false)`, which on 19beta1 makes the next
+        // created id **106** and `PostgresqlRange.first` return the id=101 fixture — measured.
+        // That is the condition run 85 read as the failure, and PostgreSQL is in it too, so a
+        // created row above the fixtures cannot be what separates the two servers.
+        // `reset_pk_sequence!` reads the maximum in a **separate** query and interpolates it as
+        // a literal, so this is two statements and not a subquery — `postgresql/schema_statements`
+        // builds `SELECT setval('…', <max>, true)`.
+        let max_pk = ddl.rows("SELECT MAX(id) FROM postgresql_ranges");
+        assert_eq!(max_pk, [[Some("105".to_owned())]], "round {round}");
+        // The **name is resolved in its own query too** (`pk_and_sequence_for`) and comes back
+        // quoted and schema-qualified, which is the spelling `crate::exec` already carries a
+        // regression test for.
+        ddl.run("SELECT setval('\"public\".\"postgresql_ranges_id_seq\"', 105, true)")
+            .unwrap();
+        let after_reset =
+            writer.rows("INSERT INTO postgresql_ranges (note) VALUES ('reset') RETURNING id");
+        assert_eq!(
+            after_reset,
+            [[Some("106".to_owned())]],
+            "round {round}: after reset_pk_sequence! the next id is max(id) + 1, as on 19beta1"
+        );
+    }
+
+    let ones: Vec<Vec<Vec<Option<String>>>> =
+        (0..46).map(|_| vec![vec![Some("1".to_owned())]]).collect();
+    assert_eq!(
+        returned, ones,
+        "every round re-creates the table, so every created id is 1 — an id above 101 is what \
+         makes `PostgresqlRange.first` return a fixture"
+    );
+}
+
+/// **An explicit id never moves a sequence**, which is what separates the two servers in
+/// `range_test.rb`.
+///
+/// r1's PG-side capture (run 86) overturned the reading this lane and the coordinator had both
+/// been working from: there is **no `reset_pk_sequence!` anywhere in that test's path** — 890
+/// statements and not one `setval` or `nextval` on `postgresql_ranges_id_seq`. So on 19beta1 the
+/// five explicit-id fixtures leave the sequence completely alone, `last_value` is still `1` with
+/// `is_called` `f`, the `create!` gets id **1**, and `PostgresqlRange.first` returns the row the
+/// test just made. That is why PostgreSQL passes.
+///
+/// The three things to check are therefore the sequence's own state and the next id, with no
+/// `setval` in sight anywhere.
+#[test]
+fn an_explicit_id_does_not_move_the_sequence() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+    session
+        .run("CREATE TABLE pr (id bigserial PRIMARY KEY, note text)")
+        .unwrap();
+    for id in 101..=105 {
+        session
+            .run(&format!(
+                "INSERT INTO pr (id, note) VALUES ({id}, 'fixture')"
+            ))
+            .unwrap();
+    }
+
+    // `1 | f` on 19beta1: nothing has drawn from it, so it has not been called and its `last_value`
+    // is still the start.
+    assert_eq!(
+        session.rows("SELECT last_value, is_called FROM pr_id_seq"),
+        [[Some("1".to_owned()), Some("f".to_owned())]],
+        "five explicit ids must leave the sequence untouched"
+    );
+
+    // And the created row is **1**, below the fixtures, which is what makes `.first` the new row.
+    assert_eq!(
+        session.rows("INSERT INTO pr (note) VALUES ('created') RETURNING id"),
+        [[Some("1".to_owned())]],
+        "the next id is the sequence's first value, not max(id) + 1"
+    );
+    assert_eq!(
+        session.rows("SELECT id FROM pr ORDER BY id ASC LIMIT 1"),
+        [[Some("1".to_owned())]],
+        "`PostgresqlRange.first` is the created row"
+    );
+}
+
+/// **A re-created sequence must start at 1 even while another session is drawing from it.**
+///
+/// r1's node-side capture (run 86) narrowed `range_test.rb#test_infinity_values` to a race:
+/// twenty isolated `DROP`/`CREATE` cycles all give id 1, and only under concurrent activity from
+/// another pass did a cycle come up **already advanced by exactly one block** — `33 = 1 + 32`, and
+/// once `737`. Never on a quiet node. `ActiveRecord`'s pool is what supplies that concurrency in
+/// the file, which is why the test passes alone and fails inside it.
+///
+/// So the shape here is a cycle of `DROP TABLE` + `CREATE TABLE` on one connection while others
+/// keep inserting, and the assertion is the one PostgreSQL always satisfies: **the first id after
+/// a `CREATE` is 1**. A block reserved against the old sequence, or against the new one before its
+/// stored counter was written, is what would make it 33.
+///
+/// The writers are expected to fail — their table disappears under them — so their errors are
+/// counted rather than asserted; what must never happen is a *created* row numbered above the
+/// fixtures.
+#[test]
+fn a_re_created_sequence_starts_at_one_under_concurrency() {
+    let cluster = Cluster::start();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let advanced: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        // Four writers, which is `ActiveRecord`'s pool minus the one doing the schema change.
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let mut writer = cluster.session();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Every outcome is fine — the table comes and goes underneath this — and the
+                    // point of the thread is the `nextval` traffic, not its success.
+                    let _ = writer.run("INSERT INTO cyc (note) VALUES ('w')");
+                }
+            });
+        }
+
+        // **The stop flag is set on every path**, including a panic: `thread::scope` joins while
+        // unwinding, so a failure that left the writers spinning would turn an assertion into a
+        // hang rather than a report.
+        let cycles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ddl = cluster.session();
+            for round in 0..40 {
+                // **The schema change is tolerated too, not only the probe below.** Four writers
+                // hammering the same table make every catalog write a race this connection can
+                // lose, and a `DROP` that came back `40001` used to panic here — the test
+                // manufacturing its own failure out of the load it exists to create. A round
+                // whose table was never re-created has no id to judge, so it is skipped for the
+                // same reason a round whose insert lost is.
+                if ddl.run("DROP TABLE IF EXISTS cyc").is_err()
+                    || ddl
+                        .run("CREATE TABLE cyc (id bigserial PRIMARY KEY, note text)")
+                        .is_err()
+                {
+                    continue;
+                }
+                // Tolerated, not asserted: with four writers churning the same table this
+                // connection's own statement can lose a race on the catalog and come back
+                // `42P01`. A round that could not be measured is skipped rather than failed —
+                // what is being looked for is a *wrong id*, and a round with no id in it has
+                // none.
+                if ddl.run("INSERT INTO cyc (note) VALUES ('ddl')").is_err() {
+                    continue;
+                }
+                // **The signature is a whole block, not a gap.** A statement that fails after
+                // drawing `nextval` burns its value on a real server too, and the writers here
+                // fail constantly — their table is being dropped under them — so small gaps are
+                // ordinary and `max(id) > count(*)` catches those rather than the defect.
+                //
+                // What a block outliving its sequence produces is different in kind: the *first*
+                // row in a fresh table numbered `1 + SEQUENCE_BATCH`. r1 saw exactly `33`, and
+                // once `737`. So the invariant is on the **minimum** id, and the threshold is one
+                // block: burned values move it by ones, a stale reservation moves it by 32.
+                let Ok(Outcome::Rows { rows: shape, .. }) = ddl.run("SELECT min(id) FROM cyc")
+                else {
+                    continue;
+                };
+                let Some(Some(min)) = shape.first().and_then(|row| row.first()) else {
+                    continue;
+                };
+                let min = String::from_utf8_lossy(min).parse::<i64>().unwrap_or(1);
+                let batch = i64::try_from(esker_sql::catalog::SEQUENCE_BATCH).unwrap_or(32);
+                if min > batch {
+                    advanced
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(format!(
+                            "round {round}: the lowest id in a fresh table is {min}, more than \
+                             one block ({batch}) in — a reservation outlived its sequence"
+                        ));
+                }
+            }
+        }));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(panic) = cycles {
+            std::panic::resume_unwind(panic);
+        }
+    });
+
+    let advanced = advanced
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        advanced.is_empty(),
+        "a re-created sequence came up already advanced, which is the file's failure:\n{}",
+        advanced.join("\n")
+    );
+}
+
+/// **The schema change and the insert on two different connections**, which is the one thing
+/// r1's resetting cycles did not have.
+///
+/// Run 86's whole-file trace: the created id is exactly `1 + 32 * (k - 1)` for the k-th test —
+/// one whole block per `create_table force: true`, and the counter never returns to 1. r1's own
+/// twenty cycles of the identical DDL reset correctly every time, and they ran on **one
+/// connection**; `ActiveRecord` runs the file through a pool, so the `DROP`/`CREATE` and the
+/// `INSERT` need not be the same session.
+///
+/// So this is that repro, deterministic rather than concurrent: `ddl` re-creates the table and
+/// `writer` — a different session, with its own catalog cache and its own view of which sequence
+/// the table has — does the insert. PostgreSQL answers 1 every round.
+#[test]
+fn a_second_connection_sees_the_re_created_sequence_start_over() {
+    let cluster = Cluster::start();
+    let mut ddl = cluster.session();
+    let mut writer = cluster.session();
+
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ddl.run("DROP TABLE IF EXISTS two_conn").unwrap();
+        ddl.run("CREATE TABLE two_conn (id bigserial PRIMARY KEY, v int8)")
+            .unwrap();
+        // The five explicit-id fixtures the file inserts before its `create!`, which must leave
+        // the sequence alone.
+        for id in 101..=105 {
+            ddl.run(&format!("INSERT INTO two_conn (id, v) VALUES ({id}, 0)"))
+                .unwrap();
+        }
+        let created = writer.rows("INSERT INTO two_conn (v) VALUES (1) RETURNING id");
+        ids.push(
+            created
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .flatten()
+                .unwrap_or_default(),
+        );
+    }
+
+    assert_eq!(
+        ids,
+        ["1", "1", "1", "1"],
+        "a re-created sequence handed a second connection a value from the old run — this is the \
+         file's `1, 33, 65, 97`"
+    );
+}

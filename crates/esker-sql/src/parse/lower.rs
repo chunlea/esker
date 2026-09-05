@@ -1573,6 +1573,29 @@ pub(super) fn column_default(
     {
         return Err(error);
     }
+    // **`nextval('s')` is stored as `nextval('s'::regclass)`**, which is not the text that was
+    // written. PostgreSQL does not keep the text at all — it keeps a parsed node, and `nextval`
+    // takes a `regclass`, so the `unknown` literal is coerced and the coercion is what
+    // `pg_get_expr` deparses. Measured: a column declared
+    // `DEFAULT nextval('postgresql_serials_id_seq')` reads back with the cast.
+    //
+    // It matters because it is what a *hand-written* default looks like to a schema dumper.
+    // `serial_test.rb`'s `test_schema_dump_with_not_serial` matches on the `::regclass` form to
+    // decide the column is not a serial, and a dumper handed back the text as typed does not
+    // recognise it. A **serial's** own default already prints this way
+    // (`catalog::pg_attribute`), from the sequence rather than from any stored text — this is the
+    // other half, and now both spellings agree.
+    //
+    // Normalised here rather than at every reader: the matcher is `sequence_literal_name`, the
+    // one `lower_set_default` uses, so there is still one reader of this grammar.
+    if let Expr::Function(function) = expr
+        && let Ok(name) = unqualified_function_name(function)
+        && name.eq_ignore_ascii_case("nextval")
+        && let Ok([argument]) = <[&Expr; 1]>::try_from(function_arguments(function, "nextval")?)
+        && let Some(sequence) = sequence_literal_name(argument)
+    {
+        return Ok((None, Some(format!("nextval('{sequence}'::regclass)"))));
+    }
     Ok((None, Some(expr.to_string())))
 }
 
@@ -1788,6 +1811,24 @@ fn lower_set_default(value: &Expr) -> Result<plan::ColumnDefault> {
     })
 }
 
+/// `json` or `jsonb` when an expression is **written** as one, and `None` otherwise.
+///
+/// Syntax only, which is all this layer has and all the guard above needs: a cast (`x::jsonb`) or
+/// a typed string (`JSONB '…'`). A `json`-typed *column* is invisible here and is caught where the
+/// plan carries its type, in `crate::exec::cursor`.
+fn json_cast_name(expr: &Expr) -> Option<&'static str> {
+    let data_type = match unwrap_nested(expr) {
+        Expr::Cast { data_type, .. } => data_type,
+        Expr::TypedString(typed) => &typed.data_type,
+        _ => return None,
+    };
+    match lower_type(data_type) {
+        Ok((ColumnType::Json, _)) => Some("json"),
+        Ok((ColumnType::Jsonb, _)) => Some("jsonb"),
+        _ => None,
+    }
+}
+
 /// The sequence a `nextval` argument names: `'s'` and `'s'::regclass` are the same thing.
 fn sequence_literal_name(argument: &Expr) -> Option<String> {
     let inner = match unwrap_nested(argument) {
@@ -1796,7 +1837,10 @@ fn sequence_literal_name(argument: &Expr) -> Option<String> {
     };
     match inner {
         Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) => Some(sequence_reference(text)),
+            Value::SingleQuotedString(text)
+            | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
+                Some(sequence_reference(text))
+            }
             _ => None,
         },
         _ => None,
@@ -2989,25 +3033,32 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         !create.alter_options.is_empty(),
         "CREATE INDEX with table options",
     )?;
-    if let Some(using) = &create.using
-        && !matches!(using, IndexType::BTree)
-    {
-        // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is a
-        // different complaint: `amcaninclude` is a property of the access method, checked before
-        // anything about the index is built, so `USING hash (…) INCLUDE (…)` is refused for the
-        // payload rather than for the method. Measured for `hash` and for `brin`, one sentence
-        // with the name substituted.
-        if create.include.is_empty() {
-            // Every index here is a range of the ordered key space, which is what a btree is.
-            // Saying `USING hash` and getting one would be a different index than the user asked
-            // for.
-            return Err(SqlError::unsupported(format!("an index USING {using}")));
+    // **`gin` and `gist` are recorded; `hash` and `brin` are still refused**
+    // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+    // The two that are recorded are the two the suite writes, and what is built underneath is the
+    // ordered index every index here is — the catalog says what was asked for and nothing claims a
+    // trigram search is accelerated. The two that are refused have no operator class this node
+    // knows either, so recording one would be a name with nothing behind it.
+    let access_method = match &create.using {
+        None | Some(IndexType::BTree) => catalog::BTREE_ACCESS_METHOD.to_owned(),
+        Some(using) => {
+            let name = using.to_string().to_ascii_lowercase();
+            if !matches!(name.as_str(), "gin" | "gist") {
+                // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is
+                // a different complaint: `amcaninclude` is a property of the access method,
+                // checked before anything about the index is built, so `USING hash (…) INCLUDE
+                // (…)` is refused for the payload rather than for the method. Measured for `hash`
+                // and for `brin`, one sentence with the name substituted.
+                if create.include.is_empty() {
+                    return Err(SqlError::unsupported(format!("an index USING {using}")));
+                }
+                return Err(SqlError::AccessMethodWithoutInclude(name));
+            }
+            name
         }
-        return Err(SqlError::AccessMethodWithoutInclude(
-            using.to_string().to_ascii_lowercase(),
-        ));
-    }
+    };
     Ok(plan::CreateIndex {
+        access_method,
         // Kept as text and lowered per row, the same trade a `CHECK` makes — and normalised the
         // way `pg_get_indexdef` prints it, which is one pair of parentheses however it was
         // written (`unwrap_nested`).
@@ -3615,6 +3666,25 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     })));
                 }
                 BinaryOperator::StringConcat => {
+                    // **A `jsonb` operand takes `||` away from string concatenation**, and this
+                    // is the only layer that can see one: a literal cast is folded to its value
+                    // before the executor runs, and `jsonb` has no `Datum` of its own — it is a
+                    // `Datum::Text`, so `'{"a":1}'::jsonb || '{"b":2}'::jsonb` would concatenate
+                    // two documents into a string that is not a document. A **wrong answer**
+                    // where a refusal is a gap, which
+                    // [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) ranks
+                    // the other way round, so it is refused here with the `0A000` the operator
+                    // gave before `||` over text existed. A jsonb *column* is caught in
+                    // `exec::cursor`, where an `Expr::Ordinal` still carries its type.
+                    //
+                    // PostgreSQL's answer is document **merge**, right operand winning a
+                    // duplicate key. Building it needs a representation of its own —
+                    // `docs/plans/jsonb-representation.md`, and ADR 0042's rule is why.
+                    for operand in [left.as_ref(), right.as_ref()] {
+                        if let Some(name) = json_cast_name(operand) {
+                            return Err(SqlError::unsupported(format!("|| over {name}")));
+                        }
+                    }
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreConcat,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
@@ -4358,21 +4428,17 @@ fn lower_sequence_function(
         )));
     }
 
+    // **`nextval('s'::regclass)` names the same sequence as `nextval('s')`**, and it is the
+    // spelling a real server hands back: `pg_get_expr` deparses the coercion `nextval(regclass)`
+    // forces on the literal, so a client that reads a default and sends it on writes the cast.
+    // This refused it until the third reader of this grammar became a caller of the first —
+    // `sequence_literal_name`, which `lower_set_default` and `column_default` already use.
     let named = |expr: &Expr| -> Result<String> {
-        match expr {
-            Expr::Value(value) => match &value.value {
-                Value::SingleQuotedString(text)
-                | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
-                    Ok(sequence_reference(text))
-                }
-                other => Err(SqlError::unsupported(format!(
-                    "the sequence name {other}, which is not a string literal"
-                ))),
-            },
-            other => Err(SqlError::unsupported(format!(
-                "the sequence name {other}, which is not a string literal"
-            ))),
-        }
+        sequence_literal_name(expr).ok_or_else(|| {
+            SqlError::unsupported(format!(
+                "the sequence name {expr}, which is not a string literal"
+            ))
+        })
     };
 
     let call = match (func, plain.as_slice()) {
@@ -7232,6 +7298,7 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
         .iter()
         .map(|column| {
             index_key_options(column)?;
+            refuse_if(column.operator_class.is_some(), "an index operator class")?;
             // `UNIQUE (a DESC)` and `PRIMARY KEY (a NULLS FIRST)` are **syntax errors** on a real
             // server — measured, `42601 syntax error at or near "DESC"` — because a constraint's
             // grammar has no direction in it at all. Refused by name rather than accepted and
@@ -7256,8 +7323,12 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
 }
 
 /// The options a key part may not carry, whichever kind of key it is in.
+///
+/// **An operator class is no longer one of them in a `CREATE INDEX`** — it is recorded there
+/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md))
+/// — and it is still refused in a *constraint*, where a real server's grammar has no place for
+/// one: `UNIQUE (a text_pattern_ops)` is a syntax error there.
 fn index_key_options(column: &IndexColumn) -> Result<()> {
-    refuse_if(column.operator_class.is_some(), "an index operator class")?;
     refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
     Ok(())
 }

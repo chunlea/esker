@@ -2054,6 +2054,24 @@ impl Executor {
                         }
                     }
                 })?;
+        // **Who drew it, and for what.** The reservation above is logged by the allocator, which
+        // knows the sequence and not the session; this is the other half, so one log line pair
+        // says `session 42 drew 33 for sequence 9 running INSERT INTO …`. Together they attribute
+        // a block boundary to a statement, which is the whole difficulty of a `+32 per test`
+        // climb seen from a client.
+        tracing::debug!(
+            pid = self.identity.pid,
+            sequence_id,
+            value,
+            query = self
+                .identity
+                .activity
+                .lock()
+                .ok()
+                .and_then(|activity| activity.query.clone())
+                .unwrap_or_default(),
+            "drew a sequence value"
+        );
         // **`currval` and `lastval` stay this session's**, because that is what they are on a real
         // server: the value *this* session last took, not one the node did.
         self.last_sequence = Some(sequence_id);

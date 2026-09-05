@@ -397,7 +397,20 @@ const PD_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// It bounds a probe against a socket that accepts and then says nothing, which is the case the
 /// probe exists for; the budgets that decide whether a process started are [`PD_START_TIMEOUT`]
 /// and [`STORE_START_TIMEOUT`].
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+///
+/// **It was 500 ms, and at 500 ms it decided instead of bounding.** A driver that is up and
+/// healthy still has to be scheduled to answer, and on a box under real load that takes longer
+/// than half a second — so every probe timed out, the loop never saw an answer, and the start
+/// failed at [`PD_START_TIMEOUT`] blaming a driver that was fine. `esker-cli::cluster_start` went
+/// red on the ci-tree that way on 2026-09-04 while passing 3/3 alone.
+///
+/// **Raising it costs nothing on the path that matters.** A process that has not bound yet
+/// refuses the *connect*, which returns at once whatever this says; this value is only ever spent
+/// on a socket that accepted and then went quiet, which is exactly what it is for. Five seconds
+/// still leaves four probes inside the driver's budget and twelve inside the stores', and neither
+/// of those two budgets changed — the verdict stays theirs, which is what the paragraph above
+/// always claimed and what 500 ms quietly took away.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Between two readiness probes. A round trip is the cost, so this polls rather than spins.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
