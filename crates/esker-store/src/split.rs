@@ -19,13 +19,38 @@
 //! When no such key exists — a region holding nothing, one key, or only its own `start_key` — this
 //! answers `None`. A region that cannot be split is not an error; it is a region that is large
 //! because of one big value, and 4b splits by key count rather than by breaking that value up.
+//!
+//! # What "the region's data" is
+//!
+//! A region owns a range of the **user** key space, and a store writes each user key into one of
+//! two physical shapes, in more than one column family: `'r' ++ key` for `RawKV`, and
+//! `'x' ++ enc(key) ++ !ts` in `default` and `write` for anything transactional — which is every
+//! SQL row, since a row is the user key a transaction writes. Both functions here read every one
+//! of those ranges, through [`crate::keyspace`], the same mapping a snapshot ships a region by.
+//!
+//! Until [ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md) they read
+//! `['r' ++ start, 's')` in `default` alone, so a region holding a SQL table reported `~0` bytes
+//! and offered no boundary: a SQL table occupied exactly one region whatever its size, at any
+//! threshold (`docs/plans/phase-16-mpp.md` §10). The `lock` family is still not read, and that is
+//! a decision rather than an omission — the ADR says why.
 
 use bytes::Bytes;
-use esker_engine::{Db, ReadOptions};
+use esker_engine::{Db, DbIterator, ReadOptions, cf};
 use esker_keys::prefix;
 use esker_proto::{ProtoError, Region};
 
 use crate::error::engine_to_proto;
+use crate::keyspace::{PHYSICAL_NAMESPACES, physical_ranges};
+
+/// The column families whose bytes are a region's **data**, and so its size and the source of its
+/// split boundary ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+///
+/// `lock` is absent on purpose: a lock is one in-flight transaction's claim on one key, deleted by
+/// both commit and rollback, so counting it would make a region's size a function of how many
+/// transactions happen to be open and let a burst of prewrites split data that has not been
+/// written. `raft` is absent for the reason `snapshot::SNAPSHOT_CFS` excludes it — it is this
+/// store's log and metadata, keyed by region id rather than by user key.
+const DATA_CFS: [&str; 2] = [cf::DEFAULT, cf::WRITE];
 
 /// A region is split once its approximate size passes this (`docs/DESIGN.md` §14).
 pub const REGION_SPLIT_SIZE: u64 = crate::REGION_SPLIT_SIZE;
@@ -75,9 +100,14 @@ impl Default for SplitOptions {
 
 /// Picks the key `region` should be split at, or `None` if it has no legal boundary.
 ///
-/// Scans the region's range in the `default` column family, keeping an approximately uniform
-/// sample of at most `max_sampled` keys, and returns the middle one — the first sample strictly
-/// above `region.start_key`, since a boundary equal to the start would leave an empty half.
+/// Walks every range the region owns — each data column family, each physical namespace — as one
+/// stream of **user keys**, keeps an approximately uniform sample of at most `max_sampled` of
+/// them, and returns the middle one: the first sample strictly above `region.start_key`, since a
+/// boundary equal to the start would leave an empty half.
+///
+/// User keys, because that is what a boundary is. It is checked against `start_key`/`end_key`, it
+/// travels in the `Split` command, and every peer applies it to its own copy of the range —
+/// none of which knows about a `'x'` prefix or a timestamp suffix.
 ///
 /// # Why the sample halves rather than the scan stopping
 ///
@@ -93,34 +123,15 @@ pub fn choose_split_key(
     max_sampled: usize,
 ) -> Result<Option<Bytes>, ProtoError> {
     let max_sampled = max_sampled.max(MIN_SAMPLED_KEYS);
-    let low = prefix::raw_key(&region.start_key);
-    let high = if region.end_key.is_empty() {
-        // The first key past the whole `'r'` namespace, which is where an unbounded region ends.
-        vec![prefix::RAW + 1]
-    } else {
-        prefix::raw_key(&region.end_key)
-    };
-
-    let mut iter = db
-        .iter(esker_engine::cf::DEFAULT, &ReadOptions::default())
-        .map_err(|error| engine_to_proto(&error))?;
+    let mut keys = RegionKeys::open(db, region)?;
 
     let mut samples: Vec<Bytes> = Vec::new();
     let mut stride: u64 = 1;
     let mut seen: u64 = 0;
 
-    iter.seek(&low);
-    while iter.valid() && iter.key() < &high[..] {
+    while let Some(user) = keys.next_key()? {
         if seen % stride == 0 {
-            let Some(user) = iter.key().strip_prefix(&[prefix::RAW]) else {
-                // The bounds keep the scan inside the namespace, so this cannot happen without
-                // the namespace itself being wrong — which is not something to guess about.
-                return Err(ProtoError::internal(format!(
-                    "a split scan read a key outside the 'r' namespace: {:?}",
-                    iter.key()
-                )));
-            };
-            samples.push(Bytes::copy_from_slice(user));
+            samples.push(Bytes::from(user));
             if samples.len() == max_sampled {
                 // Keep every second sample and look at half as many from here on, so the sample
                 // stays spread over the whole of what has been read.
@@ -135,11 +146,166 @@ pub fn choose_split_key(
             }
         }
         seen += 1;
-        iter.next();
     }
-    iter.status().map_err(|error| engine_to_proto(&error))?;
 
     Ok(midpoint(&samples, region))
+}
+
+/// Every user key a region holds, in order, once each.
+///
+/// One [`Source`] per (data column family × physical namespace) — the same set of ranges
+/// [`approximate_size`] adds up, which is the property worth keeping: a region whose size says
+/// "split" and whose scan says "there is nothing here" is recorded as unsplittable and not looked
+/// at again until it has grown by another whole threshold
+/// (`Store::spawn_split_checker`).
+struct RegionKeys {
+    sources: Vec<Source>,
+}
+
+impl RegionKeys {
+    /// Opens a cursor on each range, all reading **one snapshot**, so the merged stream is one
+    /// view of the region rather than four taken a moment apart.
+    fn open(db: &Db, region: &Region) -> Result<Self, ProtoError> {
+        let options = ReadOptions {
+            snapshot: Some(db.snapshot()),
+            ..ReadOptions::default()
+        };
+        let mut sources = Vec::with_capacity(DATA_CFS.len() * PHYSICAL_NAMESPACES.len());
+        for name in DATA_CFS {
+            for (namespace, (low, high)) in
+                PHYSICAL_NAMESPACES.into_iter().zip(physical_ranges(region))
+            {
+                sources.push(Source::open(db, name, &options, namespace, &low, high)?);
+            }
+        }
+        Ok(Self { sources })
+    }
+
+    /// The next user key any source holds, and `None` once every source is spent.
+    ///
+    /// A key held by more than one source — a row whose value was long enough to need a `default`
+    /// entry beside its `write` record — is **one** key: every source sitting on it advances
+    /// together.
+    fn next_key(&mut self) -> Result<Option<Vec<u8>>, ProtoError> {
+        let Some(smallest) = self
+            .sources
+            .iter()
+            .filter_map(|source| source.current.as_ref())
+            .min()
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        for source in &mut self.sources {
+            if source.current.as_deref() == Some(&smallest[..]) {
+                source.advance()?;
+            }
+        }
+        Ok(Some(smallest))
+    }
+}
+
+/// One column family's slice of one physical namespace, yielding the user keys in it.
+struct Source {
+    iter: DbIterator,
+    /// Exclusive upper bound, an engine key.
+    high: Vec<u8>,
+    /// Which shape the engine keys in this range have, so they can be read back as user keys.
+    namespace: u8,
+    /// The user key the cursor is on, or `None` past the end of the range.
+    current: Option<Vec<u8>>,
+}
+
+impl Source {
+    fn open(
+        db: &Db,
+        name: &str,
+        options: &ReadOptions,
+        namespace: u8,
+        low: &[u8],
+        high: Vec<u8>,
+    ) -> Result<Self, ProtoError> {
+        let mut iter = db
+            .iter(name, options)
+            .map_err(|error| engine_to_proto(&error))?;
+        iter.seek(low);
+        let mut source = Self {
+            iter,
+            high,
+            namespace,
+            current: None,
+        };
+        source.load()?;
+        Ok(source)
+    }
+
+    /// Reads the key the cursor is on into `current`, or clears it past the range.
+    ///
+    /// The status is checked on every step rather than once at the end, so a read error stops the
+    /// scan where it happened instead of being discovered after a boundary was chosen from a
+    /// partial one.
+    fn load(&mut self) -> Result<(), ProtoError> {
+        self.iter
+            .status()
+            .map_err(|error| engine_to_proto(&error))?;
+        self.current = if self.iter.valid() && self.iter.key() < &self.high[..] {
+            Some(user_key(self.namespace, self.iter.key())?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Steps to the next **distinct** user key, passing over the rest of the current key's
+    /// versions.
+    ///
+    /// Without that, the sample is weighted by how often a row was updated rather than by how many
+    /// rows there are: a table where one row was rewritten a thousand times would have a thousand
+    /// samples inside one row, and its boundary would divide no rows at all.
+    fn advance(&mut self) -> Result<(), ProtoError> {
+        let Some(passed) = self.current.take() else {
+            return Ok(());
+        };
+        loop {
+            self.iter.next();
+            self.load()?;
+            if self.current.as_deref() != Some(&passed[..]) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The user key an engine key of `namespace` carries.
+///
+/// The bounds keep each scan inside its own namespace, so a key that does not fit its shape means
+/// the namespace itself is wrong — which is not something to guess about, and not something to
+/// panic on either (`CLAUDE.md` invariant 9). A third physical namespace has to be given a decoder
+/// here as well as a range in [`crate::keyspace`].
+fn user_key(namespace: u8, engine_key: &[u8]) -> Result<Vec<u8>, ProtoError> {
+    match namespace {
+        prefix::RAW => engine_key
+            .strip_prefix(&[prefix::RAW])
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                ProtoError::internal(format!(
+                    "a split scan read a key outside the 'r' namespace: {engine_key:?}"
+                ))
+            }),
+        // `'x' ++ enc(user_key) ++ !ts`, in both the `default` and `write` families. The decode is
+        // `esker-txn`'s, because the encoding is (`CLAUDE.md` invariant 7).
+        prefix::TXN => esker_txn::key::split(engine_key)
+            .map(|(user, _)| user)
+            .map_err(|error| {
+                ProtoError::internal(format!(
+                    "a split scan could not read a key in the 'x' namespace: {error}"
+                ))
+            }),
+        other => Err(ProtoError::internal(format!(
+            "a split scan has no way to read the {:?} namespace",
+            char::from(other)
+        ))),
+    }
 }
 
 /// The first sample at or after the middle that is a legal boundary for `region`.
@@ -171,16 +337,33 @@ fn midpoint(samples: &[Bytes], region: &Region) -> Option<Bytes> {
 /// It is still a *hint* and nothing deterministic reads it — `Db::approximate_size` names the three
 /// directions it over-counts in — but it is now the same hint on every peer, which is what makes a
 /// region heartbeat's `approximate_size` a number PD can compare across stores.
+///
+/// # Every family the region spans, and every namespace in it
+///
+/// One [`Db::approximate_size`] per (data column family × physical namespace), summed. The
+/// families are [`DATA_CFS`] and the ranges are [`crate::keyspace::physical_ranges`], the mapping
+/// a snapshot ships a region by.
+///
+/// Both namespaces are asked of both families rather than kept in a table of which family may hold
+/// which — `write` holds only `'x'` today, and asking it for `['r', 's')` costs an overlap check
+/// that matches no file. It is a cheaper guarantee than the table, and one that cannot go stale.
+///
+/// Reading `default` under `'r'` alone is what made a SQL table one region for ever, and reading
+/// `default` under both namespaces would not have fixed it: a value of
+/// `esker_txn::SHORT_VALUE_MAX_LEN` or under is inlined into its `write` record and costs no
+/// `default` entry at all, and ordinary SQL rows are short
+/// ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
 pub fn approximate_size(db: &Db, region: &Region) -> Result<u64, ProtoError> {
-    let low = prefix::raw_key(&region.start_key);
-    let high = if region.end_key.is_empty() {
-        // The first key past the whole `'r'` namespace, which is where an unbounded region ends.
-        vec![prefix::RAW + 1]
-    } else {
-        prefix::raw_key(&region.end_key)
-    };
-    db.approximate_size(esker_engine::cf::DEFAULT, Some(&low), Some(&high))
-        .map_err(|error| engine_to_proto(&error))
+    let mut total: u64 = 0;
+    for name in DATA_CFS {
+        for (low, high) in physical_ranges(region) {
+            let bytes = db
+                .approximate_size(name, Some(&low), Some(&high))
+                .map_err(|error| engine_to_proto(&error))?;
+            total = total.saturating_add(bytes);
+        }
+    }
+    Ok(total)
 }
 
 /// Whether `key` divides `region` into two non-empty ranges.

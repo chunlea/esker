@@ -51,6 +51,10 @@ pub const TSO_LOGICAL_BITS: u32 = esker_txn::TSO_LOGICAL_BITS;
 
 pub mod gc;
 pub mod heartbeat;
+// How a region's user-key range reaches the engine: one range per physical namespace, shared by
+// the snapshot, the reclaim and the split so there is one mapping rather than three. The module's
+// own `//!` docs say the rest; a `///` here would collide with them.
+mod keyspace;
 pub mod meta;
 pub mod pd;
 pub mod pd_remote;
