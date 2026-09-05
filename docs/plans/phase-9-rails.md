@@ -1682,3 +1682,78 @@ is a self-contained read method that can land alone.
 
 Cross-node deadlock (debt #4) is untouched by this: it needs a graph both nodes can see, which is
 PD's.
+
+## Census: what a trigger body would buy, and what refusing one would cost
+
+Written 2026-09-05 at the coordinator's request, as the input to a decision that is the user's:
+**implement trigger execution for the corpus's shapes, or refuse `CREATE TRIGGER` by name.** No
+code was written for this; every line below is measured.
+
+### What exists today
+
+`CREATE FUNCTION … LANGUAGE plpgsql` and `CREATE TRIGGER` are both **accepted and recorded** — the
+function lands in `pg_proc`, the trigger in `pg_trigger` — and **no body ever executes**. Measured
+with a trigger whose body inserts into a second table: the second table stays empty.
+
+### The whole surface, in the vendored Rails suite
+
+Four `CREATE TRIGGER` in the tree; **one file** is PostgreSQL's
+(`test/schema/postgresql_specific_schema.rb`), holding two triggers, and one further function is
+`LANGUAGE SQL` rather than plpgsql:
+
+| Object | Body | Depends on it |
+|---|---|---|
+| `partitioned_insert_trigger` | `BEFORE INSERT`, redirects the row into an `INHERITS` child, `RETURN NULL` | nothing — see below |
+| `populate_column` | `BEFORE INSERT`, `DECLARE`, `SELECT MAX(id) INTO`, `NEW.id = COALESCE(…)+1` | one test |
+| `my_uuid_generator()` | `LANGUAGE SQL`, one `SELECT`, used as a column `DEFAULT` | a separate gap |
+
+### What implementing it buys: one test
+
+`PersistenceTest#test_model_with_no_auto_populated_fields_still_returns_primary_key_after_insert`,
+and nothing else.
+
+The four tests that insert into `postgresql_partitioned_table_parent`
+(`postgresql_adapter_test.rb:211-233`) look like dependants and are not. Each asserts that
+`exec_insert` returns the id that `SELECT max(id) FROM …_parent` reports. On a real server the
+trigger moves the row to the inheriting child and the parent's `SELECT` still sees it, because
+that is what `INHERITS` means; here the trigger does nothing and the row stays in the parent, where
+the same `SELECT` sees it. **Both roads reach the same assertion**, which is why all four pass
+today — confirmed against `failures-47ffc338.txt`, zero occurrences.
+
+That is also the reason this census was worth taking before writing code: the naive count of tests
+"touching a trigger" is ten, and the number that can tell whether a body ran is one.
+
+### What refusing `CREATE TRIGGER` with `0A000` would cost: the whole suite
+
+Not the ten tests, and not the one — **the schema load**.
+
+Both trigger blocks live in `postgresql_specific_schema.rb`, which every PostgreSQL run loads
+before any test. The first is wrapped in a `rescue ActiveRecord::StatementInvalid` that retries
+only for `language "plpgsql" does not exist` and **re-raises everything else**. The second, the one
+this census came from, has no `rescue` at all. A refusal from either aborts the load, and a suite
+whose schema did not load runs nothing.
+
+So "refuse by name" is not the cheap option it sounds like. The cheap option is what the node does
+now: accept the object, record it, and run no body — which costs exactly one failing test and
+tells no lie the catalog can be asked about, since `pg_trigger` really does hold a trigger that
+really does exist.
+
+### If it is implemented, the shapes to cover
+
+In order of what the corpus actually uses, not of generality:
+
+1. `BEFORE INSERT … FOR EACH ROW`, and `RETURN NEW` after assigning `NEW.<column>`.
+2. `RETURN NULL` suppressing the row — which is the partitioning trigger, and needs `NEW.*` and
+   `INHERITS` reads to be worth anything.
+3. `DECLARE`, one scalar local, `SELECT … INTO`, and `COALESCE`.
+
+That is a plpgsql interpreter with assignment, a declare block, one statement form and two return
+forms. It is a phase, not a unit, and it should not be started inside a DDL lane's queue.
+
+### The adjacent gap this census found, which is smaller
+
+`CREATE FUNCTION … LANGUAGE SQL` is accepted, and **calling it is `0A000 the function
+my_uuid_generator is not supported`** — measured, on `INSERT INTO pg_uuids_2 (name) VALUES ('x')`
+where the column's `DEFAULT` names it. A one-statement SQL-language function used as a `DEFAULT` is
+a much smaller feature than plpgsql and is independent of triggers. It is recorded here so that a
+decision about triggers is not mistaken for a decision about user-defined functions.

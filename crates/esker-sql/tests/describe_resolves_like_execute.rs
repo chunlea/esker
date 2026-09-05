@@ -219,3 +219,110 @@ fn a_bind_parameter_is_typed_from_a_column_in_the_session_s_own_schema() {
     // `1 t T 2 D C Z` — parsed, parameters described, rows described, bound, one row, complete.
     assert_eq!(stream, "1tT2DCZ", "the whole exchange: {stream}");
 }
+
+/// **A three-part column name types the parameter beside it.**
+///
+/// `schema_test.rb`'s `test_habtm_table_name_with_schema`, whose models carry a schema in
+/// `table_name` (`self.table_name = "music.songs"`), so `ActiveRecord` writes every column of the
+/// join fully qualified: `"music"."albums"."id" = $1`. That lowers with `Expr::Column::table` set
+/// to the **qualified** relation name, while the relation is known to the inference by its alias
+/// or its bare name — so nothing matched, `$1` fell back to text, and the statement was
+/// `42883 operator does not exist: bigint = text`.
+///
+/// The same shape as the two-part case above and a second site of it: the fix is again comparing
+/// both sides at the same qualification, not a new rule. It became reachable only once three-part
+/// names parsed at all (`06291ca5`); before that the file stopped earlier, at
+/// `the qualified column "music"."albums_songs"."song_id" is not supported`.
+///
+/// **Five reconstructions passed before this one failed.** The two-part join, the default scope's
+/// boolean, the `LIMIT`, the aliased projection — all typed correctly. What none of them had was
+/// the third part of the name, and the run-91 log is what named it.
+///
+/// **And then the obvious fix did nothing, because the lookup existed twice.** `walk_predicate` had
+/// its own inlined copy of the qualifier-matching loop and never called `column_type`, so
+/// correcting the shared one changed no behaviour at all — the same shape `one-grammar-one-parser`
+/// names. What found it was printing the three values (`name`, `qualifier`, `named`) and seeing
+/// that `column_type` was **never reached**, with everything it needed sitting correct one frame
+/// above it:
+///
+/// ```text
+/// tables=["music\0albums"]  named=[("albums", "music\0albums")]
+/// filter=Eq(Column { table: Some("music\0albums"), name: "id" }, Parameter(1))
+/// ```
+///
+/// So the fix is one lookup and one rule, not a second copy corrected to match.
+#[test]
+fn a_three_part_column_name_types_the_parameter_it_is_compared_with() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA music",
+        "CREATE TABLE music.albums (id bigserial primary key, deleted boolean default false)",
+        "CREATE TABLE music.songs (id bigserial primary key)",
+        "CREATE TABLE music.albums_songs (album_id bigint, song_id bigint)",
+        // The control: the same shape in `public`, which is where every other test lives and why
+        // the defect was invisible.
+        "CREATE TABLE plain (id bigserial primary key)",
+    ]);
+
+    for (sql, oids, what) in [
+        (
+            "SELECT \"music\".\"albums\".\"id\" FROM music.albums WHERE \"music\".\"albums\".\"id\" = $1",
+            vec![20_u32],
+            "a three-part name on both sides",
+        ),
+        (
+            "SELECT songs.id FROM music.songs LEFT OUTER JOIN music.albums \
+             ON \"music\".\"albums\".\"id\" = \"music\".\"songs\".\"id\" \
+             AND \"music\".\"albums\".\"deleted\" = $1 WHERE \"music\".\"albums\".\"id\" = $2",
+            vec![16, 20],
+            "the join the HABTM test sends, default scope and all",
+        ),
+        (
+            "SELECT \"public\".\"plain\".\"id\" FROM plain WHERE \"public\".\"plain\".\"id\" = $1",
+            vec![20],
+            "and the same in public, whose qualified name is bare",
+        ),
+    ] {
+        let mut session = Session::new();
+        let mut out = Vec::new();
+        for message in [
+            Frontend::Parse {
+                statement: "q".to_owned(),
+                sql: sql.to_owned(),
+                param_types: Vec::new(),
+            },
+            Frontend::Describe {
+                target: Target::Statement,
+                name: "q".to_owned(),
+            },
+            Frontend::Sync,
+        ] {
+            session.handle(&message, &mut node.executor, &mut out);
+        }
+        assert!(
+            !tags(&out).contains('E'),
+            "{what} was refused: {sql}\n{}",
+            String::from_utf8_lossy(&out).escape_debug()
+        );
+        assert_eq!(parameter_oids(&out), oids, "{what}: {sql}");
+    }
+}
+
+/// The OIDs of the first `ParameterDescription` in a response.
+fn parameter_oids(out: &[u8]) -> Vec<u32> {
+    let mut at = 0;
+    while at + 5 <= out.len() {
+        let len = u32::from_be_bytes([out[at + 1], out[at + 2], out[at + 3], out[at + 4]]) as usize;
+        if out[at] == b't' {
+            let body = &out[at + 5..at + 1 + len];
+            let count = usize::from(u16::from_be_bytes([body[0], body[1]]));
+            return (0..count)
+                .map(|i| {
+                    let o = 2 + i * 4;
+                    u32::from_be_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
+                })
+                .collect();
+        }
+        at += 1 + len;
+    }
+    Vec::new()
+}

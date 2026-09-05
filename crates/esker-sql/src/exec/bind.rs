@@ -458,11 +458,6 @@ fn static_type(expr: &Expr, named: &[Named<'_>]) -> Option<ColumnType> {
 /// `named` is what the statement calls its relations — aliases included — and `tables` is every
 /// relation it resolved. Both are needed: a qualifier is matched against the first, and a subquery
 /// builds its own `named` list out of the second.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per expression a parameter can sit in, and a clause missing from it is a \
-              parameter that keeps the text fallback — which is the bug this function exists for"
-)]
 fn walk_predicate(
     expr: &Expr,
     named: &[Named<'_>],
@@ -514,23 +509,14 @@ fn walk_predicate(
                 // which. An ambiguous bare name types nothing rather than the first match: the
                 // planner will refuse the statement anyway, and guessing a type here would put a
                 // `ParameterDescription` on the wire for a query that is about to fail.
-                if let Some((qualifier, name, number)) = pair {
-                    let mut found = None;
-                    for (called, candidate) in named {
-                        if qualifier.is_some_and(|qualifier| qualifier != called) {
-                            continue;
-                        }
-                        if let Some(at) = candidate.column(name) {
-                            if found.is_some() {
-                                found = None;
-                                break;
-                            }
-                            found = Some(parameter_type(candidate, at));
-                        }
-                    }
-                    if let Some(ty) = found {
-                        seen(number, ty);
-                    }
+                // **Through `column_type`, not a second copy of it.** This had the same loop
+                // inlined, and the two then disagreed: a fix to the shared one did nothing here,
+                // which is how a three-part column name went on being typed `text` after the
+                // matching rule had already been corrected. One lookup, one rule.
+                if let Some((qualifier, name, number)) = pair
+                    && let Some(ty) = column_type(named, qualifier, name)
+                {
+                    seen(number, ty);
                 }
             }
             walk_predicate(left, named, tables, seen);
@@ -648,7 +634,20 @@ fn single_column_type(
 fn column_type(named: &[Named<'_>], qualifier: Option<&str>, name: &str) -> Option<ColumnType> {
     let mut found = None;
     for (called, candidate) in named {
-        if qualifier.is_some_and(|qualifier| qualifier != called) {
+        // **The qualifier and the name it is compared with must be at the same qualification.**
+        // A three-part column — `"music"."albums"."id"`, which `ActiveRecord` writes for a model
+        // whose `table_name` carries a schema — lowers with `table` set to the *qualified* relation
+        // name (`music` NUL `albums`), while `called` is the alias or the bare name. So this
+        // matched nothing, the parameter beside it kept `text`, and the statement came back
+        // `42883 operator does not exist: bigint = text` — `schema_test.rb`'s
+        // `test_habtm_table_name_with_schema`, reachable only once three-part names parsed at all.
+        //
+        // Comparing the bare forms can only ever match *more*, and the ambiguity guard below is
+        // what makes that safe: two relations of one bare name leave `found` set twice and answer
+        // `None`, which is the `text` fallback rather than a guess. Over-matching costs nothing a
+        // real server does not also do — a qualifier naming a relation the `FROM` does not have is
+        // `42P01` when the statement runs, and typing a parameter never decides that.
+        if qualifier.is_some_and(|qualifier| qualifier != called && bare(qualifier) != called) {
             continue;
         }
         if let Some(at) = candidate.column(name) {
