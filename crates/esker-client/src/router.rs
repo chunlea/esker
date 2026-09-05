@@ -341,7 +341,30 @@ impl Router {
         if let Some(route) = self.cache.lookup(key) {
             return Ok(route);
         }
-        let route = self.resolver.locate(key)?.ok_or_else(|| {
+        // **"No region covers this key" is waited out here, for every caller.**
+        //
+        // It was raised at once, and that made the driver's *knowledge* look like a fact about the
+        // cluster: a store learns of its own split instantly and the driver at the next heartbeat,
+        // so under load `GetRegion` answers nothing for a moment and every caller saw
+        // `08006 … key is not in region 0`. Four call sites met it — the two scans, the fragment
+        // dispatch, and `Router::call` on the **write** path, where `may_ask_again` is correctly
+        // false for a mutation and the refusal was therefore terminal. Repairing them one at a
+        // time was three fixes and a fourth waiting; the lookup is where it belongs.
+        //
+        // A *store's* `KeyNotInRegion` is untouched by this and stays terminal for a write, which
+        // is right: that one says the request went somewhere that never held the key.
+        let mut resolved = self.resolver.locate(key)?;
+        if resolved.is_none() {
+            let policy = RetryPolicy::default();
+            for attempt in 0..ROUTE_REPAIR_ATTEMPTS {
+                self.clock.sleep(self.jitter.apply(policy.backoff(attempt)));
+                resolved = self.resolver.locate(key)?;
+                if resolved.is_some() {
+                    break;
+                }
+            }
+        }
+        let route = resolved.ok_or_else(|| {
             // Not retryable, and the classifier agrees: `KeyNotInRegion` says this key belongs
             // to no region the cluster admits to, which is what "no region covers it" is.
             ProtoError::KeyNotInRegion {

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d383b36e43ac6373fb6d64c6566b6baf3ffadfa8a1e4a44b06e40a98572bc6ab # shrinks to ops = [Get(150), Put(203, 5), Get(241), Delete(78), Batch([(32, 6), (223, 232), (105, 164)]), Batch([(201, 242), (182, 69), (28, 246)]), Get(206), Put(250, 115), Get(78), Batch([(237, 60)]), Put(87, 1), Batch([(180, 218), (159, 103)]), Put(36, 57), Delete(18), Batch([]), Delete(52), Get(166), Scan { lo: 113, hi: 34, limit: 182, unbounded_end: false }, Put(235, 120), Scan { lo: 194, hi: 64, limit: 69, unbounded_end: false }, Scan { lo: 255, hi: 74, limit: 45, unbounded_end: false }, Delete(106)]

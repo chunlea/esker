@@ -110,6 +110,65 @@ pub enum SqlError {
     #[error("set-returning functions are not allowed in DEFAULT expressions")]
     DefaultSetReturning,
 
+    /// `CREATE OR REPLACE VIEW` that renames a column the view already publishes.
+    ///
+    /// **A replacement may append and may not rename.** Measured on 19beta1, and surfaced by the
+    /// view corpus once writing through a view stopped aborting the block:
+    ///
+    /// ```text
+    /// ERROR:  cannot change name of view column "name" to "title"
+    /// HINT:  Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.
+    /// ```
+    ///
+    /// This node accepted it, which is a wrong answer rather than a missing feature: a replacement
+    /// that silently renames a column breaks every query written against the old name, and
+    /// [ADR 0031](../../docs/adr/0031-a-refusal-outranks-a-wrong-answer.md) ranks that below a
+    /// refusal.
+    #[error("cannot change name of view column \"{from}\" to \"{to}\"")]
+    CannotRenameViewColumn {
+        /// The name the view already publishes.
+        from: String,
+        /// The name the replacement would give it.
+        to: String,
+    },
+
+    /// `CREATE OR REPLACE VIEW` that publishes fewer columns than the view already does.
+    ///
+    /// The other half of the same rule, and PostgreSQL's whole sentence — it names no column,
+    /// because the replacement's shortness is the fault and not any one column.
+    #[error("cannot drop columns from view")]
+    CannotDropViewColumns,
+
+    /// A write on a view that is not **auto-updatable**, in PostgreSQL's own three sentences.
+    ///
+    /// A simple view — one relation, no `DISTINCT`, no grouping, no `LIMIT`, every projection a
+    /// plain column — is written through onto the table underneath, which is what
+    /// `view_test.rb`'s `UpdateableViewTest` does four times. Anything else is refused, and the
+    /// refusal is measured rather than composed (19beta1):
+    ///
+    /// ```text
+    /// ERROR:  cannot update view "h1agg"
+    /// DETAIL:  Views that return aggregate functions are not automatically updatable.
+    /// HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an
+    ///        unconditional ON UPDATE DO INSTEAD rule.
+    /// ```
+    ///
+    /// The verb is carried because a real server writes three different ones — `cannot insert
+    /// into view`, `cannot update view`, `cannot delete from view` — rather than one sentence with
+    /// a hole in it.
+    #[error("cannot {verb} view \"{view}\"")]
+    ViewNotUpdatable {
+        /// `insert into`, `update` or `delete from`.
+        verb: String,
+        /// The view's name, as the user wrote it.
+        view: String,
+        /// Which property makes it non-updatable, in PostgreSQL's words.
+        detail: String,
+        /// The two ways out, in PostgreSQL's words. Verb-specific, and measured for all three
+        /// rather than extrapolated from one.
+        hint: String,
+    },
+
     /// Contract C2. The statement parsed and we will not run it — the feature is named so the
     /// message reads the way PostgreSQL's own does.
     #[error("{0} is not supported")]
@@ -2497,6 +2556,10 @@ impl SqlError {
         match self {
             // **`0A000`, not `2BP01`** — measured. A `DROP` of the same table is a dependency
             // error; PostgreSQL spells the truncate refusal as a missing feature.
+            // **`55000`, not `0A000`** — measured, and it is the surprising one: a refusal that
+            // reads like a missing feature ("not automatically updatable") is spelled by
+            // PostgreSQL as an object that is not in the state the statement needs.
+            SqlError::ViewNotUpdatable { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference
@@ -2778,7 +2841,12 @@ impl SqlError {
             SqlError::ExclusionViolation { .. } | SqlError::ExclusionNotCreatable { .. } => {
                 sqlstate::EXCLUSION_VIOLATION
             }
-            SqlError::MultiplePrimaryKeys(_) => sqlstate::INVALID_TABLE_DEFINITION,
+            // `42P16` for all three: a table with two primary keys, and a view replacement that
+            // renames or drops a column, are each an invalid *table definition* — which is the
+            // class PostgreSQL puts a view's shape rules in too.
+            SqlError::MultiplePrimaryKeys(_)
+            | SqlError::CannotRenameViewColumn { .. }
+            | SqlError::CannotDropViewColumns => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
@@ -2968,7 +3036,10 @@ impl SqlError {
             // `crate::value::xml` builds it, because only it knows which line the parser stopped
             // on. Merged with the arms above because the body is theirs: the detail *is* the
             // payload, which is what every variant on this arm has in common.
-            | SqlError::InvalidXmlContent(detail) => Some(detail.clone()),
+            | SqlError::InvalidXmlContent(detail)
+            // The detail *is* the payload here too, and it is PostgreSQL's own sentence naming
+            // which property makes the view non-updatable.
+            | SqlError::ViewNotUpdatable { detail, .. } => Some(detail.clone()),
             SqlError::OnConflictMovesPartition => Some(
                 "The result tuple would appear in a different partition than the original tuple."
                     .to_owned(),
@@ -3051,6 +3122,12 @@ impl SqlError {
     )]
     pub fn hint(&self) -> Option<String> {
         match self {
+            // PostgreSQL's own, and it names the statement that *does* rename a view column.
+            SqlError::CannotRenameViewColumn { .. } => Some(
+                "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead."
+                    .to_owned(),
+            ),
+            SqlError::ViewNotUpdatable { hint, .. } => Some(hint.clone()),
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
             SqlError::RangeSubtypeNotOrdered(_) => Some(
                 "You must specify an operator class for the range type or define a default \

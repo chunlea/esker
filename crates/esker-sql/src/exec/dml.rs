@@ -448,6 +448,233 @@ fn row_at_defaults(
         .collect()
 }
 
+/// A view a write can be rewritten onto the table underneath, and what the rewrite needs.
+///
+/// **PostgreSQL calls these auto-updatable**, and it is not a corner: `view_test.rb`'s
+/// `UpdateableViewTest` writes through one four times, and this node answered
+/// `42P01 relation "printed_books" does not exist` — a *wrong answer*, because the relation is
+/// right there and a real server writes through it. Measured on 19beta1:
+///
+/// ```text
+/// CREATE VIEW p AS SELECT id, name, status, format FROM books WHERE format = 'paperback';
+/// UPDATE p SET name = 'AWDwR' WHERE id = 1;      -> UPDATE 1
+/// INSERT INTO p (name, format) VALUES (…);        -> INSERT 0 1
+/// UPDATE p SET format = 'hardback' WHERE id = 1;  -> UPDATE 1   (the row leaves the view)
+/// DELETE FROM p;                                  -> DELETE 1
+/// ```
+///
+/// The last two are the ones a guess gets wrong: without `WITH CHECK OPTION` a row may be updated
+/// *out* of the view, and a `DELETE` with no `WHERE` deletes what the view shows and not the table.
+struct Updatable {
+    /// The table underneath, folded.
+    table: String,
+    /// The view's own `WHERE`, which every read and write through it is additionally bounded by.
+    filter: Option<crate::plan::Expr>,
+    /// View column to base column, for the projections that rename.
+    renames: std::collections::BTreeMap<String, String>,
+}
+
+/// Whether `name` is a view a write can go through, and PostgreSQL's refusal when it is not.
+///
+/// The refusal is measured rather than invented — `cannot {verb} view "{name}"` with the `DETAIL`
+/// naming *which* property makes it non-updatable, and the `HINT` a real server gives:
+///
+/// ```text
+/// ERROR:  cannot update view "h1agg"
+/// DETAIL:  Views that return aggregate functions are not automatically updatable.
+/// HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional
+///        ON UPDATE DO INSTEAD rule.
+/// ```
+fn updatable(
+    executor: &Executor,
+    txn: &dyn Txn,
+    name: &str,
+    verb: Verb,
+) -> Result<Option<Updatable>> {
+    let Some(view) = executor.view_named(txn, name)? else {
+        return Ok(None);
+    };
+    let body = Executor::view_body(&view)?;
+    let refuse = |detail: &str| {
+        let (gerund, upper) = verb.hint_parts();
+        Err(SqlError::ViewNotUpdatable {
+            verb: verb.word().to_owned(),
+            view: name.to_owned(),
+            detail: detail.to_owned(),
+            hint: format!(
+                "To enable {gerund} the view, provide an INSTEAD OF {upper} trigger or an \
+                 unconditional ON {upper} DO INSTEAD rule."
+            ),
+        })
+    };
+
+    let Some(from) = body.from.as_ref().filter(|_| body.joins.is_empty()) else {
+        return refuse(
+            "Views that do not select from a single table or view are not automatically updatable.",
+        );
+    };
+    if body.distinct {
+        return refuse("Views containing DISTINCT are not automatically updatable.");
+    }
+    if !body.group_by.is_empty() || body.having.is_some() {
+        return refuse("Views containing GROUP BY are not automatically updatable.");
+    }
+    if body.limit.is_some() || body.offset.is_some() {
+        return refuse("Views containing LIMIT or OFFSET are not automatically updatable.");
+    }
+    if from.derived.is_some() || from.values.is_some() || from.function.is_some() {
+        return refuse(
+            "Views that do not select from a single table or view are not automatically updatable.",
+        );
+    }
+
+    // Every projection item must be a plain column of that relation; anything computed has no
+    // column to write back to, which is what PostgreSQL means by "not automatically updatable".
+    let mut renames = std::collections::BTreeMap::new();
+    for item in &body.projection {
+        match item {
+            crate::plan::SelectItem::Expr { expr, alias } => match expr {
+                crate::plan::Expr::Column { name: column, .. } => {
+                    let shown = alias.clone().unwrap_or_else(|| column.clone());
+                    if &shown != column {
+                        renames.insert(shown, column.clone());
+                    }
+                }
+                crate::plan::Expr::Aggregate(_) => {
+                    return refuse(
+                        "Views that return aggregate functions are not automatically updatable.",
+                    );
+                }
+                _ => {
+                    return refuse(
+                        "Views that return columns that are not columns of the underlying base relation are not automatically updatable.",
+                    );
+                }
+            },
+            // `SELECT *` and `SELECT t.*` are every column of the one relation, under their own
+            // names — nothing to rename and nothing that is not a base column.
+            crate::plan::SelectItem::Wildcard | crate::plan::SelectItem::QualifiedWildcard(_) => {}
+        }
+    }
+    Ok(Some(Updatable {
+        table: from.name.clone(),
+        filter: body.filter.clone(),
+        renames,
+    }))
+}
+
+/// Renames every `Expr::Column` a view showed under a different name.
+///
+/// A view may rename what it selects — `SELECT id AS book_id …` — so a statement written against
+/// the view speaks names the base table does not have. The map is only ever non-empty for such a
+/// view, which is why the ordinary case walks nothing.
+fn rename_columns(
+    expr: &mut crate::plan::Expr,
+    renames: &std::collections::BTreeMap<String, String>,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    crate::exec::bind::walk_expr_mut(expr, &mut |expr| {
+        if let crate::plan::Expr::Column { name, .. } = expr
+            && let Some(base) = renames.get(name)
+        {
+            name.clone_from(base);
+        }
+    });
+}
+
+/// The `UPDATE` a view's write becomes, against the table underneath.
+fn update_onto(update: &Update, view: Updatable) -> Update {
+    let mut rewritten = update.clone();
+    rewritten.table = view.table;
+    rewritten.assignments = rewritten
+        .assignments
+        .into_iter()
+        .map(|(column, mut value)| {
+            rename_columns(&mut value, &view.renames);
+            match view.renames.get(&column) {
+                Some(base) => (base.clone(), value),
+                None => (column, value),
+            }
+        })
+        .collect();
+    if let Some(filter) = &mut rewritten.filter {
+        rename_columns(filter, &view.renames);
+    }
+    // **The view's own `WHERE` bounds the write**, which is the whole of what makes
+    // `UPDATE p SET …` touch one row rather than every row of the table.
+    rewritten.filter = both(rewritten.filter, view.filter);
+    rewritten
+}
+
+/// The `INSERT` a view's write becomes.
+///
+/// **The view's `WHERE` is not applied.** Without `WITH CHECK OPTION` a real server lets a row be
+/// inserted that the view will not show, and measured it does exactly that.
+fn insert_onto(insert: &Insert, view: Updatable) -> Insert {
+    let mut rewritten = insert.clone();
+    rewritten.table = view.table;
+    if let Some(columns) = &mut rewritten.columns {
+        for column in columns.iter_mut() {
+            if let Some(base) = view.renames.get(column) {
+                column.clone_from(base);
+            }
+        }
+    }
+    rewritten
+}
+
+/// Which write is being refused, for the message.
+#[derive(Clone, Copy)]
+enum Verb {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl Verb {
+    fn word(self) -> &'static str {
+        match self {
+            // PostgreSQL's own three: "cannot insert into view", "cannot update view",
+            // "cannot delete from view". Measured; they are not one sentence with a hole in it.
+            Verb::Insert => "insert into",
+            Verb::Update => "update",
+            Verb::Delete => "delete from",
+        }
+    }
+
+    /// The `HINT`'s two halves, which differ per verb and were measured together:
+    ///
+    /// ```text
+    /// To enable updating the view,     … INSTEAD OF UPDATE trigger … ON UPDATE DO INSTEAD rule.
+    /// To enable inserting into the view … INSTEAD OF INSERT trigger … ON INSERT DO INSTEAD rule.
+    /// To enable deleting from the view  … INSTEAD OF DELETE trigger … ON DELETE DO INSTEAD rule.
+    /// ```
+    fn hint_parts(self) -> (&'static str, &'static str) {
+        match self {
+            Verb::Insert => ("inserting into", "INSERT"),
+            Verb::Update => ("updating", "UPDATE"),
+            Verb::Delete => ("deleting from", "DELETE"),
+        }
+    }
+}
+
+/// `a AND b`, where a missing side is no restriction at all.
+fn both(
+    left: Option<crate::plan::Expr>,
+    right: Option<crate::plan::Expr>,
+) -> Option<crate::plan::Expr> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(crate::plan::Expr::Binary {
+            op: crate::plan::BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        }),
+        (only, None) | (None, only) => only,
+    }
+}
+
 pub(super) fn insert(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -455,6 +682,9 @@ pub(super) fn insert(
     written: &mut Written,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&insert.table)?;
+    if let Some(view) = updatable(executor, txn, &insert.table, Verb::Insert)? {
+        return self::insert(executor, txn, &insert_onto(insert, view), written);
+    }
     let table = executor.require_table(txn, &insert.table)?;
     refuse_matview_write(&table, &insert.table)?;
     let targets = target_columns(&table, insert)?;
@@ -900,6 +1130,11 @@ pub(super) fn update(
     written: &mut Written,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
+    // **A write on a simple view goes to the table underneath.** Before `require_table`, which
+    // knows only tables and answered `42P01` for a view that is right there.
+    if let Some(view) = updatable(executor, txn, &update.table, Verb::Update)? {
+        return self::update(executor, txn, &update_onto(update, view), written);
+    }
     let named = executor.require_table(txn, &update.table)?;
     refuse_matview_write(&named, &update.table)?;
     let chain = update.chain();
@@ -1032,6 +1267,16 @@ pub(super) fn delete(
     delete: &Delete,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
+    if let Some(view) = updatable(executor, txn, &delete.table, Verb::Delete)? {
+        let mut rewritten = delete.clone();
+        rewritten.table = view.table;
+        if let Some(filter) = &mut rewritten.filter {
+            rename_columns(filter, &view.renames);
+        }
+        // A `DELETE` with no `WHERE` deletes what the **view** shows, not the table.
+        rewritten.filter = both(rewritten.filter, view.filter);
+        return self::delete(executor, txn, &rewritten);
+    }
     let named = executor.require_table(txn, &delete.table)?;
     refuse_matview_write(&named, &delete.table)?;
     let mut returned = Returned::open(delete.returning.as_ref(), &named)?;

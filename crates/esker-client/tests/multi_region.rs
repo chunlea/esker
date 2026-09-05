@@ -569,3 +569,65 @@ fn a_driver_that_answers_stale_twice_is_waited_out() {
         "the driver should have been asked until it stopped being behind"
     );
 }
+
+/// **A write survives a driver that does not know the key yet.**
+///
+/// The fourth call site, and the one repairing the scans could not reach. In `Router::call` a
+/// `KeyNotInRegion` is `Verdict::Surface` and `may_ask_again` is — correctly — false for a
+/// mutation, so the refusal was terminal and an `INSERT` answered
+/// `08006 … key is not in region 0` under a loaded gate while passing alone.
+///
+/// **The distinction is which refusal it is.** A *store's* `KeyNotInRegion` stays terminal for a
+/// write: it says the request went somewhere that never held the key, and re-sending a mutation on
+/// that basis is exactly what the retry rules forbid. The *resolver's* — `region_id 0`, empty
+/// bounds — says only that the driver has not caught up with a split, and that is waitable for a
+/// write as much as for a read. Waited out in `Router::route`, so all four sites get it.
+#[test]
+fn a_write_waits_out_a_driver_that_does_not_know_the_key_yet() {
+    #[derive(Debug)]
+    struct StaleThenRight {
+        stale: AtomicU32,
+        inner: RegionTable,
+    }
+    impl RegionResolver for StaleThenRight {
+        fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+            if self
+                .stale
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                != Err(0)
+            {
+                return Ok(None);
+            }
+            self.inner.locate(key)
+        }
+    }
+    let resolver = Arc::new(StaleThenRight {
+        stale: AtomicU32::new(2),
+        inner: RegionTable::from_routes([route(region(1, b"", b"", Epoch::INITIAL))]),
+    });
+    let harness = harness_with(Arc::clone(&resolver) as Arc<dyn RegionResolver>);
+    harness.transport.script(
+        Rule::new(
+            Matcher::Method(esker_client::wire::Method::RawPut),
+            Outcome::Reply(RawKvResp::Put),
+        )
+        .forever(),
+    );
+
+    harness
+        .client
+        .put(b"a", b"1")
+        .expect("the write waits for the driver rather than surfacing its refusal");
+    assert_eq!(
+        resolver.stale.load(Ordering::Relaxed),
+        0,
+        "the driver should have been asked until it stopped saying 'no region'"
+    );
+    assert_eq!(
+        harness.transport.stores(),
+        vec![1],
+        "and then the write went to the region that owns the key"
+    );
+}
