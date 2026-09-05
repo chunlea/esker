@@ -138,7 +138,15 @@ fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
     // The victim has to have started before it can be found; poll rather than sleep a guess.
     let mut pid = None;
     for _ in 0..200 {
-        let rows = hunter.rows("SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep%'");
+        // **`AND pid <> pg_backend_pid()`, and it is not decoration.** This very query contains
+        // the text `pg_sleep`, so it matches *itself* — the first version of this test cancelled
+        // the hunter and answered `57014` from the `SELECT pg_cancel_backend(...)` line. It passed
+        // alone, because the victim happened to hold the lower pid and sorted first, and failed
+        // only in the full suite when the order flipped. Excluding yourself is why a real server
+        // has `pg_backend_pid()`.
+        let rows = hunter.rows(
+            "SELECT pid FROM pg_stat_activity              WHERE query LIKE '%pg_sleep%' AND pid <> pg_backend_pid()",
+        );
         if let Some(found) = rows.first().and_then(|row| row.first()) {
             pid = Some(found.clone());
             break;

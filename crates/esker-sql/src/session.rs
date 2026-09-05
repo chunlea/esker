@@ -46,7 +46,7 @@ impl Backend {
     /// Records the database this session is on.
     pub fn on_database(&self, database: &str) {
         if let Ok(mut activity) = self.activity.lock() {
-            activity.database = database.to_owned();
+            database.clone_into(&mut activity.database);
         }
     }
 
