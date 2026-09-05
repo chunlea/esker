@@ -196,7 +196,92 @@ impl Parsed {
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }
+        if let Some(written) = self.alter_column_collation() {
+            apply_alter_collation(&mut lowered, written)?;
+        }
         Ok(lowered)
+    }
+}
+
+/// The `COLLATE` an `ALTER COLUMN … TYPE` named, which came off the source so the statement would
+/// parse (`crate::parse::strip_alter_column_collation`).
+///
+/// Decided here and not in the strip, so that a name this node does not have is the same `42704` a
+/// `CREATE TABLE` gives it and a type with no ordering the same `42804` — one rule for the clause,
+/// wherever it is written.
+fn apply_alter_collation(lowered: &mut plan::Statement, written: &str) -> Result<()> {
+    let plan::Statement::AlterTable(alter) = lowered else {
+        return Ok(());
+    };
+    for action in &mut alter.actions {
+        if let plan::AlterTableAction::SetColumnType { ty, collation, .. } = action {
+            *collation = Some(collation_text(written, *ty)?);
+        }
+    }
+    Ok(())
+}
+
+/// The collation a `COLLATE` names, if this node has it.
+///
+/// `C` and `POSIX` are the same ordering under two names — byte order, which a memcomparable key
+/// already gives — and they are the only two
+/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). Anything
+/// else is `42704` with PostgreSQL's own sentence, because accepting the name and sorting by bytes
+/// anyway would answer a question the client did not ask.
+fn collation_name(name: &ObjectName) -> Result<String> {
+    let written = name.0.last().map_or_else(String::new, ToString::to_string);
+    collation(written.trim_matches('"'))
+}
+
+/// [`collation_name`] for a name that arrived as text rather than as a parsed one — the clause
+/// [`crate::parse::strip_alter_column_collation`] cut out. **One rule, asked twice**: the two
+/// spellings of `COLLATE` in this grammar must not be able to disagree about which names exist.
+fn collation(written: &str) -> Result<String> {
+    if written.eq_ignore_ascii_case("C") || written.eq_ignore_ascii_case("POSIX") {
+        return Ok(written.to_uppercase());
+    }
+    Err(SqlError::UndefinedCollation(written.to_owned()))
+}
+
+/// [`collation`] and then the type, which is [`column_collation`] for the same text spelling.
+fn collation_text(written: &str, ty: ColumnType) -> Result<String> {
+    let name = collation(written)?;
+    if catalog::pg_attribute::collatable(ty) {
+        Ok(name)
+    } else {
+        Err(SqlError::CollationNotSupported(ty.name()))
+    }
+}
+
+/// [`collation_name`], and then the type it was written on.
+///
+/// **Two different sqlstates, and the order between them is measured.** A name this node does not
+/// have is `42704` whatever it sits on; a name it does have on a type with no ordering to override
+/// is `42804`. PostgreSQL checks the name first — `a int COLLATE "nope"` is `42704`, not `42804` —
+/// so this does too, by asking `collation_name` before it asks the type.
+fn column_collation(name: &ObjectName, ty: ColumnType) -> Result<String> {
+    let collation = collation_name(name)?;
+    if catalog::pg_attribute::collatable(ty) {
+        Ok(collation)
+    } else {
+        Err(SqlError::CollationNotSupported(ty.name()))
+    }
+}
+
+/// The type a literal has on its own, for the questions that can be asked before a scope exists.
+///
+/// `None` is PostgreSQL's `unknown`: a quoted string takes the type of whatever it is used with,
+/// and `NULL` has none at all — so neither can be told it is not collatable, and PostgreSQL agrees
+/// (`SELECT 'x' COLLATE "C"` is accepted, measured).
+fn literal_type(literal: &plan::Literal) -> Option<ColumnType> {
+    match literal {
+        plan::Literal::Integer(value) if i32::try_from(*value).is_ok() => Some(ColumnType::Int4),
+        plan::Literal::Integer(_) => Some(ColumnType::Int8),
+        plan::Literal::Decimal(_) => Some(ColumnType::Numeric),
+        plan::Literal::Bool(_) => Some(ColumnType::Bool),
+        plan::Literal::TypedNull(ty) => Some(*ty),
+        plan::Literal::Typed(value) => value.column_type(),
+        plan::Literal::Null | plan::Literal::String(_) => None,
     }
 }
 
@@ -301,8 +386,10 @@ fn apply_database_options(
                     )));
                 }
             }
+            // `C` and `POSIX` are one ordering under two names (ADR 0076), so a database asking
+            // for either is asking for what this node already is.
             "LC_COLLATE" | "LC_CTYPE" | "LOCALE" => {
-                if !value.eq_ignore_ascii_case(COLLATION) {
+                if !value.eq_ignore_ascii_case(COLLATION) && !value.eq_ignore_ascii_case("POSIX") {
                     return Err(SqlError::unsupported(format!(
                         "the collation {value}, on a node whose only collation is {COLLATION}"
                     )));
@@ -2306,6 +2393,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         // Both end here, because what they produce is the same record.
         let mut sequence = serial_identity(&column.data_type);
         let mut generated: Option<String> = None;
+        let mut collation: Option<String> = None;
         for option in &column.options {
             match &option.option {
                 // A column `CHECK`, named the way PostgreSQL names one when nothing else does:
@@ -2373,6 +2461,23 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                     Ok(expr) => generated = Some(expr),
                     Err(identity) => sequence = Some(identity),
                 },
+                // **`COLLATE "C"` and `COLLATE "POSIX"` name the ordering this node has** —
+                // byte order, which is what a memcomparable key already gives, so honouring one
+                // costs nothing and ignoring it would cost the client the order it asked for
+                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                // Every other name is `42704`, the sqlstate a real server gives for a collation it
+                // does not have, because this node genuinely does not have that ordering.
+                ColumnOption::Collation(name) => {
+                    // A user-defined type is an enum, whose stored form is a smallint (ADR 0050)
+                    // and whose `ty` here is a placeholder — so ask about the *written* type, not
+                    // the placeholder, and let a `COLLATE` on an enum be the `42804` it is.
+                    let written = if user_type_name.is_some() {
+                        ColumnType::Int2
+                    } else {
+                        ty
+                    };
+                    collation = Some(column_collation(name, written)?);
+                }
                 other => return Err(SqlError::unsupported(column_option_name(other))),
             }
         }
@@ -2381,6 +2486,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
             not_null = true;
         }
         columns.push(plan::Column {
+            collation,
             name: column_name,
             ty,
             user_type_name,
@@ -2563,6 +2669,9 @@ fn lower_alter_table(
                     ty,
                     typmod,
                     using,
+                    // Filled in by `Parsed::lower`, which is where the clause the parser could not
+                    // read arrives (`crate::parse::strip_alter_column_collation`).
+                    collation: None,
                 });
                 continue;
             }
@@ -2656,6 +2765,7 @@ fn lower_alter_table(
         )?;
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
         let mut not_null = false;
+        let mut collation: Option<String> = None;
         let mut primary_key = false;
         let mut generated: Option<String> = None;
         let mut default = None;
@@ -2732,6 +2842,13 @@ fn lower_alter_table(
                 ColumnOption::Unique(_) => "ALTER TABLE ... ADD COLUMN ... UNIQUE",
                 // `NULL` is the default and says nothing; honouring it is honouring nothing.
                 ColumnOption::Null => continue,
+                // The same clause `CREATE TABLE` takes, and it has to be here too:
+                // `add_column … collation: "C"` is one of `collation_test.rb`'s five, and the
+                // column it adds is read back by the same `attcollation <> typcollation`.
+                ColumnOption::Collation(name) => {
+                    collation = Some(column_collation(name, ty)?);
+                    continue;
+                }
                 other => return Err(SqlError::unsupported(column_option_name(other))),
             };
             return Err(SqlError::unsupported(named));
@@ -2747,6 +2864,7 @@ fn lower_alter_table(
         actions.push(plan::AlterTableAction::AddColumn {
             primary_key,
             column: plan::Column {
+                collation,
                 name: ident(&column_def.name),
                 ty,
                 user_type_name,
@@ -3392,6 +3510,30 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             op: UnaryOperator::Plus,
             expr,
         } => lower_expr(expr),
+        // `title COLLATE "C" DESC`, which `unsafe_raw_sql_test.rb` sends and which this node can
+        // answer *exactly*: `C` is byte order and a memcomparable key is already in byte order, so
+        // the clause asks for the ordering the rows would have had. The name is still checked —
+        // `42704` for one this node does not have — because accepting `en_US.UTF-8` here and
+        // sorting by bytes would return the rows in an order nobody asked for (ADR 0076).
+        //
+        // **The type check reaches as far as the type does.** A literal carries one, so
+        // `SELECT 1 COLLATE "C"` is the measured `42804`; a column reference does not have one
+        // until the executor resolves it against a scope, and `COLLATE` on a non-collatable
+        // *column* is accepted here where PostgreSQL raises. Declared in
+        // `tests/corpus/pg19_collation.txt` rather than left to be found.
+        Expr::Collate { expr, collation } => {
+            let lowered = lower_expr(expr)?;
+            // The name is checked and then dropped: both names this node has mean byte order, so
+            // there is nothing for the plan to carry.
+            collation_name(collation)?;
+            if let plan::Expr::Literal(literal) = &lowered
+                && let Some(ty) = literal_type(literal)
+                && !catalog::pg_attribute::collatable(ty)
+            {
+                return Err(SqlError::CollationNotSupported(ty.name()));
+            }
+            Ok(lowered)
+        }
         Expr::Nested(inner) => lower_expr(inner),
         // `~`, `~*`, `!~`, `!~*` — POSIX matching, in `LIKE`'s shape and for `LIKE`'s reason: a
         // subject and a *pattern*, with modifiers a binary op has nowhere to put.
@@ -4709,10 +4851,20 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             texts.push(Some(text.clone()));
             continue;
         }
+        // **Not a constant, so the whole constructor becomes a runtime one.** `ARRAY[casttarget]`
+        // is what `ActiveRecord`'s case-insensitivity probe sends, and an element that is a column
+        // has no value until there is a row — so the elements are lowered as expressions and the
+        // element type is settled where a scope exists (`exec::query::resolve`). Everything
+        // already folded above is discarded rather than mixed in: one constructor is built one
+        // way, and a half-folded one would have two rules for what its type is.
         let Expr::Value(value) = strip_nesting(expr) else {
-            return Err(SqlError::unsupported(
-                "an ARRAY constructor over anything but constants",
-            ));
+            return Ok(plan::Expr::Array {
+                elements: elements
+                    .iter()
+                    .map(lower_expr)
+                    .collect::<Result<Vec<_>>>()?,
+                element: None,
+            });
         };
         // The widest element type wins, in PostgreSQL's own order: a string makes the whole array
         // `text`, a decimal makes it `numeric`, and integers alone leave it an integer array.

@@ -938,3 +938,95 @@ So the candidate the oracle change introduced is not the cause, and what was see
 unexplained. What it is not, now, is unrecorded and undiagnosable: the next occurrence leaves a
 file. A row missing entirely is a catch-up or a seal, a row with the wrong `region` value is the
 widening, and a row visible on one side only is MVCC resolution.
+
+---
+
+# §store unit 4 — a region's columnar copy holds a region, not a table
+
+Opened 2026-09-05 by lane h1-part, from the `mpp` lane's multi-region matrix on the fixed main:
+the **columnar** path returns N× answers across regions — a bare `count(*)` was 4× with several
+regions — while the row path is right. Each fragment is legitimately routed to its own region and
+still reads too much.
+
+## What it is, and it is one line
+
+`crates/esker-store/src/columnar/region.rs`, the walk that builds a copy for a learner placed on a
+region that already has data:
+
+```rust
+let (start, end) = esker_keys::row::table_row_range(tenant, table_id);
+```
+
+**The whole table's key range, on a store that holds several regions of that table.** A store's
+`write` column family holds the rows of every region it hosts, so the walk feeds each region's
+columnar copy every row of that table *on that store*. With four learners on two stores, two copies
+each hold what two regions own, every fragment answers for more rows than its shard covers, and the
+SQL node adds the shards up. The row path is unaffected because a row read goes through the region
+that owns the key.
+
+Everything around it is already region-scoped and that is what made this hard to see: the slot is
+keyed by region id, its directory is `<data-dir>/columnar/<region-id>/`, and the live apply tee only
+ever sees its own peer's entries. **Only the initial walk is scoped to the wrong thing**, and only
+a multi-region table on a multi-region store can show it — which is a shape that did not exist
+before [ADR 0073](../adr/0073-a-regions-size-is-the-data-families-it-spans.md) made a SQL table split
+at all.
+
+## Why the epoch guard does not cover it
+
+[ADR 0040](../adr/0040-the-engine-a-query-runs-on.md) already names a neighbouring case — *"a region
+that split after its columnar copy was built is not routed… the epoch pins it"* — and closes with
+*"a split-aware columnar copy is `esker-store`'s."* That guard is real and it does not apply here:
+the splits in this cluster happen **before** the learners are placed, so no shard is ever stale and
+no epoch is ever wrong. The copies are built correctly-epoched and simply contain too much.
+
+## The decision: both, and they are not alternatives
+
+**1. Scope the walk to the region's range — the fix.** Intersect the table range with the region's
+own `[start_key, end_key)`, read from the region record (`meta::load_regions`, by the slot's
+`region_id`) at rebuild time rather than cached in the slot, because a split moves it. This stops
+the copy ever being wrong and stops it being N times too large on disk.
+
+**2. Honour a key range at scan time — the guarantee.** `Fragment::validate` today *refuses* any
+bounded `KeyRange`, on the stated ground that "a columnar file records no key range". That is true
+of the file's *metadata* and not of its contents: the run carries the row key as a column — the
+visibility filter already reads it (`runs.visibility.0`) — so a row-level restriction is exactly a
+predicate on that column. Implementing it makes the answer correct **whatever a run happens to
+contain**, which is what covers the case (1) cannot: a parent's existing runs after a split, which
+nothing prunes.
+
+They are not alternatives because they fail differently. (1) alone leaves every copy built before it
+wrong, and leaves ADR 0040's split case open. (2) alone leaves each store storing N times the data
+it needs and paying to read and discard it on every fragment. Doing (1) without (2) would also mean
+the correctness of an answer depends on a *build-time* decision, which is the shape that made this
+defect invisible for a whole phase.
+
+### Two things settled while reading, which narrow (2) before it is written
+
+* **The restriction belongs to the store, not to the client.** It is a property of the *region*,
+  not of the query, so the store applies it from its own region record and `Fragment.range` — the
+  field a client could send — stays refused. That keeps ADR 0040's sentence true of the wire, needs
+  no wire change, and makes the guarantee independent of a client sending the right bounds.
+* **It cannot be a rewrite of the fragment's filter.** The tempting cheap version is
+  `filter AND __key >= start AND __key < end`, and it does not work: `Expr::Column(n)` addresses a
+  **projection slot**, not a column of the file, and the query this defect was measured on —
+  `count(*)` — projects nothing at all. So the range has to be a `ScanOptions` field honoured where
+  the key column is already read, which is beside `Visibility`; both evaluation paths
+  (`evaluate_with` and `merged::evaluate`) route through that.
+
+**What is not in this unit:** pruning a parent's runs on a split, and stripe-level range metadata so
+a bounded range can skip stripes instead of filtering rows. The first is the storage half of ADR
+0040's sentence and wants its own unit; the second is a performance change and this one is a
+correctness change. Both get a row when this closes.
+
+## How it will be proved
+
+* `mpp`'s multi-region differential (real binaries, `Engine: columnar` asserted) is the acceptance
+  and arrives on its branch — the shape that reproduces N× today.
+* In `esker-store`, a unit test that places two regions of one table on **one** store and asserts
+  each copy holds only its own region's rows: the assertion is the row count per copy, because that
+  is the number that was N times too large.
+* In `esker-columnar`, the range predicate asserted directly, including the two boundary readings an
+  empty bound has — `start` empty means "from the beginning", `end` empty means "to the end of the
+  key space" — which is the rule `clamp_end` in `esker-client` already had to get right twice.
+* A counterfactual for each: revert (1) and the store test reddens; revert (2) and the range test
+  reddens.

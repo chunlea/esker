@@ -200,6 +200,12 @@ pub(crate) fn evaluate(
                 row.get(visibility.deleted_column as usize),
                 Some(Value::Bool(true))
             );
+            // The region's own bounds, before the resolver — see `scan::in_range` and
+            // `next_is_visible` for why the order matters: a key the region does not own must not
+            // settle, or the next in-range key looks already-decided.
+            if !crate::scan::in_range(options.range.as_ref(), &key) {
+                continue;
+            }
             if !resolver.visible(&key, commit_ts, deleted, visibility.ts) {
                 continue;
             }

@@ -40,6 +40,7 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         .iter()
         .zip(column_types(list)?)
         .map(|(name, ty)| ColumnDef {
+            collation: None,
             name: name.clone(),
             ty,
             typmod: crate::value::NO_TYPMOD,

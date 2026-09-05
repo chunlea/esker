@@ -67,7 +67,12 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         // `ADD COLUMN ... bigserial` left this list: it creates the sequence now, on an empty
         // table (`tests/add_column_primary_key.rs`). What stays refused is the same statement over
         // a table that has rows, which PostgreSQL fills from the sequence.
-        ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
+        //
+        // `CREATE TABLE … COLLATE "C"` left it too, and for a different reason: it is **built**
+        // now, because `C` and `POSIX` name byte order and byte order is the ordering this node
+        // has ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+        // A collation it does not have is still refused, with `42704` rather than `0A000`, which
+        // is why it does not belong here either: `tests/collation.rs` holds both halves.
         // **`PARTITION BY LIST` and `RANGE` left this list** with statements 781-786; `HASH` is
         // what is still refused, because nothing captured how it routes and a strategy this node
         // guessed at would put rows in the wrong partition.
@@ -205,7 +210,6 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
         ),
         // `ADD COLUMN ... PRIMARY KEY` left this list with the `bigserial` above it, and so did
         // `ADD CONSTRAINT ... PRIMARY KEY`.
-        ("ALTER TABLE t ADD COLUMN c text COLLATE \"C\"", "COLLATE"),
         // `ALTER COLUMN a TYPE text` was here. It converts now, so what stays refused is the
         // `USING` that asks for a **computation** rather than a conversion — the boundary the unit
         // draws, and the one worth guarding (ADR 0031 rule 2).

@@ -1,22 +1,25 @@
 //! **`pk_and_sequence_for` and `reset_pk_sequence!` over a schema-qualified table.**
 //!
-//! Two `schema_test.rb` tests, both **already passing at HEAD** when this was written — they were
-//! failing at `06291ca5` and gone by `47ffc338`, so something in between closed them. This file
-//! exists to pin the behaviour, because nothing else asserted it and a fix nobody tested is a fix
-//! that regresses quietly.
+//! Two `schema_test.rb` tests. The **dependency** half was already passing at HEAD when this was
+//! written — failing at `06291ca5`, gone by `47ffc338`, closed by something in between — and this
+//! file pins it, because nothing else asserted it and a fix nobody tested is a fix that regresses
+//! quietly. The **fallback** half was not passing, and is the unit.
 //!
-//! # What `ActiveRecord` actually runs, and one thing it cannot
+//! # What `ActiveRecord` runs, and which query answers
 //!
 //! `pk_and_sequence_for` tries a **dependency** query first — the sequence `pg_depend` links to
-//! the primary key's column — and falls back to parsing the printed `nextval(…)` default. **The
-//! fallback cannot run on this node**: it uses `split_part`, which is `0A000` here. So every
-//! answer comes from the first query, including the one for
-//! `table_with_unmatched_sequence_for_pk`, whose sequence is deliberately *not* the column's
-//! derived one.
+//! the primary key's column — and falls back to parsing the printed `nextval(…)` default.
 //!
-//! That is worth knowing before someone changes the dependency rows: there is no second path to
-//! fall back to, and the failure would be silent — `pk_and_sequence_for` returning nothing reads
-//! as "no sequence", which `reset_pk_sequence!` treats as nothing to do.
+//! Both queries earn their place, on a real server as much as here. PostgreSQL answers the
+//! dependency query with **0 rows** for `table_with_unmatched_sequence_for_pk` — measured —
+//! because a sequence merely named in a `DEFAULT` has no `pg_depend` row pointing at the column.
+//! So the fallback is not a workaround for a catalog row this node is missing; it is the path
+//! PostgreSQL itself takes for that table, and it was unreachable here while `split_part`,
+//! `strpos` and `substr` answered `0A000`.
+//!
+//! The failure that caused was silent, which is why it is worth a test: `pk_and_sequence_for`
+//! returning nothing reads as "no sequence", and `reset_pk_sequence!` treats that as nothing
+//! to do.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

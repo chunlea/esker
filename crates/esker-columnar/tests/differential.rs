@@ -346,6 +346,7 @@ fn agree(
                 prune,
                 widening: None,
                 visibility: None,
+                range: None,
             },
         )
         .map(|result| result.output);

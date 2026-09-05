@@ -126,6 +126,7 @@ pub(super) fn create_table(
     let (columns, primary_key, primary_key_name) = if declared_key.is_empty() {
         let mut with_row_id = Vec::with_capacity(columns.len() + 1);
         with_row_id.push(ColumnDef {
+            collation: None,
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
@@ -279,6 +280,9 @@ fn declared_columns(
             _ => column.typmod,
         };
         let mut kept = ColumnDef {
+            // What the declaration asked for, which the lowerer has already narrowed to an
+            // ordering this node has (ADR 0076).
+            collation: column.collation.clone(),
             name: column.name.clone(),
             ty,
             typmod,
@@ -1240,15 +1244,31 @@ fn money_as_numeric(cents: i64) -> esker_keys::numeric::Numeric {
 /// The order of the checks is PostgreSQL's, and it is observable: the **pair** is rejected before
 /// any row is read (`42804` with the `USING` to write), the **default** before that (`42804`
 /// naming the default), and only then can a row fail on its own value.
+/// The four things `ALTER COLUMN … TYPE` carries, together because they are one clause.
+struct TypeChange<'a> {
+    /// The target type.
+    ty: ColumnType,
+    /// Its `atttypmod`, or `-1`.
+    typmod: i32,
+    /// The type a `USING` casts the column to, when the statement wrote one.
+    using: Option<ColumnType>,
+    /// The collation the statement named, or `None` to take the new type's own.
+    collation: Option<&'a str>,
+}
+
 fn set_column_type(
     txn: &mut dyn Txn,
     executor: &Executor,
     updated: &mut TableDef,
     column: &str,
-    ty: ColumnType,
-    typmod: i32,
-    using: Option<ColumnType>,
+    change: &TypeChange<'_>,
 ) -> Result<()> {
+    let &TypeChange {
+        ty,
+        typmod,
+        using,
+        collation,
+    } = change;
     let at = updated
         .column(column)
         .ok_or_else(|| SqlError::UndefinedColumnInRelation {
@@ -1308,6 +1328,10 @@ fn set_column_type(
     };
     updated.columns[at].ty = ty;
     updated.columns[at].typmod = typmod;
+    // **Assigned and not merged.** A statement with no `COLLATE` gives the column its new type's
+    // collation, so one that had `COLLATE "C"` and is retyped without a clause goes back to the
+    // default — which is what PostgreSQL does, and what keeping the old name here would not.
+    updated.columns[at].collation = collation.map(ToOwned::to_owned);
     updated.columns[at].default = default;
     updated.columns[at].missing = missing;
     let types = updated.column_types();
@@ -3686,6 +3710,7 @@ fn matview_columns(planned: &super::query::Planned, declared: &[String]) -> Resu
         .iter()
         .enumerate()
         .map(|(at, column)| ColumnDef {
+            collation: None,
             name: declared
                 .get(at)
                 .cloned()
@@ -3719,6 +3744,7 @@ fn matview_table(
 ) -> TableDef {
     let mut with_row_id = Vec::with_capacity(columns.len() + 1);
     with_row_id.push(ColumnDef {
+        collation: None,
         name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
         ty: ColumnType::Int8,
         typmod: crate::value::NO_TYPMOD,
@@ -4846,6 +4872,12 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             .get(*at)
             .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        Expr::Array { elements, .. } => {
+            format!(
+                "ARRAY[{}]",
+                elements.iter().map(sub).collect::<Vec<_>>().join(", ")
+            )
+        }
         Expr::Like {
             operand,
             pattern,
@@ -5373,9 +5405,21 @@ pub(super) fn alter_table(
             ty,
             typmod,
             using,
+            collation,
         } = action
         {
-            set_column_type(txn, executor, &mut updated, column, *ty, *typmod, *using)?;
+            set_column_type(
+                txn,
+                executor,
+                &mut updated,
+                column,
+                &TypeChange {
+                    ty: *ty,
+                    typmod: *typmod,
+                    using: *using,
+                    collation: collation.as_deref(),
+                },
+            )?;
             changed = true;
             continue;
         }
@@ -5516,6 +5560,7 @@ pub(super) fn alter_table(
                 ty,
                 &def,
                 &ColumnDef {
+                    collation: None,
                     name: column.name.clone(),
                     ty,
                     typmod: column.typmod,
@@ -5533,6 +5578,7 @@ pub(super) fn alter_table(
             None => column.default.clone(),
         };
         updated.columns.push(ColumnDef {
+            collation: column.collation.clone(),
             name: column.name.clone(),
             ty,
             typmod: column.typmod,

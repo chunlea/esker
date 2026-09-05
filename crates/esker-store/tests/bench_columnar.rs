@@ -301,6 +301,7 @@ fn scan_columnar(apply: &ColumnarApply, at: i64) -> usize {
         &ScanOptions {
             prune: true,
             widening: None,
+            range: None,
             visibility: Some(Visibility {
                 key_columns: vec![key_slot],
                 ts_column: ts_slot,
