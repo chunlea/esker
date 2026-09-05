@@ -3669,6 +3669,9 @@ pub(super) fn drop_schema(
     txn: &mut dyn Txn,
     drop: &plan::DropSchema,
 ) -> Result<Outcome> {
+    // The sequences every dropped table takes with it — see `drop_one_table`, which cannot forget
+    // their reserved blocks itself.
+    let mut forgotten: Vec<u64> = Vec::new();
     for name in &drop.names {
         // **The catalog's own two are `2BP01` before anything else is looked at**, `IF EXISTS`
         // included: they exist, so the clause does not apply, and what is wrong is that the
@@ -3730,7 +3733,7 @@ pub(super) fn drop_schema(
                 executor.catalog_view(&*txn)?.relation(stored)?
             {
                 let table = executor.table_by_id(txn, table_id)?;
-                drop_one_table(executor, txn, &table)?;
+                forgotten.extend(drop_one_table(executor, txn, &table)?);
             }
         }
         // The types go too, and after the tables: a column declared as one of them has already
@@ -3739,6 +3742,9 @@ pub(super) fn drop_schema(
             catalog::drop_type(txn, executor.tenant, stored);
         }
         catalog::drop_schema(txn, executor.tenant, name)?;
+        for sequence_id in std::mem::take(&mut forgotten) {
+            executor.forget_sequence_block(sequence_id);
+        }
     }
     Ok(Outcome::done("DROP SCHEMA"))
 }
@@ -4113,6 +4119,8 @@ pub(super) fn drop_table(
     txn: &mut dyn Txn,
     drop: &DropTable,
 ) -> Result<Outcome> {
+    // See `drop_one_table`: it cannot forget a dropped sequence's reserved block itself.
+    let mut forgotten: Vec<u64> = Vec::new();
     for name in &drop.names {
         // `42501`, and `IF EXISTS` does not excuse it — measured, both spellings.
         catalog::pg_catalog::refuse_write(name)?;
@@ -4194,7 +4202,7 @@ pub(super) fn drop_table(
                     detail: format!("table {} depends on table {}", child.name, table.name),
                 });
             }
-            drop_one_table(executor, txn, &child)?;
+            forgotten.extend(drop_one_table(executor, txn, &child)?);
         }
         let (start, end) = catalog::foreign_key_backref_range(executor.tenant, table.id);
         for (key, _) in txn.scan(&start, &end, 0)? {
@@ -4241,7 +4249,10 @@ pub(super) fn drop_table(
             ));
         }
 
-        drop_one_table(executor, txn, &table)?;
+        forgotten.extend(drop_one_table(executor, txn, &table)?);
+    }
+    for sequence_id in forgotten {
+        executor.forget_sequence_block(sequence_id);
     }
     Ok(Outcome::done("DROP TABLE"))
 }
@@ -4256,16 +4267,22 @@ pub(super) fn drop_table(
 ///
 /// The same path `DROP SCHEMA … CASCADE` walks, so each table takes its own indexes, sequences and
 /// primary key with it and nothing is left half-dropped.
-pub(super) fn drop_temp_schema(executor: &Executor, txn: &mut dyn Txn, schema: &str) -> Result<()> {
+pub(super) fn drop_temp_schema(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    schema: &str,
+) -> Result<Vec<u64>> {
+    let mut forgotten = Vec::new();
     for stored in catalog::relations_in_schema(&*txn, executor.tenant, schema)? {
         if let Some(catalog::Relation::Table { table_id }) =
             executor.catalog_view(&*txn)?.relation(&stored)?
         {
             let table = executor.table_by_id(txn, table_id)?;
-            drop_one_table(executor, txn, &table)?;
+            forgotten.extend(drop_one_table(executor, txn, &table)?);
         }
     }
-    catalog::drop_schema(txn, executor.tenant, schema)
+    catalog::drop_schema(txn, executor.tenant, schema)?;
+    Ok(forgotten)
 }
 
 /// `ON COMMIT` for every temporary table this session has, run at the end of **every** transaction
@@ -4280,9 +4297,10 @@ pub(super) fn drop_temp_schema(executor: &Executor, txn: &mut dyn Txn, schema: &
 /// It runs inside the committing transaction, so the emptying and the statement's own writes are
 /// one atomic step — and a transaction that rolls back undoes both, which is what makes a rollback
 /// need no rule of its own.
-pub(super) fn run_on_commit(executor: &Executor, txn: &mut dyn Txn) -> Result<()> {
+pub(super) fn run_on_commit(executor: &Executor, txn: &mut dyn Txn) -> Result<Vec<u64>> {
+    let mut forgotten = Vec::new();
     let Some(schema) = executor.temp_schema() else {
-        return Ok(());
+        return Ok(forgotten);
     };
     let held = catalog::relations_in_schema(&*txn, executor.tenant, schema)?;
     for stored in held {
@@ -4295,10 +4313,10 @@ pub(super) fn run_on_commit(executor: &Executor, txn: &mut dyn Txn) -> Result<()
         match table.on_commit {
             catalog::OnCommit::PreserveRows => {}
             catalog::OnCommit::DeleteRows => empty_table(executor, txn, &table)?,
-            catalog::OnCommit::Drop => drop_one_table(executor, txn, &table)?,
+            catalog::OnCommit::Drop => forgotten.extend(drop_one_table(executor, txn, &table)?),
         }
     }
-    Ok(())
+    Ok(forgotten)
 }
 
 /// Every row and every index entry of one table, deleted — the table itself stays.
@@ -4324,7 +4342,16 @@ fn empty_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Resu
     Ok(())
 }
 
-fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Result<()> {
+/// Answers with the **ids of the sequences it dropped**, which the caller has to forget.
+///
+/// A session reserves [`catalog::SEQUENCE_BATCH`] values of a sequence and serves them from an
+/// in-memory block; the block is keyed by the sequence's id and nothing here can reach it, because
+/// this takes `&Executor`. Leaving it behind cannot hand out a wrong value — `catalog::allocate_id`
+/// never reuses an id, so a re-created sequence is a different sequence and gets its own block —
+/// but the entry stays for the life of the connection, and a long-lived one that creates and drops
+/// tables collects one per drop. So the ids come back out and `Executor::forget_sequence_block`
+/// takes them where there is a `&mut` to do it with.
+fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> Result<Vec<u64>> {
     // The rows go with the table. A range delete is what this wants and the transaction layer
     // has none, so every key is deleted individually -- correct, and `TODO(post-v1)` for a
     // table large enough that this is a problem.
@@ -4355,7 +4382,8 @@ fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> R
         updated.schema_version += 1;
         catalog::replace_table(txn, executor.tenant, &parent, &updated)?;
     }
-    catalog::drop_table(txn, executor.tenant, table)
+    catalog::drop_table(txn, executor.tenant, table)?;
+    Ok(table.sequences.iter().map(|sequence| sequence.id).collect())
 }
 
 pub(super) fn create_index(
