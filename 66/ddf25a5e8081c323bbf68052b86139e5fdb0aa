@@ -1,0 +1,55 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_5d44c337c19c11 58,66,313,371-373,2092-2100,2133-2134
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_e5c0c6e78b5662::t_470e1a95823136 146-150
+crates/esker-sql/tests/session_parameters.rs
+  s_e5c0c6e78b5662::t_d3bd15c4f4c68c 79,81-85,90-97,100
+crates/esker-sql/src/catalog/def_functions.rs
+  s_e5c0c6e78b5662::t_8d80178e77133f 43,141,153
+crates/esker-sql/src/catalog/information_schema.rs
+  s_e5c0c6e78b5662::t_418d345068c3db 39,197,226
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_e5c0c6e78b5662::t_37678d112ede43 185,194,360-361,364,478,542
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_ce8023f9999d44 880,889,910,919,929,947
+crates/esker-sql/src/exec/assign.rs
+  s_e5c0c6e78b5662::t_f4d15dea77ad08 42,70,88-92,116,137
+crates/esker-sql/src/exec/dml.rs
+  s_e5c0c6e78b5662::t_7051b1153ebfb5 53,63,73,88,98,117,279-281,599,660,769,785,807,1058,1143,1207,1275-1283,1463,1492
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_d94281540e1171 1237,1241-1257,1260-1261,1268,1591
+crates/esker-sql/src/parameter.rs
+  s_e5c0c6e78b5662::t_244b8e783e7da5 78-79,87-100,149,468-476,513-517
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_ea9723eaba78f2 2292-2299
+crates/esker-sql/src/value/array.rs
+  s_e5c0c6e78b5662::t_332f322e88a828 249,255,262,272,285,289
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_3429edc12206fc 89,92-96,107,110,114-131,352,356-359,362-368,370,520-527
+crates/esker-sql/src/value/timestamp.rs
+  s_e5c0c6e78b5662::t_f072fde385487e 92-131,142,145,174-177,183-196,199-211,214,227-230,253,306-320,350-353
+crates/esker-sql/src/value/zone/mod.rs
+  s_e5c0c6e78b5662::t_f3729d19385ed3 31-32,71-95,294-303,338-346
+crates/esker-sql/tests/assignment_cast_date.rs
+  s_e5c0c6e78b5662::t_545131759a41e7 45-48,50-56,58-62,64-70,72-74
+crates/esker-sql/tests/set_parameters.rs
+  s_e5c0c6e78b5662::t_7e47c422829cb4 37-41,43-45
+crates/esker-sql/tests/time_zone.rs
+  s_e5c0c6e78b5662::t_d9e88751d55526 1-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "66ddf25a5e8081c323bbf68052b86139e5fdb0aa",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
