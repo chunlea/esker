@@ -1000,6 +1000,19 @@ it needs and paying to read and discard it on every fragment. Doing (1) without 
 the correctness of an answer depends on a *build-time* decision, which is the shape that made this
 defect invisible for a whole phase.
 
+### Two things settled while reading, which narrow (2) before it is written
+
+* **The restriction belongs to the store, not to the client.** It is a property of the *region*,
+  not of the query, so the store applies it from its own region record and `Fragment.range` — the
+  field a client could send — stays refused. That keeps ADR 0040's sentence true of the wire, needs
+  no wire change, and makes the guarantee independent of a client sending the right bounds.
+* **It cannot be a rewrite of the fragment's filter.** The tempting cheap version is
+  `filter AND __key >= start AND __key < end`, and it does not work: `Expr::Column(n)` addresses a
+  **projection slot**, not a column of the file, and the query this defect was measured on —
+  `count(*)` — projects nothing at all. So the range has to be a `ScanOptions` field honoured where
+  the key column is already read, which is beside `Visibility`; both evaluation paths
+  (`evaluate_with` and `merged::evaluate`) route through that.
+
 **What is not in this unit:** pruning a parent's runs on a split, and stripe-level range metadata so
 a bounded range can skip stripes instead of filtering rows. The first is the storage half of ADR
 0040's sentence and wants its own unit; the second is a performance change and this one is a
