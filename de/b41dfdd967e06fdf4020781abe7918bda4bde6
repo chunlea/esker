@@ -1,0 +1,27 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_80f3b26e5bcbd0::t_002df7bb6d8202 527,529-540,4537
+crates/esker-sql/tests/corpus/pg19_gin_tsvector.txt
+  s_80f3b26e5bcbd0::t_3faa8e0a6bab21 1-58
+crates/esker-sql/tests/gin_default_opclass.rs
+  s_80f3b26e5bcbd0::t_c08e653f8cda77 20-33,44-47,49-53,55-60,62,64-77,85-131
+crates/esker-sql/tests/tsvector.rs
+  s_80f3b26e5bcbd0::t_cacc8c9cdca859 13,17-23,48-52,65-79,109,111
+docs/adr/0066-a-tsvector-is-its-canonical-text.md
+  s_80f3b26e5bcbd0::t_80161bd6855199 77-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "deb41dfdd967e06fdf4020781abe7918bda4bde6",
+  "prompts": {},
+  "sessions": {
+    "s_80f3b26e5bcbd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2718fa83-28c7-4d6b-b36d-c2d6eaa873d9",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
