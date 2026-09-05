@@ -297,3 +297,120 @@ fn wish(range: &(Vec<u8>, Vec<u8>), replicas: u8) -> ColumnarWish {
         replicas,
     }
 }
+
+/// A backend whose transactions take `delay` to begin, standing for the one thing
+/// [`esker_sql::pd::columnar_wishes`] does that has no bound: it opens a transaction and scans the
+/// catalog range **across the cluster**, so its cost is a region mid-split, a leader that has
+/// moved, or a store saturated by somebody else's load.
+///
+/// Only the refresher is given one of these. A session keeps the ordinary backend, because what is
+/// under test is the renewal's cadence and not a slow statement.
+#[derive(Debug)]
+struct SlowToReport {
+    inner: Arc<dyn Backend>,
+    delay: Duration,
+}
+
+impl Backend for SlowToReport {
+    fn begin(&self) -> esker_sql::error::Result<Box<dyn esker_sql::backend::Txn>> {
+        std::thread::sleep(self.delay);
+        self.inner.begin()
+    }
+
+    fn begin_at(
+        &self,
+        start_ts: u64,
+    ) -> esker_sql::error::Result<Box<dyn esker_sql::backend::Txn>> {
+        self.inner.begin_at(start_ts)
+    }
+
+    fn now(&self) -> esker_sql::error::Result<u64> {
+        self.inner.now()
+    }
+
+    /// **Forwarded on purpose, both of them.** They have trait defaults — an unbounded lease and no
+    /// step interval — so a wrapper that left them out would answer "this node may always write"
+    /// from the very object this test uses to watch a lease lapse. That is the shape of defect this
+    /// file exists to catch, and it would have hidden it.
+    fn schema_lease_remaining(&self) -> Option<Duration> {
+        self.inner.schema_lease_remaining()
+    }
+
+    fn schema_step_interval(&self) -> Option<StepInterval> {
+        self.inner.schema_step_interval()
+    }
+}
+
+/// **A report slower than the lease must not expire the lease.**
+///
+/// The renewal and the columnar report are one round on one thread:
+///
+/// ```text
+/// loop { sleep(lease / 3); renew(); report(); }
+/// ```
+///
+/// The renewal is recorded before the report, so *this* renewal is never late — which is what the
+/// code's own comment claims, and it is true. What it does not say is that the next sleep does not
+/// begin until the report returns, so **the report delays the following renewal**. A report costing
+/// more than the remaining two thirds of the lease lets it expire, and nothing anywhere logs it:
+/// the renewal succeeded, and a slow read is not an error.
+///
+/// Measured on a real cluster before this test was written: a round with `renew_ms=0` and
+/// `report_ms=3879` against a `period_ms=1666`, on a 5 s lease — the next renewal due 5,545 ms
+/// after the last, 545 ms past expiry — in the same attempt whose first `INSERT` came back
+/// `25006 cannot execute INSERT in a read-only transaction`. Reads kept working throughout, which
+/// is why it looks like a client problem and is not one.
+///
+/// Deterministic and clusterless: the report is made slow on purpose rather than waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_slower_than_the_lease_does_not_expire_it() {
+    const LEASE_MS: u64 = 400;
+    let (_pd, pd_handle, address) = standin_pd::serve_with_lease(LEASE_MS).await;
+    let cluster = cluster::Cluster::start_on_this_runtime().await;
+
+    let (lease, backend, refresher) = tokio::task::block_in_place(|| {
+        let lease = Arc::new(PdLease::new());
+        let backend = cluster.backend_holding(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>);
+        // Three lease-lengths, so that a report which delays the renewal cannot fail to expire it.
+        let slow: Arc<dyn Backend> = Arc::new(SlowToReport {
+            inner: Arc::clone(&backend),
+            delay: Duration::from_millis(LEASE_MS * 3),
+        });
+        let conn = Arc::new(PdConn::new(address));
+        let refresher =
+            LeaseRefresher::new(conn, Arc::clone(&lease)).asserting_columnar_for(slow, TENANT);
+        refresher
+            .refresh()
+            .expect("a node fetches its lease before it serves");
+        (lease, backend, refresher)
+    });
+
+    std::thread::Builder::new()
+        .name("schema-lease".to_owned())
+        .spawn(move || refresher.run())
+        .unwrap();
+
+    // Watched through the **backend**, because `Backend::schema_lease_remaining` returning `None`
+    // is literally what the write path turns into `25006`; asserting on anything else would be
+    // asserting on a proxy for the symptom.
+    let watched = Duration::from_millis(LEASE_MS * 8);
+    let until = std::time::Instant::now() + watched;
+    let mut lapses = 0u32;
+    let mut samples = 0u32;
+    while std::time::Instant::now() < until {
+        samples += 1;
+        if backend.schema_lease_remaining().is_none() {
+            lapses += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        lapses, 0,
+        "this node's lease lapsed in {lapses} of {samples} samples over {watched:?} while its \
+         placement driver answered every renewal: the report is on the renewal's thread, so a \
+         report slower than the lease starves the renewal that would have kept it"
+    );
+
+    pd_handle.shutdown().await.unwrap();
+}

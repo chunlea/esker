@@ -267,11 +267,27 @@ impl PdLease {
     }
 
     /// Records a fresh answer from PD.
+    ///
+    /// **A renewal that lands more than half a lease after the previous one is a warning**, with
+    /// both durations, because it is the only visible symptom of a renewal cadence that has come
+    /// unstuck. Half rather than the whole: at the whole, the node has already refused a write and
+    /// the log arrives after the client's error. Here, rather than in the refresher, so that every
+    /// path which records a lease is measured — the startup grant included.
     pub fn record(&self, lease: Lease) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(Held {
-            at: Instant::now(),
-            lease,
-        });
+        let now = Instant::now();
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = *held {
+            let since = now.duration_since(previous.at);
+            if since > Duration::from_millis(previous.lease.lease_ms) / 2 {
+                tracing::warn!(
+                    since_previous_ms = since.as_millis(),
+                    lease_ms = previous.lease.lease_ms,
+                    "a schema lease renewal landed more than half a lease after the previous one; \
+                     a renewal this late is one lost round trip away from refusing writes"
+                );
+            }
+        }
+        *held = Some(Held { at: now, lease });
     }
 
     /// How long until this node must stop writing, or `None` if it already must.
@@ -385,6 +401,35 @@ pub fn columnar_wishes(
     Ok(wishes)
 }
 
+/// Sends the whole set to PD, or logs why it could not read it.
+///
+/// **A failed read sends nothing**, which is the one thing that must not go wrong here: an empty
+/// report is a valid assertion meaning "no table wants a columnar copy", so a node that reported
+/// `[]` because its own store was unreachable would retire every learner in the cluster.
+///
+/// A free function rather than a method because it now has two callers on two threads — the
+/// startup round and [`Reporter`] — and belongs to neither.
+fn assert_wishes(conn: &PdConn, backend: &dyn Backend, tenant: u64) {
+    match columnar_wishes(backend, tenant) {
+        Ok(wishes) => {
+            let ranges = wishes.len();
+            if let Err(error) = conn.report_columnar(wishes) {
+                tracing::warn!(
+                    %error,
+                    "could not report columnar placement; the next round re-asserts it"
+                );
+            } else {
+                tracing::debug!(ranges, "asserted columnar placement");
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "could not read this tenant's columnar settings; reporting nothing rather than \
+             asserting an empty set"
+        ),
+    }
+}
+
 /// The thread that renews this node's lease, and re-asserts its columnar wishes.
 ///
 /// One thread doing both, because they are one PD answer's worth of work: the lease is what says
@@ -418,75 +463,149 @@ impl LeaseRefresher {
         self
     }
 
-    /// One round: renew the lease, then re-assert the wishes.
+    /// **The startup round**: renew the lease, then assert the wishes, both before serving.
     ///
-    /// The lease first, because it is the half that must not be late — a report that misses a
-    /// round is repaired by the next one, and a lease that misses enough of them stops this node
-    /// writing.
+    /// The one place the two still travel together, and the only place they may. A node has not
+    /// opened its client socket yet, so this round's cost is paid by startup rather than by a
+    /// lease that is meanwhile running out — which is precisely what makes it safe here and unsafe
+    /// in a loop ([`LeaseRefresher::run`]).
     ///
     /// # Errors
     ///
-    /// The renewal's failure. A **report** that fails is logged and not returned: the lease is
-    /// still good, so this node keeps writing, and PD hears the same content on the next round.
+    /// The renewal's failure, which the binary turns into a refusal to start. A **report** that
+    /// fails is logged and not returned: the lease is still good, so this node serves, and PD
+    /// hears the same content on the reporter's next round.
     pub fn refresh(&self) -> Result<Lease, ProtoError> {
+        // **The report first here, and the renewal last.** The opposite of the order the loop used
+        // to run, for the opposite reason: nothing is being kept alive across this round, so what
+        // matters is that the lease be *fresh when this returns* — the caller opens the client
+        // socket next. Recording it first and then reporting hands the socket a lease already aged
+        // by the whole report, which on a slow one is a lease that has expired before the node has
+        // served a single statement. That is the residual the deterministic test found once the
+        // loop was fixed: 1 lapsed sample in 263, in exactly the window between serving and the
+        // refresher's first renewal.
+        if let Some((backend, tenant)) = &self.wishes {
+            assert_wishes(&self.conn, &**backend, *tenant);
+        }
         let lease = self.conn.schema_lease()?;
         self.lease.record(lease);
-        self.assert_wishes();
         Ok(lease)
     }
 
-    /// Sends the whole set, or logs why it could not read it.
-    ///
-    /// **A failed read sends nothing**, which is the one thing that must not go wrong here: an
-    /// empty report is a valid assertion meaning "no table wants a columnar copy", so a node that
-    /// reported `[]` because its own store was unreachable would retire every learner in the
-    /// cluster.
-    fn assert_wishes(&self) {
-        let Some((backend, tenant)) = &self.wishes else {
-            return;
-        };
-        match columnar_wishes(&**backend, *tenant) {
-            Ok(wishes) => {
-                let ranges = wishes.len();
-                if let Err(error) = self.conn.report_columnar(wishes) {
-                    tracing::warn!(
-                        %error,
-                        "could not report columnar placement; the next refresh re-asserts it"
-                    );
-                } else {
-                    tracing::debug!(ranges, "asserted columnar placement");
-                }
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "could not read this tenant's columnar settings; reporting nothing rather than \
-                 asserting an empty set"
-            ),
-        }
-    }
-
-    /// Renews for as long as this node runs.
+    /// Renews for as long as this node runs, and reports beside it on a thread of its own.
     ///
     /// Never returns, and never gives up: a node that has lost PD has stopped writing, and the
     /// only way back is to keep asking. The cadence stays the one PD last published
     /// ([`PdLease::refresh_period`]).
+    ///
+    /// # Why the report is not on this thread
+    ///
+    /// It was, and the two were one round: `sleep(lease / 3)` then renew then report. The renewal
+    /// is recorded before the report, so *that* renewal is never late — which is what this comment
+    /// used to claim, and it was true and it was not enough. **The next sleep did not begin until
+    /// the report returned**, and the report is [`columnar_wishes`]: a transaction opened against
+    /// the cluster and a catalog range scanned across it, whose cost is a region mid-split, a
+    /// leader that has moved, or a store saturated by somebody else's load. A report costing more
+    /// than the remaining two thirds of the lease let it expire, and nothing logged a thing —
+    /// the renewal had succeeded, and a slow read is not an error.
+    ///
+    /// Measured on a real cluster: a round with `renew_ms=0` and `report_ms=3879` against a
+    /// `period_ms=1666` on a 5 s lease, putting the next renewal 5,545 ms after the last, in the
+    /// same run whose first `INSERT` came back `25006`. Reads kept working throughout, which is
+    /// why it presents as a client problem and is not one.
+    ///
+    /// The two halves have different failure semantics — a lost report is repaired by the next
+    /// one, a lost renewal stops this node writing — so they now keep different threads and
+    /// different cadences, and neither can make the other late.
     pub fn run(self) {
-        loop {
-            let period = self.lease.refresh_period().unwrap_or(MIN_REFRESH_PERIOD);
-            std::thread::sleep(period);
-            match self.refresh() {
-                Ok(lease) => tracing::trace!(
-                    lease_ms = lease.lease_ms,
-                    step_ms = lease.step.step_ms,
-                    "renewed the schema lease"
-                ),
-                // Not an error the node can act on: writes fail closed on their own when the
-                // lease runs out, and reads are unaffected either way.
-                Err(error) => tracing::warn!(
+        let Self {
+            conn,
+            lease,
+            wishes,
+        } = self;
+        if let Some((backend, tenant)) = wishes {
+            let reporter = Reporter {
+                conn: Arc::clone(&conn),
+                lease: Arc::clone(&lease),
+                backend,
+                tenant,
+            };
+            if let Err(error) = std::thread::Builder::new()
+                .name("columnar-report".to_owned())
+                .spawn(move || reporter.run())
+            {
+                // The lease is the half that must not be late, and it is this thread's. A node
+                // that could not start a reporter renews correctly and asserts nothing, which is
+                // a placement that stops being repaired — loud, and not fatal.
+                tracing::warn!(
                     %error,
-                    "could not renew the schema lease from the placement driver"
-                ),
+                    "could not start the columnar reporter; this node will renew its lease but \
+                     assert no columnar placement"
+                );
             }
+        }
+        renew_forever(&conn, &lease);
+    }
+}
+
+/// Renews `lease` for ever, on a cadence that is a **deadline and not a delay**.
+///
+/// `sleep` until `round_start + period`, so the time a renewal itself takes comes out of the wait
+/// rather than being added to it. With the report moved off this thread the renewal is a single
+/// fast call, and this is what keeps that true if it ever stops being one.
+fn renew_forever(conn: &PdConn, lease: &PdLease) {
+    loop {
+        let round_started = Instant::now();
+        match conn.schema_lease() {
+            Ok(answer) => {
+                lease.record(answer);
+                tracing::trace!(
+                    lease_ms = answer.lease_ms,
+                    step_ms = answer.step.step_ms,
+                    "renewed the schema lease"
+                );
+            }
+            // Not an error the node can act on: writes fail closed on their own when the lease
+            // runs out, and reads are unaffected either way.
+            Err(error) => tracing::warn!(
+                %error,
+                "could not renew the schema lease from the placement driver"
+            ),
+        }
+        let period = lease.refresh_period().unwrap_or(MIN_REFRESH_PERIOD);
+        let due = round_started + period;
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// The columnar report, on its own thread and its own cadence.
+///
+/// One round at a time by construction — the loop does not start a report until the last has
+/// returned — so a slow cluster read makes reports rarer and never makes them pile up. Its PD half
+/// already carries a deadline ([`BlockingTransport`]); its backend half is a cluster read and its
+/// duration is **not** bounded, which is exactly why it is no longer allowed near the renewal.
+///
+/// A report that misses a round is repaired by the next one: [`columnar_wishes`] is a full
+/// assertion, not a delta (ADR 0022 Decision 5).
+#[derive(Debug)]
+struct Reporter {
+    conn: Arc<PdConn>,
+    lease: Arc<PdLease>,
+    backend: Arc<dyn Backend>,
+    tenant: u64,
+}
+
+impl Reporter {
+    fn run(self) {
+        loop {
+            let round_started = Instant::now();
+            assert_wishes(&self.conn, &*self.backend, self.tenant);
+            // The lease's cadence, because it is the number PD publishes and a report has no
+            // clock of its own to prefer. A deadline here too, so a slow round makes the next one
+            // immediate rather than doubly late.
+            let period = self.lease.refresh_period().unwrap_or(MIN_REFRESH_PERIOD);
+            let due = round_started + period;
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
         }
     }
 }
