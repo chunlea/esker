@@ -433,10 +433,25 @@ fn a_savepoint_rollback_leaves_no_write_to_conflict_against_real_stores() {
 /// | 4 × 15 | 0 refusals, 3/3 green | 3/3 green — **detects nothing** |
 /// | 8 × 50 | 1 refusal in 400, fails ~1 run in 2 | **4/4 green, 0 refusals** |
 ///
-/// So it never fails while the mechanism is there, and catches its absence about half the time — a
-/// guard rather than a proof, and the size is what buys that. Three smaller scripted tests were
-/// written first and every one passed with the mechanism removed; they are not in this file,
-/// because a test that cannot fail for the reason it names is worse than no test.
+/// It catches the mechanism's absence about half the time — a guard rather than a proof, and the
+/// size is what buys that. Three smaller scripted tests were written first and every one passed
+/// with the mechanism removed; they are not in this file, because a test that cannot fail for the
+/// reason it names is worse than no test.
+///
+/// **It said "it never fails while the mechanism is there", and that was wrong.** The `4/4` above
+/// is four runs on a quiet machine, and I wrote a *rate* down as a *property*. Under a full gate —
+/// 3,664 tests, this one at 7.8 s — it failed on `refused == 0`: a `40001` that nobody's missing
+/// check caused, raised because eight writers contending on one row on a saturated box is a
+/// different experiment from eight writers on an idle one. So both directions of this test are
+/// rates:
+///
+/// * with the mechanism, refusals are **usually** zero and not provably zero;
+/// * without it, one appears in about half of runs.
+///
+/// The assertion is left at `refused == 0` rather than widened to a threshold, because a threshold
+/// is a number nobody can defend and it would hide the very signal the test exists for. What
+/// changes is the claim: if this reddens in a loaded gate, **re-run it alone before believing it**,
+/// and the failure to look for is the *unloaded* one.
 ///
 /// **The count is refusals, not lost updates.** A lost update cannot happen here: the per-key read
 /// stamp (ADR 0057 §4) makes first-committer-wins refuse a write computed from a stale value, so
