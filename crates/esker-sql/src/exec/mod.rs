@@ -130,6 +130,8 @@ pub struct Executor {
     /// One session's reserved block per sequence: the next value it will hand out and the first
     /// value past its block. See [`Executor::next_sequence_value`].
     sequences: std::collections::BTreeMap<u64, (i64, i64)>,
+    //  Held blocks are dropped when their sequence is (`exec::ddl::drop_one_table`), so this does
+    //  not grow with the number of tables a long-lived connection has created and dropped.
     /// The sequences this session has a `currval` for, which is **not** the same set as the ones
     /// it holds a block of.
     ///
@@ -228,7 +230,10 @@ impl Drop for Executor {
         let Ok(mut txn) = self.backend.begin() else {
             return;
         };
-        if ddl::drop_temp_schema(self, &mut *txn, &schema).is_ok() {
+        if let Ok(forgotten) = ddl::drop_temp_schema(self, &mut *txn, &schema) {
+            for sequence_id in forgotten {
+                self.forget_sequence_block(sequence_id);
+            }
             let _ = txn.commit();
         }
     }
@@ -428,7 +433,11 @@ impl Executor {
     fn checked_and_committed(&mut self, mut txn: Box<dyn Txn>, written: &Written) -> Result<()> {
         // **The implicit transaction ends here**, so this is where `ON COMMIT` fires for a
         // statement outside a block — the half an implementation hooked to `COMMIT` alone misses.
-        if let Err(error) = ddl::run_on_commit(self, &mut *txn) {
+        if let Err(error) = ddl::run_on_commit(self, &mut *txn).map(|forgotten| {
+            for sequence_id in forgotten {
+                self.forget_sequence_block(sequence_id);
+            }
+        }) {
             let _ = txn.rollback();
             return Err(error);
         }
@@ -931,8 +940,11 @@ impl Executor {
                 {
                     let mut txn = self.backend.begin()?;
                     match ddl::drop_temp_schema(self, &mut *txn, &schema) {
-                        Ok(()) => {
+                        Ok(forgotten) => {
                             txn.commit()?;
+                            for sequence_id in forgotten {
+                                self.forget_sequence_block(sequence_id);
+                            }
                         }
                         Err(error) => {
                             let _ = txn.rollback();
@@ -1821,12 +1833,24 @@ impl Executor {
     /// resetting only the key leaves the session handing out values from inside a block that no
     /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
     /// because a value that was never handed out is not one this session last took.
-    fn forget_sequence_block(&mut self, sequence_id: u64) {
+    pub(super) fn forget_sequence_block(&mut self, sequence_id: u64) {
         self.sequences.remove(&sequence_id);
         self.currval_defined.remove(&sequence_id);
         if self.last_sequence == Some(sequence_id) {
             self.last_sequence = None;
         }
+    }
+
+    /// How many sequences this session holds a reserved block of.
+    ///
+    /// For `tests/real_backend.rs`, which asserts that a dropped table's sequence takes its block
+    /// with it: a connection that creates and drops tables for its whole life would otherwise
+    /// collect one entry per drop. It cannot hand out a wrong value — a relation id is never
+    /// reused, so a re-created sequence is a different sequence — which is why the leak needs a
+    /// count to be visible at all.
+    #[must_use]
+    pub fn held_sequence_blocks(&self) -> usize {
+        self.sequences.len()
     }
 
     /// Sets one sequence back to its start — the counter **and** this session's block.
@@ -3196,9 +3220,16 @@ impl Execute for Executor {
         if let Some(mut txn) = self.open.take() {
             let outcome = ddl::run_on_commit(self, &mut *txn);
             self.open = Some(txn);
-            if let Err(error) = outcome {
-                let _ = self.rollback();
-                return Err(error);
+            match outcome {
+                Ok(forgotten) => {
+                    for sequence_id in forgotten {
+                        self.forget_sequence_block(sequence_id);
+                    }
+                }
+                Err(error) => {
+                    let _ = self.rollback();
+                    return Err(error);
+                }
             }
         }
         self.savepoints.clear();
