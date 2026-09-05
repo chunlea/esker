@@ -1,0 +1,85 @@
+# `CREATE DATABASE` / `DROP DATABASE` as `ActiveRecord`'s tasks send them, and `pg_database` as the
+# adapter reads it.
+#
+# `db:create`, `db:drop` and `db:test:prepare` are `PostgreSQLDatabaseTasks#create` / `#drop`
+# (`tasks/postgresql_database_tasks.rb:11-22`), which connect to the maintenance database and call
+# `create_database` / `drop_database` (`postgresql/schema_statements.rb:23-60`). The option string is
+# built there, in that order, and the three `pg_database` readers — `encoding`, `collation`, `ctype`
+# (`:247-259`) — are what the adapter asks about the database it is *already* connected to.
+#
+# **This file breaks the lane's `BEGIN … ROLLBACK` rule, deliberately, and says so here.**
+# `CREATE DATABASE` cannot run inside a transaction block — that refusal is itself captured below —
+# so there is no way to record what these statements answer without executing them for real. The
+# containment is: one scratch database with a name nothing else uses (`esker_cap_scratch`), created
+# and dropped inside this file, and a `SELECT count(*) FROM pg_database` at the end that answers `0`.
+# The first section is still wrapped, because everything in it can be.
+#
+# Things reasoning would get wrong:
+#
+# * **`CREATE DATABASE` is not transactional and neither is `DROP DATABASE`.** Both answer `25001`
+#   inside a block — so an implementation that runs everything in an implicit transaction has to
+#   special-case them, not just parse them.
+# * **`DROP DATABASE` uses `IF EXISTS` and `CREATE DATABASE` does not.** `drop_database` always
+#   emits `DROP DATABASE IF EXISTS "x"` (`:59`), so dropping something absent must **succeed**;
+#   `create_database` has no `IF NOT EXISTS`, so a second create must fail with `42P04`.
+# * **The option string is positional and quoted two different ways.** Identifiers —
+#   `OWNER`, `TEMPLATE`, `TABLESPACE` — are `"double quoted"`; values — `ENCODING`, `LOCALE`,
+#   `LC_COLLATE`, `LC_CTYPE` — are `'single quoted'`; `CONNECTION LIMIT` is bare. That is
+#   `create_database`'s `each_with_object` verbatim and the shapes below are what it produces.
+# * **You cannot drop the database you are connected to** (`55006`), which is why the tasks connect
+#   to the maintenance database first. An implementation that ignores the current database answers
+#   where PostgreSQL raises.
+# * **`pg_encoding_to_char(encoding)` is a function over an integer**, not a text column:
+#   `pg_database.encoding` is an `int4` and `datcollate`/`datctype` are `text`. AR reads all three
+#   for one database, keyed by `datname = current_database()`.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+# ---- the three readers, verbatim (postgresql/schema_statements.rb:247-259) ----
+SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()	text,name	r|UTF8
+SELECT 'r', datcollate FROM pg_database WHERE datname = current_database()	text,text	r|en_US.utf8
+SELECT 'r', datctype FROM pg_database WHERE datname = current_database()	text,text	r|en_US.utf8
+# ---- pg_database as a relation ----
+SELECT 'r', datname, datistemplate, datallowconn, datconnlimit FROM pg_database ORDER BY datname	text,name,boolean,boolean,integer	r|esker|f|t|-1 ; r|postgres|f|t|-1 ; r|template0|t|f|-1 ; r|template1|t|t|-1
+SELECT 'r', datname, pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname = current_database()	text,name,name,text,text	r|esker|UTF8|en_US.utf8|en_US.utf8
+SELECT 'r', pg_typeof(encoding), pg_typeof(datname), pg_typeof(datcollate), pg_typeof(datistemplate), pg_typeof(datdba) FROM pg_database WHERE datname = current_database()	text,regtype,regtype,regtype,regtype,regtype	r|integer|name|text|boolean|oid
+SELECT 'r', d.datname, r.rolname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba WHERE d.datname = current_database()	text,name,name	r|esker|esker
+SELECT 'r', count(*) FROM pg_database WHERE datname = 'nosuchdatabase'	text,bigint	r|0
+SELECT 'r', current_database(), current_database() = (SELECT datname FROM pg_database WHERE oid = (SELECT oid FROM pg_database WHERE datname = current_database()))	text,name,boolean	r|esker|t
+# ---- neither statement may run inside a transaction block ----
+SAVEPOINT c1		-
+CREATE DATABASE "esker_cap_scratch"	!25001 CREATE DATABASE cannot run inside a transaction block
+ROLLBACK TO c1		-
+SAVEPOINT c2		-
+DROP DATABASE IF EXISTS "esker_cap_scratch"	!25001 DROP DATABASE cannot run inside a transaction block
+ROLLBACK TO c2		-
+ROLLBACK		-
+# ---- from here the session is in autocommit, and the statements are executed for real ----
+# `create_database(name, encoding: "utf8")` — the default the tasks pass (DEFAULT_ENCODING)
+CREATE DATABASE "esker_cap_scratch" ENCODING = 'utf8'		-
+SELECT 'r', datname, pg_encoding_to_char(encoding), datallowconn, datistemplate FROM pg_database WHERE datname = 'esker_cap_scratch'	text,name,name,boolean,boolean	r|esker_cap_scratch|UTF8|t|f
+# a second create has no IF NOT EXISTS to fall back on
+CREATE DATABASE "esker_cap_scratch" ENCODING = 'utf8'	!42P04 database "esker_cap_scratch" already exists
+# ...and `drop_database` always carries IF EXISTS
+DROP DATABASE IF EXISTS "esker_cap_scratch"		-
+SELECT 'r', count(*) FROM pg_database WHERE datname = 'esker_cap_scratch'	text,bigint	r|0
+DROP DATABASE IF EXISTS "esker_cap_scratch"		-
+DROP DATABASE "esker_cap_scratch"	!3D000 database "esker_cap_scratch" does not exist
+# ---- the full option string `create_database` can build, in its own order ----
+CREATE DATABASE "esker_cap_scratch" OWNER = "esker" TEMPLATE = "template0" ENCODING = 'UTF8' LC_COLLATE = 'en_US.utf8' LC_CTYPE = 'en_US.utf8' CONNECTION LIMIT = 5		-
+SELECT 'r', datname, pg_encoding_to_char(encoding), datcollate, datctype, datconnlimit FROM pg_database WHERE datname = 'esker_cap_scratch'	text,name,name,text,text,integer	r|esker_cap_scratch|UTF8|en_US.utf8|en_US.utf8|5
+DROP DATABASE IF EXISTS "esker_cap_scratch"		-
+# ---- the options that do not survive a mismatched template, and an unknown one ----
+CREATE DATABASE "esker_cap_scratch" TEMPLATE = "template1" ENCODING = 'SQL_ASCII'	!22023 new encoding (SQL_ASCII) is incompatible with the encoding of the template database (UTF8) HINT: Use the same encoding as in the template database, or use template0 as template.
+CREATE DATABASE "esker_cap_scratch2" ENCODING = 'nosuchencoding'	!42704 nosuchencoding is not a valid encoding name
+CREATE DATABASE "esker_cap_scratch3" TEMPLATE = "nosuchtemplate"	!3D000 template database "nosuchtemplate" does not exist
+CREATE DATABASE "esker_cap_scratch4" OWNER = "nosuchowner"	!42704 role "nosuchowner" does not exist
+DROP DATABASE IF EXISTS "esker_cap_scratch"		-
+# ---- you cannot drop the database you are connected to ----
+DROP DATABASE "esker"	!55006 cannot drop the currently open database
+DROP DATABASE "nosuchdatabase"	!3D000 database "nosuchdatabase" does not exist
+# ---- and a template database is refused ----
+DROP DATABASE "template0"	!42809 cannot drop a template database
+# ---- proof the oracle is as it was: only the four databases it started with ----
+SELECT count(*) FROM pg_database WHERE datname LIKE 'esker_cap%'	bigint	0
+SELECT datname FROM pg_database ORDER BY datname	name	esker ; postgres ; template0 ; template1

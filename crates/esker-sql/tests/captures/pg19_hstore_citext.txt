@@ -1,0 +1,133 @@
+# `hstore` and `citext` as COLUMN TYPES and VALUES — what `hstore_test.rb` and `citext_test.rb` send.
+#
+# **Run 47 ranking row 7: `extension "…" is not available`, 114 tests over 9 files**, and hstore is
+# the bulk of it. `captures/pg19_extensions.txt` already pins the *install* mechanics — availability,
+# `CREATE`/`DROP EXTENSION`, schemas, the two error probes. This file is the other half and does not
+# repeat it: **the two types once they are installed**, which is every statement in the two test
+# files that reaches the server.
+#
+# Things reasoning would get wrong:
+#
+# * **`hstore` and `citext` are not built-in oids.** They are allocated when the extension is
+#   installed, so nothing may hard-code them; AR's boot type-map query reads them by `typname` and
+#   the column reader gets the name back through `format_type`. Both queries are below verbatim.
+# * **`citext` is not `text` with a `lower()` around it.** It is its own type with its own equality,
+#   and `test_case_insensitiveness` asserts AR emits **no** `lower(...)` for it — so `=` itself must
+#   be case-insensitive, and `ORDER BY`, `DISTINCT`, `LIKE` and `~~` follow that collation too. The
+#   rows below say which of them fold case and which do not, because they are not all the same.
+# * **`hstore` has an array form.** `hstore_test.rb` declares `t.hstore "payload", array: true`, so
+#   `hstore[]` has to parse and render, including a NULL *value inside* a hstore inside an array —
+#   which is not the same thing as a NULL element.
+# * **The quoting is the test suite's, not a tidy example.** `test_backslash`, `test_quotes`,
+#   `test_parse6/7` and `test_comma` push `"`, `\`, `,` and `=>` through the value round trip; those
+#   exact pairs are below. A parser that handles `a=>b` and not these passes no test in that file.
+# * **`t.hstore "tags", default: ""`** — the empty hstore is a *default*, and an empty hstore is not
+#   NULL and not the empty string when it comes back.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing on the oracle. Because
+# `\gdesc` runs in a second session *after* that rollback, every statement naming `hst` or `cit` has
+# an **empty** declared-types column; the `pg_typeof` lines are what pin the types instead.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+# ---- what the adapter asks before it uses either type (postgresql_adapter.rb:488-530) ----
+SELECT 'r', true FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+SELECT 'r', installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|f
+CREATE EXTENSION IF NOT EXISTS "hstore"		-
+CREATE EXTENSION IF NOT EXISTS "citext"		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname IN ('citext','hstore') ORDER BY extname	text,name,text	r|citext|1.8 ; r|hstore|1.8
+# ---- AR's boot type-map query, narrowed to the two names (the oids are assigned, never fixed) ----
+SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('hstore','citext') ORDER BY t.typname	text,name,oid,"char",regproc,"char",oid,"char",smallint	r|citext|0|,|citextin|b|0|S|-1 ; r|hstore|0|,|hstore_in|b|0|U|-1
+SELECT 'r', t.typname, t.oid = 0 AS oid_is_zero, t.typarray = 0 AS no_array_type FROM pg_type t WHERE t.typname IN ('hstore','citext') ORDER BY t.typname	text,name,boolean,boolean	r|citext|f|f ; r|hstore|f|f
+SELECT 'r', pg_typeof('a=>b'::hstore), pg_typeof('x'::citext), pg_typeof(ARRAY['a=>b'::hstore])		r|hstore|citext|hstore[]
+# ---- the tables the two files create in setup ----
+DROP TABLE IF EXISTS hst		-
+CREATE TABLE hst (id serial primary key, tags hstore DEFAULT '', payload hstore[], settings hstore)		-
+DROP TABLE IF EXISTS cit		-
+CREATE TABLE cit (id serial primary key, cival citext)		-
+# ---- column_definitions(table) verbatim (postgresql_adapter.rb:1057) — how AR learns the type ----
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypmod, c.collname, col_description(a.attrelid, a.attnum) AS comment, attidentity AS identity, attgenerated as attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '"hst"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('hst_id_seq'::regclass)|t|-1|\N|\N|| ; r|tags|hstore|''::hstore|f|-1|\N|\N|| ; r|payload|hstore[]|\N|f|-1|\N|\N|| ; r|settings|hstore|\N|f|-1|\N|\N||
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"cit"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('cit_id_seq'::regclass)|t ; r|cival|citext|\N|f
+# ---- hstore values: the round trips the tests assert ----
+INSERT INTO hst (tags) VALUES ('1=>2')		-
+SELECT 'r', tags FROM hst ORDER BY id		r|"1"=>"2"
+SELECT 'r', 'a=>b'::hstore		r|"a"=>"b"
+SELECT 'r', ''::hstore = ''::hstore, ''::hstore IS NULL		r|t|f
+SELECT 'r', 'key=>NULL'::hstore, ('key=>NULL'::hstore)->'key' IS NULL		r|"key"=>NULL|t
+SELECT 'r', 'a=>b, 1=>2'::hstore		r|"1"=>"2", "a"=>"b"
+# the quoting torture: test_quotes, test_whitespace, test_backslash, test_comma, test_parse6/7
+SELECT 'r', '"a"=>"b\"ar", "1\"foo"=>"2"'::hstore		r|"a"=>"b\"ar", "1\"foo"=>"2"
+SELECT 'r', '"a b"=>"b ar"'::hstore		r|"a b"=>"b ar"
+SELECT 'r', '"a\\b"=>"b\\ar"'::hstore		r|"a\\b"=>"b\\ar"
+SELECT 'r', '"a, b"=>"bar"'::hstore		r|"a, b"=>"bar"
+SELECT 'r', '"\"a"=>"q>w"'::hstore		r|"\"a"=>"q>w"
+SELECT 'r', '"\"a"=>"q\"w"'::hstore		r|"\"a"=>"q\"w"
+SELECT 'r', '"c"=>"}", "\"a\""=>"b \"a b"'::hstore		r|"c"=>"}", "\"a\""=>"b \"a b"
+SELECT 'r', 'NULL=>NULL'::hstore, ('NULL=>NULL'::hstore)->'NULL' IS NULL		r|"NULL"=>NULL|t
+# ---- the operators and functions the file and the adapter reach for ----
+SELECT 'r', ('a=>b, c=>d'::hstore)->'a', ('a=>b'::hstore) ? 'a', ('a=>b, c=>d'::hstore) @> 'a=>b'		r|b|t|t
+SELECT 'r', akeys('a=>1, b=>2'::hstore), avals('a=>1, b=>2'::hstore)		r|{a,b}|{1,2}
+SELECT 'r', hstore('a','b'), hstore(ARRAY['a','b'], ARRAY['1','2'])		r|"a"=>"b"|"a"=>"1", "b"=>"2"
+SELECT 'r', pg_typeof(('a=>b'::hstore)->'a'), pg_typeof(akeys('a=>b'::hstore)), pg_typeof(('a=>b'::hstore) ? 'a')		r|text|text[]|boolean
+# ---- hstore[] — `t.hstore "payload", array: true` ----
+INSERT INTO hst (payload) VALUES (ARRAY['"AA"=>"BB", "CC"=>"DD"'::hstore, '"AA"=>NULL'::hstore])		-
+SELECT 'r', payload FROM hst WHERE payload IS NOT NULL		r|{"\"AA\"=>\"BB\", \"CC\"=>\"DD\"","\"AA\"=>NULL"}
+SELECT 'r', array_length(payload, 1), (payload)[1]->'AA' FROM hst WHERE payload IS NOT NULL		r|2|BB
+INSERT INTO hst (payload) VALUES (ARRAY['"this,has"=>"many,values"'::hstore])		-
+SELECT 'r', payload FROM hst WHERE payload IS NOT NULL ORDER BY id		r|{"\"AA\"=>\"BB\", \"CC\"=>\"DD\"","\"AA\"=>NULL"} ; r|{"\"this,has\"=>\"many,values\""}
+# ---- the default: `t.hstore "tags", default: ""` ----
+INSERT INTO hst (settings) VALUES ('one=>two')		-
+SELECT 'r', tags, tags = ''::hstore FROM hst WHERE settings IS NOT NULL		r||t
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = '"hst"'::regclass AND a.attname = 'tags'		r|''::hstore
+# ---- what a bad hstore literal answers ----
+SAVEPOINT s1		-
+SELECT 'r', 'a'::hstore	!42601 syntax error in hstore: unexpected end of string
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT 'r', 'a=>b=>c'::hstore		r|"a"=>"b=>c"
+ROLLBACK TO s2		-
+# ---- citext: the semantics the file asserts, one row each ----
+INSERT INTO cit (cival) VALUES ('Cased Text')		-
+SELECT 'r', cival FROM cit WHERE cival = 'cased text'		r|Cased Text
+SELECT 'r', 'ABC'::citext = 'abc'::citext, 'ABC'::citext = 'abc', 'ABC'::citext <> 'abd'		r|t|t|t
+SELECT 'r', 'ABC'::citext LIKE 'abc', 'ABC'::citext ILIKE 'abc', 'ABC'::citext ~~ 'abc'		r|t|t|t
+SELECT 'r', 'ABC'::citext < 'abd'::citext, 'ABC'::citext > 'abb'::citext		r|t|t
+SELECT 'r', lower('ABC'::citext), upper('abc'::citext), length('ABC'::citext)		r|abc|ABC|3
+SELECT 'r', pg_typeof('x'::citext), pg_typeof('x'::citext || 'y'), pg_typeof(lower('X'::citext))		r|citext|text|text
+INSERT INTO cit (cival) VALUES ('CASED TEXT')		-
+SELECT 'r', count(*) FROM cit WHERE cival = 'cased text'		r|2
+SELECT 'r', count(DISTINCT cival) FROM cit		r|1
+SELECT 'r', cival FROM cit ORDER BY cival, id		r|Cased Text ; r|CASED TEXT
+SELECT 'r', cival = 'Cased Text' AS eq_exact, cival = 'CASED TEXT' AS eq_folded FROM cit ORDER BY id		r|t|t ; r|t|t
+# A unique index over citext FOLDS CASE, and that is the whole reason this section is here:
+# `validates_uniqueness_of` on a citext column is enforced by one, and two rows that differ only in
+# case cannot both be in it. The index cannot even be built over the two rows above -- that refusal
+# is the evidence, so it is an error probe rather than an accident.
+SAVEPOINT s3		-
+CREATE UNIQUE INDEX cit_cival_uidx ON cit (cival)	!23505 could not create unique index "cit_cival_uidx" DETAIL: Key (cival)=(Cased Text) is duplicated.
+ROLLBACK TO s3		-
+DELETE FROM cit WHERE id = (SELECT max(id) FROM cit)		-
+CREATE UNIQUE INDEX cit_cival_uidx ON cit (cival)		-
+SAVEPOINT s4		-
+INSERT INTO cit (cival) VALUES ('cased text')	!23505 duplicate key value violates unique constraint "cit_cival_uidx" DETAIL: Key (cival)=(cased text) already exists.
+ROLLBACK TO s4		-
+SELECT 'r', indexdef FROM pg_indexes WHERE indexname = 'cit_cival_uidx'	text,text	r|CREATE UNIQUE INDEX cit_cival_uidx ON public.cit USING btree (cival)
+DROP INDEX cit_cival_uidx		-
+# ---- change_table adding a column of each type (test_change_table_supports_hstore / _json) ----
+ALTER TABLE hst ADD COLUMN "users" hstore DEFAULT ''		-
+ALTER TABLE cit ADD COLUMN "username" citext		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"cit"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|cival|citext ; r|username|citext
+# ---- add_column with a hstore default that is not empty (hstore_test.rb:62) ----
+ALTER TABLE hst ADD COLUMN "permissions" hstore DEFAULT '"users"=>"read", "articles"=>"write"'		-
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = '"hst"'::regclass AND a.attname = 'permissions'		r|'"users"=>"read", "articles"=>"write"'::hstore
+# ---- teardown: `disable_extension "hstore", force: :cascade` after the tables are gone ----
+DROP TABLE hst		-
+DROP TABLE cit		-
+DROP EXTENSION IF EXISTS "hstore" CASCADE		-
+DROP EXTENSION IF EXISTS "citext" CASCADE		-
+SELECT 'r', installed_version IS NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+ROLLBACK		-
+# ---- proof the oracle is as it was ----
+SELECT count(*) FROM pg_extension WHERE extname IN ('hstore','citext')	bigint	0
+SELECT count(*) FROM pg_class WHERE relname IN ('hst','cit')	bigint	0

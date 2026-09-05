@@ -1,0 +1,108 @@
+# The catalog lives in `pg_catalog` — the namespace unit the `relkind` divergence argued for.
+#
+# **Run 56: `schema_cache_test.rb` 7 tests on `relation "pg_type" does not exist`, and
+# `postgresql_adapter_test.rb` 2 on `relation "pg_catalog.pg_class" does not exist`.** Two
+# statements, both from `ActiveRecord`'s own adapter and both verbatim below:
+#
+#   * `postgresql/schema_statements.rb:436`, `primary_keys` — `i.indrelid = '"pg_type"'::regclass`.
+#     The name arrives **quoted**, because `quote_table_name` put it there, and a catalog relation
+#     was resolved by its bare spelling only.
+#   * `postgresql/schema_statements.rb:188`, `table_comment` — `FROM pg_catalog.pg_class c LEFT
+#     JOIN pg_namespace n ON n.oid = c.relnamespace … AND n.nspname = 'public'`. The qualifier is
+#     the relation's real schema, and the join is what a client uses to keep the catalog out of a
+#     schema dump.
+#
+# Things reasoning would get wrong:
+#
+# * **A catalog relation's `relkind` is `r`, not `v`** — `pg_class`, `pg_type` and twenty others
+#   are ordinary tables. Only five are views: `pg_indexes`, `pg_views`, `pg_stat_activity`,
+#   `pg_available_extensions`, and every `information_schema` relation. A node that answered `v`
+#   for all of them kept them out of `ActiveRecord`'s `tables()` by accident, and this file is why
+#   that accident can be given up: the namespace does it properly.
+# * **`nspname = ANY (current_schemas(false))` is what excludes them**, and `current_schemas(false)`
+#   is `{public}` while `current_schemas(true)` is `{pg_catalog,public}`. So the catalog is
+#   *resolvable* without a qualifier and *invisible* to a table list, which are two different
+#   questions answered by two different functions.
+# * **A `regclass` prints qualified exactly when its schema is not in the search path.**
+#   `to_regclass('pg_catalog.pg_class')::text` is `pg_class` and
+#   `to_regclass('information_schema.tables')::text` is `information_schema.tables`, in one row of
+#   one statement. An implementation that always printed the bare name, or always the qualified
+#   one, gets one of the two wrong.
+# * **`information_schema.tables` *does* list `pg_class`.** It is every schema's relations, not the
+#   search path's, so the two catalog names are in it — which is why `ActiveRecord` reads
+#   `pg_class` joined to `pg_namespace` for `tables()` and not this view.
+# * **`SELECT … FROM public.pg_class` is `42P01`**, quoted whole as `"public.pg_class"`: the
+#   catalog is not in `public`, and a qualifier that names the wrong schema finds nothing even
+#   when the bare name would have found something.
+# * **`CREATE TABLE pg_catalog.mine` is `42501`, not `42P07` or `0A000`**, and its own sentence:
+#   `permission denied to create "pg_catalog.mine"` with `DETAIL: System catalog modifications are
+#   currently disallowed.`
+# * **`pg_attribute` has a row per column of every catalog relation**, `pg_views`' four included.
+#   The whole file's column lists are a real server's; this node models a subset of the wide ones,
+#   which is where its declared divergences are.
+#
+# The capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`, and
+# the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE ns_books (id serial primary key, name character varying(255))		-
+INSERT INTO ns_books (name) VALUES ('one')		-
+SELECT 'r', nspname FROM pg_namespace WHERE nspname IN ('public','pg_catalog','information_schema') ORDER BY nspname	text,name	r|information_schema ; r|pg_catalog ; r|public
+SELECT 'r', current_schema(), current_schemas(false), current_schemas(true)	text,name,name[],name[]	r|public|{public}|{pg_catalog,public}
+SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('pg_type','pg_range','pg_class','pg_namespace','pg_attribute','pg_attrdef','pg_index','pg_constraint','pg_collation','pg_extension','pg_available_extensions','pg_inherits','pg_am','pg_proc','pg_trigger','pg_language','pg_partitioned_table','pg_indexes','pg_views','pg_stat_activity','pg_database','pg_depend','pg_sequence','pg_enum') ORDER BY c.relname	text,name,name,"char"	r|pg_catalog|pg_am|r ; r|pg_catalog|pg_attrdef|r ; r|pg_catalog|pg_attribute|r ; r|pg_catalog|pg_available_extensions|v ; r|pg_catalog|pg_class|r ; r|pg_catalog|pg_collation|r ; r|pg_catalog|pg_constraint|r ; r|pg_catalog|pg_database|r ; r|pg_catalog|pg_depend|r ; r|pg_catalog|pg_enum|r ; r|pg_catalog|pg_extension|r ; r|pg_catalog|pg_index|r ; r|pg_catalog|pg_indexes|v ; r|pg_catalog|pg_inherits|r ; r|pg_catalog|pg_language|r ; r|pg_catalog|pg_namespace|r ; r|pg_catalog|pg_partitioned_table|r ; r|pg_catalog|pg_proc|r ; r|pg_catalog|pg_range|r ; r|pg_catalog|pg_sequence|r ; r|pg_catalog|pg_stat_activity|v ; r|pg_catalog|pg_trigger|r ; r|pg_catalog|pg_type|r ; r|pg_catalog|pg_views|v
+SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('tables','columns','table_constraints','key_column_usage','referential_constraints') AND n.nspname = 'information_schema' ORDER BY c.relname	text,name,name,"char"	r|information_schema|columns|v ; r|information_schema|key_column_usage|v ; r|information_schema|referential_constraints|v ; r|information_schema|table_constraints|v ; r|information_schema|tables|v
+SELECT 'r', count(*) AS catalog_relations_in_public FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname LIKE 'pg\_%'	text,bigint	r|0
+SELECT 'r', count(*) AS pg_class_as_base_table FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'pg_class' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+SELECT 'r', count(*) AS pg_class_as_data_source FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'pg_class' AND c.relkind IN ('r','v','m','p','f') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+SELECT 'r', count(*) AS user_table_is_listed FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'ns_books' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|1
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'pg_namespace'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	text,name,text	r|oid|oid ; r|nspname|name ; r|nspowner|oid ; r|nspacl|aclitem[]
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = 'pg_views'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	text,name	r|schemaname ; r|viewname ; r|viewowner ; r|definition
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'pg_sequence'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	text,name,text	r|seqrelid|oid ; r|seqtypid|oid ; r|seqstart|bigint ; r|seqincrement|bigint ; r|seqmax|bigint ; r|seqmin|bigint ; r|seqcache|bigint ; r|seqcycle|boolean
+SELECT 'r', count(*) > 0 AS pg_class_has_columns FROM pg_attribute WHERE attrelid = 'pg_class'::regclass AND attnum > 0	text,boolean	r|t
+SELECT 'r', 'pg_type'::regclass::text	text,text	r|pg_type
+SELECT 'r', '"pg_type"'::regclass::text	text,text	r|pg_type
+SELECT 'r', 'pg_catalog.pg_class'::regclass::text	text,text	r|pg_class
+SELECT 'r', '"pg_catalog"."pg_class"'::regclass::text	text,text	r|pg_class
+SELECT 'r', to_regclass('pg_type')::text, to_regclass('pg_catalog.pg_class')::text, to_regclass('information_schema.tables')::text	text,text,text,text	r|pg_type|pg_class|information_schema.tables
+SELECT 'r', to_regclass('pg_catalog.nosuch') IS NULL AS missing_in_pg_catalog	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_catalog.pg_class c WHERE c.relname = 'pg_class'	text,bigint	r|1
+SELECT 'r', count(*) FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog'	text,bigint	r|1
+SELECT 'r', count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = 'ns_books'::regclass AND a.attnum > 0		r|2
+SELECT 'r', pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'ns_books' AND c.relkind IN ('r','p') AND n.nspname = 'public'	text,text	r|\N
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '"pg_type"'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)	name	oid
+SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '"ns_books"'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)		id
+SELECT 'r', table_schema, table_name FROM information_schema.tables WHERE table_name = 'ns_books'	text,name,name	r|public|ns_books
+SELECT 'r', count(*) AS catalog_tables_listed FROM information_schema.tables WHERE table_name IN ('pg_class','pg_type')	text,bigint	r|2
+SAVEPOINT s1		-
+SELECT 'r', count(*) FROM pg_catalog.nosuchcatalog	!42P01 relation "pg_catalog.nosuchcatalog" does not exist
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE TABLE pg_catalog.mine (id int)	!42501 permission denied to create "pg_catalog.mine" DETAIL: System catalog modifications are currently disallowed.
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT 'r', count(*) FROM public.pg_class	!42P01 relation "public.pg_class" does not exist
+ROLLBACK TO s3		-
+SELECT 'r', count(*) AS catalog_columns_listed FROM information_schema.columns WHERE table_name = 'pg_class'	text,bigint	r|34
+SAVEPOINT s4		-
+DROP SCHEMA pg_catalog	!2BP01 cannot drop schema pg_catalog because it is required by the database system
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+CREATE SCHEMA pg_catalog	!42939 unacceptable schema name "pg_catalog" DETAIL: The prefix "pg_" is reserved for system schemas.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+CREATE SCHEMA information_schema	!42P06 schema "information_schema" already exists
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+DROP TABLE pg_catalog.pg_class	!42501 permission denied: "pg_class" is a system catalog
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+SELECT 'r', 'nosuch'::regclass::text	!42P01 relation "nosuch" does not exist
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+SELECT 'r', count(*) FROM pg_catalog.ns_books	!42P01 relation "pg_catalog.ns_books" does not exist
+ROLLBACK TO s9		-
+SELECT 'r', to_regclass('public.pg_class') IS NULL AS catalog_is_not_in_public, to_regclass('pg_catalog.ns_books') IS NULL AS user_table_is_not_in_pg_catalog	text,boolean,boolean	r|t|t
+DROP TABLE ns_books		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'ns_books'	bigint	0

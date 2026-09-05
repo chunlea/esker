@@ -1,0 +1,112 @@
+# `pg_type` and `pg_range`, as a real PostgreSQL 19beta1 answers them -- the first slice of
+# `pg_catalog` and the one `ActiveRecord` asks for before anything else. Four of its 36 boot
+# statements read these two relations (`docs/bench/rails-scoreboard.md`), and rung 2 of the ladder
+# stopped on `relation "pg_type" does not exist`.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# No fixture: both relations are built in.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# WHOSE TYPES DOES `pg_type` LIST? The predecessor left this open and said it wanted a capture
+# rather than an argument (`docs/plans/phase-9-rails.md` §Unit 5, handover question 1). The
+# capture is of `ActiveRecord` rather than of PostgreSQL, and it is in the adapter's own source:
+#
+#   * `add_pg_decoders` runs statement 4 and builds its decoders with
+#     `result.filter_map { |row| construct_coder(row, coders_by_name[row["typname"]]) }` --
+#     `construct_coder` returns `nil` for a name it has no coder for, so a **short answer is a
+#     shorter map and not an error**;
+#   * `TypeMapInitializer#run` (statements 7-9) partitions the rows it is given and registers each
+#     partition. An empty partition registers nothing;
+#   * a column whose OID is in no map is decoded as a string.
+#
+# So a short `pg_type` costs a client nothing it can see, **and this node never sends an OID that
+# is not in it**: the six types it has are the six it can put in a `RowDescription`. Listing
+# PostgreSQL's standard OIDs would be the opposite trade -- telling a client this server has
+# `numeric` and `int4`, which it answers `0A000` for. The decision is therefore the literal
+# meaning of the relation: `pg_type` lists the types **this** server has, with PostgreSQL's own
+# OIDs for them, and `SELECT typname FROM pg_type WHERE typname = 'numeric'` is no rows here and
+# one row there. That is the divergence, it is declared in `tests/pg_catalog.rs`, and it closes
+# one type at a time as types arrive.
+#
+# TWO THINGS THE CAPTURE SETTLED THAT READING WOULD HAVE GOT WRONG:
+#
+#   * **`pg_range` has no `oid` column.** `SELECT oid FROM pg_range` is `42703`, and that is what
+#     makes `LEFT JOIN pg_range AS r ON oid = rngtypid` legal with an unqualified `oid` -- there
+#     is only one `oid` in scope. A `pg_range` given one would make `ActiveRecord`'s statement 7
+#     ambiguous, which is `42702` and a query a real server takes.
+#   * **DDL on a system catalog is `42501`, not `0A000`.** `DROP TABLE pg_type`, `ALTER TABLE` and
+#     `CREATE INDEX` all answer `permission denied: "pg_type" is a system catalog`. DML is *not*
+#     refused for a superuser -- the three write probes below run inside a rolled-back block for
+#     exactly that reason, and deleting a row out of `pg_type` breaks the database.
+
+# --- one row per type this node has, with every column ActiveRecord reads
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'int8'	oid,name,oid,"char",regproc,"char",oid	20|int8|0|,|int8in|b|0
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'text'	oid,name,oid,"char",regproc,"char",oid	25|text|0|,|textin|b|0
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bool'	oid,name,oid,"char",regproc,"char",oid	16|bool|0|,|boolin|b|0
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bytea'	oid,name,oid,"char",regproc,"char",oid	17|bytea|0|,|byteain|b|0
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'float8'	oid,name,oid,"char",regproc,"char",oid	701|float8|0|,|float8in|b|0
+SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'timestamptz'	oid,name,oid,"char",regproc,"char",oid	1184|timestamptz|0|,|timestamptz_in|b|0
+
+# --- the six together, and the count that says how many there are of them
+SELECT typname FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid	name	bool ; bytea ; int8 ; text ; float8 ; timestamptz
+SELECT oid FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid	oid	16 ; 17 ; 20 ; 25 ; 701 ; 1184
+SELECT count(*) FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz')	bigint	6
+
+# --- and the ones a real server has and this one does not, which is the declared divergence
+SELECT typname FROM pg_type WHERE typname IN ('int8', 'numeric') ORDER BY typname	name	int8 ; numeric
+SELECT typname FROM pg_type WHERE typname = 'numeric'	name	numeric
+SELECT typname FROM pg_type WHERE typname = 'nosuchtype'	name	-
+
+# --- it is a relation like any other: an alias, a qualifier, either direction of the lookup
+SELECT t.oid FROM pg_type AS t WHERE t.typname = 'int8'	oid	20
+SELECT t.typname FROM pg_type t WHERE t.oid = 20	name	int8
+SELECT typname FROM pg_type WHERE oid = 20	name	int8
+SELECT nosuch FROM pg_type WHERE typname = 'int8'	!42703 column "nosuch" does not exist
+
+# --- each column on its own, so a wrong one is named rather than hidden in a row
+SELECT typtype FROM pg_type WHERE typname = 'int8'	"char"	b
+SELECT typdelim FROM pg_type WHERE typname = 'int8'	"char"	,
+SELECT typinput FROM pg_type WHERE typname = 'bool'	regproc	boolin
+SELECT typinput FROM pg_type WHERE typname = 'timestamptz'	regproc	timestamptz_in
+SELECT typelem, typbasetype FROM pg_type WHERE typname = 'text'	oid,oid	0|0
+
+# --- the three predicates ActiveRecord's statements 7, 8 and 9 are built on
+SELECT oid FROM pg_type WHERE typname = 'int8' AND typtype = 'b'	oid	20
+SELECT oid FROM pg_type WHERE typtype IN ('r', 'e', 'd') AND typname IN ('int8', 'text')	oid	-
+SELECT oid FROM pg_type WHERE typelem IN (16, 17) AND typname IN ('int8', 'text')	oid	-
+
+# --- and everything the query surface already had, over a relation with no key range
+SELECT typname FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname DESC	name	text ; int8
+SELECT DISTINCT typtype FROM pg_type WHERE typname IN ('int8', 'text', 'bool')	"char"	b
+SELECT typtype, count(*) FROM pg_type WHERE typname IN ('int8', 'text', 'bool') GROUP BY typtype	"char",bigint	b|3
+
+# --- pg_range, which is empty here and has no `oid` column on either server
+SELECT count(*) FROM pg_range WHERE rngtypid = 20	bigint	0
+SELECT rngsubtype FROM pg_range WHERE rngtypid = 20	oid	-
+SELECT oid FROM pg_range WHERE rngtypid = 20	!42703 column "oid" does not exist
+
+# --- the join ActiveRecord opens with, both spellings of it and both kinds
+SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON t.oid = r.rngtypid WHERE t.typname = 'int8'	name,oid	int8|\N
+SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON oid = rngtypid WHERE t.typname IN ('int8', 'text') ORDER BY t.oid	name,oid	int8|\N ; text|\N
+SELECT t.typname FROM pg_type AS t JOIN pg_range AS r ON oid = rngtypid WHERE t.typname = 'int8'	name	-
+
+# --- DDL on a system catalog: `42501`, and the same sentence for all three
+DROP TABLE pg_type	!42501 permission denied: "pg_type" is a system catalog
+ALTER TABLE pg_type ADD COLUMN a bigint	!42501 permission denied: "pg_type" is a system catalog
+CREATE INDEX ix ON pg_type (oid)	!42501 permission denied: "pg_type" is a system catalog
+
+# --- DML, which a **superuser** is allowed to attempt. Rolled back: a committed `DELETE` here
+# --- takes `int8` out of the database and every later statement answers `cache lookup failed`
+BEGIN		-
+INSERT INTO pg_type (oid, typname) VALUES (99, 'nope')	!23502 null value in column "typnamespace" of relation "pg_type" violates not-null constraint DETAIL: Failing row contains (99, nope, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
+ROLLBACK		-
+BEGIN		-
+UPDATE pg_type SET typname = 'nope' WHERE typname = 'int8'		-
+ROLLBACK		-
+BEGIN		-
+DELETE FROM pg_type WHERE typname = 'int8'		-
+ROLLBACK		-
+SELECT typname FROM pg_type WHERE typname = 'int8'	name	int8

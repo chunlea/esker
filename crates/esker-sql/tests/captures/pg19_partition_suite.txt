@@ -1,0 +1,149 @@
+# What the Rails suite *does* with a partitioned table once the schema has loaded — as a real
+# PostgreSQL 19beta1 answers it.
+#
+# `pg19_partition.txt` pinned the DDL of statements 781-786. This pins the statements the **test
+# cases** send afterwards, found by grepping `activerecord-8.1.3.1`'s own suite:
+#
+#     test/cases/adapters/postgresql/partitions_test.rb     create + `table_exists?` + `drop_table`
+#     test/cases/adapters/postgresql/schema_test.rb         partitioned index, `indexes()`,
+#                                                           `index_name_exists?`, `remove_index`,
+#                                                           and the three schema-dumper tests
+#     test/cases/insert_all_test.rb:766                     `upsert_all` through a partitioned table
+#     test/schema/postgresql_specific_schema.rb:192         `force: true`, which is a DROP first
+#
+# Every catalog query here is **`ActiveRecord`'s own**, copied out of
+# `connection_adapters/postgresql/schema_statements.rb` with its `relkind` filters intact — that is
+# the point of half of them.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. `\gdesc` runs
+# **inline**, in the same session, so every statement here has its declared types pinned — unlike
+# `pg19_partition.txt`, whose describe pass ran after the rollback.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`DROP TABLE` of a partitioned parent succeeds and takes every partition with it — no
+#     `CASCADE`.** `DROP TABLE IF EXISTS "measurements"` with two partitions holding rows leaves
+#     `0` relations matching `measurements%`: the partitions and their indexes go too. This is the
+#     statement `create_table(:measurements, force: true)` sends on every schema reload, so a node
+#     that refused it could never load the suite's schema twice.
+#     `CASCADE` changes nothing about it: `DROP TABLE "measurements" CASCADE` leaves the same `0`.
+#     The keyword is not what makes the partitions go — the partitioning is.
+#   * **And `INHERITS` is the opposite, in the same session.** `DROP TABLE "ip"` with an inheriting
+#     child is `2BP01 cannot drop table ip because other objects depend on it`, `DETAIL: table ic
+#     depends on table ip`, `HINT: Use DROP ... CASCADE …`. The two share `pg_inherits` and an edge
+#     and differ here completely — one rule for both is wrong for one of them.
+#   * **`DROP INDEX` on the partitioned index takes every partition's own index with it.** After
+#     dropping `index_measurements_on_logdate_and_city_id`, *zero* relations match
+#     `%logdate_city_id%` — the children the suite never named are removed by the drop of the
+#     parent it did name. `remove_index` is what `schema_test.rb` sends.
+#   * **`pg_get_partkeydef` on a *partition* is NULL**, not its parent's key. So the schema dumper
+#     writes `options: "PARTITION BY LIST (city_id)"` for `measurements` and nothing for
+#     `measurements_toronto` — and since `table_options` asks `inherited_table_names` **first**,
+#     and `pg_inherits` does have a row for a partition, `ActiveRecord` dumps a partition as
+#     **`INHERITS (measurements)`**. Measured: that query answers `measurements`.
+#   * **A `PRIMARY KEY` on a partitioned table is the unique-index rule again**, and the partition
+#     gets **its own** `pk_part_1_pkey`: a duplicate row is `23505 … violates unique constraint
+#     "pk_part_1_pkey"`, naming the child. `PRIMARY KEY ("b")` on a table partitioned by `a` is
+#     `0A000 PRIMARY KEY constraint on partitioned table must include all partitioning columns`,
+#     `DETAIL: … lacks column "a" which is part of the partition key.`
+#   * **PostgreSQL 19 gives a `NOT NULL` its own `pg_constraint` row**, `contype = 'n'`, named
+#     `<table>_<column>_not_null` and printed `NOT NULL a` — and **a partition inherits those rows**
+#     while getting a primary-key row of its own. Three rows on the parent, three on the partition,
+#     and only one of the three is the key.
+#   * **`upsert_all` works straight through the parent.** `ON CONFLICT ("logdate","city_id") DO
+#     UPDATE` updates the row in whichever partition holds it — the conflict target is the
+#     partitioned index's key and the arbiter is the partition's own index.
+#   * **A partitioned table with no partitions at all is ordinary in every way that is asked
+#     here**: `relkind` `p`, `relhassubclass` `f`, visible to `relkind IN ('r','v','m','p','f')`,
+#     and `DROP TABLE IF EXISTS` takes it. That is `partitions_test.rb` in full.
+#   * `pg_get_indexdef` for a **partition's** index has no `ON ONLY` — only the parent's does — and
+#     `indexes('measurements')` answers exactly **one** row where the two partitions have one each
+#     of their own, because the query filters on `t.relname`.
+BEGIN		-
+CREATE TABLE "partitioned_events" ("issued_at" timestamp) partition by range (issued_at)		-
+SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'partitioned_events' AND c.relkind IN ('r','v','m','p','f')	text,name	r|partitioned_events
+SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'partitioned_events'	text,"char",boolean	r|p|f
+DROP TABLE IF EXISTS "partitioned_events"		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'partitioned_events'	text,bigint	r|0
+CREATE TABLE "measurements" ("city_id" character varying NOT NULL, "logdate" date NOT NULL, "peaktemp" integer, "unitsales" integer) PARTITION BY LIST (city_id)		-
+CREATE UNIQUE INDEX "index_measurements_on_logdate_and_city_id" ON "measurements" ("logdate", "city_id")		-
+CREATE TABLE "measurements_toronto" PARTITION OF measurements FOR VALUES IN (1)		-
+CREATE TABLE "measurements_concepcion" PARTITION OF measurements FOR VALUES IN (2)		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-01',30,10)		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('2','2026-09-02',31,11)		-
+SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'measurements' AND c.relkind IN ('r','v','m','p','f')	text,name	r|measurements
+SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'measurements_toronto' AND c.relkind IN ('r','v','m','p','f')	text,name	r|measurements_toronto
+SELECT 'r', COUNT(*) FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND i.relname = 'index_measurements_on_logdate_and_city_id' AND t.relname = 'measurements' AND n.nspname = ANY (current_schemas(false))	text,bigint	r|1
+SELECT 'r', i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND d.indisprimary = 'f' AND t.relname = 'measurements' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname	text,name,boolean,int2vector,text,boolean	r|index_measurements_on_logdate_and_city_id|t|2 1|CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON ONLY public.measurements USING btree (logdate, city_id)|t
+SELECT 'r', i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND d.indisprimary = 'f' AND t.relname = 'measurements_toronto' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname	text,name,boolean,int2vector,text,boolean	r|measurements_toronto_logdate_city_id_idx|t|2 1|CREATE UNIQUE INDEX measurements_toronto_logdate_city_id_idx ON public.measurements_toronto USING btree (logdate, city_id)|t
+SELECT 'r', pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'measurements' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|LIST (city_id)
+SELECT 'r', pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'measurements_toronto' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|\N
+SELECT 'r', parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'measurements_toronto' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,name	r|measurements
+SAVEPOINT s1		-
+DROP TABLE IF EXISTS "measurements"		-
+SELECT 'r', count(*) FROM pg_class WHERE relname LIKE 'measurements%'	text,bigint	r|0
+ROLLBACK TO s1		-
+SAVEPOINT s1b		-
+DROP TABLE "measurements" CASCADE		-
+SELECT 'r', count(*) FROM pg_class WHERE relname LIKE 'measurements%'	text,bigint	r|0
+ROLLBACK TO s1b		-
+SAVEPOINT s2		-
+DROP TABLE "measurements_toronto"		-
+SELECT 'r', count(*) FROM "measurements"	text,bigint	r|1
+SELECT 'r', pg_get_indexdef('index_measurements_on_logdate_and_city_id'::regclass)	text,text	r|CREATE UNIQUE INDEX index_measurements_on_logdate_and_city_id ON ONLY public.measurements USING btree (logdate, city_id)
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE TABLE "ip" ("a" integer)		-
+CREATE TABLE "ic" ( ) INHERITS ("ip")		-
+DROP TABLE "ip"	!2BP01 cannot drop table ip because other objects depend on it DETAIL: table ic depends on table ip HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+DROP INDEX "index_measurements_on_logdate_and_city_id"		-
+SELECT 'r', count(*) FROM pg_class WHERE relname LIKE '%logdate_city_id%'	text,bigint	r|0
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+INSERT INTO "measurements" ("city_id","logdate","peaktemp","unitsales") VALUES ('1','2026-09-05',1,1),('2','2026-09-06',2,2),('2','2026-09-07',0,0) ON CONFLICT ("logdate","city_id") DO UPDATE SET "peaktemp"=excluded."peaktemp","unitsales"=excluded."unitsales"		-
+SELECT 'r', city_id, peaktemp FROM "measurements" ORDER BY city_id, logdate	text,character varying,integer	r|1|30 ; r|1|1 ; r|2|31 ; r|2|2 ; r|2|0
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+CREATE TABLE "trains" ("name" character varying, "kind" character varying) PARTITION BY LIST (kind)		-
+SELECT 'r', pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'trains' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|LIST (kind)
+SELECT 'r', pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'trains' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|\N
+SELECT 'r', parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'trains' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,name	-
+DROP TABLE "trains"		-
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+CREATE TABLE "trains" ("name" character varying, "created_at" timestamp(6) NOT NULL) PARTITION BY RANGE (created_at)		-
+SELECT 'r', pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'trains' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|RANGE (created_at)
+DROP TABLE "trains"		-
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+CREATE TABLE "trains" ("id" bigserial primary key, "name" character varying)		-
+SELECT 'r', pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'trains' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,text	r|\N
+DROP TABLE "trains"		-
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+CREATE TABLE "pk_part" ("a" integer NOT NULL, "b" integer NOT NULL, PRIMARY KEY ("a", "b")) PARTITION BY LIST (a)		-
+SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'pk_part'	text,"char",boolean	r|p|f
+SELECT 'r', conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'pk_part'::regclass	text,name,"char",text	r|pk_part_a_not_null|n|NOT NULL a ; r|pk_part_b_not_null|n|NOT NULL b ; r|pk_part_pkey|p|PRIMARY KEY (a, b)
+SELECT 'r', i.relname, x.indisprimary, x.indisunique FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'pk_part'::regclass	text,name,boolean,boolean	r|pk_part_pkey|t|t
+CREATE TABLE "pk_part_1" PARTITION OF pk_part FOR VALUES IN (1)		-
+SELECT 'r', i.relname, x.indisprimary FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'pk_part_1'::regclass	text,name,boolean	r|pk_part_1_pkey|t
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'pk_part_1'::regclass	text,name,"char"	r|pk_part_1_pkey|p ; r|pk_part_a_not_null|n ; r|pk_part_b_not_null|n
+INSERT INTO "pk_part" ("a","b") VALUES (1, 1)		-
+INSERT INTO "pk_part" ("a","b") VALUES (1, 1)	!23505 duplicate key value violates unique constraint "pk_part_1_pkey" DETAIL: Key (a, b)=(1, 1) already exists.
+SELECT 'r', attname FROM pg_index x JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY(x.indkey) WHERE x.indrelid = 'pk_part'::regclass AND x.indisprimary ORDER BY attname	text,name	r|a ; r|b
+ROLLBACK TO s9		-
+SAVEPOINT s10		-
+CREATE TABLE "pk_bad" ("a" integer NOT NULL, "b" integer NOT NULL, PRIMARY KEY ("b")) PARTITION BY LIST (a)	!0A000 PRIMARY KEY constraint on partitioned table must include all partitioning columns DETAIL: PRIMARY KEY constraint on table "pk_bad" lacks column "a" which is part of the partition key.
+ROLLBACK TO s10		-
+SELECT 'r', pg_typeof(relhassubclass), pg_typeof(relkind) FROM pg_class WHERE relname = 'measurements'	text,regtype,regtype	r|boolean|"char"
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'measurements%' OR relname LIKE 'trains%' OR relname LIKE 'pk_part%' OR relname LIKE 'partitioned_events%' OR relname IN ('ip','ic')	bigint	0

@@ -1,0 +1,94 @@
+# `DISCARD ALL` — what a pooled connection is reset with.
+#
+# **Run 50 ranking: `DISCARD ALL is not supported`, 24 tests over 8 files, and 27 more raises in the
+# follow-on table.** It is not a statement any test writes: `postgresql_adapter.rb:392` sends
+# `@raw_connection.query "DISCARD ALL"` when the adapter resets a connection, so it lands on every
+# file that returns a connection to the pool and asks for it back.
+#
+# Things reasoning would get wrong:
+#
+# * **It cannot run inside a transaction block** (`25001`), the same as `CREATE DATABASE`. An
+#   implementation that wraps every statement in an implicit transaction has to special-case it.
+# * **It is five resets in one word**, and each has its own spelling that must also work: `PLANS`
+#   (deallocate cached plans), `SEQUENCES` (forget `currval`), `TEMP`/`TEMPORARY` (drop this
+#   session's temp tables), plus the parts `ALL` alone covers — prepared statements and every `SET`
+#   the session made. The rows below take each one in turn and then check what actually changed.
+# * **It releases advisory locks.** That is the connection to `pg19_advisory_lock.txt` and the reason
+#   a pooled connection cannot leak a Rails migration lock: `DISCARD ALL` is `pg_advisory_unlock_all`
+#   among other things. `DISCARD PLANS` and `DISCARD SEQUENCES` do **not** release them.
+# * **`currval` after `DISCARD SEQUENCES` is an error, not a stale number** — `55000 currval of
+#   sequence "…" is not yet defined in this session`, the same answer as a fresh connection.
+# * **`DEALLOCATE ALL` is not the same statement** and is captured beside it for the difference.
+#
+# **This file cannot be wrapped in `BEGIN … ROLLBACK`**, for the same reason
+# `pg19_create_database.txt` cannot: the statement under test refuses to run in one, and that
+# refusal is itself the first thing captured. Everything it touches is **session state** — temp
+# tables, prepared statements, `SET`s, locks — so nothing it does outlives the capture's own psql
+# session, and the counts at the end prove the permanent catalog is untouched.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+SELECT 'r', 1 AS in_a_transaction	text,integer	r|1
+DISCARD ALL	!25001 DISCARD ALL cannot run inside a transaction block
+ROLLBACK		-
+# ---- from here the session is in autocommit ----
+# build the five kinds of session state DISCARD ALL is supposed to erase
+CREATE TEMP TABLE dsc_tmp (id int)		-
+INSERT INTO dsc_tmp VALUES (1)		-
+PREPARE dsc_plan AS SELECT $1::int + 1		-
+SELECT 'r', name FROM pg_prepared_statements WHERE name = 'dsc_plan'	text,text	r|dsc_plan
+SET search_path = 'public'		-
+SET statement_timeout = '31s'		-
+SET timezone = 'Europe/Paris'		-
+CREATE SEQUENCE dsc_seq		-
+SELECT 'r', nextval('dsc_seq'), currval('dsc_seq')		r|1|1
+SELECT 'r', pg_try_advisory_lock(7001)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001	text,bigint	r|1
+SELECT 'r', count(*) FROM dsc_tmp		r|1
+SELECT 'r', current_setting('statement_timeout'), current_setting('timezone')	text,text,text	r|31s|Europe/Paris
+# ---- DISCARD PLANS: plans only. The prepared statement, the locks and the temp table stay. ----
+DISCARD PLANS		-
+SELECT 'r', count(*) FROM pg_prepared_statements WHERE name = 'dsc_plan'	text,bigint	r|1
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001	text,bigint	r|1
+SELECT 'r', count(*) FROM dsc_tmp		r|1
+# ---- DISCARD SEQUENCES: currval is not stale, it is undefined again ----
+DISCARD SEQUENCES		-
+SAVEPOINT s1	!25P01 SAVEPOINT can only be used in transaction blocks
+SELECT 'r', currval('dsc_seq')	!55000 currval of sequence "dsc_seq" is not yet defined in this session
+ROLLBACK TO s1	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+SELECT 'r', nextval('dsc_seq')		r|2
+# ---- DISCARD TEMP: the temp table goes, everything else stays ----
+DISCARD TEMP		-
+SAVEPOINT s2	!25P01 SAVEPOINT can only be used in transaction blocks
+SELECT 'r', count(*) FROM dsc_tmp	!42P01 relation "dsc_tmp" does not exist
+ROLLBACK TO s2	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+SELECT 'r', count(*) FROM pg_prepared_statements WHERE name = 'dsc_plan'	text,bigint	r|1
+SELECT 'r', current_setting('statement_timeout')	text,text	r|31s
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001	text,bigint	r|1
+# ---- DEALLOCATE ALL is the narrow one: prepared statements and nothing else ----
+PREPARE dsc_plan2 AS SELECT 1		-
+DEALLOCATE ALL		-
+SELECT 'r', count(*) FROM pg_prepared_statements	text,bigint	r|0
+SELECT 'r', current_setting('statement_timeout'), count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001	text,text,bigint	r|31s|1
+# ---- DISCARD ALL: the SETs go back to their defaults and the advisory lock is released ----
+CREATE TEMP TABLE dsc_tmp2 (id int)		-
+PREPARE dsc_plan3 AS SELECT 1		-
+DISCARD ALL		-
+SELECT 'r', current_setting('statement_timeout'), current_setting('timezone')	text,text,text	r|0|Etc/UTC
+SELECT 'r', count(*) FROM pg_prepared_statements	text,bigint	r|0
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+SAVEPOINT s3	!25P01 SAVEPOINT can only be used in transaction blocks
+SELECT 'r', count(*) FROM dsc_tmp2	!42P01 relation "dsc_tmp2" does not exist
+ROLLBACK TO s3	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+# ---- the spellings, and one that is not a spelling ----
+DISCARD TEMPORARY		-
+DISCARD ALL		-
+SAVEPOINT s4	!25P01 SAVEPOINT can only be used in transaction blocks
+DISCARD EVERYTHING	!42601 syntax error at or near "EVERYTHING"
+ROLLBACK TO s4	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+# ---- proof: the permanent catalog is untouched. The sequence is the only object left, and it goes.
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'dsc_seq'	text,bigint	r|1
+DROP SEQUENCE dsc_seq		-
+SELECT count(*) FROM pg_class WHERE relname IN ('dsc_seq','dsc_tmp','dsc_tmp2')	bigint	0
+SELECT count(*) FROM pg_prepared_statements	bigint	0
+SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'	bigint	0

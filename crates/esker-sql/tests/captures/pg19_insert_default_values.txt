@@ -1,0 +1,86 @@
+# `INSERT … DEFAULT VALUES` — an INSERT with no source — as a real PostgreSQL 19beta1 answers it.
+#
+# **Run 45 ranking: 9 tests across 5 files** — `adapter_test.rb`, `boolean_test.rb`,
+# `callbacks_test.rb`, `eager_load_nested_include_test.rb`, `nested_error_test.rb`,
+# `postgresql_adapter_test.rb`. It is what ActiveRecord emits whenever a record is saved with no
+# attributes set: `abstract/database_statements.rb:519` returns the literal string
+# `"DEFAULT VALUES"` from `empty_insert_statement_value`.
+#
+# The two forms below are what Rails actually sends, obtained by subscribing to `sql.active_record`
+# rather than by reading the adapter:
+#
+#     INSERT INTO "dvs" DEFAULT VALUES RETURNING "id"     -- a model with a primary key
+#     INSERT INTO dv_nopk DEFAULT VALUES                  -- exec_insert with no returning
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`.
+#
+# **A note on how this file was nearly got wrong, twice.** The first draft gave `dvs` a
+# `t timestamp DEFAULT now()` column so `RETURNING *` would show every default — which makes the
+# capture unreplayable, because the timestamp differs each run. It is a constant string here
+# instead. And the Rails probe used to obtain the statement text originally wrapped itself in
+# `execute("BEGIN") … execute("ROLLBACK")`; `create!` opens ActiveRecord's *own* transaction, which
+# committed the outer one, and two tables escaped onto the shared oracle and had to be dropped by
+# hand. Drive a probe with `transaction { … raise ActiveRecord::Rollback }` or a raw `PG` connection,
+# never raw `BEGIN` through an ActiveRecord connection.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`DEFAULT VALUES` is not "insert a row of NULLs" — every column default is applied.**
+#     `dvs.s` comes back `dflt`, and a table whose columns all have defaults
+#     (`dv_alldefault`) gets `1|2`. Only columns without a default are NULL.
+#   * **It works on a table with no primary key and no defaults at all.** `dv_nopk` gets a row whose
+#     single column is NULL — `count(*)` is 1 while `count(n)` is 0.
+#   * **`RETURNING` composes with it in every form**: `RETURNING "id"` (what Rails sends),
+#     a column list, and `RETURNING *`. With no primary key, `RETURNING n` returns the NULL.
+#   * **A NOT NULL column with no default makes it `23502`**, and the DETAIL prints the whole
+#     failing row with the generated key already filled in: `Failing row contains (1, null).` —
+#     the `bigserial` has already advanced. `INSERT INTO … (id) VALUES (DEFAULT)` fails the same way
+#     and consumes another sequence value, so the two failures show `(1, null)` then `(2, null)`.
+#   * **`DEFAULT VALUES` takes no list and cannot be repeated.**
+#     `INSERT INTO dvs DEFAULT VALUES, DEFAULT VALUES` is `42601 syntax error at or near ","` — it is
+#     not a `VALUES` clause with one row, and there is no multi-row form of it.
+#   * **`INSERT INTO … VALUES (DEFAULT, DEFAULT)` is a different statement that reaches the same
+#     result** — the `DEFAULT` keyword inside a `VALUES` list is its own grammar, and both spellings
+#     have to work because ActiveRecord emits the first and the suite writes the second.
+#   * **A missing table is `42P01`**, reported against the table and not against the missing source.
+BEGIN		-
+CREATE TABLE dvs (id bigserial primary key, n integer, s character varying DEFAULT 'dflt', t character varying DEFAULT 'fixed')		-
+INSERT INTO "dvs" DEFAULT VALUES RETURNING "id"		1
+INSERT INTO "dvs" DEFAULT VALUES RETURNING "id"		2
+SELECT 'r', id, n, s FROM dvs ORDER BY id		r|1|\N|dflt ; r|2|\N|dflt
+INSERT INTO dvs DEFAULT VALUES		-
+SELECT 'r', count(*) FROM dvs		r|3
+INSERT INTO "dvs" DEFAULT VALUES RETURNING "id", "n", "s"		4|\N|dflt
+INSERT INTO "dvs" DEFAULT VALUES RETURNING *		5|\N|dflt|fixed
+CREATE TABLE dv_nopk (n integer)		-
+INSERT INTO dv_nopk DEFAULT VALUES		-
+SELECT 'r', count(*), count(n) FROM dv_nopk		r|1|0
+INSERT INTO dv_nopk DEFAULT VALUES RETURNING n		\N
+CREATE TABLE dv_notnull (id bigserial primary key, req integer NOT NULL)		-
+SAVEPOINT s1		-
+INSERT INTO dv_notnull DEFAULT VALUES	!23502 null value in column "req" of relation "dv_notnull" violates not-null constraint DETAIL: Failing row contains (1, null).
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+INSERT INTO dv_notnull (id) VALUES (DEFAULT)	!23502 null value in column "req" of relation "dv_notnull" violates not-null constraint DETAIL: Failing row contains (2, null).
+ROLLBACK TO s2		-
+CREATE TABLE dv_alldefault (a integer DEFAULT 1, b integer DEFAULT 2)		-
+INSERT INTO dv_alldefault DEFAULT VALUES		-
+SELECT 'r', a, b FROM dv_alldefault		r|1|2
+INSERT INTO dv_alldefault VALUES (DEFAULT, DEFAULT)		-
+SELECT 'r', a, b FROM dv_alldefault ORDER BY a, b		r|1|2 ; r|1|2
+SAVEPOINT s3		-
+INSERT INTO dvs DEFAULT VALUES, DEFAULT VALUES	!42601 syntax error at or near ","
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+INSERT INTO nosuchtable DEFAULT VALUES	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO s4		-
+SELECT 'r', pg_typeof(id) FROM dvs LIMIT 1		r|bigint
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('dvs','dv_nopk','dv_notnull','dv_alldefault')	bigint	0

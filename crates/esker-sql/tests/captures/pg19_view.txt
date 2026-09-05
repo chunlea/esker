@@ -1,0 +1,118 @@
+# `CREATE VIEW` / `DROP VIEW` — `view_test.rb`, including the name it deliberately chose.
+#
+# **Run 53 ranking: `CREATE VIEW is not supported`, 21 tests in one file.** Another new row from
+# tests getting further than before. The file's `setup` is one statement and its `teardown` is one
+# (`view_test.rb:88-93`):
+#
+#     CREATE VIEW "ebooks'" AS SELECT id, name, cover, status FROM books WHERE format = 'ebook'
+#     DROP VIEW "ebooks'"
+#
+# Things reasoning would get wrong:
+#
+# * **The view is named `ebooks'` — with an apostrophe in it.** That is not a typo in this file, it
+#   is the suite's own choice, and it is the whole point: a double-quoted identifier containing a
+#   single quote has to survive `quote_table_name`, the catalog, `pg_get_viewdef` and the schema
+#   dumper. An implementation that quotes identifiers by wrapping them in single quotes, or that
+#   escapes the two kinds of quote with one rule, fails this file at `setup` and never reaches a test.
+# * **A view is a data source and not a table**, the same one-letter distinction as a foreign table:
+#   AR maps `VIEW` to `relkind IN ('v','m')` and `BASE TABLE` to `('r','p')`
+#   (`postgresql/schema_statements.rb:1171-1176`), and `test_table_exists` asserts `table_exists?` is
+#   **false** for this name while `data_source_exists?` is **true**.
+# * **A view has no primary key**, and `test_does_not_assume_id_column_as_primary_key` asserts AR
+#   finds none even though the view selects `id`. There is no `pg_constraint` row to find — the rows
+#   below show the empty answer that has to come back rather than an error.
+# * **A simple view is auto-updatable and a `DISTINCT` one is not.** `INSERT`/`UPDATE`/`DELETE`
+#   through the first work with no rule or trigger; through the second they raise `55000`.
+#   `information_schema.views.is_updatable` is where that is published.
+# * **`CREATE OR REPLACE VIEW` may add columns at the end and may not rename or remove one**, which
+#   is a different rule from `CREATE TABLE`'s and has its own message.
+# * **A materialized view is `relkind = 'm'`, holds rows, and needs `REFRESH`** — the same helper in
+#   `view_test.rb:218-222` drives it with `CREATE MATERIALIZED VIEW` / `DROP MATERIALIZED VIEW`.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE books (id serial primary key, name character varying(255), cover character varying(255), status integer, format character varying(255))		-
+INSERT INTO books (name, cover, status, format) VALUES ('Ruby for Rails', 'hard', 0, 'ebook')		-
+INSERT INTO books (name, cover, status, format) VALUES ('Paper Only', 'soft', 1, 'paperback')		-
+# ---- the file's setup statement, verbatim, apostrophe and all ----
+CREATE VIEW "ebooks'" AS SELECT id, name, cover, status FROM books WHERE format = 'ebook'		-
+SELECT 'r', id, name, cover, status FROM "ebooks'"		r|1|Ruby for Rails|hard|0
+SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks'''	text,name,"char"	r|ebooks'|v
+SELECT 'r', viewname, definition FROM pg_views WHERE viewname = 'ebooks'''	text,name,text	r|ebooks'| SELECT id,
+SELECT 'r', pg_get_viewdef('"ebooks''"'::regclass, true)		r| SELECT id,
+SELECT 'r', table_name, is_updatable FROM information_schema.views WHERE table_name = 'ebooks'''	text,name,character varying(3)	r|ebooks'|YES
+# ---- a view is a data source and not a table: the two relkind lists AR uses ----
+SELECT 'r', count(*) AS as_base_table FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'ebooks''' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+SELECT 'r', count(*) AS as_view FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'ebooks''' AND c.relkind IN ('v','m') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|1
+SELECT 'r', count(*) AS as_data_source FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'ebooks''' AND c.relkind IN ('r','v','m','p','f') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|1
+# ---- its columns, and the primary key it does not have ----
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"ebooks''"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|f ; r|name|character varying(255)|f ; r|cover|character varying(255)|f ; r|status|integer|f
+SELECT 'r', count(*) AS constraints_on_the_view FROM pg_constraint WHERE conrelid = '"ebooks''"'::regclass		r|0
+SELECT 'r', count(*) AS indexes_on_the_view FROM pg_index WHERE indrelid = '"ebooks''"'::regclass		r|0
+# ---- a simple view is auto-updatable ----
+CREATE VIEW ebooks_plain AS SELECT id, name, cover, status, format FROM books WHERE format = 'ebook'		-
+SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_plain'	text,character varying(3),character varying(3)	r|YES|YES
+INSERT INTO ebooks_plain (name, cover, status, format) VALUES ('Written Through', 'hard', 0, 'ebook')		-
+SELECT 'r', name FROM books WHERE name = 'Written Through'		r|Written Through
+UPDATE ebooks_plain SET cover = 'soft' WHERE name = 'Written Through'		-
+SELECT 'r', cover FROM books WHERE name = 'Written Through'		r|soft
+DELETE FROM ebooks_plain WHERE name = 'Written Through'		-
+SELECT 'r', count(*) FROM books WHERE name = 'Written Through'		r|0
+# ---- ...and one with DISTINCT is not ----
+CREATE VIEW ebooks_distinct AS SELECT DISTINCT format FROM books		-
+SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_distinct'	text,character varying(3),character varying(3)	r|NO|NO
+SAVEPOINT v1		-
+INSERT INTO ebooks_distinct (format) VALUES ('audio')	!55000 cannot insert into view "ebooks_distinct" DETAIL: Views containing DISTINCT are not automatically updatable. HINT: To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.
+ROLLBACK TO v1		-
+# ---- CREATE OR REPLACE: append yes, rename no, drop no ----
+CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name, cover, status, format FROM books WHERE format = 'ebook' AND status = 0		-
+SELECT 'r', pg_get_viewdef('ebooks_plain'::regclass, true)		r| SELECT id,
+CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name, cover, status, format, 'x'::text AS extra FROM books WHERE format = 'ebook'		-
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = 'ebooks_plain'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id ; r|name ; r|cover ; r|status ; r|format ; r|extra
+SAVEPOINT v2		-
+CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name AS title, cover, status, format, 'x'::text AS extra FROM books WHERE format = 'ebook'	!42P16 cannot change name of view column "name" to "title" HINT: Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.
+ROLLBACK TO v2		-
+SAVEPOINT v3		-
+CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name FROM books WHERE format = 'ebook'	!42P16 cannot drop columns from view
+ROLLBACK TO v3		-
+# ---- a column list on the view itself ----
+CREATE VIEW ebooks_named (book_id, book_name) AS SELECT id, name FROM books		-
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = 'ebooks_named'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|book_id ; r|book_name
+# ---- the base table cannot be dropped while a view reads it ----
+SAVEPOINT v4		-
+DROP TABLE books	!2BP01 cannot drop table books because other objects depend on it DETAIL: view "ebooks'" depends on table books HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO v4		-
+# ---- a materialized view: relkind 'm', its own rows, and REFRESH ----
+CREATE MATERIALIZED VIEW ebooks_mat AS SELECT id, name FROM books WHERE format = 'ebook'		-
+SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks_mat'	text,name,"char"	r|ebooks_mat|m
+SELECT 'r', count(*) FROM ebooks_mat		r|1
+INSERT INTO books (name, cover, status, format) VALUES ('Late Arrival', 'hard', 0, 'ebook')		-
+SELECT 'r', count(*) AS before_refresh FROM ebooks_mat		r|1
+REFRESH MATERIALIZED VIEW ebooks_mat		-
+SELECT 'r', count(*) AS after_refresh FROM ebooks_mat		r|2
+SELECT 'r', count(*) FROM pg_views WHERE viewname = 'ebooks_mat'	text,bigint	r|0
+SELECT 'r', matviewname FROM pg_matviews WHERE matviewname = 'ebooks_mat'	text,name	r|ebooks_mat
+# ---- dropping, in the file's own spelling and the guarded one ----
+DROP VIEW "ebooks'"		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'ebooks'''	text,bigint	r|0
+SAVEPOINT v5		-
+DROP VIEW "ebooks'"	!42P01 view "ebooks'" does not exist
+ROLLBACK TO v5		-
+DROP VIEW IF EXISTS "ebooks'"		-
+SAVEPOINT v6		-
+DROP VIEW ebooks_mat	!42809 "ebooks_mat" is not a view HINT: Use DROP MATERIALIZED VIEW to remove a materialized view.
+ROLLBACK TO v6		-
+DROP MATERIALIZED VIEW ebooks_mat		-
+SAVEPOINT v7		-
+DROP TABLE books	!2BP01 cannot drop table books because other objects depend on it DETAIL: view ebooks_plain depends on table books HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO v7		-
+DROP VIEW ebooks_named		-
+DROP VIEW ebooks_distinct		-
+DROP VIEW ebooks_plain		-
+DROP TABLE books		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('books','ebooks_plain','ebooks_distinct','ebooks_named','ebooks_mat')	bigint	0
+SELECT count(*) FROM pg_class WHERE relname = 'ebooks'''	bigint	0

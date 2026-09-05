@@ -12,7 +12,7 @@
 //!
 //! # The whole capture replays
 //!
-//! `corpus/pg19_tsvector.txt` is `captures/pg19_tsvector.txt` **byte for byte** — the harness's
+//! `corpus/pg19_tsvector.txt` is `captures/pg19_tsvector.txt` (vendored, ADR 0075) **byte for byte** — the harness's
 //! captures directory is not in git, so this copy is the capture's only backup and it is kept
 //! whole. The replay took the file in prefixes as the machinery underneath it landed: part 1 the
 //! declaration and round trip, part 2 the value and operator surface once there was a stemmer, and

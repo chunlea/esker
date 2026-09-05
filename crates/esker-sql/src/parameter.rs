@@ -133,7 +133,7 @@ pub const PARAMETERS: &[Parameter] = &[
     },
     // **The text-search configuration a bare `to_tsvector(text)` uses.** PostgreSQL reports it
     // schema-qualified — `pg_catalog.english` — which is what `full_text_test.rb`'s server reads
-    // back and what `captures/pg19_tsvector.txt` pins. `Values::Free` because the capture measures
+    // back and what `crates/esker-sql/tests/captures/pg19_tsvector.txt` pins. `Values::Free` because the capture measures
     // only the boot value: refusing a name without having measured which names PostgreSQL refuses
     // is how this lane has invented rules before.
     Parameter {

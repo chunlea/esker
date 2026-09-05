@@ -1,0 +1,87 @@
+# What PostgreSQL 19 stores for an EXCLUDE constraint, and what a client has to read back to
+# reconstruct one.
+#
+# **Run 83 ranking: `an EXCLUDE constraint is not supported`, 8 tests over 1 file** — all of
+# `migration/exclusion_constraint_test.rb`, and it is the largest single-file row on the board after
+# TSVECTOR. The suite's own schema builds three of them on one table
+# (`postgresql_specific_schema.rb:170-172`), differing only in deferrability, and the test then asks
+# the adapter to hand back name, expression, `using`, `where` and `deferrable` for each.
+#
+# The whole file is gated on the feature, and the file is guarded by
+# `if ActiveRecord::Base.lease_connection.supports_exclusion_constraints?` — so a server that
+# advertises support and then answers these catalog queries differently costs the file twice.
+#
+# Things reasoning would get wrong:
+#
+# * **`contype = 'x'`, and the constraint owns an index.** An EXCLUDE constraint is not a check: it
+#   is backed by a real index (`conindid`), and the access method lives on that index's `pg_class`
+#   row, not on the constraint. `using: :gist` is read back from `pg_am` through `conindid`.
+# * **Deferrability is TWO booleans, not one field.** `deferrable: false`, `:immediate` and
+#   `:deferred` are `(condeferrable, condeferred)` = `(f,f)`, `(t,f)` and `(t,t)`. A client that
+#   stores one flag cannot tell `:immediate` from `false`, and the suite asserts all three.
+# * **`pg_get_constraintdef` is the only place the WHERE clause survives in readable form.** The
+#   predicate is stored in the index's `indpred`, not on the constraint row, and the suite compares
+#   the `where` it wrote against what comes back -- so the round-trip text matters, including how
+#   PostgreSQL re-renders `IS NOT NULL` and parenthesises.
+# * **The operator is part of the constraint, not of the index.** `WITH &&` becomes an entry in
+#   `pg_constraint.conexclop`, an array of operator oids, which is what makes it an *exclusion*
+#   rather than a plain index.
+# * **A same-named table in another schema must not appear.** `test_exclusion_constraints_scoped_to_schemas`
+#   creates `test_schema.invoices` beside `public.invoices` and asserts the count for `invoices` does
+#   not change, so the lookup has to be schema-aware rather than by relname.
+#
+# One `BEGIN … ROLLBACK`. The tables live and die inside it, so `\gdesc` -- which runs in a SECOND
+# session after the rollback -- cannot see them: queries naming them carry rows and an empty types
+# column, as `pg19_tsvector.txt` and `pg19_serial.txt` do. The `SELECT count(*)` lines after the
+# `ROLLBACK` prove nothing persisted.
+BEGIN		-
+# ---- does the server advertise it at all, and what backs it ----
+SELECT 'r', amname FROM pg_am WHERE amname IN ('gist','btree','gin') ORDER BY amname	text,name	r|btree ; r|gin ; r|gist
+SELECT 'r', oprname, oprleft::regtype, oprright::regtype FROM pg_operator WHERE oprname = '&&' AND oprleft = 'daterange'::regtype	text,name,regtype,regtype	-
+# ---- the suite's own three, exactly as postgresql_specific_schema.rb:162-173 writes them ----
+CREATE TABLE test_exclusion_constraints (id bigserial primary key, start_date date, end_date date, valid_from date, valid_to date, transaction_from date, transaction_to date)		-
+ALTER TABLE test_exclusion_constraints ADD CONSTRAINT test_exclusion_constraints_date_overlap EXCLUDE USING gist (daterange(start_date, end_date) WITH &&) WHERE (start_date IS NOT NULL AND end_date IS NOT NULL)		-
+ALTER TABLE test_exclusion_constraints ADD CONSTRAINT test_exclusion_constraints_valid_overlap EXCLUDE USING gist (daterange(valid_from, valid_to) WITH &&) WHERE (valid_from IS NOT NULL AND valid_to IS NOT NULL) DEFERRABLE INITIALLY IMMEDIATE		-
+ALTER TABLE test_exclusion_constraints ADD CONSTRAINT test_exclusion_constraints_transaction_overlap EXCLUDE USING gist (daterange(transaction_from, transaction_to) WITH &&) WHERE (transaction_from IS NOT NULL AND transaction_to IS NOT NULL) DEFERRABLE INITIALLY DEFERRED		-
+# ---- exactly what the adapter reads back: name, expression, using, where, deferrable ----
+SELECT 'r', conname, contype, condeferrable, condeferred FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x' ORDER BY conname		r|test_exclusion_constraints_date_overlap|x|f|f ; r|test_exclusion_constraints_transaction_overlap|x|t|t ; r|test_exclusion_constraints_valid_overlap|x|t|f
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x' ORDER BY conname		r|test_exclusion_constraints_date_overlap|EXCLUDE USING gist (daterange(start_date, end_date) WITH &&) WHERE (((start_date IS NOT NULL) AND (end_date IS NOT NULL))) ; r|test_exclusion_constraints_transaction_overlap|EXCLUDE USING gist (daterange(transaction_from, transaction_to) WITH &&) WHERE (((transaction_from IS NOT NULL) AND (transaction_to IS NOT NULL))) DEFERRABLE INITIALLY DEFERRED ; r|test_exclusion_constraints_valid_overlap|EXCLUDE USING gist (daterange(valid_from, valid_to) WITH &&) WHERE (((valid_from IS NOT NULL) AND (valid_to IS NOT NULL))) DEFERRABLE
+SELECT 'r', c.conname, am.amname AS using_method FROM pg_constraint c JOIN pg_class i ON i.oid = c.conindid JOIN pg_am am ON am.oid = i.relam WHERE c.conrelid = 'test_exclusion_constraints'::regclass AND c.contype = 'x' ORDER BY c.conname		r|test_exclusion_constraints_date_overlap|gist ; r|test_exclusion_constraints_transaction_overlap|gist ; r|test_exclusion_constraints_valid_overlap|gist
+SELECT 'r', c.conname, pg_get_expr(i.indpred, i.indrelid) AS where_clause FROM pg_constraint c JOIN pg_index i ON i.indexrelid = c.conindid WHERE c.conrelid = 'test_exclusion_constraints'::regclass AND c.contype = 'x' ORDER BY c.conname		r|test_exclusion_constraints_date_overlap|((start_date IS NOT NULL) AND (end_date IS NOT NULL)) ; r|test_exclusion_constraints_transaction_overlap|((transaction_from IS NOT NULL) AND (transaction_to IS NOT NULL)) ; r|test_exclusion_constraints_valid_overlap|((valid_from IS NOT NULL) AND (valid_to IS NOT NULL))
+SELECT 'r', c.conname, pg_get_expr(i.indexprs, i.indrelid) AS expression FROM pg_constraint c JOIN pg_index i ON i.indexrelid = c.conindid WHERE c.conrelid = 'test_exclusion_constraints'::regclass AND c.contype = 'x' ORDER BY c.conname		r|test_exclusion_constraints_date_overlap|daterange(start_date, end_date) ; r|test_exclusion_constraints_transaction_overlap|daterange(transaction_from, transaction_to) ; r|test_exclusion_constraints_valid_overlap|daterange(valid_from, valid_to)
+SELECT 'r', conname, array_length(conexclop, 1) AS operators, conexclop::text FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x' ORDER BY conname		r|test_exclusion_constraints_date_overlap|1|{3888} ; r|test_exclusion_constraints_transaction_overlap|1|{3888} ; r|test_exclusion_constraints_valid_overlap|1|{3888}
+# ---- the three deferrability states as the two booleans that carry them ----
+SELECT 'r', conname, condeferrable AS deferrable, condeferred AS initially_deferred, CASE WHEN NOT condeferrable THEN 'false' WHEN condeferred THEN 'deferred' ELSE 'immediate' END AS what_AR_calls_it FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x' ORDER BY conname		r|test_exclusion_constraints_date_overlap|f|f|false ; r|test_exclusion_constraints_transaction_overlap|t|t|deferred ; r|test_exclusion_constraints_valid_overlap|t|f|immediate
+# ---- and that the constraint actually excludes ----
+INSERT INTO test_exclusion_constraints (start_date, end_date) VALUES ('2020-01-01', '2020-06-01')		-
+SAVEPOINT x1		-
+INSERT INTO test_exclusion_constraints (start_date, end_date) VALUES ('2020-03-01', '2020-09-01')	!23P01 conflicting key value violates exclusion constraint "test_exclusion_constraints_date_overlap" DETAIL: Key (daterange(start_date, end_date))=([2020-03-01,2020-09-01)) conflicts with existing key (daterange(start_date, end_date))=([2020-01-01,2020-06-01)).
+ROLLBACK TO x1		-
+INSERT INTO test_exclusion_constraints (start_date, end_date) VALUES ('2020-07-01', '2020-09-01')		-
+SELECT 'r', count(*) FROM test_exclusion_constraints		r|2
+# ---- the WHERE clause means NULLs are exempt from the exclusion ----
+INSERT INTO test_exclusion_constraints (start_date, end_date) VALUES (NULL, NULL)		-
+INSERT INTO test_exclusion_constraints (start_date, end_date) VALUES (NULL, NULL)		-
+SELECT 'r', count(*) AS rows_with_null_dates FROM test_exclusion_constraints WHERE start_date IS NULL		r|2
+# ---- a DEFERRED constraint raises at COMMIT, not at the statement ----
+SAVEPOINT x2		-
+INSERT INTO test_exclusion_constraints (transaction_from, transaction_to) VALUES ('2020-01-01', '2020-06-01')		-
+INSERT INTO test_exclusion_constraints (transaction_from, transaction_to) VALUES ('2020-03-01', '2020-09-01')		-
+SELECT 'r', 'both deferred rows inserted without error' AS note	text,text	r|both deferred rows inserted without error
+ROLLBACK TO x2		-
+# ---- scoped_to_schemas: a same-named table elsewhere must not be counted ----
+CREATE TABLE invoices (id bigserial primary key, start_date date, end_date date)		-
+ALTER TABLE invoices ADD CONSTRAINT invoices_date_overlap EXCLUDE USING gist (daterange(start_date, end_date) WITH &&)		-
+CREATE SCHEMA test_schema		-
+CREATE TABLE test_schema.invoices (id bigserial primary key, start_date date, end_date date)		-
+ALTER TABLE test_schema.invoices ADD CONSTRAINT invoices_date_overlap_2 EXCLUDE USING gist (daterange(start_date, end_date) WITH &&)		-
+SELECT 'r', count(*) AS by_relname_wrong FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = 'invoices' AND c.contype = 'x'	text,bigint	r|2
+SELECT 'r', count(*) AS by_regclass_right FROM pg_constraint WHERE conrelid = 'public.invoices'::regclass AND contype = 'x'		r|1
+SELECT 'r', n.nspname, t.relname, c.conname FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE t.relname = 'invoices' AND c.contype = 'x' ORDER BY n.nspname	text,name,name,name	r|public|invoices|invoices_date_overlap ; r|test_schema|invoices|invoices_date_overlap_2
+# ---- what DROP takes with it ----
+ALTER TABLE test_exclusion_constraints DROP CONSTRAINT test_exclusion_constraints_date_overlap		-
+SELECT 'r', count(*) AS constraints_left FROM pg_constraint WHERE conrelid = 'test_exclusion_constraints'::regclass AND contype = 'x'		r|2
+SELECT 'r', count(*) AS indexes_left FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname LIKE 'test_exclusion_constraints%'	text,bigint	r|3
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('test_exclusion_constraints','invoices')	bigint	0
+SELECT count(*) FROM pg_namespace WHERE nspname = 'test_schema'	bigint	0

@@ -1,0 +1,263 @@
+BEGIN		-
+CREATE TABLE ac (i integer, b bigint, s smallint, n numeric(10,2), d double precision, r real, t text, v character varying(255), c character(5), ts timestamp, tstz timestamptz, dt date, bo boolean, tm time, iv interval, mo money, uu uuid)		-
+INSERT INTO ac (i, b, s, n, d, r, t, v, c, ts, tstz, dt, bo, tm, iv, mo, uu) VALUES (7, 8, 9, 10.50, 11.5, 12.5, '13', '14', '15', '2020-01-02 03:04:05', '2020-01-02 03:04:05+00', '2020-01-02', true, '03:04:05', '1 day', 16.00, '00000000-0000-0000-0000-000000000001')		-
+SAVEPOINT a1		-
+ALTER TABLE ac ALTER COLUMN i TYPE double precision		-
+SELECT 'r', format_type(a.atttypid, a.atttypmod), (SELECT i::text FROM ac) FROM pg_attribute a WHERE a.attrelid = 'ac'::regclass AND a.attname = 'i'		r|double precision|7
+ROLLBACK TO a1		-
+SAVEPOINT a2		-
+ALTER TABLE ac ALTER COLUMN ts TYPE timestamp		-
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+ALTER TABLE ac ALTER COLUMN ts TYPE timestamp(3)		-
+ROLLBACK TO a3		-
+SAVEPOINT a4		-
+ALTER TABLE ac ALTER COLUMN i TYPE bigint		-
+ROLLBACK TO a4		-
+SAVEPOINT a5		-
+ALTER TABLE ac ALTER COLUMN b TYPE integer		-
+ROLLBACK TO a5		-
+SAVEPOINT a6		-
+ALTER TABLE ac ALTER COLUMN i TYPE text		-
+ROLLBACK TO a6		-
+SAVEPOINT a7		-
+ALTER TABLE ac ALTER COLUMN i TYPE character varying(50)		-
+ROLLBACK TO a7		-
+SAVEPOINT a8		-
+ALTER TABLE ac ALTER COLUMN t TYPE integer	!42804 column "t" cannot be cast automatically to type integer HINT: You might need to specify "USING t::integer".
+ROLLBACK TO a8		-
+SAVEPOINT a9		-
+ALTER TABLE ac ALTER COLUMN t TYPE integer USING t::integer		-
+SELECT 'r', format_type(a.atttypid, a.atttypmod), (SELECT t::text FROM ac) FROM pg_attribute a WHERE a.attrelid = 'ac'::regclass AND a.attname = 't'		r|integer|13
+ROLLBACK TO a9		-
+SAVEPOINT a10		-
+ALTER TABLE ac ALTER COLUMN v TYPE character varying(80)		-
+ROLLBACK TO a10		-
+SAVEPOINT a11		-
+ALTER TABLE ac ALTER COLUMN n TYPE double precision		-
+ROLLBACK TO a11		-
+SAVEPOINT a12		-
+ALTER TABLE ac ALTER COLUMN d TYPE numeric(10,2)		-
+ROLLBACK TO a12		-
+SAVEPOINT a13		-
+ALTER TABLE ac ALTER COLUMN dt TYPE timestamp		-
+ROLLBACK TO a13		-
+SAVEPOINT a14		-
+ALTER TABLE ac ALTER COLUMN ts TYPE date		-
+ROLLBACK TO a14		-
+SAVEPOINT a15		-
+ALTER TABLE ac ALTER COLUMN bo TYPE integer	!42804 column "bo" cannot be cast automatically to type integer HINT: You might need to specify "USING bo::integer".
+ROLLBACK TO a15		-
+SAVEPOINT a16		-
+ALTER TABLE ac ALTER COLUMN i TYPE boolean	!42804 column "i" cannot be cast automatically to type boolean HINT: You might need to specify "USING i::boolean".
+ROLLBACK TO a16		-
+SAVEPOINT a17		-
+ALTER TABLE ac ALTER COLUMN t TYPE timestamp	!42804 column "t" cannot be cast automatically to type timestamp without time zone HINT: You might need to specify "USING t::timestamp without time zone".
+ROLLBACK TO a17		-
+SAVEPOINT a18		-
+ALTER TABLE ac ALTER COLUMN ts TYPE timestamptz		-
+ROLLBACK TO a18		-
+SAVEPOINT a19		-
+ALTER TABLE ac ALTER COLUMN i TYPE real		-
+ROLLBACK TO a19		-
+SAVEPOINT a20		-
+ALTER TABLE ac ALTER COLUMN d TYPE integer		-
+ROLLBACK TO a20		-
+SAVEPOINT a21		-
+ALTER TABLE ac ALTER COLUMN c TYPE text		-
+ROLLBACK TO a21		-
+SAVEPOINT a22		-
+ALTER TABLE ac ALTER COLUMN t TYPE character varying(2)		-
+ROLLBACK TO a22		-
+SAVEPOINT b1		-
+ALTER TABLE ac ALTER COLUMN d TYPE text		-
+ROLLBACK TO b1		-
+SAVEPOINT b2		-
+ALTER TABLE ac ALTER COLUMN ts TYPE text		-
+ROLLBACK TO b2		-
+SAVEPOINT b3		-
+ALTER TABLE ac ALTER COLUMN dt TYPE character varying(30)		-
+ROLLBACK TO b3		-
+SAVEPOINT b4		-
+ALTER TABLE ac ALTER COLUMN bo TYPE text		-
+ROLLBACK TO b4		-
+SAVEPOINT b5		-
+ALTER TABLE ac ALTER COLUMN n TYPE character varying(20)		-
+ROLLBACK TO b5		-
+SAVEPOINT b6		-
+ALTER TABLE ac ALTER COLUMN t TYPE date	!42804 column "t" cannot be cast automatically to type date HINT: You might need to specify "USING t::date".
+ROLLBACK TO b6		-
+SAVEPOINT b7		-
+ALTER TABLE ac ALTER COLUMN v TYPE timestamp	!42804 column "v" cannot be cast automatically to type timestamp without time zone HINT: You might need to specify "USING v::timestamp without time zone".
+ROLLBACK TO b7		-
+SAVEPOINT b8		-
+ALTER TABLE ac ALTER COLUMN t TYPE boolean	!42804 column "t" cannot be cast automatically to type boolean HINT: You might need to specify "USING t::boolean".
+ROLLBACK TO b8		-
+SAVEPOINT b9		-
+ALTER TABLE ac ALTER COLUMN n TYPE integer		-
+ROLLBACK TO b9		-
+SAVEPOINT b10		-
+ALTER TABLE ac ALTER COLUMN i TYPE numeric(10,2)		-
+ROLLBACK TO b10		-
+SAVEPOINT b11		-
+ALTER TABLE ac ALTER COLUMN r TYPE double precision		-
+ROLLBACK TO b11		-
+SAVEPOINT b12		-
+ALTER TABLE ac ALTER COLUMN d TYPE real		-
+ROLLBACK TO b12		-
+SAVEPOINT b13		-
+ALTER TABLE ac ALTER COLUMN s TYPE numeric(10,2)		-
+ROLLBACK TO b13		-
+SAVEPOINT b14		-
+ALTER TABLE ac ALTER COLUMN bo TYPE character varying(10)		-
+ROLLBACK TO b14		-
+SAVEPOINT b15		-
+ALTER TABLE ac ALTER COLUMN tstz TYPE date		-
+ROLLBACK TO b15		-
+SAVEPOINT b16		-
+ALTER TABLE ac ALTER COLUMN dt TYPE timestamptz		-
+ROLLBACK TO b16		-
+SAVEPOINT b17		-
+ALTER TABLE ac ALTER COLUMN c TYPE integer	!42804 column "c" cannot be cast automatically to type integer HINT: You might need to specify "USING c::integer".
+ROLLBACK TO b17		-
+SAVEPOINT b18		-
+ALTER TABLE ac ALTER COLUMN i TYPE character(20)		-
+ROLLBACK TO b18		-
+SAVEPOINT c1		-
+ALTER TABLE ac ALTER COLUMN tm TYPE interval		-
+ROLLBACK TO c1		-
+SAVEPOINT c2		-
+ALTER TABLE ac ALTER COLUMN ts TYPE time		-
+ROLLBACK TO c2		-
+SAVEPOINT c3		-
+ALTER TABLE ac ALTER COLUMN tm TYPE text		-
+ROLLBACK TO c3		-
+SAVEPOINT c4		-
+ALTER TABLE ac ALTER COLUMN iv TYPE text		-
+ROLLBACK TO c4		-
+SAVEPOINT c5		-
+ALTER TABLE ac ALTER COLUMN dt TYPE time	!42804 column "dt" cannot be cast automatically to type time without time zone HINT: You might need to specify "USING dt::time without time zone".
+ROLLBACK TO c5		-
+SAVEPOINT c6		-
+ALTER TABLE ac ALTER COLUMN mo TYPE numeric(10,2)		-
+ROLLBACK TO c6		-
+SAVEPOINT c7		-
+ALTER TABLE ac ALTER COLUMN n TYPE money		-
+ROLLBACK TO c7		-
+SAVEPOINT c8		-
+ALTER TABLE ac ALTER COLUMN mo TYPE text		-
+ROLLBACK TO c8		-
+SAVEPOINT c9		-
+ALTER TABLE ac ALTER COLUMN uu TYPE text		-
+ROLLBACK TO c9		-
+SAVEPOINT c10		-
+ALTER TABLE ac ALTER COLUMN t TYPE uuid	!42804 column "t" cannot be cast automatically to type uuid HINT: You might need to specify "USING t::uuid".
+ROLLBACK TO c10		-
+SAVEPOINT c11		-
+ALTER TABLE ac ALTER COLUMN i TYPE money		-
+ROLLBACK TO c11		-
+SAVEPOINT c12		-
+ALTER TABLE ac ALTER COLUMN mo TYPE double precision	!42804 column "mo" cannot be cast automatically to type double precision HINT: You might need to specify "USING mo::double precision".
+ROLLBACK TO c12		-
+SAVEPOINT c13		-
+ALTER TABLE ac ALTER COLUMN iv TYPE time		-
+ROLLBACK TO c13		-
+SAVEPOINT c14		-
+ALTER TABLE ac ALTER COLUMN tstz TYPE time		-
+ROLLBACK TO c14		-
+SAVEPOINT d1		-
+ALTER TABLE ac ALTER COLUMN d TYPE integer		-
+SELECT 'r', d::text AS double_to_int FROM ac		r|12
+ROLLBACK TO d1		-
+SAVEPOINT d2		-
+ALTER TABLE ac ALTER COLUMN n TYPE integer		-
+SELECT 'r', n::text AS numeric_to_int FROM ac		r|11
+ROLLBACK TO d2		-
+SAVEPOINT d3		-
+ALTER TABLE ac ALTER COLUMN mo TYPE numeric(10,2)		-
+SELECT 'r', mo::text AS money_to_numeric FROM ac		r|16.00
+ROLLBACK TO d3		-
+SAVEPOINT d4		-
+ALTER TABLE ac ALTER COLUMN iv TYPE time		-
+SELECT 'r', iv::text AS interval_to_time FROM ac		r|00:00:00
+ROLLBACK TO d4		-
+SAVEPOINT d5		-
+ALTER TABLE ac ALTER COLUMN i TYPE money		-
+SELECT 'r', i::text AS int_to_money FROM ac		r|$7.00
+ROLLBACK TO d5		-
+SAVEPOINT d6		-
+ALTER TABLE ac ALTER COLUMN n TYPE money		-
+SELECT 'r', n::text AS numeric_to_money FROM ac		r|$10.50
+ROLLBACK TO d6		-
+SAVEPOINT d7		-
+ALTER TABLE ac ALTER COLUMN dt TYPE timestamp		-
+SELECT 'r', dt::text AS date_to_timestamp FROM ac		r|2020-01-02 00:00:00
+ROLLBACK TO d7		-
+SAVEPOINT d8		-
+ALTER TABLE ac ALTER COLUMN ts TYPE date		-
+SELECT 'r', ts::text AS timestamp_to_date FROM ac		r|2020-01-02
+ROLLBACK TO d8		-
+SAVEPOINT d9		-
+ALTER TABLE ac ALTER COLUMN ts TYPE time		-
+SELECT 'r', ts::text AS timestamp_to_time FROM ac		r|03:04:05
+ROLLBACK TO d9		-
+SAVEPOINT d10		-
+ALTER TABLE ac ALTER COLUMN tm TYPE interval		-
+SELECT 'r', tm::text AS time_to_interval FROM ac		r|03:04:05
+ROLLBACK TO d10		-
+SAVEPOINT d11		-
+ALTER TABLE ac ALTER COLUMN i TYPE double precision		-
+SELECT 'r', i::text AS int_to_double FROM ac		r|7
+ROLLBACK TO d11		-
+SAVEPOINT d12		-
+ALTER TABLE ac ALTER COLUMN r TYPE double precision		-
+SELECT 'r', r::text AS real_to_double FROM ac		r|12.5
+ROLLBACK TO d12		-
+SAVEPOINT d13		-
+ALTER TABLE ac ALTER COLUMN d TYPE numeric(10,2)		-
+SELECT 'r', d::text AS double_to_numeric FROM ac		r|11.50
+ROLLBACK TO d13		-
+SAVEPOINT d14		-
+ALTER TABLE ac ALTER COLUMN bo TYPE text		-
+SELECT 'r', bo AS bool_to_text FROM ac		r|true
+ROLLBACK TO d14		-
+SAVEPOINT d15		-
+ALTER TABLE ac ALTER COLUMN ts TYPE text		-
+SELECT 'r', ts AS ts_to_text FROM ac		r|2020-01-02 03:04:05
+ROLLBACK TO d15		-
+SAVEPOINT d16		-
+ALTER TABLE ac ALTER COLUMN mo TYPE text		-
+SELECT 'r', mo AS money_to_text FROM ac		r|$16.00
+ROLLBACK TO d16		-
+SAVEPOINT d17		-
+ALTER TABLE ac ALTER COLUMN d TYPE real		-
+SELECT 'r', d::text AS double_to_real FROM ac		r|11.5
+ROLLBACK TO d17		-
+SAVEPOINT d18		-
+ALTER TABLE ac ALTER COLUMN v TYPE character varying(80)		-
+SELECT 'r', v AS varchar_narrowed FROM ac		r|14
+ROLLBACK TO d18		-
+CREATE TABLE rr (a double precision, b double precision, c numeric(4,1), e numeric(4,1), f real)		-
+INSERT INTO rr (a, b, c, e, f) VALUES (12.5, -12.5, 12.5, -12.5, 12.5)		-
+SAVEPOINT e3		-
+ALTER TABLE rr ALTER COLUMN a TYPE integer		-
+SELECT 'r', a::text AS double_12_5 FROM rr		r|12
+ROLLBACK TO e3		-
+SAVEPOINT e4		-
+ALTER TABLE rr ALTER COLUMN b TYPE integer		-
+SELECT 'r', b::text AS double_neg_12_5 FROM rr		r|-12
+ROLLBACK TO e4		-
+SAVEPOINT e5		-
+ALTER TABLE rr ALTER COLUMN c TYPE integer		-
+SELECT 'r', c::text AS numeric_12_5 FROM rr		r|13
+ROLLBACK TO e5		-
+SAVEPOINT e6		-
+ALTER TABLE rr ALTER COLUMN e TYPE integer		-
+SELECT 'r', e::text AS numeric_neg_12_5 FROM rr		r|-13
+ROLLBACK TO e6		-
+SAVEPOINT e7		-
+ALTER TABLE rr ALTER COLUMN f TYPE integer		-
+SELECT 'r', f::text AS real_12_5 FROM rr		r|12
+ROLLBACK TO e7		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'ac'	bigint	0

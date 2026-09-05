@@ -1,0 +1,83 @@
+# `IN (subquery)` in the `WHERE` of a writing statement — as a real PostgreSQL 19beta1 answers it.
+#
+# **Run 46 ranking: 31 tests across 6 files** — `has_many_associations_test.rb` (21),
+# `delete_all_test.rb` (4), `has_one_associations_test.rb` (3) and three more. It is what
+# ActiveRecord emits for `delete_all` / `update_all` on a relation that carries a `LIMIT` or a
+# `JOIN`: it cannot express those on a `DELETE`, so it wraps the selection in a subquery.
+#
+# The statements are verbatim from `sql.active_record`, captured while running
+# `VlPost.limit(2).delete_all`, `VlComment.joins(:vl_post).where(…).delete_all`,
+# `VlPost.limit(2).update_all(…)` and `VlComment.joins(:vl_post).update_all(…)` inside
+# `transaction { … raise ActiveRecord::Rollback }` against the oracle:
+#
+#     DELETE FROM "vl_posts" WHERE ("vl_posts"."id")
+#       IN (SELECT "vl_posts"."id" FROM "vl_posts" LIMIT $1)
+#     DELETE FROM "vl_comments" WHERE ("vl_comments"."id")
+#       IN (SELECT "vl_comments"."id" FROM "vl_comments"
+#           INNER JOIN "vl_posts" ON "vl_posts"."id" = "vl_comments"."vl_post_id"
+#           WHERE "vl_posts"."title" = $1)
+#     UPDATE "vl_posts" SET "title" = $1 WHERE ("vl_posts"."id")
+#       IN (SELECT "vl_posts"."id" FROM "vl_posts" LIMIT $2)
+#
+# **FOUR columns, not the corpus's three** — same reason and same tool as
+# `pg19_bind_parameters.txt`: the `LIMIT` is a bind, so these cannot be replayed by SQL text alone.
+#
+#   <sql> <tab> <json params> <tab> <types> <tab> <rows | !SQLSTATE message>
+#
+# Everything runs inside one `BEGIN … ROLLBACK` with a `SAVEPOINT` per probe; the tool reports what
+# it left behind, and it is `0`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The subquery reads the table the statement is writing, and it is evaluated against the
+#     pre-statement snapshot.** `DELETE FROM vl_posts WHERE (id) IN (SELECT id FROM vl_posts LIMIT
+#     $1)` is not circular and does not loop: it deletes exactly one row. An implementation that
+#     streams the subquery while deleting can delete the wrong number.
+#   * **`(col) IN (…)` with the parentheses is a one-element row constructor, not a typo.** Rails
+#     always emits it that way, and the multi-column form is legal too:
+#     `(id, vl_post_id) IN (SELECT id, vl_post_id FROM …)` works and is pinned here. A parser that
+#     accepts only a bare column before `IN` rejects every one of these 31 tests.
+#   * **`NOT IN` over a subquery that yields NULL deletes NOTHING**, and that is not a bug to fix
+#     around: `id NOT IN (SELECT NULL::bigint)` leaves both rows, because `x <> NULL` is unknown for
+#     every row. `id IN (SELECT NULL::bigint)` also matches nothing. Same subquery, both directions,
+#     zero rows affected — while `NOT IN` over a real value set does delete (`n2` goes, `n1` stays).
+#   * **An empty subquery is a no-op, not an error**: `IN (SELECT … WHERE 1=0)` deletes zero rows and
+#     the count is unchanged.
+#   * **`LIMIT` inside the subquery has no `ORDER BY`**, so which row Rails deletes is unspecified —
+#     the tests that use it do not depend on which, only on how many.
+#   * **`UPDATE … FROM` with a self-alias is a different shape entirely.** For a joined `update_all`
+#     ActiveRecord does **not** use a subquery; it emits
+#     `UPDATE "vl_comments" "__active_record_update_alias" SET … FROM "vl_comments" INNER JOIN …
+#     WHERE "vl_comments"."id" = "__active_record_update_alias"."id"`. Supporting `IN (subquery)`
+#     alone leaves that one failing, and it is in the same test files.
+#   * **`RETURNING` composes with the subquery form** — a `DELETE … WHERE id IN (…) RETURNING id,
+#     title` is accepted, and returns nothing when the subquery matched nothing.
+CREATE TABLE vl_posts (id bigserial primary key, vl_author_id bigint, title character varying)	[]		-
+CREATE TABLE vl_comments (id bigserial primary key, vl_post_id bigint, body character varying)	[]		-
+INSERT INTO vl_posts (vl_author_id, title) VALUES (1,'x'), (1,'y'), (2,'z')	[]		-
+INSERT INTO vl_comments (vl_post_id, body) VALUES (1,'a'), (2,'b'), (3,'c')	[]		-
+DELETE FROM "vl_posts" WHERE ("vl_posts"."id") IN (SELECT "vl_posts"."id" FROM "vl_posts" LIMIT $1)	[1]		-
+SELECT id, title FROM vl_posts ORDER BY id	[]	bigint,character varying	2|y ; 3|z
+UPDATE "vl_posts" SET "title" = $1 WHERE ("vl_posts"."id") IN (SELECT "vl_posts"."id" FROM "vl_posts" LIMIT $2)	["renamed", 1]		-
+SELECT id, title FROM vl_posts ORDER BY id	[]	bigint,character varying	2|renamed ; 3|z
+DELETE FROM "vl_comments" WHERE ("vl_comments"."id") IN (SELECT "vl_comments"."id" FROM "vl_comments" INNER JOIN "vl_posts" ON "vl_posts"."id" = "vl_comments"."vl_post_id" WHERE "vl_posts"."title" = $1)	["z"]		-
+SELECT id, vl_post_id FROM vl_comments ORDER BY id	[]	bigint,bigint	1|1 ; 2|2
+DELETE FROM vl_comments WHERE (vl_comments.id) IN (SELECT vl_comments.id FROM vl_comments WHERE 1=0)	[]		-
+SELECT count(*) FROM vl_comments	[]	bigint	2
+DELETE FROM vl_comments WHERE (vl_comments.id, vl_comments.vl_post_id) IN (SELECT vl_comments.id, vl_comments.vl_post_id FROM vl_comments WHERE body = $1)	["a"]		-
+SELECT count(*) FROM vl_comments	[]	bigint	1
+UPDATE "vl_comments" "__active_record_update_alias" SET "body" = $1 FROM "vl_comments" INNER JOIN "vl_posts" ON "vl_posts"."id" = "vl_comments"."vl_post_id" WHERE "vl_comments"."id" = "__active_record_update_alias"."id"	["joined"]		-
+SELECT id, body FROM vl_comments ORDER BY id	[]	bigint,character varying	2|joined
+DELETE FROM vl_posts WHERE id IN (SELECT vl_post_id FROM vl_comments WHERE body = $1)	["joined"]		-
+SELECT count(*) FROM vl_posts	[]	bigint	1
+DELETE FROM vl_posts WHERE id IN (SELECT id FROM vl_posts WHERE id = $1) RETURNING id, title	[1]	bigint,character varying	-
+DELETE FROM vl_posts WHERE id NOT IN (SELECT vl_post_id FROM vl_comments WHERE vl_post_id IS NOT NULL)	[]		-
+SELECT count(*) FROM vl_posts	[]	bigint	0
+INSERT INTO vl_posts (vl_author_id, title) VALUES (9,'n1'), (9,'n2')	[]		-
+SELECT count(*) FROM vl_posts	[]	bigint	2
+DELETE FROM vl_posts WHERE id IN (SELECT NULL::bigint)	[]		-
+SELECT count(*) FROM vl_posts	[]	bigint	2
+DELETE FROM vl_posts WHERE id NOT IN (SELECT NULL::bigint)	[]		-
+SELECT count(*) FROM vl_posts	[]	bigint	2
+DELETE FROM vl_posts WHERE id NOT IN (SELECT id FROM vl_posts WHERE title = 'n1')	[]		-
+SELECT count(*), min(title) FROM vl_posts	[]	bigint,text	1|n1

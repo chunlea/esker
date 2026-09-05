@@ -1,0 +1,98 @@
+# `CREATE EXTENSION` / `DROP EXTENSION` and `pg_available_extensions` — as a real PostgreSQL
+# 19beta1 answers them.
+#
+# **Run 45 ranking row 2: 111 tests across 6 files**, and it is four extensions with very unequal
+# weight:
+#
+#     hstore        90 tests   array_test.rb (42), hstore_test.rb (45), extension_migration_test.rb (3)
+#     postgres_fdw  10 tests   foreign_table_test.rb
+#     citext         7 tests   citext_test.rb
+#     ltree          4 tests   ltree_test.rb
+#
+# **`hstore` alone is 81% of the row.** The statements are the adapter's own, from
+# `activerecord-8.1.3.1/…/postgresql_adapter.rb:488-513`:
+#
+#     CREATE EXTENSION IF NOT EXISTS "hstore"                                    -- enable_extension
+#     CREATE EXTENSION IF NOT EXISTS "pgcrypto" SCHEMA extschema                 -- with a schema
+#     SELECT true FROM pg_available_extensions WHERE name = 'hstore'             -- extension_available?
+#     SELECT installed_version IS NOT NULL FROM pg_available_extensions WHERE …  -- extension_enabled?
+#
+# On `esker-pg19` all four are **available and not installed**, which is the state the suite starts
+# from and the reason `enable_extension` is called at all.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# `CREATE EXTENSION` is a write, and the README records that a `\gdesc` pass once installed
+# `uuid-ossp` *outside* a capture's transaction; `sesscap.py` now sends `\gdesc` only for
+# row-producing queries, so nothing here is described. The two `SELECT count(*)` lines at the end
+# prove it left nothing behind and both answer `0`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **"available" and "installed" are different columns of one view.** `pg_available_extensions`
+#     lists every extension the *server* could install, with `installed_version` NULL until it is.
+#     `extension_available?` reads the row's existence; `extension_enabled?` reads
+#     `installed_version IS NOT NULL`. A node that reports an empty `pg_available_extensions` makes
+#     both answer false, and the suite then reports `extension "hstore" is not available` — which is
+#     what run 45 measured.
+#   * **The message for an unknown extension is `0A000`, not `42704`**, and it carries a HINT:
+#     `extension "nosuchextension" is not available` / `HINT: The extension must first be installed
+#     on the system where PostgreSQL is running.` But **`DROP EXTENSION` on the same name is
+#     `42704 extension "nosuchextension" does not exist`** — different class for the same name,
+#     depending on the verb.
+#   * **`IF NOT EXISTS` is what makes it idempotent, and without it a second create is `42710`.**
+#     Rails always sends the `IF NOT EXISTS` form, so a node that only implements the bare form
+#     fails on the statement the suite actually sends.
+#   * **Installing an extension changes `pg_available_extensions` too** — `installed_version` goes
+#     from NULL to `1.8` — so the view is not static metadata.
+#   * **`SCHEMA <name>` places the extension's objects, and `pg_extension.extnamespace` records it.**
+#     The clause comes after the quoted name.
+#   * **Each extension brings a type with real behaviour, and the tests use it**: `hstore` prints
+#     canonicalised as `"a"=>"1", "b"=>"2"` (quoted, spaced) rather than as written; `citext`
+#     compares case-insensitively (`'ABC' = 'abc'` is `t`); `ltree` matches an `lquery` with `~`.
+#     Supporting `CREATE EXTENSION` as a no-op would move the failure rather than fix it.
+#   * **`postgres_fdw` registers a row in `pg_foreign_data_wrapper`**, not a type — the only one of
+#     the four whose value is in the catalog rather than in a datatype.
+BEGIN		-
+SELECT 'r', name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('hstore','citext','ltree','postgres_fdw') ORDER BY name	text,name,text,text	r|citext|1.8|\N ; r|hstore|1.8|\N ; r|ltree|1.3|\N ; r|postgres_fdw|1.3|\N
+SELECT 'r', true FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+SELECT 'r', installed_version IS NOT NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|f
+SELECT 'r', count(*) FROM pg_available_extensions WHERE name = 'nosuchextension'	text,bigint	r|0
+CREATE EXTENSION IF NOT EXISTS "hstore"		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname = 'hstore'	text,name,text	r|hstore|1.8
+SELECT 'r', installed_version FROM pg_available_extensions WHERE name = 'hstore'	text,text	r|1.8
+SELECT 'r', 'a=>1, b=>2'::hstore		r|"a"=>"1", "b"=>"2"
+SELECT 'r', ('a=>1, b=>2'::hstore)->'a', akeys('a=>1, b=>2'::hstore), pg_typeof('a=>1'::hstore)		r|1|{a,b}|hstore
+CREATE EXTENSION IF NOT EXISTS "hstore"		-
+SELECT 'r', count(*) FROM pg_extension WHERE extname = 'hstore'	text,bigint	r|1
+CREATE EXTENSION IF NOT EXISTS "citext"		-
+SELECT 'r', 'ABC'::citext = 'abc'::citext, pg_typeof('x'::citext)		r|t|citext
+CREATE EXTENSION IF NOT EXISTS "ltree"		-
+SELECT 'r', 'a.b.c'::ltree, 'a.b.c'::ltree ~ 'a.*'::lquery, pg_typeof('a.b'::ltree)		r|a.b.c|t|ltree
+CREATE EXTENSION IF NOT EXISTS "postgres_fdw"		-
+SELECT 'r', fdwname FROM pg_foreign_data_wrapper WHERE fdwname = 'postgres_fdw'	text,name	r|postgres_fdw
+SAVEPOINT s1		-
+CREATE EXTENSION "nosuchextension"	!0A000 extension "nosuchextension" is not available HINT: The extension must first be installed on the system where PostgreSQL is running.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE EXTENSION hstore	!42710 extension "hstore" already exists
+ROLLBACK TO s2		-
+CREATE SCHEMA extschema		-
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" SCHEMA extschema		-
+SELECT 'r', e.extname, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pgcrypto'	text,name,name	r|pgcrypto|extschema
+DROP EXTENSION "hstore"		-
+SELECT 'r', count(*) FROM pg_extension WHERE extname = 'hstore'	text,bigint	r|0
+SELECT 'r', installed_version IS NULL FROM pg_available_extensions WHERE name = 'hstore'	text,boolean	r|t
+SAVEPOINT s3		-
+DROP EXTENSION "nosuchextension"	!42704 extension "nosuchextension" does not exist
+ROLLBACK TO s3		-
+DROP EXTENSION IF EXISTS "nosuchextension"		-
+SELECT 'r', pg_typeof(extversion), pg_typeof(name) FROM pg_extension, pg_available_extensions WHERE extname = 'citext' AND name = 'citext'	text,regtype,regtype	r|text|name
+ROLLBACK		-
+SELECT count(*) FROM pg_extension WHERE extname IN ('hstore','citext','ltree','postgres_fdw','pgcrypto')	bigint	0
+SELECT count(*) FROM pg_namespace WHERE nspname = 'extschema'	bigint	0

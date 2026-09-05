@@ -1,0 +1,137 @@
+# The seven DDL shapes `postgresql_specific_schema.rb` still asks for, as a real PostgreSQL
+# 19beta1 answers them — in the order `ActiveRecord` hits them.
+#
+# NOT types. `uuid`, `interval`, `oid` and `::regtype` are the other four items of run 23's queue
+# and are captured already (`pg19_uuid.txt`, `pg19_interval.txt`, `pg19_regtype.txt`). These seven
+# had no oracle evidence:
+#
+#   703  CREATE EXTENSION                          — rung 4's stopper
+#   741  GENERATED ALWAYS AS (expr) STORED
+#   753  DROP SEQUENCE … CASCADE
+#   754  CREATE SEQUENCE … START n OWNED BY t.c
+#   755  ALTER TABLE … ALTER COLUMN … SET DEFAULT
+#   757  DROP FUNCTION IF EXISTS f()
+#   765  CREATE TABLE … INHERITS (…)
+#
+# **Statements are as `ActiveRecord` emits them**, taken verbatim from
+# `triage/schema-probe-1a512ba-both.txt` rather than retyped — including the 1040-character
+# `CREATE TABLE "defaults"` and the 522-character multi-statement `INHERITS` line.
+#
+# Captured in one session with `scratchpad/sesscap.py`, wrapped in **`BEGIN … ROLLBACK`**: this
+# creates extensions, sequences, functions and triggers, and none of it may outlive the capture.
+# Error probes sit in `SAVEPOINT` / `ROLLBACK TO` so one refusal does not abort the block. The two
+# `SELECT count(*)` lines at the end prove nothing survived.
+#
+# A few `CREATE TABLE`s here are **scaffolding**, marked as such: `companies` has to exist before
+# `ALTER TABLE companies ALTER COLUMN id …` can be asked, and in the suite `schema.rb` creates it.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# As with `pg19_catalog_functions.txt`, the rollback means `\gdesc` — which runs in a second
+# session afterwards — cannot describe the temporary objects, so those rows have an empty
+# declared-types column. `pg_typeof` lines pin the types that matter.
+#
+# **A capture-tooling hazard this file found, and the reason for the three `DROP`s after the
+# `ROLLBACK`.** `sesscap.py` fills the declared-types column by re-sending each statement with
+# `\gdesc` appended, in a second session. For a single statement that is harmless — `\gdesc`
+# describes without executing. For a **multi-statement line** it is not: psql executes every
+# statement up to the last `;` and only describes the fragment after it, so the `INHERITS` line
+# below — five statements in one message, as `ActiveRecord` sends it — was **executed for real,
+# outside the `BEGIN`**, by the pass that was only supposed to be reading types. One pass left four
+# objects on the oracle with the transaction's own `ROLLBACK` recorded as successful, which is how
+# it was found: the capture was not idempotent and the counts inside the session said it should
+# have been.
+#
+# So a capture containing a multi-statement line must clean up **after** its `ROLLBACK` as well as
+# inside it. `pg19_ddl_cascade_fk_trigger.txt` has multi-statement `TRIGGER` lines and is worth
+# re-checking against the same hazard.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`CREATE EXTENSION IF NOT EXISTS` on an already-installed extension is a plain success**,
+#     not a no-op error and not a different tag — and it does **not** upgrade the version. The
+#     second call below returns the same `pg_extension` row as the first.
+#   * **A `GENERATED ALWAYS AS … STORED` column cannot be written**, and the refusal is its own
+#     SQLSTATE: `428C9`, `cannot insert a non-DEFAULT value into column "virtual_stored_number"`,
+#     with a `DETAIL` naming it a generated column. `DEFAULT` *is* accepted where a value is not —
+#     the same asymmetry `GENERATED ALWAYS AS IDENTITY` has.
+#   * **`attgenerated` is `s`**, and the expression lives where a default does not:
+#     `pg_get_expr(adbin, adrelid)` on `pg_attrdef` returns the generation expression, while
+#     `information_schema.columns.column_default` for that column is **NULL** — a generated column
+#     has no default, and a reader that looked there would find nothing.
+#   * **`OWNED BY` makes the sequence a dependent of the column, not of the table.** Dropping the
+#     column drops the sequence; `DROP SEQUENCE` without `CASCADE` on a sequence a default depends
+#     on is `2BP01`. And `START 101` means the **first** `nextval` is 101, not 102 — the start
+#     value is returned, not stepped past.
+#   * **`ALTER COLUMN … SET DEFAULT nextval(…)` replaces the `bigserial`'s own default** and leaves
+#     the original sequence behind, still owned, which is why the suite drops
+#     `companies_id_seq` on the next line. `pg_attrdef` shows one row for the column, the new one.
+#   * **`DROP FUNCTION IF EXISTS f()` on a function that does not exist is a success**, and the
+#     empty argument list is significant: `DROP FUNCTION IF EXISTS f` without parentheses is a
+#     *different* statement (it means "any arity") and PostgreSQL 19 accepts it too. But once the
+#     trigger below exists, the **same statement is `2BP01`** — `cannot drop function
+#     partitioned_insert_trigger() because other objects depend on it`, with a `DETAIL` naming the
+#     trigger. `IF EXISTS` covers absence, not dependency.
+#   * **`INHERITS` arrives as five statements in one message**, dollar-quoted plpgsql included,
+#     so it is all-or-nothing under the implicit transaction — the same rule
+#     `pg19_ddl_cascade_fk_trigger.txt` measured for `DISABLE TRIGGER ALL`. The child table has
+#     **no columns of its own**: `CREATE TABLE … ( ) INHERITS (parent)` takes the parent's, and
+#     `pg_inherits` is where the relationship lives, not `pg_class`.
+BEGIN		-
+SELECT 'g', count(*) FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto')	text,bigint	g|0
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"		-
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto') ORDER BY extname	name,text	pgcrypto|1.4 ; uuid-ossp|1.1
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+SELECT 'g', count(*) FROM pg_extension WHERE extname = 'uuid-ossp'	text,bigint	g|1
+SAVEPOINT sx1		-
+CREATE EXTENSION "uuid-ossp"	!42710 extension "uuid-ossp" already exists
+ROLLBACK TO sx1		-
+SAVEPOINT sx2		-
+CREATE EXTENSION IF NOT EXISTS "nosuchextension"	!0A000 extension "nosuchextension" is not available HINT: The extension must first be installed on the system where PostgreSQL is running.
+ROLLBACK TO sx2		-
+CREATE TABLE "defaults" ("id" bigserial primary key, "virtual_stored_number" integer GENERATED ALWAYS AS (random_number * 10) STORED, "random_number" integer DEFAULT random() * 100, "ruby_on_rails" character varying DEFAULT concat('Ruby ', 'on ', 'Rails'), "modified_date" date DEFAULT CURRENT_DATE, "modified_date_function" date DEFAULT now(), "fixed_date" date DEFAULT '2004-01-01', "modified_time" timestamp(6) DEFAULT CURRENT_TIMESTAMP, "modified_time_without_precision" timestamp DEFAULT CURRENT_TIMESTAMP, "modified_time_with_precision_0" timestamp(0) DEFAULT CURRENT_TIMESTAMP, "modified_time_function" timestamp(6) DEFAULT now(), "fixed_time" timestamp(6) DEFAULT '2004-01-01 00:00:00', "fixed_time_with_time_zone" timestamptz DEFAULT '2004-01-01 00:00:00', "char1" char(1) DEFAULT 'Y', "char2" character varying(50) DEFAULT 'a varchar field', "char3" text DEFAULT 'a text field', "bigint_default" bigint DEFAULT 0::bigint, "binary_default_function" bytea DEFAULT convert_to('A', 'UTF8'), "multiline_default" text DEFAULT '--- [] ')		-
+SELECT attname, attgenerated, attnotnull FROM pg_attribute WHERE attrelid = 'defaults'::regclass AND attname IN ('virtual_stored_number','random_number') ORDER BY attname		random_number||f ; virtual_stored_number|s|f
+SELECT a.attname, regexp_replace(pg_get_expr(d.adbin, d.adrelid), '\s+', ' ', 'g') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'defaults'::regclass AND a.attname IN ('virtual_stored_number','random_number','fixed_date','bigint_default') ORDER BY a.attname		bigint_default|(0)::bigint ; fixed_date|'2004-01-01'::date ; random_number|(random() * (100)::double precision) ; virtual_stored_number|(random_number * 10)
+SELECT column_name, column_default, is_generated, generation_expression FROM information_schema.columns WHERE table_name = 'defaults' AND column_name = 'virtual_stored_number'	name,character varying,character varying,character varying	virtual_stored_number|\N|ALWAYS|(random_number * 10)
+INSERT INTO defaults (random_number) VALUES (7)		-
+SELECT 'g', random_number, virtual_stored_number FROM defaults		g|7|70
+SAVEPOINT sg1		-
+INSERT INTO defaults (random_number, virtual_stored_number) VALUES (7, 1)	!428C9 cannot insert a non-DEFAULT value into column "virtual_stored_number" DETAIL: Column "virtual_stored_number" is a generated column.
+ROLLBACK TO sg1		-
+INSERT INTO defaults (random_number, virtual_stored_number) VALUES (8, DEFAULT)		-
+SELECT 'g', count(*) FROM defaults		g|2
+CREATE TABLE companies (id bigserial primary key, name text)		-
+DROP SEQUENCE IF EXISTS companies_nonstd_seq CASCADE		-
+CREATE SEQUENCE companies_nonstd_seq START 101 OWNED BY companies.id		-
+SELECT 'g', nextval('companies_nonstd_seq'), nextval('companies_nonstd_seq')		g|101|102
+SELECT seqstart, seqincrement FROM pg_sequence WHERE seqrelid = 'companies_nonstd_seq'::regclass		101|1
+ALTER TABLE companies ALTER COLUMN id SET DEFAULT nextval('companies_nonstd_seq')		-
+SELECT regexp_replace(pg_get_expr(d.adbin, d.adrelid), '\s+', ' ', 'g') FROM pg_attrdef d WHERE d.adrelid = 'companies'::regclass		nextval('companies_nonstd_seq'::regclass)
+DROP SEQUENCE IF EXISTS companies_id_seq		-
+SAVEPOINT ss1		-
+DROP SEQUENCE companies_nonstd_seq	!2BP01 cannot drop sequence companies_nonstd_seq because other objects depend on it DETAIL: default value for column id of table companies depends on sequence companies_nonstd_seq HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO ss1		-
+DROP SEQUENCE companies_nonstd_seq CASCADE		-
+SELECT 'g', count(*) FROM pg_class WHERE relname = 'companies_nonstd_seq'	text,bigint	g|0
+DROP FUNCTION IF EXISTS partitioned_insert_trigger()		-
+DROP FUNCTION IF EXISTS partitioned_insert_trigger		-
+CREATE TABLE postgresql_partitioned_table_parent ( id SERIAL PRIMARY KEY, number integer ); CREATE TABLE postgresql_partitioned_table ( ) INHERITS (postgresql_partitioned_table_parent); CREATE OR REPLACE FUNCTION partitioned_insert_trigger() RETURNS TRIGGER AS $$ BEGIN INSERT INTO postgresql_partitioned_table VALUES (NEW.*); RETURN NULL; END; $$ LANGUAGE plpgsql; CREATE TRIGGER insert_partitioning_trigger BEFORE INSERT ON postgresql_partitioned_table_parent FOR EACH ROW EXECUTE PROCEDURE partitioned_insert_trigger();		-
+SELECT 'g', count(*) FROM pg_inherits WHERE inhrelid = 'postgresql_partitioned_table'::regclass		g|1
+SELECT c.relname, p.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE c.relname = 'postgresql_partitioned_table'	name,name	postgresql_partitioned_table|postgresql_partitioned_table_parent
+SELECT attname FROM pg_attribute WHERE attrelid = 'postgresql_partitioned_table'::regclass AND attnum > 0 ORDER BY attnum		id ; number
+SELECT 'g', count(*) FROM pg_proc WHERE proname = 'partitioned_insert_trigger'	text,bigint	g|1
+SELECT tgname FROM pg_trigger WHERE tgrelid = 'postgresql_partitioned_table_parent'::regclass AND NOT tgisinternal		insert_partitioning_trigger
+INSERT INTO postgresql_partitioned_table_parent (number) VALUES (42)		-
+SELECT 'g', (SELECT count(*) FROM postgresql_partitioned_table_parent), (SELECT count(*) FROM postgresql_partitioned_table)		g|1|1
+SAVEPOINT sf1		-
+DROP FUNCTION IF EXISTS partitioned_insert_trigger()	!2BP01 cannot drop function partitioned_insert_trigger() because other objects depend on it DETAIL: trigger insert_partitioning_trigger on table postgresql_partitioned_table_parent depends on function partitioned_insert_trigger() HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO sf1		-
+ROLLBACK		-
+DROP TABLE IF EXISTS postgresql_partitioned_table CASCADE		-
+DROP TABLE IF EXISTS postgresql_partitioned_table_parent CASCADE		-
+DROP FUNCTION IF EXISTS partitioned_insert_trigger() CASCADE		-
+SELECT 'g', count(*) FROM pg_class WHERE relname IN ('defaults','companies','postgresql_partitioned_table','postgresql_partitioned_table_parent')	text,bigint	g|0
+SELECT 'g', count(*) FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto')	text,bigint	g|0

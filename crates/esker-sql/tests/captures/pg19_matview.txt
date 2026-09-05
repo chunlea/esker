@@ -1,0 +1,58 @@
+BEGIN		-
+CREATE TABLE mv_books (id serial primary key, name character varying(255), status integer NOT NULL, format character varying(255))		-
+INSERT INTO mv_books (name, status, format) VALUES ('Ruby for Rails', 0, 'ebook')		-
+INSERT INTO mv_books (name, status, format) VALUES ('Paper Only', 1, 'paperback')		-
+CREATE MATERIALIZED VIEW mv_ebooks AS SELECT id, name, status FROM mv_books WHERE format = 'ebook'		-
+SELECT 'r', relname, relkind, relispopulated FROM pg_class WHERE relname = 'mv_ebooks'	text,name,"char",boolean	r|mv_ebooks|m|t
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = 'mv_ebooks'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|f ; r|name|character varying(255)|f ; r|status|integer|f
+SELECT 'r', count(*) AS pk_constraints FROM pg_constraint WHERE conrelid = 'mv_ebooks'::regclass		r|0
+SELECT 'r', count(*) AS indexes FROM pg_index WHERE indrelid = 'mv_ebooks'::regclass		r|0
+SELECT 'r', count(*) FROM mv_ebooks		r|1
+INSERT INTO mv_books (name, status, format) VALUES ('Late Arrival', 0, 'ebook')		-
+SELECT 'r', count(*) AS before_refresh FROM mv_ebooks		r|1
+REFRESH MATERIALIZED VIEW mv_ebooks		-
+SELECT 'r', count(*) AS after_refresh FROM mv_ebooks		r|2
+SELECT 'r', count(*) AS in_pg_views FROM pg_views WHERE viewname = 'mv_ebooks'	text,bigint	r|0
+SELECT 'r', matviewname, hasindexes, ispopulated FROM pg_matviews WHERE matviewname = 'mv_ebooks'	text,name,boolean,boolean	r|mv_ebooks|f|t
+SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name = 'mv_ebooks'	text,name,character varying	-
+CREATE MATERIALIZED VIEW mv_nodata AS SELECT id, name FROM mv_books WITH NO DATA		-
+SELECT 'r', relispopulated FROM pg_class WHERE relname = 'mv_nodata'	text,boolean	r|f
+SAVEPOINT s1		-
+SELECT 'r', count(*) FROM mv_nodata	!55000 materialized view "mv_nodata" has not been populated HINT: Use the REFRESH MATERIALIZED VIEW command.
+ROLLBACK TO s1		-
+REFRESH MATERIALIZED VIEW mv_nodata		-
+SELECT 'r', count(*) AS after_first_refresh FROM mv_nodata		r|3
+SELECT 'r', relispopulated FROM pg_class WHERE relname = 'mv_nodata'	text,boolean	r|t
+CREATE MATERIALIZED VIEW mv_withdata AS SELECT id FROM mv_books WITH DATA		-
+SELECT 'r', count(*) FROM mv_withdata		r|3
+SAVEPOINT s2		-
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ebooks	!55000 cannot refresh materialized view "public.mv_ebooks" concurrently HINT: Create a unique index with no WHERE clause on one or more columns of the materialized view.
+ROLLBACK TO s2		-
+CREATE UNIQUE INDEX mv_ebooks_id ON mv_ebooks (id)		-
+SAVEPOINT s3		-
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ebooks		-
+ROLLBACK TO s3		-
+SELECT 'r', matviewname, hasindexes FROM pg_matviews WHERE matviewname = 'mv_ebooks'	text,name,boolean	r|mv_ebooks|t
+SAVEPOINT s4		-
+DROP VIEW mv_ebooks	!42809 "mv_ebooks" is not a view HINT: Use DROP MATERIALIZED VIEW to remove a materialized view.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+DROP TABLE mv_books	!2BP01 cannot drop table mv_books because other objects depend on it DETAIL: materialized view mv_ebooks depends on table mv_books HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+CREATE MATERIALIZED VIEW mv_ebooks AS SELECT id FROM mv_books	!42P07 relation "mv_ebooks" already exists
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+REFRESH MATERIALIZED VIEW mv_nosuch	!42P01 relation "mv_nosuch" does not exist
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+DROP MATERIALIZED VIEW mv_nosuch	!42P01 materialized view "mv_nosuch" does not exist
+ROLLBACK TO s8		-
+DROP MATERIALIZED VIEW IF EXISTS mv_nosuch		-
+DROP MATERIALIZED VIEW mv_withdata		-
+DROP MATERIALIZED VIEW mv_nodata		-
+DROP MATERIALIZED VIEW mv_ebooks		-
+SELECT 'r', count(*) AS left_behind FROM pg_class WHERE relname IN ('mv_ebooks','mv_nodata','mv_withdata')	text,bigint	r|0
+DROP TABLE mv_books		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('mv_books','mv_ebooks','mv_nodata','mv_withdata')	bigint	0

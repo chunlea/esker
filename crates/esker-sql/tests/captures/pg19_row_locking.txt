@@ -1,0 +1,110 @@
+# `SELECT … FOR UPDATE` / `FOR SHARE` — the row-level locking clause, as the suite sends it.
+#
+# **Run 53 ranking: `a row-level locking clause is not supported`, 21 tests over 4 files** —
+# `locking_test.rb` (14 raises), `relations_test.rb` (7), `transaction_nested_test.rb` (2),
+# `query_cache_test.rb` (1). It is a new row, and the good kind: those tests could not previously
+# get far enough to lock a row. `lock!` and `with_lock` are what send it — 8 and 25 call sites in
+# those two files — and both render as a `FOR UPDATE` appended to an ordinary `SELECT`.
+#
+# Things reasoning would get wrong:
+#
+# * **There are four strengths, not one**, and they are ordered: `FOR UPDATE`, `FOR NO KEY UPDATE`,
+#   `FOR SHARE`, `FOR KEY SHARE`. AR sends the first by default and passes any string through, so all
+#   four reach the server from `lock("FOR SHARE")` and friends.
+# * **PostgreSQL refuses the clause on the nullable side of an outer join**, and the suite *knows*:
+#   `locking_test.rb:721` reads "PostgreSQL protests SELECT ... FOR UPDATE on an outer join" and
+#   skips `test_eager_find_with_lock` for this adapter alone. The refusal below is the one that
+#   comment is about, and an implementation that allows it makes a skipped test start failing.
+# * **It is refused with `DISTINCT`, `GROUP BY`, aggregates, `UNION` and window functions** — five
+#   different statements, one SQLSTATE (`0A000`), five different messages naming the offending
+#   construct. A refusal that names the wrong one is still a wrong answer.
+# * **`LIMIT`/`OFFSET` are fine with it** — that combination is exactly what `lock!` sends, since it
+#   is a `find` with a limit.
+# * **`OF <table>` names a FROM-list alias, not a table.** With an alias in scope the base name is
+#   *not* accepted, which is the opposite of what an implementation that resolves names to tables
+#   would do.
+# * **`NOWAIT` and `SKIP LOCKED` cannot be shown from one session.** Their whole behaviour is what
+#   happens when another session already holds the lock, and this corpus is one session by
+#   construction. What is captured here is that they parse, that they are accepted in both spellings,
+#   and what `pg_locks` holds afterwards; the blocking behaviour is **not** captured and is marked as
+#   such rather than guessed.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE lk (id serial primary key, name character varying(255), lock_version integer DEFAULT 0 NOT NULL)		-
+CREATE TABLE lkr (id serial primary key, lk_id integer, note character varying(255))		-
+INSERT INTO lk (name) VALUES ('one')		-
+INSERT INTO lk (name) VALUES ('two')		-
+INSERT INTO lkr (lk_id, note) VALUES (1, 'a')		-
+# ---- what `lock!` sends: a find with a limit, and FOR UPDATE on the end ----
+SELECT 'r', id, name FROM "lk" WHERE "lk"."id" = 1 LIMIT 1 FOR UPDATE		r|1|one
+SELECT 'r', id FROM "lk" ORDER BY "lk"."id" ASC LIMIT 1 OFFSET 1 FOR UPDATE		r|2
+# ---- the four strengths ----
+SELECT 'r', id FROM lk WHERE id = 1 FOR UPDATE		r|1
+SELECT 'r', id FROM lk WHERE id = 1 FOR NO KEY UPDATE		r|1
+SELECT 'r', id FROM lk WHERE id = 1 FOR SHARE		r|1
+SELECT 'r', id FROM lk WHERE id = 1 FOR KEY SHARE		r|1
+# ---- what the locks look like while the transaction holds them ----
+SELECT 'r', locktype, mode, granted FROM pg_locks WHERE locktype IN ('transactionid','tuple') AND pid = pg_backend_pid() ORDER BY locktype, mode	text,text,text,boolean	r|transactionid|ExclusiveLock|t
+SELECT 'r', count(*) > 0 AS holds_a_row_lock FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'transactionid'	text,boolean	r|t
+# ---- NOWAIT and SKIP LOCKED parse; their behaviour needs a second session and is NOT captured ----
+SELECT 'r', id FROM lk WHERE id = 1 FOR UPDATE NOWAIT		r|1
+SELECT 'r', id FROM lk WHERE id = 2 FOR UPDATE SKIP LOCKED		r|2
+SELECT 'r', id FROM lk FOR SHARE NOWAIT		r|1 ; r|2
+SELECT 'r', id FROM lk FOR NO KEY UPDATE SKIP LOCKED		r|1 ; r|2
+# ---- OF names a FROM-list entry ----
+SELECT 'r', lk.id FROM lk JOIN lkr ON lkr.lk_id = lk.id FOR UPDATE OF lk		r|1
+SELECT 'r', lk.id FROM lk JOIN lkr ON lkr.lk_id = lk.id FOR UPDATE OF lk, lkr		r|1
+SELECT 'r', l.id FROM lk l JOIN lkr r ON r.lk_id = l.id FOR UPDATE OF l		r|1
+SAVEPOINT k1		-
+SELECT 'r', l.id FROM lk l JOIN lkr r ON r.lk_id = l.id FOR UPDATE OF lk	!42P01 relation "lk" in FOR UPDATE clause not found in FROM clause
+ROLLBACK TO k1		-
+SAVEPOINT k2		-
+SELECT 'r', id FROM lk FOR UPDATE OF nosuchtable	!42P01 relation "nosuchtable" in FOR UPDATE clause not found in FROM clause
+ROLLBACK TO k2		-
+# ---- the outer join the suite skips this adapter for (locking_test.rb:721) ----
+SAVEPOINT k3		-
+SELECT 'r', lk.id FROM lk LEFT OUTER JOIN lkr ON lkr.lk_id = lk.id FOR UPDATE	!0A000 FOR UPDATE cannot be applied to the nullable side of an outer join
+ROLLBACK TO k3		-
+SELECT 'r', lk.id FROM lk LEFT OUTER JOIN lkr ON lkr.lk_id = lk.id FOR UPDATE OF lk		r|1 ; r|2
+SAVEPOINT k4		-
+SELECT 'r', lk.id FROM lk RIGHT OUTER JOIN lkr ON lkr.lk_id = lk.id FOR UPDATE OF lk	!0A000 FOR UPDATE cannot be applied to the nullable side of an outer join
+ROLLBACK TO k4		-
+# ---- the five constructs it cannot be combined with, each with its own message ----
+SAVEPOINT k6		-
+SELECT DISTINCT id FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with DISTINCT clause
+ROLLBACK TO k6		-
+SAVEPOINT k7		-
+SELECT count(*) FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with aggregate functions
+ROLLBACK TO k7		-
+SAVEPOINT k8		-
+SELECT name, count(*) FROM lk GROUP BY name FOR UPDATE	!0A000 FOR UPDATE is not allowed with GROUP BY clause
+ROLLBACK TO k8		-
+SAVEPOINT k9		-
+SELECT id FROM lk UNION SELECT id FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT
+ROLLBACK TO k9		-
+SAVEPOINT k10		-
+SELECT id, row_number() OVER (ORDER BY id) FROM lk FOR UPDATE	!0A000 FOR UPDATE is not allowed with window functions
+ROLLBACK TO k10		-
+# ---- in a subquery it applies to the subquery's own FROM ----
+SELECT 'r', count(*) FROM (SELECT id FROM lk WHERE id = 1 FOR UPDATE) s		r|1
+SAVEPOINT k11		-
+SELECT 'r', count(*) FROM (SELECT DISTINCT id FROM lk FOR UPDATE) s	!0A000 FOR UPDATE is not allowed with DISTINCT clause
+ROLLBACK TO k11		-
+# ---- and on a view, where there is no row to lock ----
+CREATE VIEW lkv AS SELECT id, name FROM lk		-
+SELECT 'r', id FROM lkv WHERE id = 1 FOR UPDATE		r|1
+CREATE VIEW lkv2 AS SELECT DISTINCT name FROM lk		-
+SAVEPOINT k12		-
+SELECT 'r', name FROM lkv2 FOR UPDATE	!0A000 FOR UPDATE is not allowed with DISTINCT clause
+ROLLBACK TO k12		-
+DROP VIEW lkv2		-
+DROP VIEW lkv		-
+DROP TABLE lkr		-
+DROP TABLE lk		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('lk','lkr','lkv','lkv2')	bigint	0
+SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'transactionid'	bigint	0

@@ -1,0 +1,34 @@
+BEGIN		-
+CREATE TABLE nv_t (id serial primary key, quantity integer)		-
+INSERT INTO nv_t (quantity) VALUES (-5)		-
+SAVEPOINT n1		-
+ALTER TABLE nv_t ADD CONSTRAINT q_plain CHECK (quantity > 0)	!23514 check constraint "q_plain" of relation "nv_t" is violated by some row
+ROLLBACK TO n1		-
+ALTER TABLE nv_t ADD CONSTRAINT quantity_check CHECK (quantity > 0) NOT VALID		-
+SELECT 'r', conname, contype, convalidated FROM pg_constraint WHERE conrelid = 'nv_t'::regclass AND conname = 'quantity_check'		r|quantity_check|c|f
+SELECT 'r', pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'quantity_check'	text,text	r|CHECK ((quantity > 0)) NOT VALID
+SELECT 'r', count(*) AS rows_kept FROM nv_t		r|1
+SAVEPOINT n2		-
+INSERT INTO nv_t (quantity) VALUES (-1)	!23514 new row for relation "nv_t" violates check constraint "quantity_check" DETAIL: Failing row contains (2, -1).
+ROLLBACK TO n2		-
+INSERT INTO nv_t (quantity) VALUES (9)		-
+SELECT 'r', count(*) AS after_good_insert FROM nv_t		r|2
+SAVEPOINT n3		-
+ALTER TABLE nv_t VALIDATE CONSTRAINT quantity_check	!23514 check constraint "quantity_check" of relation "nv_t" is violated by some row
+ROLLBACK TO n3		-
+DELETE FROM nv_t WHERE quantity < 0		-
+ALTER TABLE nv_t VALIDATE CONSTRAINT quantity_check		-
+SELECT 'r', conname, convalidated FROM pg_constraint WHERE conname = 'quantity_check'	text,name,boolean	r|quantity_check|t
+SAVEPOINT n4		-
+ALTER TABLE nv_t VALIDATE CONSTRAINT nosuch_check	!42704 constraint "nosuch_check" of relation "nv_t" does not exist
+ROLLBACK TO n4		-
+ALTER TABLE nv_t DROP CONSTRAINT quantity_check		-
+SELECT 'r', count(*) AS constraints_left FROM pg_constraint WHERE conrelid = 'nv_t'::regclass AND contype = 'c'		r|0
+CREATE TABLE nv_u (id serial primary key, n integer)		-
+ALTER TABLE nv_u ADD CONSTRAINT u_check CHECK (n > 0) NOT VALID		-
+ALTER TABLE nv_u VALIDATE CONSTRAINT u_check		-
+SELECT 'r', conname, convalidated FROM pg_constraint WHERE conname = 'u_check'	text,name,boolean	r|u_check|t
+DROP TABLE nv_u		-
+DROP TABLE nv_t		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('nv_t','nv_u')	bigint	0
