@@ -68,9 +68,26 @@ max-threads = 1
 # run for this: the gate lock prevents the contention the change addresses, so a before/after under
 # it measures nothing (that was learned the expensive way in v47). The proof is later gates
 # staying green.
+#
+# **`esker-sql::composite` joined on a third sighting of the same shape.** It calls
+# `Cluster::start()` in all five of its tests — the same `tests/cluster/mod.rs` as `joint_gate`
+# above — and in one loaded gate three of the five ended as `OutcomeUnknown … timed out` at
+# ~11.8 s each with a peer-deadline message, where all five pass alone in 0.055-0.073 s. A 200x
+# stretch ending in a deadline is the starvation signature, not a race.
+#
+# **It is not the only cluster-starting binary outside this group**, and that is worth writing down
+# where the next reader will find it. Nine `esker-sql` binaries start a cluster and are in no group
+# at all — `case_insensitive_probe` (2 clusters), `collation` (6), `composite` (5),
+# `derived_name_in_a_schema` (1), `enum_default` (2), `jsonb_concat` (1), `psql_smoke` (1),
+# `regtype_user_probe` (1) and `store_locking` (9): twenty-eight clusters between them. A
+# non-member does not only suffer the contention, it **causes** it — this group bounds its members
+# against each other, not against the rest of the run. Only `composite` is added here, because only
+# `composite` has the wall clocks, and because serialising the other eight lengthens every lane's
+# gate and is not one lane's call to make.
+#
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)
-        or binary(real_backend) or binary(real_corpus) or binary(redrive_live)))
+        or binary(real_backend) or binary(real_corpus) or binary(redrive_live) or binary(composite)))
     or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
