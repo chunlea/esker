@@ -86,13 +86,20 @@ whose printed form depends on the catalog. Refused by name, which is the honest 
 * The alternative, comparing an `oid` against a `text` at the comparison site, is the shortcut this
   project retired: it answers the one statement that motivated it, leaves `::oidvector` unbuilt,
   and leaves `'text'::regtype < 'int4'::regtype` wrong for anybody who asks.
-* **A user-defined type's `regtype` is still text**, and this is the half of the decision that is
-  not built. `'color'::regtype` over a type a `CREATE TYPE` made goes through
-  `CatalogFunc::UserRegType`, which resolves the name against the catalog at execution and answers
-  a `Datum::Text` — so `pg_typeof('color'::regtype)` says `text` there and `regtype` for every
-  built-in, and `'color'::regtype = <oid>` does not compare. Nothing regressed (the `regtype_user`
-  corpus is unchanged) and nothing in the suite reaches it, but the model is applied to one half of
-  the type and the other half is a follow-up, not a difference of opinion.
+* **A user-defined type's `regtype` was still text, and is not any more.** This was written as the
+  half not built, and run 97 found the cost within one round: the probe stopped failing on
+  `oidvector` and started failing on `type "example_type" does not exist`, because it now *reached*
+  a `CREATE DOMAIN` through `regtype`. `CatalogFunc::UserRegType` answers a `Datum::RegType` now —
+  the catalog read that resolves the name has the oid in hand anyway — and two things followed for
+  free: `pg_typeof('mood'::regtype)` is `regtype`, and `WHERE enumtypid = 'mood'::regtype`
+  compares, which this file had recorded as the case position could not decide.
+  **`pg_enum.enumtypid` moved to `oid` with it**, for the reason `pg_cast.castsource` did: it is
+  what a `regtype` is compared against.
+
+  The lesson is about the *shape* of a half-built decision, not this one: making the built-in half
+  work moved the failure one step further along the same statement, where it looked like a new
+  defect and was the recorded gap arriving. A declared not-built half should be expected to
+  surface as somebody else's regression.
 * `format_type` took an oid and had to learn that a `regtype` is one. Four corpora caught that in a
   single run, which is what one shared accessor with a missing arm looks like — and is why the
   arm sits beside `Datum::Oid`'s rather than in a second function.
