@@ -1800,9 +1800,21 @@ fn approximate_size_counts_a_range_across_the_memtable_and_the_files() {
 /// because the filesystem is in memory.
 #[test]
 fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
+    // Sixty attempts, a bounded writer per attempt, and a wall-clock budget over the whole thing:
+    // whichever runs out first ends the loop, and falling short of `LEAST` is a failure with a
+    // reason rather than a test that quietly ran three attempts and called itself green.
     const ATTEMPTS: usize = 60;
+    const LEAST: usize = 20;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+    const WRITES: u32 = 2_000;
+
+    let started = std::time::Instant::now();
     let mut failures = Vec::new();
+    let mut ran = 0usize;
     for attempt in 0..ATTEMPTS {
+        if started.elapsed() >= BUDGET {
+            break;
+        }
         let (_, fs) = memfs();
         let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
         // Six rounds over the same 200 keys, so L0 fills with files that overlap each other --
@@ -1822,14 +1834,20 @@ fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
         let writer = Arc::clone(&db);
         let flag = Arc::clone(&stop);
         let hand = std::thread::spawn(move || {
-            let mut n = 0u32;
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            // **A fixed number of writes, not "until the compaction returns".** Written the other
+            // way, an attempt's work is whatever the scheduler allows: a `compact_range` slowed by
+            // a loaded box is given a bigger database to compact by a writer that is not slowed
+            // with it, and the two chase each other. That is what made this test run past 300 s in
+            // a full-workspace gate having taken 1.7 s in a crate-only run.
+            for n in 0..WRITES {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let _unused = writer.put(
                     cf::DEFAULT,
                     format!("bg-{n:06}").as_bytes(),
                     b"x".repeat(256).as_slice(),
                 );
-                n += 1;
             }
         });
 
@@ -1837,15 +1855,27 @@ fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
         let outcome = db.compact_range(cf::DEFAULT, None, None);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         hand.join().unwrap();
+        ran += 1;
 
         if let Err(why) = outcome {
             failures.push(format!("attempt {attempt}: {why}"));
         }
     }
+
     assert!(
         failures.is_empty(),
-        "compact_range refused a legal concurrent workload {} times in {ATTEMPTS}: {failures:?}",
+        "compact_range refused a legal concurrent workload {} times in {ran}: {failures:?}",
         failures.len(),
+    );
+    // **A slow box makes this red with a reason, never a gate with no end.** Below `LEAST` the
+    // detection rate this test is sized for is not reached, so passing would be a claim it did not
+    // earn: the defect showed once in twenty, and twenty attempts catch a regression about two
+    // times in three.
+    assert!(
+        ran >= LEAST,
+        "only {ran} of {ATTEMPTS} attempts fitted in {BUDGET:?}; this box is too slow for this \
+         test to mean anything, and a test that cannot reach its own detection rate must say so \
+         rather than pass"
     );
 }
 
@@ -1909,9 +1939,16 @@ fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
     // back.
     let mut round = 0u32;
     let mut overlapping = 0u32;
-    // A ceiling so that a writer wedged for any reason fails this as a slow test rather than
-    // hanging it, and a floor so the compactions keep going briefly after the writes stop.
-    while round < 4 || (!done.load(std::sync::atomic::Ordering::Acquire) && round < 60) {
+    // **A round ceiling and a wall clock, whichever comes first.** The ceiling alone is a cap on
+    // work, not on time: on a box where every round is slow, sixty of them is still unbounded from
+    // a gate's point of view. Both, so a slow machine ends this test rather than extending it.
+    let started = std::time::Instant::now();
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    while round < 4
+        || (!done.load(std::sync::atomic::Ordering::Acquire)
+            && round < 60
+            && started.elapsed() < BUDGET)
+    {
         if !done.load(std::sync::atomic::Ordering::Acquire) {
             overlapping += 1;
         }
@@ -1932,7 +1969,9 @@ fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
 
     assert!(
         overlapping >= 1,
-        "no round ran while the writer was writing, so nothing here was concurrent with anything"
+        "no round ran while the writer was writing, so nothing here was concurrent with anything; \
+         {round} rounds in {:?}",
+        started.elapsed()
     );
     assert!(
         db.compactions_run() > compactions_before,
