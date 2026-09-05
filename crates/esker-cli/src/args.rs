@@ -263,6 +263,10 @@ Bench-mpp options:
       --seed N          Seed for the generated values (default 20260904)
       --dir PATH        Where the cluster's data lives (default a temporary directory)
       --keep            Keep the data directory after the run
+      --diagnose        Report what each statement does on each engine, and the region
+                        map it ran against, instead of timing anything. Never fails on a
+                        statement: what the path does across a region boundary is the
+                        result
       --no-join         Leave the join out of the timed set. It costs tens of seconds
                         where the aggregates cost tens of milliseconds and cannot reach
                         the columnar path at all, so it is the first thing to drop under
@@ -1287,6 +1291,7 @@ fn parse_bench_mpp(arguments: &[String]) -> Result<Command, ParseError> {
             }
             "--keep" => options.keep = true,
             "--no-join" => options.no_join = true,
+            "--diagnose" => options.diagnose = true,
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
     }

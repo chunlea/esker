@@ -241,6 +241,75 @@ pub(crate) fn queries(shape: Shape) -> Vec<Query> {
     ]
 }
 
+/// The statements the correctness half runs, each naming what it is evidence about.
+///
+/// Deliberately wider than [`queries`]: the timed set is four shapes chosen to answer one
+/// question, and this set exists to say *what the path does* across a region boundary — so it
+/// includes the shapes that are not routed at all, because a boundary breaks a row scan and a
+/// point read as readily as it breaks a fragment.
+pub(crate) fn diagnostics(shape: Shape) -> Vec<(&'static str, String)> {
+    let mid = shape.rows / 2;
+    let mut out = vec![
+        (
+            "count(*), whole table",
+            format!("SELECT count(*) FROM {FACT}"),
+        ),
+        (
+            "aggregate with a filter",
+            format!("SELECT count(*), sum(amount) FROM {FACT} WHERE day < {CONTROL_DAY}"),
+        ),
+        (
+            "GROUP BY, low cardinality",
+            format!("SELECT g32, count(*) FROM {FACT} GROUP BY g32 ORDER BY g32"),
+        ),
+        (
+            "GROUP BY, high cardinality",
+            format!("SELECT ghigh, count(*) FROM {FACT} GROUP BY ghigh ORDER BY ghigh LIMIT 5"),
+        ),
+        (
+            "join, semi-join shape",
+            format!(
+                "SELECT count(*) FROM {FACT} JOIN {DIM} ON {FACT}.ghigh = {DIM}.k \
+                 WHERE {DIM}.bucket = 3"
+            ),
+        ),
+        // A point read and a bounded range are never routed (ADR 0022 rule 1); they are here
+        // because they cross the boundary through the *row* path, which is the half a fragment
+        // never exercises.
+        (
+            "point read, low key",
+            format!("SELECT id, amount FROM {FACT} WHERE id = 1"),
+        ),
+        (
+            "point read, past the split",
+            format!("SELECT id, amount FROM {FACT} WHERE id = {mid}"),
+        ),
+        (
+            "range scan across the boundary",
+            format!("SELECT count(*) FROM {FACT} WHERE id BETWEEN 1 AND {mid}"),
+        ),
+        (
+            "full row scan, ordered",
+            format!("SELECT id FROM {FACT} ORDER BY id LIMIT 3"),
+        ),
+        // A write after the split: the region cache is a hint repaired by the refusals it causes,
+        // and a write is the operation that meets a stale one hardest.
+        (
+            "insert past the split",
+            format!(
+                "INSERT INTO {FACT} VALUES ({}, 1, 1, 1, 1, 'label-0', 'x')",
+                shape.rows + 1
+            ),
+        ),
+        (
+            "count(*) after that insert",
+            format!("SELECT count(*) FROM {FACT}"),
+        ),
+    ];
+    out.retain(|(_, sql)| !sql.is_empty());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GROUPS_LOW, Kind, Shape, payload, queries};
