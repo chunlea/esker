@@ -4104,6 +4104,28 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
     // `lower()` and `lower('a','b')` are each their own message, measured.
+    // **`mod(x, y)` is `x % y`, not an approximation of it.** PostgreSQL's `%` for `int8` is
+    // implemented by `int8mod` — the same C function `mod()` calls — and the two agree on every
+    // sign combination, measured. So the call is rewritten into the arithmetic this crate already
+    // evaluates and tests, rather than given a scalar variant of its own; it is immutable for free
+    // that way, which is what `postgresql_adapter_test.rb`'s expression index needs.
+    if name == "mod" {
+        refuse_wrong_arity(function, "mod", 2)?;
+        if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args
+            && let [
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(left)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(right)),
+            ] = args.as_slice()
+        {
+            return Ok(plan::Expr::Arithmetic {
+                op: plan::ArithOp::Modulo,
+                left: Box::new(lower_expr(left)?),
+                right: Box::new(lower_expr(right)?),
+                ty: None,
+            });
+        }
+        return Err(SqlError::UndefinedFunction("mod(unknown)".to_owned()));
+    }
     if let Some(func) = plan::ScalarFunc::from_name(&name) {
         refuse_wrong_arity(function, func.name(), 1)?;
         let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
