@@ -266,6 +266,23 @@ impl<'a> Scope<'a> {
     /// `invalid reference to FROM-clause entry`, with a `HINT` naming the alias. Answering the
     /// first for both would tell a user their table is absent when it is right there.
     fn entry(&self, qualifier: &str) -> Result<usize> {
+        // **A qualifier may name the relation's schema**, which the referable name does not carry:
+        // `SELECT s1.things.name FROM s1.things` is a statement a real server answers, and the
+        // qualifier arrives here as the *stored* name (`s1 NUL things`) because
+        // `crate::parse::lower`'s three-part arm resolves it through `relation_name`.
+        //
+        // It matches only where no explicit alias replaced the name — `FROM s1.things t` makes
+        // `s1.things.name` an `invalid reference` on a real server, with a `HINT` naming `t`, and
+        // that is what the fallback below already answers.
+        if qualifier.contains(crate::catalog::SCHEMA_SEPARATOR)
+            && let Some(index) = self.tables.iter().position(|table| table.name == qualifier)
+            && self
+                .names
+                .get(index)
+                .is_some_and(|name| name == crate::catalog::split_qualified(qualifier).1)
+        {
+            return Ok(index);
+        }
         let mut matches = self
             .names
             .iter()
