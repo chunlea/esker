@@ -72,6 +72,12 @@ pub(crate) struct BenchMppOptions {
     pub(crate) seed: u64,
     /// Keep the data directory after the run.
     pub(crate) keep: bool,
+    /// Leave the join out of the timed set.
+    ///
+    /// It costs tens of seconds where the aggregates cost tens of milliseconds, and it cannot
+    /// reach the columnar path at all, so under a time budget it is the first thing to drop:
+    /// what it measures is the row engine, and the verdict turns on the aggregates.
+    pub(crate) no_join: bool,
     /// How often a region's leader reports it to PD, in milliseconds.
     ///
     /// A flag rather than a constant because it is the knob that decides how fast placement
@@ -96,6 +102,7 @@ impl Default for BenchMppOptions {
             base_port: 24_160,
             seed: 20_260_904,
             keep: false,
+            no_join: false,
             // **The shipped defaults, which is what the working reference uses.** Shortening
             // them to 2 s places a columnar learner in seconds rather than fifty, and asks PD to
             // act on every region thirty times as often; matching `esker cluster start` keeps
@@ -147,6 +154,9 @@ struct Run {
 
 /// How long a columnar copy has to appear and catch up before the run gives up.
 const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the SQL node has to become writable before the run gives up.
+const WRITABLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long the cluster has to reach its replica target before the run gives up.
 ///
@@ -248,10 +258,31 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
         esker_pd::schedule::TARGET_REPLICAS
     );
 
+    // **Readiness is a node that accepts a WRITE, not one that answers.** `SELECT 1` passes
+    // while the node is read-only, and a SQL node holds its schema lease for 5 s and renews it;
+    // if the first renewal has not landed when the first statement arrives, every write is
+    // `25006 ... schema lease has expired and the placement driver is unreachable`. That killed
+    // six runs before this loop existed, including three inside a 20-minute quiet window granted
+    // for the measurement. So `CREATE TABLE` is retried on a fresh connection until the node is
+    // writable or the deadline passes -- a wait, not a failure.
     let mut pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+    let writable = Instant::now();
+    loop {
+        match workload::create(&mut pg) {
+            Ok(()) => break,
+            Err(why) if why.contains("25006") && writable.elapsed() < WRITABLE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(500));
+                pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+            }
+            Err(why) => return Err(why),
+        }
+    }
+    println!(
+        "the node accepted its first write after {:.1?}",
+        writable.elapsed()
+    );
 
     let started = Instant::now();
-    workload::create(&mut pg)?;
     let statements = workload::load(&mut pg, shape)?;
     let load = started.elapsed();
     println!(
@@ -269,7 +300,11 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
         "ALTER TABLE {} SET (columnar_replicas = 1)",
         workload::FACT
     ))?;
-    let queries = workload::queries(shape);
+    let mut queries = workload::queries(shape);
+    if options.no_join {
+        queries.retain(|query| query.kind != Kind::Join);
+        println!("the join is not in this run's timed set (--no-join)");
+    }
     let probe_query = queries
         .iter()
         .find(|query| query.kind == Kind::LowCardinality)
@@ -293,6 +328,12 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     // engine. Discarded rather than reported: a warm-up in the medians would be a slow first run
     // wearing the same name as three fast ones.
     for query in &queries {
+        if query.kind == Kind::Join {
+            // The warm-up exists so the first measured repeat is not paying for a cold cache,
+            // and the join is measured once anyway — warming it costs two of the most expensive
+            // executions in the run for a median of one that does not need them.
+            continue;
+        }
         for arm in [Arm::Columnar, Arm::Row] {
             let _ = one(&mut pg, cluster, query, arm)?;
         }

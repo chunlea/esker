@@ -263,6 +263,10 @@ Bench-mpp options:
       --seed N          Seed for the generated values (default 20260904)
       --dir PATH        Where the cluster's data lives (default a temporary directory)
       --keep            Keep the data directory after the run
+      --no-join         Leave the join out of the timed set. It costs tens of seconds
+                        where the aggregates cost tens of milliseconds and cannot reach
+                        the columnar path at all, so it is the first thing to drop under
+                        a time budget
 
 Linux only: the decomposition is read from /proc, per process. It needs an
 esker-sql binary beside this one.
@@ -1282,6 +1286,7 @@ fn parse_bench_mpp(arguments: &[String]) -> Result<Command, ParseError> {
                 )?));
             }
             "--keep" => options.keep = true,
+            "--no-join" => options.no_join = true,
             other => return Err(ParseError::UnknownFlag(other.to_owned())),
         }
     }
