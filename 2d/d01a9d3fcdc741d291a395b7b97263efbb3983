@@ -1,0 +1,21 @@
+crates/esker-cli/src/bench_mpp/mod.rs
+  s_609bbbdbf3c419::t_3f9a0a827286b7 733-739
+crates/esker-cli/src/bench_mpp/workload.rs
+  s_609bbbdbf3c419::t_26ee7994b06ad1 235,237-247,283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2dd01a9d3fcdc741d291a395b7b97263efbb3983",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
