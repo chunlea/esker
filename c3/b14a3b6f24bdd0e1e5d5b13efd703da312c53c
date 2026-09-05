@@ -1,0 +1,19 @@
+crates/esker-store/src/split.rs
+  s_e5c0c6e78b5662::t_d1eec8702652b0 29-30,285,345-346,643-644,665-666,679,687-693,697-702,706-707,714-717,727-728
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c3b14a3b6f24bdd0e1e5d5b13efd703da312c53c",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
