@@ -141,12 +141,21 @@ const EXPLAIN_DIVERGENCES: &[(&str, &str)] = &[
         "EXPLAIN ANALYZE DELETE FROM t",
         "The same rule, and the same reason.",
     ),
-    (
-        "EXPLAIN VERBOSE SELECT count(*) FROM t",
-        "`VERBOSE` adds output column lists and schema qualification to every node. There is one \
-         schema here and the plan already names its columns, so honouring it would mean printing \
-         the same plan and calling it verbose. Refused by name, as it was before this milestone.",
-    ),
+    // **`EXPLAIN VERBOSE` was here and is not any more**, and the entry's own argument is worth
+    // answering rather than deleting in silence. It said honouring `VERBOSE` "would mean printing
+    // the same plan and calling it verbose", and preferred a refusal.
+    //
+    // That reasoning weighs the wrong two things. The choice is not between an honest refusal and a
+    // dishonest plan — it is between refusing a statement **PostgreSQL runs** and answering it with
+    // the detail this node has. `explain_test.rb` sends `VERBOSE` in a list with `ANALYZE`, so the
+    // refusal cost three of that file's five tests, and it cost them at the *parser*: nothing
+    // downstream ever ran. Printing the same plan is not a wrong answer, because what a plan
+    // contains is already a declared divergence on every line; there is simply no extra detail to
+    // show, and saying so by showing none is truthful.
+    //
+    // `(FORMAT JSON)` below stays refused, and the difference is the test of the rule: `FORMAT`
+    // changes the *shape* a client parses, so answering it with text would be a wrong answer rather
+    // than a plainer one.
     (
         "EXPLAIN (FORMAT JSON) SELECT count(*) FROM t",
         "A second rendering of a plan text that is already a declared divergence from \
