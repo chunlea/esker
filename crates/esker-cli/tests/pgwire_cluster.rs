@@ -160,7 +160,9 @@ fn read_until_ready(socket: &mut TcpStream) -> String {
                 .map(|field| field[1..].to_owned())
                 .collect::<Vec<_>>()
                 .join(" | ");
-            tags.push_str(&format!("<{text}>"));
+            tags.push('<');
+            tags.push_str(&text);
+            tags.push('>');
         }
         if tag == 'Z' {
             return tags;

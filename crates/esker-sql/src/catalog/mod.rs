@@ -3094,12 +3094,6 @@ fn seeded(txn: &dyn Txn) -> Result<bool> {
     // One key is enough to answer it: the question is whether *anything* was written.
     Ok(txn.scan(&start, &end, 1)?.is_empty())
 }
-
-/// Records a database. The caller has already decided the name is free.
-///
-/// **The seed is written here**, the first time anything is, so that the directory stops being
-/// empty in the same transaction that gives it a second row — otherwise a cluster with two
-/// databases would report only the one somebody typed.
 /// One role, as `pg_roles` and `pg_authid` report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDef {
@@ -3175,6 +3169,11 @@ pub fn drop_role(txn: &mut dyn Txn, name: &str) -> Result<()> {
 /// Where role oids begin, clear of every reserved relation id.
 const FIRST_ROLE_OID: u64 = 16_384;
 
+/// Records a database. The caller has already decided the name is free.
+///
+/// **The seed is written here**, the first time anything is, so that the directory stops being
+/// empty in the same transaction that gives it a second row — otherwise a cluster with two
+/// databases would report only the one somebody typed.
 pub fn create_database(txn: &mut dyn Txn, name: &str, id: u64) -> Result<()> {
     if seeded(&*txn)? {
         txn.put(
