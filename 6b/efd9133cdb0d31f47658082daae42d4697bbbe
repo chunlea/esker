@@ -1,0 +1,21 @@
+crates/esker-engine/tests/db.rs
+  s_2d916f5f540186::t_e35caccd82c26c 1796-1800,1803,1805,1847,1871,1886-1887,1889,1891-1893,1900,1903-1917,1928,1930,1933-1942,1945,1950-1951
+docs/adr/0079-compaction-concurrency-reserves-the-output-range.md
+  s_2d916f5f540186::t_570887b79e8fa0 103-107,112-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6befd9133cdb0d31f47658082daae42d4697bbbe",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
