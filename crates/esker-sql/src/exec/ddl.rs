@@ -610,6 +610,82 @@ fn add_check(
     catalog::replace_table(txn, executor.tenant, table, updated)
 }
 
+/// Adds an `EXCLUDE` to a table that already exists, after checking the rows already in it.
+///
+/// The constraint itself is the one a `CREATE TABLE` builds, from the same clause parser — the
+/// only thing an `ALTER` adds is that the rows are there first. A real server validates them and
+/// refuses with a sentence of its own, measured:
+/// `23P01 could not create exclusion constraint "c"`, whose `DETAIL` says "conflicts with key"
+/// where the write path's says "conflicts with existing key".
+///
+/// **`DEFERRABLE` does not defer this.** Deferral is about the writes that follow, and a
+/// constraint added `DEFERRABLE INITIALLY DEFERRED` over conflicting rows is refused at once —
+/// measured, and the reason the check is unconditional here.
+fn add_exclude(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    updated: &mut TableDef,
+    exclude: &catalog::ExcludeDef,
+) -> Result<()> {
+    if updated
+        .excludes
+        .iter()
+        .any(|seen| seen.name == exclude.name)
+        || updated.checks.iter().any(|seen| seen.name == exclude.name)
+    {
+        return Err(SqlError::DuplicateConstraint {
+            constraint: exclude.name.clone(),
+            relation: updated.name.clone(),
+        });
+    }
+    validate_exclude_rows(txn, executor, updated, exclude)?;
+    updated.excludes.push(exclude.clone());
+    updated.schema_version += 1;
+    catalog::replace_table(txn, executor.tenant, table, updated)
+}
+
+/// Scans for two stored rows the constraint would refuse, and names it if it finds them.
+///
+/// Paged for the reason [`validate_check_rows`]'s is: a table that does not fit in memory is a
+/// table this must still be able to check. Each row is put to
+/// [`super::dml::exclusion_conflict`], which skips the row itself by primary key — so what it
+/// finds is a *different* row that conflicts, which is exactly the question.
+fn validate_exclude_rows(
+    txn: &mut dyn Txn,
+    executor: &Executor,
+    table: &TableDef,
+    exclude: &catalog::ExcludeDef,
+) -> Result<()> {
+    let (start, end) = crate::row::table_row_range(executor.tenant, table.id);
+    let schema = table.row_schema();
+    let mut found: Option<SqlError> = None;
+    super::for_each_page(txn, &start, &end, |txn, page| {
+        for (_, value) in page {
+            if found.is_some() {
+                return Ok(());
+            }
+            let row = crate::row::decode_row(&schema, value)?;
+            if let Some(SqlError::ExclusionViolation {
+                constraint,
+                key,
+                value,
+                existing,
+            }) = super::dml::exclusion_conflict(txn, executor.tenant, table, exclude, &row)?
+            {
+                found = Some(SqlError::ExclusionNotCreatable {
+                    constraint,
+                    key,
+                    value,
+                    existing,
+                });
+            }
+        }
+        Ok(())
+    })?;
+    found.map_or(Ok(()), Err)
+}
+
 /// Scans the table for a row the check refuses, and names the constraint if it finds one.
 ///
 /// The scan is paged for the reason [`backfill`]'s is: a table that does not fit in memory is a
@@ -5216,6 +5292,10 @@ pub(super) fn alter_table(
     for action in &alter.actions {
         if let AlterTableAction::AddCheck(check) = action {
             add_check(txn, executor, &table, &mut updated, check)?;
+            continue;
+        }
+        if let AlterTableAction::AddExclude(exclude) = action {
+            add_exclude(txn, executor, &table, &mut updated, exclude)?;
             continue;
         }
         if let AlterTableAction::AddForeignKey(key) = action {

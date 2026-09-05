@@ -117,6 +117,23 @@ impl Parsed {
         if let Some(reset) = self.alter_table_reset() {
             return Ok(plan::Statement::AlterTable(lower_alter_table_reset(reset)?));
         }
+        if let Some(clause) = self.alter_exclude() {
+            // The parser was handed `CHECK (true)` in the clause's place, so the `ALTER` itself —
+            // its table, its `IF EXISTS`, its `ONLY` — is lowered normally and only the one action
+            // is swapped. There is exactly one placeholder, because the rewrite makes exactly one.
+            let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
+            let plan::Statement::AlterTable(alter) = &mut lowered else {
+                return Err(SqlError::unsupported("an EXCLUDE constraint"));
+            };
+            let exclude = crate::parse::parse_exclude_constraint(clause, &alter.name)?;
+            let placeholder = alter
+                .actions
+                .iter()
+                .position(|action| matches!(action, plan::AlterTableAction::AddCheck(_)))
+                .ok_or_else(|| SqlError::unsupported("an EXCLUDE constraint"))?;
+            alter.actions[placeholder] = plan::AlterTableAction::AddExclude(exclude);
+            return Ok(lowered);
+        }
         let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
         // `WITH [NO] DATA` was cut off the source so the statement would parse.
         if let plan::Statement::CreateMaterializedView(create) = &mut lowered
