@@ -3275,6 +3275,12 @@ impl Execute for Executor {
         // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
         // the precedence `deadline_from` keeps.
         let _clock = cancel::until(self.statement_deadline());
+        // **The cancellation flag is installed here, not by the protocol layer.** It was in
+        // pgwire's blocking closure while only a connection had an identity, which left every
+        // in-process session — a `Pair`, a `Cluster`, a re-drive — uncancellable: `cancel::check`
+        // found no flag on the thread and a `pg_cancel_backend` that had already returned `true`
+        // stopped nothing. One identity, one place that arms it.
+        let _flag = cancel::with_session(self.identity.pid, Arc::clone(&self.identity.cancel));
         // **What `pg_stat_activity` shows while this runs**, cleared by the guard however the
         // statement ends. This is where an in-process session gets a `query` column too: the
         // executor is the one layer every session goes through, socket or not.

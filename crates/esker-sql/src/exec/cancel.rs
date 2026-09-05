@@ -22,13 +22,15 @@ use crate::error::{Result, SqlError};
 thread_local! {
     /// When the statement on this thread must stop, or `None` for "as long as it takes".
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// The flag another connection sets to cancel this one's statement, when there is a session
-    /// behind this thread at all.
+    /// Who this thread's statement belongs to: its pid, and the flag another session sets to
+    /// cancel it.
     ///
     /// **Installed per statement, not per connection.** Each statement is handed to
     /// `tokio::task::spawn_blocking`, so consecutive statements of one session run on *different*
-    /// pool threads and a flag installed once at connect time would be invisible to all of them.
-    static FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    /// pool threads and anything installed once at connect time would be invisible to all of them.
+    /// The pid rides along because `pg_backend_pid()` is evaluated deep in the expression
+    /// evaluator, which is handed a transaction and a catalog and has no idea who is asking.
+    static SESSION: RefCell<Option<(u32, Arc<AtomicBool>)>> = const { RefCell::new(None) };
 }
 
 /// Installs `deadline` until the returned guard is dropped.
@@ -52,17 +54,22 @@ impl Drop for Guard {
 /// is idle must not kill the *next* statement it runs. PostgreSQL cancels the query that is running
 /// and nothing else, and a flag left set from a previous statement would cancel a statement nobody
 /// asked about.
-pub(crate) fn with_flag(flag: Arc<AtomicBool>) -> FlagGuard {
+pub(crate) fn with_session(pid: u32, flag: Arc<AtomicBool>) -> FlagGuard {
     flag.store(false, Ordering::Relaxed);
-    FlagGuard(FLAG.with_borrow_mut(|slot| slot.replace(flag)))
+    FlagGuard(SESSION.with_borrow_mut(|slot| slot.replace((pid, flag))))
+}
+
+/// The pid of the session running this thread's statement, for `pg_backend_pid()`.
+pub(crate) fn current_pid() -> Option<u32> {
+    SESSION.with_borrow(|slot| slot.as_ref().map(|(pid, _)| *pid))
 }
 
 /// Puts the previous flag back, for the same reason [`Guard`] does.
-pub(crate) struct FlagGuard(Option<Arc<AtomicBool>>);
+pub(crate) struct FlagGuard(Option<(u32, Arc<AtomicBool>)>);
 
 impl Drop for FlagGuard {
     fn drop(&mut self) {
-        FLAG.with_borrow_mut(|slot| *slot = self.0.take());
+        SESSION.with_borrow_mut(|slot| *slot = self.0.take());
     }
 }
 
@@ -73,9 +80,9 @@ impl Drop for FlagGuard {
 /// comparison, so a per-page or per-10ms call costs nothing worth measuring; calling it per *row*
 /// would be a different question and is not what any caller does.
 pub(super) fn check() -> Result<()> {
-    if FLAG.with_borrow(|slot| {
+    if SESSION.with_borrow(|slot| {
         slot.as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            .is_some_and(|(_, flag)| flag.load(Ordering::Relaxed))
     }) {
         return Err(SqlError::QueryCanceled);
     }
@@ -87,7 +94,7 @@ pub(super) fn check() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, until, with_flag};
+    use super::{check, current_pid, until, with_session};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -96,7 +103,7 @@ mod tests {
     #[test]
     fn a_set_flag_cancels_the_statement() {
         let flag = Arc::new(AtomicBool::new(false));
-        let _guard = with_flag(Arc::clone(&flag));
+        let _guard = with_session(7, Arc::clone(&flag));
         assert!(check().is_ok(), "nothing has asked yet");
 
         flag.store(true, Ordering::Relaxed);
@@ -114,7 +121,7 @@ mod tests {
     #[test]
     fn a_stale_cancellation_does_not_carry_into_the_next_statement() {
         let flag = Arc::new(AtomicBool::new(true));
-        let _guard = with_flag(Arc::clone(&flag));
+        let _guard = with_session(7, Arc::clone(&flag));
         assert!(
             check().is_ok(),
             "the flag was set before this statement began and must have been cleared"

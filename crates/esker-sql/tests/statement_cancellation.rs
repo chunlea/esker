@@ -116,3 +116,88 @@ fn statement_timeout_cancels_a_statement_that_is_working() {
         "it answered 57014 only after the sleep finished, which is not cancellation"
     );
 }
+
+/// **The whole Rails mechanism, with a simpler victim.**
+///
+/// `transaction_test.rb` finds its target with `SELECT pid FROM pg_stat_activity WHERE query LIKE
+/// '% FOR UPDATE'` and cancels it. That query could not have worked before: the view returned one
+/// row whose pid was `std::process::id()` — the same number for every session — with `query` NULL,
+/// so the `LIKE` matched nothing and there was no pid to pass. This asserts the three halves of
+/// that working: **a row per session**, **the statement text in it**, and **a cancel that lands**.
+///
+/// `pg_sleep` rather than a row lock because the victim only has to be busy, and a sleep is busy
+/// without a second transaction to arrange.
+#[test]
+fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
+    let pair = Pair::new(&[]);
+
+    let mut victim = pair.session();
+    let sleeping = std::thread::spawn(move || victim.run("SELECT pg_sleep(10)"));
+
+    let mut hunter = pair.session();
+    // The victim has to have started before it can be found; poll rather than sleep a guess.
+    let mut pid = None;
+    for _ in 0..200 {
+        let rows = hunter.rows("SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep%'");
+        if let Some(found) = rows.first().and_then(|row| row.first()) {
+            pid = Some(found.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = pid.expect("the sleeping session must appear in pg_stat_activity with its statement");
+
+    assert_eq!(
+        hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
+        [["t".to_owned()]],
+        "the pid was found, so there was a session to ask"
+    );
+
+    let started = Instant::now();
+    let stopped = sleeping
+        .join()
+        .unwrap()
+        .expect_err("the sleep was cancelled, so the statement is an error");
+    assert_eq!(stopped.sqlstate(), "57014", "{stopped}");
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "it ended only when the sleep did, which is not a cancellation"
+    );
+}
+
+/// **Cancelling yourself stops the statement that asked** — measured against PG19, where
+/// `SELECT pg_cancel_backend(pg_backend_pid())` answers `canceling statement due to user request`
+/// rather than returning a row.
+#[test]
+fn a_session_can_cancel_itself_and_the_statement_is_the_one_that_dies() {
+    let pair = Pair::new(&[]);
+    let mut session = pair.session();
+
+    // **`pg_backend_pid()`, not `LIMIT 1`.** The view lists every session in the process now, so
+    // the first row is whichever session has the lowest pid — in a test binary, somebody else's.
+    // That is the whole reason a real server has this function, and the first draft of this test
+    // cancelled a stranger and passed for the wrong reason.
+    let pid = session.rows("SELECT pg_backend_pid()")[0][0].clone();
+    let cancelled = session
+        .run(&format!("SELECT pg_cancel_backend({pid})"))
+        .expect_err("asking yourself to stop stops the asking statement");
+    assert_eq!(cancelled.sqlstate(), "57014", "{cancelled}");
+
+    // And the session is still usable afterwards: a cancel ends a statement, not a connection.
+    assert_eq!(session.rows("SELECT 1"), [["1".to_owned()]]);
+}
+
+/// A pid nobody holds is `false`, not an error.
+///
+/// PostgreSQL also raises `WARNING: PID 999999 is not a PostgreSQL backend process` beside it;
+/// this node does not, which is a declared divergence recorded on `CatalogFunc::PgCancelBackend`.
+/// The boolean, which is what a caller branches on, is the same.
+#[test]
+fn cancelling_a_pid_that_is_not_here_is_false() {
+    let pair = Pair::new(&[]);
+    let mut session = pair.session();
+    assert_eq!(
+        session.rows("SELECT pg_cancel_backend(999999)"),
+        [["f".to_owned()]]
+    );
+}

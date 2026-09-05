@@ -157,6 +157,26 @@ pub fn snapshot() -> Vec<(u32, Activity)> {
     rows
 }
 
+/// Cancels the session at `pid` without a key, for `pg_cancel_backend()`.
+///
+/// **No key, and that is not an oversight.** The protocol's `CancelRequest` arrives unauthenticated
+/// on a fresh socket, so it must prove it was told the secret; `pg_cancel_backend` is a function
+/// call inside an authenticated session, which is the proof. PostgreSQL draws the same line.
+///
+/// False for a pid nobody holds, which is what the function answers there.
+pub fn cancel_pid(pid: u32) -> bool {
+    let Ok(live) = backends().lock() else {
+        return false;
+    };
+    match live.get(&pid) {
+        Some(backend) => {
+            backend.cancel.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Forgets a session that has gone.
 pub fn deregister(pid: u32) {
     if let Ok(mut live) = backends().lock() {

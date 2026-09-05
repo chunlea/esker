@@ -10,7 +10,6 @@
 //! appears in exactly one function.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -175,12 +174,6 @@ struct Work {
     session: Session,
     executor: Box<dyn Execute + Send>,
     out: Vec<u8>,
-    /// The flag a `CancelRequest` on another connection sets.
-    ///
-    /// **It travels with the bundle**, because each statement is handed to `spawn_blocking` and
-    /// consecutive statements of one session land on *different* pool threads: a flag installed
-    /// once when the connection opened would be invisible to every one of them.
-    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
@@ -234,7 +227,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         };
         let mut work = Work {
             session: Session::new(),
-            cancel: self.backend.as_ref().map(|backend| backend.cancel.clone()),
             executor,
             out: std::mem::take(&mut self.out),
         };
@@ -298,10 +290,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // messages rather than reallocated per statement.
             work = tokio::task::spawn_blocking(move || {
                 let mut work = work;
-                // Installed for this statement only, and cleared as it goes in: a cancellation
-                // that arrived while the session was idle must not kill the next statement, which
-                // is what a real server does and what `cancel::with_flag` enforces.
-                let _cancel = work.cancel.clone().map(crate::exec::cancel::with_flag);
                 work.session
                     .handle(&message, work.executor.as_mut(), &mut work.out);
                 work
