@@ -926,6 +926,15 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
                 walk_expr_mut(arg, visit);
             }
         }
+        // **The same blind spot one node later.** `ARRAY[…]` over expressions was added without
+        // teaching these two walkers, and this match has a catch-all so the compiler could not
+        // say so — the cost was a `'x'::regtype` over a catalog type sitting inside a constructor
+        // and never being resolved, which reached the row evaluator and said so.
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                walk_expr_mut(element, visit);
+            }
+        }
         // **The arms below were the blind spot.** `descend` and this walk are the crate's general
         // ones — `has_sequence_call`, `has_set_func` and the parameter inference all go through
         // them — and neither descended into arithmetic, a negation, a `LIKE` pattern or a
@@ -1213,6 +1222,11 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         Expr::Coalesce(args) => {
             for arg in args {
                 descend(arg, visit);
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                descend(element, visit);
             }
         }
         // The same arms as `walk_expr_mut`'s, and for the same reason: these two are the crate's
