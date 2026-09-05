@@ -457,5 +457,125 @@ change.
 
 ### The timing half
 
-Still parked, and now for a second reason: the numbers it would take are wrong by a factor of the
-region count. No quiet window is wanted until the columnar copy is region-scoped.
+Was parked here for a second reason — the numbers it would take were wrong by a factor of the region
+count — and the store's columnar copy became region-scoped the next day, which unparked it. It ran
+in a second quiet window and is **§11**, where it found something else entirely: a table that splits
+under a bulk load cannot be loaded at all, so the multi-region timings this section was waiting for
+still do not exist.
+
+## 11. The timing half, run at last — 2026-09-05, second quiet window
+
+| field | value |
+|---|---|
+| commit | `e841beb7` (binaries rebuilt at it before the window opened) |
+| machine | aarch64 Linux container, MemTotal 15.7 GiB, uncapped, 16 CPUs |
+| load average | **1.6 – 2.8 throughout** — the quietest the machine has been for any run here |
+| window | 30 minutes, other lanes held out of it |
+| rows | 20,000 (the plan said 60,000; §11a is why it could not be) |
+
+The `--stores` axis was to be 4, 8 and 6 with rows and split size fixed, so that every point had the
+same regions and the only variable was how many distinct stores their learners landed on. **None of
+the three completed**, and what stopped them is worth more than the table would have been.
+
+### 11a. A table that splits under a bulk load cannot be loaded
+
+Every N point died during the `INSERT` phase, in under a minute, on an idle machine:
+
+| N stores | rows | outcome |
+|---|---|---|
+| 4 | 20,000 | `08006: gave up after 10 attempts: peer is not the leader of region 34` |
+| 8 | 20,000 | `08006: deadline passed after 14 attempts` |
+| 6 | 20,000 | `08006: deadline passed after 14 attempts` |
+
+Store count changes nothing, and 60,000 rows failed the same way earlier at row ~43,500. So the
+control: **same rows, same stores, same machine, same binaries — only the split threshold moves.**
+
+| `--region-split-size` | fact-table regions | load |
+|---|---|---|
+| 1 GiB | 1 | **succeeds**, 85 s |
+| 16 MiB | 1 | **succeeds** |
+| 4 MiB | several | **fails** |
+
+That is the diagnosis rather than the observation: it is not volume, not store count, not the
+machine, and not the quiet window. **A bulk load into a table that splits under it fails.**
+
+The mechanism is the fourth unrepaired routing call site, named in `docs/plans/phase-16-mpp.md`
+§J12. `router::repair_route` has three callers — both scans and the fragment enumeration — and
+`Router::call`, the write path, is not one of them: `classify(KeyNotInRegion)` is `Verdict::Surface`
+and `may_ask_again` is false for a write, so a write surfaces at once. Compounding it,
+`learned_a_newer_epoch` deliberately does **not** reset the retry budget on a `NotLeader` hint,
+because "chasing a leader around a region that is not changing is exactly the loop the budget was
+put there to stop". That rule is right for a dead region and wrong for one that has just been
+created by a split and is still electing — which is every region during a load that splits.
+
+### 11b. The aggregates, one region, 20,000 rows
+
+Median of 3, every routed row asserted by `EXPLAIN ANALYZE` to have run on the engine named.
+
+| query | engine | fragments | wall median | SQL-node CPU | stores' CPU | loopback |
+|---|---|---|---|---|---|---|
+| control-scan | columnar | 1 of 1 | **0.003 s** | 0.00 s | 0.00 s | 9.8 KiB |
+| control-scan | rows | 0 of 0 | 0.068 s | 0.01 s | 0.07 s | 2.1 MiB |
+| group-low | columnar | 1 of 1 | **0.004 s** | 0.00 s | 0.01 s | 11.4 KiB |
+| group-low | rows | 0 of 0 | 0.070 s | 0.01 s | 0.06 s | 2.1 MiB |
+| group-high | columnar | 1 of 1 | **0.008 s** | 0.00 s | 0.01 s | 204.2 KiB |
+| group-high | rows | 0 of 0 | 0.072 s | 0.01 s | 0.06 s | 2.2 MiB |
+
+**9× to 23×**, and the ratio falls as the answer grows: the scan and the 32-group aggregate are
+18–23×, the 4,000-group one 9×, because what the columns save is reading columns nobody projected
+and that saving is fixed while the result is not.
+
+### 11c. The join, which is what this unit was built for
+
+| join arm | fragments | wall | SQL-node CPU | stores' CPU | loopback |
+|---|---|---|---|---|---|
+| columnar | 1 of 1 | **0.012 s** | 0.00 s | 0.00 s | 243.4 KiB |
+| rows | 0 of 0 | 3.658 s | 0.58 s | 4.69 s | 25.1 MiB |
+
+**305×, and 103× less network.** The row engine spends 4.69 s of store CPU; the columnar path
+spends none that the sampler can see.
+
+At the **default** `--groups-high` the same join does not route, and that is the bound working. The
+planner says so in as many words — this is the diagnose row, not an inference:
+
+```text
+| join, semi-join shape | rows  (columnar refused: a join whose inner side has more keys
+                                 than a fragment carries) | — | 1 row(s) | yes |
+```
+
+`dim` holds one row per high-cardinality group, so `bucket = 3` selects far more keys than
+`esker_columnar::fragment::MAX_IN_VALUES` (4,096). The join is therefore measured with
+`--groups-high` **below** the cap, and the number above is a routable join rather than a
+representative one. Whether 4,096 is the right cap is a separate question this does not answer.
+
+### 11d. The stale flag that nearly made this a wrong report
+
+The join's numbers in the first two runs of the window read ~3.5–3.9 s **on both arms**, and the run
+was green. `workload::Query::columnar_is_possible` was `false` for the join, with a comment giving
+the reason: ADR 0040 Decision 4 substitutes one plan shape, so a join has no fragment to be pushed
+into. That was true when it was written and the join unit falsified it.
+
+The flag does not force an engine — it only relaxes an assertion — so the failure was silent in the
+worst available way: **the join arm ran on rows, and the assertion required rows.** A comparison of
+the row engine against itself was reported as a join measurement, and nothing was red.
+
+Two lessons, both already in this file's vocabulary. A record of *why something cannot happen* has
+to be re-read when the thing happens; and an assertion that encodes a limitation becomes, the moment
+the limitation lifts, a guarantee that it never lifts.
+
+### 11e. Fan-out: still one distinct store, and what that gates
+
+Every successful run reports **1 region, 1 columnar learner, 1 distinct store**, because the only
+configurations that load are the ones where the fact table never splits. The spread this window
+existed to measure — 5 learners on 2 distinct stores, from §9 — could not be reached at all.
+
+So the exchange question is not merely unanswered, it is **gated on the write path**. An exchange
+distributes the merge across the nodes holding the data; until a table can be *loaded* while it
+splits, there is no multi-region table to spread anything over, and no honest measurement of what an
+exchange would save. That is now the first thing in front of ADR 0022 milestone 5 — ahead of the
+shuffle protocol, the operator, and the spill.
+
+One reporting weakness found here and worth fixing: the header counts **cluster** regions while the
+fragment line counts the **table's**, so `regions | 2` beside `1 of 1 fragments` reads like a query
+answered from half a table. It was not — the second region held `dim`, which never asked for a
+columnar copy — but a reader should not have to run a second experiment to learn that.
