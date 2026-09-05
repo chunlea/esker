@@ -27,6 +27,7 @@
 pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
+mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
@@ -1094,6 +1095,18 @@ impl Executor {
         crate::parameter::Isolation::named(
             &self.parameter(crate::parameter::transaction_isolation()),
         )
+    }
+
+    /// When the statement about to run must stop, from `statement_timeout`.
+    ///
+    /// **Not `lock_timeout`**, which bounds one wait rather than the statement: a session with a
+    /// 50 ms lock timeout and no statement timeout may run a five-second scan, and cutting it off
+    /// would be this node inventing a limit nobody set.
+    fn statement_deadline(&self) -> Option<std::time::Instant> {
+        let value = self.parameter(crate::parameter::statement_timeout());
+        crate::parameter::timeout_ms(&value)
+            .filter(|ms| *ms > 0)
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms))
     }
 
     fn lock_deadline(&self) -> Option<(u64, Deadline)> {
@@ -2904,6 +2917,10 @@ pub(crate) fn for_each_page(
 ) -> Result<()> {
     let mut next = start.to_vec();
     loop {
+        // **Where a long statement actually spends its time.** A page boundary is the natural
+        // check point: fine enough that `statement_timeout` means something on a big table, coarse
+        // enough to cost nothing.
+        cancel::check()?;
         let read = txn.scan(&next, end, SCAN_CHUNK)?;
         let Some((last, _)) = read.last() else {
             return Ok(());
@@ -3166,6 +3183,11 @@ impl Execute for Executor {
     }
 
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
+        // **The statement's clock starts here**, at the one boundary every statement crosses, and
+        // stops when this call returns however it returns (`cancel::Guard`). `statement_timeout`
+        // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
+        // the precedence `deadline_from` keeps.
+        let _clock = cancel::until(self.statement_deadline());
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
         if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {

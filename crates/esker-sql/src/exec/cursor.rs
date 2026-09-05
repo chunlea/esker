@@ -2276,6 +2276,35 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **Sleeps in short steps and checks between them.** A single `sleep` for the whole
+        // duration would ignore `statement_timeout` and a cancel until it was over, and being
+        // interruptible is the entire reason this node has `pg_sleep` — it is how a test makes a
+        // statement that is *working* rather than waiting (`tests/statement_cancellation.rs`).
+        //
+        // NULL in, NULL out: `pg_sleep` is strict on a real server and sleeps for nothing.
+        CatalogFunc::PgSleep => {
+            let Some(seconds) = args
+                .first()
+                .and_then(Datum::to_text)
+                .and_then(|text| text.trim().parse::<f64>().ok())
+            else {
+                return Ok(Datum::Null);
+            };
+            if seconds.is_finite() && seconds > 0.0 {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+                loop {
+                    super::cancel::check()?;
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    // A short step so a cancel is acted on promptly rather than at the end.
+                    std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
+                }
+            }
+            // `void`, which prints as the empty string.
+            Datum::Text(String::new())
+        }
         // **The transaction's instant**, so two calls in one transaction are equal and their
         // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
         //
