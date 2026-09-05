@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 35;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 36;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -757,18 +757,28 @@ pub(super) fn extension_name_of(tenant: u64, key: &[u8]) -> Result<String> {
 
 /// An installed extension's version, behind the same version byte as every other record.
 #[must_use]
-pub(super) fn encode_extension(version: &str) -> Vec<u8> {
+pub(super) fn encode_extension(version: &str, schema: &str) -> Vec<u8> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     put_str(version, &mut out);
+    // **Version 36 appends the schema**, because `CREATE EXTENSION … SCHEMA <name>` has somewhere
+    // to put it and `pg_extension.extnamespace` was a constant before it did. A record written
+    // before 36 has no schema field and reads back as `public`, which is where every extension
+    // this build could install went.
+    put_str(schema, &mut out);
     out
 }
 
-/// Reads one back.
-pub(super) fn decode_extension(bytes: &[u8]) -> Result<String> {
+/// Reads one back: the version it installed at, and the schema it lives in.
+pub(super) fn decode_extension(bytes: &[u8]) -> Result<(String, String)> {
     let mut reader = Reader::at_least(bytes, OLDEST_EXTENSION_VERSION)?;
     let version = reader.string()?;
+    let schema = if reader.version >= 36 {
+        reader.string()?
+    } else {
+        super::PUBLIC_SCHEMA.to_owned()
+    };
     reader.finish()?;
-    Ok(version)
+    Ok((version, schema))
 }
 
 /// One user-defined type, keyed by name.

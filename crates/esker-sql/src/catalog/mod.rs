@@ -2337,10 +2337,10 @@ impl View<'_> {
 /// A catalog write like any other, so it commits and rolls back with the transaction that ran the
 /// `CREATE EXTENSION` — which is what a real server does, and what makes the statement safe inside
 /// the schema-load transaction `ActiveRecord` wraps everything in.
-pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &str) {
+pub fn install_extension(txn: &mut dyn Txn, tenant: u64, name: &str, version: &str, schema: &str) {
     txn.put(
         &record::extension_key(tenant, name),
-        &record::encode_extension(version),
+        &record::encode_extension(version, schema),
     );
 }
 
@@ -2452,18 +2452,18 @@ pub fn drop_type(txn: &mut dyn Txn, tenant: u64, name: &str) {
     txn.delete(&record::type_key(tenant, name));
 }
 
-/// Every extension this tenant has installed, by name, in name order.
+/// Every extension this tenant has installed, in name order, as `(name, version, schema)`.
 ///
 /// One prefix scan. The **available** set is a property of the build and is not stored — which of
-/// them is installed is the only part that is state.
-pub fn installed_extensions(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, String)>> {
+/// them is installed is the only part that is state, and since record version 36 *where* each one
+/// lives is part of that state: `CREATE EXTENSION … SCHEMA <name>` has somewhere to put it and
+/// `pg_extension.extnamespace` reads it back.
+pub fn installed_extensions(txn: &dyn Txn, tenant: u64) -> Result<Vec<(String, String, String)>> {
     let (start, end) = record::extension_range(tenant);
     let mut installed = Vec::new();
     for (key, value) in txn.scan(&start, &end, 0)? {
-        installed.push((
-            record::extension_name_of(tenant, &key)?,
-            record::decode_extension(&value)?,
-        ));
+        let (version, schema) = record::decode_extension(&value)?;
+        installed.push((record::extension_name_of(tenant, &key)?, version, schema));
     }
     Ok(installed)
 }
@@ -3758,11 +3758,16 @@ pub const PUBLIC_SCHEMA_ID: u64 = 11;
 /// These are not records. A schema a `CREATE SCHEMA` wrote is one; these are properties of the
 /// build, the way the relations in them are, which is what keeps `pg_namespace` a *view* over
 /// what exists rather than a second copy of it.
-pub const RESERVED_SCHEMAS: [(&str, u64); 2] = [("pg_catalog", 12), ("information_schema", 13)];
+pub const RESERVED_SCHEMAS: [(&str, u64); 2] =
+    [(PG_CATALOG_SCHEMA, 12), ("information_schema", 13)];
 
 /// The schema the catalog's own relations live in, and the one a name resolves in without a
 /// qualifier: `current_schemas(true)` is `{pg_catalog,public}` where `current_schemas(false)` is
 /// `{public}`, which is what makes `pg_class` reachable and invisible to a table list at once.
+///
+/// **It is also where `plpgsql` is installed** — measured on 19beta1, `extnamespace` `pg_catalog`
+/// and `extrelocatable` `f`, alone among the extensions this build offers. That is what makes
+/// `ActiveRecord#extensions` list it as `pg_catalog.plpgsql` rather than bare.
 pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
 /// `pg_temp` written with no number: **the asking session's own temporary schema**.
@@ -4277,7 +4282,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "23",               // catalog format version
+                "24",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -4366,15 +4371,19 @@ mod tests {
     /// every other record here makes, asserted rather than assumed.
     #[test]
     fn an_extension_record_is_a_version_and_the_version_it_installed_at() {
-        let encoded = record::encode_extension("1.1");
+        let encoded = record::encode_extension("1.1", "public");
         assert_eq!(
             hex(&encoded),
             concat!(
-                "23",       // catalog format version
-                "03312e31", // varint 3, "1.1"
+                "24",             // catalog format version
+                "03312e31",       // varint 3, "1.1"
+                "067075626c6963", // varint 6, "public" - the schema, since version 36
             )
         );
-        assert_eq!(record::decode_extension(&encoded).unwrap(), "1.1");
+        assert_eq!(
+            record::decode_extension(&encoded).unwrap(),
+            ("1.1".to_owned(), "public".to_owned())
+        );
 
         // The name is the key, not the value — an extension has no other identity a client sees.
         let key = record::extension_key(1, "uuid-ossp");
@@ -4394,7 +4403,12 @@ mod tests {
     fn an_extension_record_from_version_12_still_decodes() {
         let mut written_at_12 = vec![12u8];
         written_at_12.extend_from_slice(&[3, b'1', b'.', b'1']);
-        assert_eq!(record::decode_extension(&written_at_12).unwrap(), "1.1");
+        // **And it reads back as `public`**, which is where every extension a version-12 build
+        // could install actually went - the field did not exist because there was nowhere else.
+        assert_eq!(
+            record::decode_extension(&written_at_12).unwrap(),
+            ("1.1".to_owned(), "public".to_owned())
+        );
     }
 
     /// **Every record kind owns its own key byte**, and two that share one are two records in one
@@ -4452,7 +4466,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "23",                 // catalog format version
+                "24",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -5787,7 +5801,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "23",               // catalog format version
+                "24",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );
