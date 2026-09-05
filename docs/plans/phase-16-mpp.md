@@ -395,12 +395,20 @@ Named so the next person can check them rather than re-derive them:
 1. ~~**A SQL table that splits.**~~ **Done, 2026-09-05, by the `split` lane** (ADR 0073). The size
    estimate and the boundary scan see the SQL keyspace now. This was called "the cheapest of the
    three" and it was; what it unblocks is the *measurement*, not the exchange.
-2. **A finishing cost that grows past the scan.** The shape to watch is `regions × groups`: at 50
+2. **Fan-out is bounded by distinct stores, not by regions.** Measured on the first multi-region
+   cluster anyone ran: five regions, five columnar learners, on **two** distinct stores. PD places
+   a learner on the healthiest store *without a peer of that region*
+   (`esker_pd::schedule`), and with three voters and four stores few stores are free for any given
+   region, so learners cluster. An exchange's parallelism is the number of **nodes** holding the
+   fragments; a verdict reasoning from region count would have overestimated it by more than twice
+   on that cluster. `esker bench-mpp --diagnose` reports both numbers, and any re-measure must read
+   the second (`docs/bench/mpp-baseline.md` §9d).
+3. **A finishing cost that grows past the scan.** The shape to watch is `regions × groups`: at 50
    bytes and, say, 40 µs a group (36 ms over ~900 groups' worth of measurable difference — an upper
    bound, since the tick hides the rest), a hundred regions each holding 100,000 groups would ship
    500 MB into one node and merge ten million partials. That is where an exchange earns its keep,
    and it is four orders of magnitude from anything this system can currently produce.
-3. **Parallel dispatch first, if regions ever do split.** Fragments are asked one at a time
+4. **Parallel dispatch first, now that regions do split.** Fragments are asked one at a time
    (§1), so R regions cost R round trips before any merging happens. That is `esker-sql` and
    `esker-client`, no wire change, no shuffle, no spill — and on today's numbers a 25 ms round trip
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after

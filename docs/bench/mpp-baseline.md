@@ -287,69 +287,101 @@ This is `esker-store`'s and is escalated rather than acted on: a measurement mus
 measures, and this lane does not own that crate.
 
 
+
 ## 9. The multi-region correctness half — 2026-09-05
 
-ADR 0073 landed and a SQL table splits. §8 said the fragment-count axis was now reachable and that
-re-measuring was what this file owed. **The correctness half was run first, and it says the timing
-half cannot be run yet.**
+ADR 0073 landed and a SQL table splits, so §8's missing axis became reachable and the correctness
+half was run before the timing half. It found a real defect — and this section's **first version
+described it wrongly**, which is recorded below rather than quietly fixed, because the way it was
+wrong is the more useful half.
 
-`esker bench-mpp --diagnose` — the mode that reports what each path *does* instead of timing it,
-never failing on a statement, because what a path does across a boundary is the result:
+### 9a. What is true
 
-```bash
-esker-cli bench-mpp --stores 4 --rows 120000 --groups-high 2000 --batch 5000 \
-    --diagnose --region-split-size 4194304
+Five regions, each confirmed from its own leader, each with a columnar learner placed:
+
+| statement | row engine | columnar |
+|---|---|---|
+| `count(*)`, whole table | `08006 … key is not in region 1` | **1 row** |
+| aggregate with a filter | `08006` | **1 row** |
+| `GROUP BY`, low cardinality | `08006` | **32 rows** |
+| `GROUP BY`, high cardinality | `08006` | **5 rows** |
+| the join (semi-join shape) | `08006` | **1 row** |
+| range scan across the boundary | `08006` | `08006` |
+| full row scan, ordered | `08006` | `08006` |
+| point read below the split / past it | 1 row | 1 row |
+| insert past the split | commits | (duplicate key, proving the first did) |
+
+**The row scan path does not iterate regions.** It asks the first region for keys the first region
+does not hold, and `KeyNotInRegion` reaches the client as `08006` instead of moving on. Past a
+table's split threshold every row-path `SELECT` that is not a point read stops working, which is
+the whole of scale-out from SQL. Owned by `esker-client`'s range scan and `esker-sql`'s cursor;
+`crates/esker-cli/tests/cross_region_scan.rs` reproduces it in twelve seconds.
+
+**The fragment path does.** Five regions, five fragments, answers that agree with what the single
+region gave — including the semi-join. That is
+[ADR 0040](../adr/0040-the-engine-a-query-runs-on.md)'s *"one fragment per region"* demonstrated
+across a real boundary, and it means the working traversal and the broken one are in the same tree.
+
+The two rows that fail on **both** engines are consistent rather than contradictory: a bounded
+range and an ordered scan are never routed to the columns (ADR 0022 rule 1), so both fall back to
+the row path by design and meet the same defect.
+
+### 9b. The version of this that was wrong, and why
+
+The first run reported *"every scan fails across a region boundary, **on both engines**"*. That
+sentence was true of that run and false of the system. That run had **0 of 10 regions with a
+columnar learner**, so every columnar query refused and fell back to the row plan — and the row
+plan is the broken one. What was measured was the fallback; what was reported was the columnar
+path.
+
+**It is the denominator mistake, made in the one place nothing checked it.** `routing_differential`
+exists because *"a query that fell back agrees with the row engine for free"*, and it asserts
+`Engine: columnar` on every comparison for exactly this reason. A hand-run diagnostic matrix
+asserted no such thing, so a column headed `columnar` held numbers the row engine produced.
+
+The fix to the harness is the same rule: **`--diagnose` reports the `ALTER`'s outcome and samples
+placement until every region has a learner before it believes a column labelled `columnar`.**
+
+### 9c. Placement after a split: a clean negative
+
+The same weakness produced the same false reading twice, so it was tested rather than assumed.
+`ALTER TABLE … SET (columnar_replicas = 1)` **committed** — reported now instead of swallowed —
+and placement was then sampled rather than read once:
+
+```text
+| at   | regions | with a columnar learner |
+|  3ms |    5    |            0            |
+|  30s |    5    |            1            |
+|  45s |    5    |            3            |
+|  60s |    5    |            5            |
 ```
 
-The table split into **10 regions**, confirmed from each region's own leader. Then, on **both
-engines**:
+**A split half inherits `columnar_replicas` and gets a learner placed.** PD's wish list is keyed by
+key range and a half is inside the table's range, so the rule predicted it and the measurement
+confirms it. The earlier "0 of 10" was one reading taken immediately after the `ALTER`, at a 60 s
+region heartbeat — a number equally consistent with *not yet* and with *never*, which is why a
+series and not a sample is what settles it.
 
-| statement | row | columnar |
-|---|---|---|
-| `count(*)`, whole table | `08006 … key is not in region 1` | same |
-| aggregate with a filter | `08006` | same |
-| `GROUP BY`, low and high cardinality | `08006` | same |
-| the join (semi-join shape) | `08006` | same |
-| range scan across the boundary | `08006` | same |
-| full row scan, ordered | `08006` | same |
-| **point read below the split** | **1 row** | 1 row |
-| **point read past the split** | **1 row** | 1 row |
-| **insert past the split** | **committed** | (duplicate key, proving the first did) |
+**No defect. Nothing for `esker-pd` or `esker-store`.**
 
-### What that means, stated carefully
+### 9d. Five learners, two stores — the number the exchange would actually be limited by
 
-**Routing, the region cache and the write path all follow a boundary.** A point read at either end
-of the table answers, and a write past the split commits. So the region cache is not simply stale
-and the router is not simply wrong.
+The five learners landed on **two** distinct stores, not five. PD places one on the *healthiest
+store without a peer of that region* (`esker_pd::schedule`), and with three voters and four stores
+few stores are free for any given region — so learners cluster.
 
-**A scan does not.** It asks the first region for keys the first region does not hold, and
-`KeyNotInRegion` reaches the client as `08006` instead of moving on to the next region. It is
-below the engine choice — both engines fail identically — so it is the row scan path, not the
-fragment path, and not this milestone's routing.
+That is worth more to milestone 5 than it looks. An exchange's parallelism is bounded by the number
+of **distinct nodes** holding the fragments, not by the number of regions, and this cluster has
+five fragments on two nodes. A verdict that reasoned from region count would overestimate the
+available parallelism by more than twice on the very first multi-region cluster anyone measured.
+`--diagnose` reports both numbers for that reason, and §10's re-measure must read the second.
 
-**The cost is scale-out from SQL.** The moment a table grows past its split threshold, every
-`SELECT` that is not a point read stops working. This is the first build in which that can happen,
-which is why it has not been seen before.
+### 9e. What is still unanswered
 
-### What is answered and what is not
-
-ADR 0040's questions this run was meant to answer — does one fragment go to each region, does the
-client's cache refresh on `EpochNotMatch`, do the engines agree across regions — **cannot be
-answered while no scan completes.** Nothing here contradicts them; they are simply not reachable
-past the failure above. Also unanswered: **0 of 10 regions had a columnar learner**, so the
-columnar path was never exercised multi-region at all.
-
-### The red test
-
-`crates/esker-cli/tests/cross_region_scan.rs` reproduces it in **12 seconds** — 200 rows of 4 KiB
-across a 256 KiB threshold, six regions, one `count(*)` — against the real binaries, speaking the
-wire itself so it cannot skip. It is red, and it is handed to whoever owns `esker-client` and
-`esker-sql`'s cursor rather than fixed here: those are not this lane's paths.
-
-**It must not land while it is red.** A red test on `main` is a broken gate for every lane.
-
-### The timing half is blocked on this
-
-The exchange verdict's re-measure (§8) and the join's before/after both need a multi-region scan
-to complete. Neither can be taken until the scan path is fixed, and no quiet window will change
-that. The single-region numbers in §7 stand and remain labelled as such.
+* **The cache refreshing on `EpochNotMatch`** — not reachable while the row path fails before a
+  refresh would be exercised.
+* **The engines agreeing across regions** — the columnar side answers and the row side errors, so
+  there is no pair to compare. This is what the differential is for and it needs the scan fix.
+* **The timing half.** The exchange re-measure and the join before/after need both engines to
+  complete; neither is blocked on a quiet window, and scheduling one before the scan fix would
+  waste it. §7's single-region numbers stand and remain labelled single-region.
