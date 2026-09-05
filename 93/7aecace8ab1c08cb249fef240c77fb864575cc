@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/dml.rs
+  s_2bed4ac2b1c944::t_c071cca7d3aab3 589
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_c2a35ac58a2094 3214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "937aecace8ab1c08cb249fef240c77fb864575cc",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
