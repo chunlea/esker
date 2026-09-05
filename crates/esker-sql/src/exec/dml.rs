@@ -503,11 +503,11 @@ fn updatable(
         })
     };
 
-    if !body.joins.is_empty() || body.from.is_none() {
+    let Some(from) = body.from.as_ref().filter(|_| body.joins.is_empty()) else {
         return refuse(
             "Views that do not select from a single table or view are not automatically updatable.",
         );
-    }
+    };
     if body.distinct {
         return refuse("Views containing DISTINCT are not automatically updatable.");
     }
@@ -517,7 +517,6 @@ fn updatable(
     if body.limit.is_some() || body.offset.is_some() {
         return refuse("Views containing LIMIT or OFFSET are not automatically updatable.");
     }
-    let from = body.from.as_ref().expect("checked above");
     if from.derived.is_some() || from.values.is_some() || from.function.is_some() {
         return refuse(
             "Views that do not select from a single table or view are not automatically updatable.",
@@ -580,6 +579,47 @@ fn rename_columns(
     });
 }
 
+/// The `UPDATE` a view's write becomes, against the table underneath.
+fn update_onto(update: &Update, view: Updatable) -> Update {
+    let mut rewritten = update.clone();
+    rewritten.table = view.table;
+    rewritten.assignments = rewritten
+        .assignments
+        .into_iter()
+        .map(|(column, mut value)| {
+            rename_columns(&mut value, &view.renames);
+            match view.renames.get(&column) {
+                Some(base) => (base.clone(), value),
+                None => (column, value),
+            }
+        })
+        .collect();
+    if let Some(filter) = &mut rewritten.filter {
+        rename_columns(filter, &view.renames);
+    }
+    // **The view's own `WHERE` bounds the write**, which is the whole of what makes
+    // `UPDATE p SET …` touch one row rather than every row of the table.
+    rewritten.filter = both(rewritten.filter, view.filter);
+    rewritten
+}
+
+/// The `INSERT` a view's write becomes.
+///
+/// **The view's `WHERE` is not applied.** Without `WITH CHECK OPTION` a real server lets a row be
+/// inserted that the view will not show, and measured it does exactly that.
+fn insert_onto(insert: &Insert, view: Updatable) -> Insert {
+    let mut rewritten = insert.clone();
+    rewritten.table = view.table;
+    if let Some(columns) = &mut rewritten.columns {
+        for column in columns.iter_mut() {
+            if let Some(base) = view.renames.get(column) {
+                column.clone_from(base);
+            }
+        }
+    }
+    rewritten
+}
+
 /// Which write is being refused, for the message.
 #[derive(Clone, Copy)]
 enum Verb {
@@ -623,18 +663,7 @@ pub(super) fn insert(
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&insert.table)?;
     if let Some(view) = updatable(executor, txn, &insert.table, Verb::Insert)? {
-        let mut rewritten = insert.clone();
-        rewritten.table = view.table;
-        if let Some(columns) = &mut rewritten.columns {
-            for column in columns.iter_mut() {
-                if let Some(base) = view.renames.get(column) {
-                    column.clone_from(base);
-                }
-            }
-        }
-        // **The view's `WHERE` is not applied**: without `WITH CHECK OPTION` a real server lets a
-        // row be inserted that the view will not show, and measured it does exactly that.
-        return self::insert(executor, txn, &rewritten, written);
+        return self::insert(executor, txn, &insert_onto(insert, view), written);
     }
     let table = executor.require_table(txn, &insert.table)?;
     refuse_matview_write(&table, &insert.table)?;
@@ -1082,26 +1111,7 @@ pub(super) fn update(
     // **A write on a simple view goes to the table underneath.** Before `require_table`, which
     // knows only tables and answered `42P01` for a view that is right there.
     if let Some(view) = updatable(executor, txn, &update.table, Verb::Update)? {
-        let mut rewritten = update.clone();
-        rewritten.table = view.table;
-        for (_, value) in &mut rewritten.assignments {
-            rename_columns(value, &view.renames);
-        }
-        rewritten.assignments = rewritten
-            .assignments
-            .into_iter()
-            .map(|(column, value)| match view.renames.get(&column) {
-                Some(base) => (base.clone(), value),
-                None => (column, value),
-            })
-            .collect();
-        if let Some(filter) = &mut rewritten.filter {
-            rename_columns(filter, &view.renames);
-        }
-        // **The view's own `WHERE` bounds the write**, which is the whole of what makes
-        // `UPDATE p SET …` touch one row rather than every row of the table.
-        rewritten.filter = both(rewritten.filter, view.filter);
-        return self::update(executor, txn, &rewritten, written);
+        return self::update(executor, txn, &update_onto(update, view), written);
     }
     let named = executor.require_table(txn, &update.table)?;
     refuse_matview_write(&named, &update.table)?;
