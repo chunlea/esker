@@ -1,0 +1,19 @@
+crates/esker-sql/src/exec/fragment.rs
+  s_609bbbdbf3c419::t_68d810789c3abd 1457-1462
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a30e57c36abdcc630f516e132acbf7c8f71594de",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
