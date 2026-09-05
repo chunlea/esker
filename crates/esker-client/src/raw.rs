@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crate::clock::Clock;
 use crate::error::{Error, Result};
 use crate::region_cache::{RegionCache, RegionResolver};
-use crate::router::Router;
+use crate::router::{Router, clamp_end, owns};
 use crate::transport::StoreTransport;
 use crate::wire::{Body, DEFAULT_SCAN_LIMIT, Method, RawKvReq, RawKvResp};
 
@@ -178,6 +178,21 @@ impl RawClient {
         self.scan_with(start, end, limit, true)
     }
 
+    /// Walks the regions of `[start, end)`, asking each only for the keys it holds.
+    ///
+    /// **This sent one request for the whole range**, which a store refuses the moment the range
+    /// leaves its region — `RegionMeta::check_range` requires containment, and invariant 5 is why
+    /// it is right to. `Transaction::scan` was fixed for that first, because SQL reads through it
+    /// and a table past the split threshold made every non-point `SELECT` answer
+    /// `08006 key is not in region 1`; this is the same defect on the `RawKV` path, found while
+    /// fixing that one and unreachable only because nothing scans large `RawKV` ranges today.
+    ///
+    /// The two directions differ in one way and it is not the clamp. A forward scan can walk
+    /// lazily — ask, take the region's end, carry on from it — because the next region is found
+    /// with a key it already has. A **reverse** scan needs the *last* region first, and routing
+    /// only answers "who holds this key", so there is no key to ask with when `end` is empty. It
+    /// therefore enumerates the regions forward and visits them backwards, which costs the walk up
+    /// front and is the only order that can be right.
     fn scan_with(
         &self,
         start: &[u8],
@@ -185,15 +200,77 @@ impl RawClient {
         limit: u32,
         reverse: bool,
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        let request = RawKvReq::Scan {
-            start: Bytes::copy_from_slice(start),
-            end: Bytes::copy_from_slice(end),
-            limit: self.bounded_limit(limit),
-            reverse,
-        };
-        match self.call(&request)? {
-            RawKvResp::Scan { pairs } => Ok(pairs),
-            other => Err(unexpected(Method::RawScan, &other)),
+        let limit = self.bounded_limit(limit);
+        let mut pairs = Vec::new();
+        for (from, to) in self.regions_of(start, end, reverse)? {
+            if pairs.len() >= limit as usize {
+                break;
+            }
+            pairs.extend(self.scan_region(&from, &to, limit, reverse)?);
+        }
+        pairs.truncate(limit as usize);
+        Ok(pairs)
+    }
+
+    /// The `[from, to)` pieces of `[start, end)`, one per region, in the order the scan visits them.
+    fn regions_of(&self, start: &[u8], end: &[u8], reverse: bool) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut pieces = Vec::new();
+        let mut cursor = Bytes::copy_from_slice(start);
+        for _ in 0..crate::txn::MAX_SCAN_REGIONS {
+            let boundary = self.router.route(&cursor)?.region.end_key;
+            let piece_end = clamp_end(end, &boundary);
+            pieces.push((cursor.clone(), piece_end));
+            if boundary.is_empty()
+                || (!end.is_empty() && boundary.as_ref() >= end)
+                || boundary <= cursor
+            {
+                break;
+            }
+            cursor = boundary;
+        }
+        if reverse {
+            pieces.reverse();
+        }
+        Ok(pieces)
+    }
+
+    /// One region's worth, repairing a boundary the region has moved under.
+    ///
+    /// The refusal names the range the store actually owns, and that is believed over the region
+    /// cache for the reason `Transaction::scan_region` records: a store knows about its own split
+    /// at once and the placement driver at the next heartbeat, so re-asking the driver inside that
+    /// window returns the same stale boundary.
+    fn scan_region(
+        &self,
+        from: &Bytes,
+        to: &Bytes,
+        limit: u32,
+        reverse: bool,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut to = to.clone();
+        let mut refreshes = 0;
+        loop {
+            let request = RawKvReq::Scan {
+                start: from.clone(),
+                end: to.clone(),
+                limit,
+                reverse,
+            };
+            match self.call(&request) {
+                Ok(RawKvResp::Scan { pairs }) => return Ok(pairs),
+                Ok(other) => return Err(unexpected(Method::RawScan, &other)),
+                Err(Error::Store(crate::wire::ProtoError::KeyNotInRegion {
+                    start_key,
+                    end_key,
+                    ..
+                })) if refreshes < crate::txn::SCAN_ROUTE_REFRESHES
+                    && owns(&start_key, &end_key, from) =>
+                {
+                    refreshes += 1;
+                    to = clamp_end(&to, &end_key);
+                }
+                Err(other) => return Err(other),
+            }
         }
     }
 

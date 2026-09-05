@@ -111,12 +111,19 @@ fn a_blocked_statement_is_cancelled_by_the_session_holding_its_row() {
     // B: the victim, on its own session, through `Parse`/`Bind`/`Execute`.
     let sessions = pair.sessions();
     let victim = std::thread::spawn(move || {
+        let hears_a = hears_a;
         let mut node = sessions.session();
         let mut session = Session::new();
         simple(&mut session, &mut node, "BEGIN");
         // Far past the cancellation, so that a cancel that never lands is a `55P03` this test can
         // name rather than a hang the runner has to kill.
         simple(&mut session, &mut node, "SET lock_timeout = '20s'");
+        // **A must hold the row before B asks for it.** Without this B is free to win the race,
+        // take the lock itself and finish — which is not a cancellation that missed, it is a test
+        // that never set up the situation it names. It failed exactly that way twice under a full
+        // gate and never once alone: `left: None` in seven milliseconds, a victim that simply
+        // committed. The channel for it existed and was dropped instead of waited on.
+        edge(&hears_a, "A holds the row");
         reached(&b_says, "B is about to block");
         let out = extended(
             &mut session,
@@ -137,9 +144,8 @@ fn a_blocked_statement_is_cancelled_by_the_session_holding_its_row() {
         "SELECT value FROM samples WHERE id = $1 FOR UPDATE",
         vec![Some(b"1".to_vec())],
     );
+    reached(&a_says, "A holds the row");
     edge(&hears_b, "B is about to block");
-    let _ = a_says.send("A holds it");
-    let _ = hears_a;
 
     // The Rails hunt, verbatim — no `state` filter and no `pid <> pg_backend_pid()` — and its
     // **first row**, which is the whole of what this asserts.
@@ -280,6 +286,7 @@ fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
     ]);
     let (b_pid, hears_b_pid) = channel();
     let (b_says, hears_b) = channel();
+    let (a_says, a_holds) = channel();
 
     let sessions = pair.sessions();
     let victim = std::thread::spawn(move || {
@@ -287,6 +294,10 @@ fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
         let _ = b_pid.send(node.rows("SELECT pg_backend_pid()")[0][0].clone());
         node.run("BEGIN").unwrap();
         node.run("SET lock_timeout = '20s'").unwrap();
+        // The same handshake the test above needs, and for the same reason: without it B may take
+        // the row first, and then it is the holder and A is the waiter — the opposite of what this
+        // asserts, reached without any assertion failing to say so.
+        edge(&a_holds, "A holds the row");
         reached(&b_says, "B is about to block");
         let _ = node.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE");
     });
@@ -299,6 +310,7 @@ fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
     a.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE")
         .unwrap();
     let waiter = hears_b_pid.recv().expect("B says who it is");
+    reached(&a_says, "A holds the row");
     edge(&hears_b, "B is about to block");
     std::thread::sleep(Duration::from_millis(300));
 
