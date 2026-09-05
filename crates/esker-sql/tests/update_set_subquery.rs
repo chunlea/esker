@@ -108,3 +108,32 @@ fn a_subquery_returning_more_than_one_row_is_refused() {
         "a refused statement writes nothing"
     );
 }
+
+/// **Run once, before the first row — and this is the test that can tell.**
+///
+/// `max` cannot: it is idempotent here, so a subquery re-run after every write still answers 3.
+/// `sum` can. Measured on 19beta1, `UPDATE h1s_d SET n = (SELECT sum(n) FROM h1s_d)` over
+/// `(1, 2, 3)` leaves **6, 6, 6** — the sum as the statement found it. A node that planned and ran
+/// the subquery per row would write 6, then sum `(6, 2, 3)` for the second row and write 11, then
+/// sum `(6, 11, 3)` and write 20: a statement reading its own writes, with a different answer on
+/// every row and no error to say so.
+#[test]
+fn an_uncorrelated_subquery_over_the_target_reads_the_pre_statement_rows() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE h1s_d (id bigint primary key, n bigint)",
+        "INSERT INTO h1s_d VALUES (1, 1), (2, 2), (3, 3)",
+    ]);
+    assert_eq!(
+        node.answer("UPDATE h1s_d SET n = (SELECT sum(n) FROM h1s_d)"),
+        parity::Answer::Done
+    );
+    assert_eq!(
+        node.rows("SELECT id, n FROM h1s_d ORDER BY id"),
+        vec![
+            vec!["1".to_owned(), "6".to_owned()],
+            vec!["2".to_owned(), "6".to_owned()],
+            vec!["3".to_owned(), "6".to_owned()]
+        ],
+        "6, 11, 20 would be the subquery re-run after each write"
+    );
+}
