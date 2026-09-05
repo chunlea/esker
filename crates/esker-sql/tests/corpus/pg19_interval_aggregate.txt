@@ -1,0 +1,78 @@
+# **`sum` and `avg` over an interval**, and the division an average is, from PostgreSQL 19beta1.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, in this order. The derivation behind the
+# division rows is `tests/captures/pg19_interval_aggregate.txt`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`avg(interval)` is `sum / count` through the same code `interval / n` is.** 180 measured
+#     pairs — twenty values by nine divisors — agree byte for byte, which is also why the
+#     accumulator must keep the exact sum and divide once: the mean of two means is not the mean,
+#     and here it is not even the same rounding.
+#   * **`1 mon / 3` is `10 days`, and only rounding makes it so.** `(1/3) * 30` is
+#     `9.999999999999998` in a double, so scaling each field and truncating answers
+#     `9 days 23:59:59.999999` — wrong in the last microsecond and unrecognisable in print.
+#   * **`1 mon / 9` is `3 days 07:59:59.9712`, not `3 days 08:00:00`.** The month's remainder is
+#     rounded to six decimals **as a number of days** (`0.333333`) before its whole days are split
+#     off; rounding the seconds instead gives the wrong answer here.
+#   * **`100 days / 7` keeps full precision** (`14 days 06:51:25.714286`): the flattening is
+#     confined to the month remainder and does not touch the day remainder.
+#   * **The time field is not normalised into days.** `'1 mon 1 day 23:59:59.999999' / 16` is
+#     `1 day 24:00:00` — twenty-four hours in a field beside a day field of one.
+#   * **The last microsecond rounds ties to even**: `3 us / 2` is `2 us` and `5 us / 2` is `2 us`,
+#     which neither truncation nor half-away-from-zero produces.
+#   * **`sum(time)` and `avg(time)` exist and are `interval`s**, where `min(time)` is a `time`.
+#     `sum(timestamp)`, `avg(timestamp)` and `sum(date)` do not exist at all.
+#   * **`sum` overflows**: `22008 interval out of range`, where `/ 0` is `22012 division by zero`.
+#   * `DISTINCT` **converts** before it deduplicates: `1 mon` and `30 days` are one value.
+CREATE TABLE ia (id int8 PRIMARY KEY, g int4, v interval, t time, ts timestamp)		-
+INSERT INTO ia VALUES (1, 1, '1 mon', '01:00:00', '2020-01-01 00:00:00'), (2, 1, '1 day', '02:00:00', '2020-01-02 00:00:00'), (3, 2, '3 days', NULL, NULL), (4, 2, NULL, '23:30:00', NULL)		-
+SELECT sum(v), avg(v) FROM ia	interval,interval	1 mon 4 days|11 days 08:00:00
+SELECT pg_typeof(sum(v)), pg_typeof(avg(v)) FROM ia	regtype,regtype	interval|interval
+SELECT g, sum(v), avg(v) FROM ia GROUP BY g ORDER BY g	integer,interval,interval	1|1 mon 1 day|15 days 12:00:00 ; 2|3 days|3 days
+SELECT avg(v) FROM ia WHERE id = 3	interval	3 days
+SELECT sum(v) FROM ia WHERE false	interval	\N
+SELECT avg(v) FROM ia WHERE false	interval	\N
+SELECT sum(v), avg(v), count(v), count(*) FROM ia WHERE v IS NULL	interval,interval,bigint,bigint	\N|\N|0|1
+SELECT min(v), max(v) FROM ia	interval,interval	1 day|1 mon
+SELECT pg_typeof(min(v)), pg_typeof(max(v)) FROM ia	regtype,regtype	interval|interval
+SELECT sum(t), avg(t) FROM ia	interval,interval	26:30:00|08:50:00
+SELECT pg_typeof(sum(t)), pg_typeof(avg(t)) FROM ia	regtype,regtype	interval|interval
+SELECT pg_typeof(min(t)), pg_typeof(max(t)) FROM ia	regtype,regtype	time without time zone|time without time zone
+SELECT sum(ts) FROM ia	!42883 function sum(timestamp without time zone) does not exist
+SELECT avg(ts) FROM ia	!42883 function avg(timestamp without time zone) does not exist
+SELECT sum(DISTINCT v), avg(DISTINCT v) FROM ia	interval,interval	1 mon 4 days|11 days 08:00:00
+SELECT avg(v) FROM (VALUES ('1 mon'::interval), ('1 day')) t(v)	interval	15 days 12:00:00
+SELECT avg(v) FROM (VALUES ('1 day'::interval), ('2 days')) t(v)	interval	1 day 12:00:00
+SELECT avg(v) FROM (VALUES ('6 years'::interval), ('4 mons')) t(v)	interval	3 years 2 mons
+SELECT avg(v) FROM (VALUES ('1 mon'::interval), ('1 mon'), ('1 mon')) t(v)	interval	1 mon
+SELECT avg(v) FROM (VALUES ('1 mon'::interval), ('0'::interval), ('0'::interval)) t(v)	interval	10 days
+SELECT avg(v), sum(v) FROM (VALUES ('1 mon'::interval), ('30 days')) t(v)	interval,interval	30 days|1 mon 30 days
+SELECT sum(v) FROM (VALUES ('12 mons'::interval), ('1 mon')) t(v)	interval	1 year 1 mon
+SELECT sum(v) FROM (VALUES ('23:00:00'::interval), ('02:00:00')) t(v)	interval	25:00:00
+SELECT avg(v) FROM (VALUES ('1 mon'::interval), ('0.000001 sec'), ('7 days'), ('-3 mons 2 days 01:02:03.456789')) t(v)	interval	-13 days +06:15:30.864198
+SELECT sum(v) FROM (VALUES ('2147483647 days'::interval), ('1 day')) t(v)	!22008 interval out of range
+SELECT avg(v) FROM (VALUES ('178956970 years 6 mons'::interval)) t(v)	interval	178956970 years 6 mons
+SELECT '1 mon'::interval / 2, '1 mon'::interval / 3	interval,interval	15 days|10 days
+SELECT '1 mon'::interval / 7, '1 mon'::interval / 9	interval,interval	4 days 06:51:25.6896|3 days 07:59:59.9712
+SELECT '1 mon'::interval / 24, '1 mon'::interval / 60	interval,interval	1 day 06:00:00|12:00:00
+SELECT '7 mons'::interval / 9, '1 year'::interval / 7	interval,interval	23 days 07:59:59.9712|1 mon 21 days 10:17:08.5344
+SELECT '1 mon 1 day'::interval / 7, '1 mon -2 days'::interval / 7	interval,interval	4 days 10:17:08.546743|4 days -00:00:00.024686
+SELECT '100 days'::interval / 7, '1 day -12:00:00'::interval / 7	interval,interval	14 days 06:51:25.714286|01:42:51.428572
+SELECT '1 mon 29 days'::interval / 16, '11 mons 29 days'::interval / 16	interval,interval	3 days 16:30:00|22 days 10:30:00
+SELECT '3 mons 29 days'::interval / 7	interval	17 days 00:00:00.012343
+SELECT '1 mon 1 day 23:59:59.999999'::interval / 16	interval	1 day 24:00:00
+SELECT '-1 mons'::interval / 4, '-1 mons -1 days -01:00:00'::interval / 7	interval,interval	-7 days -12:00:00|-4 days -10:25:42.832457
+SELECT '0.000001 sec'::interval / 2, '0.000003 sec'::interval / 2	interval,interval	00:00:00|00:00:00.000002
+SELECT '0.000005 sec'::interval / 2, '0.000009 sec'::interval / 2	interval,interval	00:00:00.000002|00:00:00.000004
+SELECT '-0.000003 sec'::interval / 2, '-0.000005 sec'::interval / 2	interval,interval	-00:00:00.000002|-00:00:00.000002
+SELECT '0.000003 sec'::interval / 4, '0.000007 sec'::interval / 4	interval,interval	00:00:00.000001|00:00:00.000002
+SELECT '1 mon'::interval * 0.1111111111111111, '1 mon'::interval * 0.0625	interval,interval	3 days 07:59:59.9712|1 day 21:00:00
+SELECT '11 mons 29 days'::interval * 0.0625, '1 mon 29 days'::interval * 2.5	interval,interval	22 days 10:30:00|2 mons 87 days 12:00:00
+SELECT '1 mon'::interval / 0	!22012 division by zero
+SELECT '2147483647 days'::interval / 0.5	!22008 interval out of range
+SELECT '2147483647 days'::interval + '1 day'::interval	!22008 interval out of range

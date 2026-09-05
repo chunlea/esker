@@ -1,0 +1,142 @@
+# **`sum` and `avg` over an interval, and the division an average is** — PostgreSQL 19beta1,
+# 2026-09-05.
+#
+# WHY THIS WAS CAPTURED
+#
+# `interval_test.rb`'s fourth test stops at `PG::UndefinedFunction: ERROR: function avg(interval)
+# does not exist`, and everything after it in the file is `current transaction is aborted`. This
+# node's `Executor::result_type` refuses `Sum` and `Avg` over `ColumnType::Interval` where `min`
+# and `max` fall through and answer.
+#
+# The obvious reading — "an average is a sum divided by a count, and this node already has
+# `interval / n`" — is right about the shape and **wrong about the arithmetic**, and that is the
+# whole content of this capture.
+#
+# ==============================================================================================
+# 1. THE AVERAGE IS THE DIVISION, MEASURED RATHER THAN ASSUMED
+# ==============================================================================================
+#
+# Twenty values crossed with nine divisors, each divisor `n` also run as an average over `n` rows
+# whose sum is the value:
+#
+#     SELECT v::text, n, (v / n)::text,
+#            (SELECT avg(CASE WHEN i = 1 THEN v ELSE '0'::interval END)::text
+#               FROM generate_series(1, n) g(i))
+#     FROM vals, ns ORDER BY 1, 2;
+#
+# **180 rows, 180 agreements, byte for byte.** `avg(interval)` is `interval_div(sum, count)` and
+# not a fold, which also settles that the accumulator must keep the exact sum and divide **once**
+# at the end — the mean of two means is not the mean, and here it is not even the same rounding.
+#
+# ==============================================================================================
+# 2. WHAT THE DIVISION ACTUALLY DOES — derived from the table, not from memory
+# ==============================================================================================
+#
+# The three fields are independent, and a fraction cascades *down* only: months into days at
+# thirty days a month, days into microseconds at 86400 seconds a day. Nothing cascades up. What no
+# amount of reasoning would have produced is **where the rounding is**:
+#
+#     1 mon / 3   ->  10 days                      exactly, no seconds
+#     1 mon / 7   ->  4 days 06:51:25.6896
+#     1 mon / 9   ->  3 days 07:59:59.9712         NOT 3 days 08:00:00
+#     100 days / 7 -> 14 days 06:51:25.714286      full precision, no 1e-6 flattening
+#
+# `1 mon / 3` is the sharp one. In double, `(1/3) * 30` is `9.999999999999998`, so a truncating
+# implementation answers `9 days 23:59:59.999999` — a value that is wrong in the last microsecond
+# and prints as a completely different interval. PostgreSQL answers `10 days`.
+#
+# `1 mon / 9` is the one that says the rounding is **not** applied where you would put it. The same
+# reasoning that fixes `/3` by rounding the seconds gives `3 days 08:00:00` here; the measured
+# answer is 28800 microseconds short of that, which is exactly what you get if the *day* remainder
+# is rounded to six decimals — `0.333333` — and only then multiplied by 86400.
+#
+# And `100 days / 7` says that flattening is confined to the month remainder: the day remainder
+# keeps its full double precision and prints `.714286`, where a blanket six-decimal round would
+# have given `.6896`.
+#
+# The rule the whole table fits, with every step measured:
+#
+#     month'  = trunc(months / n)
+#     rem_d   = round6((months / n - month') * 30)          <- six decimals, in DAYS
+#     day'    = trunc(days / n)
+#     rem_s   = round6((days / n - day' + rem_d - trunc(rem_d)) * 86400)   <- six decimals, in SECONDS
+#     if |rem_s| >= 86400:  day' += trunc(rem_s / 86400);  rem_s -= trunc(rem_s / 86400) * 86400
+#     day'   += trunc(rem_d)
+#     micros' = round_ties_even(micros / n + rem_s * 1e6)
+#
+# `round6` is itself ties-to-even. Every truncation is toward zero, which is what makes the
+# negative rows come out with per-field signs rather than a borrow.
+#
+# Rows that pin each step, all measured:
+#
+#     rem_d rounding decides the day       1 mon / 3                    10 days
+#     rem_d rounding is in days            1 mon / 9                    3 days 07:59:59.9712
+#     rem_s keeps full precision           100 days / 7                 14 days 06:51:25.714286
+#     both remainders, carry taken         11 mons 29 days / 16         22 days 10:30:00
+#     carry with a remainder left over     3 mons 29 days / 7           17 days 00:00:00.012343
+#     the two remainders cancel            1 mon -2 days / 7            4 days -00:00:00.024686
+#     truncation toward zero               -1 mons / 4                  -7 days -12:00:00
+#
+# **The seconds field is not normalised into days at the end.** `'1 mon 1 day 23:59:59.999999' /
+# 16` is `1 day 24:00:00` — a full day *in the time field*, beside a day field of 1. The carry
+# above applies to the remainder being cascaded, never to the result.
+#
+# ROUNDING IS TIES-TO-EVEN, AND BOTH HALVES OF THAT WERE MEASURED
+#
+#     1 us / 2  ->  00:00:00           0.5 -> 0, so not half-away-from-zero
+#     3 us / 2  ->  00:00:00.000002    1.5 -> 2, so not truncation
+#     5 us / 2  ->  00:00:00.000002    2.5 -> 2, which only ties-to-even gives
+#     9 us / 2  ->  00:00:00.000004    4.5 -> 4
+#    -3 us / 2  -> -00:00:00.000002    and the negatives mirror
+#
+# MULTIPLICATION IS THE SAME FUNCTION
+#
+#     1 mon * 0.1111111111111111  ->  3 days 07:59:59.9712   = 1 mon / 9
+#     1 mon * 0.33333333333333333 ->  10 days                = 1 mon / 3
+#
+# so the fix belongs in the one place both operators go through, and `/` may keep dividing by the
+# factor rather than multiplying by its reciprocal — measured to agree at 3 and at 9.
+#
+# ==============================================================================================
+# 3. THE AGGREGATE CENSUS — which of them exist over a temporal type at all
+# ==============================================================================================
+#
+#     SELECT a.aggfnoid::regprocedure, pg_get_function_result(p.oid)
+#     FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid
+#     WHERE p.pronargs = 1 AND p.proargtypes[0] IN (1186, 1083, 1266, 1114, 1184, 1082);
+#
+#     avg(interval)                    interval
+#     sum(interval)                    interval
+#     min(interval) max(interval)      interval
+#     min/max(date, time, timetz, timestamp, timestamptz)   the argument's own type
+#
+# **There is no `sum(date)`, no `avg(timestamp)`, no `sum(timetz)`** — 42883, each naming the type
+# in full. And the row that is not in that census and exists anyway:
+#
+#     SELECT pg_typeof(sum(v)), pg_typeof(avg(v)) FROM (VALUES ('12:00:00'::time)) t(v);
+#      interval | interval
+#
+# `sum(time)` and `avg(time)` **do exist**, through the implicit `time -> interval` cast, and they
+# answer an `interval` where `min(time)` answers a `time`. ADR 0031's rule about the aggregate set
+# being per type, one type further: it is not even per type, it is per (aggregate, type) pair.
+#
+#     sum(time) over 01:00, 02:00, 23:30   ->  26:30:00     an interval, past a day
+#     avg(time) over the same               ->  08:50:00
+#
+# ==============================================================================================
+# 4. THE EDGES
+# ==============================================================================================
+#
+#     avg over no rows                        NULL          (and sum over no rows, NULL)
+#     avg over rows that are all NULL         NULL
+#     avg skips NULLs                         avg(1 day, NULL, 3 days) = 2 days
+#     sum('2147483647 days', '1 day')         22008 interval out of range   (finite_interval_pl)
+#     '2147483647 days' / 0.5                 22008 interval out of range   (interval_div)
+#     '1 mon' / 0                             22012 division by zero
+#     '1 mon' / 'NaN'::float8                 22008 interval out of range
+#     avg of one 178956970 years 6 mons       itself: dividing by 1 cannot overflow
+#     sum(DISTINCT), avg(DISTINCT)            distinctness **converts**: 1 mon and 30 days are one
+#                                             value, and the sum of the two is 1 mon
+#
+# Every probe above ran inside one `BEGIN … ROLLBACK` with a `SAVEPOINT` per probe; the final
+# count of temp relations was 0 before and after the rollback.
