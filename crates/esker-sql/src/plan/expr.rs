@@ -1175,7 +1175,6 @@ impl CatalogFunc {
             // was written — `crate::exec::Executor::resolve_user_function` is where a wrong one is
             // answered, because only the catalog knows how many the function has.
             CatalogFunc::UserFunc => &[1, 2, 3, 4, 5, 6, 7, 8],
-            CatalogFunc::PgSleep => &[1],
             CatalogFunc::FormatType
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
@@ -1227,7 +1226,8 @@ impl CatalogFunc {
             | CatalogFunc::PgTypeof
             | CatalogFunc::LtreeNlevel
             | CatalogFunc::LtreeToText
-            | CatalogFunc::TextToLtree => &[1],
+            | CatalogFunc::TextToLtree
+            | CatalogFunc::PgSleep => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
