@@ -65,7 +65,7 @@ use bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::region_cache::RegionResolver;
 use crate::retry::backoff_ms;
-use crate::router::{ClientOptions, Router, fan_out};
+use crate::router::{ClientOptions, Router, clamp_end, fan_out, owns};
 use crate::transport::StoreTransport;
 use crate::wire::{
     Body, DEFAULT_SCAN_LIMIT, LockInfo, Method, ProtoError, Response, TxnKvReq, TxnKvResp,
@@ -143,29 +143,6 @@ pub const MAX_LOCK_RESOLUTIONS: u32 = 8;
 /// and not a deadline. Four, because the measured case is a table splitting under a bulk load and
 /// one was demonstrably too few (`Transaction::scan_region`).
 pub const SCAN_ROUTE_REFRESHES: usize = 4;
-
-/// Whether `[start_key, end_key)` — a region, as the store named it — contains `key`.
-///
-/// An empty `end_key` is the end of the key space; an empty `start_key` is its beginning.
-fn owns(start_key: &Bytes, end_key: &Bytes, key: &Bytes) -> bool {
-    start_key.as_ref() <= key.as_ref() && (end_key.is_empty() || key.as_ref() < end_key.as_ref())
-}
-
-/// A scan page's end: the caller's, or the region's, whichever comes first.
-///
-/// **An empty key means "the end of the key space" on both sides**, and they mean it in opposite
-/// directions here — an empty `boundary` is the last region, so the caller's own `end` stands; an
-/// empty `end` is an unbounded scan, so the region's boundary is what bounds this page. Reading
-/// either one as a literal empty string would clamp every page to nothing.
-fn clamp_end(end: &[u8], boundary: &Bytes) -> Bytes {
-    if boundary.is_empty() {
-        return Bytes::copy_from_slice(end);
-    }
-    if end.is_empty() || boundary.as_ref() < end {
-        return boundary.clone();
-    }
-    Bytes::copy_from_slice(end)
-}
 
 /// Where timestamps come from (`CLAUDE.md` invariant 6).
 ///

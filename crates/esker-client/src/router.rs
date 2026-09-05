@@ -426,6 +426,32 @@ impl Router {
     }
 }
 
+/// Whether `[start_key, end_key)` — a region, as the store named it — contains `key`.
+///
+/// Beside the router rather than beside either scan, because **both** scans need it and a second
+/// copy of a range rule is a second chance to get an empty key's two meanings backwards.
+///
+/// An empty `end_key` is the end of the key space; an empty `start_key` is its beginning.
+pub(crate) fn owns(start_key: &Bytes, end_key: &Bytes, key: &Bytes) -> bool {
+    start_key.as_ref() <= key.as_ref() && (end_key.is_empty() || key.as_ref() < end_key.as_ref())
+}
+
+/// A scan page's end: the caller's, or the region's, whichever comes first.
+///
+/// **An empty key means "the end of the key space" on both sides**, and they mean it in opposite
+/// directions here — an empty `boundary` is the last region, so the caller's own `end` stands; an
+/// empty `end` is an unbounded scan, so the region's boundary is what bounds this page. Reading
+/// either one as a literal empty string would clamp every page to nothing.
+pub(crate) fn clamp_end(end: &[u8], boundary: &Bytes) -> Bytes {
+    if boundary.is_empty() {
+        return Bytes::copy_from_slice(end);
+    }
+    if end.is_empty() || boundary.as_ref() < end {
+        return boundary.clone();
+    }
+    Bytes::copy_from_slice(end)
+}
+
 /// Turns a terminal protocol error into a client error, naming the ambiguous case.
 ///
 /// A mutation whose outcome is `Unknown` is the case the whole retry story is built around: it

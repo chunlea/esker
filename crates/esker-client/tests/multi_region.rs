@@ -295,3 +295,146 @@ fn a_region_that_refuses_a_key_is_dropped_from_the_cache() {
         "the entry that produced the refusal is still cached"
     );
 }
+
+/// The `[start, end)` each store's region owns, for asserting what it was asked.
+fn owned(store: u64) -> (&'static [u8], &'static [u8]) {
+    match store {
+        1 => (b"", b"g"),
+        2 => (b"g", b"q"),
+        _ => (b"q", b""),
+    }
+}
+
+/// Every `Scan` a call sent, as `(store, start, end)`.
+fn scans(transport: &FakeTransport) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
+    transport
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call.body() {
+            Some(esker_client::wire::RawKvReq::Scan { start, end, .. }) => {
+                Some((call.store_id, start.to_vec(), end.to_vec()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// **A raw scan asks each region only for the keys that region holds.**
+///
+/// It sent one request for the caller's whole range, which a store refuses as soon as the range
+/// leaves its region — the same defect `Transaction::scan` had, and the reason it was invisible is
+/// that nothing scans a large RawKV range today. Asserted on the **requests**, because a
+/// `FakeTransport` answers whatever it is scripted to and would never refuse.
+#[test]
+fn a_raw_scan_asks_each_region_only_for_the_keys_it_holds() {
+    let harness = harness();
+    harness.transport.script(
+        Rule::new(
+            Matcher::Method(esker_client::wire::Method::RawScan),
+            Outcome::Reply(RawKvResp::Scan { pairs: Vec::new() }),
+        )
+        .forever(),
+    );
+
+    harness.client.scan(b"", b"", 100).unwrap();
+
+    let sent = scans(&harness.transport);
+    assert_eq!(
+        sent.iter().map(|(store, ..)| *store).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "one request per region, in key order: {sent:?}"
+    );
+    for (store, start, end) in &sent {
+        let (from, to) = owned(*store);
+        assert!(
+            start.as_slice() >= from,
+            "store {store} asked below its region"
+        );
+        assert!(
+            to.is_empty() || (!end.is_empty() && end.as_slice() <= to),
+            "store {store} was asked for [{start:?}, {end:?}), past its own {to:?}"
+        );
+    }
+}
+
+/// **A reverse scan visits the regions from the top.**
+///
+/// The direction routing cannot walk lazily: `route` answers "who holds this key" and a reverse
+/// scan wants the *last* region first, with no key to ask for it when `end` is empty. So the
+/// regions are enumerated forward and visited backwards, and the store order is the assertion.
+#[test]
+fn a_reverse_raw_scan_visits_the_regions_from_the_top() {
+    let harness = harness();
+    harness.transport.script(
+        Rule::new(
+            Matcher::Method(esker_client::wire::Method::RawScan),
+            Outcome::Reply(RawKvResp::Scan { pairs: Vec::new() }),
+        )
+        .forever(),
+    );
+
+    harness.client.scan_reverse(b"", b"", 100).unwrap();
+
+    let sent = scans(&harness.transport);
+    assert_eq!(
+        sent.iter().map(|(store, ..)| *store).collect::<Vec<_>>(),
+        vec![3, 2, 1],
+        "the highest region first: {sent:?}"
+    );
+    for (store, start, end) in &sent {
+        let (from, to) = owned(*store);
+        assert!(
+            start.as_slice() >= from,
+            "store {store} asked below its region"
+        );
+        assert!(
+            to.is_empty() || (!end.is_empty() && end.as_slice() <= to),
+            "store {store} was asked past its own end"
+        );
+    }
+}
+
+/// **A boundary the store has moved under the scan is repaired from the refusal.**
+///
+/// `KeyNotInRegion` carries the range the store actually owns, and that is newer than anything the
+/// placement driver can say inside a heartbeat — see `Transaction::scan_region`.
+#[test]
+fn a_raw_scan_repairs_a_boundary_the_store_moved() {
+    let harness = harness();
+    // Store 1 has split at `d` and refuses the first ask; after that everything answers.
+    harness
+        .transport
+        .script(Rule::new(
+            Matcher::All(vec![
+                Matcher::Method(esker_client::wire::Method::RawScan),
+                Matcher::Store(1),
+            ]),
+            Outcome::Fail(ProtoError::KeyNotInRegion {
+                key: Bytes::from_static(b""),
+                region_id: 1,
+                start_key: Bytes::from_static(b""),
+                end_key: Bytes::from_static(b"d"),
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(esker_client::wire::Method::RawScan),
+                Outcome::Reply(RawKvResp::Scan { pairs: Vec::new() }),
+            )
+            .forever(),
+        );
+
+    harness.client.scan(b"", b"", 100).unwrap();
+
+    let sent = scans(&harness.transport);
+    assert_eq!(
+        sent[0].2,
+        b"g".to_vec(),
+        "the first ask used the cache's boundary: {sent:?}"
+    );
+    assert_eq!(
+        sent[1].2,
+        b"d".to_vec(),
+        "the retry uses the bound the store itself named, not the cache's: {sent:?}"
+    );
+}
