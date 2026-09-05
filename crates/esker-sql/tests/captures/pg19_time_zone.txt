@@ -1,7 +1,7 @@
 # **What a named time zone has to produce** — PostgreSQL 19beta1, 2026-09-05.
 #
 # Captured before any decision about where the zone table comes from
-# (`docs/adr/0079-the-time-zone-table-is-data-the-reader-is-ours.md`), because the shape of the
+# (`docs/adr/0080-the-time-zone-table-is-data-the-reader-is-ours.md`), because the shape of the
 # answers is what says how much of a TZif file has to be read. One `BEGIN … ROLLBACK`, a
 # `SAVEPOINT` around every probe.
 #

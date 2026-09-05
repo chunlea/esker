@@ -1,6 +1,6 @@
-# 0079 — the time-zone table is a dependency, the reader is ours
+# 0080 — the time-zone table is a dependency, the reader is ours
 
-**Status**: proposed · **Date**: 2026-09-05
+**Status**: accepted · **Date**: 2026-09-05
 
 ## Context
 
