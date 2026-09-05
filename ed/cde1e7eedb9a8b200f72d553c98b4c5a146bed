@@ -1,0 +1,23 @@
+crates/esker-sql/tests/captures/pg19_interval_aggregate.txt
+  s_2bed4ac2b1c944::t_5f0bbc3fcbbee2 1-142
+crates/esker-sql/tests/corpus/pg19_interval_aggregate.txt
+  s_2bed4ac2b1c944::t_22916e36ba94d6 1-78
+crates/esker-sql/tests/interval_aggregate.rs
+  s_2bed4ac2b1c944::t_ae589de8b26daa 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "edcde1e7eedb9a8b200f72d553c98b4c5a146bed",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
