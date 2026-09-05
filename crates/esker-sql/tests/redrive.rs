@@ -344,6 +344,37 @@ struct GatedTxn {
 }
 
 impl Txn for GatedTxn {
+    // **Every defaulted method is forwarded, including the ones this test never calls.**
+    //
+    // A wrapper only has to forget one to opt its whole test out of a mechanism, and the compiler
+    // says nothing: seven of these were missing, so a `GatedTxn` took no row lock (`lock`'s default
+    // answers `Taken` to everybody), never began a statement, and reported an empty `pg_locks`.
+    // Harmless *today* — `exec::redrive` calls none of the seven, and what makes the racing test a
+    // race is the storage's write-write conflict, as the module doc says — and a trap for whoever
+    // adds the first `lock()` to the re-driver, because the test that should catch them is the one
+    // that has quietly stopped locking. The same omission was a live wrong answer one file over
+    // (`Recording::locks`, `tests/pg_locks.rs`).
+    fn lock(&mut self, key: &[u8]) -> esker_sql::Result<esker_sql::backend::Lock> {
+        self.inner.lock(key)
+    }
+    fn locks(&self) -> esker_sql::backend::LockView {
+        self.inner.locks()
+    }
+    fn validate_reads(&mut self, on: bool) {
+        self.inner.validate_reads(on);
+    }
+    fn changed_since_statement(&self, key: &[u8]) -> esker_sql::Result<bool> {
+        self.inner.changed_since_statement(key)
+    }
+    fn restart_statement(&mut self) -> esker_sql::Result<()> {
+        self.inner.restart_statement()
+    }
+    fn begin_statement(&mut self) -> esker_sql::Result<()> {
+        self.inner.begin_statement()
+    }
+    fn abandon_locks(&mut self) {
+        self.inner.abandon_locks();
+    }
     fn get(&self, key: &[u8]) -> esker_sql::Result<Option<Bytes>> {
         self.inner.get(key)
     }

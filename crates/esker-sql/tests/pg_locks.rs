@@ -192,3 +192,45 @@ fn a_wait_that_timed_out_leaves_no_row_behind() {
     a.run("ROLLBACK").unwrap();
     assert!(watcher.rows("SELECT * FROM pg_locks").is_empty());
 }
+
+/// **A savepoint is not a lock release, and it must not look like one.**
+///
+/// The third instance of one shape in this crate, and the only one of the three that was a live
+/// wrong answer. `Txn::locks` is a *defaulted* trait method, so a wrapper that forwards everything
+/// it was written to forward silently opts out of it and answers `LockView::default()` — empty.
+/// `Recording` is that wrapper, and the executor puts it around the real transaction for **every
+/// statement while a savepoint is open** (`exec/mod.rs`, `savepoints.recording()`). Rails opens one
+/// for every nested `transaction do`, so this is the state a stuck session is most likely to be in
+/// when somebody finally asks what it holds — and an empty `pg_locks` there says "nothing is held
+/// on this node", which is a different claim from "I cannot tell you".
+///
+/// The assertion is the pair, not the second line alone: the same question is asked either side of
+/// one `SAVEPOINT`, so the test names the savepoint as the only thing that changed.
+#[test]
+fn a_savepoint_does_not_hide_the_lock_the_session_is_holding() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE lk (id bigint primary key, n text)",
+        "INSERT INTO lk VALUES (1, 'a')",
+    ]);
+    node.run("BEGIN").unwrap();
+    node.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE")
+        .unwrap();
+
+    let held = vec![vec!["tuple".to_owned(), "t".to_owned()]];
+    let query = "SELECT locktype, granted FROM pg_locks";
+    assert_eq!(node.rows(query), held, "the row this session locked");
+
+    node.run("SAVEPOINT s").unwrap();
+    assert_eq!(
+        node.rows(query),
+        held,
+        "the same lock, the same session, one savepoint later"
+    );
+
+    // And after a rollback to it: the lock was taken before the savepoint, so it survives — which
+    // is the answer that would still be right if `Recording` were bypassed only on the way in.
+    node.run("ROLLBACK TO SAVEPOINT s").unwrap();
+    assert_eq!(node.rows(query), held, "a rollback to a later savepoint");
+    node.run("ROLLBACK").unwrap();
+    assert!(node.rows(query).is_empty(), "and the block released it");
+}
