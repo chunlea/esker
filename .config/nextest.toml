@@ -52,10 +52,26 @@ max-threads = 1
 # process — which is what says this group, and not the exclusivity override, is the right home:
 # the cost is Raft ticks competing with each other, and one at a time is the whole fix. They are
 # **deliberately not** given `threads-required` for the reason the next override states.
+#
+# **`esker-store::snapshot` joined on the same argument, and on two sightings rather than one.** It
+# holds regions like its neighbours `promotion` and `balance`, and it was the only member of that
+# family left out. Two different tests in it have now stretched by the same factor in two different
+# gates, each green alone:
+#
+# ```text
+# a_snapshot_replacing_a_held_region_routes_through_a_retire   61.5 s loaded   0.647 s alone
+# a_held_region_is_retired_even_after_the_office_has_moved     60.7 s loaded   0.83-1.21 s alone (3/3)
+# ```
+#
+# ~60 s against under a second is starvation and not a race — a race takes the same time in both
+# outcomes, which is how `store_locking`'s red was told apart from these. No load experiment was
+# run for this: the gate lock prevents the contention the change addresses, so a before/after under
+# it measures nothing (that was learned the expensive way in v47). The proof is later gates
+# staying green.
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)
         or binary(real_backend) or binary(real_corpus) or binary(redrive_live)))
-    or (package(esker-store) and (binary(promotion) or binary(balance)))
+    or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
 test-group = 'cluster'
