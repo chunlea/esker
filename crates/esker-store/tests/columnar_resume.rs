@@ -363,3 +363,72 @@ fn the_manifest_never_claims_more_than_the_runs_hold() {
         build.versions,
     );
 }
+
+/// **A copy that was not told of every entry re-walks instead of answering.**
+///
+/// [`a_manifest_older_than_the_log_falls_back_to_the_full_walk`] proves the refusal works on the
+/// way *in*: a slot opened against a manifest older than the log's truncation point re-walks,
+/// because the entries a resume would replay are gone. A copy that is **already open** never goes
+/// through that door again — `ensure` short-circuits on the table being open — and this is the
+/// case that puts one there.
+///
+/// A **snapshot install** writes committed versions straight into the column families: no entry
+/// applies, so `RaftPeer::tee_columnar` never runs, and the log it lands on begins after the
+/// snapshot's index. A copy that was behind is missing everything in between with no path back to
+/// it — the log cannot replay those entries and nothing re-walks. `Store::fetch_snapshot` replaces
+/// the region through `Store::retire_region_now`, which stops the peer and leaves the slot where it
+/// was, so the copy that comes back is the one that was there before.
+///
+/// **The entry teed afterwards is the point of this test**, and the reason the check cannot live on
+/// the read path. The peer carries on applying, and one entry ingested after the gap leaves every
+/// index the copy holds looking continuous again; asked later, nothing distinguishes it from a copy
+/// that saw everything. `ColumnarSlot::saw` is told about every applied entry, so the gap is caught
+/// at the only moment it is visible.
+///
+/// This is the wrong answer `esker-sql`'s `joint_gate` differential caught under load: the fragment
+/// answered without the rows of one entry, and the only row whose visible state depended on that
+/// entry disappeared (`docs/plans/phase-16-mpp.md` §J13).
+#[test]
+fn a_copy_not_told_of_every_entry_re_walks_instead_of_answering() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+    let mut log = Log::open(&db);
+    ask_for_a_copy(&db, &mut log);
+    for id in 0_i64..4 {
+        log.commit(
+            &db,
+            20 + id.unsigned_abs() * 2,
+            21 + id.unsigned_abs() * 2,
+            &[put(id, "x")],
+        );
+    }
+
+    // Opened here and **kept**, which is the whole difference from the test above.
+    let open = slot(dir.path());
+    assert_eq!(read(&open, &db, 1_000).len(), 4);
+    let sealed_at = open.last_build(TENANT, TABLE).unwrap().to_index;
+
+    // The transfer: a version this copy is never told about, on a log compacted past everything it
+    // holds. Both halves of a snapshot install, and neither reaches the copy.
+    let unseen = log.commit(&db, 90, 91, &[put(9, "brought-by-the-snapshot")]);
+    let mut batch = WriteBatch::new();
+    log.storage
+        .stage_compact(&mut batch, unseen, 1, ConfState::default())
+        .unwrap();
+    db.write(batch, &WriteOptions::synced()).unwrap();
+    assert!(log.storage.truncated_index() > sealed_at);
+
+    // And the peer carries on. This entry is applied and teed normally, and until `saw` existed it
+    // was enough to make the copy's indices continuous again.
+    let next = log.commit(&db, 92, 93, &[put(10, "arrived-after")]);
+    open.saw(next);
+    open.commit(&db, next, 93, &[row_key(10)]).unwrap();
+
+    assert_eq!(
+        read(&open, &db, 1_000).len(),
+        6,
+        "the copy answered from what it held when the log left it behind, plus what it was teed \
+         after; the versions in between are in the region and in no log, so a copy that does not \
+         re-walk here never holds them",
+    );
+}

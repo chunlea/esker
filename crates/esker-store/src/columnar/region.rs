@@ -131,6 +131,13 @@ struct Tables {
     fetched: BTreeMap<(u64, u64), (u8, esker_keys::columnar::Published)>,
     /// What the last open of each table's copy had to read.
     builds: BTreeMap<(u64, u64), Build>,
+    /// The highest region apply index this slot has been **told about** — by
+    /// [`ColumnarSlot::saw`], by a tee, or by the walk an open did.
+    ///
+    /// Not per table, and that is the point: an entry that touched another table still says this
+    /// slot was present for that index, and a table it did not touch is complete without it. What
+    /// this answers is the one question a copy cannot answer for itself — *was I here?*
+    seen: u64,
 }
 
 /// What a fragment needs to evaluate, taken under the lock and used outside it.
@@ -248,6 +255,10 @@ impl ColumnarSlot {
                 apply.entry_applied(index)?;
             }
         }
+        // Recorded for **every** entry that reaches here, including one that touched no table with
+        // a copy: what it establishes is that this slot was present at `index`, not that anything
+        // was written.
+        tables.seen = tables.seen.max(index);
         Ok(())
     }
 
@@ -380,6 +391,45 @@ impl ColumnarSlot {
         tables.missing.clear();
     }
 
+    /// Records that the peer applied entry `index`, and drops every open copy when that entry did
+    /// **not** follow the last one this slot was told about.
+    ///
+    /// Called for every entry a columnar learner applies, committing or not, which is what makes
+    /// the number exact: a gap in it means entries reached the region's state and did not reach
+    /// this copy, and a copy missing an entry is a copy that can answer without a row.
+    ///
+    /// **What opens a gap is a snapshot install.** A replica that falls behind its leader's
+    /// compaction boundary is repaired by one, and a snapshot writes committed versions straight
+    /// into the column families — no entry applies, so [`ColumnarSlot::commit`] never runs — onto a
+    /// log that begins after the snapshot's index. `Store::fetch_snapshot` replaces the region
+    /// through `Store::retire_region_now`, which stops the peer and leaves this slot where it was,
+    /// so the copy that comes back is the one that was there before, missing everything in between
+    /// and with no path back to it: the log cannot replay those entries and nothing re-walks. The
+    /// first entry applied after the transfer is the gap, and this is where it is caught.
+    ///
+    /// The same gap opens when a peer applies entries before its region record calls it a columnar
+    /// learner — the tee is skipped for those, so the next entry after the role lands is the first
+    /// this slot hears of. Dropping the copies makes the next open re-walk, which is the answer in
+    /// both cases.
+    ///
+    /// **Checked here rather than when a fragment asks**, because by then the evidence is gone: a
+    /// single entry teed after the gap would leave the index looking continuous. A gap is a fact
+    /// about the moment it happens.
+    pub fn saw(&self, index: u64) {
+        let mut tables = self.lock();
+        if !tables.open.is_empty() && index > tables.seen.saturating_add(1) {
+            tracing::warn!(
+                region_id = self.region_id,
+                seen = tables.seen,
+                index,
+                "this region's columnar copy was not told of every entry between; re-opening it \
+                 from the region rather than answering from it"
+            );
+            tables.open.clear();
+        }
+        tables.seen = tables.seen.max(index);
+    }
+
     /// Opens the target for a table if the catalog says it wants one, converting what the region
     /// already holds. Answers whether it built one *now*.
     fn ensure(&self, db: &Db, tables: &mut Tables, tenant: u64, table_id: u64) -> Result<bool> {
@@ -459,6 +509,9 @@ impl ColumnarSlot {
         );
         tables.builds.insert((tenant, table_id), build);
         tables.open.insert((tenant, table_id), apply);
+        // The walk read the region at one instant and the state record named it, so the slot was
+        // as present at that index as a tee makes it.
+        tables.seen = tables.seen.max(build.to_index);
         Ok(true)
     }
 
