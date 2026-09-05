@@ -158,8 +158,9 @@ pub(crate) struct DbInner {
     pub(crate) compact_wanted: Condvar,
     /// Signalled when one finishes, so a waiter can look again.
     pub(crate) compaction_done: Condvar,
-    /// File numbers a running compaction has claimed, so two never take the same file.
-    pub(crate) compacting: Mutex<BTreeSet<u64>>,
+    /// What running compactions have claimed: their input files, and the key range each will
+    /// write into one level ([`crate::db::compact::Reservations`]).
+    pub(crate) compacting: Mutex<compact::Reservations>,
     /// Files written but not yet named by any version. The obsolete-file sweep skips them.
     pub(crate) pending_outputs: Mutex<BTreeSet<u64>>,
     /// Where the last compaction of `(cf, level)` stopped, so the next starts after it.
@@ -529,7 +530,7 @@ impl Db {
                 inner
                     .compacting
                     .lock()
-                    .map_or(0, |busy| busy.len())
+                    .map_or(0, |busy| busy.files())
                     .to_string(),
             ),
             _ => {

@@ -1779,3 +1779,148 @@ fn approximate_size_counts_a_range_across_the_memtable_and_the_files() {
         "a straddling range came out as {straddling} of {flushed}"
     );
 }
+
+/// **A legal caller must not be told its database is corrupt.**
+///
+/// Writing while `compact_range` runs is an ordinary supported workload, and it used to come back
+/// with `column family 0 level 1: files 133 and 132 overlap` — once in twenty attempts with a
+/// writer, and never once in twenty with the writer stopped.
+///
+/// Two `L0 → L1` plans picked different L0 files, which legitimately overlap each other; with L1
+/// empty neither pulled in an L1 file, so their *input* sets were disjoint and both reservations
+/// succeeded. Both then wrote into L1 over the same keys. `check_disjoint` refused the resulting
+/// edit — so nothing reached disk and this was a failed operation rather than lost data — and the
+/// error surfaced to the caller. Reserving the output range as well is what stops the second plan
+/// starting ([ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)).
+///
+/// Twenty attempts because one is not evidence: the original A/B was 1/20 against 0/20, so a
+/// single green run of a single attempt would have said nothing either way.
+#[test]
+fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
+    let mut failures = Vec::new();
+    for attempt in 0..20 {
+        let (_, fs) = memfs();
+        let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
+        // Six rounds over the same 200 keys, so L0 fills with files that overlap each other --
+        // which is the shape that made two plans' inputs disjoint and their outputs not.
+        for round in 0..6u32 {
+            for i in 0..200u32 {
+                db.put(
+                    cf::DEFAULT,
+                    format!("key-{i:04}").as_bytes(),
+                    format!("round{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = Arc::clone(&db);
+        let flag = Arc::clone(&stop);
+        let hand = std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _unused = writer.put(
+                    cf::DEFAULT,
+                    format!("bg-{n:06}").as_bytes(),
+                    b"x".repeat(256).as_slice(),
+                );
+                n += 1;
+            }
+        });
+
+        db.flush(cf::DEFAULT).unwrap();
+        let outcome = db.compact_range(cf::DEFAULT, None, None);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hand.join().unwrap();
+
+        if let Err(why) = outcome {
+            failures.push(format!("attempt {attempt}: {why}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "compact_range refused a legal concurrent workload {} times in 20: {failures:?}",
+        failures.len(),
+    );
+}
+
+/// **The same contention, sustained, checked for what it actually wrote.**
+///
+/// The test above asks whether `compact_range` returns an error. This asks the harder question:
+/// after a writer, the background pool and repeated `compact_range` calls have all been working
+/// the same levels at once, is every key still readable at its newest value? A reservation rule
+/// that serialised too little would corrupt a level; one that serialised the wrong thing could
+/// drop an output and lose a key while returning `Ok`.
+///
+/// **The writer is bounded, and that is not a detail.** The first version of this test let it run
+/// unthrottled for the whole loop, so every round had more to compact than the last and
+/// `compact_range(None, None)` was chasing a database that grew faster than it drained: 456 other
+/// tests finished while this one spun at 350% CPU past seventy seconds. Reserving the output range
+/// makes that worse rather than better, because `L0 -> L1` is now one compaction at a time — which
+/// is the throughput [ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)
+/// says the invariant costs, observed rather than predicted. A test whose work is unbounded cannot
+/// tell that from a livelock, so the writer stops at a fixed count and the contention is what is
+/// left.
+#[test]
+fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
+    let (_, fs) = memfs();
+    let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
+
+    // The keys whose final value is asserted. Written first and rewritten by the loop below, so
+    // they span every level by the time the compactions start moving them.
+    for i in 0..300u32 {
+        db.put(
+            cf::DEFAULT,
+            format!("key-{i:04}").as_bytes(),
+            b"first".as_slice(),
+        )
+        .unwrap();
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = Arc::clone(&db);
+    let flag = Arc::clone(&stop);
+    let hand = std::thread::spawn(move || {
+        // Enough to keep L0 filling for the whole loop, and a end to it: see the note above.
+        for n in 0..8_000u32 {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let _unused = writer.put(
+                cf::DEFAULT,
+                format!("bg-{n:06}").as_bytes(),
+                b"y".repeat(256).as_slice(),
+            );
+        }
+    });
+
+    // Rewrite the asserted keys between compactions, so their newest version is somewhere the
+    // compactions are actively moving rather than settled at the bottom.
+    for round in 0..4u32 {
+        for i in 0..300u32 {
+            db.put(
+                cf::DEFAULT,
+                format!("key-{i:04}").as_bytes(),
+                format!("round{round}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.compact_range(cf::DEFAULT, None, None)
+            .unwrap_or_else(|why| panic!("round {round}: {why}"));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    hand.join().unwrap();
+
+    let missing: Vec<u32> = (0..300u32)
+        .filter(|i| {
+            get(&db, format!("key-{i:04}").as_bytes()).as_deref() != Some(b"round3".as_slice())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} keys did not read back their newest value after concurrent compaction: {missing:?}",
+        missing.len(),
+    );
+}
