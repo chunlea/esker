@@ -456,6 +456,13 @@ pub enum SqlError {
     #[error("index \"{0}\" does not exist")]
     UndefinedIndex(String),
 
+    /// `ADD CONSTRAINT … UNIQUE USING INDEX` naming an index that is not unique. Measured on
+    /// 19beta1: `42809 "plain_idx" is not a unique index`, with a `DETAIL` naming what such an
+    /// index cannot be used for — the same class an `ALTER` on the wrong kind of object gets,
+    /// because the index is there and is the wrong kind.
+    #[error("\"{0}\" is not a unique index")]
+    IndexNotUnique(String),
+
     /// The name exists and is the wrong kind of thing: `DROP TABLE` naming an index. Distinct from
     /// "does not exist", and a client told the wrong one would go looking for the wrong bug.
     #[error("\"{name}\" is not {expected}")]
@@ -2670,6 +2677,7 @@ impl SqlError {
             // A constraint that cannot be deferred is the wrong *kind* of object for the
             // statement, which is the same `42809` an `ALTER` on the wrong kind gets.
             | SqlError::ConstraintNotDeferrable(_)
+            | SqlError::IndexNotUnique(_)
             | SqlError::ParameterlessAggregate
             | SqlError::ExclusionOperatorNotInFamily { .. }
             // A template database is there rather than missing, and is not a dependency violation
@@ -2987,6 +2995,9 @@ impl SqlError {
             SqlError::UniqueViolation { key: Some(key), .. } => {
                 Some(format!("{key} already exists."))
             }
+            SqlError::IndexNotUnique(_) => Some(
+                "Cannot create a primary key or unique constraint using such an index.".to_owned(),
+            ),
             SqlError::NotNullViolationInRelation { row: Some(row), .. }
             | SqlError::CheckViolation { row, .. } => {
                 Some(format!("Failing row contains ({row})."))
