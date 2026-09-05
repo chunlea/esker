@@ -1,0 +1,201 @@
+crates/esker-keys/src/value.rs
+  s_80f3b26e5bcbd0::t_d496d623ef1e8a 173
+crates/esker-sql/src/parameter.rs
+  s_80f3b26e5bcbd0::t_b57abbfbf224ef 136
+crates/esker-sql/tests/captures/pg19_add_column_not_null.txt
+  s_80f3b26e5bcbd0::t_65acbaf81a6e34 1-88
+crates/esker-sql/tests/captures/pg19_advisory_lock.txt
+  s_80f3b26e5bcbd0::t_ee757528570aea 1-82
+crates/esker-sql/tests/captures/pg19_alter_column_type.txt
+  s_80f3b26e5bcbd0::t_12635f768c8071 1-132
+crates/esker-sql/tests/captures/pg19_alter_type.txt
+  s_80f3b26e5bcbd0::t_81702e7764f070 1-40
+crates/esker-sql/tests/captures/pg19_alter_type_cast.txt
+  s_80f3b26e5bcbd0::t_0b09b2e15c62df 1-263
+crates/esker-sql/tests/captures/pg19_array.txt
+  s_80f3b26e5bcbd0::t_86a09e264cf762 1-156
+crates/esker-sql/tests/captures/pg19_array_subquery.txt
+  s_80f3b26e5bcbd0::t_bef83c67f17373 1-98
+crates/esker-sql/tests/captures/pg19_array_type_map.txt
+  s_80f3b26e5bcbd0::t_630d722498cb0e 1-85
+crates/esker-sql/tests/captures/pg19_assignment_cast_date.txt
+  s_80f3b26e5bcbd0::t_ec2fb08ab7af8c 1-95
+crates/esker-sql/tests/captures/pg19_between.txt
+  s_80f3b26e5bcbd0::t_16e510e64b1bac 1-56
+crates/esker-sql/tests/captures/pg19_bind_parameters.txt
+  s_80f3b26e5bcbd0::t_71cde142ad8d95 1-83
+crates/esker-sql/tests/captures/pg19_boolean_argument.txt
+  s_80f3b26e5bcbd0::t_0ed80b7585ee2a 1-65
+crates/esker-sql/tests/captures/pg19_catalog_functions.txt
+  s_80f3b26e5bcbd0::t_84743706103adf 1-112
+crates/esker-sql/tests/captures/pg19_catalog_namespace.txt
+  s_80f3b26e5bcbd0::t_da7d4bcf3f7875 1-108
+crates/esker-sql/tests/captures/pg19_check_not_valid.txt
+  s_80f3b26e5bcbd0::t_27d3be63f52f28 1-34
+crates/esker-sql/tests/captures/pg19_coalesce_current_database.txt
+  s_80f3b26e5bcbd0::t_c7738d3534b864 1-85
+crates/esker-sql/tests/captures/pg19_concat.txt
+  s_80f3b26e5bcbd0::t_46149f8328f5c4 1-48
+crates/esker-sql/tests/captures/pg19_create_database.txt
+  s_80f3b26e5bcbd0::t_cb3774ecd8869f 1-85
+crates/esker-sql/tests/captures/pg19_create_schema_elements.txt
+  s_80f3b26e5bcbd0::t_a305de951b8797 1-99
+crates/esker-sql/tests/captures/pg19_create_type.txt
+  s_80f3b26e5bcbd0::t_6fc07c09daa28c 1-108
+crates/esker-sql/tests/captures/pg19_crossed_bounds.txt
+  s_80f3b26e5bcbd0::t_e756d7672c0c2c 1-42
+crates/esker-sql/tests/captures/pg19_current_schemas.txt
+  s_80f3b26e5bcbd0::t_c218f39cd13d08 1-78
+crates/esker-sql/tests/captures/pg19_date.txt
+  s_80f3b26e5bcbd0::t_88ed38566ba127 1-118
+crates/esker-sql/tests/captures/pg19_ddl_cascade_fk_trigger.txt
+  s_80f3b26e5bcbd0::t_0e7a128599c87c 1-105
+crates/esker-sql/tests/captures/pg19_default_uuid.txt
+  s_80f3b26e5bcbd0::t_8e98a945d4a454 1-98
+crates/esker-sql/tests/captures/pg19_discard_all.txt
+  s_80f3b26e5bcbd0::t_3a4262bc830cef 1-94
+crates/esker-sql/tests/captures/pg19_do_block.txt
+  s_80f3b26e5bcbd0::t_ce3d92dbe9a9bd 1-77
+crates/esker-sql/tests/captures/pg19_do_create_enum.txt
+  s_80f3b26e5bcbd0::t_291b2e7cf2e525 1-86
+crates/esker-sql/tests/captures/pg19_domain.txt
+  s_80f3b26e5bcbd0::t_79c1286cdbdc20 1-51
+crates/esker-sql/tests/captures/pg19_domain_schema.txt
+  s_80f3b26e5bcbd0::t_7d774eb73441e9 1-35
+crates/esker-sql/tests/captures/pg19_drop_column.txt
+  s_80f3b26e5bcbd0::t_2e001a1dc2cd83 1-121
+crates/esker-sql/tests/captures/pg19_drop_constraint.txt
+  s_80f3b26e5bcbd0::t_d91318b13f39bf 1-95
+crates/esker-sql/tests/captures/pg19_enum_values.txt
+  s_80f3b26e5bcbd0::t_7c0dc2ca8b803d 1-121
+crates/esker-sql/tests/captures/pg19_exclusion_constraint.txt
+  s_80f3b26e5bcbd0::t_c1d9f7c1f79167 1-87
+crates/esker-sql/tests/captures/pg19_extensions.txt
+  s_80f3b26e5bcbd0::t_009ade77d66381 1-98
+crates/esker-sql/tests/captures/pg19_foreign_key_options.txt
+  s_80f3b26e5bcbd0::t_e424b7f8f53f01 1-124
+crates/esker-sql/tests/captures/pg19_foreign_table.txt
+  s_80f3b26e5bcbd0::t_bcf0f9e9d72de4 1-120
+crates/esker-sql/tests/captures/pg19_format_type.txt
+  s_80f3b26e5bcbd0::t_5b58e23a4383ec 1-73
+crates/esker-sql/tests/captures/pg19_function_language.txt
+  s_80f3b26e5bcbd0::t_9886e9c5c8410f 1-41
+crates/esker-sql/tests/captures/pg19_generate_subscripts.txt
+  s_80f3b26e5bcbd0::t_eb4fb1d0ddacde 1-77
+crates/esker-sql/tests/captures/pg19_gin_tsvector.txt
+  s_80f3b26e5bcbd0::t_4a38bd1f1f2821 1-58
+crates/esker-sql/tests/captures/pg19_group_by_key.txt
+  s_80f3b26e5bcbd0::t_e53efb4c1c0396 1-62
+crates/esker-sql/tests/captures/pg19_hstore_citext.txt
+  s_80f3b26e5bcbd0::t_79ec297ebfa86f 1-133
+crates/esker-sql/tests/captures/pg19_include_index.txt
+  s_80f3b26e5bcbd0::t_3f26ae3007d391 1-96
+crates/esker-sql/tests/captures/pg19_index_constraint.txt
+  s_80f3b26e5bcbd0::t_6e8866238d04f3 1-136
+crates/esker-sql/tests/captures/pg19_insert_default_values.txt
+  s_80f3b26e5bcbd0::t_dc52ebb2402411 1-86
+crates/esker-sql/tests/captures/pg19_integer_plus_text.txt
+  s_80f3b26e5bcbd0::t_ba6520b0d73256 1-83
+crates/esker-sql/tests/captures/pg19_interval.txt
+  s_80f3b26e5bcbd0::t_9e11a842238dbe 1-133
+crates/esker-sql/tests/captures/pg19_json.txt
+  s_80f3b26e5bcbd0::t_5cfdaeb243c8a3 1-137
+crates/esker-sql/tests/captures/pg19_matview.txt
+  s_80f3b26e5bcbd0::t_ae51de33821ec0 1-58
+crates/esker-sql/tests/captures/pg19_matview_guards.txt
+  s_80f3b26e5bcbd0::t_53e17f559debfc 1-33
+crates/esker-sql/tests/captures/pg19_numeric.txt
+  s_80f3b26e5bcbd0::t_8edad0a4242406 1-134
+crates/esker-sql/tests/captures/pg19_on_conflict.txt
+  s_80f3b26e5bcbd0::t_d29171ea49c383 1-152
+crates/esker-sql/tests/captures/pg19_partition.txt
+  s_80f3b26e5bcbd0::t_4500c1e0d3a4e7 1-142
+crates/esker-sql/tests/captures/pg19_partition_suite.txt
+  s_80f3b26e5bcbd0::t_9401c76ecfdd8d 1-149
+crates/esker-sql/tests/captures/pg19_pg_available_extensions.txt
+  s_80f3b26e5bcbd0::t_179787db7b77a6 1-51
+crates/esker-sql/tests/captures/pg19_pg_catalog.txt
+  s_80f3b26e5bcbd0::t_f366c1e7469ae1 1-112
+crates/esker-sql/tests/captures/pg19_regex_match.txt
+  s_80f3b26e5bcbd0::t_45f787332a5ed1 1-119
+crates/esker-sql/tests/captures/pg19_regtype.txt
+  s_80f3b26e5bcbd0::t_d6bfac24b3b6a5 1-129
+crates/esker-sql/tests/captures/pg19_relation_resolution.txt
+  s_80f3b26e5bcbd0::t_8fae15f7a4f461 1-123
+crates/esker-sql/tests/captures/pg19_rename_column.txt
+  s_80f3b26e5bcbd0::t_20996995bb68f8 1-82
+crates/esker-sql/tests/captures/pg19_reset_pk_sequence.txt
+  s_80f3b26e5bcbd0::t_e20fec461ffa7c 1-93
+crates/esker-sql/tests/captures/pg19_returning_protocol.txt
+  s_80f3b26e5bcbd0::t_c4c2e971ee2677 1-72
+crates/esker-sql/tests/captures/pg19_row_locking.txt
+  s_80f3b26e5bcbd0::t_cf5a7abddab1bb 1-110
+crates/esker-sql/tests/captures/pg19_scalar_functions.txt
+  s_80f3b26e5bcbd0::t_fae337b610e880 1-85
+crates/esker-sql/tests/captures/pg19_schema.txt
+  s_80f3b26e5bcbd0::t_6410f22e88e179 1-120
+crates/esker-sql/tests/captures/pg19_search_path.txt
+  s_80f3b26e5bcbd0::t_13779a70d1af38 1-86
+crates/esker-sql/tests/captures/pg19_serial.txt
+  s_80f3b26e5bcbd0::t_dab2294773ee76 1-77
+crates/esker-sql/tests/captures/pg19_set_parameters.txt
+  s_80f3b26e5bcbd0::t_137031a2506eef 1-112
+crates/esker-sql/tests/captures/pg19_set_session.txt
+  s_80f3b26e5bcbd0::t_644d9bf3017288 1-70
+crates/esker-sql/tests/captures/pg19_specific_schema_ddl.txt
+  s_80f3b26e5bcbd0::t_f712d55fa60dcc 1-137
+crates/esker-sql/tests/captures/pg19_temp_on_commit.txt
+  s_80f3b26e5bcbd0::t_1ed88c122ce411 1-48
+crates/esker-sql/tests/captures/pg19_temp_table.txt
+  s_80f3b26e5bcbd0::t_b34cc08cba6ded 1-113
+crates/esker-sql/tests/captures/pg19_time.txt
+  s_80f3b26e5bcbd0::t_f8a9bb69491132 1-109
+crates/esker-sql/tests/captures/pg19_transaction_timeouts.txt
+  s_80f3b26e5bcbd0::t_0f7b93b3a4d976 1-110
+crates/esker-sql/tests/captures/pg19_trigger_function.txt
+  s_80f3b26e5bcbd0::t_078eab284c2153 1-131
+crates/esker-sql/tests/captures/pg19_tsrange.txt
+  s_80f3b26e5bcbd0::t_9fd1ea9c4aad10 1-174
+crates/esker-sql/tests/captures/pg19_tsvector.txt
+  s_80f3b26e5bcbd0::t_97416273a1a878 1-131
+crates/esker-sql/tests/captures/pg19_two_database_dogs.txt
+  s_80f3b26e5bcbd0::t_a3aa8d053c7583 1-78
+crates/esker-sql/tests/captures/pg19_unique_constraint.txt
+  s_80f3b26e5bcbd0::t_c9d70d48259ed6 1-137
+crates/esker-sql/tests/captures/pg19_unique_over_existing_rows.txt
+  s_80f3b26e5bcbd0::t_14d0c820d29003 1-68
+crates/esker-sql/tests/captures/pg19_unlogged_table.txt
+  s_80f3b26e5bcbd0::t_317fa65953bdf7 1-95
+crates/esker-sql/tests/captures/pg19_uuid.txt
+  s_80f3b26e5bcbd0::t_4263121e11df7f 1-92
+crates/esker-sql/tests/captures/pg19_values_catalog_function.txt
+  s_80f3b26e5bcbd0::t_ecd3d662f71551 1-80
+crates/esker-sql/tests/captures/pg19_view.txt
+  s_80f3b26e5bcbd0::t_5e00b9b1481bb2 1-118
+crates/esker-sql/tests/captures/pg19_view_debts.txt
+  s_80f3b26e5bcbd0::t_762b6734adb729 1-76
+crates/esker-sql/tests/captures/pg19_virtual_generated_column.txt
+  s_80f3b26e5bcbd0::t_b87502913e5934 1-74
+crates/esker-sql/tests/captures/pg19_write_in_subquery.txt
+  s_80f3b26e5bcbd0::t_53b94e222fabf5 1-83
+crates/esker-sql/tests/tsvector.rs
+  s_80f3b26e5bcbd0::t_5aaf9e845aed32 15
+docs/adr/0075-the-oracle-captures-live-in-the-repository.md
+  s_80f3b26e5bcbd0::t_42b4dcf06d4d36 1-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9fa1542149db8a8900f0ac15c9de3be8e98aa895",
+  "prompts": {},
+  "sessions": {
+    "s_80f3b26e5bcbd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2718fa83-28c7-4d6b-b36d-c2d6eaa873d9",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
