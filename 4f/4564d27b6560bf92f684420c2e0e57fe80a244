@@ -1,0 +1,14 @@
+crates/esker-store/tests/split.rs
+  h_44076b318daf9c 21-24,132-218,253-260,448-552
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4f4564d27b6560bf92f684420c2e0e57fe80a244",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
