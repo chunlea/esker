@@ -1,0 +1,23 @@
+crates/esker-sql/tests/cancel_over_a_socket.rs
+  s_609bbbdbf3c419::t_dddacc9c095805 19-20,22
+crates/esker-sql/tests/pgwire_client/mod.rs
+  s_609bbbdbf3c419::t_5726b4e741ef2d 1-135
+crates/esker-sql/tests/savepoint_reply.rs
+  s_609bbbdbf3c419::t_e01fbac0b7bf51 1-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f66d8f7ad9e4e987bc72b6d84d9a4e37c1b66b2e",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
