@@ -1,0 +1,22 @@
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 2321-2328,2799-2800
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 2667-2749,3156-3168
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 3991-4021
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 741-747,1105-1130,1237-1240,1350-1353,1394-1395,1405-1407,1460,1494-1496,1529-1530
+crates/esker-sql/tests/pk_and_sequence_for_schema.rs
+  h_44076b318daf9c 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1f3d524cf1e389ce45a1aac68bae6ee8d7664302",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
