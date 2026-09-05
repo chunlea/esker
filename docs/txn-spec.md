@@ -135,7 +135,10 @@ The snapshot answers five questions (`TxnSnapshot`):
 ```
 get_lock(k)                      → the lock on k, if any
 seek_write(k, ts)                → the newest (commit_ts, WriteRecord) with commit_ts ≤ ts
-newest_write_after(k, ts)        → the newest (commit_ts, WriteRecord) with commit_ts > ts
+newest_write_after(k, ts)        → the newest COMMITTED (commit_ts, WriteRecord) with
+                                   commit_ts > ts; a Rollback marker is stepped past, not
+                                   answered with. A Lock record IS a commit here, though a
+                                   read steps past it — see ADR 0078
 write_of_txn(k, start_ts)        → the record the transaction at start_ts left here:
                                    its commit, or its rollback marker
 get_value(k, start_ts)           → the `default` entry
@@ -177,6 +180,9 @@ Two checks, and **both** are load-bearing:
    conflict**: another transaction wrote what we read. Fail; the client aborts and may retry with a
    fresh `start_ts`. *(Skipping this check breaks snapshot isolation's lost-update guarantee.)*
    A record whose `start_ts` is *our own* is not a conflict with ourselves — see check 2.
+   A transaction that took `k` after our snapshot and then **rolled back** left a marker at
+   `commit_ts == start_ts`, above every older commit; it committed nothing and is not a conflict,
+   which is why this predicate answers with commits only (ADR 0078).
 2. `write_of_txn(k, start_ts)`. A `Rollback` means this transaction was already rolled back by
    someone who found its lock expired. Fail — resurrecting it would commit a transaction another
    party has already told a reader is dead. A *commit* there is our own, from an attempt whose
