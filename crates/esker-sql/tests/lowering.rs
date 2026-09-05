@@ -36,7 +36,11 @@ fn lower(sql: &str) -> esker_sql::Result<Statement> {
 #[test]
 fn a_clause_we_do_not_honour_is_refused_by_name() {
     let cases = [
-        ("CREATE TABLE t AS SELECT 1", "CREATE TABLE ... AS"),
+        // **`CREATE TABLE ... AS` left this list** with `tests/create_table_as.rs`: it is a
+        // statement of its own now, typed from the query's plan on the path
+        // `CREATE MATERIALIZED VIEW` already used. What it still does not honour is `WITH NO
+        // DATA`, and that is not on this list because the corpus never sends it — a refusal for a
+        // clause nobody writes is a rule nobody measured.
         // **`OR REPLACE` is a modifier, not the name of anything.** These were refused as
         // "CREATE OR is not supported" — a truncated token pair that names no feature and tells a
         // user nothing about which statement was declined, and the widening that fixed it is in
@@ -437,11 +441,13 @@ fn explain_wraps_a_lowered_statement() {
     };
     assert!(matches!(*inner, Statement::CreateTable(_)));
     // **The refusal inside is still the answer**, which is what this half asserts: `EXPLAIN` does
-    // not excuse a clause the lowering will not honour. `CREATE TEMPORARY TABLE` used to be the
-    // case here and now lowers (ADR 0054), so the statement that carries the refusal is one that
-    // still has one.
+    // not excuse a clause the lowering will not honour. The example has moved twice now, and that
+    // is the point of writing it down: `CREATE TEMPORARY TABLE` lowered with ADR 0054, then
+    // `CREATE TABLE ... AS` lowered with `tests/create_table_as.rs`. Each time, the statement
+    // carrying the refusal is replaced by one that still has one — `PARTITION BY HASH`, which is
+    // refused because nothing captured how it routes.
     assert_eq!(
-        lower("EXPLAIN CREATE TABLE t AS SELECT 1")
+        lower("EXPLAIN CREATE TABLE t (a int8) PARTITION BY HASH (a)")
             .unwrap_err()
             .sqlstate(),
         sqlstate::FEATURE_NOT_SUPPORTED
