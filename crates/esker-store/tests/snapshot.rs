@@ -238,6 +238,41 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
                     store.store_id(),
                     store.peer_of(region.id).map(|peer| peer.leader())
                 );
+                // **A hint that points outside the group is the caller's mistake, and it is
+                // fatal here rather than at the deadline.** Following a redirect can only reach
+                // a store this helper was handed. When the office is on one the caller left
+                // out, every remaining attempt re-asks a follower that has already answered, so
+                // the deadline is spent re-proving what the first refusal said. That is what
+                // 9046 attempts in 30.000411395s were, all to store 1, which answered
+                // `leader=Some(2)` every time (`docs/plans/debt-c7.md` section 14). The peer
+                // list of the store that refused says where the office went, so say it.
+                if let esker_proto::ProtoError::NotLeader {
+                    leader_hint: Some(peer_id),
+                    ..
+                } = &error
+                    && let Some(elsewhere) = store.regions().get(region.id).and_then(|state| {
+                        state
+                            .region()
+                            .peers
+                            .iter()
+                            .find(|peer| peer.peer_id == *peer_id)
+                            .map(|peer| peer.store_id)
+                    })
+                {
+                    assert!(
+                        group
+                            .iter()
+                            .any(|candidate| candidate.store_id() == elsewhere),
+                        "writing {key:?}: the office is peer {peer_id} on store {elsewhere}, \
+                         and this put was given only stores {:?}; retrying cannot reach a store \
+                         it was not handed",
+                        group
+                            .iter()
+                            .map(|candidate| candidate.store_id())
+                            .collect::<Vec<_>>()
+                    );
+                }
+
                 // **Follow the hint, or this is a livelock rather than a retry.** An election
                 // moves no epoch, so re-sending to the peer that just disclaimed leadership at
                 // the same epoch asks a question already answered, and in a two-voter group the
@@ -266,28 +301,16 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
     }
 }
 
-/// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
+/// Two voters for region 1 with the office deliberately on the **second** store.
 ///
-/// The mechanism behind two recorded sightings of `snapshot.rs:228`
-/// (`a_region_reaches_a_store_that_never_had_it`,
-/// `a_snapshot_replacing_a_held_region_routes_through_a_retire`), driven rather than waited for.
-/// Neither reproduced under load — not under twenty-four spinning threads, 8 runs each, nor under
-/// six full runs of this crate's 305 tests — because both need an *election*, and an election
-/// needs a peer starved for the 250-500 ms this file's tick budget allows. Moving the office on
-/// purpose reaches the same state in a second and always.
+/// The state this file's two redirect tests need and neither should race for. Both of the
+/// sightings behind them arrive here by being unlucky — a peer starved for the 250-500 ms this
+/// file's tick budget allows — which is why neither reproduced under load and both reproduce
+/// instantly when the office is moved on purpose.
 ///
-/// [`put`] retries what the store tells it to retry, which is right, and re-reads the region's
-/// epoch each time round, which is also right and is not enough: **an election moves no epoch**.
-/// So a `NotLeader` is re-sent to the peer that just disclaimed leadership, at the same epoch,
-/// until the deadline — and in a two-voter group the office does not come back on its own. That is
-/// a livelock, not a slow write, and thirty seconds of it is indistinguishable from a hang.
-///
-/// The fix is to follow the hint the refusal already carries, which is what a real client does
-/// (`esker-client`'s router, `docs/DESIGN.md` §10). This test is red without it: it fails at
-/// [`put`]'s deadline having spent thirty seconds re-asking a follower.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_write_follows_the_office_when_it_moves() {
-    trace();
+/// Returns once the second store leads *and* the first does not, so anything a caller then aims
+/// at `first` is aimed at a store that has stopped leading.
+async fn two_voters_with_the_office_on_the_second() -> (Node, Node) {
     let pd = Arc::new(FakePd::new());
     let first_address_listener = reserve();
     let first_address = first_address_listener.local_addr().unwrap();
@@ -355,6 +378,33 @@ async fn a_write_follows_the_office_when_it_moves() {
         "the first store still leads, so the office did not move and this proves nothing"
     );
 
+    (first, second)
+}
+
+/// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
+///
+/// The mechanism behind two recorded sightings of `snapshot.rs:228`
+/// (`a_region_reaches_a_store_that_never_had_it`,
+/// `a_snapshot_replacing_a_held_region_routes_through_a_retire`), driven rather than waited for.
+/// Neither reproduced under load — not under twenty-four spinning threads, 8 runs each, nor under
+/// six full runs of this crate's 305 tests — because both need an *election*, and an election
+/// needs a peer starved for the 250-500 ms this file's tick budget allows. Moving the office on
+/// purpose reaches the same state in a second and always.
+///
+/// [`put`] retries what the store tells it to retry, which is right, and re-reads the region's
+/// epoch each time round, which is also right and is not enough: **an election moves no epoch**.
+/// So a `NotLeader` is re-sent to the peer that just disclaimed leadership, at the same epoch,
+/// until the deadline — and in a two-voter group the office does not come back on its own. That is
+/// a livelock, not a slow write, and thirty seconds of it is indistinguishable from a hang.
+///
+/// The fix is to follow the hint the refusal already carries, which is what a real client does
+/// (`esker-client`'s router, `docs/DESIGN.md` §10). This test is red without it: it fails at
+/// [`put`]'s deadline having spent thirty seconds re-asking a follower.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_follows_the_office_when_it_moves() {
+    trace();
+    let (first, second) = two_voters_with_the_office_on_the_second().await;
+
     // Aimed at the store that has *stopped* leading, which is exactly what the sightings do.
     // Without following the hint this spends the whole deadline and fails.
     let region = first.store.regions().regions()[0].clone();
@@ -376,6 +426,37 @@ async fn a_write_follows_the_office_when_it_moves() {
 
     first.stop().await;
     second.stop().await;
+}
+
+/// **A write cannot follow the office to a store it was never handed.**
+///
+/// [`put`] follows `NotLeader`'s hint, which is right and is not sufficient: the hint names a
+/// *peer*, and this helper can only ask the stores its caller passed. Where those disagree the
+/// loop has nothing it can do with the answer it is given, and re-asks the follower until the
+/// deadline.
+///
+/// That is the mechanism behind `a_snapshot_replacing_a_held_region_routes_through_a_retire`
+/// failing in g1's gate on 2026-09-04 at 35.854 s — well under the 60 s deadline it was blamed
+/// on twice: `writing b"k00058" never succeeded after 9046 attempts in 30.000411395s`, every one
+/// of them to store 1, which answered `leader=Some(Some(2))` every time. The announcement
+/// helper wrote keys 40..60 through a one-store group *after* `AddPeer` had made a second voter,
+/// so there was a redirect and nowhere to follow it to.
+///
+/// The deadline was never the mechanism and lengthening it fixes nothing. This pins the
+/// diagnosis instead: a hint the group cannot honour fails the write at once and names the store
+/// the caller left out, rather than spending thirty seconds proving the first refusal.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(
+    expected = "the office is peer 2 on store 2, and this put was given only stores [1]"
+)]
+async fn a_put_says_which_store_it_was_not_given() {
+    trace();
+    let (first, _second) = two_voters_with_the_office_on_the_second().await;
+
+    // Deliberately the group the announcement helper used to pass: the store that has stopped
+    // leading, and only it.
+    let region = first.store.regions().regions()[0].clone();
+    put(&[&first.store], &region, key(1), b"after").await;
 }
 
 /// Commits one key through Percolator on `store`, as a client would: prewrite, then commit.
@@ -1128,10 +1209,41 @@ async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
 /// *harder* widens the gap and the first round wins, while a middling load keeps it just close
 /// enough to lose several. Numbers that go up and then down with load are the signature.
 async fn announce_a_snapshot_and_await_the_retire(
+    pd: &Arc<FakePd>,
     first: &Node,
     second: &Node,
     old: &Arc<esker_store::RaftPeer>,
 ) {
+    // **This helper's premise is that store 1 leads, and under load it stops being true.**
+    //
+    // Everything below reads `first` as the leader: the gap is measured against its applied
+    // index, and the announcement is sent from peer 1 with its term. Once `AddPeer`'s learner is
+    // promoted the region has two voters, and a two-voter group on a box that will not schedule
+    // its threads elects the other one -- [`put`]'s doc says fifteen times in twenty runs. Each
+    // of the three ways that goes wrong was seen in a gate on 2026-09-04:
+    //
+    // * the write loop re-asks a follower for thirty seconds (fixed by giving it both stores);
+    // * `old` is the *leader* now, so it is never behind `leader`, and the gap never appears;
+    // * `receive_raft`'s held-region branch is guarded by `!peer.is_leader()`, so an
+    //   announcement aimed at the peer that now leads is correctly ignored and nothing retires.
+    //
+    // All three are one thing: a precondition that was assumed rather than held. Elections are
+    // not this test's subject, so the office is put back where the scenario needs it -- driven,
+    // like everything else in this file, rather than waited for
+    // (`docs/plans/debt-c7.md` section 16).
+    if !first.store.peer_of(1).is_some_and(|peer| peer.is_leader()) {
+        let epoch = first.store.regions().regions()[0].epoch;
+        pd.issue(Operator::TransferLeader {
+            region_id: 1,
+            epoch,
+            to_peer_id: 1,
+        });
+        wait_for("the office to come back to the first store", || {
+            first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+        })
+        .await;
+    }
+
     let leader = first.store.peer_of(1).expect("the leader");
     let Some(state) = second.store.regions().get(1) else {
         // No region to replace: the scenario is already past what it was going to observe.
@@ -1149,7 +1261,10 @@ async fn announce_a_snapshot_and_await_the_retire(
             loop {
                 let region = first.store.regions().regions()[0].clone();
                 for n in 40..60 {
-                    put(&[&first.store], &region, key(n), b"value").await;
+                    // **Both stores, because by here there are two voters.** `AddPeer` has
+                    // promoted peer 2, so the office can move while this loop runs, and a
+                    // one-store group cannot follow the redirect it is then given.
+                    put(&[&first.store, &second.store], &region, key(n), b"value").await;
                 }
                 let ahead = leader.applied_index();
                 if old.applied_index() < ahead {
@@ -1178,6 +1293,15 @@ async fn announce_a_snapshot_and_await_the_retire(
             },
         },
     );
+    // The premise again, at the instant it matters: an announcement aimed at a peer that leads
+    // is dropped by the guard rather than acted on, and the only sign of it would be the wait
+    // below expiring sixty seconds later with nothing to say.
+    assert!(
+        !second.store.peer_of(1).is_some_and(|peer| peer.is_leader()),
+        "the office moved to the peer this announcement is aimed at, so `receive_raft`'s \
+         held-region branch (`!peer.is_leader() && peer.applied_index() < index`) will ignore it"
+    );
+
     second
         .store
         .receive_raft(esker_proto::RaftBatch::new(vec![announcement]))
@@ -1205,21 +1329,13 @@ async fn announce_a_snapshot_and_await_the_retire(
     .await;
 }
 
-/// **A snapshot that replaces a region this store already holds retires the old peer first.**
+/// One region on store 1, a learner of it arrived on store 2, and the peer that holds it there.
 ///
-/// `Store::fetch_snapshot` step 1 calls `retire_region_now` before it writes a byte, and that is
-/// what answers anything still outstanding on the peer being replaced — the snapshot half of the
-/// rule stated on [`esker_store::peer`]'s pending queue: *a pending proposal is resolved on every
-/// path that can make its index unreachable*. The step-down half has its own regressions next to
-/// that queue; this pins the routing, because a refactor of `fetch_snapshot` that dropped the
-/// retire would put the leak back without failing anything else.
-///
-/// Driven by handing the store the announcement directly rather than by arranging for a leader to
-/// send one: `receive_raft` is the entry point either way, and naming an index the learner cannot
-/// have reached makes the held-region branch a fact rather than a race.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
-    trace();
+/// The state both retire tests start from. Store 1 bootstraps region 1 as the only voter and
+/// writes forty keys so there is a log to be behind; `AddPeer` then places peer 2 on store 2 and
+/// the return waits for the region to actually arrive rather than for the operator to be issued.
+async fn a_second_store_holding_region_one() -> (Arc<FakePd>, Node, Node, Arc<esker_store::RaftPeer>)
+{
     let pd = Arc::new(FakePd::new());
     let first_address_listener = reserve();
     let first_address = first_address_listener.local_addr().unwrap();
@@ -1277,11 +1393,86 @@ async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
         .peer_of(1)
         .expect("the arrived region has a peer");
 
+    (pd, first, second, old)
+}
+
+/// **A snapshot that replaces a region this store already holds retires the old peer first.**
+///
+/// `Store::fetch_snapshot` step 1 calls `retire_region_now` before it writes a byte, and that is
+/// what answers anything still outstanding on the peer being replaced — the snapshot half of the
+/// rule stated on [`esker_store::peer`]'s pending queue: *a pending proposal is resolved on every
+/// path that can make its index unreachable*. The step-down half has its own regressions next to
+/// that queue; this pins the routing, because a refactor of `fetch_snapshot` that dropped the
+/// retire would put the leak back without failing anything else.
+///
+/// Driven by handing the store the announcement directly rather than by arranging for a leader to
+/// send one: `receive_raft` is the entry point either way, and naming an index the learner cannot
+/// have reached makes the held-region branch a fact rather than a race.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_replacing_a_held_region_routes_through_a_retire() {
+    trace();
+    let (pd, first, second, old) = a_second_store_holding_region_one().await;
+
     // `receive_raft` acts only when the learner's apply index is **below** the announced one, so
     // the announcement is built one past what this peer has applied — see
     // [`announce_a_snapshot_and_await_the_retire`], which used to race for that gap and now
     // constructs it.
-    announce_a_snapshot_and_await_the_retire(&first, &second, &old).await;
+    announce_a_snapshot_and_await_the_retire(&pd, &first, &second, &old).await;
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// **The retire still happens when the office has moved to the peer being replaced.**
+///
+/// `Store::receive_raft`'s held-region branch is guarded by `!peer.is_leader() &&
+/// peer.applied_index() < index`. The first half is a precondition this file never stated: a
+/// two-voter group on a box that will not schedule its threads elects the other peer — [`put`]'s
+/// doc says fifteen times in twenty runs — and when it elects *this* one the announcement is a
+/// follower's message to a leader, which is correctly ignored. Nothing then retires, and the wait
+/// spends its whole sixty seconds saying only that it was a wait with no end.
+///
+/// That is `a_snapshot_replacing_a_held_region_routes_through_a_retire` failing in three of four
+/// gates on 2026-09-04 at 35.854 s, 61.508 s and 60.957 s — two different points in one test,
+/// which is what two mechanisms behind one symptom looks like
+/// (`docs/plans/debt-c7.md` section 16).
+///
+/// Driven rather than waited for, like everything else in this file: the office is moved on
+/// purpose, so the branch is a fact rather than a race.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_region_is_retired_even_after_the_office_has_moved() {
+    trace();
+    let (pd, first, second, old) = a_second_store_holding_region_one().await;
+
+    // The learner has to be a voter before it can hold the office, and `AddPeer` promotes it
+    // through PD rather than at once — which is why the gate sightings needed a long enough write
+    // loop to reach this state, and why waiting for it here is the whole difference between
+    // driving the case and hoping for it.
+    wait_for("the second store to become a voter", || {
+        first.store.regions().get(1).is_some_and(|state| {
+            state
+                .region()
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == 2 && peer.role == PeerRole::Voter)
+        })
+    })
+    .await;
+
+    // Exactly the state the gates reached by being unlucky: the office on the peer that is about
+    // to be announced at.
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::TransferLeader {
+        region_id: 1,
+        epoch,
+        to_peer_id: 2,
+    });
+    wait_for("the second store to lead", || {
+        second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    announce_a_snapshot_and_await_the_retire(&pd, &first, &second, &old).await;
 
     first.stop().await;
     second.stop().await;
