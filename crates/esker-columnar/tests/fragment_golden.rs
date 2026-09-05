@@ -94,6 +94,98 @@ fn golden_fragment_bytes() {
     assert_eq!(codec::decode(&bytes).unwrap(), golden());
 }
 
+/// A fragment carrying an `IN` list, from `docs/plans/phase-16-mpp.md` §J4.
+fn with_an_in_list(values: Vec<Value>) -> Fragment {
+    Fragment {
+        filter: Some(Expr::In {
+            operand: Box::new(Expr::Column(0)),
+            values,
+        }),
+        ..Fragment::scan(TableRef::default(), vec![0])
+    }
+}
+
+#[test]
+fn an_in_list_round_trips() {
+    let fragment = with_an_in_list(vec![Value::Int8(1), Value::Int8(4), Value::Int8(9)]);
+    let bytes = codec::encode(&fragment);
+    assert_eq!(codec::decode(&bytes).unwrap(), fragment);
+}
+
+/// **Strictly ascending is checked, not sorted.** Sorting on arrival would accept two encodings of
+/// one predicate and hide a producer that had lost its ordering — and the evaluator's binary
+/// search is only correct because this refusal exists.
+#[test]
+fn an_in_list_out_of_order_or_repeating_is_refused() {
+    for values in [
+        vec![Value::Int8(9), Value::Int8(1)],
+        vec![Value::Int8(1), Value::Int8(1)],
+    ] {
+        let bytes = codec::encode(&with_an_in_list(values.clone()));
+        let error = codec::decode(&bytes).expect_err("a list that is not strictly ascending");
+        assert!(
+            format!("{error}").contains("ascending"),
+            "refused for the wrong reason on {values:?}: {error}"
+        );
+    }
+}
+
+/// `x IN (NULL)` is unknown for every `x`. No producer of this node wants it, so it is refused
+/// where a reader would otherwise have to reason about it.
+#[test]
+fn an_in_list_holding_a_null_is_refused() {
+    let bytes = codec::encode(&with_an_in_list(vec![Value::Null]));
+    let error = codec::decode(&bytes).expect_err("a NULL in the list");
+    assert!(
+        format!("{error}").contains("NULL"),
+        "refused for the wrong reason: {error}"
+    );
+}
+
+/// Both bounds, because every limit here is one a broken or hostile peer cannot exceed.
+#[test]
+fn an_in_list_outside_its_bounds_is_refused() {
+    for count in [0_usize, esker_columnar::fragment::MAX_IN_VALUES + 1] {
+        let values = (0..count)
+            .map(|n| Value::Int8(i64::try_from(n).unwrap()))
+            .collect();
+        let bytes = codec::encode(&with_an_in_list(values));
+        assert!(
+            codec::decode(&bytes).is_err(),
+            "a list of {count} values decoded"
+        );
+    }
+}
+
+/// **The forward-compatibility story, asserted rather than assumed.**
+///
+/// A build that does not know an expression node refuses the whole fragment, and the caller
+/// answers by reading rows — the answer that was always there (`docs/DESIGN.md` §16.2). This is
+/// the property that let `Expr::In` be added as tag 8 with **no format-version bump**, and it is
+/// the one a future node's author needs to be able to rely on.
+#[test]
+fn an_expression_node_this_build_does_not_know_refuses_the_whole_fragment() {
+    let mut bytes = codec::encode(&with_an_in_list(vec![Value::Int8(1)]));
+    let tag = bytes
+        .iter()
+        .rposition(|byte| *byte == 8)
+        .expect("the IN tag is in the encoding");
+    bytes[tag] = 200;
+    // **Re-checksum, or this tests the wrong thing.** The CRC covers version ++ body and is
+    // verified first, deliberately: intact bytes carrying an unknown tag are a build that does not
+    // implement them, and damaged bytes are damage, and they are different answers
+    // (`docs/DESIGN.md` §16.2). Leaving the old CRC in place made this fail as corruption, which
+    // is the *other* branch.
+    let body = bytes.len() - 4;
+    let checksum = crc32c::checksum(&bytes[..body]);
+    bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+    let error = codec::decode(&bytes).expect_err("an unknown expression node");
+    assert!(
+        format!("{error}").contains("expression node"),
+        "an unknown node must refuse as one: {error}"
+    );
+}
+
 #[test]
 fn the_simplest_fragments_round_trip() {
     let cases = [
