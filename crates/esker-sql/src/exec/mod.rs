@@ -2898,12 +2898,25 @@ impl Executor {
             // `lower_type` gave before this pass existed, and the same one a column of it gets.
             return Err(SqlError::unsupported(format!("the type {name}")));
         };
-        // **A composite is still refused by name.** Its value is a row, which this vocabulary
-        // has no shape for; the other two kinds are answered below.
-        if matches!(def.kind, crate::catalog::TypeKind::Composite { .. }) {
-            return Err(SqlError::unsupported(format!(
-                "a cast to the composite type {name}"
-            )));
+        // **A composite's value is its canonical record text**, so the cast is the input function
+        // and nothing more — the same thing a write into a column of one does
+        // (`exec::assign::into_composite`). It was refused here on the argument that "its value is
+        // a row, which this vocabulary has no shape for"; the shape is `text`, canonicalised, and
+        // it is what `pg_typeof` and every client already see.
+        if let crate::catalog::TypeKind::Composite { fields } = &def.kind {
+            let text = match operand {
+                Expr::Literal(Literal::String(text)) => text.clone(),
+                Expr::Literal(Literal::Typed(value)) => match &**value {
+                    Datum::Text(text) => text.clone(),
+                    _ => return Err(SqlError::unsupported(format!("the type {name}"))),
+                },
+                // A NULL is a NULL, as it is for every cast.
+                Expr::Literal(Literal::Null) => return Ok(Some(Expr::Literal(Literal::Null))),
+                _ => return Err(SqlError::unsupported(format!("a cast to {name} per row"))),
+            };
+            return Ok(Some(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+                crate::value::composite::canonicalise(&text, fields.len())?,
+            ))))));
         }
         // **Only a literal.** A cast of a *column* to a user type happens per row and would need
         // the type in the row evaluator; nothing the suite sends writes one, and a `0A000` naming

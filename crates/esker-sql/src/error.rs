@@ -876,6 +876,15 @@ pub enum SqlError {
     #[error("invalid hexadecimal data: odd number of digits")]
     OddHexDigits,
 
+    /// A record literal that will not read as one: `22P02`, with PostgreSQL's own sentence and
+    /// the literal quoted back.
+    ///
+    /// **One message for four different faults** — too few fields, too many, an unterminated
+    /// quote, and no parentheses at all — which is measured and is why the arity check raises this
+    /// rather than a count error of its own.
+    #[error("malformed record literal: \"{0}\"")]
+    MalformedRecordLiteral(String),
+
     /// A `bytea` escape-format literal has a backslash that starts nothing valid. PostgreSQL does
     /// not quote the input back in this one, which a capture is the only way to know.
     #[error("invalid input syntax for type bytea")]
@@ -2727,6 +2736,8 @@ impl SqlError {
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
             SqlError::InvalidXmlContent(_) => sqlstate::INVALID_XML_CONTENT,
             SqlError::MalformedRangeLiteral { .. }
+            // A record literal that will not read is the same class as a range one that will not.
+            | SqlError::MalformedRecordLiteral(_)
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
             | SqlError::InvalidHexadecimalDigit(_)
