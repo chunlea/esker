@@ -51,6 +51,17 @@ impl Db {
     ///
     /// Synchronous: it returns when the range has been compacted, which is what makes it
     /// usable from a test and from `esker-cli`.
+    ///
+    /// **It waits for its own work and for nothing else.** The background pool schedules
+    /// compactions of its own whenever the levels warrant one, and this call neither owns nor
+    /// drains them: under a steady write load the pool always has work, so waiting the pool out
+    /// would be a wait with no bound. "The range has been compacted" is therefore a statement
+    /// about *this range*, never about the database being quiet — a caller wanting quiet has to
+    /// stop writing first, and nothing here can do that for it.
+    ///
+    /// A test read it the other way round and asserted `esker.compactions-running == 0` after
+    /// this returned, which is why the sentence above is here rather than implied
+    /// (`tests/db.rs::the_background_pool_compacts_by_itself`, 2026-09-05).
     pub fn compact_range(&self, cf: &str, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         let handle = self.inner.cf_by_name(cf)?;
         // An inverted range is a caller's mistake, and silently compacting the files that

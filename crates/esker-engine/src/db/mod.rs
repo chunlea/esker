@@ -491,6 +491,15 @@ impl Db {
     /// A named statistic, for `esker-cli` and for tests that need to see a stall rather than
     /// infer one (`docs/DESIGN.md` §4.4, §12).
     ///
+    /// # `esker.compactions-running` counts **files**, not compactions
+    ///
+    /// It is the size of the reservation set every compaction claims its *inputs* in
+    /// ([`super::compact`], "two compactions must not touch one file"), so one compaction over
+    /// five input files reports `5`. The name is the older of the two and the count is the true
+    /// one; it is documented rather than renamed because `esker-cli` and existing tests ask for it
+    /// by name. A caller wanting "is anything compacting" wants `> "0"`, and a caller wanting how
+    /// many have *finished* wants [`Db::compactions_run`].
+    ///
     /// Recognised names: `esker.num-column-families`, `esker.snapshots`,
     /// `esker.compaction-floor`, `esker.instance`,
     /// `esker.last-sequence`, `esker.write-stalls`, `esker.write-slowdowns`,
