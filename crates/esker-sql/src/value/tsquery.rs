@@ -233,6 +233,119 @@ impl Parser<'_> {
     }
 }
 
+use super::tsvector::{self, Config, Lexeme};
+
+/// `to_tsquery(config, text)`: the grammar, then the configuration over each lexeme.
+///
+/// **A query's lexemes are stemmed and stop-filtered exactly as a vector's are**, which is what
+/// makes `@@` work at all — `to_tsquery('english', 'cats')` is `'cat'`, and it has to be, because
+/// the vector it will be matched against holds `cat`.
+///
+/// A stop word **takes its operator with it**: `to_tsquery('english', 'running & the')` is `'run'`,
+/// not `'run' & <nothing>`. Measured, and it is why this returns an `Option`: a query made only
+/// of stop words is no query at all.
+pub fn to_tsquery(config: Config, text: &str) -> Result<Option<Node>> {
+    Ok(prune(&from_text(text)?, config))
+}
+
+/// `plainto_tsquery(config, text)`: every word `AND`ed together.
+#[must_use]
+pub fn plainto_tsquery(config: Config, text: &str) -> Option<Node> {
+    join(config, text, |left, right| {
+        Node::And(Box::new(left), Box::new(right))
+    })
+}
+
+/// `phraseto_tsquery(config, text)`: every word joined by the phrase operator, so the order is
+/// part of the question. `'cat fat'` does **not** match `'fat' <-> 'cat'`, measured.
+#[must_use]
+pub fn phraseto_tsquery(config: Config, text: &str) -> Option<Node> {
+    join(config, text, |left, right| {
+        Node::Phrase(Box::new(left), Box::new(right))
+    })
+}
+
+fn join(config: Config, text: &str, with: fn(Node, Node) -> Node) -> Option<Node> {
+    let mut built: Option<Node> = None;
+    for lexeme in tsvector::to_lexemes(config, text) {
+        let next = Node::Lexeme(lexeme.word);
+        built = Some(match built {
+            None => next,
+            Some(left) => with(left, next),
+        });
+    }
+    built
+}
+
+/// Applies a configuration to every lexeme of a parsed query, dropping the ones that are stop
+/// words and collapsing the operators left without an operand.
+fn prune(node: &Node, config: Config) -> Option<Node> {
+    match node {
+        Node::Lexeme(word) => tsvector::to_tsvector(config, word)
+            .into_iter()
+            .next()
+            .map(|lexeme| Node::Lexeme(lexeme.word)),
+        Node::Not(inner) => prune(inner, config).map(|inner| Node::Not(Box::new(inner))),
+        Node::Phrase(a, b) | Node::And(a, b) | Node::Or(a, b) => {
+            let (left, right) = (prune(a, config), prune(b, config));
+            match (left, right) {
+                // **One side surviving is the whole query**, which is what makes
+                // `running & the` into `'run'`.
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+                (Some(left), Some(right)) => Some(match node {
+                    Node::Phrase(..) => Node::Phrase(Box::new(left), Box::new(right)),
+                    Node::And(..) => Node::And(Box::new(left), Box::new(right)),
+                    _ => Node::Or(Box::new(left), Box::new(right)),
+                }),
+            }
+        }
+    }
+}
+
+/// `tsvector @@ tsquery`.
+///
+/// **The phrase operator is positional and the rest is set membership.** `'cat fat'` holds both
+/// lexemes and still does not match `'fat' <-> 'cat'`, because `<->` asks where they are and not
+/// whether they are there.
+#[must_use]
+pub fn matches(vector: &[Lexeme], query: &Node) -> bool {
+    match query {
+        Node::Lexeme(word) => vector.iter().any(|lexeme| lexeme.word == *word),
+        Node::Not(inner) => !matches(vector, inner),
+        Node::And(a, b) => matches(vector, a) && matches(vector, b),
+        Node::Or(a, b) => matches(vector, a) || matches(vector, b),
+        Node::Phrase(..) => !phrase_positions(vector, query).is_empty(),
+    }
+}
+
+/// Where a node's match *ends*, in token positions, for the phrase operator's benefit.
+///
+/// A lexeme ends wherever it occurs; `a <-> b` ends where `b` occurs one position after some
+/// ending of `a`. Anything else has no position, which is why `!x <-> y` cannot be answered here
+/// and is not something the capture asks.
+fn phrase_positions(vector: &[Lexeme], node: &Node) -> Vec<u16> {
+    match node {
+        Node::Lexeme(word) => vector
+            .iter()
+            .filter(|lexeme| lexeme.word == *word)
+            .flat_map(|lexeme| lexeme.positions.iter().map(|(at, _)| *at))
+            .collect(),
+        Node::Phrase(a, b) => {
+            let left = phrase_positions(vector, a);
+            phrase_positions(vector, b)
+                .into_iter()
+                .filter(|at| {
+                    at.checked_sub(1)
+                        .is_some_and(|before| left.contains(&before))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +356,68 @@ mod tests {
 
     /// The capture's own rows: `to_tsquery` prints its operators with spaces and quotes every
     /// lexeme, and `!` binds to what follows it with no space.
+    /// **Every line here is an answer PostgreSQL 19beta1 gave**, captured in one rolled-back
+    /// session beside the tsvector capture.
+    #[test]
+    fn a_query_is_stemmed_and_stop_filtered_like_a_vector() {
+        let q = |text: &str| {
+            to_tsquery(Config::English, text)
+                .unwrap()
+                .map(|n| to_text(&n))
+        };
+        // A query's lexemes are stemmed, which is what makes `@@` meet the vector at all.
+        assert_eq!(q("cats").as_deref(), Some("'cat'"));
+        // **A stop word takes its operator with it**: `running & the` is `'run'`, not `'run' & …`.
+        assert_eq!(q("running & the").as_deref(), Some("'run'"));
+        // And a query that is nothing but stop words is no query at all.
+        assert_eq!(q("the"), None);
+    }
+
+    #[test]
+    fn plainto_and_phraseto_join_the_words_they_keep() {
+        let plain = plainto_tsquery(Config::English, "the fat cats").map(|n| to_text(&n));
+        assert_eq!(plain.as_deref(), Some("'fat' & 'cat'"));
+        let phrase = phraseto_tsquery(Config::English, "the fat cats").map(|n| to_text(&n));
+        assert_eq!(phrase.as_deref(), Some("'fat' <-> 'cat'"));
+        assert_eq!(plainto_tsquery(Config::English, "the a of"), None);
+    }
+
+    /// **`@@` is set membership until a phrase asks where.** `'cat fat'` holds both lexemes and
+    /// still does not match `'fat' <-> 'cat'` — measured, and the reason `<->` needed positions
+    /// rather than a second `AND`.
+    #[test]
+    fn a_phrase_match_is_positional_and_the_rest_is_not() {
+        let vector = tsvector::to_tsvector(Config::English, "The Fat Cats ate a rat");
+        assert!(matches(
+            &vector,
+            &to_tsquery(Config::English, "cats").unwrap().unwrap()
+        ));
+        assert!(matches(
+            &vector,
+            &to_tsquery(Config::English, "fat & cat").unwrap().unwrap()
+        ));
+        assert!(!matches(
+            &vector,
+            &to_tsquery(Config::English, "fat & dog").unwrap().unwrap()
+        ));
+        assert!(matches(
+            &vector,
+            &to_tsquery(Config::English, "!dog").unwrap().unwrap()
+        ));
+
+        let forwards = tsvector::to_tsvector(Config::English, "fat cat");
+        let backwards = tsvector::to_tsvector(Config::English, "cat fat");
+        let phrase = phraseto_tsquery(Config::English, "fat cat").unwrap();
+        assert!(
+            matches(&forwards, &phrase),
+            "the words are adjacent and in order"
+        );
+        assert!(
+            !matches(&backwards, &phrase),
+            "both lexemes are present and the order is wrong, which is the whole point of <->"
+        );
+    }
+
     #[test]
     fn the_operators_print_the_way_postgresql_prints_them() {
         assert_eq!(canon("fat & cat"), "'fat' & 'cat'");
