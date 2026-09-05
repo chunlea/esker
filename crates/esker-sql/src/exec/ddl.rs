@@ -3034,11 +3034,32 @@ fn rename_table(
     updated: &mut TableDef,
     to: &str,
 ) -> Result<()> {
-    if catalog::name_exists(&*txn, executor.tenant, to)? {
+    // **The new name is bare and the stored one carries the schema**, so it is rebuilt in the
+    // table's *own* schema before it is either checked or written. Using `to` as the stored name
+    // was two bugs on two lines and they looked like different faults:
+    //
+    // * the collision check asked **`public`**, because a bare stored name *is* `public`
+    //   (`catalog::qualify`), so a table in another schema could not be renamed to any name the
+    //   fixtures happened to hold — which is `SchemaWithDotsTest`'s head error, tapped off the
+    //   wire: `ALTER TABLE "posts" RENAME TO "articles"` answering
+    //   `42P07 relation "articles" already exists` against a fixture in `public`;
+    // * and when `public` held no such name the rename *succeeded* and **moved the table into
+    //   `public`**, silently, because the bare name it stored is what a `public` relation's name
+    //   looks like. That is why the harness lane saw no `my.schema.articles` afterwards **and no
+    //   error** — one cause, two symptoms that read like a contradiction.
+    //
+    // Measured on 19beta1 with `public.g1v54_art` deliberately present: the rename is accepted,
+    // `g1.v54.g1v54_art` exists afterwards and `public.g1v54_art` is untouched. The check itself is
+    // right and stays — a second rename onto a name **this** schema holds is `42P07` — it was only
+    // ever asking the wrong schema.
+    let target = catalog::qualify(catalog::split_qualified(&updated.name).0, to);
+    if catalog::name_exists(&*txn, executor.tenant, &target)? {
+        // The message names the relation **bare**, which is what a real server prints even for a
+        // collision inside a named schema: `relation "g1v54_art" already exists`.
         return Err(SqlError::DuplicateTable(to.to_owned()));
     }
     updated.name.clear();
-    updated.name.push_str(to);
+    updated.name.push_str(&target);
     Ok(())
 }
 
