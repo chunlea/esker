@@ -1,0 +1,14 @@
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 399-584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0ea724170be2f3997192b42099c0ee31b1ca3465",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
