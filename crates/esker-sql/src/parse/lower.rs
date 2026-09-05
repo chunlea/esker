@@ -562,16 +562,22 @@ fn lower_statement(
         // is: an extension is looked up by the string a control file is named with, not by a
         // PostgreSQL identifier.
         Statement::CreateExtension(create) => {
-            // `SCHEMA` and `VERSION` choose where it goes and which version to install; this node
-            // has one schema and offers one version per extension, so honouring the words while
-            // ignoring them would answer a question the user did not ask. `CASCADE` installs an
+            // **`SCHEMA` is carried now**; the comment here used to say "this node has one schema"
+            // and that stopped being true when schemas landed. `pg_extension.extnamespace` reads
+            // it back, which is the whole of what `ActiveRecord#extensions` needs.
+            //
+            // `VERSION` still is not: this build offers exactly one version per extension
+            // (`catalog::pg_catalog::AVAILABLE_EXTENSIONS`), so honouring the word while ignoring
+            // the number would answer a question the user did not ask. `CASCADE` installs an
             // extension's own dependencies, of which there are none here.
-            refuse_if(create.schema.is_some(), "CREATE EXTENSION ... SCHEMA")?;
             refuse_if(create.version.is_some(), "CREATE EXTENSION ... VERSION")?;
             refuse_if(create.cascade, "CREATE EXTENSION ... CASCADE")?;
             Ok(plan::Statement::CreateExtension(plan::CreateExtension {
                 name: create.name.value.clone(),
                 if_not_exists: create.if_not_exists,
+                // A schema name is an identifier and its case is its own, the way every other
+                // qualifier in this lowering is taken.
+                schema: create.schema.as_ref().map(|name| name.value.clone()),
             }))
         }
         // `ALTER INDEX <name> RENAME TO <name>`, the one form `ActiveRecord` sends. `sqlparser`

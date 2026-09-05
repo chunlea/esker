@@ -1017,16 +1017,25 @@ impl CatalogView {
             // `pg_available_extensions` as a non-NULL `installed_version` beside every available
             // one. They disagreed before `CREATE EXTENSION` existed, because one was a constant
             // that said `plpgsql` was installed and the other held nothing at all.
-            CatalogView::PgExtension => Ok(installed(txn, tenant)?
-                .into_iter()
-                .map(|(name, version)| {
-                    vec![
-                        Datum::Text(name),
-                        Datum::Int8(PUBLIC_NAMESPACE_OID),
-                        Datum::Text(version),
-                    ]
-                })
-                .collect()),
+            // **`extnamespace` is read back, not assumed.** It was `PUBLIC_NAMESPACE_OID` for
+            // every row, which made `CREATE EXTENSION … SCHEMA <name>` unreportable even once it
+            // was accepted, and put `plpgsql` in `public` where a real server has it in
+            // `pg_catalog`. `ActiveRecord#extensions` joins this to `pg_namespace` and then drops
+            // the schema when it equals `current_schema`, so the constant made every extension
+            // list bare.
+            CatalogView::PgExtension => {
+                let schemas = super::schema_names(txn, tenant)?;
+                Ok(installed(txn, tenant)?
+                    .into_iter()
+                    .map(|(name, version, schema)| {
+                        vec![
+                            Datum::Text(name),
+                            Datum::Int8(namespace_oid(&schemas, &schema)),
+                            Datum::Text(version),
+                        ]
+                    })
+                    .collect())
+            }
             CatalogView::PgAvailableExtensions => {
                 let installed = installed(txn, tenant)?;
                 Ok(AVAILABLE_EXTENSIONS
@@ -1034,8 +1043,8 @@ impl CatalogView {
                     .map(|(name, default_version)| {
                         let version = installed
                             .iter()
-                            .find(|(installed, _)| installed == name)
-                            .map(|(_, version)| Datum::Text(version.clone()));
+                            .find(|(installed, ..)| installed == name)
+                            .map(|(_, version, _)| Datum::Text(version.clone()));
                         vec![
                             Datum::Text((*name).to_owned()),
                             Datum::Text((*default_version).to_owned()),
@@ -1333,16 +1342,26 @@ pub fn extension_types(extension: &str) -> &'static [ColumnType] {
     }
 }
 
-/// The extension every database has installed before anything runs.
-const PRE_INSTALLED: (&str, &str) = ("plpgsql", "1.0");
+/// The extension every database has installed before anything runs, and **the schema it lives
+/// in**, which is not `public`.
+///
+/// Measured on 19beta1: `plpgsql`'s `extnamespace` is `pg_catalog` and its `extrelocatable` is
+/// `f` - alone among the extensions this build offers, and the reason `ActiveRecord#extensions`
+/// lists it as `pg_catalog.plpgsql` rather than bare. Reporting it in `public` put the wrong
+/// string in that list for the one extension every database has.
+const PRE_INSTALLED: (&str, &str, &str) = ("plpgsql", "1.0", super::PG_CATALOG_SCHEMA);
 
-/// Every installed extension, in name order: the one that is always there, then whatever a
-/// `CREATE EXTENSION` recorded.
-fn installed(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<(String, String)>> {
-    let mut rows = vec![(PRE_INSTALLED.0.to_owned(), PRE_INSTALLED.1.to_owned())];
-    for (name, version) in super::installed_extensions(txn, tenant)? {
-        if name != PRE_INSTALLED.0 {
-            rows.push((name, version));
+/// Every installed extension, in name order, as `(name, version, schema)`: the one that is always
+/// there, then whatever a `CREATE EXTENSION` recorded.
+fn installed(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<(String, String, String)>> {
+    let mut rows = vec![(
+        PRE_INSTALLED.0.to_owned(),
+        PRE_INSTALLED.1.to_owned(),
+        PRE_INSTALLED.2.to_owned(),
+    )];
+    for row in super::installed_extensions(txn, tenant)? {
+        if row.0 != PRE_INSTALLED.0 {
+            rows.push(row);
         }
     }
     rows.sort();
@@ -1353,7 +1372,7 @@ fn installed(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<(String, 
 pub fn is_installed(txn: &dyn crate::backend::Txn, tenant: u64, name: &str) -> Result<bool> {
     Ok(installed(txn, tenant)?
         .iter()
-        .any(|(installed, _)| installed == name))
+        .any(|(installed, ..)| installed == name))
 }
 
 /// Whether this build has an extension, and the version it would install at.
