@@ -453,6 +453,16 @@ pub enum SqlError {
         alias: String,
     },
 
+    /// Two `FROM` entries that share an implicit alias — `FROM s1.things, s2.things`, where both
+    /// are referable as `things` and neither is the obvious one.
+    ///
+    /// **Different from [`Self::DuplicateTableName`]**, which is about the entries: these are two
+    /// relations a query is allowed to have, and only the *reference* is undecidable. PostgreSQL
+    /// accepts the `FROM` and refuses the bare qualifier, with its own class — measured, `42P09`
+    /// against the other's `42712`.
+    #[error("table reference \"{0}\" is ambiguous")]
+    AmbiguousTableReference(String),
+
     /// `FROM t JOIN t` or `FROM a AS x JOIN b AS x` — two FROM entries a qualifier cannot tell
     /// apart.
     ///
@@ -2469,6 +2479,7 @@ impl SqlError {
             SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
+            SqlError::AmbiguousTableReference(_) => sqlstate::AMBIGUOUS_ALIAS,
             SqlError::AmbiguousFunction { .. } => sqlstate::AMBIGUOUS_FUNCTION,
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
