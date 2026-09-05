@@ -1,0 +1,23 @@
+crates/esker-sql/tests/pgwire_client/mod.rs
+  s_6f7019c05b578b::t_e113b4b4bcf1a8 59-100,178-184
+crates/esker-sql/tests/view_bind_at_the_wire.rs
+  s_6f7019c05b578b::t_de7a488d9bdea4 1-102
+crates/esker-sql/tests/view_bind_real_stores.rs
+  s_6f7019c05b578b::t_24c9656ecb66bc 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "fe723c633e9f186b2cd39aa04ee8b568afc2f030",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
