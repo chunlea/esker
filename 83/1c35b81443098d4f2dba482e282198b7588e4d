@@ -1,0 +1,14 @@
+crates/esker-store/tests/cluster.rs
+  h_44076b318daf9c 491-516,520,526-548,581,623-646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "831c35b81443098d4f2dba482e282198b7588e4d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
