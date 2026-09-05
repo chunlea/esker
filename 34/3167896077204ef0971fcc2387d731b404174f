@@ -1,0 +1,19 @@
+crates/esker-sql/tests/update_set_subquery.rs
+  s_e5c0c6e78b5662::t_1d0ad88e8320a4 111-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "343167896077204ef0971fcc2387d731b404174f",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
