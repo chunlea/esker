@@ -290,12 +290,13 @@ fn named_relations<'a>(
         // its halves to whichever `t` the list happens to hold first.
         let Some(def) = tables
             .iter()
-            .find(
-                |candidate| match entry.name.contains(crate::catalog::SCHEMA_SEPARATOR) {
-                    true => candidate.name == entry.name,
-                    false => bare(&candidate.name) == entry.name,
-                },
-            )
+            .find(|candidate| {
+                if entry.name.contains(crate::catalog::SCHEMA_SEPARATOR) {
+                    candidate.name == entry.name
+                } else {
+                    bare(&candidate.name) == entry.name
+                }
+            })
             .map(AsRef::as_ref)
         else {
             continue;
