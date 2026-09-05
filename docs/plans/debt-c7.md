@@ -606,3 +606,38 @@ The wave's earlier gates ran three of those five: `cargo deny` and the doctests 
 because a container gate had been built beside `just check` rather than from it (h1's finding), and
 `run.sh` exited 0 regardless until it was fixed. Both are why the fmt line in §10 was green for days
 while it was red.
+
+## 13. The durability assertion is sound, and the proof is in the code
+
+`cluster::no_acknowledged_write_is_lost_when_the_leader_is_killed` failed once in h1's container run
+at **1.8 s** — a normal-duration run, so an assertion fired during ordinary operation rather than at
+the end of a slow one. The question was whether an acknowledged write is really lost or the test
+mis-attributes an unacknowledged one. **It does not mis-attribute.** Every link is now checked
+against the source rather than argued:
+
+| link | how it is known |
+|---|---|
+| `propose` returning `Ok` means the entry **applied on the leader** | `complete_proposal` has one call site, at the end of the apply path; every other resolution — the unknown-command path, the truncated-index path, the append-failure drain — sends `Err` |
+| applied ⟹ **committed** | `RaftLog::applied_to` clamps with `.min(self.committed)`, and `next_committed` hands out only `[applied + 1, committed + 1)` |
+| committed ⟹ **a majority of voters hold it in their logs** | `maybe_commit` sorts the voters' `matched` descending and takes `matched[quorum - 1]`, with §5.4.2's term condition refusing to commit an earlier term's entry by counting |
+| `last_acked` names **the acknowledged write itself**, not a later entry | measured: the leader's applied index moved by exactly 1 for each of the 12 writes, in 65 runs, with no exceptions |
+| a follower's `last_index` is its **log tail**, and logs do not shrink below commit | `Status::last_index` is documented as the last index in its log; truncation is above the commit point |
+
+So on three nodes `holders == 1` — the leader having applied an entry that **neither** follower holds
+— cannot happen unless commit safety is violated. And at 1.8 s only `assert_quorum_holds` can have
+fired: the convergence path spends ten seconds inside `eventually` before it panics.
+
+**If that assertion fired, it is a real violation of invariant 1.** Not lag, not a stale read, not
+the test naming the wrong index.
+
+### What is not known, and it is the reproduction
+
+233 sound runs on the macOS host produced nothing: 30 solo, 78 across four loads with a flat curve
+(1.33 / 1.49 / 1.29 / 1.34 s — this test is not slowed by CPU load at all), 60 with ten concurrent
+clusters, 65 instrumented. h1 saw it in the **Linux container**, which is the one environment this
+lane has not been able to run in — different scheduler, different loopback.
+
+The message would settle it in one line, and it is already diagnostic: `assert_quorum_holds` prints
+every peer's `term/commit/applied/last` from before the kill, so the next occurrence says which
+peers held the entry and which did not. Nobody has captured it yet — the same gap as §6's sighting,
+and for the same reason.

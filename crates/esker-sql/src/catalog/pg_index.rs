@@ -389,6 +389,9 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
                         ty: ColumnType::Text,
                     },
                     order: crate::catalog::KeyOrder::ASCENDING,
+                    // An exclusion's key takes the type's default class, which is what an
+                    // unwritten one means everywhere.
+                    opclass: None,
                 }]),
                 // **Not unique.** The `&&` lives only in `pg_constraint`; the index behind an
                 // exclusion constraint is a plain one, measured.
