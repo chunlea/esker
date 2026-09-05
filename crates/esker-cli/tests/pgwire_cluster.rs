@@ -181,9 +181,27 @@ fn esker_cli() -> &'static str {
     env!("CARGO_BIN_EXE_esker-cli")
 }
 
-/// The SQL node's binary, beside this one — `CARGO_BIN_EXE_esker-sql` exists only for binaries of
-/// this test's own package.
+/// The SQL node's binary, beside this one — **built first, because nothing else builds it.**
+///
+/// `CARGO_BIN_EXE_esker-sql` exists only for binaries of this test's own package, so the path is
+/// the sibling in the same target directory. Cargo will not have put a *current* one there:
+/// `cargo nextest run -p esker-cli` builds this package's test targets and not another package's
+/// binary, so whatever is on disk may be any age at all.
+///
+/// The first red run of this test was against a binary twelve minutes stale — it reported the very
+/// bug the fix had already removed, which is the most misleading way a test can fail. Building it
+/// here costs a no-op cargo invocation when it is fresh and makes the test unable to lie about
+/// which code it exercised.
 fn esker_sql() -> PathBuf {
+    let built = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+        .args(["build", "-p", "esker-sql", "--bin", "esker-sql"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    assert!(
+        built.is_ok_and(|status| status.success()),
+        "the esker-sql binary must build before this test can drive it"
+    );
     Path::new(esker_cli())
         .parent()
         .expect("the test binary has a directory")
