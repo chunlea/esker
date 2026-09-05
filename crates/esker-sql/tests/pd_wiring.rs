@@ -368,7 +368,7 @@ async fn a_report_slower_than_the_lease_does_not_expire_it() {
     let (_pd, pd_handle, address) = standin_pd::serve_with_lease(LEASE_MS).await;
     let cluster = cluster::Cluster::start_on_this_runtime().await;
 
-    let (lease, backend, refresher) = tokio::task::block_in_place(|| {
+    let (backend, refresher) = tokio::task::block_in_place(|| {
         let lease = Arc::new(PdLease::new());
         let backend = cluster.backend_holding(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>);
         // Three lease-lengths, so that a report which delays the renewal cannot fail to expire it.
@@ -382,7 +382,10 @@ async fn a_report_slower_than_the_lease_does_not_expire_it() {
         refresher
             .refresh()
             .expect("a node fetches its lease before it serves");
-        (lease, backend, refresher)
+        // The lease itself is not returned: the backend holds a clone of it and so does the
+        // refresher, and this test deliberately watches it through `Backend`, which is the value
+        // the write path turns into `25006`.
+        (backend, refresher)
     });
 
     std::thread::Builder::new()
