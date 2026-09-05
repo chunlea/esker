@@ -3211,7 +3211,7 @@ impl Executor {
             } else if let Some(def) = crate::catalog::view(txn, self.tenant, &name)?
                 && let Some(table) = def.as_table()
             {
-                found.push(std::sync::Arc::new(table));
+                found.push(Arc::new(table));
             }
         }
         Ok(found)

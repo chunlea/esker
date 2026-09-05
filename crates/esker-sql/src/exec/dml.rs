@@ -586,7 +586,7 @@ fn rename_columns(
             if let Some(qualifier) = table
                 && crate::exec::bind::bare(qualifier) == crate::exec::bind::bare(through)
             {
-                *qualifier = onto.to_owned();
+                onto.clone_into(qualifier);
             }
             if let Some(base) = renames.get(name) {
                 name.clone_from(base);
