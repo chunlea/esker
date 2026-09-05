@@ -1,0 +1,19 @@
+.config/nextest.toml
+  s_2d916f5f540186::t_b97f8c45ee0e52 56-83,101-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d45c2328354c63659dbcd9fe0cf0edeaf3f9717a",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
