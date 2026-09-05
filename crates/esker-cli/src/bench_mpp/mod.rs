@@ -96,11 +96,15 @@ impl Default for BenchMppOptions {
             base_port: 24_160,
             seed: 20_260_904,
             keep: false,
-            // **The shipped defaults, which is what the working reference uses.** A 2 s region
-            // heartbeat places a columnar learner in seconds instead of fifty, and it also asks
-            // PD to act on every region thirty times as often; runs at 2 s lost the SQL node's
-            // schema lease mid-load twice, and runs at 60 s completed. Setup is slower and the
-            // measured statements are unaffected, which is the right way round.
+            // **The shipped defaults, which is what the working reference uses.** Shortening
+            // them to 2 s places a columnar learner in seconds rather than fifty, and asks PD to
+            // act on every region thirty times as often; matching `esker cluster start` keeps
+            // one fewer thing different between this benchmark and the path that is known to
+            // work. Setup is slower and the measured statements are unaffected.
+            //
+            // It is *not* known to fix the schema-lease expiry seen at 2 s: the same
+            // `25006 ... schema lease has expired` came back at these intervals on a loaded
+            // machine. What discriminates those runs is the machine's load, not this knob.
             region_heartbeat_ms: 60_000,
             heartbeat_tick_ms: 1_000,
         }
