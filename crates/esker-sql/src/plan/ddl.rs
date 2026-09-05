@@ -140,6 +140,23 @@ pub struct AlterIndexRename {
     pub if_exists: bool,
 }
 
+/// `ADD CONSTRAINT [name] UNIQUE USING INDEX <index> [DEFERRABLE …]`.
+///
+/// The index supplies the columns, so there is no column list to lower — which is why this is not
+/// a [`UniqueConstraint`] with an extra field: that struct is also `CREATE TABLE`'s, where the
+/// spelling does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueUsingIndex {
+    /// The constraint's name, or `None` to take the index's.
+    pub name: Option<String>,
+    /// The existing index being promoted.
+    pub index: String,
+    /// `DEFERRABLE`.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`.
+    pub deferred: bool,
+}
+
 /// A `UNIQUE` constraint, which becomes a unique index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniqueConstraint {
@@ -1319,6 +1336,12 @@ pub enum AlterTableAction {
     /// same index and only `IndexDef::constraint` tells them apart, which is what decides whether
     /// `DROP CONSTRAINT` or `DROP INDEX` can remove it.
     AddUnique(UniqueConstraint),
+    /// `ADD CONSTRAINT … UNIQUE USING INDEX <index>` — promote an index that already exists.
+    ///
+    /// A unique constraint here **is** an [`crate::catalog::IndexDef`] with its `constraint` field
+    /// set, so promoting one is setting that field and renaming the index; nothing is built and
+    /// nothing is backfilled, because the index is already there and already filled.
+    AddUniqueUsingIndex(UniqueUsingIndex),
     /// `RENAME COLUMN <from> TO <to>`, the one shape `rename_column` sends
     /// (`abstract/schema_statements.rb:1923`).
     ///
