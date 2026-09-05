@@ -75,8 +75,8 @@ pub enum Values {
     /// A boolean, in any of PostgreSQL's spellings. Anything else is `22023` with a sentence of
     /// its own rather than a list — measured: `parameter "x" requires a Boolean value`.
     Boolean,
-    /// Any text. PostgreSQL validates `search_path` not at all and `TimeZone` against a zone
-    /// database this node does not carry, so what narrows both here is [`Parameter::honour`].
+    /// Any text. PostgreSQL validates `search_path` not at all, which is measured: an entry
+    /// naming no schema is skipped rather than refused.
     ///
     /// Qualified, which is what a bare `[honour]` was missing: rustdoc resolves a name in the
     /// *module*'s scope, and an inherent method is not in one. It is not that the method is
@@ -84,6 +84,20 @@ pub enum Values {
     /// belongs to. Both lanes that met this under `-D warnings` fixed it; this is the fix that
     /// keeps the link.
     Free,
+    /// A time-zone name, checked against the table and **stored in its canonical spelling**.
+    ///
+    /// Measured, and both halves matter: `SET TIME ZONE 'america/new_york'` is accepted where
+    /// `'Nowhere/Notreal'` is `22023 invalid value for parameter "TimeZone": "Nowhere/Notreal"`,
+    /// and `SHOW TimeZone` then answers `America/New_York` rather than what was typed
+    /// (`tests/captures/pg19_time_zone.txt`).
+    ///
+    /// Until ADR 0080 this was [`Values::Free`] plus a refusal in [`Parameter::honour`] for any
+    /// name that did not mean UTC, and that refusal's list of UTC spellings had **three names a
+    /// real server rejects** in it — `universal`, `zulu` and `z` are not in the installed table
+    /// and are `22023` there, where this node was accepting them. Answering where PostgreSQL
+    /// raises is the class ADR 0031 ranks worst, and it came from a list written by hand instead
+    /// of a table looked up.
+    TimeZone,
     /// An integer with an optional time unit: `10ms`, `2s`, `0`.
     ///
     /// **The unit stays in the value.** `SHOW idle_in_transaction_session_timeout` answers `10ms`,
@@ -132,7 +146,7 @@ pub const PARAMETERS: &[Parameter] = &[
         name: "timezone",
         reported: "TimeZone",
         boot: "UTC",
-        values: Values::Free,
+        values: Values::TimeZone,
         read_only: false,
     },
     // **The text-search configuration a bare `to_tsvector(text)` uses.** PostgreSQL reports it
@@ -451,6 +465,15 @@ impl Parameter {
             }
             // Read back exactly as written: a real server hands `Etc/UTC` back as `Etc/UTC`.
             Values::Free => Ok(value.to_owned()),
+            // **The table decides, and it answers with the canonical spelling.** `Etc/UTC` still
+            // reads back as `Etc/UTC` because that is its own canonical name, and
+            // `america/new_york` reads back as `America/New_York` because that is New York's.
+            Values::TimeZone => crate::value::zone::Zone::shared(value)
+                .map(|zone| zone.name().to_owned())
+                .ok_or_else(|| SqlError::InvalidParameterValue {
+                    name: self.reported,
+                    value: value.to_owned(),
+                }),
             // Three refusals rather than one, because PostgreSQL gives them two sentences: a
             // value it cannot read and one whose magnitude will not fit are quoted back
             // identically and separated by a `HINT` alone, while one that fits and is out of
@@ -487,11 +510,11 @@ impl Parameter {
             // PostgreSQL's own answer, with PostgreSQL's own sentence. This crate's string lexer
             // is standard-conforming and cannot be made otherwise by a setting.
             ("standard_conforming_strings", "off") => Err(SqlError::NonStandardStringLiterals),
-            // `timestamptz` is printed in UTC and nowhere else, so a zone that is not UTC would be
-            // a setting honoured in `SHOW` and ignored in every row.
-            ("timezone", zone) if !is_utc(zone) => {
-                Err(SqlError::unsupported(format!("the time zone \"{zone}\"")))
-            }
+            // **`TimeZone` was refused by name here until ADR 0080**, because a `timestamptz` was
+            // printed in UTC and nowhere else and a zone honoured in `SHOW` and ignored in every
+            // row would be a setting that lies. The zone now reaches the renderer through
+            // `crate::value::Rendering`, so there is nothing left to refuse: a name that does not
+            // resolve is `22023` at `SET`, from [`Values::TimeZone`], and one that does is meant.
             // **`lock_timeout` was honoured first** — a waiter is a loop the SQL layer drives —
             // and `statement_timeout` is honoured now too: `exec::cancel` gives the statement a
             // deadline this thread carries, and the loops long enough to matter check it. Both
@@ -536,15 +559,6 @@ pub fn duration_ms(value: &str) -> Option<u64> {
     #[allow(clippy::cast_sign_loss)]
     let scaled = count.checked_mul(*numerator as u64)?;
     (scaled != 0).then_some(scaled)
-}
-
-/// The spellings of UTC this node can print in. `Etc/UTC` is the same instant offset and reads
-/// back as itself, which is what a real server does with it.
-fn is_utc(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "utc" | "etc/utc" | "universal" | "zulu" | "z" | "+00:00" | "utc+0" | "utc-0"
-    )
 }
 
 /// What a transaction promises about what it can see, and what it does about a conflict.

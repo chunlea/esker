@@ -50,7 +50,7 @@ struct Returned {
     rows: Vec<Vec<Option<Vec<u8>>>>,
     /// The session's `IntervalStyle`. `RETURNING` is a second path to a client and had to be told
     /// about it separately, exactly as it had to be told that an enum leaves as its label.
-    style: crate::value::IntervalStyle,
+    rendering: crate::value::Rendering,
 }
 
 impl Returned {
@@ -60,7 +60,7 @@ impl Returned {
     fn open(
         returning: Option<&Returning>,
         table: &TableDef,
-        style: crate::value::IntervalStyle,
+        rendering: crate::value::Rendering,
     ) -> Result<Option<Self>> {
         let Some(items) = returning else {
             return Ok(None);
@@ -70,7 +70,7 @@ impl Returned {
             columns,
             exprs,
             rows: Vec::new(),
-            style,
+            rendering,
         }))
     }
 
@@ -85,7 +85,7 @@ impl Returned {
         from: crate::plan::TableRef,
         joins: &[crate::plan::Join],
         scope: &query::Scope<'_>,
-        style: crate::value::IntervalStyle,
+        rendering: crate::value::Rendering,
     ) -> Result<Option<Self>> {
         let Some(items) = returning else {
             return Ok(None);
@@ -95,7 +95,7 @@ impl Returned {
             columns,
             exprs,
             rows: Vec::new(),
-            style,
+            rendering,
         }))
     }
 
@@ -114,7 +114,7 @@ impl Returned {
                     // two output paths, and only the `SELECT` one used it.
                     match self.columns.get(at).and_then(|c| c.user_type.as_ref()) {
                         Some(def) => super::assign::from_enum(&value, def).to_text(),
-                        None => crate::value::to_text_under(&value, self.style),
+                        None => crate::value::to_text_under(&value, self.rendering),
                     }
                     .map(String::into_bytes)
                 })
@@ -276,7 +276,9 @@ pub(super) fn column_default_value(
 /// gate: PostgreSQL coerces a default to its column when the table is created, so by the time a
 /// row is written the pair has already been accepted.
 pub(super) fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
-    crate::value::assignment_cast(value, ty)
+    // **The boot rendering.** A `DEFAULT` is coerced to its column when the table is created, so
+    // the session that later inserts a row is not the one whose zone decided the value.
+    crate::value::assignment_cast(value, ty, crate::value::Rendering::default())
 }
 
 fn sequence_datum(ty: ColumnType, value: i64) -> Result<Datum> {
@@ -594,8 +596,7 @@ pub(super) fn insert(
     let table = executor.require_table(txn, &insert.table)?;
     refuse_matview_write(&table, &insert.table)?;
     let targets = target_columns(&table, insert)?;
-    let mut returned =
-        Returned::open(insert.returning.as_ref(), &table, executor.interval_style())?;
+    let mut returned = Returned::open(insert.returning.as_ref(), &table, executor.rendering())?;
     // The row keys this statement has written, for the `21000` above. Only `ON CONFLICT` fills it:
     // without the clause a second write to one key is the ordinary `23505`.
     let mut touched: Vec<Vec<u8>> = Vec::new();
@@ -656,7 +657,7 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
-            row[*target] = value_for_column(expr, column, &table, &*txn)?;
+            row[*target] = value_for_column(expr, column, &table, &*txn, executor.rendering())?;
         }
         // A sequence fills its column when the statement did not name it, or named it and wrote
         // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
@@ -765,6 +766,7 @@ fn value_for_column(
     column: &crate::catalog::ColumnDef,
     table: &TableDef,
     txn: &dyn Txn,
+    rendering: crate::value::Rendering,
 ) -> Result<Datum> {
     // **An enum column takes a label, not an `int2`.** The value is read as *text* whatever the
     // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
@@ -780,7 +782,7 @@ fn value_for_column(
         };
         // Through `into_column` rather than straight to `into_enum`: the kind is decided in one
         // place, so a composite is canonicalised here exactly as an enum is mapped.
-        return super::assign::into_column(value, column, Some(def));
+        return super::assign::into_column(value, column, Some(def), rendering);
     }
     match expr {
         crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
@@ -802,6 +804,7 @@ fn value_for_column(
                 cursor::evaluate_in_txn(&resolved, &[], txn)?,
                 column,
                 super::assign::rewriting_type_of(table, column),
+                rendering,
             )
         }
     }
@@ -1052,7 +1055,7 @@ fn update_returning(
         target_ref,
         chain,
         &query::Scope::chain(&entries),
-        executor.interval_style(),
+        executor.rendering(),
     )
 }
 
@@ -1137,6 +1140,7 @@ pub(super) fn update(
                     evaluated,
                     column,
                     super::assign::rewriting_type_of(&table, column),
+                    executor.rendering(),
                 )?;
             }
             fit_typmods(&table, &mut new)?;
@@ -1200,8 +1204,7 @@ pub(super) fn delete(
     }
     let named = executor.require_table(txn, &delete.table)?;
     refuse_matview_write(&named, &delete.table)?;
-    let mut returned =
-        Returned::open(delete.returning.as_ref(), &named, executor.interval_style())?;
+    let mut returned = Returned::open(delete.returning.as_ref(), &named, executor.rendering())?;
     let mut count = 0;
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
     // measured, and each row has to go through its own table's keys and indexes.
@@ -1269,7 +1272,15 @@ fn resolve_conflict(
     let crate::plan::ConflictAction::DoUpdate(assignments) = &on_conflict.action else {
         return Ok(None);
     };
-    let updated = apply_conflict_update(target, assignments, &existing.row, proposed, &*txn)?;
+    let rendering = executor.rendering();
+    let updated = apply_conflict_update(
+        target,
+        assignments,
+        &existing.row,
+        proposed,
+        &*txn,
+        rendering,
+    )?;
     // **A `DO UPDATE` cannot move a row between partitions**, where a plain `UPDATE` can. Setting
     // the key to what it already holds is fine; setting it to another partition's value is `0A000`
     // with PostgreSQL's own `DETAIL`.
@@ -1449,6 +1460,7 @@ fn apply_conflict_update(
     existing: &[Datum],
     proposed: &[Datum],
     txn: &dyn Txn,
+    rendering: crate::value::Rendering,
 ) -> Result<Vec<Datum>> {
     let mut both = existing.to_vec();
     both.extend_from_slice(proposed);
@@ -1477,6 +1489,7 @@ fn apply_conflict_update(
             evaluated,
             column,
             super::assign::rewriting_type_of(table, column),
+            rendering,
         )?;
     }
     fit_typmods(table, &mut updated)?;

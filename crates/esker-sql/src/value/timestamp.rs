@@ -89,7 +89,46 @@ pub(super) fn round_to_precision(micros: i64, precision: u32) -> i64 {
 }
 
 pub(super) fn to_text(micros: i64) -> String {
-    with_zone(micros, true)
+    with_zone(micros, Zoning::Utc)
+}
+
+/// The same instant **in a session's time zone**, which is what a client is sent.
+///
+/// `None` is UTC, which is the boot value and what every path with no session uses — an index
+/// key, an error message and a stored catalog default must not move when someone runs a `SET`.
+///
+/// The offset is printed in the shortest form that says it, which is PostgreSQL's rule and is not
+/// cosmetic: `-05`, `+05:45` and `-04:56:02` are all measured
+/// (`tests/captures/pg19_time_zone.txt`), the last being New York before it had a standard time.
+pub(super) fn to_text_in(micros: i64, zone: Option<&super::zone::Zone>) -> String {
+    match zone {
+        None => with_zone(micros, Zoning::Utc),
+        Some(zone) => {
+            // The offset is the one in force **at this instant**, so it is looked up from the UTC
+            // value and only then added: looking it up from the local value would ask the zone
+            // about a time that does not exist twice a year.
+            let unix = micros.div_euclid(MICROS_PER_SECOND) + PG_EPOCH_UNIX_SECONDS;
+            let offset = zone.offset_at(unix).seconds;
+            with_zone(
+                micros.saturating_add(i64::from(offset) * MICROS_PER_SECOND),
+                Zoning::Offset(offset),
+            )
+        }
+    }
+}
+
+/// 2000-01-01T00:00:00Z as a Unix time: what converts this crate's epoch to the zone table's.
+pub(super) const PG_EPOCH_UNIX_SECONDS: i64 = UNIX_TO_PG_EPOCH_DAYS * SECONDS_PER_DAY;
+
+/// What, if anything, follows the time.
+#[derive(Clone, Copy)]
+enum Zoning {
+    /// No offset at all: a `timestamp`, which does no conversion and shows no zone.
+    None,
+    /// `+00`, the only offset a node with no zone table could print.
+    Utc,
+    /// Seconds east of UTC, printed as `±HH`, `±HH:MM` or `±HH:MM:SS`.
+    Offset(i32),
 }
 
 /// What PostgreSQL's `timestamp_out` writes: the same instant with **no offset**.
@@ -100,10 +139,10 @@ pub(super) fn to_text(micros: i64) -> String {
 /// This node only ever means UTC (`src/parameter.rs`), so the two agree here on every value and
 /// disagree on one string.
 pub(super) fn to_text_without_zone(micros: i64) -> String {
-    with_zone(micros, false)
+    with_zone(micros, Zoning::None)
 }
 
-fn with_zone(micros: i64, zone: bool) -> String {
+fn with_zone(micros: i64, zone: Zoning) -> String {
     match micros {
         POS_INFINITY => return "infinity".to_owned(),
         NEG_INFINITY => return "-infinity".to_owned(),
@@ -132,23 +171,47 @@ fn with_zone(micros: i64, zone: bool) -> String {
         out.push('.');
         out.push_str(format!("{fraction:06}").trim_end_matches('0'));
     }
-    if zone {
-        out.push_str("+00");
+    match zone {
+        Zoning::None => {}
+        Zoning::Utc => out.push_str("+00"),
+        Zoning::Offset(seconds) => out.push_str(&offset_text(seconds)),
     }
     out.push_str(era);
     out
 }
 
+/// `-05`, `+05:45`, `-04:56:02` — the shortest form that says the offset, sign always written.
+fn offset_text(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let magnitude = seconds.unsigned_abs();
+    let (hours, minutes, seconds) = (magnitude / 3600, (magnitude / 60) % 60, magnitude % 60);
+    if seconds != 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    } else if minutes != 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}")
+    }
+}
+
 /// Reads the ISO subset for `timestamp` **without** time zone.
 ///
-/// The same lexer, and the same instant for every input this node accepts — a zone displacement is
-/// what a `timestamp` has no room for, and this node's only zone is UTC, so the two functions
-/// differ in exactly one thing: **the name in the error**. Measured: a real server says
-/// `invalid input syntax for type timestamp: "not a date"`, naming the short form, where the
-/// zoned one names `timestamp with time zone`. Two messages about two types, and neither is the
+/// The same lexer, and two differences from the zoned one.
+///
+/// **A trailing offset is read and discarded**, which is what PostgreSQL's `timestamp_in` does:
+/// `'2011-01-02 12:30:00+13'::timestamp` is `2011-01-02 12:30:00`, and so is the same text with
+/// `-05`. This function used to *apply* the displacement, on the reasoning that "this node's only
+/// zone is UTC, so the two functions differ in exactly one thing". That was true and invisible
+/// while every offset printed was `+00`; the moment a session could be in Auckland,
+/// `at::timestamp` answered the UTC clock where a real server answers the local one. A cast is a
+/// text round trip, so the input function's rule about the offset decides the cast's answer.
+///
+/// And **the name in the error**: a real server says
+/// `invalid input syntax for type timestamp: "not a date"`, naming the short form, where the zoned
+/// one names `timestamp with time zone`. Two messages about two types, and neither is the
 /// other's.
 pub(super) fn from_text_without_zone(text: &str) -> Result<i64> {
-    from_text(text).map_err(|error| match error {
+    read(text, Zoned::Ignored).map_err(|error| match error {
         SqlError::InvalidDatetimeFormat { value, .. } => SqlError::InvalidDatetimeFormat {
             // `timestamp`, not `timestamp without time zone`: the input function's own name and
             // not the type's long one.
@@ -161,6 +224,10 @@ pub(super) fn from_text_without_zone(text: &str) -> Result<i64> {
 
 /// Reads the ISO subset, or says which construct it did not read.
 pub(super) fn from_text(text: &str) -> Result<i64> {
+    read(text, Zoned::Applied)
+}
+
+fn read(text: &str, zoned: Zoned) -> Result<i64> {
     let body = super::datetime_body(text);
     let lower = body.to_ascii_lowercase();
     match lower.as_str() {
@@ -183,7 +250,7 @@ pub(super) fn from_text(text: &str) -> Result<i64> {
         return Err(invalid_format(text));
     }
 
-    match parse_iso(body) {
+    match parse_iso_in(body, zoned) {
         Ok(micros) if (MIN_MICROS..=MAX_MICROS).contains(&micros) => Ok(micros),
         // **`timestamp`, not `timestamp without time zone`** — and the same word for a
         // `timestamptz`, whose *syntax* error names the full type. Measured: PostgreSQL words
@@ -236,6 +303,21 @@ enum Reject {
 }
 
 fn parse_iso(body: &str) -> std::result::Result<i64, Reject> {
+    parse_iso_in(body, Zoned::Applied)
+}
+
+/// Whether a trailing offset in the text moves the instant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Zoned {
+    /// `timestamptz`: `2011-01-02 12:30:00+13` is 23:30 UTC on the 1st.
+    Applied,
+    /// `timestamp`: the offset is **read and discarded**, which is what PostgreSQL's
+    /// `timestamp_in` does — `'2011-01-02 12:30:00+13'::timestamp` is `2011-01-02 12:30:00` and so
+    /// is the same text with `-05`. Measured on 19beta1.
+    Ignored,
+}
+
+fn parse_iso_in(body: &str, zoned: Zoned) -> std::result::Result<i64, Reject> {
     // The era is a suffix, and BC years count backwards through astronomical year 0.
     let (body, bc) = match () {
         () if body.len() > 3 && body[body.len() - 3..].eq_ignore_ascii_case(" bc") => {
@@ -265,7 +347,10 @@ fn parse_iso(body: &str) -> std::result::Result<i64, Reject> {
     days_from_pg_epoch_checked(year, month, day)
         .and_then(|days| days.checked_mul(MICROS_PER_DAY))
         .and_then(|micros| micros.checked_add(time_micros))
-        .and_then(|micros| micros.checked_sub(zone_seconds.checked_mul(MICROS_PER_SECOND)?))
+        .and_then(|micros| match zoned {
+            Zoned::Applied => micros.checked_sub(zone_seconds.checked_mul(MICROS_PER_SECOND)?),
+            Zoned::Ignored => Some(micros),
+        })
         .ok_or(Reject::OutOfRange)
 }
 

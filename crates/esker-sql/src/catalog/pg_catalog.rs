@@ -877,7 +877,7 @@ impl CatalogView {
         view: CatalogView,
         txn: &dyn crate::backend::Txn,
         tenant: u64,
-        style: crate::value::IntervalStyle,
+        rendering: crate::value::Rendering,
     ) -> Result<Vec<Vec<Datum>>> {
         match view {
             CatalogView::InformationSchemaTables => super::information_schema::tables(txn, tenant),
@@ -886,7 +886,7 @@ impl CatalogView {
                 super::information_schema::domains(txn, tenant)
             }
             CatalogView::InformationSchemaColumns => {
-                super::information_schema::columns(txn, tenant, style)
+                super::information_schema::columns(txn, tenant, rendering)
             }
             CatalogView::InformationSchemaTableConstraints => {
                 super::information_schema::table_constraints(txn, tenant)
@@ -907,7 +907,7 @@ impl CatalogView {
     /// there is no state to keep in step and no way for the two to disagree. The constant views
     /// ignore both.
     ///
-    /// `style` reaches exactly three of the arms below — the two that print a column's stored
+    /// `rendering` reaches exactly three of the arms below — the two that print a column's stored
     /// `DEFAULT` and the `information_schema` view over the same thing — because
     /// `pg_get_expr` renders a constant through the type's **output function**, so an `interval`
     /// default reads `'3 years'::interval` under the boot style and `'P3Y'::interval` under the one
@@ -916,7 +916,7 @@ impl CatalogView {
         self,
         txn: &dyn crate::backend::Txn,
         tenant: u64,
-        style: crate::value::IntervalStyle,
+        rendering: crate::value::Rendering,
     ) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
@@ -926,7 +926,7 @@ impl CatalogView {
             CatalogView::PgSequence => pg_sequence_rows(txn, tenant),
             CatalogView::PgClass => pg_class_rows(txn, tenant),
             CatalogView::PgAttribute => super::pg_attribute::rows(txn, tenant),
-            CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant, style),
+            CatalogView::PgAttrdef => super::pg_attribute::default_rows(txn, tenant, rendering),
             CatalogView::PgIndex => super::pg_index::rows(txn, tenant),
             CatalogView::PgInherits => inherits_rows(txn, tenant),
             CatalogView::PgProc => proc_rows(txn, tenant),
@@ -944,7 +944,7 @@ impl CatalogView {
             // arms that all call one module, and keeping them here is what pushed `rows_of` past
             // the size lint when the sixth arrived (ADR 0065's `information_schema.domains`).
             view if view.schema() == super::INFORMATION_SCHEMA => {
-                Self::information_schema_rows(view, txn, tenant, style)
+                Self::information_schema_rows(view, txn, tenant, rendering)
             }
             // **The four a real server has**, measured: `c`, `internal`, `plpgsql` and `sql`,
             // with only the last two `lanpltrusted` — a non-superuser may write a function in

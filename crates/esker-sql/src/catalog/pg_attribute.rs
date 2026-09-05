@@ -182,7 +182,7 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
 pub fn default_rows(
     txn: &dyn Txn,
     tenant: u64,
-    style: crate::value::IntervalStyle,
+    rendering: crate::value::Rendering,
 ) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
     let mut rows = Vec::new();
@@ -191,7 +191,7 @@ pub fn default_rows(
             continue;
         };
         for (attnum, (position, column)) in table.user_columns().enumerate() {
-            let Some(expression) = default_expression(column, table, position, style) else {
+            let Some(expression) = default_expression(column, table, position, rendering) else {
                 continue;
             };
             rows.push(vec![
@@ -357,10 +357,11 @@ fn attribute(
     };
     let has_default = own
         && !column.dropped
-        // **The boot style, deliberately**: this asks only *whether* there is a default, and
+        // **The boot rendering, deliberately** — the default style and UTC: this asks only
+        // *whether* there is a default, and
         // whether one exists cannot depend on how it prints.
         && position.is_some_and(|at| {
-            default_expression(column, table, at, crate::value::IntervalStyle::Postgres).is_some()
+            default_expression(column, table, at, crate::value::Rendering::default()).is_some()
         })
         && identity == NOT_IDENTITY;
     // **A tombstone answers about itself, not about the column it was.** Measured on 19beta1:
@@ -474,7 +475,7 @@ pub fn default_expression(
     column: &ColumnDef,
     table: &TableDef,
     at: usize,
-    style: crate::value::IntervalStyle,
+    rendering: crate::value::Rendering,
 ) -> Option<String> {
     // A **volatile** default, which catalog record v5 records as a flag rather than a value
     // (`ColumnDef::default_now`) because a constant cannot express it. It prints unparenthesised,
@@ -538,7 +539,7 @@ pub fn default_expression(
         return Some(format!("'{label}'::{}", def.name));
     }
     Some(super::def_functions::constant_expression(
-        value, column.ty, style,
+        value, column.ty, rendering,
     ))
 }
 

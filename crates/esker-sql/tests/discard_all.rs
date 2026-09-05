@@ -109,13 +109,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // rather than reported and ignored. What the corpus proves either way is that
         // `statement_timeout` reads its boot value after a `DISCARD`, and now it proves the
         // stronger version of it — from `31s` back to `0` rather than from `0` to `0`.
-        // The zone below is still refused and is older than this unit.
-        (
-            "SET timezone = 'Europe/Paris'",
-            "`0A000` naming the zone: `timestamptz` is printed in UTC and nowhere else, so a zone \
-             this node will not use is refused rather than reported.",
-            "pg19_discard_all.txt:42",
-        ),
         // A syntax error's *message* has never been claimed to be PostgreSQL's (`phase-6a.md` §1);
         // what C1 promises is that a statement a real server accepts is never `42601`. Both refuse
         // this one and both say `42601`.

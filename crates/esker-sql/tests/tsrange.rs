@@ -91,16 +91,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg_range is not built",
             "pg19_tsrange.txt:46",
         ),
-        // **A second time zone is a knob this node does not have.** It honours `TimeZone` only
-        // where it means UTC (`crate::parameter`), so the `SET` itself is `0A000` — and the fact
-        // the capture is *for* survives it: the `UTC` reading beside this one agrees, and it is a
-        // `tstzrange[]` rendering through the session's zone at all that had to work. The block is
-        // guarded in the corpus so one refusal does not take the twenty-three statements after it.
-        (
-            "SET TimeZone = 'Pacific/Auckland'",
-            "this node honours TimeZone only where it means UTC",
-            "pg19_assignment_cast_date.txt:68",
-        ),
         // **Array containment, which is not a range fact.** `@>` between two arrays is the array
         // operator `tests/array.rs` already declares for every element type — `'{1,2}'::int[] @>
         // '{1}'::int[]` is the same `0A000` — and it arrives here because the corpus asks it of a

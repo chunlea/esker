@@ -39,6 +39,7 @@ pub(super) fn into_column(
     value: Datum,
     column: &ColumnDef,
     user_type: Option<&crate::catalog::TypeDef>,
+    rendering: crate::value::Rendering,
 ) -> Result<Datum> {
     // **An enum first, and by its own rule.** The column is an `int2` in the row, so every test
     // below would be about the storage: `'angry'` would be `22P02 invalid input syntax for type
@@ -66,7 +67,7 @@ pub(super) fn into_column(
     // "the cast exists and this value fails it", which is a `22003` about the value and must not
     // be reported as a type mismatch. Measured: `UPDATE w SET i4 = i8` where the `i8` holds
     // 5000000000 is `22003 integer out of range` on a real server, not `42804`.
-    coerce(&value, column.ty).unwrap_or_else(|| {
+    coerce(&value, column.ty, rendering).unwrap_or_else(|| {
         Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: column.ty.name().to_owned(),
@@ -84,7 +85,11 @@ pub(super) fn into_column(
 /// microseconds for the same instant and the conversion between them is the identity. The day a
 /// session zone means anything else, this is one of the places that has to learn about it — and
 /// `crate::value::PgDatum::pg_cmp`'s arm for the same pair is the other.
-fn coerce(value: &Datum, ty: ColumnType) -> Option<Result<Datum>> {
+fn coerce(
+    value: &Datum,
+    ty: ColumnType,
+    rendering: crate::value::Rendering,
+) -> Option<Result<Datum>> {
     // **An array's cast is its element's cast**, which is PostgreSQL's own rule and the reason
     // this is one arm rather than sixteen: `ARRAY['one','two']` is a `text[]` and a
     // `character varying(255)[]` column takes it, exactly as a bare `'one'` goes into a
@@ -108,7 +113,7 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Result<Datum>> {
                     // `integer[]` column is `22003 integer out of range`, the same sentence the
                     // scalar gets. A `?` on the outer `Option` would have reported it as "no cast
                     // exists" and answered `42804` about the arrays instead.
-                    match coerce(&datum, want)? {
+                    match coerce(&datum, want, rendering)? {
                         Ok(datum) => datum,
                         Err(error) => return Some(Err(error)),
                     }
@@ -129,7 +134,7 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Result<Datum>> {
     // Gated by [`crate::value::has_assignment_cast`], because the rule's text tail would otherwise
     // accept `UPDATE t SET i4 = txt` — which a real server refuses.
     if crate::value::has_assignment_cast(value.column_type(), ty) {
-        return Some(crate::value::assignment_cast(value.clone(), ty));
+        return Some(crate::value::assignment_cast(value.clone(), ty, rendering));
     }
     Some(Ok(match (value, ty) {
         (Datum::TimestampTz(micros), ColumnType::Timestamp) => Datum::Timestamp(*micros),

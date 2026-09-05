@@ -42,39 +42,36 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg_cast is not built",
             "pg19_assignment_cast_date.txt:43",
         ),
-        // **These two answer correctly now and are still listed, because nothing compares them.**
-        // The per-row cast landed (`plan::Expr::Cast`), and probed directly both give what a real
-        // server gives — `1` and `t`. They stay declared because `SET TimeZone =
-        // 'Pacific/Auckland'` earlier in this corpus is refused, aborts the transaction, and
-        // swallows every statement after it: this file's entry in the harness's `SWALLOWING_DEBT`.
+        // **Both of these came out from behind the `SET TimeZone` refusal** that ADR 0080 closed,
+        // and neither is a time-zone gap: the zone reaches the renderer and the second column of
+        // the first row proves it — `2011-01-02 12:30:00+13` agrees exactly. What does not agree
+        // is what the cast is *applied to*.
         //
-        // So the entries below are measuring the **time zone** gap and not a cast one, and they
-        // come off the moment a named zone is a thing this node has. Left in place rather than
-        // deleted, because rule 2 cannot fire on a statement it never ran, and a divergence
-        // nobody checks is exactly what the provenance rule exists to keep honest.
+        // **A cast over a literal is folded at lowering, where there is no session.**
+        // `'2011-01-01 23:30:00+00'::timestamptz::date` is `2011-01-02` on a real server and
+        // `2011-01-01` here, because the fold renders the instant with the boot output function
+        // and reads the day off that text. The **column** form is right — `cursor::evaluate`'s
+        // cast renders under the session (`tests/time_zone.rs`) — so this is the literal fold and
+        // not the conversion, and it is the same gap `tests/interval_style.rs` declares for
+        // `'1 mon'::interval::text`. One fix closes both.
         (
-            "SELECT 'r', count(*) FROM bk WHERE updated_on = CURRENT_TIMESTAMP::date",
-            "a per-row cast has only text as a target",
-            "pg19_assignment_cast_date.txt:54",
+            "SELECT 'r', '2011-01-01 23:30:00+00'::timestamptz::date, '2011-01-01 \
+             23:30:00+00'::timestamptz",
+            "a cast over a literal is folded at lowering, where there is no session to render the \
+             instant in",
+            "pg19_assignment_cast_date.txt:69",
         ),
+        // **The `INSERT` above is taken now** — `has_assignment_cast` learned the pair and
+        // `value::assignment_cast` learned the zone — and these two reads of what it stored are
+        // the *same literal fold* as the row above, one statement later. The value written is the
+        // UTC day because the operand `'2011-01-01 23:30:00+00'::timestamptz` was folded at
+        // lowering, where there is no session; an instant that arrives as an **expression** takes
+        // the session's day, which `tests/time_zone.rs` asserts against a column. One fix closes
+        // this, the row above it, and `tests/interval_style.rs`'s literal cast.
         (
-            "SELECT 'r', CURRENT_DATE = CURRENT_TIMESTAMP::date FROM bk2",
-            "a per-row cast has only text as a target",
-            "UNMEASURED",
-        ),
-        // **The one thing about this cast that is deliberately not reproduced.** `timestamptz` ->
-        // `date` asks which calendar day an instant falls on *here*, so the answer depends on the
-        // session zone — the capture takes one instant in `UTC` and in `Pacific/Auckland` and gets
-        // two different dates. This node honours `TimeZone` only where it means UTC, so it refuses
-        // the `SET` rather than accepting it and answering as though it were UTC, which would be a
-        // wrong date rather than a refusal. The five statements after it are that refusal's wake:
-        // the whole section is one `SAVEPOINT`, so its row is rolled back on both sides and the
-        // counts that follow agree.
-        (
-            "SET TimeZone = 'Pacific/Auckland'",
-            "this node honours TimeZone only where it means UTC, and refuses rather than \
-             answering a wrong calendar day",
-            "pg19_assignment_cast_date.txt:68",
+            "SELECT 'r', name, updated_on FROM bk WHERE name = 'tz probe'",
+            "the instant was folded to a date at lowering, where there is no session zone",
+            "pg19_assignment_cast_date.txt:71",
         ),
     ],
 };

@@ -246,20 +246,20 @@ impl Parser<'_> {
 /// `array_out`: the text PostgreSQL prints for this value.
 #[must_use]
 pub fn to_text(value: &ArrayValue) -> String {
-    to_text_under(value, crate::value::IntervalStyle::Postgres)
+    to_text_under(value, crate::value::Rendering::default())
 }
 
 /// The same, with the session's `IntervalStyle` handed to every element — which matters for one
 /// element type and is threaded rather than special-cased so that a nested array gets it too.
 #[must_use]
-pub fn to_text_under(value: &ArrayValue, style: crate::value::IntervalStyle) -> String {
+pub fn to_text_under(value: &ArrayValue, rendering: crate::value::Rendering) -> String {
     let mut out = String::new();
     // The bound is part of the value, so a value that does not start at one says where it starts.
     if value.lower != 1 && !value.values.is_empty() {
         let upper = value.lower + i32::try_from(value.values.len()).unwrap_or(0) - 1;
         let _ = write!(out, "[{}:{upper}]=", value.lower);
     }
-    write_dimension(value, &value.dims, 0, &mut 0, style, &mut out);
+    write_dimension(value, &value.dims, 0, &mut 0, rendering, &mut out);
     out
 }
 
@@ -269,7 +269,7 @@ fn write_dimension(
     dims: &[i32],
     depth: usize,
     next: &mut usize,
-    style: crate::value::IntervalStyle,
+    rendering: crate::value::Rendering,
     out: &mut String,
 ) {
     out.push('{');
@@ -282,11 +282,11 @@ fn write_dimension(
             out.push(',');
         }
         if depth + 1 < dims.len() {
-            write_dimension(value, dims, depth + 1, next, style, out);
+            write_dimension(value, dims, depth + 1, next, rendering, out);
         } else {
             let element = match value.values.get(*next) {
                 Some(Some(element)) => quoted(
-                    crate::value::to_text_under(element, style)
+                    crate::value::to_text_under(element, rendering)
                         .unwrap_or_default()
                         .as_str(),
                 ),

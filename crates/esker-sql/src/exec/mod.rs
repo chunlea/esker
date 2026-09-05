@@ -1234,27 +1234,38 @@ impl Executor {
 
     /// The style an `interval` is printed to a client under.
     ///
-    /// **A setting this node stored and ignored until run 100.** `ActiveRecord` sends
+    /// **Two settings this node stored and ignored.** `ActiveRecord` sends
     /// `SET intervalstyle = iso_8601` when it connects and then *parses* what comes back; its
     /// `OID::Interval#cast_value` rescues a parse failure by returning `nil`, so a server that
     /// answers the wrong dialect hands the client no value and no error. Two `interval_test.rb`
-    /// failures were that and nothing else (`tests/interval_style.rs`).
-    pub(super) fn interval_style(&self) -> crate::value::IntervalStyle {
-        self.parameters
-            .get("intervalstyle")
-            .and_then(|value| crate::value::IntervalStyle::parse(value))
-            .unwrap_or_default()
+    /// failures were that and nothing else (`tests/interval_style.rs`). `TimeZone` was the
+    /// other, refused by name until this node had a zone table (ADR 0080).
+    ///
+    /// A zone that does not resolve cannot reach here: `SET` refuses it with `22023`, so the
+    /// stored value is always a name the table has.
+    pub(super) fn rendering(&self) -> crate::value::Rendering {
+        crate::value::Rendering {
+            interval_style: self
+                .parameters
+                .get("intervalstyle")
+                .and_then(|value| crate::value::IntervalStyle::parse(value))
+                .unwrap_or_default(),
+            zone: self
+                .parameters
+                .get("timezone")
+                .and_then(|name| crate::value::zone::Zone::shared(name)),
+        }
     }
 
-    /// What the session decides about the rows a cursor produces: the resolved `search_path` and
-    /// the `IntervalStyle`.
+    /// What the session decides about the rows a cursor produces: the resolved `search_path`,
+    /// and the `IntervalStyle` and `TimeZone` that [`crate::value::Rendering`] carries.
     ///
     /// The path is resolved by the caller because resolving it reads the catalog and needs a
     /// transaction; everything else here is session state and is read from the parameters.
     fn settings<'a>(&self, search_path: &'a [String]) -> cursor::Settings<'a> {
         cursor::Settings {
             search_path,
-            interval_style: self.interval_style(),
+            rendering: self.rendering(),
         }
     }
 
@@ -1577,7 +1588,7 @@ impl Executor {
         // produced. Running it inside the plan would run it once per row, which is what
         // PostgreSQL does over a `FROM` and is why that shape is refused rather than approximated.
         let (planned, raw) = self.planned_rows(txn, select)?;
-        let style = self.interval_style();
+        let style = self.rendering();
         let mut rows = Vec::new();
         for row in raw {
             let row = &row[..row.len() - planned.junk];

@@ -2289,7 +2289,14 @@ impl Literal {
             // After the two arms above, not before: an array and a `B'…'` literal have their own
             // measured rules and this must not take them.
             Literal::Typed(value) if crate::value::has_assignment_cast(value.column_type(), ty) => {
-                crate::value::assignment_cast((**value).clone(), ty)
+                // **The boot rendering, because lowering has no session.** A cast folded here cannot ask
+                // which zone the client is in, which is the gap `tests/assignment_cast_date.rs`
+                // declares for `'…'::timestamptz::date` written as a literal.
+                crate::value::assignment_cast(
+                    (**value).clone(),
+                    ty,
+                    crate::value::Rendering::default(),
+                )
             }
             Literal::Typed(_) => mismatch(),
 

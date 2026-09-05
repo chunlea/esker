@@ -143,8 +143,11 @@ const SWALLOWING_DEBT: &[&str] = &[
     // runtime cast made that statement answer, so it stops the file no more. Three statements
     // came out from behind it — one that agrees and two that do not, both now declared with
     // their capture lines. The list may only shrink, and this is what shrinking looks like.
-    // `tests/assignment_cast_date.rs`
-    "SET TimeZone = 'Pacific/Auckland'",
+    // `tests/assignment_cast_date.rs`'s entry was `SET TimeZone = 'Pacific/Auckland'` and is
+    // **gone**: the zone table landed (ADR 0080), so the `SET` is answered rather than refused and
+    // the five statements behind it run. Two of them agreed and were deleted from that file's
+    // divergences by rule 2; the ones that did not are declared there with their capture lines.
+    // The list may only shrink, and this is what shrinking looks like.
     // `tests/create_schema_elements.rs`
     "CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())",
     "CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one",

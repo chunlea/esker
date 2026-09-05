@@ -34,15 +34,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              other line about this parameter agrees.",
             "pg19_set_parameters.txt:56",
         ),
-        // **A standing refusal, and it predates this unit.** `timestamptz` is printed in UTC and
-        // nowhere else, so a zone that is not UTC would be a setting honoured by `SHOW` and
-        // ignored by every row — which is the one failure a client cannot see. Accepting it here
-        // would make `SHOW TimeZone` lie about what the next `SELECT` will print.
+        // **Surfaced by ADR 0080, and older than it.** `SET TimeZone` earlier in this corpus was
+        // a refusal that aborted the transaction and swallowed the forty-four statements after it;
+        // the zone table answers it now, and this is the first of those to disagree. `SET LOCAL`
+        // is refused by name here for every parameter (`tests/session_parameters.rs`), which is
+        // its own gap and not this one — the value and the parameter are both fine.
         (
-            "SET TIME ZONE 'America/New_York'",
-            "`0A000` naming the zone: this node prints `timestamptz` in UTC only, so it refuses \
-             rather than reporting a zone it will not use (`crate::parameter::Parameter::honour`).",
-            "pg19_set_parameters.txt:78",
+            "SET LOCAL lc_monetary = 'C'",
+            "`SET LOCAL` is refused by name for every parameter, which is a gap of its own",
+            "pg19_set_parameters.txt:85",
         ),
     ],
 };

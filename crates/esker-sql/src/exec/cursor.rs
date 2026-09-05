@@ -55,7 +55,7 @@ pub(super) struct Settings<'a> {
     /// it, which prints every name qualified — the answer that cannot mislead.
     pub(super) search_path: &'a [String],
     /// How an `interval` is rendered for a client.
-    pub(super) interval_style: crate::value::IntervalStyle,
+    pub(super) rendering: crate::value::Rendering,
 }
 
 impl Settings<'_> {
@@ -63,7 +63,7 @@ impl Settings<'_> {
     pub(super) fn none() -> Self {
         Settings {
             search_path: &[],
-            interval_style: crate::value::IntervalStyle::Postgres,
+            rendering: crate::value::Rendering::default(),
         }
     }
 }
@@ -310,7 +310,7 @@ fn inner_side(
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
-        return view.rows_of(txn, tenant, settings.interval_style);
+        return view.rows_of(txn, tenant, settings.rendering);
     }
     if !matches!(probe, Probe::Materialize) {
         return Ok(Vec::new());
@@ -368,10 +368,9 @@ impl<'a> Cursor<'a> {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
-            Node::CatalogView { view, .. } => Kind::Rows(
-                view.rows_of(txn, tenant, settings.interval_style)?
-                    .into_iter(),
-            ),
+            Node::CatalogView { view, .. } => {
+                Kind::Rows(view.rows_of(txn, tenant, settings.rendering)?.into_iter())
+            }
             // Rows written into the statement, evaluated here for the same reason a catalog view's
             // are: nothing is stored, so there is no key range to seek in and the row count is the
             // length of the list.
@@ -2090,8 +2089,15 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
             value => {
-                let text = value
-                    .to_text()
+                // **The session's output function, not the boot one.** A cast between two types
+                // here is a text round trip, so the text it goes through has to be the text the
+                // session would see: under `SET TimeZone = 'Pacific/Auckland'`,
+                // `'2011-01-01 23:30:00+00'::timestamptz::date` is `2011-01-02` on a real server
+                // and was `2011-01-01` here, because the round trip rendered the instant in UTC
+                // and the date parser read the day off it. Measured
+                // (`tests/captures/pg19_time_zone.txt`), and the same reasoning `ToText` below
+                // already applied for an `interval`'s dialect.
+                let text = crate::value::to_text_under(&value, env.settings.rendering)
                     .ok_or_else(|| SqlError::DatatypeMismatch("a value with no text".to_owned()))?;
                 // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)`
                 // bounds the string exactly as a `varchar(3)` column would.
@@ -2124,8 +2130,8 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 // `SELECT term` and `SELECT term::text` cannot answer in two dialects in one
                 // session. Measured on 19beta1: under `iso_8601` the cast, `||`, `format`,
                 // `::varchar`, `array_to_string` and `jsonb_build_object` all say `P1Y`.
-                let text = crate::value::to_text_under(&value, env.settings.interval_style)
-                    .unwrap_or_default();
+                let text =
+                    crate::value::to_text_under(&value, env.settings.rendering).unwrap_or_default();
                 Datum::Text(if *strip_blanks {
                     text.trim_end_matches(' ').to_owned()
                 } else {

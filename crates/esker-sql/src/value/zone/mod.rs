@@ -28,6 +28,8 @@
 //! server does: `SET TIME ZONE 'america/new_york'` is accepted and `SHOW TimeZone` then says
 //! `America/New_York`. Measured, both cases and `'utc'` → `UTC`.
 
+use std::collections::HashMap;
+
 mod posix;
 mod tzif;
 
@@ -64,6 +66,31 @@ impl Zone {
                 .and_then(jiff_tzdb::get)
         })?;
         Self::read(canonical, bytes).ok()
+    }
+
+    /// The zone with this name, parsed once for the life of the process.
+    ///
+    /// **Kept rather than freed, on purpose.** A session's zone has to reach the renderer, and a
+    /// renderer that re-read the file for every row would parse a thousand transitions to print
+    /// one timestamp. The set is bounded by the table — 598 names, of which a process typically
+    /// touches one — so this is a static table built lazily rather than a leak that grows.
+    ///
+    /// A `&'static` is also what keeps [`crate::value::Rendering`] `Copy`, and that is what let
+    /// the zone reach the cursor without a second argument at seventeen call sites.
+    #[must_use]
+    pub fn shared(name: &str) -> Option<&'static Zone> {
+        static PARSED: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, &'static Zone>>> =
+            std::sync::OnceLock::new();
+        let table = PARSED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let zone = Zone::by_name(name)?;
+        let mut table = table.lock().ok()?;
+        // Keyed by the **canonical** name, so that every spelling of one zone shares one parse.
+        if let Some(found) = table.get(zone.name) {
+            return Some(found);
+        }
+        let leaked: &'static Zone = Box::leak(Box::new(zone));
+        table.insert(leaked.name, leaked);
+        Some(leaked)
     }
 
     /// Every zone name the table carries, in the database's own order.
@@ -264,6 +291,16 @@ mod tests {
         assert_eq!(sydney.offset_at(PAST_THE_TABLE).seconds, 10 * 3600);
     }
 
+    /// One parse per zone, however many spellings ask for it.
+    #[test]
+    fn a_shared_zone_is_parsed_once_and_shared_by_every_spelling() {
+        let one = Zone::shared("America/New_York").expect("New York");
+        let two = Zone::shared("america/new_york").expect("lowercase");
+        assert!(std::ptr::eq(one, two), "two spellings, two parses");
+        assert_eq!(one.offset_at(SUMMER).abbrev, "EDT");
+        assert!(Zone::shared("Nowhere/Notreal").is_none());
+    }
+
     #[test]
     fn a_name_resolves_whatever_its_case_and_answers_the_canonical_one() {
         assert_eq!(
@@ -297,6 +334,15 @@ mod tests {
             );
             assert!(!offset.abbrev.is_empty(), "{name} has no abbreviation");
             count += 1;
+        }
+        // Printed so the number is evidence in a test run rather than something to go and
+        // derive, the way `dep_budget.rs` prints the crate count.
+        println!(
+            "time zones read: {count}, IANA {:?}",
+            Zone::database_version()
+        );
+        for name in ["Universal", "Zulu", "Greenwich", "Etc/UTC", "UTC", "GMT"] {
+            println!("  {name}: {}", Zone::by_name(name).is_some());
         }
         assert!(count > 300, "only {count} zones were read");
     }

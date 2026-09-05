@@ -86,12 +86,14 @@ pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f6
 /// `ActiveRecord` reads an interval by parsing the text, and returns `nil` rather than an error
 /// when the parse fails (`tests/interval_style.rs`).
 #[must_use]
-pub fn to_text_under(value: &Datum, style: IntervalStyle) -> Option<String> {
+pub fn to_text_under(value: &Datum, rendering: Rendering) -> Option<String> {
     use PgDatum as _;
-    if style == IntervalStyle::Postgres {
-        return value.to_text();
-    }
     match value {
+        // **A zoned instant is the one value whose text depends on the session's zone**, and it
+        // depends on it whatever the `IntervalStyle` is, which is why this arm is above the
+        // short-circuit below rather than inside it.
+        Datum::TimestampTz(micros) => Some(timestamp::to_text_in(*micros, rendering.zone)),
+        _ if rendering.interval_style == IntervalStyle::Postgres => value.to_text(),
         Datum::Interval {
             months,
             days,
@@ -102,12 +104,30 @@ pub fn to_text_under(value: &Datum, style: IntervalStyle) -> Option<String> {
                 days: *days,
                 micros: *micros,
             },
-            style,
+            rendering.interval_style,
         )),
         // An array of intervals prints its elements the same way, which is what `all_terms` is.
-        Datum::Array(array) => Some(array::to_text_under(array, style)),
+        Datum::Array(array) => Some(array::to_text_under(array, rendering)),
         _ => value.to_text(),
     }
+}
+
+/// Everything about a **session** that changes the text of a value.
+///
+/// Two members so far and the second is why this is a struct: `IntervalStyle` was threaded to the
+/// cursor as an argument of its own, and `TimeZone` arriving behind it would have been a second
+/// one at every call site. A third will be free.
+///
+/// `Copy`, which the `&'static` zone is what makes possible ([`zone::Zone::shared`]), and
+/// `Default` — the boot session: the `postgres` interval style and UTC.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rendering {
+    /// Which of the four dialects an `interval` prints in.
+    pub interval_style: IntervalStyle,
+    /// The session's zone, or `None` for UTC — which is both the boot value and what every path
+    /// with **no** session uses, because an index key and an error message must not move when
+    /// someone runs a `SET`.
+    pub zone: Option<&'static zone::Zone>,
 }
 pub use interval::Style as IntervalStyle;
 pub use timestamp::{MAX_MICROS, MIN_MICROS, NEG_INFINITY, POS_INFINITY};
@@ -329,14 +349,25 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     clippy::cast_possible_truncation,
     reason = "`in_range` checks the bound first, which is what makes each cast exact"
 )]
-pub fn assignment_cast(value: Datum, ty: ColumnType) -> Result<Datum> {
+pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Result<Datum> {
     if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
         return Ok(value);
     }
+    // **Which calendar day an instant falls on is a question about a place**, so a `timestamptz`
+    // is moved into the session's zone before the day is taken off it and a `timestamp` is not:
+    // `'2011-01-01 23:30:00+00'` is the 1st in UTC and the 2nd in `Pacific/Auckland`, and a real
+    // server stores the second one (`tests/captures/pg19_time_zone.txt`).
     if let (ColumnType::Date, Datum::Timestamp(micros) | Datum::TimestampTz(micros)) = (ty, &value)
     {
+        let local = match (&value, rendering.zone) {
+            (Datum::TimestampTz(_), Some(zone)) => {
+                let unix = micros.div_euclid(1_000_000) + timestamp::PG_EPOCH_UNIX_SECONDS;
+                micros.saturating_add(i64::from(zone.offset_at(unix).seconds) * 1_000_000)
+            }
+            _ => *micros,
+        };
         return Ok(Datum::Date(
-            i32::try_from(micros.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
+            i32::try_from(local.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
         ));
     }
     // **A float into an integer rounds, and it rounds half to *even*.** Measured on 19beta1:
@@ -486,7 +517,14 @@ pub fn has_assignment_cast(from: Option<ColumnType>, to: ColumnType) -> bool {
     }
     matches!(
         (from, to),
-        (ColumnType::Json, ColumnType::Jsonb) | (ColumnType::Jsonb, ColumnType::Json)
+        (ColumnType::Json, ColumnType::Jsonb)
+            | (ColumnType::Jsonb, ColumnType::Json)
+            // **An instant into a `date` column**, which a real server takes at `castcontext = 'a'`
+            // — `INSERT INTO t (d) VALUES (now())` is the calendar day *here*. Refused until ADR
+            // 0080, because taking it while every instant printed in UTC would have stored the
+            // wrong day rather than refused one; the gate and the zone landed together for that
+            // reason.
+            | (ColumnType::Timestamp | ColumnType::TimestampTz, ColumnType::Date)
     )
 }
 

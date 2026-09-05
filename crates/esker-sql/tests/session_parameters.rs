@@ -76,21 +76,28 @@ fn client_min_messages_actually_suppresses_a_notice() {
     assert_eq!(node.executor_notices().len(), 1);
 }
 
-/// A value this node cannot mean is refused **by name**, never accepted and ignored.
+/// A value this node cannot mean is refused, and the two that **left** this test are the point.
 ///
-/// A real server takes the zone; taking it here would honour the setting in `SHOW` and nowhere
-/// else, because an instant still prints in UTC. **`search_path` left this test** with the
-/// namespace unit: it is now honoured for real, so the value is no longer one this node cannot
-/// mean — an entry naming no schema is *skipped*, which is what a real server does with it too.
+/// It was written for `search_path` and `TimeZone`, both of which were then refused by name.
+/// `search_path` left with the namespace unit: an entry naming no schema is now *skipped*, which
+/// is what a real server does with it. **`TimeZone` left with ADR 0080**, and the refusal it is
+/// replaced by is a different one — a zone this node cannot resolve is `22023` with PostgreSQL's
+/// own sentence, where a zone it can is simply meant.
 #[test]
 fn a_value_this_node_cannot_mean_is_refused_by_name() {
     let mut node = parity::Node::new(FIXTURE);
 
-    let error = node.run("SET timezone TO 'America/New_York'").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    // The zone that used to be `0A000` here is a value now, and reads back canonically.
+    node.run("SET timezone TO 'america/new_york'").unwrap();
+    assert_eq!(node.rows("SHOW timezone"), vec![vec!["America/New_York"]]);
+
+    // A name the table does not have is PostgreSQL's own `22023`, measured
+    // (`tests/captures/pg19_time_zone.txt`).
+    let error = node.run("SET timezone TO 'Nowhere/Notreal'").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::INVALID_PARAMETER_VALUE);
     assert_eq!(
         error.to_string(),
-        "the time zone \"America/New_York\" is not supported"
+        "invalid value for parameter \"TimeZone\": \"Nowhere/Notreal\""
     );
 
     // A path naming a schema that is not there is **accepted** and resolves to nothing, which is
