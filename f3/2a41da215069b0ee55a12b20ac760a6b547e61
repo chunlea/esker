@@ -1,0 +1,16 @@
+docs/bench/mpp-baseline.md
+  h_44076b318daf9c 10-13,193-287
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 18-20,310,312-314,316-321,323-327,346-398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f32a41da215069b0ee55a12b20ac760a6b547e61",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
