@@ -238,6 +238,41 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
                     store.store_id(),
                     store.peer_of(region.id).map(|peer| peer.leader())
                 );
+                // **A hint that points outside the group is the caller's mistake, and it is
+                // fatal here rather than at the deadline.** Following a redirect can only reach
+                // a store this helper was handed. When the office is on one the caller left
+                // out, every remaining attempt re-asks a follower that has already answered, so
+                // the deadline is spent re-proving what the first refusal said. That is what
+                // 9046 attempts in 30.000411395s were, all to store 1, which answered
+                // `leader=Some(2)` every time (`docs/plans/debt-c7.md` section 11). The peer
+                // list of the store that refused says where the office went, so say it.
+                if let esker_proto::ProtoError::NotLeader {
+                    leader_hint: Some(peer_id),
+                    ..
+                } = &error
+                    && let Some(elsewhere) = store.regions().get(region.id).and_then(|state| {
+                        state
+                            .region()
+                            .peers
+                            .iter()
+                            .find(|peer| peer.peer_id == *peer_id)
+                            .map(|peer| peer.store_id)
+                    })
+                {
+                    assert!(
+                        group
+                            .iter()
+                            .any(|candidate| candidate.store_id() == elsewhere),
+                        "writing {key:?}: the office is peer {peer_id} on store {elsewhere}, \
+                         and this put was given only stores {:?}; retrying cannot reach a store \
+                         it was not handed",
+                        group
+                            .iter()
+                            .map(|candidate| candidate.store_id())
+                            .collect::<Vec<_>>()
+                    );
+                }
+
                 // **Follow the hint, or this is a livelock rather than a retry.** An election
                 // moves no epoch, so re-sending to the peer that just disclaimed leadership at
                 // the same epoch asks a question already answered, and in a two-voter group the
@@ -266,28 +301,16 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
     }
 }
 
-/// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
+/// Two voters for region 1 with the office deliberately on the **second** store.
 ///
-/// The mechanism behind two recorded sightings of `snapshot.rs:228`
-/// (`a_region_reaches_a_store_that_never_had_it`,
-/// `a_snapshot_replacing_a_held_region_routes_through_a_retire`), driven rather than waited for.
-/// Neither reproduced under load — not under twenty-four spinning threads, 8 runs each, nor under
-/// six full runs of this crate's 305 tests — because both need an *election*, and an election
-/// needs a peer starved for the 250-500 ms this file's tick budget allows. Moving the office on
-/// purpose reaches the same state in a second and always.
+/// The state this file's two redirect tests need and neither should race for. Both of the
+/// sightings behind them arrive here by being unlucky — a peer starved for the 250-500 ms this
+/// file's tick budget allows — which is why neither reproduced under load and both reproduce
+/// instantly when the office is moved on purpose.
 ///
-/// [`put`] retries what the store tells it to retry, which is right, and re-reads the region's
-/// epoch each time round, which is also right and is not enough: **an election moves no epoch**.
-/// So a `NotLeader` is re-sent to the peer that just disclaimed leadership, at the same epoch,
-/// until the deadline — and in a two-voter group the office does not come back on its own. That is
-/// a livelock, not a slow write, and thirty seconds of it is indistinguishable from a hang.
-///
-/// The fix is to follow the hint the refusal already carries, which is what a real client does
-/// (`esker-client`'s router, `docs/DESIGN.md` §10). This test is red without it: it fails at
-/// [`put`]'s deadline having spent thirty seconds re-asking a follower.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_write_follows_the_office_when_it_moves() {
-    trace();
+/// Returns once the second store leads *and* the first does not, so anything a caller then aims
+/// at `first` is aimed at a store that has stopped leading.
+async fn two_voters_with_the_office_on_the_second() -> (Node, Node) {
     let pd = Arc::new(FakePd::new());
     let first_address_listener = reserve();
     let first_address = first_address_listener.local_addr().unwrap();
@@ -355,6 +378,33 @@ async fn a_write_follows_the_office_when_it_moves() {
         "the first store still leads, so the office did not move and this proves nothing"
     );
 
+    (first, second)
+}
+
+/// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
+///
+/// The mechanism behind two recorded sightings of `snapshot.rs:228`
+/// (`a_region_reaches_a_store_that_never_had_it`,
+/// `a_snapshot_replacing_a_held_region_routes_through_a_retire`), driven rather than waited for.
+/// Neither reproduced under load — not under twenty-four spinning threads, 8 runs each, nor under
+/// six full runs of this crate's 305 tests — because both need an *election*, and an election
+/// needs a peer starved for the 250-500 ms this file's tick budget allows. Moving the office on
+/// purpose reaches the same state in a second and always.
+///
+/// [`put`] retries what the store tells it to retry, which is right, and re-reads the region's
+/// epoch each time round, which is also right and is not enough: **an election moves no epoch**.
+/// So a `NotLeader` is re-sent to the peer that just disclaimed leadership, at the same epoch,
+/// until the deadline — and in a two-voter group the office does not come back on its own. That is
+/// a livelock, not a slow write, and thirty seconds of it is indistinguishable from a hang.
+///
+/// The fix is to follow the hint the refusal already carries, which is what a real client does
+/// (`esker-client`'s router, `docs/DESIGN.md` §10). This test is red without it: it fails at
+/// [`put`]'s deadline having spent thirty seconds re-asking a follower.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_follows_the_office_when_it_moves() {
+    trace();
+    let (first, second) = two_voters_with_the_office_on_the_second().await;
+
     // Aimed at the store that has *stopped* leading, which is exactly what the sightings do.
     // Without following the hint this spends the whole deadline and fails.
     let region = first.store.regions().regions()[0].clone();
@@ -376,6 +426,37 @@ async fn a_write_follows_the_office_when_it_moves() {
 
     first.stop().await;
     second.stop().await;
+}
+
+/// **A write cannot follow the office to a store it was never handed.**
+///
+/// [`put`] follows `NotLeader`'s hint, which is right and is not sufficient: the hint names a
+/// *peer*, and this helper can only ask the stores its caller passed. Where those disagree the
+/// loop has nothing it can do with the answer it is given, and re-asks the follower until the
+/// deadline.
+///
+/// That is the mechanism behind `a_snapshot_replacing_a_held_region_routes_through_a_retire`
+/// failing in g1's gate on 2026-09-04 at 35.854 s — well under the 60 s deadline it was blamed
+/// on twice: `writing b"k00058" never succeeded after 9046 attempts in 30.000411395s`, every one
+/// of them to store 1, which answered `leader=Some(Some(2))` every time. The announcement
+/// helper wrote keys 40..60 through a one-store group *after* `AddPeer` had made a second voter,
+/// so there was a redirect and nowhere to follow it to.
+///
+/// The deadline was never the mechanism and lengthening it fixes nothing. This pins the
+/// diagnosis instead: a hint the group cannot honour fails the write at once and names the store
+/// the caller left out, rather than spending thirty seconds proving the first refusal.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(
+    expected = "the office is peer 2 on store 2, and this put was given only stores [1]"
+)]
+async fn a_put_says_which_store_it_was_not_given() {
+    trace();
+    let (first, _second) = two_voters_with_the_office_on_the_second().await;
+
+    // Deliberately the group the announcement helper used to pass: the store that has stopped
+    // leading, and only it.
+    let region = first.store.regions().regions()[0].clone();
+    put(&[&first.store], &region, key(1), b"after").await;
 }
 
 /// Commits one key through Percolator on `store`, as a client would: prewrite, then commit.
@@ -1149,7 +1230,10 @@ async fn announce_a_snapshot_and_await_the_retire(
             loop {
                 let region = first.store.regions().regions()[0].clone();
                 for n in 40..60 {
-                    put(&[&first.store], &region, key(n), b"value").await;
+                    // **Both stores, because by here there are two voters.** `AddPeer` has
+                    // promoted peer 2, so the office can move while this loop runs, and a
+                    // one-store group cannot follow the redirect it is then given.
+                    put(&[&first.store, &second.store], &region, key(n), b"value").await;
                 }
                 let ahead = leader.applied_index();
                 if old.applied_index() < ahead {
