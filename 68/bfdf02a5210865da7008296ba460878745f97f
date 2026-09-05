@@ -1,0 +1,26 @@
+crates/esker-columnar/src/fragment/codec.rs
+  h_44076b318daf9c 61-62,323-330,376-409
+crates/esker-columnar/src/fragment/expr.rs
+  h_44076b318daf9c 129-148,187,209-210,229-244,479-548
+crates/esker-columnar/src/fragment/mod.rs
+  h_44076b318daf9c 52-60,354-378
+crates/esker-columnar/src/scan.rs
+  h_44076b318daf9c 487-489
+crates/esker-columnar/tests/differential.rs
+  h_44076b318daf9c 178-192
+crates/esker-columnar/tests/fragment_golden.rs
+  h_44076b318daf9c 97-188
+docs/adr/0073-a-fragment-expression-node-is-added-by-tag-not-by-version.md
+  h_44076b318daf9c 1-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "68bfdf02a5210865da7008296ba460878745f97f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
