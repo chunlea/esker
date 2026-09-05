@@ -524,3 +524,61 @@ fn a_pool_of_connections_sees_a_re_created_sequence_start_over() {
         ddl.run("DROP TABLE pp").unwrap();
     }
 }
+
+/// Consecutive `bigserial` ids are **consecutive**, on a real cluster.
+///
+/// r1's run-82 probe against the live node: five inserts into a table with one `bigserial`
+/// column answered `1, 33, 65, 97, 129`, with `last_value` at the *end* of each block —
+/// **every statement was allocating a fresh block of 32 and using only its first value**, so 31
+/// of every 32 were discarded. PostgreSQL gives `1, 2, 3, 4, 5`.
+///
+/// It is what makes `range_test.rb#test_infinity_values` order-dependent: the test reads
+/// `PostgresqlRange.first` and the fixtures hold 101-105, so a created row sorts before them
+/// while the blocks are small and after them once they have run past 105 — the flip-flop the
+/// board recorded across runs 73, 74, 75 and 77.
+///
+/// `SEQUENCE_BATCH` is a *declared* divergence about the gaps a session leaves; handing out one
+/// value per block is not that. The block exists so that a batch is reserved once and served from
+/// memory, and this asserts it is served.
+#[test]
+fn consecutive_serial_ids_are_consecutive() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+    session
+        .run("CREATE TABLE ser (id bigserial PRIMARY KEY, v int8)")
+        .unwrap();
+    for value in 1..=5 {
+        session
+            .run(&format!("INSERT INTO ser (v) VALUES ({value})"))
+            .unwrap();
+    }
+    assert_eq!(
+        session.rows("SELECT id FROM ser ORDER BY id"),
+        (1..=5)
+            .map(|id| vec![Some(id.to_string())])
+            .collect::<Vec<_>>(),
+        "five inserts on one connection are five consecutive ids"
+    );
+
+    // And across connections: the second one takes its own block, so its ids are not the first
+    // one's — but each connection's own run is still consecutive, which is what a reserved block
+    // means. That the two blocks differ is `SEQUENCE_BATCH`'s declared gap and not this.
+    let mut other = cluster.session();
+    for value in 6..=8 {
+        other
+            .run(&format!("INSERT INTO ser (v) VALUES ({value})"))
+            .unwrap();
+    }
+    let theirs: Vec<i64> = other
+        .rows("SELECT id FROM ser WHERE v > 5 ORDER BY id")
+        .into_iter()
+        .map(|row| row[0].as_deref().unwrap_or_default().parse().unwrap_or(0))
+        .collect();
+    assert_eq!(theirs.len(), 3);
+    assert_eq!(
+        theirs[1] - theirs[0],
+        1,
+        "the second connection's own ids are consecutive too: {theirs:?}"
+    );
+    assert_eq!(theirs[2] - theirs[1], 1, "{theirs:?}");
+}

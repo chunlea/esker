@@ -547,17 +547,19 @@ fn split_type_name_parts(spelled: &str) -> (Option<String>, String, bool) {
 /// spellings that are neither of a type's two names.
 pub fn named_type(spelled: &str) -> Result<Option<Named>> {
     let (schema, bare, sql_grammar) = split_type_name_parts(spelled);
-    // **A schema nobody declared is `3F000`, not `42704`** — measured: `'nosuchschema.mood'` is
-    // `schema "nosuchschema" does not exist` and `'public.nosuchtype'` is
-    // `type "public.nosuchtype" does not exist`. A real server decides which is missing before it
-    // says anything, so the two errors are two different questions.
+    // **A schema this module does not know is not an error here**, and that it was is the half of
+    // the qualified-name unit that got left behind: `schema_1.text` is a `CREATE DOMAIN` in a
+    // schema a user made, and this function has no catalog to ask. So a name it cannot resolve is
+    // `None`, and the *executor* decides between "no such schema" (`3F000`) and "no such type"
+    // (`42704`) — it is the only place that can tell them apart. Only the three schemas a
+    // built-in type can live in are answered here.
     if let Some(schema) = &schema
         && !matches!(
             schema.as_str(),
             "public" | "pg_catalog" | "information_schema"
         )
     {
-        return Err(SqlError::UndefinedSchema(schema.clone()));
+        return Ok(None);
     }
     let lowered = bare.trim().to_ascii_lowercase();
     // **Dimensions are ignored and the internal name works.** `integer[]`, `integer[][]`,

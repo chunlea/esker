@@ -269,7 +269,12 @@ impl Relations {
     /// only the built-ins.
     #[must_use]
     pub fn user_type_by_name(&self, name: &str) -> Option<&super::TypeDef> {
-        self.user_types.values().find(|def| def.name == name)
+        // The stored name carries its schema (`schema ++ NUL ++ name`) and the spelled one a dot,
+        // so the two are compared through `display_name` — `schema_1.text` finds the domain in
+        // `schema_1`, and a type in `public` is stored bare and found by its bare name.
+        self.user_types
+            .values()
+            .find(|def| super::display_name(&def.name) == name)
     }
 
     /// The user-defined type with this oid, or `None`.
