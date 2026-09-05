@@ -449,9 +449,14 @@ fn a_savepoint_rollback_leaves_no_write_to_conflict_against_real_stores() {
 /// * without it, one appears in about half of runs.
 ///
 /// The assertion is left at `refused == 0` rather than widened to a threshold, because a threshold
-/// is a number nobody can defend and it would hide the very signal the test exists for. What
-/// changes is the claim: if this reddens in a loaded gate, **re-run it alone before believing it**,
-/// and the failure to look for is the *unloaded* one.
+/// is a number nobody can defend and it would hide the very signal the test exists for. What the
+/// experiment needed instead was the machine, so it takes it: `.config/nextest.toml` gives this one
+/// test `threads-required = 'num-test-threads'`, the same knob the real-process cluster binaries
+/// use. Serialising it against the other members of a group would not have been enough — the load
+/// is the other three thousand tests, not its neighbours.
+///
+/// If it ever reddens anyway, **re-run it alone before believing it**, and the failure worth
+/// chasing is the *unloaded* one.
 ///
 /// **The count is refusals, not lost updates.** A lost update cannot happen here: the per-key read
 /// stamp (ADR 0057 §4) makes first-committer-wins refuse a write computed from a stale value, so
