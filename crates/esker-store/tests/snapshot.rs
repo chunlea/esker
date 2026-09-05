@@ -310,7 +310,7 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
 ///
 /// Returns once the second store leads *and* the first does not, so anything a caller then aims
 /// at `first` is aimed at a store that has stopped leading.
-async fn two_voters_with_the_office_on_the_second() -> (Node, Node) {
+async fn two_voters_with_the_office_on_the_second() -> (Arc<FakePd>, Node, Node) {
     let pd = Arc::new(FakePd::new());
     let first_address_listener = reserve();
     let first_address = first_address_listener.local_addr().unwrap();
@@ -378,7 +378,7 @@ async fn two_voters_with_the_office_on_the_second() -> (Node, Node) {
         "the first store still leads, so the office did not move and this proves nothing"
     );
 
-    (first, second)
+    (pd, first, second)
 }
 
 /// **A write aimed at a store that has stopped leading is never answered, however long it waits.**
@@ -403,7 +403,7 @@ async fn two_voters_with_the_office_on_the_second() -> (Node, Node) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_follows_the_office_when_it_moves() {
     trace();
-    let (first, second) = two_voters_with_the_office_on_the_second().await;
+    let (_pd, first, second) = two_voters_with_the_office_on_the_second().await;
 
     // Aimed at the store that has *stopped* leading, which is exactly what the sightings do.
     // Without following the hint this spends the whole deadline and fails.
@@ -451,12 +451,38 @@ async fn a_write_follows_the_office_when_it_moves() {
 )]
 async fn a_put_says_which_store_it_was_not_given() {
     trace();
-    let (first, _second) = two_voters_with_the_office_on_the_second().await;
-
-    // Deliberately the group the announcement helper used to pass: the store that has stopped
-    // leading, and only it.
+    let (pd, first, second) = two_voters_with_the_office_on_the_second().await;
     let region = first.store.regions().regions()[0].clone();
-    put(&[&first.store], &region, key(1), b"after").await;
+
+    // **The office has to still be on peer 2 when the call starts, and a two-voter group can
+    // elect peer 1 back before it does.** If that happens the write simply succeeds, the branch
+    // this test exists for is never reached, and `should_panic` reports only the absence of a
+    // panic -- which is what this test did once inside a loaded crate run. So the state is
+    // re-established and the call retried: hold the precondition, do not assume it
+    // (`docs/plans/debt-c7.md` section 16, which is the same rule the retire helper learned).
+    for _ in 0..20 {
+        if !second.store.peer_of(1).is_some_and(|peer| peer.is_leader()) {
+            let epoch = first.store.regions().regions()[0].epoch;
+            pd.issue(Operator::TransferLeader {
+                region_id: 1,
+                epoch,
+                to_peer_id: 2,
+            });
+            wait_for("the office to go back to the second store", || {
+                second.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+            })
+            .await;
+        }
+
+        // Deliberately the group the announcement helper used to pass: the store that has
+        // stopped leading, and only it. This panics -- that *is* the assertion -- unless an
+        // election returned the office between the check above and the first attempt.
+        put(&[&first.store], &region, key(1), b"after").await;
+    }
+    panic!(
+        "the office returned to store 1 before each of 20 attempts, so the redirect branch was \
+         never reached and this test asserted nothing"
+    );
 }
 
 /// Commits one key through Percolator on `store`, as a client would: prewrite, then commit.

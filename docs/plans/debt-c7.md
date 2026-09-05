@@ -880,3 +880,107 @@ corrected in the standing lane guidance.
 The load itself was not the spinners alone: with all fourteen gone the average was still 196, and
 macOS `StorageManagementService` and `ApplicationsStorageExtension` were burning 58% and 65%. Disk
 is healthy (72% used, 1.0 TiB free).
+
+## 18. Proving a negative and waiting for an event are not the same wait
+
+§15 left `sim_sweep` open with a diagnosis and no fix, because it went 0/12 solo and this wave's
+rule is to measure before touching. The diagnosis stands on the evidence rather than on a
+reproduction, and it is readable straight off the failure:
+
+```
+case "a newer membership that does not name this store": required Reclaim,
+observed Observed { still_hosted: false, keys_left: 6, keys_before: 6 }
+```
+
+`still_hosted: false` says the store **gave the region up** — the decision the case is about was
+taken, and taken correctly. Only the six keys were still on disk. The sweep had not refused to
+reclaim; it had not finished reclaiming.
+
+`check`'s `Reclaim` arm failed on `keys_left != 0` alone, so it could not tell those apart, and
+`observe` gave both kinds of case the same three-second clock. But they are different waits:
+
+* a case that requires `Reclaim` is waiting for an **event** — the region gone and its keys with
+  it. Its budget only has to be long enough that reaching the end means the reclaim *stalled*.
+* a case that requires `Keep` is proving a **negative**. The only way to do that is to spend the
+  window, and then check the throttle really got its rounds inside it.
+
+Three seconds is right for the second and arbitrary for the first. So the positive case now waits
+on its event (`RECLAIM_DEADLINE`, 30 s) and the negative keeps exactly the window it had
+(`NOTHING_HAPPENS_WINDOW`, 3 s) together with the round guard, which is untouched. A reclaim that
+never finishes still fails — at the deadline, and now saying which half is outstanding, because
+`Half` gained `ReclaimUnfinished`: *the store gave the region up and its keys are still on disk*,
+which points at ADR 0034's cursor rather than at the decision.
+
+This is not a budget increase dressed up. The negative proof is unchanged; the change is that a
+positive is no longer judged by a stopwatch.
+
+### And the test I wrote two sections ago had the same bug
+
+`a_put_says_which_store_it_was_not_given` (§14) failed once inside a loaded crate run and 0/8
+solo. It calls `two_voters_with_the_office_on_the_second()` and then writes — assuming the office
+*stays* on peer 2. A two-voter group can elect peer 1 back before the call starts, and then the
+write simply succeeds, the redirect branch is never reached, and `#[should_panic]` reports the
+absence of a panic rather than the reason for it.
+
+That is precisely the fault §16 and §17 are about, committed by me while writing them up. It now
+re-establishes the office and retries, bounded, and says so if it never got a clean attempt:
+
+> the office returned to store 1 before each of 20 attempts, so the redirect branch was never
+> reached and this test asserted nothing
+
+**Nine sightings in this wave; the count of them fixed by changing a budget is still zero.**
+
+## 19. A region with no leader for ninety seconds
+
+The instrument fixed in §17 answered on the **first run** of the next arm, and the answer is not a
+test defect.
+
+```
+writing b"k000733" never succeeded in 90.001262152s; the last refusal was: None
+  store 1: peer of region 77, is_leader=false, believes leader=None
+  store 2: peer of region 77, is_leader=false, believes leader=None
+  store 3: peer of region 77, is_leader=false, believes leader=None
+```
+
+Read it against the three gates the old message could not distinguish:
+
+* **not** "no store holds a region containing this key" — all three hold region 77;
+* **not** "holds the region but has no peer of it" — all three have a peer;
+* every peer says `is_leader=false`, and every peer says `believes leader=None`.
+
+Nobody leads, and nobody believes anybody else does, for **ninety seconds**. This is region 77,
+which the test's own load created by splitting. `put` is not failing to find the leader; there is
+no leader to find.
+
+That is a liveness finding in the store, not in the test. It is not invariant 1 — nothing
+acknowledged was lost, the writes simply never happened — but a range that cannot elect anybody is
+a range that cannot be written to, and `regions_reach_a_store_that_joins_and_none_is_left_without_a_leader`
+is a sibling test whose whole subject is that this must not happen.
+
+### What is not yet known, and how the next occurrence will say it
+
+`leader=None` everywhere is still ambiguous between two very different states, and the message
+could not separate them:
+
+* every peer is a **follower** whose election timer keeps being reset, so nobody ever campaigns;
+* every peer is a **candidate**, campaigning and losing, over and over.
+
+And a third possibility the membership settles: a freshly split range whose peers are still
+**learners** has no voters, and a group with no voters cannot elect anyone however long it waits.
+
+So the diagnostic now carries, per store, the peer's `term`, its Raft `role`, its `voted_for`, and
+the region's full membership with each member's Voter/Learner role. The next occurrence says which
+of the three it is in one line, without another arm to set it up.
+
+**This is handed over rather than fixed.** Diagnosing a leaderless region is store work — the apply
+loop, the campaign path, or the split's conf state — and this lane's remit was the tests around it.
+The reproduction is cheap: 14 busy threads, `a_learner_on_a_fresh_store_becomes_a_voter_under_load`,
+1 of 1 on the arm that found it and 2 of 4 on the arm before.
+
+### The arm, and the guard that stopped it
+
+One arm, 14 threads, GNU `timeout` proved both ways first. It aborted itself before run 2: the
+1-minute load average reached 108 against the ceiling of 80 written into the script after §17's
+incident. Spinners were killed and verified with `ps -p` — the check that works. The guard cost
+seven runs and prevented a repeat of the 196 that stopped the previous arm; the finding arrived on
+run 1 regardless.
