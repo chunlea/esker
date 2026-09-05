@@ -1965,11 +1965,37 @@ fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::CheckViolation {
                 constraint: check.name.clone(),
                 relation: table.name.clone(),
-                row: super::index::render_values(row),
+                row: failing_row(table, row),
             });
         }
     }
     Ok(())
+}
+
+/// The row a `DETAIL: Failing row contains (…)` names: **the columns a user can see**.
+///
+/// Rendering the stored row printed two things PostgreSQL does not. Column 0 of a table with no
+/// primary key is the internal row id ([`crate::catalog::INTERNAL_ROW_ID_NAME`]), and a column
+/// `DROP COLUMN` tombstoned is still in the row (ADR 0051) — so a one-column table reported three
+/// values. Measured on 19beta1:
+///
+/// ```text
+/// CREATE TABLE pk_auto (id integer NOT NULL);   INSERT INTO pk_auto DEFAULT VALUES
+///     DETAIL:  Failing row contains (null).             -- this node said (1, null)
+/// CREATE TABLE t3 (a int NOT NULL, b text);     INSERT INTO t3 (b) VALUES ('x')
+///     DETAIL:  Failing row contains (null, x).          -- this node said (1, null, x)
+/// ```
+///
+/// [`TableDef::user_columns`] is the same iterator `SELECT *` expands to, which is the definition
+/// of the set PostgreSQL prints here.
+fn failing_row(table: &TableDef, row: &[Datum]) -> String {
+    // `get` rather than an index: the row and the column list are built together and cannot
+    // disagree, and a message is not the place to find out otherwise.
+    let visible: Vec<Datum> = table
+        .user_columns()
+        .filter_map(|(at, _)| row.get(at).cloned())
+        .collect();
+    super::index::render_values(&visible)
 }
 
 fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
@@ -1994,7 +2020,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::NotNullViolationInRelation {
                 column: column.name.clone(),
                 relation: table.name.clone(),
-                row: Some(super::index::render_values(row)),
+                row: Some(failing_row(table, row)),
             });
         }
     }
