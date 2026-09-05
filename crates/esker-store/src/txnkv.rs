@@ -145,9 +145,12 @@ impl TxnSnapshot for EngineSnapshot<'_> {
     }
 
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> esker_txn::Result<Option<Version>> {
-        // From the newest version downwards, and the first one is the answer: anything at or
-        // below `ts` ends the question.
-        self.walk(user_key, u64::MAX, ts.saturating_add(1), Some)
+        // From the newest record downwards, and the first *commit* is the answer: anything at
+        // or below `ts` ends the question, and a rollback marker is stepped past rather than
+        // answered with (ADR 0078).
+        self.walk(user_key, u64::MAX, ts.saturating_add(1), |version| {
+            (version.record.kind != esker_txn::Kind::Rollback).then_some(version)
+        })
     }
 
     /// Every `write` record in `[start, end)`, looking for one committed after `ts`.
@@ -178,7 +181,13 @@ impl TxnSnapshot for EngineSnapshot<'_> {
             let (_, commit_ts) = key::split(iter.key())?;
             if commit_ts > ts {
                 let record = WriteRecord::decode(iter.value())?;
-                return Ok(Some(Version::new(commit_ts, record)));
+                // A rollback marker is not a commit, so it is not a phantom either (ADR 0078):
+                // a transaction that took a key in this range and died changed nothing, and
+                // refusing the read set over it is a `40001` for nothing. A `Lock` record is a
+                // different matter — it *is* a commit, just one that wrote no version.
+                if record.kind != esker_txn::Kind::Rollback {
+                    return Ok(Some(Version::new(commit_ts, record)));
+                }
             }
             iter.next();
         }
@@ -231,10 +240,14 @@ fn cf_id(db: &Db, column: Cf) -> Result<u32, ProtoError> {
 /// is stale when nothing replaced it.
 pub(crate) fn latest_commit(db: &Db, key: &[u8]) -> Result<TxnKvResp, ProtoError> {
     let snapshot = EngineSnapshot::new(db);
+    // No `kind` filter here: `newest_write_after` answers with the newest *committed* write and
+    // steps past markers itself (ADR 0078). Filtering the `Option` afterwards was how this
+    // answered `None` — "nothing ever committed this key" — whenever the newest record happened
+    // to be a rollback marker, which is what let `changed_since_statement` miss a real commit and
+    // leave the statement to be refused at prewrite instead of re-run.
     let newest = snapshot
         .newest_write_after(key, 0)
         .map_err(txn_to_proto)?
-        .filter(|version| version.record.kind != esker_txn::Kind::Rollback)
         .map(|version| version.commit_ts);
     Ok(TxnKvResp::LatestCommit { newest })
 }

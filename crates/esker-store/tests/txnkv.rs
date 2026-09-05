@@ -1028,3 +1028,100 @@ async fn a_longer_retention_keeps_more_of_one_table() {
         "a table with no override takes the cluster default, not retention zero"
     );
 }
+
+/// **`LatestCommit` answers with the newest *commit*, not with whatever record is on top**
+/// ([ADR 0078](../../docs/adr/0078-a-marker-is-not-a-commit.md)).
+///
+/// A rollback marker lives at `commit_ts == start_ts`, so a transaction that takes a key and dies
+/// leaves the newest record on it. This answer used to be computed by filtering that record out of
+/// the `Option` afterwards, which turned "the newest commit is 20" into "nothing ever committed
+/// this key" — and `changed_since_statement`, whose whole job is to notice the writer in front,
+/// therefore saw nothing, did not re-run the statement, and left it to be refused at prewrite with
+/// a `40001` nobody needed (`esker-sql`'s `store_locking` suite counts exactly those).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_newest_commit_survives_a_marker_written_above_it() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    commit_one(&transport, b"k", b"v", 10, 20).await;
+    // A second transaction took the key and died. Its marker is now the newest record on `k`.
+    let rolled = call(
+        &transport,
+        TxnKvReq::Rollback {
+            start_ts: 30,
+            keys: vec![key(b"k")],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rolled,
+        TxnKvResp::Rollback {
+            status: TxnStatus::Ok
+        }
+    );
+
+    let newest = call(&transport, TxnKvReq::LatestCommit { key: key(b"k") })
+        .await
+        .unwrap();
+    assert_eq!(
+        newest,
+        TxnKvResp::LatestCommit { newest: Some(20) },
+        "the commit at 20 is still the newest commit; the marker at 30 committed nothing and must \
+         not erase it"
+    );
+}
+
+/// **A marker inside a validated range is not a phantom** (ADR 0078).
+///
+/// The read-set range check (ADR 0067 §3) refuses a prewrite when anything committed inside the
+/// range after the transaction's snapshot. A transaction that took a key in that range and then
+/// rolled back committed nothing and changed nothing a reader could have seen, so refusing over
+/// its marker is a `40001` for a phantom that does not exist. This is the range-shaped face of the
+/// same rule the key-level check keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marker_inside_a_checked_range_is_not_a_phantom() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    // Above the checking transaction's snapshot of 40, which is what makes it a candidate phantom.
+    let rolled = call(
+        &transport,
+        TxnKvReq::Rollback {
+            start_ts: 50,
+            keys: vec![key(b"m")],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rolled,
+        TxnKvResp::Rollback {
+            status: TxnStatus::Ok
+        }
+    );
+
+    let checked = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::CheckRange {
+                start: key(b"a"),
+                end: key(b"z"),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        checked,
+        TxnKvResp::prewrite_ok(1),
+        "nothing committed in the range: the only record above the snapshot is a rollback marker"
+    );
+}

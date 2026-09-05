@@ -666,7 +666,7 @@ mod tests {
 
     use super::{
         CommitDecision, Op, Prewrite, PrewriteDecision, ReadOutcome, check_prewrite,
-        commit_primary, read,
+        commit_primary, read, rollback,
     };
     use crate::mutation::Cf;
     use crate::snapshot::MemoryStore;
@@ -752,5 +752,78 @@ mod tests {
         let mut store = MemoryStore::new();
         commit_one(&mut store, b"k", b"small", 10, 20);
         assert!(store.is_empty(Cf::Default), "a short value is inline");
+    }
+    /// Rolls one key back the way the resolver does, leaving the marker at `commit_ts == start_ts`.
+    fn roll_back_one(store: &mut MemoryStore, key: &[u8], start_ts: u64) {
+        let mutations = rollback(store, key, start_ts).unwrap();
+        store.apply(&mutations);
+    }
+
+    /// **A rollback marker is not a commit, and first-committer-wins has no business seeing it.**
+    ///
+    /// `newest_write_after` answers the conflict check, and it used to answer with the newest
+    /// record of *any* kind. A marker lives at `commit_ts == start_ts`, so a transaction that took
+    /// this key after our snapshot and then died left something above our snapshot that looks, to a
+    /// check that does not read `kind`, exactly like a commit that beat us. Nothing committed; the
+    /// statement is refused with `40001` anyway.
+    ///
+    /// This is the same rule reads have always kept: `newest_version_at` steps past a record whose
+    /// `Kind::is_a_version` is false rather than answering with it.
+    #[test]
+    fn a_rollback_marker_is_not_a_commit_and_refuses_nobody() {
+        let mut store = MemoryStore::new();
+        commit_one(&mut store, b"k", b"v", 10, 20);
+        // A writer that took the key at 30 and died. Its marker sits at 30, above the snapshot
+        // the next writer read at.
+        roll_back_one(&mut store, b"k", 30);
+
+        let request = Prewrite::new(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"k"),
+            35,
+            Op::Put(Bytes::from_static(b"next")),
+        )
+        .read_at(25);
+
+        assert!(
+            matches!(
+                check_prewrite(&store, &request).unwrap(),
+                PrewriteDecision::Lock(_)
+            ),
+            "the only record above the snapshot is a rollback marker, and a rollback committed \
+             nothing: refusing here is a 40001 for a conflict that does not exist"
+        );
+    }
+
+    /// **Stepping past a marker must not step past the commit under it**, and the refusal has to
+    /// name the commit that actually won.
+    ///
+    /// The half of the rule the test above cannot state: a real commit hiding beneath a marker is
+    /// still a conflict. Before the marker was stepped past, this refusal reported the *marker's*
+    /// timestamp — telling the client "a commit at 50 beat you" about a transaction that rolled
+    /// back and committed nothing at all.
+    #[test]
+    fn a_commit_under_a_rollback_marker_still_refuses_and_names_itself() {
+        let mut store = MemoryStore::new();
+        commit_one(&mut store, b"k", b"v", 10, 20);
+        // Somebody really did commit above our snapshot, at 40 ...
+        commit_one(&mut store, b"k", b"theirs", 30, 40);
+        // ... and somebody else took the key afterwards and died, leaving a marker above that.
+        roll_back_one(&mut store, b"k", 50);
+
+        let request = Prewrite::new(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"k"),
+            55,
+            Op::Put(Bytes::from_static(b"next")),
+        )
+        .read_at(25);
+
+        assert_eq!(
+            check_prewrite(&store, &request).unwrap(),
+            PrewriteDecision::Conflict { commit_ts: 40 },
+            "the commit at 40 is the one that beat this transaction; the marker at 50 is not a \
+             commit and must not be named as the winner"
+        );
     }
 }

@@ -62,10 +62,22 @@ pub trait TxnSnapshot {
     /// inclusive**: a version committed at exactly `ts` is visible at `ts`.
     fn seek_write(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>>;
 
-    /// The newest `write` record with `commit_ts > ts`, if there is one.
+    /// The newest **committed** write with `commit_ts > ts`, if there is one.
     ///
     /// Prewrite's conflict check: any answer at all means a transaction committed after our
     /// snapshot, and first-committer-wins says we lose.
+    ///
+    /// **A rollback marker is stepped past, not answered with**
+    /// ([ADR 0078](../../../docs/adr/0078-a-marker-is-not-a-commit.md)). A marker lives at
+    /// `commit_ts == start_ts`, so a transaction that took this key after our snapshot and then
+    /// died leaves a record above it that an implementation reading only the timestamp cannot tell
+    /// from a commit — and the refusal it produces names a `commit_ts` at which nothing committed.
+    ///
+    /// **A `Kind::Lock` record is not stepped past**, which is where this parts company with
+    /// `percolator::newest_version_at`. A read wants a *version* and a lock record has no value;
+    /// this asks who *committed*, and a `SELECT … FOR UPDATE` that committed is a committer. The
+    /// two questions differ on exactly one kind, and `a_lock_kind_record_is_a_conflict_but_not_a_version`
+    /// holds the line.
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>>;
 
     /// **Anything committed inside `[start, end)` after `ts`** — the phantom test
@@ -129,7 +141,7 @@ mod memory {
     use bytes::Bytes;
 
     use super::{TxnSnapshot, Version};
-    use crate::codec::{LockRecord, WriteRecord};
+    use crate::codec::{Kind, LockRecord, WriteRecord};
     use crate::error::Result;
     use crate::mutation::{Cf, Mutation, Mutations};
 
@@ -236,15 +248,19 @@ mod memory {
         }
 
         fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {
-            // Newest first, so the newest version is the first the iterator yields; if that
-            // one is not above `ts`, none of them is.
-            match self.versions(user_key).next() {
-                None => Ok(None),
-                Some(version) => {
-                    let version = version?;
-                    Ok((version.commit_ts > ts).then_some(version))
+            // Newest first, so the walk ends at the first record at or below `ts`: nothing
+            // under it can be above `ts` either. Rollback markers are stepped past on the way
+            // down; a `Lock` record is a commit and stops the walk like any other.
+            for version in self.versions(user_key) {
+                let version = version?;
+                if version.commit_ts <= ts {
+                    return Ok(None);
+                }
+                if version.record.kind != Kind::Rollback {
+                    return Ok(Some(version));
                 }
             }
+            Ok(None)
         }
 
         fn write_of_txn(&self, user_key: &[u8], start_ts: u64) -> Result<Option<Version>> {
