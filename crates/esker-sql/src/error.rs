@@ -270,6 +270,15 @@ pub enum SqlError {
     #[error("canceling statement due to statement timeout")]
     StatementTimeout,
 
+    /// A statement somebody asked to stop: `pg_cancel_backend()` or the protocol's
+    /// `CancelRequest`.
+    ///
+    /// **`57014` and PostgreSQL's own sentence.** The same code as a statement timeout and a
+    /// different message, which is the pattern `55P03` already follows for its two conditions —
+    /// the code says what happened to the statement and the sentence says who did it.
+    #[error("canceling statement due to user request")]
+    QueryCanceled,
+
     /// Two transactions waiting for each other's rows. **`40P01`**, and exactly one of them gets
     /// it — measured on PostgreSQL 19, where the survivor's *both* updates landed.
     ///
@@ -2424,7 +2433,7 @@ impl SqlError {
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
             SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
-            SqlError::StatementTimeout => sqlstate::QUERY_CANCELED,
+            SqlError::StatementTimeout | SqlError::QueryCanceled => sqlstate::QUERY_CANCELED,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::CannotChangeMatview(_)

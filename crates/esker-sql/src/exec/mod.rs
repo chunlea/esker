@@ -27,7 +27,7 @@
 pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
-mod cancel;
+pub(crate) mod cancel;
 mod comment;
 mod cursor;
 mod ddl;

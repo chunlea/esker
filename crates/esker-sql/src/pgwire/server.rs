@@ -10,6 +10,7 @@
 //! appears in exactly one function.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -108,6 +109,19 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
     }
 }
 
+impl<S> Drop for Connection<S> {
+    /// **Forgets this session however the connection ends**, which is why it is a destructor and
+    /// not a line at each `return`: the run loop leaves by six routes — `Terminate`, the client
+    /// vanishing, an idle-in-transaction timeout, a failed startup, an I/O error — and a registry
+    /// that leaked one entry per dropped connection would grow for the life of the process and
+    /// hand out pids that answer for nobody.
+    fn drop(&mut self) {
+        if let Some(backend) = &self.backend {
+            crate::pgwire::backends::deregister(backend.pid);
+        }
+    }
+}
+
 /// One client connection.
 #[derive(Debug)]
 pub struct Connection<S> {
@@ -130,6 +144,12 @@ pub struct Connection<S> {
     ///
     /// `None` for a connection built directly, which is what the in-memory tests do.
     pending: Option<Vec<u8>>,
+    /// This session's pid, key and cancellation flag, from the moment startup completes.
+    ///
+    /// `None` before then and for a connection that never got that far — a `CancelRequest` is
+    /// itself a connection that never completes a startup, and registering one would put a
+    /// session in the table that can never run a statement.
+    backend: Option<crate::pgwire::backends::Backend>,
 }
 
 /// What one message's worth of work owns while it runs.
@@ -143,6 +163,12 @@ struct Work {
     session: Session,
     executor: Box<dyn Execute + Send>,
     out: Vec<u8>,
+    /// The flag a `CancelRequest` on another connection sets.
+    ///
+    /// **It travels with the bundle**, because each statement is handed to `spawn_blocking` and
+    /// consecutive statements of one session land on *different* pool threads: a flag installed
+    /// once when the connection opened would be invisible to every one of them.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
@@ -163,6 +189,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             user: String::new(),
             database: String::new(),
             out: Vec::with_capacity(8 * 1024),
+            backend: None,
             pending,
         }
     }
@@ -189,6 +216,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         };
         let mut work = Work {
             session: Session::new(),
+            cancel: self.backend.as_ref().map(|backend| backend.cancel.clone()),
             executor,
             out: std::mem::take(&mut self.out),
         };
@@ -252,6 +280,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // messages rather than reallocated per statement.
             work = tokio::task::spawn_blocking(move || {
                 let mut work = work;
+                // Installed for this statement only, and cleared as it goes in: a cancellation
+                // that arrived while the session was idle must not kill the next statement, which
+                // is what a real server does and what `cancel::with_flag` enforces.
+                let _cancel = work.cancel.clone().map(crate::exec::cancel::with_flag);
                 work.session
                     .handle(&message, work.executor.as_mut(), &mut work.out);
                 work
@@ -292,10 +324,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 Startup::SslRequest | Startup::GssEncRequest => {
                     refuse(&mut self.stream, &self.config.tls).await?;
                 }
-                // Cancellation needs a registry of running queries, which arrives with the
-                // executor. Closing is what a server that cannot cancel should do: the protocol
-                // gives no reply to a CancelRequest even when it works.
-                Startup::Cancel { .. } => return Ok(false),
+                // **The protocol gives no reply to a `CancelRequest`, even when it works**, so
+                // this asks and closes either way — a wrong pid and a wrong key are indistinguishable
+                // from a right one from the client's side, which is what leaves nothing to guess
+                // against.
+                Startup::Cancel { pid, key } => {
+                    crate::pgwire::backends::cancel(pid, key);
+                    return Ok(false);
+                }
                 Startup::Parameters { .. } => {
                     return self.complete_startup(&startup).await;
                 }
@@ -356,8 +392,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         ] {
             Message::ParameterStatus { name, value }.encode(&mut self.out);
         }
-        // No cancellation yet, so the key is a constant rather than a secret pretending to be one.
-        Message::BackendKeyData { pid: 0, key: 0 }.encode(&mut self.out);
+        // **A real pid and a real secret.** They were `0, 0` while nothing could cancel: a key
+        // that is a constant is worse than no key, because it looks like one. The pair is what a
+        // `CancelRequest` on another connection must present to stop this session's statement.
+        let backend = crate::pgwire::backends::register();
+        self.backend = Some(backend.clone());
+        Message::BackendKeyData {
+            pid: backend.pid,
+            key: backend.key,
+        }
+        .encode(&mut self.out);
         Message::ReadyForQuery(TransactionStatus::Idle).encode(&mut self.out);
         self.stream.write_all(&self.out).await?;
         self.stream.flush().await?;
