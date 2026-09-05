@@ -418,10 +418,23 @@ Named so the next person can check them rather than re-derive them:
 
 A multi-region columnar query returns **N times** the right answer — measured 2026-09-05,
 `docs/bench/mpp-baseline.md` §10 — so `exec::fragment` refuses a table in more than one region and
-`EXPLAIN` names the rule. The guard is **temporary**. It is retired by
-`crates/esker-cli/tests/multi_region_differential.rs` going green: the test that asserts the two
-engines agree across regions with `Engine: columnar` on every comparison, which cannot pass until
-the columnar copy is region-scoped (`esker-store`'s, by ADR 0040's own sentence).
+`EXPLAIN` names the rule. What decides it is what the source declares:
+`FragmentSource::runs_are_region_scoped`, required with no default, because a defaulted method is a
+silent opt-out and a source that quietly answered "yes" returns a wrong number rather than a slow
+one.
+
+**The store-side fix arrives in halves and one half is not enough.** With the copy built from the
+region's range but the scan range not applied, a two-hundred-row table answers 357; with the scan
+range applied and the build scoping absent, 52. So `ClientFragments` answers `false` until **both**
+halves are in.
+
+**What retires the guard is the declaration, and what checks the declaration is
+`crates/esker-cli/tests/multi_region_differential.rs`** — which is green in either state and is not
+retired at all. It reads the declaration out of `EXPLAIN` and asserts what that declaration
+promises: `false` means the guard fired, `EXPLAIN` named the rule, and the answers are still right;
+`true` means every comparison ran on the columns and agreed. Its demand turns on the moment the
+flip happens, and until then it is the check that the guard is really guarding — which is why it
+carries no `#[ignore]` and runs every time.
 
 Until then **every number in this file is single-region**, and the exchange re-measure is blocked
 on correctness rather than on a quiet machine.
