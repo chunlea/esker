@@ -213,6 +213,24 @@ pub(super) fn column_default_value(
     if let Some(error) = failure {
         return Err(error);
     }
+    // **And a cast to a user-defined type**, for the same reason and by the same road: a
+    // `DEFAULT 'x'::schema_1.text` is a `UserCast` that the statement pass would have folded, and
+    // this path never runs it. `Executor::user_cast` is the *same* function the statement pass
+    // calls, rather than a second reading of the same names — the three that had drifted are what
+    // `value::split_type_name` was for.
+    let mut types = None;
+    let mut failure = None;
+    let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
+        match Executor::user_cast(tenant, &mut types, txn, expr, false) {
+            Ok(Some(resolved)) => *expr = resolved,
+            Ok(None) => {}
+            Err(error) => failure = Some(error),
+        }
+        Ok(())
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let scope = query::Scope::single(table);
     let resolved = query::resolve(&parsed, &scope).map_err(|error| {
         SqlError::Internal(format!(
