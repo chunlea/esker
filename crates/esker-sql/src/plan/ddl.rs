@@ -1155,4 +1155,13 @@ pub enum AlterTableAction {
         /// the same as forgetting it to every reader.
         replicas: Option<u8>,
     },
+    /// A storage parameter a real server takes and this node has nowhere to put: every name in a
+    /// `RESET` but `columnar_replicas`, and anything in the `toast` namespace.
+    ///
+    /// **It is its own variant because the alternative was wrong.** Saying "accepted, and it
+    /// changes nothing" with `SetColumnarReplicas { replicas: None }` reuses the one action that
+    /// already meant something — *forget the setting* — so a `SET (toast.autovacuum_enabled = …)`
+    /// deleted a table's columnar wish and told the placement driver about it. A no-op needs a
+    /// state of its own; it cannot borrow one.
+    AcceptStorageParameter,
 }
