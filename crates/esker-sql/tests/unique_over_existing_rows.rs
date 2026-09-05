@@ -17,16 +17,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // `ALTER TABLE … ADD CONSTRAINT … PRIMARY KEY` is refused by name and is a different feature
-    // from this unit's: PostgreSQL's answer here is `42P16 multiple primary keys for table "uoe"
-    // are not allowed`, which is about the table already having one rather than about the rows.
-    // Adding a primary key to a table without one is its own unit.
-    answers: &[(
-        "ALTER TABLE uoe ADD CONSTRAINT uoe_a_pk PRIMARY KEY (a);",
-        "`0A000` naming the construct: adding a `PRIMARY KEY` by `ALTER TABLE` is not implemented, \
-         so this node never reaches the `42P16` about the one the table already has.",
-        "pg19_unique_over_existing_rows.txt:53",
-    )],
+    // **This list was one entry and is empty.** It declared that
+    // `ALTER TABLE … ADD CONSTRAINT … PRIMARY KEY` came back `0A000` rather than PostgreSQL's
+    // `42P16 multiple primary keys for table "uoe" are not allowed`, and said in its own words
+    // that "adding a primary key to a table without one is its own unit". That unit landed, so the
+    // row agrees and the entry goes — ADR 0031 rule 2, and the harness is what noticed.
+    answers: &[],
 };
 
 #[test]
