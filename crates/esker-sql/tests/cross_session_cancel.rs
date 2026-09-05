@@ -36,8 +36,7 @@ fn sqlstate(out: &[u8]) -> Option<String> {
         let len = u32::from_be_bytes([out[at + 1], out[at + 2], out[at + 3], out[at + 4]]) as usize;
         if out[at] == b'E' {
             let body = &out[at + 5..at + 1 + len];
-            let mut fields = body.split(|byte| *byte == 0);
-            while let Some(field) = fields.next() {
+            for field in body.split(|byte| *byte == 0) {
                 if field.first() == Some(&b'C') {
                     return Some(String::from_utf8_lossy(&field[1..]).into_owned());
                 }
