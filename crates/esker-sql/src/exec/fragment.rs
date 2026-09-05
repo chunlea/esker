@@ -582,33 +582,24 @@ fn the_shards_to_ask(
     let shards = source
         .shards(&start, &end)
         .map_err(|_| Decision::rows(Reason::NoFragmentService))?;
-    // **TEMPORARY, and it is holding back a silent wrong answer.**
+    // **A source that cannot scope a fragment to one region may not have more than one.**
     //
     // Measured on a real four-store cluster on 2026-09-05: a table in four regions, a columnar
     // learner on each, every fragment answered — and every aggregate came back **four times** its
-    // true value. `count(*)` of twenty thousand rows answered eighty thousand; the join answered
-    // 10,080 for 2,520. The multiplier is the region count, and the learners were co-located two
-    // to a store: a fragment reads its store's columnar runs rather than only its own region's, so
-    // every row is counted once per region (`docs/bench/mpp-baseline.md` §10).
+    // true value, because a learner's columnar runs are not scoped to the region the fragment
+    // asked about, so every row is counted once per region (`docs/bench/mpp-baseline.md` §10).
     //
-    // [ADR 0040](../../../../docs/adr/0040-the-engine-a-query-runs-on.md) foresaw the shape and
-    // called it *"a performance bound, not a wrong answer"*, because the epoch would refuse a
-    // shard whose region had split under it. That guard does not apply here: the splits happen
-    // **before** the learner is placed, so no shard is ever stale and every fragment is
-    // legitimately routed — and still reads too much.
+    // The rule is keyed on what the **source declares**, not on a shard count, and the difference
+    // matters: multi-shard folding is correct — `tests/routing.rs` and `tests/routing_aggregate.rs`
+    // prove it against a source that scopes properly — so a rule about shard counts would have
+    // called a working mechanism broken. What is broken is one store's columnar copy, and the
+    // source that speaks for that store is the one that says so.
     //
-    // A wrong answer must not stay reachable while the fix is built, so a table in more than one
-    // region reads rows. Region-scoping the columnar copy is `esker-store`'s (ADR 0040 says so in
-    // the same sentence), and **this guard is retired by
-    // `esker-cli/tests/multi_region_differential.rs` going green** — the test that asserts the two
-    // engines agree across regions with `Engine: columnar` on every comparison.
-    //
-    // **Before the learner check, deliberately.** A multi-region table will not be routed whether
-    // or not a learner exists, so naming the learner first would send a reader to place one and
-    // watch nothing change.
-    if shards.len() > 1 {
+    // Temporary. `FragmentSource::runs_are_region_scoped` answering `true` retires it, and
+    // `esker-cli/tests/multi_region_differential.rs` going green is what earns the flip.
+    if shards.len() > 1 && !source.runs_are_region_scoped() {
         return Err(Decision::rows(Reason::NotExpressible(
-            "a table in more than one region: the columnar copy is not region-scoped yet",
+            "a table in more than one region: this store's columnar copy is not region-scoped",
         )));
     }
     if shards.is_empty() || !shards.iter().all(Shard::is_columnar) {
