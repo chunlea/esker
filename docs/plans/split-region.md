@@ -175,8 +175,36 @@ and which namespaces count toward a region's size, and why `lock` does not. Clai
 
 | # | What | Commit |
 |---|---|---|
-| 0 | This plan | |
-| 1 | Red: the size and the boundary of a transactional region | |
-| 2 | Fix: `keyspace.rs`, and both functions read every family the region spans | |
-| 3 | ADR 0073 + DESIGN §6 | |
-| 4 | Red→green: a region of transactional rows actually splits | |
+| 0 | This plan | `637e6b40` |
+| 1 | Red: the size and the boundary of a transactional region | `bc942ab2` |
+| 2 | Fix: `keyspace.rs`, and both functions read every family the region spans | `6748f327` |
+| 3 | ADR 0073 + DESIGN §6 | `fa238b73` |
+| 4 | Red→green: a region of transactional rows actually splits | `4f4564d2` |
+| 5 | A version distribution the dedup test can actually fail on, + the gate's findings | `c3b14a3b` |
+
+## 10. What was shown red, and against what
+
+Each of these was run against code that did *not* have the fix, and the output is in the commit
+message that carries the test:
+
+* the five unit tests, against `bc942ab2`'s own code — `5000 committed rows of 200 bytes report
+  0 bytes`, `choose_split_key -> None`;
+* both integration tests, by putting `bc942ab2`'s `src/` back under this branch's `tests/` — `the
+  store stopped at 1 regions, wanted 2` after 22 seconds of waiting, and `64 committed rows of
+  200 bytes report 0 bytes`;
+* `the_versions_of_one_row_count_once`, by taking the deduplication out of `Source::advance` —
+  `the boundary landed at row 0 of 10`. Its first shape could not do this, and §5's item 3 is why:
+  ten rows of a hundred versions each puts the 500th version inside row five, which is also where
+  counting keys lands, so the test agreed with both answers.
+
+`a_lock_is_not_a_regions_size` is the exception and says so in its own doc comment: it passed
+before the fix, because everything reported zero.
+
+## 11. What this does not cover
+
+The store now splits a region of transactional rows, and every assertion above is at that layer.
+What no test here exercises is a **SQL query against a table that spans several regions** — the
+client's region-cache refresh on `EpochNotMatch`, `esker-sql`'s scan across two regions, and the
+one-columnar-fragment-per-region path of [ADR 0040](../adr/0040-the-engine-a-query-runs-on.md).
+Those are the consequence this unblocks, and re-measuring them is `docs/plans/phase-16-mpp.md`
+§10's own list, starting with its item 3.
