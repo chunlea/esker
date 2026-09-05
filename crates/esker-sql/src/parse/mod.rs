@@ -1414,6 +1414,26 @@ fn strip_virtual_generated(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec
 /// nothing has to travel beside the tree. On PostgreSQL `CREATE USER` **is** `CREATE ROLE … LOGIN`
 /// — one implies the login attribute and the other does not, and that is the only thing the two
 /// statements disagree about (measured against PG19: `rolcanlogin` is `t` and `f`).
+/// `RESET SESSION AUTHORIZATION` → `SET SESSION AUTHORIZATION DEFAULT`.
+///
+/// **Faithful, not a workaround**: PostgreSQL documents the two as the same statement, and
+/// `sqlparser` 0.62 reads the second and not the first — its `RESET` takes one parameter name and
+/// `SESSION AUTHORIZATION` is two words. The rewrite loses nothing, which is the test for whether
+/// this mechanism is the right one.
+fn rewrite_reset_authorization(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, second, third, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("RESET")
+        || !second.eq_ignore_ascii_case("SESSION")
+        || !third.eq_ignore_ascii_case("AUTHORIZATION")
+    {
+        return None;
+    }
+    let trailing = sql.trim_end().strip_suffix(';').map_or("", |_| ";");
+    Some(format!("SET SESSION AUTHORIZATION DEFAULT{trailing}"))
+}
+
 fn rewrite_user_as_role(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let [first, second, ..] = scanned.words.as_slice() else {
         return None;
@@ -2066,6 +2086,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     }
 
     let rewritten = rewrite_synonym(sql, &scanned)
+        .or_else(|| rewrite_reset_authorization(sql, &scanned))
         .or_else(|| rewrite_user_as_role(sql, &scanned))
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
         .or_else(|| strip_unlogged(sql, &scanned))

@@ -30,7 +30,19 @@ pub enum SessionStatement {
     /// name outright — correct while the node had no roles, and a lie the moment it did: the
     /// session that had just created a role was told it does not exist, because the refusal is
     /// upstream of the catalog and never asks it.
-    SetSessionAuthorization(Option<String>),
+    SetSessionAuthorization {
+        /// The role named, or `None` for `DEFAULT` — which `RESET SESSION AUTHORIZATION` is
+        /// rewritten to, PostgreSQL documenting the two as one statement.
+        name: Option<String>,
+        /// `SET LOCAL`: undone when the transaction ends, and by a rollback to a savepoint taken
+        /// before it.
+        ///
+        /// **Never a `SET LOCAL` that outlives its transaction.** That is a wrong answer rather
+        /// than a missing feature, and ADR 0031 ranks a refusal above one — so this is carried on
+        /// the same transaction-scoped restore `esker.read_as_of` already uses rather than
+        /// accepted and forgotten.
+        local: bool,
+    },
     /// `SET esker.read_as_of = '...'`, or `= DEFAULT` / `RESET`, which carry `None`.
     SetReadAsOf {
         /// What the user wrote, unresolved. `None` clears the setting.
@@ -86,7 +98,7 @@ impl SessionStatement {
         match self {
             SessionStatement::SetReadAsOf { .. }
             | SessionStatement::SetSnapshot(_)
-            | SessionStatement::SetSessionAuthorization(_)
+            | SessionStatement::SetSessionAuthorization { .. }
             | SessionStatement::SetParameter { .. } => "SET",
             // **`RESET`, not `SET`.** A `RESET ALL` reports its own verb, which is what a client
             // reading the command tag expects; `RESET <name>` is a `SetParameter` with no value

@@ -99,6 +99,13 @@ pub struct Executor {
     /// block: PostgreSQL keeps it across `COMMIT` and `ROLLBACK`, and only `RESET` or a new
     /// connection undoes it.
     authorization: Option<String>,
+    /// What `authorization` must go back to when the transaction ends, when a `SET LOCAL`
+    /// changed it.
+    ///
+    /// `Some(None)` is a real value and not an absence: the session had no authorization of
+    /// its own and must have none again. Recorded **once** per block, so a second `SET LOCAL`
+    /// restores the session's value rather than the first statement's.
+    authorization_before_block: Option<Option<String>>,
 
     pub(crate) tenant: u64,
     /// The database this session is connected to, which is the tenant above under its name.
@@ -662,6 +669,7 @@ impl Executor {
             database: crate::parse::DATABASE_NAME.to_owned(),
             user: crate::parse::DATABASE_NAME.to_owned(),
             authorization: None,
+            authorization_before_block: None,
             open: None,
             written: Written::default(),
             constraints: std::cell::RefCell::default(),
@@ -1013,13 +1021,27 @@ impl Executor {
             // is `22023` — a *parameter value* that is wrong, which is the code PostgreSQL uses
             // for this and not the `42704` an undefined object gets. `DEFAULT` puts the session
             // back to the role it connected as.
-            SessionStatement::SetSessionAuthorization(name) => {
+            SessionStatement::SetSessionAuthorization { name, local } => {
                 if let Some(role) = name {
                     let txn = self.backend.begin()?;
                     let known = crate::catalog::role_by_name(&*txn, role)?.is_some();
                     let _ = txn.rollback();
                     if !known {
                         return Err(SqlError::UndefinedRoleForAuthorization(role.clone()));
+                    }
+                }
+                // **`SET LOCAL` outside a block does nothing and warns**, which is what a real
+                // server does — there is no transaction for it to be local to.
+                if *local && self.open.is_none() {
+                    self.notice(SqlError::OutsideTransactionBlock("SET LOCAL"));
+                    return Ok(Outcome::done("SET"));
+                }
+                if *local {
+                    // What to put back when the transaction ends, remembered once: a second
+                    // `SET LOCAL` in the same block must not overwrite the session's own value
+                    // with the first one's.
+                    if self.authorization_before_block.is_none() {
+                        self.authorization_before_block = Some(self.authorization.clone());
                     }
                 }
                 self.authorization.clone_from(name);
@@ -1406,6 +1428,12 @@ impl Executor {
         );
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
+        }
+        // **A `SET LOCAL SESSION AUTHORIZATION` never outlives its transaction.** Carried on the
+        // restore `esker.read_as_of` already uses rather than on a new mechanism: one more field
+        // put back here, and one more on the savepoint mark so a `ROLLBACK TO` undoes it too.
+        if let Some(before) = self.authorization_before_block.take() {
+            self.authorization = before;
         }
     }
 
@@ -3481,8 +3509,12 @@ impl Execute for Executor {
             .as_ref()
             .map(|txn| txn.read_set())
             .unwrap_or_default();
-        self.savepoints
-            .savepoint(name, reads, self.parameters.clone());
+        self.savepoints.savepoint(
+            name,
+            reads,
+            self.authorization.clone(),
+            self.parameters.clone(),
+        );
         Ok(())
     }
 
@@ -3498,8 +3530,11 @@ impl Execute for Executor {
         self.open = Some(txn);
         // The parameters go back with the writes: a `SET` inside the savepoint is undone too.
         // Only on success — a `3B001` rolled nothing back and must change nothing.
-        let parameters = result?;
+        let (parameters, authorization) = result?;
         self.parameters = parameters;
+        // The session authorization goes back with them: a `SET LOCAL SESSION AUTHORIZATION`
+        // inside the mark is undone by a `ROLLBACK TO`, as every other `SET` in there is.
+        self.authorization = authorization;
         Ok(())
     }
 

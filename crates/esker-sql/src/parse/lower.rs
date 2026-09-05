@@ -1213,18 +1213,27 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
         // run 57's aborted-transaction row — every one of them in `schema_authorization_test.rb`,
         // whose `set_session_auth` sends `DEFAULT` between each named user.
         //
-        // `DEFAULT` asks for what is already the case and succeeds. Any *name* is
-        // `22023 role "x" does not exist`, which is true of every name here — and `22023` rather
-        // than the `42704` the same sentence takes for `CREATE DATABASE … OWNER`, because
-        // PostgreSQL reads an authorization name as a parameter value and an owner as an object.
-        // Measured, both. The file still needs `CREATE USER` to pass; what changes is that it now
-        // fails on the feature that is missing instead of aborting the transaction on this.
+        // **The name is carried, not judged.** It used to be refused here, unconditionally, with
+        // `22023 role "x" does not exist` — and the comment that stood here said that was "true of
+        // every name", which it was, on a node with no roles. Roles landed and it became a lie
+        // that no test could see: the session that had just created a role was told it does not
+        // exist, because the refusal is upstream of the catalog and never asks it (run 87).
+        //
+        // `22023` is still the answer for a name that is not a role, and still not the `42704` an
+        // undefined *object* gets — PostgreSQL reads an authorization name as a parameter value.
+        // Measured. What changed is who decides: `crate::exec` does, where the catalog is.
         Set::SetSessionAuthorization(param) => match &param.kind {
             SetSessionAuthorizationParamKind::Default => Ok(plan::Statement::Session(
-                plan::SessionStatement::SetSessionAuthorization(None),
+                plan::SessionStatement::SetSessionAuthorization {
+                    name: None,
+                    local: matches!(param.scope, ContextModifier::Local),
+                },
             )),
             SetSessionAuthorizationParamKind::User(name) => Ok(plan::Statement::Session(
-                plan::SessionStatement::SetSessionAuthorization(Some(ident(name))),
+                plan::SessionStatement::SetSessionAuthorization {
+                    name: Some(ident(name)),
+                    local: matches!(param.scope, ContextModifier::Local),
+                },
             )),
         },
         other => Err(SqlError::unsupported(set_feature_name(other))),
