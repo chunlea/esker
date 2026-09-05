@@ -564,10 +564,14 @@ impl Executor {
             }
             for key in &table.foreign_keys {
                 if key.name == name {
-                    // `DEFERRABLE` on a foreign key is recorded and changes nothing yet, so it
-                    // cannot be deferred either — and saying so is better than accepting a
-                    // `SET CONSTRAINTS` that would not defer it.
-                    return Ok(false);
+                    // **This said `false` with a comment explaining that `DEFERRABLE` on a
+                    // foreign key was recorded and did nothing yet.** It does something now — a
+                    // deferred key's check is registered and run at `COMMIT` — and `ALL` had
+                    // already been reaching it for as long as that was true, so the refusal was
+                    // only ever raised for the *named* form. Three of the five tests in
+                    // `deferred_constraints_test.rb` are that difference: Rails declares its
+                    // foreign keys `deferrable: :immediate` and names them.
+                    return Ok(key.deferrable);
                 }
             }
         }
@@ -644,9 +648,24 @@ impl Executor {
             return Ok(());
         }
         for name in names {
-            // **Not deferrable is an error and not a no-op**, even for `IMMEDIATE`, which would
-            // change nothing: PostgreSQL refuses the statement either way. Measured.
-            if !self.constraint_deferrable(txn, name)? {
+            // **`DEFERRED` on a non-deferrable constraint is an error; `IMMEDIATE` is not.**
+            //
+            // This refused both, with a comment saying PostgreSQL refuses either way and the word
+            // "measured" on it. The capture behind that comment
+            // (`captures/pg19_unique_constraint.txt`) has a `DEFERRED` row and no `IMMEDIATE` row,
+            // so the second half was an inference. Measured now, on one constraint, both ways:
+            //
+            // ```text
+            // SET CONSTRAINTS fk_plain IMMEDIATE   ->  SET CONSTRAINTS
+            // SET CONSTRAINTS fk_plain DEFERRED    ->  ERROR: constraint "fk_plain" is not deferrable
+            // ```
+            //
+            // Which follows from what the statement asks: a constraint that cannot be deferred is
+            // already immediate, so asking for immediate is asking for what is already true. The
+            // name must still **exist** either way, and `constraint_deferrable` raises `42704`
+            // for one that does not before this decides anything.
+            let deferrable = self.constraint_deferrable(txn, name)?;
+            if deferred && !deferrable {
                 return Err(SqlError::ConstraintNotDeferrable(name.clone()));
             }
             self.constraints
