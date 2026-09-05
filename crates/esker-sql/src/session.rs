@@ -37,12 +37,30 @@ pub struct Backend {
 pub struct Activity {
     /// The database it connected to, or empty before it has said.
     pub database: String,
-    /// The statement it is running, or `None` while it is idle — which is exactly the distinction
-    /// `pg_stat_activity` draws between `active` and `idle`.
+    /// The **last** statement this session ran, running or not.
+    ///
+    /// **Retained when it finishes, not cleared.** PostgreSQL keeps the text on an idle session and
+    /// this node used to empty it — measured side by side, and it is why a hunter looking for the
+    /// session *holding* a row lock found nothing: the holder is idle between statements, so its
+    /// `SELECT … FOR UPDATE` had been erased while the waiter's was still visible.
+    /// `WHERE query LIKE '% FOR UPDATE%'` matched the holder and the waiter on PG19 and only the
+    /// waiter here.
     pub query: Option<String>,
+    /// Whether that statement is running *now*, which is `active` against `idle`.
+    pub running: bool,
+    /// Whether the session is inside an open block, which is what makes `idle` into
+    /// `idle in transaction` — a distinction PostgreSQL draws and this node did not.
+    pub in_transaction: bool,
 }
 
 impl Backend {
+    /// Records whether this session is inside an open transaction block.
+    pub fn in_transaction(&self, open: bool) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.in_transaction = open;
+        }
+    }
+
     /// Records the database this session is on.
     pub fn on_database(&self, database: &str) {
         if let Ok(mut activity) = self.activity.lock() {
@@ -63,6 +81,7 @@ impl Backend {
     pub fn running(&self, sql: &str) -> Running {
         if let Ok(mut activity) = self.activity.lock() {
             activity.query = Some(sql.to_owned());
+            activity.running = true;
         }
         Running(Arc::clone(&self.activity))
     }
@@ -73,9 +92,11 @@ impl Backend {
 pub struct Running(Arc<Mutex<Activity>>);
 
 impl Drop for Running {
+    /// **Stops running; does not forget.** The text stays for `pg_stat_activity` to report on an
+    /// idle session, which is what a real server does.
     fn drop(&mut self) {
         if let Ok(mut activity) = self.0.lock() {
-            activity.query = None;
+            activity.running = false;
         }
     }
 }

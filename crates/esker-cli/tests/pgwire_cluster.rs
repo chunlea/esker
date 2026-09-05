@@ -60,7 +60,7 @@ fn a_client_runs_one_statement_against_a_real_cluster() {
     warm(esker_cli());
     warm(esker_sql());
 
-    let _cluster = Supervisor(
+    let mut cluster = Supervisor(
         Command::new(esker_cli())
             .args(["cluster", "start", "--nodes", "1", "--data-dir"])
             .arg(data_dir.path())
@@ -70,14 +70,10 @@ fn a_client_runs_one_statement_against_a_real_cluster() {
             .spawn()
             .expect("the cluster starts"),
     );
-    wait_for("the store to listen", STARTUP_SECONDS, || {
-        TcpStream::connect(("127.0.0.1", store_port)).is_ok()
-    });
-    wait_for("the driver to listen", STARTUP_SECONDS, || {
-        TcpStream::connect(("127.0.0.1", pd_port)).is_ok()
-    });
+    wait_for_port("the store", store_port, &mut cluster, STARTUP_SECONDS);
+    wait_for_port("the driver", pd_port, &mut cluster, STARTUP_SECONDS);
 
-    let _sql = Supervisor(
+    let mut sql = Supervisor(
         Command::new(esker_sql())
             .arg(format!("127.0.0.1:{sql_port}"))
             .arg(format!("127.0.0.1:{store_port}"))
@@ -87,9 +83,7 @@ fn a_client_runs_one_statement_against_a_real_cluster() {
             .spawn()
             .expect("`esker-sql` runs"),
     );
-    wait_for("the SQL node to listen", STARTUP_SECONDS, || {
-        TcpStream::connect(("127.0.0.1", sql_port)).is_ok()
-    });
+    wait_for_port("the SQL node", sql_port, &mut sql, STARTUP_SECONDS);
 
     // **The assertion is that a statement answers at all.** Before the fix the connection got its
     // whole startup burst — `AuthenticationOk`, the `ParameterStatus` run, `BackendKeyData`,
@@ -204,6 +198,21 @@ fn esker_cli() -> &'static str {
 /// here costs a no-op cargo invocation when it is fresh and makes the test unable to lie about
 /// which code it exercised.
 fn esker_sql() -> PathBuf {
+    if let Ok(given) = std::env::var("ESKER_SQL_BIN") {
+        return PathBuf::from(given);
+    }
+    let beside = Path::new(esker_cli())
+        .parent()
+        .expect("the test binary has a directory")
+        .join("esker-sql");
+    if beside.exists() && std::env::var("ESKER_TEST_FORCE_BUILD").is_err() {
+        return beside;
+    }
+    // **Only when it is genuinely absent.** Building from inside a test that the gate is running
+    // puts a second cargo against the gate's own and every other lane's, and this test failed at
+    // 191 s in a gate under load 200 doing exactly that. `run.sh` builds `--bins` before the tests
+    // now, so in a gate this branch is not taken at all.
+    eprintln!("building esker-sql: no binary at {}", beside.display());
     let built = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
         .args(["build", "-p", "esker-sql", "--bin", "esker-sql"])
         .stdout(Stdio::null())
@@ -211,12 +220,10 @@ fn esker_sql() -> PathBuf {
         .status();
     assert!(
         built.is_ok_and(|status| status.success()),
-        "the esker-sql binary must build before this test can drive it"
+        "no esker-sql binary at {} and building one failed",
+        beside.display()
     );
-    Path::new(esker_cli())
-        .parent()
-        .expect("the test binary has a directory")
-        .join("esker-sql")
+    beside
 }
 
 /// macOS evaluates a freshly linked binary on its first execution, at 0% CPU in `_dyld_start`, and
@@ -242,10 +249,27 @@ fn free_ports(span: u16) -> u16 {
     panic!("no run of {span} consecutive free ports");
 }
 
-fn wait_for(what: &str, seconds: u64, mut ready: impl FnMut() -> bool) {
+/// Waits for a port to accept, and **gives up early when the process that should open it has
+/// already exited**.
+///
+/// A bare deadline learns nothing from a child that died in its first second: it waits the whole
+/// budget and then reports a timeout, which reads as "the machine was slow" and is why this test
+/// spent 190 seconds in a gate before saying anything. A dead child is a different failure and
+/// deserves its own sentence, with the exit status that caused it.
+fn wait_for_port(what: &str, port: u16, child: &mut Supervisor, seconds: u64) {
     let deadline = Instant::now() + Duration::from_secs(seconds);
-    while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.0.try_wait() {
+            panic!("{what}: the process exited before it listened on {port} ({status})");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: nothing accepted on {port} within {seconds}s, and the process is still \
+             running — it is starved or wedged rather than dead"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
