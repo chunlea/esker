@@ -853,3 +853,85 @@ from a store's refusal at every call site that matches on the variant — and wh
 guarded on `owns(&start_key, &end_key, ..)` silently skip it, since the synthesised bounds are
 empty. Naming it separately is an `esker-proto` change and an ADR, and is the coordinator's to
 sequence — recorded here rather than improvised.
+
+## J13. A fragment answered from a copy that did not have the row — 2026-09-05
+
+`esker-sql::joint_gate the_learner_answers_fragments_that_agree_with_a_row_scan` failed in a gate at
+load ~13: the fragment answered 4 rows and the row scan 5. The fragment was missing `id 4`
+("barbara"). 3/3 green alone at 0.47–2.65 s, so a timing window rather than starvation — and a
+**wrong answer**, which is the failure this whole feature is built to not have.
+
+### What the dump says, and why it is not what it looks like
+
+```text
+min_apply_index  38
+store 4  leader=Some(false)  applied=Some(40)  columnar=true
+  id 4: 1 write records, reads as 19 bytes
+```
+
+Every store, **including the columnar learner**, holds `id 4` in its row store, and all four report
+`applied = 40`. So this is not a replica that is behind: the learner had the write. Its **columnar
+copy** did not, and the fragment was allowed to answer anyway.
+
+### The gate proves the wrong thing
+
+`esker-store`'s `Store::catch_up` establishes freshness like this:
+
+```rust
+let index = peer.read_index_as_learner().await?;   // returns once the STATE MACHINE has applied
+if peer.applied_index() >= min_apply_index { return None; }
+```
+
+Both are statements about the **row state machine**. The fragment is answered from the columnar
+copy, which is a different structure fed by `RaftPeer::tee_columnar` during apply. **Applied is not
+copied**, and nothing between the two is checked.
+
+The doc comment above `catch_up` is where the reasoning went — *"the freshness a fragment needs comes
+from the `ReadIndex` round itself, which returns only once the state machine has applied through the
+index it established"*. Every clause is true, and the conclusion does not follow: the state machine
+applying is not the copy holding.
+
+### The number the gate needs already exists
+
+`ColumnarApply::applied_index()` — *"the region apply index the **runs on disk** are complete to"*,
+the manifest claim from
+[ADR 0038](../adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md). Nothing consults
+it at fragment time. That is the whole of the first fix: compare **that** against the read index and
+`min_apply_index`, and refuse `TooFarBehind` when the copy is behind.
+
+With only that fix the query **falls back to the rows** instead of answering wrongly, which is the
+safety property and is worth having on its own even if the second fix takes longer.
+
+### Why the row was skipped rather than merely late — the hypothesis to confirm
+
+`tee_columnar` opens with:
+
+```rust
+let slot = self.columnar.as_ref()?;
+if !self.is_columnar_learner() { return None; }
+```
+
+and `is_columnar_learner()` reads the **region record**, which a peer only learns when the conf
+change naming it a learner applies. An entry committed while that is still `false` is applied to the
+row store and never teed. `entry_applied` is not called for it either, so the copy's own index stays
+behind — which is exactly why gating on the copy's index would have caught this and gating on the
+peer's did not.
+
+If that is confirmed, a gate alone leaves a copy permanently missing the row: it would refuse for
+ever rather than answer wrongly. **A gate that refuses for ever is not a copy**, so the tee needs
+closing too — either the role is known before apply, or the copy catches up from the log the way its
+open path already does.
+
+### How it is being reproduced
+
+**Deterministically, in `esker-store`, and not with a load arm.** The seam is: feed the region an
+entry while `is_columnar_learner()` is false, let the role apply, then ask a fragment. A stress loop
+would reproduce *a* timing window without saying which one; this pins the mechanism. Two red tests,
+because these are two defects — one for the gate, one for the tee.
+
+### What "fresh enough to answer" will mean
+
+The sentence the fix puts in `catch_up`'s doc: **a fragment is fresh enough when the columnar copy is
+complete through the read index — not when the row state machine is.** The `ReadIndex` round
+establishes what the region has committed; only the copy's own manifest index says what the copy can
+answer about.
