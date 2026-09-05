@@ -175,9 +175,16 @@ pub enum TxnCommand {
 impl TxnCommand {
     /// The command a request becomes, or `None` for one that changes nothing.
     ///
-    /// `Get`, `Scan`, `LatestCommit` and `GcSafepoint` answer `None`: the first three are reads —
-    /// `LatestCommit` asks what the store already knows and takes no lock (ADR 0067 §2) — and the
-    /// fourth is store-local (see this module's header).
+    /// `Get`, `Scan`, `LatestCommit`, `GcSafepoint` and `ReclaimRange` answer `None`: the first
+    /// three are reads — `LatestCommit` asks what the store already knows and takes no lock
+    /// (ADR 0067 §2) — and the last two are applied locally rather than through the log.
+    ///
+    /// **`ReclaimRange` writes, and still does not become a command.** It deletes the storage under
+    /// a range nothing can route to any more, which is housekeeping each replica does to its own
+    /// copy on its own schedule — the shape [ADR 0034](../../../docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md)
+    /// already uses for a retired region's range. Putting it through the log would make one
+    /// replica's compaction schedule the whole group's business, and would need a new
+    /// `Command` variant — a replicated format change — to say nothing more than this does.
     #[must_use]
     pub fn from_request(request: &TxnKvReq) -> Option<Self> {
         match request {
@@ -248,7 +255,8 @@ impl TxnCommand {
             TxnKvReq::Get { .. }
             | TxnKvReq::Scan { .. }
             | TxnKvReq::LatestCommit { .. }
-            | TxnKvReq::GcSafepoint { .. } => None,
+            | TxnKvReq::GcSafepoint { .. }
+            | TxnKvReq::ReclaimRange { .. } => None,
         }
     }
 

@@ -153,6 +153,15 @@ pub enum Method {
     /// `TxnWrite` variant: it answers what the store already computes for its own prewrite check,
     /// so that a waiter can tell a stale value from a fresh one instead of guessing.
     TxnLatestCommit = 0x0209,
+    /// `TxnKv::ReclaimRange` — clear the storage under a key range whose owner has been dropped
+    /// ([ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    ///
+    /// **Not a delete.** Nothing routes into a dropped database's key space, so this resolves no
+    /// versions and takes no locks: it clears the range physically, which is sound only below the
+    /// garbage-collection safepoint. A store refuses until its own safepoint has reached the
+    /// drop's commit timestamp, which is why that timestamp is on the request rather than left to
+    /// the caller's timing.
+    TxnReclaimRange = 0x020A,
 
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
     /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
@@ -199,7 +208,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -233,6 +242,7 @@ impl Method {
         Self::TxnHeartbeat,
         Self::TxnGcSafepoint,
         Self::TxnLatestCommit,
+        Self::TxnReclaimRange,
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
@@ -285,6 +295,7 @@ impl Method {
             0x0207 => Some(Self::TxnHeartbeat),
             0x0208 => Some(Self::TxnGcSafepoint),
             0x0209 => Some(Self::TxnLatestCommit),
+            0x020A => Some(Self::TxnReclaimRange),
             0x0501 => Some(Self::AdminSplit),
             0x0502 => Some(Self::AdminTransferLeader),
             0x0503 => Some(Self::AdminRegions),
@@ -350,6 +361,7 @@ impl Method {
             Self::TxnHeartbeat => "TxnKv::Heartbeat",
             Self::TxnGcSafepoint => "TxnKv::GcSafepoint",
             Self::TxnLatestCommit => "TxnKv::LatestCommit",
+            Self::TxnReclaimRange => "TxnKv::ReclaimRange",
         }
     }
 
@@ -378,6 +390,9 @@ impl Method {
                 | Self::TxnResolveLock
                 | Self::TxnHeartbeat
                 | Self::TxnGcSafepoint
+                // It deletes data. That it deletes it by range rather than key by key does not
+                // make it a read.
+                | Self::TxnReclaimRange
         )
     }
 
@@ -1593,7 +1608,8 @@ mod tests {
                 | Method::TxnResolveLock
                 | Method::TxnHeartbeat
                 | Method::TxnGcSafepoint
-                | Method::TxnLatestCommit => SERVICE_TXN_KV,
+                | Method::TxnLatestCommit
+                | Method::TxnReclaimRange => SERVICE_TXN_KV,
                 Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
                 Method::SchemaFetch => crate::messages::SERVICE_SCHEMA,
                 _ => SERVICE_RAW_KV,
@@ -1625,7 +1641,12 @@ mod tests {
 
     #[test]
     fn an_unknown_method_is_an_error_not_a_skipped_frame() {
-        for tag in [0x0000u16, 0x0109, 0x0200, 0xFFFF] {
+        // **`0x020B` is the first code this service has not issued**, and keeping the first
+        // *unused* one here is what makes this a test about an older peer meeting a newer method
+        // rather than a test about four numbers that were free the day it was written. Every
+        // method added to a service takes one of these boundaries away, so the next one replaces
+        // it — `0x020A` was in this list until `TxnKv::ReclaimRange` claimed it.
+        for tag in [0x0000u16, 0x0109, 0x0200, 0x020B, 0xFFFF] {
             assert_eq!(Method::from_u16(tag), None, "{tag:#06x}");
             assert!(Request::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");
             assert!(Response::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");

@@ -235,7 +235,12 @@ pub fn txn_request_range(request: &esker_proto::TxnKvReq) -> (Bytes, Bytes) {
         TxnKvReq::Get { key, .. } | TxnKvReq::LatestCommit { key } => {
             (Bytes::copy_from_slice(key), successor(key))
         }
-        TxnKvReq::Scan { start, end, .. } => (start.clone(), end.clone()),
+        // The span each names. A scan reads it; a reclaim clears it. Either way the epoch is
+        // checked against this range and the store serves only its own share of it
+        // (`CLAUDE.md` invariant 5, ADR 0069).
+        TxnKvReq::Scan { start, end, .. } | TxnKvReq::ReclaimRange { start, end, .. } => {
+            (start.clone(), end.clone())
+        }
         TxnKvReq::Prewrite { mutations, .. } => {
             span(mutations.iter().map(|mutation| &mutation.key()[..]))
         }
