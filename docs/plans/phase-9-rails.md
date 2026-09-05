@@ -1694,6 +1694,14 @@ Written 2026-09-05 at the coordinator's request, as the input to a decision that
 **implement trigger execution for the corpus's shapes, or refuse `CREATE TRIGGER` by name.** No
 code was written for this; every line below is measured.
 
+> **Decided 2026-09-05 by the user: neither. The status quo stands** — `CREATE FUNCTION` and
+> `CREATE TRIGGER` are accepted into the catalog, bodies are never run, and the difference is a
+> declared divergence. The census is what settled it: the naive count says ten tests touch a
+> trigger and the measured count of tests that can *tell whether a body ran* is **one**, while
+> refusing `CREATE TRIGGER` by name would abort the schema load and cost the whole suite. A
+> plpgsql interpreter is a phase and is not scheduled. The two sections below are kept as the
+> record of what was weighed, not as open options.
+
 ### What exists today
 
 `CREATE FUNCTION … LANGUAGE plpgsql` and `CREATE TRIGGER` are both **accepted and recorded** — the
