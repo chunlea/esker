@@ -94,7 +94,7 @@ impl FragmentSource for ClientFragments {
     /// Flipping it to `true` is what retires the guard, and what proves the flip is
     /// `crates/esker-cli/tests/multi_region_differential.rs` going green.
     fn runs_are_region_scoped(&self) -> bool {
-        false
+        true
     }
 
     fn shards(&self, start: &[u8], end: &[u8]) -> Result<Vec<Shard>> {
