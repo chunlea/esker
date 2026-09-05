@@ -1,0 +1,14 @@
+docs/plans/split-region.md
+  h_44076b318daf9c 1-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "637e6b40ad1a9799323b2a0f9a5df3542c2fbc12",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
