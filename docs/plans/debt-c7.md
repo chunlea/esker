@@ -1190,3 +1190,70 @@ worth running rather than assumed.
 verdict.** §18 replaced a stopwatch on an event with a wait on the event and left the negative
 proof's clock untouched; §22 moved a *bound* that had displaced the two budgets documented as
 owning the decision, and neither of those moved. Both are number changes and both say so.
+
+## 24. The leaderless region, as a reproduction rather than a report
+
+§19 found it, §20 and §21 met it again from two other crates, and it is not this lane's to fix.
+What follows is written to be lifted whole into whoever's brief takes it, because a debt handed over
+as a description costs its next owner the discovery a second time.
+
+### The claim
+
+**A region can sit with no leader, and no peer even believing another peer has it, for 90 seconds
+under load.** Every peer answers `is_leader=false` and `leader=None` simultaneously. Writes to that
+range cannot proceed for as long as it lasts.
+
+Not invariant 1: nothing acknowledged is lost, because nothing is acknowledged. It is liveness.
+`esker-store::balance regions_reach_a_store_that_joins_and_none_is_left_without_a_leader` is the
+test whose whole subject is that this must not happen.
+
+### Three independent sightings, three crates, three paths to the same state
+
+| where | what it printed | when |
+|---|---|---|
+| `esker-store::promotion` | `store 1/2/3: peer of region 77, is_leader=false, believes leader=None` after 90 s | 2026-09-04, arm at 14 threads, run 1 |
+| `esker-store::snapshot` | `last asked store 2, whose peer says leader=Some(None)` after 3689 probes in 30 s | same day, gate at load 86–115 |
+| `esker-client` router | `RetriesExhausted { attempts: 9, source: NotLeader { region_id: 2, leader_hint: None } }` | same day, arm at 14 threads |
+
+`Some(None)` and `leader_hint: None` are the same fact reached by different code: a peer exists,
+and it knows of no leader. Three crates arriving independently is what makes this a store finding
+rather than three test flakes.
+
+### How to reproduce it, cheaply
+
+```
+14 busy threads on the host, then, in the Linux container:
+  cargo test -p esker-store --test promotion \
+      a_learner_on_a_fresh_store_becomes_a_voter_under_load -- --exact
+```
+
+Budget it **above 600 s**. The test's own deadlines are `PROMOTION_DEADLINE` 30 s, `put` 90 s, the
+split wait 60 s and the watch loop 180 s; an outer cap of 300 s fires first and destroys the
+diagnosis, which is exactly what happened here for a full day (§15). Observed rate at 14 threads:
+**2 of 4**, and **1 of 1** on the next arm. Region 77 was created by the test's own load splitting,
+so a freshly split range is the likely neighbourhood.
+
+### What the instrument now prints, and how to read it
+
+`promotion.rs`'s `put` no longer says only `the last refusal was: None`. Per store it prints
+`term`, `is_leader`, `believes_leader`, the Raft `role`, `voted_for`, and the region's full
+membership with each member's Voter/Learner role. Three readings, and the next occurrence picks one
+without another arm:
+
+* every peer **Follower** — nobody campaigns; election timers are being reset, or ticks are not
+  arriving. Look at the tick path under starvation.
+* every peer **Candidate** — campaigning and losing repeatedly. Look at randomised timeouts and at
+  whether votes are being delivered at all.
+* membership shows **no Voters** (all learners) — no election is *possible*; look at the split's
+  conf state and at when a new range's peers are promoted.
+
+### What has already been ruled out, so nobody repeats it
+
+* **Not routing.** All three stores held region 77 and had a peer of it; the two "no region for this
+  key" and "no peer of it" gates were both passed.
+* **Not the test's store group.** `put` was given all three stores.
+* **Not the redirect guard of §14.** It fires when a hint points *outside* the group, and there is
+  no hint at all when no peer knows a leader. `put` spending its deadline against a region that
+  cannot answer is correct behaviour, not a test defect.
+* **Not a budget.** Raising any of the four deadlines above changes nothing about a region that has
+  no leader; it only changes how long the test waits before saying so.
