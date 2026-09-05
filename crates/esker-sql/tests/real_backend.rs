@@ -804,3 +804,51 @@ fn a_re_created_sequence_starts_at_one_under_concurrency() {
         advanced.join("\n")
     );
 }
+
+/// **The schema change and the insert on two different connections**, which is the one thing
+/// r1's resetting cycles did not have.
+///
+/// Run 86's whole-file trace: the created id is exactly `1 + 32 * (k - 1)` for the k-th test —
+/// one whole block per `create_table force: true`, and the counter never returns to 1. r1's own
+/// twenty cycles of the identical DDL reset correctly every time, and they ran on **one
+/// connection**; `ActiveRecord` runs the file through a pool, so the `DROP`/`CREATE` and the
+/// `INSERT` need not be the same session.
+///
+/// So this is that repro, deterministic rather than concurrent: `ddl` re-creates the table and
+/// `writer` — a different session, with its own catalog cache and its own view of which sequence
+/// the table has — does the insert. PostgreSQL answers 1 every round.
+#[test]
+fn a_second_connection_sees_the_re_created_sequence_start_over() {
+    let cluster = Cluster::start();
+    let mut ddl = cluster.session();
+    let mut writer = cluster.session();
+
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ddl.run("DROP TABLE IF EXISTS two_conn").unwrap();
+        ddl.run("CREATE TABLE two_conn (id bigserial PRIMARY KEY, v int8)")
+            .unwrap();
+        // The five explicit-id fixtures the file inserts before its `create!`, which must leave
+        // the sequence alone.
+        for id in 101..=105 {
+            ddl.run(&format!("INSERT INTO two_conn (id, v) VALUES ({id}, 0)"))
+                .unwrap();
+        }
+        let created = writer.rows("INSERT INTO two_conn (v) VALUES (1) RETURNING id");
+        ids.push(
+            created
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .flatten()
+                .unwrap_or_default(),
+        );
+    }
+
+    assert_eq!(
+        ids,
+        ["1", "1", "1", "1"],
+        "a re-created sequence handed a second connection a value from the old run — this is the \
+         file's `1, 33, 65, 97`"
+    );
+}
