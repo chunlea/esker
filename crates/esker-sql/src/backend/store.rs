@@ -425,6 +425,42 @@ impl Txn for StoreTxn {
         }
     }
 
+    fn buffered(&self, key: &[u8]) -> crate::backend::Buffered {
+        // A transaction that has already ended buffers nothing, which is also the honest answer.
+        self.inner.as_ref().and_then(|txn| txn.buffered(key))
+    }
+
+    fn restore(&mut self, key: &[u8], prior: crate::backend::Buffered) {
+        if let Some(txn) = self.open_mut() {
+            txn.restore(key, prior);
+        }
+    }
+
+    fn holds(&self, key: &[u8]) -> bool {
+        self.held.iter().any(|held| held == key)
+    }
+
+    fn unlock(&mut self, key: &[u8]) {
+        self.held.retain(|held| held != key);
+        // A poisoned table is ignored rather than panicked on, the same as `release`: the process
+        // is already in trouble and a panic here would take it down for a lock it is giving away.
+        if let Ok(mut locks) = self.locks.lock() {
+            locks.release(self.id, &[key.to_vec()]);
+        }
+    }
+
+    fn read_set(&self) -> crate::backend::ReadSet {
+        crate::backend::ReadSet {
+            keys: self.read_keys.borrow().clone(),
+            ranges: self.read_ranges.borrow().clone(),
+        }
+    }
+
+    fn restore_read_set(&mut self, set: crate::backend::ReadSet) {
+        *self.read_keys.borrow_mut() = set.keys;
+        *self.read_ranges.borrow_mut() = set.ranges;
+    }
+
     fn commit(mut self: Box<Self>) -> Result<Option<u64>> {
         // **The read set is handed over here, at the last moment**, because a transaction records
         // right up to its commit and the client only needs it once (ADR 0062 §1).

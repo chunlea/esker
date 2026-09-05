@@ -262,6 +262,22 @@ impl Session {
                     self.executor.rollback()?;
                     Outcome::done("ROLLBACK")
                 }
+                // Savepoints go the same way and for the same reason: `pgwire::session` routes
+                // them to the executor's own methods, so a harness that sent them to `execute`
+                // got `FeatureNotSupported("SAVEPOINT")` — a gap in the harness that reads exactly
+                // like the server refusing a statement it in fact serves.
+                StatementClass::Savepoint(name) => {
+                    self.executor.savepoint(name)?;
+                    Outcome::done("SAVEPOINT")
+                }
+                StatementClass::RollbackTo(name) => {
+                    self.executor.rollback_to(name)?;
+                    Outcome::done("ROLLBACK")
+                }
+                StatementClass::Release(name) => {
+                    self.executor.release(name)?;
+                    Outcome::done("RELEASE")
+                }
                 _ => self.executor.execute(&parsed, &Params::NONE)?,
             };
         }
