@@ -578,3 +578,84 @@ fn consecutive_serial_ids_are_consecutive() {
         "a pooled client on one node sees one consecutive run, not a block per connection"
     );
 }
+
+/// **`range_test.rb`'s own shape**, 46 rounds of it, on a real cluster through a pool.
+///
+/// The residual after ADR 0072. r1's two measured endpoints from run 85 disagree with the three
+/// tests above, and this is the one that decides between them: in isolation their replay of the
+/// file's `setup` plus the five explicit-id fixtures answered **2** for the next
+/// `INSERT … RETURNING id`, and inside the file `PostgresqlRange.first` returns the id=101 fixture
+/// — so by `test_infinity_values` the created id has climbed **above 101**, which 46 rounds of one
+/// created row each cannot do unless something carries across a round.
+///
+/// So the round here is the file's, not a convenient one:
+///
+/// * `create_table force: true` is `DROP TABLE IF EXISTS` **then** `CREATE TABLE`, at the *start*
+///   of the round — the last round's table is left behind, which is what the next round drops;
+/// * the five fixtures carry **explicit** ids 101-105, which on a real server do not advance the
+///   sequence at all;
+/// * the created row is an `INSERT … RETURNING id`, and it is the returned value that is asserted
+///   rather than `min(id)` — a round that returns 2 is a failure the lowest-id check would miss,
+///   because 2 is still below 101;
+/// * the connection **rotates** through a pool of five, which is `ActiveRecord`'s default and the
+///   reason a per-connection block was visible at all.
+///
+/// Both halves match 19beta1: **1** every round, and **106** once `reset_pk_sequence!` has run.
+/// So the id cannot climb past 101 by this route, and the created row being above the fixtures is
+/// not what separates the two servers — PostgreSQL is above them too.
+#[test]
+fn the_range_files_own_round_gives_the_ids_postgresql_gives() {
+    let cluster = Cluster::start();
+    let mut ddl = cluster.session();
+    let mut pool: Vec<_> = (0..5).map(|_| cluster.session()).collect();
+
+    let mut returned = Vec::new();
+    for round in 0..46 {
+        ddl.run("DROP TABLE IF EXISTS postgresql_ranges").unwrap();
+        ddl.run("CREATE TABLE postgresql_ranges (id bigserial PRIMARY KEY, note text)")
+            .unwrap();
+        for id in 101..=105 {
+            ddl.run(&format!(
+                "INSERT INTO postgresql_ranges (id, note) VALUES ({id}, 'fixture')"
+            ))
+            .unwrap();
+        }
+        let at = round % pool.len();
+        let writer = &mut pool[at];
+        let created =
+            writer.rows("INSERT INTO postgresql_ranges (note) VALUES ('created') RETURNING id");
+        returned.push(created);
+
+        // **And the same round with the step `ActiveRecord` actually takes between them.**
+        // `reset_pk_sequence!` runs on every fixture load and sends
+        // `setval(pg_get_serial_sequence(…), max(id) + 1, false)`, which on 19beta1 makes the next
+        // created id **106** and `PostgresqlRange.first` return the id=101 fixture — measured.
+        // That is the condition run 85 read as the failure, and PostgreSQL is in it too, so a
+        // created row above the fixtures cannot be what separates the two servers.
+        // `reset_pk_sequence!` reads the maximum in a **separate** query and interpolates it as
+        // a literal, so this is two statements and not a subquery — `postgresql/schema_statements`
+        // builds `SELECT setval('…', <max>, true)`.
+        let max_pk = ddl.rows("SELECT MAX(id) FROM postgresql_ranges");
+        assert_eq!(max_pk, [[Some("105".to_owned())]], "round {round}");
+        // The **name is resolved in its own query too** (`pk_and_sequence_for`) and comes back
+        // quoted and schema-qualified, which is the spelling `crate::exec` already carries a
+        // regression test for.
+        ddl.run("SELECT setval('\"public\".\"postgresql_ranges_id_seq\"', 105, true)")
+            .unwrap();
+        let after_reset =
+            writer.rows("INSERT INTO postgresql_ranges (note) VALUES ('reset') RETURNING id");
+        assert_eq!(
+            after_reset,
+            [[Some("106".to_owned())]],
+            "round {round}: after reset_pk_sequence! the next id is max(id) + 1, as on 19beta1"
+        );
+    }
+
+    let ones: Vec<Vec<Vec<Option<String>>>> =
+        (0..46).map(|_| vec![vec![Some("1".to_owned())]]).collect();
+    assert_eq!(
+        returned, ones,
+        "every round re-creates the table, so every created id is 1 — an id above 101 is what \
+         makes `PostgresqlRange.first` return a fixture"
+    );
+}
