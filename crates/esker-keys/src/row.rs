@@ -938,8 +938,6 @@ fn decode_key_text(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     let text = text_from_utf8(&body)?;
     Ok(match ty {
         ColumnType::Citext => (Datum::Citext(text), rest),
-        ColumnType::TsVector => (Datum::TsVector(text), rest),
-        ColumnType::TsQuery => (Datum::TsQuery(text), rest),
         // The rewrite above, undone: the key is the value with its separators lowered, and
         // nothing else, so the value comes straight back out of it.
         ColumnType::Ltree => (Datum::Ltree(text.replace(LTREE_KEY_SEPARATOR, ".")), rest),
@@ -1116,6 +1114,11 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Point
             | ColumnType::Hstore
             | ColumnType::HstoreArray
+            // Their order is not their text's; see `decode_key_column`.
+            | ColumnType::TsVector
+            | ColumnType::TsQuery
+            | ColumnType::TsVectorArray
+            | ColumnType::TsQueryArray
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::TsRange
@@ -1174,9 +1177,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::CidrArray
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
-        | ColumnType::VarBitArray
-        | ColumnType::TsVectorArray
-        | ColumnType::TsQueryArray => return decode_key_array(ty, bytes),
+        | ColumnType::VarBitArray => return decode_key_array(ty, bytes),
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)
@@ -1342,6 +1343,16 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Point
         | ColumnType::Hstore
         | ColumnType::HstoreArray
+        // **A tsvector's order is not its text's**, which is the whole reason it is here.
+        // Measured on 19beta1: `'b'` sorts before `'ab'` and `'a':1A` before `'a':1`, where plain
+        // bytes give the reverse of both — PostgreSQL orders by lexeme *length* then bytes, then
+        // by positions. Its **equality** is still its canonical text's, which is what makes this
+        // the inverse of `jsonb`: that one cannot be a key because equal values differ in bytes,
+        // this one because ordered values differ in order.
+        | ColumnType::TsVector
+        | ColumnType::TsQuery
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::TsRange
@@ -1360,17 +1371,10 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Polygon
         | ColumnType::Circle
         | ColumnType::Line => Err(not_a_key())?,
-        // **A tsvector and a tsquery are index keys**, and the oracle is what says so:
-        // `tsvector_ops` and `tsquery_ops` are btree operator classes on a real server, where
-        // `hstore` has none — which is the same question the geometric shapes above are refused by.
-        // Their comparison is their canonical text's (ADR 0066), so the text key encoding is
-        // already the right one.
         ColumnType::Text
         | ColumnType::Varchar
         | ColumnType::Bpchar
         | ColumnType::Citext
-        | ColumnType::TsVector
-        | ColumnType::TsQuery
         | ColumnType::Ltree => {
             return decode_key_text(ty, bytes);
         }
