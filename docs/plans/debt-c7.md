@@ -751,3 +751,60 @@ The same test passed at 13.550 s in g1's gate and at 10.132 s in this lane's cra
 measurement needs a budget **above the sum of the test's own deadlines** (600 s), so that whatever
 fires is the test's own assertion with the leader's `matched/next/is_learner/pending_snapshot`
 attached. Recorded as open, and deliberately not called a sighting: nothing has failed yet.
+
+## 16. One test, three mechanisms, one assumed precondition
+
+`a_snapshot_replacing_a_held_region_routes_through_a_retire` failed in **three of four gates** on
+2026-09-04 and became the most frequent red on the machine — at 35.854 s, at 61.508 s with no load
+arm running at all, and at 60.957 s in this lane's own gate **with §14's fix already in**. Three
+failures, two different panic sites, one root.
+
+`announce_a_snapshot_and_await_the_retire` reads `first` as the leader throughout: it measures the
+gap against `first`'s applied index, and it sends the announcement from peer 1 with `first`'s term.
+That premise is true when the helper is written and false as soon as `AddPeer`'s learner is
+promoted — the region then has two voters, and a two-voter group on a box that will not schedule
+its threads elects the other one, which this file's own `put` doc records as fifteen times in
+twenty runs.
+
+Nothing held the premise. Depending on *when* the office moves, it breaks in three places:
+
+| when the office moves | what fails | how it looked |
+|---|---|---|
+| during the 40..60 write loop | `put` re-asks a follower for 30 s | `9046 attempts in 30.000411395s` (§14) |
+| before the gap is measured | `old` is the *leader*, so it is never behind `leader`, and the gap never appears | `timed out after 60s waiting for a gap between the learner's applied index and the leader's` |
+| between the gap and the announcement | `receive_raft`'s held-region branch is guarded by **`!peer.is_leader()`**, so an announcement aimed at the peer that now leads is correctly ignored | `timed out after 60s waiting for the old peer to be retired` |
+
+The third is the one the store is *right* about: a leader does not accept a snapshot aimed at it.
+The test was wrong to send one.
+
+### Why §14's fix moved the symptom rather than removing it
+
+§14 gave the write loop both stores, so writes now succeed after an election instead of
+livelocking. The helper therefore no longer dies at 30 s — it proceeds, with a premise that is
+still false, and dies at 60 s further on. That is why this lane's gate, holding the §14 fix, still
+lost the test: **fixing one face of an assumed precondition promotes the next face.**
+
+### The fix
+
+The helper holds its own premise rather than assuming it: if store 1 is not leading when the helper
+starts, the office is transferred back to peer 1 and waited for. Immediately before `receive_raft`
+the premise is asserted again, so a future race says *"the office moved to the peer this
+announcement is aimed at"* at once instead of sixty seconds of silence.
+
+`a_held_region_is_retired_even_after_the_office_has_moved` drives the adverse state on purpose —
+wait for peer 2's promotion to Voter, `TransferLeader` to it, then run the scenario. The setup both
+retire tests need is extracted into `a_second_store_holding_region_one`.
+
+**Red first, no load at all:** 60.74 s, `timed out after 60s waiting for a gap between the
+learner's applied index and the leader's`. Green: both retire tests in **0.89 s**, `esker-store`
+319/319, clippy clean.
+
+### The general shape
+
+A learner cannot hold the office, so the first attempt at this test could not move it and failed
+with `timed out waiting for the second store to lead` — the promotion to Voter is the precondition
+of the precondition. Driving a case means establishing every step of it, and the gates reached this
+state only because their write loop ran long enough for PD to promote the learner first.
+
+Three of the eight sightings in this wave now have the same shape: **a test whose premise is
+established once and then assumed to hold.** Still nothing fixed by changing a budget.
