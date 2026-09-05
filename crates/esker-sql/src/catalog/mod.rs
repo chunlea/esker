@@ -3156,7 +3156,10 @@ pub fn create_role(txn: &mut dyn Txn, name: &str, can_login: bool) -> Result<()>
         None => FIRST_ROLE_OID,
     };
     txn.put(&record::next_role_key(), &record::encode_schema(next + 1));
-    txn.put(&record::role_key(name), &record::encode_role(next, can_login));
+    txn.put(
+        &record::role_key(name),
+        &record::encode_role(next, can_login),
+    );
     bump_version(txn)
 }
 

@@ -35,10 +35,10 @@ pub use ddl::{
     AlterTypeAction, Column, ColumnDefault, Comment, CommentObject, CreateDatabase,
     CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateRole, CreateSchema,
     CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
-    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole, DropSchema, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart, KeyPartName,
-    PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint, foreign_key_name,
-    index_name, primary_key_name, sequence_name, unique_constraint_name,
+    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole, DropSchema,
+    DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
+    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
+    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{
