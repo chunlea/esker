@@ -68,6 +68,31 @@ const DAYS: u64 = 365;
 /// of the join here is the *outer* side's size.
 const DIM_ROWS: u64 = 200_000;
 
+/// How many buckets [`DIM`] rows are spread over, and which one the join selects.
+///
+/// **Named rather than written twice.** The loader assigns `k % DIM_BUCKETS` and the join filters
+/// on one of them; while those were the literals `8` and `3` in separate places, nothing connected
+/// the data to the query and nothing could compute how many keys the join's inner side has.
+/// [`join_inner_keys`] can, which is what lets the expectation be derived instead of asserted.
+const DIM_BUCKETS: u64 = 8;
+
+/// The bucket the join's `WHERE` keeps. See [`DIM_BUCKETS`].
+const JOIN_BUCKET: u64 = 3;
+
+/// How many keys the join's inner side yields — the size the semi-join push-down is bounded by.
+///
+/// `dim` holds one row per high-cardinality group (capped at [`DIM_ROWS`]) and the join keeps one
+/// bucket of them, so this counts `k` in `0..dim_rows` with `k % DIM_BUCKETS == JOIN_BUCKET`.
+/// Against `esker_columnar::fragment::MAX_IN_VALUES` it says whether the rewrite can express this
+/// join at all: 500 keys at `--groups-high 4000` (it can), 12,500 at the default 100,000 (it
+/// cannot, and the planner refuses in as many words).
+pub(crate) fn join_inner_keys(shape: Shape) -> u64 {
+    shape
+        .dim_rows()
+        .saturating_sub(JOIN_BUCKET)
+        .div_ceil(DIM_BUCKETS)
+}
+
 /// The day the control's filter keeps rows below, which is about four fifths of them.
 ///
 /// A filter that kept everything would be pruned away by nothing and would measure a bare scan;
@@ -138,7 +163,7 @@ pub(crate) fn load(pg: &mut Pg, shape: Shape) -> Result<u64, String> {
             if row > key {
                 sql.push(',');
             }
-            let _ = write!(sql, "({row},{},'dim-{row}')", row % 8);
+            let _ = write!(sql, "({row},{},'dim-{row}')", row % DIM_BUCKETS);
         }
         pg.run(&sql)?;
         statements += 1;
@@ -232,19 +257,26 @@ pub(crate) struct Query {
     pub(crate) expected_rows: u64,
     /// Whether this shape can reach the columnar path at all.
     ///
-    /// It read `false` for the join, on the grounds that [ADR 0040](../../../../docs/adr/0040-the-engine-a-query-runs-on.md)
-    /// Decision 4 substitutes exactly one plan shape, `Aggregate { [Filter] { SeqScan } }`, so a
-    /// join had no fragment to be pushed into. That stopped being true when the semi-join
-    /// push-down landed, and the stale `false` was worse than a wrong comment: it made the
-    /// assertion in `mod.rs` *require* the join to be on rows, so the join arm measured the row
-    /// engine twice and the run stayed green while doing it.
+    /// **Derived, never declared** — for the aggregates it is a constant `true`, and for the join
+    /// it is computed from [`join_inner_keys`] against
+    /// `esker_columnar::fragment::MAX_IN_VALUES`.
     ///
-    /// Measured 2026-09-05: the join reaches the columnar path when its inner side fits in a
-    /// fragment. At the default `--groups-high`, it does not — `dim` holds one row per
-    /// high-cardinality group, so `bucket = 3` selects far more keys than
-    /// `esker_columnar::fragment::MAX_IN_VALUES` (4,096) and the planner refuses with *"a join
-    /// whose inner side has more keys than a fragment carries"*. That is the bound working, not a
-    /// fault, and it is why the join is measured with `--groups-high` below the cap.
+    /// It was a hand-written `false` for the join, on the grounds that
+    /// [ADR 0040](../../../../docs/adr/0040-the-engine-a-query-runs-on.md) Decision 4 substitutes
+    /// exactly one plan shape, `Aggregate { [Filter] { SeqScan } }`, so a join had no fragment to
+    /// be pushed into. True when written, and falsified by the semi-join push-down.
+    ///
+    /// The stale `false` was worse than a wrong comment, because this field does not *permit* an
+    /// engine, it **requires** one: `mod.rs` asserts `must_be_columnar == (engine == "columnar")`.
+    /// So the join arm ran on rows, the assertion demanded rows, and a comparison of the row engine
+    /// against itself was published as a join measurement — green
+    /// (`docs/bench/mpp-baseline.md` §11d).
+    ///
+    /// Flipping it to a hand-written `true` only moved the trap: every run at the default
+    /// `--groups-high` then aborted, because `dim` holds one row per high-cardinality group and one
+    /// bucket of 100,000 is 12,500 keys, far past the 4,096 a fragment carries. Both spellings are
+    /// right for one configuration and wrong for the other, which is what makes a constant the
+    /// wrong shape here. The bound decides, and the bound is imported rather than copied.
     pub(crate) columnar_is_possible: bool,
 }
 
@@ -277,10 +309,14 @@ pub(crate) fn queries(shape: Shape) -> Vec<Query> {
             kind: Kind::Join,
             sql: format!(
                 "SELECT count(*) FROM {FACT} JOIN {DIM} ON {FACT}.ghigh = {DIM}.k \
-                 WHERE {DIM}.bucket = 3"
+                 WHERE {DIM}.bucket = {JOIN_BUCKET}"
             ),
             expected_rows: 1,
-            columnar_is_possible: true,
+            // The whole point of the field: at `--groups-high 4000` this is 500 keys and the join
+            // routes; at the default 100,000 it is 12,500 and the planner refuses. Both are
+            // correct, and the run asserts whichever one this configuration earns.
+            columnar_is_possible: join_inner_keys(shape)
+                <= esker_columnar::fragment::MAX_IN_VALUES as u64,
         },
     ]
 }
@@ -314,7 +350,7 @@ pub(crate) fn diagnostics(shape: Shape) -> Vec<(&'static str, String)> {
             "join, semi-join shape",
             format!(
                 "SELECT count(*) FROM {FACT} JOIN {DIM} ON {FACT}.ghigh = {DIM}.k \
-                 WHERE {DIM}.bucket = 3"
+                 WHERE {DIM}.bucket = {JOIN_BUCKET}"
             ),
         ),
         // A point read and a bounded range are never routed (ADR 0022 rule 1); they are here
@@ -356,7 +392,7 @@ pub(crate) fn diagnostics(shape: Shape) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GROUPS_LOW, Kind, Shape, payload, queries};
+    use super::{GROUPS_LOW, Kind, Shape, join_inner_keys, payload, queries};
 
     fn shape() -> Shape {
         Shape {
@@ -365,6 +401,43 @@ mod tests {
             batch: 10,
             seed: 7,
         }
+    }
+
+    /// The join expects whichever engine its inner side earns, in **both** directions.
+    ///
+    /// This is the test the field's own history asks for. A hand-written `false` made the join arm
+    /// assert the row engine after the push-down had landed, so a row-versus-row comparison was
+    /// published as a join measurement and stayed green (`docs/bench/mpp-baseline.md` §11d);
+    /// flipping it to a hand-written `true` only moved the trap, aborting every run at the default
+    /// `--groups-high`. A constant is right for one configuration and wrong for the other, so the
+    /// assertion has to check both — a test that only ran the small case would have passed against
+    /// the `true` that broke the default.
+    #[test]
+    fn the_join_expects_whichever_engine_its_inner_side_earns() {
+        let expects_columnar = |groups_high| {
+            let shape = Shape {
+                groups_high,
+                ..shape()
+            };
+            let join = queries(shape)
+                .into_iter()
+                .find(|query| query.kind == Kind::Join)
+                .expect("the workload has a join");
+            (join_inner_keys(shape), join.columnar_is_possible)
+        };
+
+        // 4,000 groups is 500 keys in one bucket of eight, under the 4,096 a fragment carries.
+        assert_eq!(expects_columnar(4_000), (500, true));
+        // The shipped default is 12,500, past it — the planner refuses and the run must expect
+        // rows rather than call the refusal a fault.
+        assert_eq!(expects_columnar(100_000), (12_500, false));
+        // The boundary itself, from both sides: a fragment carries exactly MAX_IN_VALUES.
+        assert_eq!(
+            expects_columnar(32_768).1,
+            true,
+            "8 * 4,096 keys is the cap exactly"
+        );
+        assert_eq!(expects_columnar(32_776).1, false, "one key past it");
     }
 
     #[test]

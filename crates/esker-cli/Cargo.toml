@@ -31,6 +31,10 @@ bytes.workspace = true
 # `server` opens a store and puts the wire in front of it.
 esker-store.workspace = true
 esker-proto.workspace = true
+# `bench-mpp` derives whether its join CAN route from `fragment::MAX_IN_VALUES` rather than
+# asserting an answer, so the bound and the expectation cannot drift apart. Adds no external
+# crate: `esker-columnar` depends only on `esker-base` and `esker-engine`, both already here.
+esker-columnar.workspace = true
 # `pd serve` puts the wire in front of a placement driver, and `pd inspect` reads the state
 # it keeps in its own engine (docs/DESIGN.md §7).
 esker-pd.workspace = true
