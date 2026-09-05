@@ -198,12 +198,9 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
         // `ADD COLUMN … NOT NULL` was here. It is not a lowering question at all: whether it can
         // be done depends on whether the table has a row, which only the executor can see
         // (`tests/schema_change.rs`, `tests/add_column_not_null.rs`).
-        // Still refused, and for the rewrite rather than for volatility: PostgreSQL gives every
-        // row already stored its own value, and this `ALTER` is defined not to touch them.
-        (
-            "ALTER TABLE t ADD COLUMN c int8 DEFAULT random()",
-            "ALTER TABLE ... ADD COLUMN ... DEFAULT random(), which would rewrite every row",
-        ),
+        // `ADD COLUMN ... DEFAULT random()` was here, refused for the rewrite. The executor
+        // does the rewrite now (`tests/add_column_volatile_default.rs`), so the lowering carries
+        // the expression instead of refusing it.
         (
             "ALTER TABLE t ADD COLUMN c int8 UNIQUE",
             "ADD COLUMN ... UNIQUE",
