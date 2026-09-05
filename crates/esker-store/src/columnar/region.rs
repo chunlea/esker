@@ -544,6 +544,26 @@ impl ColumnarSlot {
         )))
     }
 
+    /// This region's `[start_key, end_key)`, read from the region record rather than remembered.
+    ///
+    /// **Read at rebuild time and never cached on the slot**, because a split moves it: a slot
+    /// outlives the range it was created with, and a walk that used a remembered range would
+    /// rebuild the parent's old span into the child's copy.
+    ///
+    /// A region record this store does not have is the whole key space, which is what a walk did
+    /// before this existed. That is the conservative direction — too much rather than too little —
+    /// and it is unreachable in practice: the slot is created by the peer that hosts the region,
+    /// so the record is there before anything can rebuild.
+    fn region_bounds(&self, db: &Db) -> Result<(Vec<u8>, Vec<u8>)> {
+        let regions = crate::meta::load_regions(db)
+            .map_err(|error| bootstrap(&format!("reading this store's region records: {error}")))?;
+        Ok(regions
+            .into_iter()
+            .find(|region| region.id == self.region_id)
+            .map(|region| (region.start_key.to_vec(), region.end_key.to_vec()))
+            .unwrap_or_default())
+    }
+
     /// Opens a copy by converting everything the region holds, which is what a resume falls back
     /// to and what every open did before ADR 0038.
     ///
@@ -577,7 +597,14 @@ impl ColumnarSlot {
             decoder as Arc<dyn super::RowDecoder>,
             self.options.clone(),
         )?;
-        let versions = convert(db, pinned, &mut apply, tenant, table_id)?;
+        let versions = convert(
+            db,
+            pinned,
+            &mut apply,
+            tenant,
+            table_id,
+            &self.region_bounds(db)?,
+        )?;
         // The walk read the region at `pinned`, and the state record says which entry that is —
         // read at the same snapshot, so it can name neither more nor less than the walk covered.
         let to = state.map_or(0, |state| state.applied_index);
@@ -751,10 +778,28 @@ fn convert(
     apply: &mut ColumnarApply,
     tenant: u64,
     table_id: u64,
+    region: &(Vec<u8>, Vec<u8>),
 ) -> Result<usize> {
-    let (start, end) = esker_keys::row::table_row_range(tenant, table_id);
+    let (table_start, table_end) = esker_keys::row::table_row_range(tenant, table_id);
+    // **The table's range intersected with the region's, and the intersection is the point.**
+    //
+    // This walked `table_row_range` alone, and a store's `write` column family holds the rows of
+    // **every region of that table the store hosts** — so each region's copy was fed the others'
+    // rows. With four learners on two stores a bare `count(*)` came back 4×: every fragment
+    // answered for more than its shard covered and the SQL node added the shards up. The row path
+    // never saw it, because a row read goes to the region that owns the key.
+    //
+    // Everything else here was already region-scoped — the slot is keyed by region, its directory
+    // is named for the region, the live tee sees only its own peer's entries — which is exactly
+    // what made one unscoped range hard to find.
+    let (start, end) = intersect(&table_start, &table_end, region);
     let low = esker_txn::key::prefix(&start);
     let high = esker_txn::key::prefix(&end);
+    if start >= end {
+        // The region holds none of this table. Not an error and not a missing copy: a store can
+        // host a region whose range does not reach the table at all.
+        return Ok(0);
+    }
     let snapshot = EngineSnapshot::at(db, pinned.clone());
     let mut rows = 0;
 
@@ -789,6 +834,31 @@ fn convert(
     iter.status()
         .map_err(|error| bootstrap(&format!("walking the write column family: {error}")))?;
     Ok(rows)
+}
+
+/// `[table_start, table_end)` narrowed to the region's own `[start, end)`.
+///
+/// **An empty bound means opposite things on the two sides**, which is the reading this has to get
+/// right: an empty region `start` is the beginning of the key space and constrains nothing, an
+/// empty region `end` is the end of it and constrains nothing either. A table range is never
+/// empty-bounded, so the result is always concrete.
+fn intersect(
+    table_start: &[u8],
+    table_end: &[u8],
+    region: &(Vec<u8>, Vec<u8>),
+) -> (Vec<u8>, Vec<u8>) {
+    let (region_start, region_end) = region;
+    let start = if region_start.as_slice() > table_start {
+        region_start.clone()
+    } else {
+        table_start.to_vec()
+    };
+    let end = if region_end.is_empty() || region_end.as_slice() > table_end {
+        table_end.to_vec()
+    } else {
+        region_end.clone()
+    };
+    (start, end)
 }
 
 /// What one `write` record is, to the columnar copy.

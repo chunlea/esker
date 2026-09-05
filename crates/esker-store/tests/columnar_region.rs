@@ -290,3 +290,118 @@ fn opening_a_copy_rebuilds_it_from_the_region() {
         "reopening trusted runs that were missing a version",
     );
 }
+
+/// A slot for `region_id`, so a test can hold two of them over one store.
+fn slot_for(dir: &std::path::Path, region_id: u64) -> ColumnarSlot {
+    ColumnarSlot::new(
+        Arc::new(LocalFileSystem::new()) as Arc<dyn FileSystem>,
+        dir.join("columnar").join(region_id.to_string()),
+        region_id,
+        ColumnarOptions::default(),
+    )
+}
+
+/// Writes the region records the walk reads its own range out of.
+fn record_regions(db: &Db, regions: &[(u64, Bytes, Bytes)]) {
+    let mut batch = WriteBatch::new();
+    let raft = db.cf_id(cf::RAFT).expect("the raft column family");
+    for (id, start_key, end_key) in regions {
+        esker_store::meta::stage_region(
+            &mut batch,
+            raft,
+            &esker_proto::Region {
+                id: *id,
+                start_key: start_key.clone(),
+                end_key: end_key.clone(),
+                peers: vec![esker_proto::Peer::voter(*id, *id)],
+                epoch: esker_proto::Epoch::INITIAL,
+            },
+        );
+    }
+    db.write(batch, &WriteOptions::default())
+        .expect("the region records are written");
+}
+
+/// **A region's copy holds that region's rows and no others.**
+///
+/// The walk that builds a copy for a newly placed learner was scoped to
+/// `table_row_range(tenant, table_id)` — the whole *table* — and a store's `write` column family
+/// holds the rows of **every region of that table the store hosts**. So on a store with two of
+/// them each copy was fed both, every fragment answered for more rows than its shard covered, and
+/// the SQL node added the shards up: the `mpp` lane measured a bare `count(*)` at 4× with four
+/// learners on two stores.
+///
+/// Everything else was already region-scoped — the slot is keyed by region, its directory is named
+/// for the region, the live tee sees only its own peer's entries — which is what made a single
+/// unscoped range hard to see. It needs **two regions of one table on one store** to show at all,
+/// and that shape did not exist before a SQL table could split
+/// ([ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+///
+/// The assertion is the rows in each copy rather than a count, so a failure names which region's
+/// rows leaked into which copy.
+#[test]
+fn a_region_copy_holds_only_the_rows_of_its_own_region() {
+    let (dir, db) = open_db();
+    commit(
+        &db,
+        10,
+        11,
+        &[TxnMutation::Put {
+            key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
+            value: Bytes::from(published(1)),
+            read_ts: None,
+        }],
+    );
+    // Four rows of one table, and a boundary between 2 and 3.
+    commit(&db, 20, 21, &[put(1, "ada"), put(2, "grace")]);
+    commit(&db, 22, 23, &[put(3, "alan"), put(4, "edsger")]);
+
+    // Two regions of that table on this one store, split at row 3's key.
+    let boundary = row_key(3);
+    record_regions(
+        &db,
+        &[
+            (1, Bytes::new(), boundary.clone()),
+            (2, boundary, Bytes::new()),
+        ],
+    );
+
+    let low = slot_for(dir.path(), 1);
+    let high = slot_for(dir.path(), 2);
+    assert_eq!(
+        read(&low, &db, 100),
+        vec![(1, "ada".to_owned()), (2, "grace".to_owned())],
+        "region 1 owns rows below the boundary and must hold no others"
+    );
+    assert_eq!(
+        read(&high, &db, 100),
+        vec![(3, "alan".to_owned()), (4, "edsger".to_owned())],
+        "region 2 owns rows from the boundary up"
+    );
+}
+
+/// **A region with no record is the whole key space, which is what the walk always did.**
+///
+/// The conservative direction — too much rather than too little — and the one every other test in
+/// this file relies on, because none of them writes a region record.
+#[test]
+fn a_slot_with_no_region_record_still_converts_the_whole_table() {
+    let (dir, db) = open_db();
+    commit(
+        &db,
+        10,
+        11,
+        &[TxnMutation::Put {
+            key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
+            value: Bytes::from(published(1)),
+            read_ts: None,
+        }],
+    );
+    commit(&db, 20, 21, &[put(1, "ada"), put(2, "grace")]);
+
+    let only = slot_for(dir.path(), 7);
+    assert_eq!(
+        read(&only, &db, 100),
+        vec![(1, "ada".to_owned()), (2, "grace".to_owned())]
+    );
+}
