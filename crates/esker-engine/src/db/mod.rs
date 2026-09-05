@@ -494,7 +494,7 @@ impl Db {
     /// # `esker.compactions-running` counts **files**, not compactions
     ///
     /// It is the size of the reservation set every compaction claims its *inputs* in
-    /// ([`super::compact`], "two compactions must not touch one file"), so one compaction over
+    /// (`db/compact.rs`, "two compactions must not touch one file"), so one compaction over
     /// five input files reports `5`. The name is the older of the two and the count is the true
     /// one; it is documented rather than renamed because `esker-cli` and existing tests ask for it
     /// by name. A caller wanting "is anything compacting" wants `> "0"`, and a caller wanting how
