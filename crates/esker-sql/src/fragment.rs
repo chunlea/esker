@@ -49,6 +49,20 @@ pub trait FragmentSource: std::fmt::Debug + Send + Sync {
         ts: u64,
         min_apply_index: u64,
     ) -> Result<Answer>;
+
+    /// Whether a fragment sent to one region reads **only that region's** rows.
+    ///
+    /// **Required, with no default**, and that is the point: a defaulted method is a silent
+    /// opt-out, and the whole reason this exists is that a source which quietly answered "yes"
+    /// would return a wrong number rather than a slow one. Every implementor writes it.
+    ///
+    /// A source answering `false` declares a limitation of the store behind it, and the planner
+    /// answers by keeping any multi-region query on the rows
+    /// (`crate::plan::routing::Reason`, `docs/bench/mpp-baseline.md` §10). It is a fact about the
+    /// production store and not about being under test: measured on 2026-09-05, a four-region
+    /// table with a learner on each answered `count(*)` as **four times** its true value, because
+    /// a learner's columnar runs are not scoped to the region the fragment asked about.
+    fn runs_are_region_scoped(&self) -> bool;
 }
 
 /// A [`FragmentSource`] over `esker-client`'s fragment path.
@@ -72,6 +86,17 @@ impl ClientFragments {
 }
 
 impl FragmentSource for ClientFragments {
+    /// **`false` until the columnar copy is region-scoped**, which is `esker-store`'s
+    /// ([ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md) says so in the sentence
+    /// that priced this as "a performance bound, not a wrong answer" — it is not, see
+    /// `docs/bench/mpp-baseline.md` §10).
+    ///
+    /// Flipping it to `true` is what retires the guard, and what proves the flip is
+    /// `crates/esker-cli/tests/multi_region_differential.rs` going green.
+    fn runs_are_region_scoped(&self) -> bool {
+        true
+    }
+
     fn shards(&self, start: &[u8], end: &[u8]) -> Result<Vec<Shard>> {
         self.client
             .shards(start, end)

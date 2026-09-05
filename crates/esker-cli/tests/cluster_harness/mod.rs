@@ -66,6 +66,7 @@ impl Drop for Supervisor {
 pub struct Cluster {
     dir: tempfile::TempDir,
     _store: Supervisor,
+    _others: Vec<Supervisor>,
     _pd: Supervisor,
     _sql: Supervisor,
     pd_port: u16,
@@ -78,10 +79,34 @@ impl Cluster {
     /// One store, because a split is the *leader's* own decision and needs only PD's id allocator
     /// — the replica target is another matter and not what this harness is about.
     pub fn start(split_size: u64) -> Self {
+        Self::start_with(1, split_size)
+    }
+
+    /// Starts `stores` stores, a driver and a SQL node.
+    ///
+    /// **Four is the minimum that can hold a columnar learner** — a region has three voters and PD
+    /// places a learner on a store with no peer of that region — and it is also what makes a SQL
+    /// node see more than one *shard*, which is what the region-count guard turns on.
+    pub fn start_with(stores: u16, split_size: u64) -> Self {
+        for attempt in 1..=4 {
+            if let Some(cluster) = Self::try_start(stores, split_size) {
+                return cluster;
+            }
+            eprintln!("harness: attempt {attempt} lost a port before its child bound; retrying");
+        }
+        panic!("four starts in a row lost a port before a child could bind");
+    }
+
+    /// One attempt, or `None` if a child lost its port.
+    ///
+    /// Long, and deliberately not split: it is sequential process setup where every step depends
+    /// on the last, and two attempts at cutting it produced worse code than the length it saved.
+    #[allow(clippy::too_many_lines)]
+    fn try_start(stores: u16, split_size: u64) -> Option<Self> {
         let dir = tempfile::TempDir::new().unwrap();
         eprintln!("harness: logs in {}", dir.path().display());
-        let base = free_ports(3);
-        let (store_port, pd_port, sql_port) = (base, base + 1, base + 2);
+        let base = free_ports(stores + 2);
+        let (store_port, pd_port, sql_port) = (base, base + stores, base + stores + 1);
         warm(esker_cli());
         warm(esker_sql());
 
@@ -96,36 +121,63 @@ impl Cluster {
                 .spawn()
                 .expect("the placement driver starts"),
         );
-        wait_for_port("the driver", pd_port, &mut pd, STARTUP_SECONDS, dir.path());
+        if !wait_for_port("the driver", pd_port, &mut pd, STARTUP_SECONDS, dir.path()) {
+            return None;
+        }
 
-        let (store_out, store_err) = log_into(dir.path(), "store");
-        let mut store = Supervisor(
-            Command::new(esker_cli())
+        let mut others: Vec<Supervisor> = Vec::new();
+        let mut store: Option<Supervisor> = None;
+        for id in 1..=stores {
+            let (store_out, store_err) = log_into(dir.path(), &format!("store{id}"));
+            let mut spawn = Command::new(esker_cli());
+            spawn
                 .args(["server", "--data-dir"])
-                .arg(dir.path().join("store"))
-                .args(["--listen", &format!("127.0.0.1:{store_port}")])
-                .args(["--store-id", "1"])
+                .arg(dir.path().join(format!("store{id}")))
+                .args(["--listen", &format!("127.0.0.1:{}", store_port + id - 1)])
+                .args(["--store-id", &id.to_string()])
                 .args(["--pd", &format!("127.0.0.1:{pd_port}")])
                 .args(["--region-split-size", &split_size.to_string()])
-                .args(["--peer", &format!("1@127.0.0.1:{store_port}")])
-                .stdout(store_out)
-                .stderr(store_err)
-                .spawn()
-                .expect("the store starts"),
-        );
-        wait_for_port(
-            "the store",
-            store_port,
-            &mut store,
-            STARTUP_SECONDS,
-            dir.path(),
-        );
+                // Placement costs one region heartbeat an operator, so a test that waits for a
+                // learner shortens it rather than waiting a minute each.
+                .args(["--region-heartbeat-ms", "2000"])
+                .args(["--heartbeat-tick-ms", "500"]);
+            // `--peer` as well as `--pd`, which is what `crate::cluster` does: without it PD's
+            // `AddPeer` has no address to reach and times out at its ceiling, for ever.
+            for peer in 1..=stores {
+                spawn.args([
+                    "--peer",
+                    &format!("{peer}@127.0.0.1:{}", store_port + peer - 1),
+                ]);
+            }
+            let mut child = Supervisor(
+                spawn
+                    .stdout(store_out)
+                    .stderr(store_err)
+                    .spawn()
+                    .expect("the store starts"),
+            );
+            if !wait_for_port(
+                &format!("store {id}"),
+                store_port + id - 1,
+                &mut child,
+                STARTUP_SECONDS,
+                dir.path(),
+            ) {
+                return None;
+            }
+            if store.is_none() {
+                store = Some(child);
+            } else {
+                others.push(child);
+            }
+        }
+        let store = store.expect("at least one store");
 
         let (sql_out, sql_err) = log_into(dir.path(), "sql");
         let mut sql = Supervisor(
             Command::new(esker_sql())
                 .arg(format!("127.0.0.1:{sql_port}"))
-                .arg(format!("127.0.0.1:{store_port}"))
+                .args((1..=stores).map(|id| format!("127.0.0.1:{}", store_port + id - 1)))
                 .args(["--pd", &format!("127.0.0.1:{pd_port}")])
                 .stdout(sql_out)
                 .stderr(sql_err)
@@ -143,6 +195,7 @@ impl Cluster {
         let cluster = Cluster {
             dir,
             _store: store,
+            _others: others,
             _pd: pd,
             _sql: sql,
             pd_port,
@@ -154,13 +207,12 @@ impl Cluster {
         loop {
             let answer = cluster.query("SELECT 1");
             if rows_of(&answer) == vec!["1".to_owned()] {
-                return cluster;
+                return Some(cluster);
             }
-            assert!(
-                Instant::now() < deadline,
-                "the SQL node never answered `SELECT 1`: {answer}{}",
-                tails(cluster.dir.path())
-            );
+            if Instant::now() >= deadline {
+                eprintln!("harness: the SQL node never answered `SELECT 1`: {answer}");
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -170,18 +222,97 @@ impl Cluster {
         one_query(self.sql_port, sql)
     }
 
+    /// Runs a statement on a named engine.
+    ///
+    /// The `SET` travels **in the same simple-query message**, because every call here opens its
+    /// own connection and session state would not survive one.
+    pub fn query_on(&self, engine: &str, sql: &str) -> String {
+        one_query(
+            self.sql_port,
+            &format!("SET esker.engine = '{engine}'; {sql}"),
+        )
+    }
+
     /// Runs a statement and fails the test if the server refused it.
+    ///
+    /// **`25006` is waited out rather than failed on.** A SQL node takes connections before it
+    /// holds a schema lease, and until it does every write is *"this node's schema lease has
+    /// expired and the placement driver is unreachable"*. It is a startup race, not a refusal —
+    /// `esker bench-mpp` learned it the same way, six runs in — so readiness here means a node
+    /// that accepts a **write**, not one that answers.
     pub fn run(&self, sql: &str) {
-        let answer = self.query(sql);
-        assert!(
-            !answer.contains("ERROR"),
-            "`{sql}` was refused: {}",
-            answer.trim()
-        );
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let answer = self.query(sql);
+            if !answer.contains("ERROR") {
+                return;
+            }
+            assert!(
+                answer.contains("25006") && Instant::now() < deadline,
+                "`{sql}` was refused: {}",
+                answer.trim()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// How many regions the cluster holds, from the placement driver's own routing table.
     pub fn regions(&self) -> usize {
+        self.region_lines().count()
+    }
+
+    /// How many regions have a columnar learner, from PD's own routing table.
+    pub fn regions_with_a_learner(&self) -> usize {
+        self.region_lines()
+            .filter(|line| line.contains('C'))
+            .count()
+    }
+
+    /// Waits until the cluster holds more than one region, and answers how many.
+    ///
+    /// **A wait, not an assertion.** A split is the leader's own decision, taken on its region
+    /// heartbeat after the size estimate crosses the threshold — so "did it split" straight after
+    /// a load is a question about timing, and under a loaded machine the answer is "not yet".
+    /// Asserting it there made this test fail in a full gate and pass alone.
+    pub fn wait_for_a_split(&self, seconds: u64) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let regions = self.regions();
+            if regions > 1 {
+                eprintln!("harness: the table is in {regions} regions");
+                return regions;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the table did not split within {seconds}s, so nothing here is about a boundary"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Waits until every region has a columnar learner.
+    ///
+    /// A series and not a reading: placement costs one region heartbeat an operator and PD does
+    /// one region at a time, so a count that climbs was latency and a single sample cannot tell
+    /// that from a count that sits.
+    pub fn wait_for_learners(&self, seconds: u64) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let (regions, with) = (self.regions(), self.regions_with_a_learner());
+            if regions > 0 && with == regions {
+                eprintln!("harness: {with} of {regions} regions have a columnar learner");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {with} of {regions} regions got a columnar learner within {seconds}s"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// One line per region from `region ls`, the header and trailer dropped.
+    fn region_lines(&self) -> std::vec::IntoIter<String> {
         let listed = Command::new(esker_cli())
             .args([
                 "region",
@@ -198,7 +329,9 @@ impl Cluster {
                     .next()
                     .is_some_and(|first| first.parse::<u64>().is_ok())
             })
-            .count()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -387,24 +520,28 @@ fn wait_for_port(
     child: &mut Supervisor,
     seconds: u64,
     dir: &std::path::Path,
-) {
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         if let Ok(Some(status)) = child.0.try_wait() {
-            panic!(
-                "{what} exited with {status} before it listened on {port}{}",
-                tails(dir)
-            );
+            // **Not a panic: a lost port is a retry, not a result.** `free_ports` reserves a run
+            // and releases it before the children bind, so a cluster test starting beside another
+            // can lose one in that window — the child exits, and panicking here reports a harness
+            // race as a product failure. It did, twice, in one gate.
+            eprintln!("harness: {what} exited with {status} before listening on {port}");
+            return false;
         }
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             eprintln!("harness: {what} is listening on {port}");
-            return;
+            return true;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what} did not listen on {port} within {seconds}s{}",
-            tails(dir)
-        );
+        if Instant::now() >= deadline {
+            eprintln!(
+                "harness: {what} did not listen on {port} within {seconds}s{}",
+                tails(dir)
+            );
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }

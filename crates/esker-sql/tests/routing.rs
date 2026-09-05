@@ -267,6 +267,40 @@ fn counts_from_two_regions_are_added() {
     assert_eq!(rows(&mut node, "SELECT count(*) FROM t"), vec![vec!["7"]]);
 }
 
+/// **A source that cannot scope a fragment to one region does not get more than one.**
+///
+/// The guard that stands until the columnar copy is region-scoped. Measured on a real four-store
+/// cluster on 2026-09-05: four regions, a learner on each, every fragment answered, and every
+/// aggregate came back four times its true value (`docs/bench/mpp-baseline.md` §10).
+///
+/// **It asserts the reason, not the answer.** The row engine is correct, so *any* fallback agrees
+/// with it — including one that happened for an unrelated reason. What has to be true is that this
+/// rule fired, and `EXPLAIN` is the only place that says so.
+///
+/// The contrast with `counts_from_two_regions_are_added` directly above is the whole point: the
+/// same two regions, the same fold, and the only difference is what the source declares about
+/// itself. Multi-shard folding is correct; one store's columnar copy is not.
+#[test]
+fn a_source_that_is_not_region_scoped_keeps_a_split_table_on_the_rows() {
+    let source = script(&[
+        groups(&[(&[], &[Partial::Count(4)])]),
+        groups(&[(&[], &[Partial::Count(3)])]),
+    ]);
+    source.split_at(b"t\x7f");
+    source.is_not_region_scoped();
+    let mut node = node_with(source);
+    ready(&mut node);
+    let plan = explain(&mut node, "SELECT count(*) FROM t");
+    assert!(
+        plan.contains("Engine: rows"),
+        "a split table was routed to a source that reads across regions:\n{plan}"
+    );
+    assert!(
+        plan.contains("not region-scoped"),
+        "the plan fell back for some other reason than the guard:\n{plan}"
+    );
+}
+
 /// A refusal is answered by the rows, silently to the client and visibly in `EXPLAIN`.
 ///
 /// The assertion that matters is the first one: the client's answer is what the row engine would
@@ -503,6 +537,12 @@ struct Scripted {
     asked: Arc<Mutex<usize>>,
     /// Where the regions are split, or empty for one region over everything.
     splits: Mutex<Vec<Vec<u8>>>,
+    /// What this source answers for [`FragmentSource::runs_are_region_scoped`].
+    ///
+    /// `true` for every test but one: this source really does scope its shards, and saying
+    /// otherwise would make the fold tests below prove nothing. The exception exists so the guard
+    /// that keys on this can be asserted to fire.
+    scoped: Mutex<bool>,
 }
 
 impl Scripted {
@@ -510,9 +550,23 @@ impl Scripted {
     fn split_at(&self, at: &[u8]) {
         self.splits.lock().unwrap().push(at.to_vec());
     }
+
+    /// Makes this source declare that a fragment reads more than its own region's rows, which is
+    /// what the production store does today (`docs/bench/mpp-baseline.md` §10).
+    fn is_not_region_scoped(&self) {
+        *self.scoped.lock().unwrap() = false;
+    }
 }
 
 impl FragmentSource for Scripted {
+    /// **`true` unless a test says otherwise, and it is not a courtesy.** This source synthesises
+    /// one shard per split and answers each from its own scripted result, so a fragment sees
+    /// exactly its region's rows — which is what the production store will do once its columnar
+    /// copy is region-scoped, and what the fold tests are the proof of.
+    fn runs_are_region_scoped(&self) -> bool {
+        *self.scoped.lock().unwrap()
+    }
+
     fn shards(&self, _start: &[u8], _end: &[u8]) -> esker_sql::Result<Vec<Shard>> {
         let splits = self.splits.lock().unwrap().clone();
         let mut bounds: Vec<Vec<u8>> = vec![Vec::new()];
@@ -571,6 +625,7 @@ fn script(answers: &[Body]) -> Arc<Scripted> {
         ),
         asked: Arc::new(Mutex::new(0)),
         splits: Mutex::new(Vec::new()),
+        scoped: Mutex::new(true),
     })
 }
 
@@ -583,6 +638,7 @@ fn refusing(reason: RefusalReason) -> Arc<Scripted> {
         }]),
         asked: Arc::new(Mutex::new(0)),
         splits: Mutex::new(Vec::new()),
+        scoped: Mutex::new(true),
     })
 }
 

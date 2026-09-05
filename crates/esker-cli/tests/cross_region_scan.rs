@@ -83,12 +83,7 @@ fn a_scan_reads_a_table_that_spans_more_than_one_region() {
     // scans fine, so an assertion about the scan below would pass for the wrong reason — the
     // failure mode `docs/bench/columnar-m2.md` calls a green that a naive implementation also
     // produces.
-    let regions = cluster.regions();
-    assert!(
-        regions > 1,
-        "the table did not split at a {SPLIT_SIZE}-byte threshold after {ROWS} rows, so this \
-         test says nothing about a region boundary: {regions} region(s)"
-    );
+    let regions = cluster.wait_for_a_split(120);
 
     let answer = cluster.query("SELECT count(*) FROM ledger");
     assert!(
