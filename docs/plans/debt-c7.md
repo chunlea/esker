@@ -1098,3 +1098,45 @@ hint when no peer knows a leader. `put` round-robins and spends its deadline, wh
 behaviour against a region that cannot answer. **Nothing to fix in the test** — this is more
 evidence for the debt already logged against the raft/store core, and the strongest yet, because
 each crate reaches it by a different path.
+
+## 22. A bound that had quietly become the verdict
+
+`esker-cli::cluster_start` was one of three reds on the ci-tree gate of `b78dfa7d`, and it passes
+3/3 alone. It is this lane's own test, closed in §1, so the recurrence is this lane's to explain.
+
+The readiness probe is right: it asks the driver a question only a driver answers
+(`ask_the_driver` — handshake plus `PdReq::Status`), it notices a child that exited and prints its
+status, and it names the last refusal when it gives up. None of that changed. What was wrong was
+one constant, and its own doc comment said so:
+
+> It bounds a probe against a socket that accepts and then says nothing, which is the case the
+> probe exists for; the budgets that decide whether a process started are `PD_START_TIMEOUT` and
+> `STORE_START_TIMEOUT`.
+
+At `500 ms` that sentence was false. `request_timeout` bounds the handshake as well as the call,
+and a driver that is up and healthy still has to be *scheduled* to complete a handshake — on a box
+at load average 90 that takes longer than half a second. So every probe timed out, the loop never
+saw an answer, and the start failed at `PD_START_TIMEOUT` blaming a driver that was fine. The
+constant meant to *bound* a probe had become the one that returned the verdict.
+
+### This is a number change, and it is not a budget increase
+
+Said plainly, because this wave has claimed nine times that nothing was fixed by changing a budget,
+and this is a number: **neither deciding budget moved.** `PD_START_TIMEOUT` is still 20 s and
+`STORE_START_TIMEOUT` still 60 s. What changed is a bound that was silently overriding them, so the
+verdict returns to the budgets that were always documented as owning it.
+
+It also costs nothing on the path that matters. A process that has not bound yet refuses the
+**connect**, which returns immediately whatever this value says; `PROBE_TIMEOUT` is only ever spent
+on a socket that accepted and then went quiet — precisely its stated job. Five seconds leaves four
+probes inside the driver's budget and twelve inside the stores'.
+
+The visible cost is the squatter tests, which exist to be answered by a socket that stays silent:
+the file now runs in 12 s rather than about 3. Bounded, and paid in the case the constant is for.
+
+### The shape
+
+§14 found a guard that could not fire because the group was too small. §17 found an `await` between
+a measurement and its use. This is the third of the same family: **a mechanism whose documented
+contract and whose actual behaviour disagreed, with the comment right and the code wrong.** Reading
+the comment against the number was the whole diagnosis; no arm, no reproduction, no message needed.
