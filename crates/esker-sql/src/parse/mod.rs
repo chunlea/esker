@@ -545,6 +545,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = virtual_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
+    // `CREATE EXTENSION … SCHEMA` needs a `WITH` this parser insists on and PostgreSQL does not.
+    let extension_with = insert_extension_with(sql, &scanned);
+    let sql = extension_with.as_deref().unwrap_or(sql);
     // `NOT NULL` on a `CREATE DOMAIN` is a clause the parser stops at; it comes off and the fact
     // travels on `Parsed`.
     let domain_not_null_rewrite = strip_domain_not_null(sql, &scanned);
@@ -737,6 +740,34 @@ fn strip_parameter_namespace(sql: &str, scanned: &Scan<'_>) -> Option<(String, S
         ),
         namespace.to_owned(),
     ))
+}
+
+/// Puts the `WITH` back into a `CREATE EXTENSION … SCHEMA | VERSION | CASCADE`.
+///
+/// PostgreSQL makes the keyword **optional** — `CREATE EXTENSION hstore SCHEMA custom_schema` and
+/// `… WITH SCHEMA custom_schema` are the same statement, measured, and the bare form is the one
+/// `ActiveRecord` sends. `sqlparser` 0.62.0 reads the options only after a `WITH`
+/// (`parse_create_extension`), so the bare spelling stopped at `Expected: end of statement, found:
+/// SCHEMA` — `42601` about valid PostgreSQL, which is the answer contract C1 exists to prevent.
+///
+/// Inserting the word is enough because the three options follow it in a fixed order and the
+/// parser already reads all three; what it could not do was start. The statement then reaches the
+/// lowering, which refuses each option **by name** — the honest `0A000` rather than a syntax
+/// error, and the same answer the `WITH` spelling has always had.
+fn insert_extension_with(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    if !starts_with_words(&scanned.words, &["CREATE", "EXTENSION"]) {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    if upper.contains(" WITH ") {
+        return None;
+    }
+    // The earliest of the three, since they may all be present and `WITH` goes before the first.
+    let at = [" SCHEMA ", " VERSION ", " CASCADE"]
+        .iter()
+        .filter_map(|word| upper.find(word))
+        .min()?;
+    Some(format!("{} WITH{}", sql.get(..at)?, sql.get(at..)?))
 }
 
 /// Cuts `NOT NULL` out of a `CREATE DOMAIN`, returning the rest of the statement.
@@ -2122,7 +2153,11 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         // both: this function is an entry point of its own, and a clause that only comes off on
         // the other path makes the same statement parse through one door and not the other.
         .or_else(|| strip_with_data(sql, &scanned).map(|(kept, _)| kept))
-        .or_else(|| strip_domain_not_null(sql, &scanned));
+        .or_else(|| strip_domain_not_null(sql, &scanned))
+        // **Here as well**, for the reason the two above it are: this function is an entry point
+        // of its own, and a statement that only parses through the other door is a statement whose
+        // answer depends on which door it came in.
+        .or_else(|| insert_extension_with(sql, &scanned));
     // **A recognised `REFRESH` parses as a placeholder here too.** `sqlparser` has no `REFRESH`
     // statement at all, so without this the same statement parsed through `parse_statements` and
     // was a bare `42601` through this door — and `42601` about valid PostgreSQL is the one answer
