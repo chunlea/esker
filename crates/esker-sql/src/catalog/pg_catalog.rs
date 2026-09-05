@@ -948,6 +948,7 @@ impl CatalogView {
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
             CatalogView::PgOpclass => Ok(pg_opclass_rows()),
+            CatalogView::PgCollation => Ok(pg_collation_rows()),
             CatalogView::PgCast => Ok(pg_cast_rows()),
             CatalogView::PgAm => Ok(pg_am_rows()),
             CatalogView::PgTsConfig => Ok(pg_ts_config_rows()),
@@ -1048,8 +1049,9 @@ impl CatalogView {
             | CatalogView::PgMatviews
             | CatalogView::InformationSchemaDomains
             | CatalogView::PgRange
-            | CatalogView::PgCollation
+
             | CatalogView::PgOpclass
+            | CatalogView::PgCollation
             | CatalogView::PgCast
             | CatalogView::PgExtension
             | CatalogView::PgInherits
@@ -1110,6 +1112,7 @@ impl CatalogView {
                             .columns()
                             .iter()
                             .map(|(name, ty)| ColumnDef {
+                                collation: None,
                                 name: (*name).to_owned(),
                                 ty: *ty,
                                 // A computed relation declares no lengths.
@@ -1995,6 +1998,25 @@ fn pg_cast_rows() -> Vec<Vec<Datum>> {
         .collect()
 }
 
+/// The collations this node has: `C`, `POSIX`, and the database's own `default`.
+///
+/// All three are the **same ordering** — byte order, which is what a memcomparable key gives — and
+/// that is why they can be reported honestly
+/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). A real
+/// server numbers them 950, 951 and 100, and `ActiveRecord` reads the name off this view by
+/// joining `a.attcollation = c.oid`, so the oids have to be PostgreSQL's or the join finds nothing.
+///
+/// `default` is here and is **not** the same ordering it would be on the oracle, where the
+/// database's default is a locale: `ORDER BY t` gives `a, A, b, B` there and `A, B, a, b` here.
+/// That difference is the pre-existing one this ADR names rather than a new one, and it is
+/// declared with its capture line in `tests/corpus/pg19_collation.txt`.
+fn pg_collation_rows() -> Vec<Vec<Datum>> {
+    [(950_i64, "C"), (951, "POSIX"), (100, "default")]
+        .into_iter()
+        .map(|(oid, name)| vec![Datum::Int8(oid), Datum::Text(name.to_owned())])
+        .collect()
+}
+
 fn pg_opclass_rows() -> Vec<Vec<Datum>> {
     super::OPERATOR_CLASSES
         .iter()
@@ -2211,10 +2233,18 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 Datum::Text(typinput(*ty).to_owned()),
                 Datum::Text(typtype(*ty).to_owned()),
                 Datum::Int8(0),
-                // No collation on any type here, which is what makes
-                // `a.attcollation <> t.typcollation` false for every column — the
-                // same answer a real server gives, by the same comparison.
-                Datum::Int8(0),
+                // **The type's own collation**, which a collatable type has and the rest do not:
+                // `100` for `text`, `varchar`, `bpchar` and `citext`, `0` for everything else, as
+                // a real server reports. It is the other half of `ActiveRecord`'s read-back — a
+                // column that named no collation inherits this number, so
+                // `a.attcollation <> t.typcollation` is false for it and the join yields NULL,
+                // while a column that named `C` carries 950 and is reported
+                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                //
+                // Leaving this at `0` while `attcollation` answered `100` made every plain `text`
+                // column report the collation `default`, which is the wrong half of the same
+                // comparison.
+                Datum::Int8(super::pg_attribute::typcollation(*ty)),
                 // The one namespace this node has, the same one every relation
                 // reports.
                 Datum::Int8(PUBLIC_NAMESPACE_OID),

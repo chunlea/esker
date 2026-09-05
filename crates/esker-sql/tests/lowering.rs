@@ -68,7 +68,11 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "ALTER TABLE t ADD COLUMN b bigserial",
             "ALTER TABLE ... ADD COLUMN ... bigserial",
         ),
-        ("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE"),
+        // `CREATE TABLE … COLLATE "C"` is **built** now, so it is not a C2 refusal any more —
+        // `C` and `POSIX` name byte order, which is the ordering this node has
+        // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+        // A collation it does not have is still refused, and with `42704` rather than `0A000`,
+        // which is why it does not belong in this list either: `tests/collation.rs` holds both.
         // **`PARTITION BY LIST` and `RANGE` left this list** with statements 781-786; `HASH` is
         // what is still refused, because nothing captured how it routes and a strategy this node
         // guessed at would put rows in the wrong partition.

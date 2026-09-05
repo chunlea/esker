@@ -1833,6 +1833,26 @@ pub enum SqlError {
     #[error("data type {0} has no default operator class for access method \"btree\"")]
     NoDefaultOperatorClass(&'static str),
 
+    /// `COLLATE "en_US.UTF-8"`: a collation this node does not have.
+    ///
+    /// PostgreSQL's own sentence, encoding and all — measured, `collation "nope" for encoding
+    /// "UTF8" does not exist`, `42704`. Refused rather than accepted and ignored, because this
+    /// node sorts by bytes and a locale collation is a **different order**: answering one and
+    /// giving the other is a wrong answer where a refusal is a gap
+    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+    #[error("collation \"{0}\" for encoding \"UTF8\" does not exist")]
+    UndefinedCollation(String),
+
+    /// `COLLATE` naming a collation this node *has*, on a type that has no ordering to override:
+    /// `42804 collations are not supported by type integer`. Measured for two types one clause
+    /// apart — `CREATE TABLE badx (a uuid COLLATE "C")` and `SELECT 1 COLLATE "C"` — which is why
+    /// the rule asks [`crate::catalog::pg_attribute::collatable`] rather than listing types here.
+    ///
+    /// The **type** and not the name is what is wrong, so it is a different class from
+    /// [`SqlError::UndefinedCollation`]: `C` exists, and `integer` still cannot have one.
+    #[error("collations are not supported by type {0}")]
+    CollationNotSupported(&'static str),
+
     /// `CREATE INDEX … USING gin(name)` where the type has no default class **for that method**.
     /// The same sentence [`SqlError::NoDefaultOperatorClass`] gives, with the method named too —
     /// measured, and the two are one message with the access method substituted.
@@ -2505,6 +2525,7 @@ impl SqlError {
             | SqlError::NoDefaultOperatorClass(_)
             | SqlError::NoDefaultOperatorClassFor { .. }
             | SqlError::NoSuchOperatorClass { .. }
+            | SqlError::UndefinedCollation(_)
             | SqlError::RangeSubtypeNotOrdered(_)
             | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. }
@@ -2562,7 +2583,10 @@ impl SqlError {
             | SqlError::CannotCastDefaultAutomatically { .. }
             // **`42804` and not the `42704` its two neighbours get**: the class exists and the
             // *type* is what it will not take. Measured beside them.
-            | SqlError::OperatorClassRejectsType { .. } => sqlstate::DATATYPE_MISMATCH,
+            | SqlError::OperatorClassRejectsType { .. }
+            // `COLLATE "C"` on an `integer`: the collation exists, the type has no ordering for it
+            // to override. `42804`, measured — and `42704` is what the *name* being unknown gets.
+            | SqlError::CollationNotSupported(_) => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.

@@ -126,6 +126,7 @@ pub(super) fn create_table(
     let (columns, primary_key, primary_key_name) = if declared_key.is_empty() {
         let mut with_row_id = Vec::with_capacity(columns.len() + 1);
         with_row_id.push(ColumnDef {
+            collation: None,
             name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
@@ -279,6 +280,9 @@ fn declared_columns(
             _ => column.typmod,
         };
         let mut kept = ColumnDef {
+            // What the declaration asked for, which the lowerer has already narrowed to an
+            // ordering this node has (ADR 0076).
+            collation: column.collation.clone(),
             name: column.name.clone(),
             ty,
             typmod,
@@ -1210,6 +1214,7 @@ fn set_column_type(
     ty: ColumnType,
     typmod: i32,
     using: Option<ColumnType>,
+    collation: Option<&str>,
 ) -> Result<()> {
     let at = updated
         .column(column)
@@ -1270,6 +1275,10 @@ fn set_column_type(
     };
     updated.columns[at].ty = ty;
     updated.columns[at].typmod = typmod;
+    // **Assigned and not merged.** A statement with no `COLLATE` gives the column its new type's
+    // collation, so one that had `COLLATE "C"` and is retyped without a clause goes back to the
+    // default — which is what PostgreSQL does, and what keeping the old name here would not.
+    updated.columns[at].collation = collation.map(ToOwned::to_owned);
     updated.columns[at].default = default;
     updated.columns[at].missing = missing;
     let types = updated.column_types();
@@ -3648,6 +3657,7 @@ fn matview_columns(planned: &super::query::Planned, declared: &[String]) -> Resu
         .iter()
         .enumerate()
         .map(|(at, column)| ColumnDef {
+            collation: None,
             name: declared
                 .get(at)
                 .cloned()
@@ -3681,6 +3691,7 @@ fn matview_table(
 ) -> TableDef {
     let mut with_row_id = Vec::with_capacity(columns.len() + 1);
     with_row_id.push(ColumnDef {
+        collation: None,
         name: catalog::INTERNAL_ROW_ID_NAME.to_owned(),
         ty: ColumnType::Int8,
         typmod: crate::value::NO_TYPMOD,
@@ -5330,9 +5341,19 @@ pub(super) fn alter_table(
             ty,
             typmod,
             using,
+            collation,
         } = action
         {
-            set_column_type(txn, executor, &mut updated, column, *ty, *typmod, *using)?;
+            set_column_type(
+                txn,
+                executor,
+                &mut updated,
+                column,
+                *ty,
+                *typmod,
+                *using,
+                collation.as_deref(),
+            )?;
             changed = true;
             continue;
         }
@@ -5461,6 +5482,7 @@ pub(super) fn alter_table(
                 ty,
                 &def,
                 &ColumnDef {
+                    collation: None,
                     name: column.name.clone(),
                     ty,
                     typmod: column.typmod,
@@ -5478,6 +5500,7 @@ pub(super) fn alter_table(
             None => column.default.clone(),
         };
         updated.columns.push(ColumnDef {
+            collation: column.collation.clone(),
             name: column.name.clone(),
             ty,
             typmod: column.typmod,

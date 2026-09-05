@@ -84,6 +84,16 @@ pub const MAX_IDENTIFIER_BYTES: usize = 63;
 pub struct ColumnDef {
     /// As the user wrote it, already folded (see [`fold_identifier`]).
     pub name: String,
+    /// The collation this column was declared with, or `None` for the type's own.
+    ///
+    /// `C` or `POSIX` and nothing else
+    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)): both
+    /// name **byte order**, which is the ordering a memcomparable key already has, so recording
+    /// one costs nothing and honours it exactly. `None` is what every column had before catalog
+    /// version 35 and is what `pg_attribute.attcollation` reports as the type's default — which is
+    /// why `ActiveRecord`'s read-back, `attcollation <> typcollation`, names only the columns that
+    /// asked for one.
+    pub collation: Option<String>,
     /// One of the types this node stores ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     pub ty: ColumnType,
     /// PostgreSQL's `pg_attribute.atttypmod`, **verbatim**, or `-1` for a type given no number.
@@ -892,6 +902,7 @@ pub const SEQUENCE_RELATION_ID_BASE: u64 = u64::MAX - 1_048_576;
 #[must_use]
 pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
     let column = |name: &str, ty: ColumnType| ColumnDef {
+        collation: None,
         name: name.to_owned(),
         ty,
         typmod: value::NO_TYPMOD,
@@ -4102,6 +4113,7 @@ mod tests {
             primary_key_comment: None,
             columns: vec![
                 ColumnDef {
+                    collation: None,
                     name: "id".into(),
                     ty: ColumnType::Int8,
                     typmod: crate::value::NO_TYPMOD,
@@ -4116,6 +4128,7 @@ mod tests {
                     user_type: None,
                 },
                 ColumnDef {
+                    collation: None,
                     name: "email".into(),
                     ty: ColumnType::Text,
                     typmod: crate::value::NO_TYPMOD,
@@ -4183,7 +4196,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "22",               // catalog format version
+                "23",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -4276,7 +4289,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "22",       // catalog format version
+                "23",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4358,7 +4371,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "22",                 // catalog format version
+                "23",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4467,6 +4480,11 @@ mod tests {
                 // 33 catalog could hold
                 // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
                 "05627472656500",
+                // Version 35, and the eighteenth section: one collation per column, in column
+                // order. Two columns, neither of which named one, so two empty strings — which is
+                // every column a version 34 catalog could hold, because `COLLATE` was refused
+                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                "0000",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -4921,6 +4939,7 @@ mod tests {
     fn a_version_4_record_carries_every_typmod() {
         let mut table = accounts(7);
         table.columns.push(ColumnDef {
+            collation: None,
             name: "v".into(),
             ty: ColumnType::Varchar,
             typmod: crate::value::typmod_of_length(5),
@@ -4935,6 +4954,7 @@ mod tests {
             user_type: None,
         });
         table.columns.push(ColumnDef {
+            collation: None,
             name: "c".into(),
             ty: ColumnType::Bpchar,
             typmod: crate::value::typmod_of_length(3),
@@ -4949,6 +4969,7 @@ mod tests {
             user_type: None,
         });
         table.columns.push(ColumnDef {
+            collation: None,
             name: "t".into(),
             ty: ColumnType::Timestamp,
             typmod: crate::value::typmod_of_precision(3),
@@ -5626,6 +5647,7 @@ mod tests {
         // `ALTER` that added the column.
         let mut widened = accounts(7);
         widened.columns.push(ColumnDef {
+            collation: None,
             name: "tier".into(),
             ty: ColumnType::Int8,
             typmod: crate::value::NO_TYPMOD,
@@ -5684,7 +5706,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "22",               // catalog format version
+                "23",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

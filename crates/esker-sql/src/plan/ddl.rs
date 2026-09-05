@@ -106,6 +106,13 @@ pub struct Column {
     /// The **folded** half of a default, set for exactly what PostgreSQL's coercion folds to a
     /// constant: a literal, read as this column's type. Everything else is above, as text.
     pub default: Option<Datum>,
+    /// The collation the column was declared with, or `None` for the type's own.
+    ///
+    /// `C` or `POSIX` only
+    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)); every
+    /// other name is refused in the lowerer, so what reaches here is always an ordering this node
+    /// actually has.
+    pub collation: Option<String>,
     /// The sequence that fills this column — `bigserial` or `GENERATED ... AS IDENTITY` — and
     /// which of the three it is.
     ///
@@ -1245,6 +1252,12 @@ pub enum AlterTableAction {
         /// s::text` casts to `text` and lands in `varchar`, which PostgreSQL takes because the
         /// second hop is an assignment cast — so both hops are checked rather than one.
         using: Option<ColumnType>,
+        /// The collation the statement named, or `None` to keep the type's own.
+        ///
+        /// **`None` clears one that was there**, which is PostgreSQL's rule and not a shortcut:
+        /// `ALTER COLUMN c TYPE text` gives the column its new type's collation, so a column that
+        /// was `COLLATE "C"` and is retyped without a clause goes back to the default.
+        collation: Option<String>,
     },
     /// `VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
     ///

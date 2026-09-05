@@ -208,6 +208,7 @@ pub(super) fn table_function_def(
         id: crate::catalog::DERIVED_TABLE_ID,
         name: name.clone(),
         columns: vec![crate::catalog::ColumnDef {
+            collation: None,
             name,
             ty,
             typmod: crate::value::NO_TYPMOD,
@@ -315,6 +316,7 @@ fn plan_derived(
         .iter()
         .enumerate()
         .map(|(at, output)| crate::catalog::ColumnDef {
+            collation: None,
             // The alias replaces the name outright: after `AS t(a, b)`, `t.id` is `42703`.
             name: derived
                 .columns

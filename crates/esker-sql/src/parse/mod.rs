@@ -292,6 +292,9 @@ pub struct Parsed {
     /// Whether a `CREATE DOMAIN` said `NOT NULL`, which `sqlparser` 0.62.0 cannot read
     /// ([`strip_domain_not_null`]).
     domain_not_null: bool,
+    /// The collation cut off an `ALTER TABLE … ALTER COLUMN … TYPE t COLLATE "x"`, which
+    /// `sqlparser` 0.62.0's `SetDataType` has nowhere to put ([`strip_alter_column_collation`]).
+    alter_column_collation: Option<String>,
     /// `WITH DATA` / `WITH NO DATA` on a `CREATE MATERIALIZED VIEW`: `Some(false)` for `NO DATA`.
     ///
     /// `sqlparser` 0.62.0 reads `CREATE MATERIALIZED VIEW … AS <query>` and then expects the
@@ -423,6 +426,13 @@ impl Parsed {
     #[must_use]
     pub fn domain_not_null(&self) -> bool {
         self.domain_not_null
+    }
+
+    /// The collation an `ALTER COLUMN … TYPE` named, as written and unvalidated — the lowering
+    /// decides whether this node has it, because that is where every other `COLLATE` is decided.
+    #[must_use]
+    pub fn alter_column_collation(&self) -> Option<&str> {
+        self.alter_column_collation.as_deref()
     }
 
     /// `WITH DATA` / `WITH NO DATA`, or `None` when the statement carried neither.
@@ -567,6 +577,11 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // travels on `Parsed`.
     let domain_not_null_rewrite = strip_domain_not_null(sql, &scanned);
     let sql = domain_not_null_rewrite.as_deref().unwrap_or(sql);
+    // `ALTER COLUMN … TYPE t COLLATE "x"`: the clause comes off and the name travels on `Parsed`.
+    let alter_collation_rewrite = strip_alter_column_collation(sql, &scanned);
+    let sql = alter_collation_rewrite
+        .as_ref()
+        .map_or(sql, |(text, _)| text.as_str());
     // `WITH [NO] DATA` is the last thing in a `CREATE MATERIALIZED VIEW` and the parser stops at
     // it; the clause comes off and the answer travels on `Parsed`.
     let with_data_rewrite = strip_with_data(sql, &scanned);
@@ -611,6 +626,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                     .map(|(_, flags)| flags.clone())
                     .unwrap_or_default(),
                 domain_not_null: domain_not_null_rewrite.is_some(),
+                alter_column_collation: alter_collation_rewrite
+                    .as_ref()
+                    .map(|(_, name)| name.clone()),
                 with_data: with_data_rewrite.as_ref().map(|(_, data)| *data),
                 refresh: refresh.clone(),
                 alter_table_reset: reset.clone(),
@@ -807,6 +825,43 @@ fn strip_domain_not_null(sql: &str, scanned: &Scan<'_>) -> Option<String> {
         return None;
     }
     Some(format!("{}{after}", sql.get(..at)?))
+}
+
+/// Cuts a trailing `COLLATE <name>` off an `ALTER TABLE … ALTER COLUMN … TYPE`, returning the rest
+/// of the statement and the name.
+///
+/// **`sqlparser` 0.62.0's `AlterColumnOperation::SetDataType` has no collation.** It reads the type
+/// and then `USING`, so `change_column … collation: "POSIX"` — one of `collation_test.rb`'s five —
+/// is `Expected: end of statement, found: COLLATE` and gets named by the refusal table two levels
+/// up, as "ALTER TABLE ... ALTER COLUMN". The clause is the last thing in the statement and its
+/// name is one token, so the tail comes off the same way [`strip_with_data`]'s does.
+///
+/// Only for the `ALTER COLUMN … TYPE` shape: a `COLLATE` anywhere else in an `ALTER TABLE` — inside
+/// an added column's definition, say — is one `sqlparser` reads for itself, and taking it here
+/// would remove a clause the parser was going to honour.
+fn strip_alter_column_collation(sql: &str, scanned: &Scan<'_>) -> Option<(String, String)> {
+    if !starts_with_words(&scanned.words, &["ALTER", "TABLE"])
+        || !contains_words(&scanned.words, &["ALTER", "COLUMN"])
+        || !contains_words(&scanned.words, &["TYPE"])
+    {
+        return None;
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    let at = trimmed.to_ascii_uppercase().rfind(" COLLATE ")?;
+    let name = trimmed.get(at + " COLLATE ".len()..)?.trim();
+    // One token and nothing after it, quoted or bare. A name with a space in it is quoted, and a
+    // second word outside the quotes means this is not the tail of the statement after all.
+    let bare = name
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'));
+    if bare.is_none() && name.split_whitespace().count() != 1 {
+        return None;
+    }
+    let bare = bare.unwrap_or(name);
+    if bare.is_empty() || bare.contains('"') {
+        return None;
+    }
+    Some((trimmed.get(..at)?.to_owned(), bare.to_owned()))
 }
 
 /// Cuts a trailing `WITH [NO] DATA` off a `CREATE MATERIALIZED VIEW`, returning the rest of the
@@ -2212,6 +2267,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         // the other path makes the same statement parse through one door and not the other.
         .or_else(|| strip_with_data(sql, &scanned).map(|(kept, _)| kept))
         .or_else(|| strip_domain_not_null(sql, &scanned))
+        .or_else(|| strip_alter_column_collation(sql, &scanned).map(|(kept, _)| kept))
         // **Here as well**, for the reason the two above it are: this function is an entry point
         // of its own, and a statement that only parses through the other door is a statement whose
         // answer depends on which door it came in.
