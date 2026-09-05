@@ -407,3 +407,106 @@ fn a_savepoint_rollback_leaves_no_write_to_conflict_against_real_stores() {
         "A's row 1 committed and the other session's row 2 stands"
     );
 }
+
+/// **Concurrent increments must not lose one** — debts #1 and #2 on the store path, and the only
+/// shape that can see them.
+///
+/// # Why this is a stress test and not a two-session script
+///
+/// `changed_since_statement` is consulted at exactly one moment: a writer takes a row lock **at
+/// once** (`waited == 0`) and has to ask whether the holder in front committed *between this
+/// statement's read and this lock*. A statement that genuinely waited restarts unconditionally and
+/// never asks; and a script that reads in one statement and writes in the next reads fresh anyway,
+/// because READ COMMITTED gives the second statement its own snapshot.
+///
+/// So the window is inside a single statement and cannot be scheduled from a client. Two scripted
+/// tests were written for this debt before this one and **both passed with the mechanism removed** —
+/// they are not in this file. The window is reachable by *contention*, which is how run 66 found the
+/// original as ~100 spurious `40001`s in 1,200 transactions.
+///
+/// # What it detects, measured rather than asserted
+///
+/// The window is **rare**. Removing `StoreTxn::changed_since_statement` and running this:
+///
+/// | size | without the override | with it |
+/// |---|---|---|
+/// | 4 × 15 | 0 refusals, 3/3 green | 3/3 green — **detects nothing** |
+/// | 8 × 50 | 1 refusal in 400, fails ~1 run in 2 | **4/4 green, 0 refusals** |
+///
+/// So it never fails while the mechanism is there, and catches its absence about half the time — a
+/// guard rather than a proof, and the size is what buys that. Three smaller scripted tests were
+/// written first and every one passed with the mechanism removed; they are not in this file,
+/// because a test that cannot fail for the reason it names is worse than no test.
+///
+/// **The count is refusals, not lost updates.** A lost update cannot happen here: the per-key read
+/// stamp (ADR 0057 §4) makes first-committer-wins refuse a write computed from a stale value, so
+/// the cost of the missing check is a `40001` nobody needed rather than a wrong answer. Asserting
+/// the total alone hid that — the first version of this test filtered on `is_ok()` and threw the
+/// evidence away.
+#[test]
+fn concurrent_increments_do_not_lose_one_against_real_stores() {
+    const WRITERS: usize = 8;
+    const EACH: usize = 50;
+
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE counter (id bigint primary key, n bigint)")
+        .unwrap();
+    setup.run("INSERT INTO counter VALUES (1, 0)").unwrap();
+
+    let committed: Vec<(usize, usize)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let cluster = &cluster;
+                scope.spawn(move || {
+                    let mut session = cluster.session();
+                    // PostgreSQL's own default: wait for the writer in front rather than give up.
+                    session.run("SET lock_timeout = 0").unwrap();
+                    let mut refused = 0_usize;
+                    let wins = (0..EACH)
+                        .filter(|_| {
+                            match session.run("UPDATE counter SET n = n + 1 WHERE id = 1") {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    // **`40001` is the thing being counted.** A writer that
+                                    // took the lock at once and did not notice the holder in
+                                    // front had just committed computes from a stale value,
+                                    // and first-committer-wins refuses it at prewrite — a
+                                    // refusal nobody needed, for a statement that could
+                                    // simply have re-run.
+                                    refused += usize::from(error.sqlstate() == "40001");
+                                    false
+                                }
+                            }
+                        })
+                        .count();
+                    (wins, refused)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let wins: usize = committed.iter().map(|(won, _)| won).sum();
+    let refused: usize = committed.iter().map(|(_, refused)| refused).sum();
+    let mut reader = cluster.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM counter WHERE id = 1"),
+        [[Some(wins.to_string())]],
+        "{wins} increments committed and the row must hold every one of them; a smaller number is \
+         a lost update — a statement that re-ran and computed from the value it read before the \
+         writer in front of it committed"
+    );
+    // **And nothing was refused for no reason**, which is the debt itself. Without
+    // `changed_since_statement` on this path a writer that took the lock at once cannot tell that
+    // the holder in front had committed, computes from the stale value, and is refused at prewrite
+    // — run 66 measured ~100 of those in 1,200 transactions. With it the statement re-runs instead.
+    assert_eq!(
+        refused,
+        0,
+        "{refused} of {} increments were refused with 40001; every one is a statement that could \
+         have re-read and re-run",
+        WRITERS * EACH
+    );
+}
