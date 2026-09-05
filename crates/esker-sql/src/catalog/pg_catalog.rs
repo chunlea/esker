@@ -1987,6 +1987,35 @@ pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 15] = [
     (871, "upper", "25", 25, "i"),
 ];
 
+/// Whether an **explicit** cast exists between two types.
+///
+/// Two rules, and the second is the one reasoning misses. Measured on 19beta1:
+///
+/// ```text
+/// pg_cast rows for text -> integer   0      '42'::text::integer      42
+/// pg_cast rows for date -> integer   0      '2020-01-01'::date::int  42846 cannot cast type date to integer
+/// ```
+///
+/// **A `pg_cast` row licenses a cast, and so does either side being a string type** — that second
+/// one is PostgreSQL's *I/O conversion*, which exists for every pair where one end has a text
+/// form to go through, and it is why `text -> integer` works with no row at all. Without it this
+/// refused `txt::integer`, which is the commonest cast in any suite.
+///
+/// The categories come from `typcategory` rather than a list written here, so "which types are
+/// strings" is answered once. `castcontext` is not read: explicit is the widest of the three, so
+/// any row licenses one.
+#[must_use]
+pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
+    // A type always casts to itself, which `pg_cast` does not list.
+    if from == to || typcategory(from) == "S" || typcategory(to) == "S" {
+        return true;
+    }
+    let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
+    CASTS
+        .iter()
+        .any(|(source, target, _, _)| *source == from && *target == to)
+}
+
 /// One `pg_cast` row per cast this node's types have between them.
 fn pg_cast_rows() -> Vec<Vec<Datum>> {
     CASTS

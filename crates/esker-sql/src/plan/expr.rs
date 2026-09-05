@@ -376,6 +376,27 @@ pub enum Expr {
         /// Its argument.
         operand: Box<Expr>,
     },
+    /// `expr::<type>` where the value is not known until there is a row, and the target is not
+    /// `text`.
+    ///
+    /// **`text` has [`Expr::ToText`] and every other target had nothing**, so a cast folded when
+    /// its operand was a constant and was `0A000` otherwise — `SELECT $1::integer` is the shape
+    /// `connection_test.rb` sends, and `CURRENT_TIMESTAMP::date` is the one
+    /// `tests/assignment_cast_date.rs` has carried as a declared divergence since the array unit.
+    ///
+    /// **Permission comes from `pg_cast`**, the same rows a client can read: a pair with no row
+    /// there is `42846 cannot cast type X to Y`, which is what `'2020-01-01'::date::int` is on a
+    /// real server. The conversion itself is the target's input function over the value's text,
+    /// which is PostgreSQL's own I/O conversion for a cast with no binary function.
+    Cast {
+        /// What to cast.
+        operand: Box<Expr>,
+        /// The type it is being cast to.
+        to: ColumnType,
+        /// Its `atttypmod`, or `-1` — so `$1::varchar(3)` bounds the string the way a column of
+        /// that type would.
+        typmod: i32,
+    },
     /// `<expr>::text`, evaluated per row.
     ///
     /// The **output function** of whatever the operand turns out to be, which is what a cast to
@@ -2359,6 +2380,7 @@ pub fn regex_operator(negated: bool, case_insensitive: bool) -> &'static str {
 fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::ToText { .. } => "a cast to text",
+        Expr::Cast { .. } => "a cast",
         Expr::Array { .. } => "an ARRAY constructor",
         Expr::Scalar { func, .. } => func.name(),
         Expr::Literal(_) => "a literal",
