@@ -707,3 +707,100 @@ fn an_explicit_id_does_not_move_the_sequence() {
         "`PostgresqlRange.first` is the created row"
     );
 }
+
+/// **A re-created sequence must start at 1 even while another session is drawing from it.**
+///
+/// r1's node-side capture (run 86) narrowed `range_test.rb#test_infinity_values` to a race:
+/// twenty isolated `DROP`/`CREATE` cycles all give id 1, and only under concurrent activity from
+/// another pass did a cycle come up **already advanced by exactly one block** — `33 = 1 + 32`, and
+/// once `737`. Never on a quiet node. `ActiveRecord`'s pool is what supplies that concurrency in
+/// the file, which is why the test passes alone and fails inside it.
+///
+/// So the shape here is a cycle of `DROP TABLE` + `CREATE TABLE` on one connection while others
+/// keep inserting, and the assertion is the one PostgreSQL always satisfies: **the first id after
+/// a `CREATE` is 1**. A block reserved against the old sequence, or against the new one before its
+/// stored counter was written, is what would make it 33.
+///
+/// The writers are expected to fail — their table disappears under them — so their errors are
+/// counted rather than asserted; what must never happen is a *created* row numbered above the
+/// fixtures.
+#[test]
+fn a_re_created_sequence_starts_at_one_under_concurrency() {
+    let cluster = Cluster::start();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let advanced: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        // Four writers, which is `ActiveRecord`'s pool minus the one doing the schema change.
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let mut writer = cluster.session();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Every outcome is fine — the table comes and goes underneath this — and the
+                    // point of the thread is the `nextval` traffic, not its success.
+                    let _ = writer.run("INSERT INTO cyc (note) VALUES ('w')");
+                }
+            });
+        }
+
+        // **The stop flag is set on every path**, including a panic: `thread::scope` joins while
+        // unwinding, so a failure that left the writers spinning would turn an assertion into a
+        // hang rather than a report.
+        let cycles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ddl = cluster.session();
+            for round in 0..40 {
+                ddl.run("DROP TABLE IF EXISTS cyc").unwrap();
+                ddl.run("CREATE TABLE cyc (id bigserial PRIMARY KEY, note text)")
+                    .unwrap();
+                // Tolerated, not asserted: with four writers churning the same table this
+                // connection's own statement can lose a race on the catalog and come back
+                // `42P01`. A round that could not be measured is skipped rather than failed —
+                // what is being looked for is a *wrong id*, and a round with no id in it has
+                // none.
+                if ddl.run("INSERT INTO cyc (note) VALUES ('ddl')").is_err() {
+                    continue;
+                }
+                // **The signature is a whole block, not a gap.** A statement that fails after
+                // drawing `nextval` burns its value on a real server too, and the writers here
+                // fail constantly — their table is being dropped under them — so small gaps are
+                // ordinary and `max(id) > count(*)` catches those rather than the defect.
+                //
+                // What a block outliving its sequence produces is different in kind: the *first*
+                // row in a fresh table numbered `1 + SEQUENCE_BATCH`. r1 saw exactly `33`, and
+                // once `737`. So the invariant is on the **minimum** id, and the threshold is one
+                // block: burned values move it by ones, a stale reservation moves it by 32.
+                let Ok(Outcome::Rows { rows: shape, .. }) = ddl.run("SELECT min(id) FROM cyc")
+                else {
+                    continue;
+                };
+                let Some(Some(min)) = shape.first().and_then(|row| row.first()) else {
+                    continue;
+                };
+                let min = String::from_utf8_lossy(min).parse::<i64>().unwrap_or(1);
+                let batch = i64::try_from(esker_sql::catalog::SEQUENCE_BATCH).unwrap_or(32);
+                if min > batch {
+                    advanced
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(format!(
+                            "round {round}: the lowest id in a fresh table is {min}, more than \
+                             one block ({batch}) in — a reservation outlived its sequence"
+                        ));
+                }
+            }
+        }));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(panic) = cycles {
+            std::panic::resume_unwind(panic);
+        }
+    });
+
+    let advanced = advanced
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        advanced.is_empty(),
+        "a re-created sequence came up already advanced, which is the file's failure:\n{}",
+        advanced.join("\n")
+    );
+}
