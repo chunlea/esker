@@ -1244,16 +1244,31 @@ fn money_as_numeric(cents: i64) -> esker_keys::numeric::Numeric {
 /// The order of the checks is PostgreSQL's, and it is observable: the **pair** is rejected before
 /// any row is read (`42804` with the `USING` to write), the **default** before that (`42804`
 /// naming the default), and only then can a row fail on its own value.
+/// The four things `ALTER COLUMN … TYPE` carries, together because they are one clause.
+struct TypeChange<'a> {
+    /// The target type.
+    ty: ColumnType,
+    /// Its `atttypmod`, or `-1`.
+    typmod: i32,
+    /// The type a `USING` casts the column to, when the statement wrote one.
+    using: Option<ColumnType>,
+    /// The collation the statement named, or `None` to take the new type's own.
+    collation: Option<&'a str>,
+}
+
 fn set_column_type(
     txn: &mut dyn Txn,
     executor: &Executor,
     updated: &mut TableDef,
     column: &str,
-    ty: ColumnType,
-    typmod: i32,
-    using: Option<ColumnType>,
-    collation: Option<&str>,
+    change: &TypeChange<'_>,
 ) -> Result<()> {
+    let &TypeChange {
+        ty,
+        typmod,
+        using,
+        collation,
+    } = change;
     let at = updated
         .column(column)
         .ok_or_else(|| SqlError::UndefinedColumnInRelation {
@@ -5398,10 +5413,12 @@ pub(super) fn alter_table(
                 executor,
                 &mut updated,
                 column,
-                *ty,
-                *typmod,
-                *using,
-                collation.as_deref(),
+                &TypeChange {
+                    ty: *ty,
+                    typmod: *typmod,
+                    using: *using,
+                    collation: collation.as_deref(),
+                },
             )?;
             changed = true;
             continue;

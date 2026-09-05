@@ -196,21 +196,29 @@ impl Parsed {
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }
-        // The `COLLATE` an `ALTER COLUMN … TYPE` named, which came off the source so the statement
-        // would parse. Decided here and not in the strip, so that a name this node does not have
-        // is the same `42704` a `CREATE TABLE` gives it, and a type with no ordering the same
-        // `42804` — one rule for the clause, wherever it is written.
-        if let Some(written) = self.alter_column_collation()
-            && let plan::Statement::AlterTable(alter) = &mut lowered
-        {
-            for action in &mut alter.actions {
-                if let plan::AlterTableAction::SetColumnType { ty, collation, .. } = action {
-                    *collation = Some(collation_text(written, *ty)?);
-                }
-            }
+        if let Some(written) = self.alter_column_collation() {
+            apply_alter_collation(&mut lowered, written)?;
         }
         Ok(lowered)
     }
+}
+
+/// The `COLLATE` an `ALTER COLUMN … TYPE` named, which came off the source so the statement would
+/// parse (`crate::parse::strip_alter_column_collation`).
+///
+/// Decided here and not in the strip, so that a name this node does not have is the same `42704` a
+/// `CREATE TABLE` gives it and a type with no ordering the same `42804` — one rule for the clause,
+/// wherever it is written.
+fn apply_alter_collation(lowered: &mut plan::Statement, written: &str) -> Result<()> {
+    let plan::Statement::AlterTable(alter) = lowered else {
+        return Ok(());
+    };
+    for action in &mut alter.actions {
+        if let plan::AlterTableAction::SetColumnType { ty, collation, .. } = action {
+            *collation = Some(collation_text(written, *ty)?);
+        }
+    }
+    Ok(())
 }
 
 /// The collation a `COLLATE` names, if this node has it.
