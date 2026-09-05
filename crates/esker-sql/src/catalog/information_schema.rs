@@ -328,8 +328,9 @@ pub fn table_constraints(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> 
     // One snapshot for the constraint rows *and* for the table each names, rather than one read
     // per row: this is a view over a view, and the catalog underneath is read once.
     let relations = Relations::read(txn, tenant)?;
+    let schemas = super::schemas(txn, tenant)?;
     let mut rows = Vec::new();
-    for row in super::pg_constraint::rows_from(&relations) {
+    for row in super::pg_constraint::rows_from(&relations, &schemas) {
         let (Some(Datum::Text(name)), Some(Datum::Text(contype))) = (row.get(1), row.get(3)) else {
             continue;
         };

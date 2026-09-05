@@ -477,7 +477,17 @@ pub fn default_expression(column: &ColumnDef, table: &TableDef, at: usize) -> Op
         return match sequence.identity {
             // `nextval('ca_id_seq'::regclass)`, exactly as a real server prints it — the cast
             // included, which is what `ActiveRecord`'s `pk_and_sequence_for` matches on.
-            Identity::Default => Some(format!("nextval('{}'::regclass)", sequence.name)),
+            //
+            // **Through `display_name`, because the stored name is not the printed one.** A
+            // sequence outside `public` is stored `schema NUL name`, and interpolating that raw
+            // put the separator byte into a client's output — `ActiveRecord`'s schema dump printed
+            // it inside the `nextval`. Measured, a real server prints a dot:
+            // `nextval('g1_ns.t_id_seq'::regclass)`. Invisible in `public`, where the stored name
+            // is bare and the two forms are the same string.
+            Identity::Default => Some(format!(
+                "nextval('{}'::regclass)",
+                super::display_name(&sequence.name)
+            )),
             Identity::ByDefault | Identity::Always => None,
         };
     }

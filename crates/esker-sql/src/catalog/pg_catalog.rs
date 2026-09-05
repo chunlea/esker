@@ -1251,7 +1251,7 @@ const PUBLIC_NAMESPACE_OID: i64 = 11;
 /// `public`'s is fixed the way a real server fixes it; every other schema's is the id its record
 /// was allocated. A name with no schema — nothing can produce one — falls back to `public`, which
 /// is the answer that cannot mislead.
-fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
+pub(super) fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
     schemas
         .iter()
         .find(|(name, _)| name == schema)

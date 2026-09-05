@@ -187,18 +187,18 @@ fn check_of(oid: i64) -> Option<(u64, usize)> {
 /// Two neighbouring catalogs spell "no value" two different ways.
 const NO_FOREIGN_ACTION: &str = " ";
 
-/// The one schema, and the id `pg_constraint.connamespace` points at — `pg_class.relnamespace`'s.
-const PUBLIC_NAMESPACE_OID: i64 = 11;
-
 /// Every `pg_constraint` row this tenant has.
 pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
-    Ok(rows_from(&Relations::read(txn, tenant)?))
+    Ok(rows_from(
+        &Relations::read(txn, tenant)?,
+        &super::schemas(txn, tenant)?,
+    ))
 }
 
 /// The same, over a snapshot somebody else has already read — which is how
 /// `information_schema.table_constraints` gets these rows without a second scan of the catalog.
 #[must_use]
-pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
+pub fn rows_from(relations: &Relations, schemas: &[(String, u64)]) -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
         let Some(table) = relations.table(relation) else {
@@ -208,7 +208,14 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
             rows.push(vec![
                 Datum::Int8(constraint.oid),
                 Datum::Text(constraint.name),
-                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                // **The schema the constrained table is in**, not a constant. `ActiveRecord`'s
+                // `exclusion_constraints` joins `pg_namespace` on *this* column and filters
+                // `t.relname = 'invoices' AND n.nspname = 'public'`, so a constant `public` made a
+                // constraint on `test_schema.invoices` answer to the public lookup: the suite's
+                // `test_exclusion_constraints_scoped_to_schemas` counted 2 where a real server
+                // counts 1. The capture said so before the code did — "the lookup has to be
+                // schema-aware rather than by relname".
+                Datum::Int8(super::pg_catalog::namespace_oid(schemas, &relation.schema)),
                 Datum::Text(constraint.contype.to_owned()),
                 // **Two flags, not one.** `condeferrable` is whether the constraint *may* be
                 // deferred and `condeferred` is whether it starts that way: `t`/`f` for
@@ -255,7 +262,7 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
             ]);
         }
     }
-    rows.extend(domain_constraint_rows(relations));
+    rows.extend(domain_constraint_rows(relations, schemas));
     rows
 }
 
@@ -265,7 +272,7 @@ pub fn rows_from(relations: &Relations) -> Vec<Vec<Datum>> {
 /// `contypid` naming the domain — measured, `ds_ci_check|c`. Without a row the constraint existed
 /// and was enforced and could not be found in the catalog, which is the state a schema dumper
 /// reads as "no constraint".
-fn domain_constraint_rows(relations: &Relations) -> Vec<Vec<Datum>> {
+fn domain_constraint_rows(relations: &Relations, schemas: &[(String, u64)]) -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for def in relations.user_types() {
         let super::TypeKind::Domain { check: Some(_), .. } = &def.kind else {
@@ -278,7 +285,12 @@ fn domain_constraint_rows(relations: &Relations) -> Vec<Vec<Datum>> {
             // so the two cannot collide, and it is the arrangement a primary key already has.
             Datum::Int8(oid),
             Datum::Text(format!("{bare}_check")),
-            Datum::Int8(PUBLIC_NAMESPACE_OID),
+            // A domain's constraint lives in the domain's schema, by the same rule the table
+            // constraints above follow.
+            Datum::Int8(super::pg_catalog::namespace_oid(
+                schemas,
+                super::split_qualified(&def.name).0,
+            )),
             Datum::Text("c".to_owned()),
             Datum::Bool(false),
             Datum::Bool(false),
