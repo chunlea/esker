@@ -7,9 +7,10 @@ and [`docs/plans/phase-16-mpp.md`](../plans/phase-16-mpp.md) §10 is the verdict
 Not a gate. `CLAUDE.md` keeps benchmarks runnable and recorded so regressions are visible, and out
 of the test gate so nobody tunes before correctness is proven.
 
-> **Status: method fixed, no numbers yet.** The driver is built, gated and committed; the run is
-> blocked on a defect outside this lane — see [§6](#6-why-run-1-is-empty). This file records the
-> method *before* the numbers deliberately: a measurement whose method is written afterwards is a
+> **Status: run 1 taken, and it found something bigger than the number it went looking for.**
+> Numbers in [§7](#7-run-1--2026-09-05); the finding that decides the verdict is
+> [§8](#8-why-there-is-no-fragment-axis-and-what-that-means). This file records the method
+> *before* the numbers deliberately: a measurement whose method is written afterwards is a
 > measurement whose method was chosen by its results.
 
 ## 1. The question, stated so it can be wrong
@@ -189,3 +190,98 @@ coordinator's `scratchpad/pgwire-cluster-repro.md`.
 `esker bench-mpp` is what found it, which is the one useful thing to say about a benchmark that has
 not produced a number: the first thing it asserts is that a real SQL node over a real cluster
 answers `SELECT 1`, and that assertion is what turned red.
+
+
+## 7. Run 1 — 2026-09-05
+
+| field | value |
+|---|---|
+| commit | `09477207`, containing main `78ff5b70` |
+| binaries | `cargo build --release -p esker-cli -p esker-sql`, in the container |
+| machine | aarch64 Linux container, MemTotal 15.7 GiB, cgroup limit **max (uncapped)**, 16 CPUs |
+| cluster | 4 stores, 1 placement driver, 1 SQL node, all child processes on loopback |
+| heartbeats | region 60 s, tick 1 s — the shipped defaults, which is what `esker cluster start` uses |
+| rows | 200,000, loaded in 44 statements of 5,000 at **2,152 rows/s** |
+| groups | 32 (`g32`), 20,000 (`ghigh`) |
+| repeats | 3, interleaved, after one discarded warm-up pass |
+| load average | **5.94 at the start, 1.59 at the end** — inside a quiet window the coordinator held other lanes out of |
+
+The join is not in this set (`--no-join`): at this size it costs tens of seconds against the
+aggregates' tens of milliseconds, and it cannot reach the columnar path at all, so under a time
+budget it is the first thing to drop. Its shape is recorded in §7c from the 40,000-row pilot.
+
+### 7a. The numbers
+
+Every row is the median of 3 runs, and every routed row was asserted by `EXPLAIN ANALYZE` to have
+actually run on the columns.
+
+| query | engine | wall median | wall min–max | SQL-node CPU | stores' CPU | loopback bytes |
+|---|---|---|---|---|---|---|
+| `control-scan` | columnar | **0.019 s** | 0.018–0.020 | 0.00 s | 0.01 s | 6.4 KiB |
+| `control-scan` | rows | 6.610 s | 6.576–6.628 | 0.10 s | 7.00 s | 20.6 MiB |
+| `group-low` (32) | columnar | **0.030 s** | 0.029–0.036 | 0.00 s | 0.03 s | 8.0 KiB |
+| `group-low` (32) | rows | 6.633 s | 6.598–6.809 | 0.11 s | 7.00 s | 20.6 MiB |
+| `group-high` (20,000) | columnar | **0.055 s** | 0.055–0.057 | 0.01 s | 0.04 s | 1013.2 KiB |
+
+A second point taken immediately afterwards, at a 4 MiB region-split size instead of 512 MiB,
+reproduced it to the millisecond — 0.018 / 0.030 / 0.054 s, 6.4 KiB / 8.0 KiB / 1013.5 KiB. That
+agreement is a **reproducibility check and not a second data point**, for the reason §8 gives.
+
+### 7b. What the decomposition says
+
+The three columnar rows hold the rows scanned and the columns projected constant and vary only the
+number of groups, so the differences are the cardinality-dependent cost and nothing else:
+
+```text
+1 group        19 ms      6.4 KiB shipped
+32 groups      30 ms      8.0 KiB          +11 ms, +1.6 KiB
+20,000 groups  55 ms   1013.2 KiB          +25 ms, +1005 KiB over 32 groups
+                                           +36 ms, +1007 KiB over one group
+```
+
+**The entire cardinality-dependent cost of a 20,000-group aggregate over 200,000 rows is 36 ms**,
+and the SQL node's own CPU inside the whole 55 ms is 0.01 s — at the 10 ms clock tick, so it is
+*at most* 10 ms and the instrument cannot say less. Shipping is **≈50 bytes a group** (1,007 KiB
+over 20,000 groups), which is the quantity an exchange redistributes rather than removes.
+
+The control moves not at all across the three: 0.019 s with one group, and 0.018 s in the repeat
+point. That is what says the run measured the query rather than the machine.
+
+### 7c. The other half, which cuts the other way
+
+Columnar against rows at this size is **6.610 s → 0.019 s**, about 350×, and 20.6 MiB shipped
+against 6.4 KiB. That is not a claim about columnar storage in general and must not be quoted as
+one: the row arm is a full `SeqScan` through the MVCC layer returning one aggregate row, which is
+the shape ADR 0022 exists to fix, and `docs/bench/columnar-m2.md` records the other direction — a
+scan that reads *every* column is **slower** columnar than row-wise.
+
+The join, from the 40,000-row pilot: 8.1 s and 7.7 s on the two arms, identical because
+`esker.engine` cannot move it — 1.2 s of SQL-node CPU against 10.7 s of stores' CPU. It runs on
+rows whatever the session says.
+
+## 8. Why there is no fragment axis, and what that means
+
+**Every point in §7 has one region and one fragment**, and that is not for want of asking. The two
+points differ only in `--region-split-size`, 512 MiB against 4 MiB, over roughly 20 MB of table.
+Both answered `| regions | 1 | with a columnar learner | 1 |`. The threshold made no difference
+because the size being compared against it is **zero**:
+
+* `esker pd inspect` reports the region holding 200,000 rows as `~0 bytes`;
+* `esker_store::split::approximate_size` (`crates/esker-store/src/split.rs:174`) measures
+  `db.approximate_size(cf::DEFAULT, ['r' ++ start, 's'))` — the **RawKV** namespace,
+  `esker_keys::prefix::RAW = b'r'`, in the **default** column family;
+* SQL rows are written under **`prefix::TXN = b'x'`** by the Percolator layer, into the `write` and
+  `default` column families — which `docs/bench/columnar-learner.md`'s own WAL dump shows as
+  `cf=2 Put "xt…"`.
+
+So a region holding nothing but SQL data measures as empty, never crosses any threshold at any
+setting, and never splits. The boundary search beneath it has the same shape: `split.rs:115` finds
+its split key by `strip_prefix(&[prefix::RAW])`.
+
+**The consequence for this ADR is larger than the missing axis.** MPP exchange shuffles
+intermediate results *between* columnar nodes, and a SQL table that is always one region always has
+exactly one fragment — so there is nothing to shuffle, at any data size, for any query. Milestone 5
+is unreachable from SQL until a SQL table can occupy more than one region.
+
+This is `esker-store`'s and is escalated rather than acted on: a measurement must not change what it
+measures, and this lane does not own that crate.

@@ -15,9 +15,9 @@ would be if it is built, worked out far enough that the verdict is a decision ab
 rather than about a guess. The **verdict** is what decides whether any of it is built, and it is
 written from `docs/bench/mpp-baseline.md` and from nothing else.
 
-> **Status: design drafted, verdict open.** §9 and §10 are `TODO` and are the two sections that
-> matter. The benchmark that fills them is built and committed (`esker bench-mpp`, 961d7ba0); the
-> run is blocked on a defect outside this lane, recorded in §9.
+> **Status: measured, and the verdict is `not yet` — see §10.** The exchange is not built, and the
+> reason is not a close call: a SQL table never occupies more than one region today, so there is
+> never more than one fragment to shuffle between.
 
 ## 1. What is already true, and is easy to misread
 
@@ -307,21 +307,24 @@ protocol, red, so that the protocol is what makes it green.
 * **No change to `esker-raft` or `esker-engine`.** Same as ADR 0022's own list: the exchange is a
   plan-layer thing on a wire, and neither of those crates learns what a partition is.
 
-## 9. TODO — the measurement
+## 9. The measurement
 
-**Blocked, not skipped.** The driver is built, gated and committed (`esker bench-mpp`, 961d7ba0):
-it starts a placement driver, N stores and a SQL node, loads a seeded seven-column table, asks for
-a columnar copy with the user's own `ALTER TABLE`, and times four queries on both engines,
-interleaved — a filtered scan with one output row (the control that no exchange can help), a
-`GROUP BY` at 32 groups, a `GROUP BY` at high cardinality, and a join. The engine is asserted from
-`EXPLAIN ANALYZE` on every run and the row count on both arms.
+`docs/bench/mpp-baseline.md` §7 has the numbers and the exact commands. In one screen: 200,000
+rows, 20,000 groups, one region, three repeats interleaved, on a quiet machine (load 5.94 falling
+to 1.59) inside a window the coordinator held other lanes out of.
 
-It cannot run yet: **`esker-sql` panics on every connection when it has real store addresses**, at
-`pgwire/server.rs`'s `for_session` on a tokio worker thread. Present at `v1.0.0` by inspection,
-introduced 2026-09-03 by `0510b44e`. Owned by the `h1` lane; the reproduction is
-`scratchpad/pgwire-cluster-repro.md`.
+```text
+columnar, 1 group        19 ms      6.4 KiB shipped
+columnar, 32 groups      30 ms      8.0 KiB
+columnar, 20,000 groups  55 ms   1013.2 KiB
+rows, any of the three  6.6 s      20.6 MiB
+```
 
-`docs/bench/mpp-baseline.md` is where the numbers go, and it is written before this section is.
+Holding rows and columns constant and varying only the group count: **the whole
+cardinality-dependent cost is 36 ms**, of which the SQL node's own CPU is at most 10 ms — the
+clock tick, so the instrument cannot resolve it further. Shipping is about **50 bytes a group**.
+The control does not move (0.019 s, 0.018 s in the repeat), which is what says the machine was not
+what was measured.
 
 ### 9a. What the measurement cannot see, and what milestone 5 owes it
 
@@ -340,29 +343,56 @@ not what a fragment cost. **If milestone 5 is built, the first three rows are pa
 an exchange nobody can measure is an exchange nobody can tune, and the argument for building it
 would be an argument for instrumenting it too.
 
-## 10. TODO — the verdict
+## 10. The verdict
 
-Written from `docs/bench/mpp-baseline.md` and from nothing else, and it is what the coordinator and
-the user decide unit 2 from — **not the length of §1 to §8**. It answers, in order:
+**Not yet — and not because the finish is cheap, though it is. Because there is nothing to shuffle.**
 
-1. **What share of a high-cardinality `GROUP BY`'s wall time is the SQL node's finishing step**,
-   with the absolute seconds beside every share, at each N and each cardinality; and does the
-   control move with it, which is what says the run measured the query and not the machine.
-2. **Is the share the exchange's to take?** §1's second fact says fragments are dispatched
-   serially, so part of what looks like "the SQL node is the bottleneck" is R round trips the SQL
-   node spends *waiting*, which an exchange does not remove and **parallel dispatch does** —
-   a change in `esker-sql` and `esker-client`, no wire change, no shuffle, no spill, and perhaps a
-   day. If the numbers can be explained by the round trips, the answer to milestone 5 is *not
-   yet, and here is a much smaller thing to do first*. Separating the two is what the R-axis and
-   the low-versus-high-cardinality pair are in the benchmark for: the low-cardinality slope in R is
-   the round trips, and what the high-cardinality slope has on top of it is the finish.
-3. **At what scale does it become the exchange's?** A share that is small at 2 million rows and
-   four regions and growing with both is a *later*, with the crossing point named in rows and
-   groups.
-4. **What the join says**, which is a different question with a different answer: it does not run
-   on the columnar path at all today, so its number is about the row engine, and if it is the
-   thing that hurts then §8's first bullet is the next phase and this one is not.
+MPP exchange moves intermediate results *between* columnar nodes, and a fragment is one per region
+(ADR 0040 Decision 4). A SQL table today always occupies exactly **one** region, whatever its size,
+because `esker_store::split::approximate_size` measures the RawKV namespace — `['r'…, 's')` in the
+default column family — while SQL rows live under `'x'` in the Percolator column families. A region
+holding 200,000 rows reports `~0 bytes` to PD and never crosses a split threshold at any setting:
+this measurement asked for four regions with a 4 MiB threshold over ~20 MB of table and got one,
+identical to the run that asked for one with a 512 MiB threshold. So a SQL query has one fragment,
+an exchange has one producer and one consumer, and there is no shuffle to build. **Milestone 5 is
+unreachable from SQL until a SQL table can occupy more than one region**, and that is `esker-store`'s
+work, not this phase's.
 
-The three answers this section may reach are **build it**, **build parallel dispatch instead and
-re-measure**, and **not yet, at this scale, and here is the scale**. It must say which, in a
-paragraph, in plain words.
+Second, and it would be the answer even if regions split tomorrow: **the finish is not where the
+time goes.** At 200,000 rows and 20,000 groups the entire cardinality-dependent cost on the SQL
+node is 36 ms out of a 55 ms query, and the node's own CPU inside it is at most 10 ms. An exchange
+removes some fraction of that 36 ms and none of the other 19. The same query on the row engine
+takes 6.6 seconds — so the thing that made this workload 350× faster was the columnar path
+milestones 1 to 4 already built, and the finish is a rounding error beside it.
+
+Third, **the join is a different question with a different answer, and it is the one worth asking
+next.** It does not reach the columnar path at all, so it has no fragment to be pushed into and no
+shuffle to attach one to; at 40,000 rows it costs 8 seconds against the aggregates' 55
+milliseconds, and `esker.engine` cannot move it. If analytical workloads on this system hurt, the
+join is where — and the next phase is a **join fragment**, not an exchange. §8's first bullet
+already says this; the numbers now say it too.
+
+### What would change this verdict
+
+Named so the next person can check them rather than re-derive them:
+
+1. **A SQL table that splits.** Until then every other line here is moot. It is also the cheapest of
+   the three: the size estimate and the boundary scan both need to see the `'x'` namespace and the
+   Percolator column families.
+2. **A finishing cost that grows past the scan.** The shape to watch is `regions × groups`: at 50
+   bytes and, say, 40 µs a group (36 ms over ~900 groups' worth of measurable difference — an upper
+   bound, since the tick hides the rest), a hundred regions each holding 100,000 groups would ship
+   500 MB into one node and merge ten million partials. That is where an exchange earns its keep,
+   and it is four orders of magnitude from anything this system can currently produce.
+3. **Parallel dispatch first, if regions ever do split.** Fragments are asked one at a time
+   (§1), so R regions cost R round trips before any merging happens. That is `esker-sql` and
+   `esker-client`, no wire change, no shuffle, no spill — and on today's numbers a 25 ms round trip
+   per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
+   parallel dispatch, not before.**
+
+### What this measurement cannot say
+
+It has **one fragment**, so it says nothing about how the finish scales with fragment count — the
+axis the exchange is actually about. That axis was the run's purpose and §8 is why it does not
+exist. Everything above about multi-region behaviour is arithmetic on a single-region measurement,
+and is labelled as such wherever it appears.
