@@ -1,0 +1,21 @@
+crates/esker-client/src/router.rs
+  s_2bed4ac2b1c944::t_bf73b7cb3b66ae 476-479
+crates/esker-client/src/txn.rs
+  s_2bed4ac2b1c944::t_079e3ea3e2fa98 68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2d4f6ef578b8f1c03b26c6a0fa48550379250fd7",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
