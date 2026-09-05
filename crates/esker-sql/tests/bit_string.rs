@@ -57,26 +57,31 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '101'::bit(3)::text, 5::int4::bit(8)",
             "integer -> bit is a conversion, not a reading of the printed digits",
+            "UNMEASURED",
         ),
         // The functions and operators over a bit string, which are one unit and none of it is in
         // the suite: `length`/`octet_length`, the bitwise `& | # ~`, and the shifts.
         (
             "SELECT 'r', length('10101'::bit(5)), octet_length('10101'::bit(5))",
             "the bit-string functions are their own unit",
+            "UNMEASURED",
         ),
         // The same unit, reached through the literal: the `B'1010'` and the `B''` beside it are
         // right and the `length` is what refuses, which is why the whole statement is here.
         (
             "SELECT 'r', B'1010', length(B'1010'), B''",
             "the bit-string functions are their own unit",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', '101'::bit(3) & '110'::bit(3), '101'::bit(3) | '110'::bit(3)",
             "the bitwise operators are their own unit",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', '101'::bit(3) << 1, '101'::bit(3) >> 1",
             "the shift operators are their own unit",
+            "UNMEASURED",
         ),
     ],
 };

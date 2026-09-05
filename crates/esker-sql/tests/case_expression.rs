@@ -24,10 +24,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "PostgreSQL answers 1: the ELSE is not evaluated. This node has no `/` operator, so \
              the statement stops at `0A000 the operator / is not supported` — the short-circuit \
              is not what is missing",
+            "UNMEASURED",
         ),
         (
             "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
             "The mirror of the line above, and the same refusal for the same reason",
+            "UNMEASURED",
         ),
     ],
 };

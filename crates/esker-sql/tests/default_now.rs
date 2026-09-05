@@ -33,12 +33,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              trade rather than anything about these four: `pg_typeof` answers a `regtype` on a \
              real server and `text` here, the same trade `'x'::regtype` makes \
              (`tests/array_subquery.rs`). All four names are the ones a real server prints.",
+            "UNMEASURED",
         ),
         (
             "SELECT CURRENT_TIMESTAMP(0) IS NOT NULL",
             "A precision on the function, which is the same instant rounded. Carrying it needs \
              the precision stored beside the flag, and nothing reads it yet — refused by name \
              rather than silently given full precision.",
+            "UNMEASURED",
         ),
     ],
 };

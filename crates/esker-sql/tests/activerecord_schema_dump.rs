@@ -57,6 +57,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `information_schema.key_column_usage` answers the same question in a shape this node \
              has — `SELECT column_name, ordinal_position … WHERE table_name = 'dumpy'` is `id|1`, \
              three lines above this one in the corpus.",
+            "UNMEASURED",
         ),
         (
             "SELECT t2.oid::regclass::text AS to_table, c.conname AS name FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname",
@@ -65,6 +66,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              before the plan is built and has no per-row form of it. Refused by name. The answer \
              underneath is no rows on both servers, because neither schema has a foreign key — so \
              this is a missing clause in front of an answer that already agrees.",
+            "UNMEASURED",
         ),
     ],
 };

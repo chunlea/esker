@@ -29,6 +29,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              setting past the block that asked for it, which is a wrong answer rather than a \
              missing feature. Nothing in run 57's row sends it — the twelve refusals are all \
              `SET SESSION AUTHORIZATION`.",
+            "pg19_set_session.txt:44",
         ),
         (
             "RESET SESSION search_path",
@@ -36,6 +37,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              server either, so the two statements are deliberately not symmetrical. Only the \
              sentence differs — PostgreSQL's parser says `syntax error at or near \"search_path\"` \
              and `sqlparser` 0.62.0 lists the tokens it expected.",
+            "pg19_set_session.txt:53",
         ),
         (
             "SELECT 'r', current_user, session_user",
@@ -44,6 +46,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              nobody created. It is the same absence `SET SESSION AUTHORIZATION` reports below and \
              the same one `CREATE DATABASE … OWNER` reports, and the feature that closes all three \
              is `CREATE USER` — which is what `schema_authorization_test.rb` actually needs.",
+            "pg19_set_session.txt:56",
         ),
         (
             "SET SESSION AUTHORIZATION esker",
@@ -54,6 +57,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              is true of *every* name here. On the oracle `esker` is the connected superuser, so \
              the same statement succeeds there. `DEFAULT` — which is what `set_session_auth` sends \
              between each named user — agrees on both sides.",
+            "pg19_set_session.txt:57",
         ),
         (
             "SET LOCAL SESSION AUTHORIZATION esker",
@@ -61,6 +65,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              keyword before a parameter assignment and not before `SESSION AUTHORIZATION`, so the \
              statement does not parse at all. The two words after it are the ones this node has an \
              answer for, and the answer is the one above.",
+            "pg19_set_session.txt:64",
         ),
     ],
 };

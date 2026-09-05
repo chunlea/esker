@@ -1,0 +1,95 @@
+# `ALTER TABLE … DROP CONSTRAINT` — the one statement four AR methods end in.
+#
+# **Run 50 ranking: `ALTER TABLE … DROP CONSTRAINT is not supported`, 17 tests over 4 files.**
+# `remove_check_constraint`, `remove_foreign_key`, `remove_unique_constraint` and
+# `remove_exclusion_constraint` all render through `schema_creation.rb:101` —
+# `"DROP CONSTRAINT #{quote_column_name(name)}"` — inside an `ALTER TABLE`.
+#
+# Things reasoning would get wrong:
+#
+# * **A unique *index* is not a unique *constraint*.** `CREATE UNIQUE INDEX` makes something
+#   `DROP CONSTRAINT` cannot remove (`42704`) and `DROP INDEX` can; `ADD CONSTRAINT … UNIQUE` makes
+#   something that owns an index which `DROP INDEX` **refuses** (`2BP01`, "use ALTER TABLE … DROP
+#   CONSTRAINT instead"). Two objects that look identical in `pg_indexes` and behave oppositely.
+# * **Dropping a unique or primary key constraint drops its index with it**, silently.
+# * **A primary key another table references cannot be dropped without `CASCADE`** (`2BP01`), and the
+#   cascade takes the *foreign key* with it — the referencing table keeps its column.
+# * **`DROP CONSTRAINT IF EXISTS` succeeds on nothing**, which is what makes AR's idempotent
+#   migrations work; the bare form is `42704`.
+# * **`NOT NULL` IS a constraint you can drop this way in PostgreSQL 19**, and that is worth saying
+#   plainly because it was not always true and this capture was written expecting the opposite. Every
+#   `NOT NULL` has its own `pg_constraint` row — `contype = 'n'`, named `<table>_<column>_not_null`,
+#   rendered by `pg_get_constraintdef` as `NOT NULL <column>` — so
+#   `ALTER TABLE … DROP CONSTRAINT "dcp_code_not_null"` succeeds and clears `attnotnull`. The older
+#   spelling `ALTER COLUMN … DROP NOT NULL` still works and is what AR sends. An implementation whose
+#   `pg_constraint` has no `'n'` rows answers AR's constraint queries with a short list and cannot
+#   drop one by name.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` line after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE dcp (id serial primary key, code character varying(255) NOT NULL, qty integer)		-
+CREATE TABLE dcc (id serial primary key, dcp_id integer, price integer)		-
+ALTER TABLE dcp ADD CONSTRAINT dcp_code_uq UNIQUE (code)		-
+ALTER TABLE dcp ADD CONSTRAINT dcp_qty_check CHECK (qty >= 0)		-
+ALTER TABLE dcc ADD CONSTRAINT fk_dcc_dcp FOREIGN KEY (dcp_id) REFERENCES dcp (id)		-
+CREATE UNIQUE INDEX index_dcc_on_price ON dcc (price)		-
+SELECT 'r', conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid IN ('"dcp"'::regclass, '"dcc"'::regclass) ORDER BY conname		r|dcc_id_not_null|n|NOT NULL id ; r|dcc_pkey|p|PRIMARY KEY (id) ; r|dcp_code_not_null|n|NOT NULL code ; r|dcp_code_uq|u|UNIQUE (code) ; r|dcp_id_not_null|n|NOT NULL id ; r|dcp_pkey|p|PRIMARY KEY (id) ; r|dcp_qty_check|c|CHECK ((qty >= 0)) ; r|fk_dcc_dcp|f|FOREIGN KEY (dcp_id) REFERENCES dcp(id)
+SELECT 'r', indexname FROM pg_indexes WHERE tablename IN ('dcp','dcc') ORDER BY indexname	text,name	r|dcc_pkey ; r|dcp_code_uq ; r|dcp_pkey ; r|index_dcc_on_price
+# ---- a CHECK: the plain case ----
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_qty_check"		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conname = 'dcp_qty_check'	text,bigint	r|0
+# ---- a UNIQUE constraint takes its index with it ----
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_code_uq"		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conname = 'dcp_code_uq'	text,bigint	r|0
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dcp' ORDER BY indexname	text,name	r|dcp_pkey
+# ---- a FOREIGN KEY, which is what remove_foreign_key sends ----
+ALTER TABLE "dcc" DROP CONSTRAINT "fk_dcc_dcp"		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conname = 'fk_dcc_dcp'	text,bigint	r|0
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"dcc"'::regclass AND a.attname = 'dcp_id'		r|dcp_id
+# ---- a unique INDEX is not a constraint ----
+SAVEPOINT c1		-
+ALTER TABLE "dcc" DROP CONSTRAINT "index_dcc_on_price"	!42704 constraint "index_dcc_on_price" of relation "dcc" does not exist
+ROLLBACK TO c1		-
+DROP INDEX index_dcc_on_price		-
+SELECT 'r', count(*) FROM pg_indexes WHERE indexname = 'index_dcc_on_price'	text,bigint	r|0
+# ---- ...and the index a UNIQUE constraint owns cannot be dropped as an index ----
+ALTER TABLE dcp ADD CONSTRAINT dcp_code_uq2 UNIQUE (code)		-
+SAVEPOINT c2		-
+DROP INDEX dcp_code_uq2	!2BP01 cannot drop index dcp_code_uq2 because constraint dcp_code_uq2 on table dcp requires it HINT: You can drop constraint dcp_code_uq2 on table dcp instead.
+ROLLBACK TO c2		-
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_code_uq2"		-
+# ---- a primary key another table references needs CASCADE ----
+ALTER TABLE dcc ADD CONSTRAINT fk_dcc_dcp2 FOREIGN KEY (dcp_id) REFERENCES dcp (id)		-
+SAVEPOINT c3		-
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_pkey"	!2BP01 cannot drop constraint dcp_pkey on table dcp because other objects depend on it DETAIL: constraint fk_dcc_dcp2 on table dcc depends on index dcp_pkey HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO c3		-
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_pkey" CASCADE		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid IN ('"dcp"'::regclass, '"dcc"'::regclass) ORDER BY conname		r|dcc_id_not_null|n ; r|dcc_pkey|p ; r|dcp_code_not_null|n ; r|dcp_id_not_null|n
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"dcc"'::regclass AND a.attname = 'dcp_id'		r|dcp_id
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dcp' ORDER BY indexname	text,name	-
+# ---- the two spellings for something that is not there ----
+SAVEPOINT c4		-
+ALTER TABLE "dcp" DROP CONSTRAINT "nosuchconstraint"	!42704 constraint "nosuchconstraint" of relation "dcp" does not exist
+ROLLBACK TO c4		-
+ALTER TABLE "dcp" DROP CONSTRAINT IF EXISTS "nosuchconstraint"		-
+SAVEPOINT c5		-
+ALTER TABLE "nosuchtable" DROP CONSTRAINT "x"	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO c5		-
+# ---- NOT NULL is a named constraint here, and both spellings remove it ----
+SELECT 'r', conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '"dcp"'::regclass AND contype = 'n' ORDER BY conname		r|dcp_code_not_null|n|NOT NULL code ; r|dcp_id_not_null|n|NOT NULL id
+SELECT 'r', attname, attnotnull FROM pg_attribute WHERE attrelid = '"dcp"'::regclass AND attname = 'code'		r|code|t
+ALTER TABLE "dcp" DROP CONSTRAINT "dcp_code_not_null"		-
+SELECT 'r', attname, attnotnull FROM pg_attribute WHERE attrelid = '"dcp"'::regclass AND attname = 'code'		r|code|f
+SELECT 'r', count(*) FROM pg_constraint WHERE conname = 'dcp_code_not_null'	text,bigint	r|0
+ALTER TABLE "dcp" ALTER COLUMN "code" SET NOT NULL		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '"dcp"'::regclass AND contype = 'n' ORDER BY conname		r|dcp_code_not_null|n ; r|dcp_id_not_null|n
+ALTER TABLE "dcp" ALTER COLUMN "code" DROP NOT NULL		-
+SELECT 'r', attname, attnotnull FROM pg_attribute WHERE attrelid = '"dcp"'::regclass AND attname = 'code'		r|code|f
+DROP TABLE dcc		-
+DROP TABLE dcp		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('dcp','dcc')	bigint	0
+SELECT count(*) FROM pg_constraint WHERE conname LIKE 'dcp_%' OR conname LIKE 'fk_dcc%'	bigint	0

@@ -91,6 +91,8 @@ pub struct Executor {
     /// view would need a second code path for the ones it cannot — which is the thing this change
     /// exists to remove.
     identity: crate::session::Backend,
+    /// Blocks of sequences this transaction dropped, to forget **if** it commits.
+    forget_on_commit: Vec<u64>,
     /// The role this session authenticated as, which `serving_user` sets.
     user: String,
     /// The role `SET SESSION AUTHORIZATION` put it in, or `None` for the one it connected as.
@@ -519,6 +521,9 @@ impl Executor {
             // this statement — so it is forgotten here. Keeping it made a later `BEGIN` inherit a
             // `SET CONSTRAINTS ALL DEFERRED` from a statement that had already finished, and a
             // constraint that was declared immediate stopped checking at the statement.
+            // **The dropped blocks are not forgotten**: the drop did not happen, so the
+            // sequences are still there and so are the reservations they handed out.
+            self.forget_on_commit.clear();
             self.constraints.borrow_mut().clear();
             let _ = txn.rollback();
             outcome?;
@@ -584,6 +589,7 @@ impl Executor {
             let _ = txn.rollback();
             return Err(error);
         }
+        self.forget_the_dropped_blocks();
         let owed = self.constraints.borrow_mut().take();
         for check in &owed {
             if let Err(error) = check.verify(&*txn, self.tenant) {
@@ -678,6 +684,7 @@ impl Executor {
             locks,
             session,
             identity,
+            forget_on_commit: Vec::new(),
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
             user: crate::parse::DATABASE_NAME.to_owned(),
@@ -2064,6 +2071,32 @@ impl Executor {
     /// resetting only the key leaves the session handing out values from inside a block that no
     /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
     /// because a value that was never handed out is not one this session last took.
+    /// Forgets a dropped sequence's block **when the drop commits**, and not before.
+    ///
+    /// Dropping a block is a node-level, non-transactional act: it throws away a reservation the
+    /// stored counter has already advanced past. Doing it inside the statement made a
+    /// **rolled-back** `DROP TABLE` cost a whole batch — the sequence came back with the
+    /// transaction, its counter did not, and the next value was `33` where PostgreSQL gives `2`.
+    ///
+    /// That is `range_test.rb`'s climb. `ActiveRecord` wraps every test in a transaction, so every
+    /// `create_table force: true` burned a block and left the *same* sequence one batch further
+    /// on — `1, 33, 65, 97 …`, one `sequence_id` for the whole file, which is what run 88's
+    /// instrumented pass recorded from inside the allocator.
+    ///
+    /// Deferring costs nothing when the drop does commit: a relation id is never reused
+    /// (`catalog::allocate_id`), so a block belonging to a dropped sequence is unreachable either
+    /// way and forgetting it is only about the memory it holds.
+    pub(super) fn forget_sequence_block_on_commit(&mut self, sequence_id: u64) {
+        self.forget_on_commit.push(sequence_id);
+    }
+
+    /// Applies the deferred forgets — which both commit paths do and neither rollback path does.
+    fn forget_the_dropped_blocks(&mut self) {
+        for sequence_id in std::mem::take(&mut self.forget_on_commit) {
+            self.forget_sequence_block(sequence_id);
+        }
+    }
+
     pub(super) fn forget_sequence_block(&mut self, sequence_id: u64) {
         self.sequences.forget(self.tenant, sequence_id);
         self.currval_defined.remove(&sequence_id);
@@ -3625,6 +3658,7 @@ impl Execute for Executor {
                 }
             }
         }
+        self.forget_the_dropped_blocks();
         self.savepoints.clear();
         let written = std::mem::take(&mut self.written);
         self.catalog_written = false;

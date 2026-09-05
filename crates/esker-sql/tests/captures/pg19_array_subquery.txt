@@ -1,0 +1,98 @@
+# `ARRAY( SELECT … )` — the array **subquery** constructor — as a real PostgreSQL 19beta1 answers it.
+#
+# **This is boot statement 32, the last of `ActiveRecord`'s 36, and it is NOT `ARRAY[…]`.**
+#
+# This lane called statement 32 "the `ARRAY[...]` constructor" in runs 33, 36, 37 and 38. That was
+# wrong, and `540c555` is what exposed it: `8c2a2be` landed the bracket constructor —
+# `SELECT ARRAY[1,2,3]` answers `{1,2,3}` on that node — and **boot stayed at 35/36**, because
+# statement 32 asks for
+#
+#     ARRAY( SELECT pg_get_indexdef(d.indexrelid, k + 1, true)
+#            FROM generate_subscripts(d.indkey, 1) AS k ORDER BY k )
+#
+# which is a different grammar production that still refuses. `pg19_array.txt` covers `ARRAY[…]`
+# thoroughly and has no row for this form; nothing else in the corpus did either — the only mention
+# anywhere was a prose line in `pg19_subquery_activerecord.txt`'s header. Hence this file.
+#
+# The last statement before the table probes is statement 32 **verbatim**, run against a table and
+# two indexes built here, so the whole row `ActiveRecord` expects is pinned and not just the
+# fragment.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. The `\gdesc` pass
+# runs after the rollback, so statements naming `"Quoted"` have an **empty** declared-types column;
+# every expression that stands alone keeps its types, and they are the specification here.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`ARRAY(SELECT …)` over zero rows is `{}`. `array_agg` over zero rows is NULL.** One row in
+#     this file asserts both at once: `array_agg(x) IS NULL` is **`t`** and
+#     `ARRAY(SELECT x …) IS NULL` is **`f`** over the same empty input. This is not a detail — it is
+#     *why* `ActiveRecord` writes statement 32 this way, and an implementation that rewrites
+#     `ARRAY(SELECT …)` into `array_agg` returns NULL where Rails expects an empty array.
+#   * **`array_length('{}', 1)` is NULL, not 0** — so the empty array is not NULL but reports a NULL
+#     length. Two different notions of empty, both observable in one row.
+#   * **`ARRAY(SELECT NULL::int4)` is `{NULL}`, a one-element array** — not `{}` and not NULL.
+#     Three distinguishable results (`{}`, `{NULL}`, NULL) that a naive implementation collapses.
+#   * **`ORDER BY` inside the subquery determines the element order** and is part of the
+#     specification: statement 32's `ORDER BY k` is what makes the column list come out in index
+#     order. `ARRAY(SELECT x … ORDER BY x DESC)` is `{3,2,1}`. `LIMIT` is honoured too.
+#   * **A two-column subquery is `42601 subquery must return only one column`** — and
+#     `ARRAY(SELECT)` with **no** select list gives the *same* error, not a syntax error.
+#   * **`ARRAY(VALUES (1),(2))` is accepted** — the argument is any subquery, not only `SELECT`.
+#   * **Nesting produces a 2-D array and `pg_typeof` still says `integer[]`.**
+#     `ARRAY(SELECT ARRAY(SELECT 1))` is `{{1}}` of type `integer[]`; PostgreSQL does not encode
+#     dimensionality in the type name.
+#   * **The element type is inferred from the subquery's one column**, and a cast applies to the
+#     array as a whole: `ARRAY(SELECT 1)::int8[]` is `{1}` of `bigint[]`.
+#   * **It correlates.** `ARRAY(SELECT q2.id FROM "Quoted" q2 WHERE q2.id <= q1.id ORDER BY q2.id)`
+#     answers `{1}` then `{1,2}` down the outer rows — statement 32 uses exactly this, referencing
+#     `d.indexrelid` and `d.indkey` from the outer join.
+#   * **Statement 32's whole row is pinned here**, and its declared types are
+#     `name, boolean, int2vector, text, text, boolean, text[]` — note `indkey` is an
+#     **`int2vector`** printed `2 3`, and the `columns` column is `text[]` holding `{a,b}`.
+#     `obj_description` on an index with no comment is NULL in the same result set as one that has
+#     a comment.
+BEGIN		-
+SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))	text,integer[],regtype	r|{1}|integer[]
+SELECT 'r', ARRAY(SELECT generate_series(1,3)), pg_typeof(ARRAY(SELECT generate_series(1,3)))	text,integer[],regtype	r|{1,2,3}|integer[]
+SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))	text,text[],regtype	r|{a}|text[]
+SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))	text,integer[],regtype	r|{}|integer[]
+SELECT 'r', ARRAY(SELECT 1 WHERE false) IS NULL, array_length(ARRAY(SELECT 1 WHERE false), 1)	text,boolean,integer	r|f|\N
+SELECT 'r', array_agg(x) IS NULL, ARRAY(SELECT x FROM generate_series(1,0) AS x) IS NULL FROM generate_series(1,0) AS x	text,boolean,boolean	r|t|f
+SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))	text,integer[],integer[]	r|{NULL}|{1,NULL,3}
+SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x ORDER BY x DESC)	text,integer[]	r|{3,2,1}
+SELECT 'r', ARRAY(SELECT x FROM generate_series(1,5) AS x ORDER BY x LIMIT 2)	text,integer[]	r|{1,2}
+SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x), array_agg(x ORDER BY x) FROM generate_series(1,3) AS x	text,integer[],integer[]	r|{1,2,3}|{1,2,3}
+SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])	text,bigint[],regtype	r|{1}|bigint[]
+SELECT 'r', ARRAY(VALUES (1),(2))	text,integer[]	r|{1,2}
+SELECT 'r', ARRAY(SELECT ARRAY(SELECT 1))	text,integer[]	r|{{1}}
+SAVEPOINT s1		-
+SELECT ARRAY(SELECT 1, 2)	!42601 subquery must return only one column
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT ARRAY(SELECT)	!42601 subquery must return only one column
+ROLLBACK TO s2		-
+DROP TABLE IF EXISTS "Quoted"		-
+CREATE TABLE "Quoted" (id int8 PRIMARY KEY, a int4, b text)		-
+CREATE INDEX quoted_a_b_idx ON "Quoted" (a, b DESC)		-
+CREATE UNIQUE INDEX quoted_b_idx ON "Quoted" (b)		-
+COMMENT ON INDEX quoted_a_b_idx IS 'the index comment'		-
+SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid, ARRAY( SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM generate_subscripts(d.indkey, 1) AS k ORDER BY k ) AS columns FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND d.indisprimary = 'f' AND t.relname = 'Quoted' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname	name,boolean,int2vector,text,text,boolean,text[]	quoted_a_b_idx|f|2 3|CREATE INDEX quoted_a_b_idx ON public."Quoted" USING btree (a, b DESC)|the index comment|t|{a,b} ; quoted_b_idx|t|3|CREATE UNIQUE INDEX quoted_b_idx ON public."Quoted" USING btree (b)|\N|t|{b}
+SELECT 'r', ARRAY( SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM generate_subscripts(d.indkey, 1) AS k ORDER BY k ) FROM pg_index d WHERE d.indexrelid = 'quoted_a_b_idx'::regclass		r|{a,b}
+SELECT 'r', pg_typeof(ARRAY( SELECT pg_get_indexdef(d.indexrelid, k + 1, true) FROM generate_subscripts(d.indkey, 1) AS k ORDER BY k )) FROM pg_index d WHERE d.indexrelid = 'quoted_a_b_idx'::regclass		r|text[]
+SELECT 'r', id, ARRAY(SELECT q2.id FROM "Quoted" q2 WHERE q2.id <= q1.id ORDER BY q2.id) FROM "Quoted" q1 ORDER BY id		-
+INSERT INTO "Quoted" VALUES (1,10,'x'), (2,20,'y')		-
+SELECT 'r', id, ARRAY(SELECT q2.id FROM "Quoted" q2 WHERE q2.id <= q1.id ORDER BY q2.id) FROM "Quoted" q1 ORDER BY id		r|1|{1} ; r|2|{1,2}
+SELECT 'r', ARRAY(SELECT b FROM "Quoted" ORDER BY b), array_agg(b ORDER BY b) FROM "Quoted"		r|{x,y}|{x,y}
+SELECT 'r', ARRAY(SELECT id FROM "Quoted" WHERE a > 99), array_agg(id) FROM "Quoted" WHERE a > 99		r|{}|\N
+SELECT 'r', 1 = ANY(ARRAY(SELECT id FROM "Quoted")), 99 = ANY(ARRAY(SELECT id FROM "Quoted"))		r|t|f
+SELECT 'r', array_length(ARRAY(SELECT id FROM "Quoted"), 1), cardinality(ARRAY(SELECT id FROM "Quoted"))		r|2|2
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('Quoted','quoted_a_b_idx','quoted_b_idx')	bigint	0

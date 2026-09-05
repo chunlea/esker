@@ -1,0 +1,82 @@
+# Advisory locks — `pg_try_advisory_lock`, `pg_advisory_lock`, `pg_advisory_unlock(_all)`.
+#
+# **Run 50 ranking #4 (after the two regressions): `the function pg_try_advisory_lock is not
+# supported`, 99 tests over 8 files.** It is not the tests reaching for it directly: every Rails
+# migration takes one. `postgresql_adapter.rb:474-486` is
+# `get_advisory_lock(id)` -> `SELECT pg_try_advisory_lock(<id>)` and
+# `release_advisory_lock(id)` -> `SELECT pg_advisory_unlock(<id>)`, with the adapter refusing any id
+# that is not a **signed 64-bit integer** before it sends anything.
+#
+# Things reasoning would get wrong:
+#
+# * **A session lock is not transactional.** `pg_advisory_lock` taken inside a transaction is still
+#   held after `ROLLBACK` — the rows below prove it — while `pg_advisory_xact_lock` is released by
+#   the transaction's end and cannot be unlocked by hand. Implementing one as the other breaks the
+#   migration lock in opposite directions: a lock that vanishes at rollback lets two migrations run,
+#   and a lock that outlives its transaction never lets the second one start.
+# * **They stack.** Taking the same lock twice in one session succeeds twice and needs **two**
+#   unlocks. `pg_try_advisory_lock` returns `t` the second time — it is re-entrant within a session,
+#   not idempotent.
+# * **Unlocking something you do not hold is a WARNING and `f`, not an error.** A refusal that
+#   raises where PostgreSQL warns is a divergence in the other direction.
+# * **There are two shapes of key**: one `bigint`, or two `int4`s. Rails sends the one-argument form;
+#   the two-argument form is in the catalog under the same name and has to resolve separately.
+# * **`DISCARD ALL` releases them all** — that is the connection between this file and
+#   `pg19_discard_all.txt`, and it is why a pooled connection does not leak a migration lock.
+#
+# The lock probes run inside `BEGIN … ROLLBACK` **and the rollback deliberately does not release
+# them**; the file ends with `pg_advisory_unlock_all()` and a `pg_locks` count that answers `0`,
+# which is the only thing that leaves the oracle clean. Locks are per session in any case, so the
+# replay pass cannot see what this one held.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+BEGIN		-
+# ---- the two statements every Rails migration sends (postgresql_adapter.rb:474, 481) ----
+SELECT 'r', pg_try_advisory_lock(3966820834000112000)	text,boolean	r|t
+SELECT 'r', locktype, mode, granted FROM pg_locks WHERE locktype = 'advisory'	text,text,text,boolean	r|advisory|ExclusiveLock|t
+SELECT 'r', pg_advisory_unlock(3966820834000112000)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+# ---- the id is a signed 64-bit integer, and both ends of the range are legal ----
+SELECT 'r', pg_try_advisory_lock(9223372036854775807), pg_advisory_unlock(9223372036854775807)	text,boolean,boolean	r|t|t
+SELECT 'r', pg_try_advisory_lock(-9223372036854775808), pg_advisory_unlock(-9223372036854775808)	text,boolean,boolean	r|t|t
+SAVEPOINT a1		-
+SELECT 'r', pg_try_advisory_lock(9223372036854775808)	!42883 function pg_try_advisory_lock(numeric) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO a1		-
+# ---- the two-argument (int4, int4) form lives under the same name ----
+SELECT 'r', pg_try_advisory_lock(42, 7)	text,boolean	r|t
+SELECT 'r', classid, objid, objsubid FROM pg_locks WHERE locktype = 'advisory'	text,oid,oid,smallint	r|42|7|2
+SELECT 'r', pg_advisory_unlock(42, 7)	text,boolean	r|t
+# ---- blocking vs trying, and what each returns ----
+SELECT 'r', pg_advisory_lock(1001) IS NULL, pg_typeof(pg_advisory_lock(1002))	text,boolean,regtype	r|f|void
+SELECT 'r', pg_typeof(pg_try_advisory_lock(1003))	text,regtype	r|boolean
+SELECT 'r', pg_advisory_unlock(1001), pg_advisory_unlock(1002), pg_advisory_unlock(1003)	text,boolean,boolean,boolean	r|t|t|t
+# ---- they STACK: two locks need two unlocks ----
+SELECT 'r', pg_try_advisory_lock(2001), pg_try_advisory_lock(2001)	text,boolean,boolean	r|t|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 2001	text,bigint	r|1
+SELECT 'r', pg_advisory_unlock(2001)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 2001	text,bigint	r|1
+SELECT 'r', pg_advisory_unlock(2001)	text,boolean	r|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 2001	text,bigint	r|0
+# ---- unlocking what you never held warns and answers f ----
+SELECT 'r', pg_advisory_unlock(999999)	text,boolean	r|f
+# ---- shared locks are a different mode and unlock through their own function ----
+SELECT 'r', pg_try_advisory_lock_shared(3001), pg_try_advisory_lock_shared(3001)	text,boolean,boolean	r|t|t
+SELECT 'r', mode, count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 3001 GROUP BY mode	text,text,bigint	r|ShareLock|1
+SELECT 'r', pg_advisory_unlock_shared(3001), pg_advisory_unlock_shared(3001)	text,boolean,boolean	r|t|t
+# ---- the transaction-scoped variants: no unlock function, released at the end ----
+SELECT 'r', pg_advisory_xact_lock(4001) IS NULL, pg_try_advisory_xact_lock(4002)	text,boolean,boolean	r|f|t
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid IN (4001, 4002)	text,bigint	r|2
+SAVEPOINT a2		-
+SELECT 'r', pg_advisory_unlock(4001)	text,boolean	r|f
+ROLLBACK TO a2		-
+# ---- a SESSION lock taken in a transaction SURVIVES the rollback ----
+SELECT 'r', pg_try_advisory_lock(5001)	text,boolean	r|t
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 5001	text,bigint	r|1
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid IN (4001, 4002)	text,bigint	r|0
+# ---- and the only thing that cleans that up ----
+SELECT 'r', pg_advisory_unlock_all() IS NULL	text,boolean	r|f
+SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'	text,bigint	r|0
+# ---- proof the oracle is as it was ----
+SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'	bigint	0

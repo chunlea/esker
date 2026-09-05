@@ -20,6 +20,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "The same two operators. The `f::text` in it is right — `tests/to_text.rs` asserts \
              the padding strip directly — and the line stays here so the operator unit inherits \
              the whole statement rather than half of it.",
+        "UNMEASURED",
     )],
 };
 

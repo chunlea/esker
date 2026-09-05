@@ -28,6 +28,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              would be most tempting to add one by flipping the operands, which works for a join \
              of two tables and does not for a chain: the flip changes which table drives every \
              step after it. It lands as its own unit, with its own capture, or not at all.",
+        "UNMEASURED",
     )],
 };
 

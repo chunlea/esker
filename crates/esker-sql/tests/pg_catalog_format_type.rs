@@ -40,6 +40,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              and this node reports those columns as `bigint` and `text` (declared in \
              `tests/pg_catalog.rs`). A `format_type` that named them would name types no \
              `RowDescription` from here ever carries.",
+        "pg19_format_type.txt:50",
     )],
 };
 

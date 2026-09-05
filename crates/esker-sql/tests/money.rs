@@ -45,14 +45,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '1.00'::money + 1",
             "an integer literal is a bigint here, so the refusal names bigint",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', '1.00'::money = 1.00",
             "a decimal literal is a double precision here, so the refusal names it",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', 6 / '2.00'::money",
             "an integer literal is a bigint here, so the refusal names bigint",
+            "UNMEASURED",
         ),
     ],
 };

@@ -20,6 +20,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              This node counts in `i64` whatever it fills; taking the word and counting wider \
              anyway would hand out a number the column cannot hold instead of the `22003` a real \
              server gives at the same point. Refused by name — contract C2.",
+            "UNMEASURED",
         ),
         (
             "CREATE SEQUENCE s5 MINVALUE 5 MAXVALUE 7 CYCLE",
@@ -28,6 +29,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              words and counted on regardless would run past the limit the user asked for and \
              would never wrap, so all three are refused by name (C2) rather than stored and \
              ignored. The refusal names the first one it meets.",
+            "UNMEASURED",
         ),
         (
             "SELECT currval('s1')",
@@ -38,6 +40,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              corpus in one session, correctly answers the value it drew two lines earlier. The \
              session rule itself is checked in `tests/sequence.rs`; this line is kept because a \
              corpus that quietly dropped it would hide the limit of how these captures are made.",
+            "UNMEASURED",
         ),
     ],
 };

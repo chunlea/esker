@@ -27,6 +27,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', s.x FROM lt l, (SELECT l.id AS x) s",
             "PostgreSQL distinguishes an entry that exists but is not visible here from one that \
              does not exist; this node reports the second for both",
+            "UNMEASURED",
         ),
         // **Explicit `LATERAL` over a subquery** is the other feature this file measures and does
         // not implement. The function form needs no keyword and is what `ActiveRecord` writes; a
@@ -36,6 +37,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', s.x FROM lt l, LATERAL (SELECT l.id AS x) s ORDER BY s.x",
             "LATERAL over a subquery is not implemented; a set-returning function needs no keyword \
              and is",
+            "UNMEASURED",
         ),
     ],
 };

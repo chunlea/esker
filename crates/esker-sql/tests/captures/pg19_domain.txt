@@ -1,0 +1,51 @@
+BEGIN		-
+CREATE DOMAIN dm_money AS numeric(8,2)		-
+SELECT 'r', typname, typtype, typbasetype::regtype::text, typnotnull, typdefault FROM pg_type WHERE typname = 'dm_money'	text,name,"char",text,boolean,text	r|dm_money|d|numeric|f|\N
+SELECT 'r', domain_name, data_type, numeric_precision, numeric_scale FROM information_schema.domains WHERE domain_name = 'dm_money'	text,name,character varying,integer,integer	r|dm_money|numeric|8|2
+CREATE TABLE dm_t (id serial primary key, price dm_money)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), t.typname, t.typtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'dm_t'::regclass AND a.attname = 'price'		r|price|dm_money|dm_money|d
+SELECT 'r', column_name, data_type, domain_name, udt_name FROM information_schema.columns WHERE table_name = 'dm_t' AND column_name = 'price'	text,name,character varying,name,name	r|price|numeric|dm_money|numeric
+INSERT INTO dm_t (price) VALUES ('34.15')		-
+SELECT 'r', price::text FROM dm_t		r|34.15
+INSERT INTO dm_t (price) VALUES (NULL)		-
+SELECT 'r', count(*) AS rows_now FROM dm_t		r|2
+SAVEPOINT d1		-
+INSERT INTO dm_t (price) VALUES ('not a number')	!22P02 invalid input syntax for type numeric: "not a number"
+ROLLBACK TO d1		-
+SAVEPOINT d2		-
+INSERT INTO dm_t (price) VALUES ('123456789.12')	!22003 numeric field overflow DETAIL: A field with precision 8, scale 2 must round to an absolute value less than 10^6.
+ROLLBACK TO d2		-
+CREATE DOMAIN dm_pos AS integer NOT NULL DEFAULT 1 CHECK (VALUE > 0)		-
+SELECT 'r', typname, typnotnull, typdefault FROM pg_type WHERE typname = 'dm_pos'	text,name,boolean,text	r|dm_pos|t|1
+CREATE TABLE dm_p (n dm_pos)		-
+SAVEPOINT d3		-
+INSERT INTO dm_p (n) VALUES (-5)	!23514 value for domain dm_pos violates check constraint "dm_pos_check"
+ROLLBACK TO d3		-
+SAVEPOINT d4		-
+INSERT INTO dm_p (n) VALUES (NULL)	!23502 domain dm_pos does not allow null values
+ROLLBACK TO d4		-
+INSERT INTO dm_p DEFAULT VALUES		-
+SELECT 'r', n::text AS domain_default FROM dm_p		r|1
+SAVEPOINT d5		-
+DROP DOMAIN dm_money	!2BP01 cannot drop type dm_money because other objects depend on it DETAIL: column price of table dm_t depends on type dm_money HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO d5		-
+SAVEPOINT d6		-
+DROP DOMAIN dm_nosuch	!42704 type "dm_nosuch" does not exist
+ROLLBACK TO d6		-
+DROP DOMAIN IF EXISTS dm_nosuch		-
+CREATE SCHEMA dm_s		-
+CREATE DOMAIN dm_s.text AS text		-
+SELECT 'r', n.nspname, t.typname, t.typtype FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'text' ORDER BY n.nspname	text,name,name,"char"	r|dm_s|text|d ; r|pg_catalog|text|b
+SET search_path = dm_s, pg_catalog		-
+CREATE TABLE dm_shadow (c text)		-
+SELECT 'r', format_type(a.atttypid, a.atttypmod), t.typtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'dm_shadow'::regclass AND a.attname = 'c'		r|text|d
+SET search_path = public		-
+SAVEPOINT d7		-
+DROP TABLE dm_p		-
+DROP DOMAIN dm_pos		-
+ROLLBACK TO d7		-
+SAVEPOINT d8		-
+CREATE DOMAIN dm_money AS text	!42710 type "dm_money" already exists
+ROLLBACK TO d8		-
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('dm_money','dm_pos')	bigint	0

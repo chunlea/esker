@@ -1,0 +1,109 @@
+# `time` without time zone, as a real PostgreSQL 19beta1 answers it — tier 2's second type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap). Eight bytes,
+# OID 1083, a microsecond count since midnight, and `timetz` (1266, twelve bytes) beside it,
+# which is a different type and is here only where the two meet.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`24:00:00` is a value.** The range is closed at both ends — `00:00:00` through
+#     `24:00:00` — so a "time of day" that cannot be a time of day is storable, and `24:00:01` is
+#     the first thing past it. `23:59:60` is *also* accepted and normalises to `24:00:00`, and
+#     `23:59:59.9999999` **rounds up into it**. Three ways to reach a twenty-fifth hour.
+#   * **`24:00:00 + 1 second` is `00:00:01`.** Adding an interval wraps modulo a day rather than
+#     overflowing or erroring — so `time` arithmetic is a ring, and the only operation that leaves
+#     it is subtraction.
+#   * **Three SQLSTATEs for three kinds of wrong**, and a plausible implementation routes all of
+#     them through one: `'25:00:00'` and `'12:60:00'` are `22008 date/time field value out of
+#     range`; `'-01:00:00'` and `'not a time'` are `22007 invalid input syntax for type time` —
+#     a *negative* time is a syntax error, not a range error, which is the one nobody guesses; and
+#     `time + time` is `42725 operator is not unique`, with a `DETAIL` of "Could not choose a best
+#     candidate operator" rather than the `42883` every other missing operator gives.
+#   * **`allballs` is a time and is not a date.** `'allballs'::time` is `00:00:00`; the same
+#     literal against `date` is `22007`. The special-word table is per type.
+#   * **`sum` and `avg` over a `time` exist and answer `interval`** — `sum` of `12:00` and `13:30`
+#     is `25:30:00`, a value no `time` column could hold. This is the exact opposite of `date`,
+#     where both are `42883`, and the two types are one tier apart. An implementation that decided
+#     the aggregate set per *category* rather than per type would get one of them wrong.
+#   * **`time * 2` is an `interval`, `time - time` is an `interval`, and `time + date` is a
+#     `timestamp`.** No arithmetic on a `time` answers a `time` except `+ interval`.
+#   * **`time::timestamp` is `42846`** even though `date + time` builds one. A cast and an operator
+#     are not the same reachability.
+#   * **An over-large precision clamps in silence.** `time(7)` is `time(6)` and `'time(9)'::regtype`
+#     is 1083 with no complaint, where a `varchar` length past its bound raises `22023`. Same
+#     asymmetry `timestamp(9)` has.
+#   * **`time(p)` rounds half away from zero**: `.5` at `time(0)` is `12:34:57` and `.9999` at
+#     `time(3)` is `12:34:57`. But an *unqualified* `time` truncating a seventh digit rounds to
+#     even: `.1234565` is `.123456`. Two rounding rules in one type, as `timestamp` has.
+#   * **`extract` answers `numeric` and `date_part` answers `double precision`**, the same split
+#     `date` has.
+DROP TABLE IF EXISTS tq		-
+SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN ('time','timetz') ORDER BY oid	oid,name,smallint,regproc,"char"	1083|time|8|time_in|D ; 1266|timetz|12|timetz_in|D
+SELECT pg_typeof('12:34:56'::time)	regtype	time without time zone
+SELECT format_type(1083, -1), format_type(1083, 3)	text,text	time without time zone|time(3) without time zone
+CREATE TABLE tq (id int8 PRIMARY KEY, t time, u time(3))		-
+INSERT INTO tq VALUES (1, '12:34:56', '12:34:56')		-
+INSERT INTO tq VALUES (2, '00:00:00', '00:00:00')		-
+INSERT INTO tq VALUES (3, '24:00:00', '23:59:59.9999')		-
+INSERT INTO tq VALUES (4, '12:34:56.123456', '12:34:56.0005')		-
+INSERT INTO tq VALUES (5, NULL, NULL)		-
+SELECT id, t, u FROM tq ORDER BY id	bigint,time without time zone,time(3) without time zone	1|12:34:56|12:34:56 ; 2|00:00:00|00:00:00 ; 3|24:00:00|24:00:00 ; 4|12:34:56.123456|12:34:56.001 ; 5|\N|\N
+SELECT id, t FROM tq ORDER BY t	bigint,time without time zone	2|00:00:00 ; 1|12:34:56 ; 4|12:34:56.123456 ; 3|24:00:00 ; 5|\N
+SELECT id, t FROM tq ORDER BY t DESC	bigint,time without time zone	5|\N ; 3|24:00:00 ; 4|12:34:56.123456 ; 1|12:34:56 ; 2|00:00:00
+SELECT id FROM tq WHERE t IS NULL	bigint	5
+SELECT id FROM tq WHERE t = '12:34:56'	bigint	1
+SELECT id FROM tq WHERE t > '12:00:00' ORDER BY id	bigint	1 ; 3 ; 4
+SELECT id FROM tq WHERE t IN ('12:34:56', '00:00:00') ORDER BY id	bigint	1 ; 2
+SELECT count(*), count(t), min(t), max(t) FROM tq	bigint,bigint,time without time zone,time without time zone	5|4|00:00:00|24:00:00
+SELECT sum(t) FROM tq	interval	49:09:52.123456
+SELECT avg(t) FROM tq	interval	12:17:28.030864
+SELECT '12:34:56'::time, '12:34'::time, '123456'::time, TIME '12:34:56'	time without time zone,time without time zone,time without time zone,time without time zone	12:34:56|12:34:00|12:34:56|12:34:56
+SELECT '00:00:00'::time, '24:00:00'::time	time without time zone,time without time zone	00:00:00|24:00:00
+SELECT '23:59:60'::time	time without time zone	24:00:00
+SELECT '23:59:59.9999999'::time	time without time zone	24:00:00
+SELECT 'allballs'::time	time without time zone	00:00:00
+SELECT '12:34:56 PM'::time, '12:34:56 AM'::time, '1:00 PM'::time	time without time zone,time without time zone,time without time zone	12:34:56|00:34:56|13:00:00
+SELECT '12:34:56.123456'::time, '12:34:56.1234565'::time	time without time zone,time without time zone	12:34:56.123456|12:34:56.123456
+SELECT '24:00:01'::time	!22008 date/time field value out of range: "24:00:01"
+SELECT '25:00:00'::time	!22008 date/time field value out of range: "25:00:00"
+SELECT '12:60:00'::time	!22008 date/time field value out of range: "12:60:00"
+SELECT '-01:00:00'::time	!22007 invalid input syntax for type time: "-01:00:00"
+SELECT 'not a time'::time	!22007 invalid input syntax for type time: "not a time"
+SELECT ''::time	!22007 invalid input syntax for type time: ""
+SELECT '12:34:56'::time(3), '12:34:56.9999'::time(3), '12:34:56.0005'::time(3)	time(3) without time zone,time(3) without time zone,time(3) without time zone	12:34:56|12:34:57|12:34:56.001
+SELECT '12:34:56.5'::time(0)	time(0) without time zone	12:34:57
+SELECT '12:34:56'::time(7)	time(6) without time zone	12:34:56
+SELECT '12:34:56'::time(-1)	!42601 syntax error at or near "-"
+SELECT '12:34:56'::time::text, '12:34:56'::text::time	text,time without time zone	12:34:56|12:34:56
+SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)	character varying,character(5)	12:34:56|12:34
+SELECT '12:34:56'::time::interval, '24:00:00'::time::interval	interval,interval	12:34:56|24:00:00
+SELECT '1 day 02:00:00'::interval::time	time without time zone	02:00:00
+SELECT '12:34:56'::time::timetz	time with time zone	12:34:56+00
+SELECT '12:34:56'::timetz::time	time without time zone	12:34:56
+SELECT '2020-01-01 12:34:56'::timestamp::time	time without time zone	12:34:56
+SELECT '12:34:56'::time::timestamp	!42846 cannot cast type time without time zone to timestamp without time zone
+SELECT '12:34:56'::time::int	!42846 cannot cast type time without time zone to integer
+SELECT '12:34:56'::time::json	!42846 cannot cast type time without time zone to json
+SELECT '12:34:56'::time + '2020-01-01'::date	timestamp without time zone	2020-01-01 12:34:56
+SELECT '2020-01-01'::date + '12:34:56'::time	timestamp without time zone	2020-01-01 12:34:56
+SELECT '12:34:56'::time - '01:00:00'::time	interval	11:34:56
+SELECT '12:34:56'::time + '1 hour'::interval	time without time zone	13:34:56
+SELECT '24:00:00'::time + '1 second'::interval	time without time zone	00:00:01
+SELECT '12:34:56'::time * 2	interval	25:09:52
+SELECT '12:34:56'::time + '12:34:56'::time	!42725 operator is not unique: time without time zone + time without time zone DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
+SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)	numeric,numeric	12|45296.000000
+SELECT date_part('minute', '12:34:56'::time)	double precision	34
+SELECT '12:34:56'::time = '12:34:56'::time, '12:34:56'::time < '13:00:00'::time	boolean,boolean	t|t
+SELECT '12:34:56'::time = '12:34:56'::timetz	boolean	t
+SELECT '12:34:56'::time = 1	!42883 operator does not exist: time without time zone = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT greatest('12:00:00'::time, '13:00:00'::time), least('12:00:00'::time, '13:00:00'::time)	time without time zone,time without time zone	13:00:00|12:00:00
+SELECT NULL::time IS NULL, '12:34:56'::time = NULL	boolean,boolean	t|\N
+SELECT '12:34:56'::timetz, '12:34:56+02'::timetz, '12:34:56+02'::timetz::text	time with time zone,time with time zone,text	12:34:56+00|12:34:56+02|12:34:56+02

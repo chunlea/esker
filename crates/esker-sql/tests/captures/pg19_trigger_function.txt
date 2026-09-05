@@ -1,0 +1,131 @@
+# A plpgsql trigger function and its `CREATE TRIGGER` — **and the answer to whether the schema load
+# needs a plpgsql runtime** — as a real PostgreSQL 19beta1 answers them.
+#
+# **Statement 790 of `postgresql_specific_schema.rb`**, verbatim as `ActiveRecord` emits it: one
+# message carrying a dollar-quoted `CREATE OR REPLACE FUNCTION … LANGUAGE plpgsql` and the
+# `CREATE TRIGGER` that installs it. It refuses at `3f02889` as `CREATE OR is not supported`, which
+# is also what statement **762** now refuses with — the two share this unit.
+#
+# ## Does the load fire it?  No. One test does.
+#
+# **The schema load only defines them.** `postgresql_specific_schema.rb:211-231` creates the table
+# `id: false` and executes the block; it inserts nothing, and this capture confirms `count(*)` is
+# **`0`** immediately after the whole statement runs. So the load needs a node that can store a
+# dollar-quoted body and register a trigger — **not** one that can execute plpgsql.
+#
+# **Exactly one test fires it**: `test/cases/persistence_test.rb:1708`,
+# `PkAutopopulatedByATriggerRecord.create`, guarded by
+# `if supports_insert_returning? && !current_adapter?(:SQLite3Adapter)`, asserting `record.id` is
+# not nil and `> 0`. That single test is the whole of the plpgsql *runtime* requirement in the
+# suite, and it needs three things together: the trigger fires `BEFORE INSERT`, it assigns
+# `NEW.id`, and `RETURNING` gives back the **trigger-modified** row.
+#
+# One qualification, because it decides how much is in scope: PostgreSQL **validates a plpgsql body
+# at `CREATE` time** — a body missing a semicolon is `42601 syntax error at end of input` from the
+# `CREATE FUNCTION` itself, not from a later call. The suite's body is valid, so a node that stores
+# the text without parsing it loads the schema identically; validation is observable here but is
+# not what the load requires.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The two `SELECT count(*)` lines at the end prove it left nothing behind — no function, no table.
+# The `\gdesc` pass runs after the rollback, so statements naming the table or the function have an
+# **empty** declared-types column; the `pg_typeof` line pins `"char"` for `prokind` and
+# `provolatile`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`pg_get_triggerdef` normalises `EXECUTE PROCEDURE` to `EXECUTE FUNCTION`.** The trigger
+#     created here with `EXECUTE PROCEDURE` prints back as `EXECUTE FUNCTION`. That matters beyond
+#     this file: **statement 762's `INHERITS` block uses `EXECUTE PROCEDURE`** and statement 790
+#     uses `EXECUTE FUNCTION` — two spellings of one clause, both of which have to parse, and only
+#     one of which is ever printed.
+#   * **The trigger overwrites an explicitly supplied value.** `INSERT … ("id") VALUES (99)
+#     RETURNING "id"` returns **`4`**, not `99`: the function assigns `NEW.id` unconditionally, and
+#     `RETURNING` reports the row *after* the `BEFORE` trigger. An implementation that evaluates
+#     `RETURNING` against the submitted row returns `99` and passes nothing.
+#   * **`DEFAULT VALUES` on a table whose only column is `NOT NULL` works only because the trigger
+#     fills it.** Disable the trigger and the same statement is `23502 null value in column "id" …
+#     violates not-null constraint`, `DETAIL: Failing row contains (null).` — which is the proof
+#     that the value comes from the trigger and not from a default.
+#   * **`tgenabled` is `O` when enabled and `D` when disabled** — a one-letter code, not a boolean —
+#     and `tgtype` is the bitmask `7` for `BEFORE` + `ROW` + `INSERT`.
+#   * **`prorettype` is `trigger`**, a real type, and **calling the function directly is `0A000
+#     trigger functions can only be called as triggers`** — not `42883`.
+#   * **The counter follows `MAX(id)`, not a sequence.** After rows `1,2,3`, an explicit `99` still
+#     becomes `4`; after that row is updated to `50` and deleted, the next insert is `4` again.
+#     Nothing is reserved and nothing is skipped.
+#   * **`CREATE OR REPLACE FUNCTION` run twice is not an error** — the second one is a plain
+#     success, no `42710` — while a second `CREATE TRIGGER` of the same name **is**
+#     `42710 trigger "t_dup" for relation "…" already exists`. `OR REPLACE` exists for the function
+#     and not for the trigger.
+#   * **A missing trigger function is `42883 function nosuchfunction() does not exist`** at
+#     `CREATE TRIGGER` time, and a missing language is `42704 language "nosuchlang" does not exist`.
+#   * **`DROP FUNCTION` with a trigger still on it is `2BP01`**, naming the trigger and the table in
+#     the DETAIL and suggesting `CASCADE` — the same dependency shape run 33 recorded for
+#     `DROP SEQUENCE`. Dropping the trigger first makes the drop succeed.
+#   * **`plpgsql` is present with `lanpltrusted = t` and no `CREATE EXTENSION`** — it is not one of
+#     the extensions `postgresql_specific_schema.rb` enables.
+BEGIN		-
+SELECT 'r', lanname, lanpltrusted FROM pg_language WHERE lanname = 'plpgsql'	text,name,boolean	r|plpgsql|t
+DROP TABLE IF EXISTS "pk_autopopulated_by_a_trigger_records"		-
+CREATE TABLE "pk_autopopulated_by_a_trigger_records" ("id" integer NOT NULL)		-
+CREATE OR REPLACE FUNCTION populate_column() RETURNS TRIGGER AS $$ DECLARE max_value INTEGER; BEGIN SELECT MAX(id) INTO max_value FROM pk_autopopulated_by_a_trigger_records; NEW.id = COALESCE(max_value, 0) + 1; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TRIGGER before_insert_trigger BEFORE INSERT ON pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column();		-
+SELECT 'r', count(*) FROM "pk_autopopulated_by_a_trigger_records"		r|0
+SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, provolatile FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE proname = 'populate_column'	text,name,"char",text,name,smallint,"char"	r|populate_column|f|trigger|plpgsql|0|v
+SELECT 'r', tgname, tgenabled, tgtype, tgnargs, tgisinternal FROM pg_trigger WHERE tgrelid = 'pk_autopopulated_by_a_trigger_records'::regclass AND NOT tgisinternal		r|before_insert_trigger|O|7|0|f
+SELECT 'r', pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'before_insert_trigger'	text,text	r|CREATE TRIGGER before_insert_trigger BEFORE INSERT ON public.pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column()
+SELECT 'r', pg_get_functiondef('populate_column'::regproc) LIKE '%LANGUAGE plpgsql%', length(prosrc) FROM pg_proc WHERE proname = 'populate_column'		r|t|162
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		1
+SELECT 'r', id FROM "pk_autopopulated_by_a_trigger_records" ORDER BY id		r|1
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		2
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		3
+SELECT 'r', id FROM "pk_autopopulated_by_a_trigger_records" ORDER BY id		r|1 ; r|2 ; r|3
+INSERT INTO "pk_autopopulated_by_a_trigger_records" ("id") VALUES (99) RETURNING "id"		4
+SELECT 'r', id FROM "pk_autopopulated_by_a_trigger_records" ORDER BY id		r|1 ; r|2 ; r|3 ; r|4
+UPDATE "pk_autopopulated_by_a_trigger_records" SET "id" = 50 WHERE "id" = 4 RETURNING "id"		50
+DELETE FROM "pk_autopopulated_by_a_trigger_records" WHERE "id" = 50		-
+SELECT 'r', count(*) FROM "pk_autopopulated_by_a_trigger_records"		r|3
+CREATE OR REPLACE FUNCTION populate_column() RETURNS TRIGGER AS $$ DECLARE max_value INTEGER; BEGIN SELECT MAX(id) INTO max_value FROM pk_autopopulated_by_a_trigger_records; NEW.id = COALESCE(max_value, 0) + 1; RETURN NEW; END; $$ LANGUAGE plpgsql		-
+SAVEPOINT s1		-
+SELECT populate_column()	!0A000 trigger functions can only be called as triggers
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE FUNCTION tf_badlang() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE nosuchlang	!42704 language "nosuchlang" does not exist
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE FUNCTION tf_badbody() RETURNS TRIGGER AS $$ BEGIN RETURN NEW END; $$ LANGUAGE plpgsql	!42601 syntax error at end of input
+ROLLBACK TO s3		-
+CREATE TRIGGER "proc_spelling_trigger" BEFORE UPDATE ON "pk_autopopulated_by_a_trigger_records" FOR EACH ROW EXECUTE PROCEDURE populate_column()		-
+SELECT 'r', pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'proc_spelling_trigger'	text,text	r|CREATE TRIGGER proc_spelling_trigger BEFORE UPDATE ON public.pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column()
+SAVEPOINT s4		-
+CREATE TRIGGER "t_nofunc" BEFORE INSERT ON "pk_autopopulated_by_a_trigger_records" FOR EACH ROW EXECUTE FUNCTION nosuchfunction()	!42883 function nosuchfunction() does not exist
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+CREATE TRIGGER "t_dup" BEFORE INSERT ON "pk_autopopulated_by_a_trigger_records" FOR EACH ROW EXECUTE FUNCTION populate_column()		-
+CREATE TRIGGER "t_dup" BEFORE INSERT ON "pk_autopopulated_by_a_trigger_records" FOR EACH ROW EXECUTE FUNCTION populate_column()	!42710 trigger "t_dup" for relation "pk_autopopulated_by_a_trigger_records" already exists
+ROLLBACK TO s5		-
+ALTER TABLE "pk_autopopulated_by_a_trigger_records" DISABLE TRIGGER "before_insert_trigger"		-
+SELECT 'r', tgname, tgenabled FROM pg_trigger WHERE tgname = 'before_insert_trigger'	text,name,"char"	r|before_insert_trigger|D
+SAVEPOINT s6		-
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"	!23502 null value in column "id" of relation "pk_autopopulated_by_a_trigger_records" violates not-null constraint DETAIL: Failing row contains (null).
+ROLLBACK TO s6		-
+ALTER TABLE "pk_autopopulated_by_a_trigger_records" ENABLE TRIGGER "before_insert_trigger"		-
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		4
+SELECT 'r', pg_typeof(prokind), pg_typeof(provolatile) FROM pg_proc WHERE proname = 'populate_column'	text,regtype,regtype	r|"char"|"char"
+DROP TRIGGER "before_insert_trigger" ON "pk_autopopulated_by_a_trigger_records"		-
+SELECT 'r', count(*) FROM pg_trigger WHERE tgname = 'before_insert_trigger'	text,bigint	r|0
+SAVEPOINT s7		-
+DROP FUNCTION populate_column()	!2BP01 cannot drop function populate_column() because other objects depend on it DETAIL: trigger proc_spelling_trigger on table pk_autopopulated_by_a_trigger_records depends on function populate_column() HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s7		-
+DROP TRIGGER "proc_spelling_trigger" ON "pk_autopopulated_by_a_trigger_records"		-
+DROP FUNCTION populate_column()		-
+SELECT 'r', count(*) FROM pg_proc WHERE proname = 'populate_column'	text,bigint	r|0
+ROLLBACK		-
+SELECT count(*) FROM pg_proc WHERE proname IN ('populate_column','tf_badlang','tf_badbody')	bigint	0
+SELECT count(*) FROM pg_class WHERE relname = 'pk_autopopulated_by_a_trigger_records'	bigint	0

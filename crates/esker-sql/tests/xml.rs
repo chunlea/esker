@@ -53,6 +53,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(payload) FROM xml_data_type ORDER BY id LIMIT 1",
             "pg_typeof reads the value, and an xml value is a Datum::Text",
+            "UNMEASURED",
         ),
         // **An `E'…'` literal is not lowered here at all**, whatever it is cast to: the parser
         // gives it as an `EscapedStringLiteral` and nothing in this crate reads one, so the cast
@@ -65,10 +66,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', E'<a>\\n</b>'::xml",
             "an E'…' literal is not lowered here, whatever the cast",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', E'<a>\\n<b>\\n'::xml",
             "an E'…' literal is not lowered here, whatever the cast",
+            "UNMEASURED",
         ),
         // **The declaration is dropped on the way in here and on the way out there.** A real
         // server keeps it in the value and strips it in `xml_out`, so `('<?xml …?><a/>'::xml)`
@@ -83,6 +86,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', length(('<?xml version=\"1.0\"?><a/>'::xml)::text)",
             "the declaration is dropped on input here and on output there",
+            "UNMEASURED",
         ),
         // **`array_agg` over an `xml` needs an `xml[]` to build**, and this node's aggregate
         // vocabulary has no array of one. The scalar type is complete; the aggregate is the gap,

@@ -40,6 +40,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(generate_series(1, 3))",
             "a bare integer constant is int8 here and int4 there, and pg_typeof answers text",
+            "UNMEASURED",
         ),
     ],
 };

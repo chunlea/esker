@@ -73,72 +73,129 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT pg_typeof('1 day'::interval), format_type(1186, -1)",
             TYPMOD,
+            "pg19_interval.txt:59",
         ),
         (
             "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM \
              pg_attribute WHERE attrelid = 'iv'::regclass AND attnum > 0 ORDER BY attnum",
             TYPMOD,
+            "pg19_interval.txt:61",
         ),
-        ("SELECT format_type(1186, 3)", TYPMOD),
-        ("SELECT format_type(1186, 32767)", TYPMOD),
+        (
+            "SELECT format_type(1186, 3)",
+            TYPMOD,
+            "pg19_format_type.txt:62",
+        ),
+        (
+            "SELECT format_type(1186, 32767)",
+            TYPMOD,
+            "pg19_interval.txt:63",
+        ),
         (
             "INSERT INTO iv VALUES (1, '1 year 2 mons 3 days 04:05:06', '1.5 seconds', \
              '1 day', '1 2', '1-2')",
             TYPMOD,
+            "pg19_interval.txt:64",
         ),
         (
             "INSERT INTO iv VALUES (2, '1 mon', '00:00:00', '2 days', '0 0', '0-0')",
             TYPMOD,
+            "pg19_interval.txt:65",
         ),
         (
             "INSERT INTO iv VALUES (3, '30 days', '00:00:00', '3 days', '0 0', '0-0')",
             TYPMOD,
+            "pg19_interval.txt:66",
         ),
         (
             "INSERT INTO iv VALUES (4, '-1 day', '00:00:00', '-1 days', '0 0', '0-0')",
             TYPMOD,
+            "pg19_interval.txt:67",
         ),
-        ("SELECT id, a, b, c, d, e FROM iv ORDER BY id", TYPMOD),
-        ("SELECT id, a FROM iv ORDER BY a", TYPMOD),
-        ("SELECT id, a FROM iv ORDER BY a DESC", TYPMOD),
-        ("SELECT id FROM iv WHERE a = '1 mon' ORDER BY id", TYPMOD),
-        ("SELECT id FROM iv WHERE a > '1 day' ORDER BY id", TYPMOD),
-        ("SELECT count(*), count(a), min(a), max(a) FROM iv", TYPMOD),
-        ("SELECT sum(a) FROM iv", TYPMOD),
-        ("SELECT avg(a) FROM iv", TYPMOD),
+        (
+            "SELECT id, a, b, c, d, e FROM iv ORDER BY id",
+            TYPMOD,
+            "pg19_interval.txt:69",
+        ),
+        (
+            "SELECT id, a FROM iv ORDER BY a",
+            TYPMOD,
+            "pg19_interval.txt:70",
+        ),
+        (
+            "SELECT id, a FROM iv ORDER BY a DESC",
+            TYPMOD,
+            "pg19_interval.txt:71",
+        ),
+        (
+            "SELECT id FROM iv WHERE a = '1 mon' ORDER BY id",
+            TYPMOD,
+            "pg19_interval.txt:73",
+        ),
+        (
+            "SELECT id FROM iv WHERE a > '1 day' ORDER BY id",
+            TYPMOD,
+            "pg19_interval.txt:74",
+        ),
+        (
+            "SELECT count(*), count(a), min(a), max(a) FROM iv",
+            TYPMOD,
+            "pg19_interval.txt:75",
+        ),
+        ("SELECT sum(a) FROM iv", TYPMOD, "pg19_interval.txt:76"),
+        ("SELECT avg(a) FROM iv", TYPMOD, "pg19_interval.txt:77"),
         (
             "SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR",
             TYPMOD,
+            "pg19_interval.txt:82",
         ),
         (
             "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
             TYPMOD,
+            "pg19_interval.txt:95",
         ),
-        ("SELECT '1 year 1 month'::interval::interval year", TYPMOD),
+        (
+            "SELECT '1 year 1 month'::interval::interval year",
+            TYPMOD,
+            "pg19_interval.txt:98",
+        ),
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \
              hours'::interval), justify_interval('1 mon 33 days 27 hours'::interval)",
             FUNCTIONS,
+            "pg19_interval.txt:112",
         ),
         (
             "SELECT age('2021-03-01'::timestamp, '2021-01-01'::timestamp)",
             FUNCTIONS,
+            "pg19_interval.txt:116",
         ),
         (
             "SELECT extract(day FROM '1 year 2 mons 3 days'::interval), extract(epoch \
              FROM '1 day'::interval)",
             FUNCTIONS,
+            "pg19_interval.txt:117",
         ),
         (
             "SELECT '1 day'::interval::varchar, '1 day'::interval::char(3)",
             BPCHAR,
+            "pg19_interval.txt:119",
         ),
-        ("SELECT '1 day'::interval::time", ARITHMETIC),
-        ("SELECT '1 day'::interval = 1", LITERAL),
+        (
+            "SELECT '1 day'::interval::time",
+            ARITHMETIC,
+            "pg19_interval.txt:120",
+        ),
+        (
+            "SELECT '1 day'::interval = 1",
+            LITERAL,
+            "pg19_interval.txt:123",
+        ),
         (
             "SELECT greatest('1 day'::interval, '2 days'::interval), least('1 \
              day'::interval, '2 days'::interval)",
             FUNCTIONS,
+            "pg19_interval.txt:124",
         ),
     ],
 };

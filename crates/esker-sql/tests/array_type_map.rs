@@ -59,17 +59,20 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', count(*) FROM pg_type WHERE typinput = 'array_in'::regproc",
             "regproc is not a type here; asked again below through typinput::text",
+            "pg19_array_type_map.txt:50",
         ),
         (
             "SELECT 'r', count(*) = count(*) FILTER (WHERE typcategory = 'A') AS \
              array_in_implies_category_A FROM pg_type WHERE typinput = 'array_in'::regproc",
             "regproc, and an aggregate FILTER clause; asked again below through typinput::text",
+            "pg19_array_type_map.txt:52",
         ),
         (
             "SELECT 'r', count(*) AS dangling_typelem FROM pg_type t WHERE t.typinput = \
              'array_in'::regproc AND NOT EXISTS (SELECT 1 FROM pg_type e WHERE e.oid = t.typelem)",
             "regproc; **the same check runs below** through typinput::text and answers 0, which \
              is the half of this statement that is about arrays",
+            "pg19_array_type_map.txt:77",
         ),
         // **This node's `pg_type` is the types it has**, which is the whole design: the rows are
         // derived from `ColumnType::ALL` so that a type cannot be added and left out of its own
@@ -78,6 +81,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', count(*) FROM pg_type WHERE typcategory = 'A'",
             "this node's pg_type holds the types it has, not PostgreSQL's whole catalogue",
+            "pg19_array_type_map.txt:51",
         ),
         // **`box` is not a type here**, and these three exist to say that `typdelim` is not always
         // a comma — `box` uses `;`, the one exception in a real server's catalogue. Every type
@@ -88,17 +92,20 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN \
              ('int4','text','varchar','box','_box') ORDER BY typname",
             "box is not a type here, so the one delimiter that is not a comma has no row",
+            "pg19_array_type_map.txt:54",
         ),
         (
             "SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, \
              a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray \
              WHERE b.typname = 'box'",
             "box is not a type here",
+            "pg19_array_type_map.txt:55",
         ),
         (
             "SELECT 'r', '{(1,1),(0,0);(3,3),(2,2)}'::box[], \
              array_length('{(1,1),(0,0);(3,3),(2,2)}'::box[], 1)",
             "box is not a type here",
+            "pg19_array_type_map.txt:56",
         ),
         // **The standing `varchar`/`text` trade, seen through a subscript.** `pg_typeof(tags)` is
         // `character varying[]` on both, because an array *value* carries its element type; an
@@ -110,6 +117,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(tags), pg_typeof(tags[1]), array_length(tags, 1) FROM atm",
             "an array element is a Datum::Text: varchar and text are one representation here",
+            "pg19_array_type_map.txt:63",
         ),
         // **`_record` is the exception the capture warns about**, and this node has no
         // pseudo-types: `array_in` implies `typcategory = 'A'` for every row here and for all but
@@ -120,11 +128,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', count(*) AS array_in_but_not_category_a FROM pg_type WHERE \
              typinput::text = 'array_in' AND typcategory <> 'A'",
             "the one row this counts on a real server is the pseudo-type _record",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', typname, typcategory FROM pg_type WHERE typinput::text = 'array_in' AND \
              typcategory <> 'A' ORDER BY typname",
             "_record is a pseudo-type and this node has none",
+            "UNMEASURED",
         ),
     ],
 };

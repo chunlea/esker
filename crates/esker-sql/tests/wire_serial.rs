@@ -343,3 +343,112 @@ async fn a_prepared_explicit_id_insert_does_not_move_the_sequence() {
         "the first row that leaves the id to the sequence is 1, not a block on"
     );
 }
+
+/// **A dropped table's sequence goes with it — for the statement `ActiveRecord` actually sends.**
+///
+/// Run 88's instrumented pass: one `sequence_id` (603) served all 23 reserved blocks across
+/// `range_test.rb`'s 46 tests, so `create_table force: true` was not re-creating the sequence and
+/// the counter climbed all file. Every in-process test in `real_backend.rs` gets a *new* sequence
+/// id per round and answers 1, which is why none of them could show this.
+///
+/// The difference has to be the statement or the path, so this uses both as sent: the wire, and
+/// `DROP TABLE IF EXISTS "postgresql_ranges"` with the identifier **quoted**, which is how the
+/// adapter writes every name. The unquoted spelling runs beside it, because if the quoting is the
+/// trigger then the pair says so and a single case would not.
+///
+/// The assertion is on the **next** statement, never on the `DROP`'s own outcome — a name record
+/// that outlives its object always reports far from its cause, and this repository has had five of
+/// them, one of which was a `serial`'s sequence outliving its table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_table_takes_its_sequence_for_both_spellings() {
+    for quoted in [true, false] {
+        let node = Arc::new(Node {
+            backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+            catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+            sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+            share: true,
+        });
+        let mut wire = Wire::open(Arc::clone(&node)).await;
+        let name = if quoted { "\"pr\"" } else { "pr" };
+        let spelling = if quoted { "quoted" } else { "unquoted" };
+
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            wire.run(&format!("DROP TABLE IF EXISTS {name}")).await;
+            wire.run(&format!(
+                "CREATE TABLE {name} (id bigserial PRIMARY KEY, v int8)"
+            ))
+            .await;
+            let reply = wire
+                .run(&format!("INSERT INTO {name} (v) VALUES (1) RETURNING id"))
+                .await;
+            ids.push(first_value(&reply).unwrap_or_else(|| {
+                panic!(
+                    "{spelling}: no row came back: {}",
+                    String::from_utf8_lossy(&reply).replace('\0', "|")
+                )
+            }));
+        }
+        assert_eq!(
+            ids,
+            ["1", "1", "1"],
+            "{spelling}: a re-created table's sequence carried on from the dropped one — this is \
+             `range_test.rb`'s climb, and `1, 33, 65` is what one surviving sequence produces"
+        );
+    }
+}
+
+/// **The schema change inside a transaction**, which is the shape `ActiveRecord`'s transactional
+/// tests give every `setup`.
+///
+/// Both halves matter and they answer different questions. A `DROP`/`CREATE` that **commits** must
+/// leave a sequence that starts at 1, like the autocommit case beside it. A `DROP`/`CREATE` that is
+/// **rolled back** must leave the *original* table and its original sequence — and then the next
+/// value is the one after whatever was already drawn, because a sequence is non-transactional here
+/// exactly as it is on a real server.
+///
+/// Written because it is the one structural difference between every probe that answers 1 and the
+/// file that climbs: run 88 showed one `sequence_id` serving all 46 tests, and a schema change that
+/// does not survive its transaction is a way for that to happen without any drop being wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_change_in_a_transaction_settles_the_sequence_either_way() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+
+    wire.run("CREATE TABLE tx (id bigserial PRIMARY KEY, v int8)")
+        .await;
+    let first = wire.run("INSERT INTO tx (v) VALUES (1) RETURNING id").await;
+    assert_eq!(first_value(&first).as_deref(), Some("1"), "the first id");
+
+    // Committed: the table is genuinely new, so its sequence is too.
+    wire.run("BEGIN").await;
+    wire.run("DROP TABLE IF EXISTS tx").await;
+    wire.run("CREATE TABLE tx (id bigserial PRIMARY KEY, v int8)")
+        .await;
+    wire.run("COMMIT").await;
+    let after_commit = wire.run("INSERT INTO tx (v) VALUES (2) RETURNING id").await;
+    assert_eq!(
+        first_value(&after_commit).as_deref(),
+        Some("1"),
+        "a committed DROP/CREATE gives a sequence that starts over"
+    );
+
+    // Rolled back: the table that survives is the one the transaction started with, and so is its
+    // sequence — which has already handed out 1.
+    wire.run("BEGIN").await;
+    wire.run("DROP TABLE IF EXISTS tx").await;
+    wire.run("CREATE TABLE tx (id bigserial PRIMARY KEY, v int8)")
+        .await;
+    wire.run("ROLLBACK").await;
+    let after_rollback = wire.run("INSERT INTO tx (v) VALUES (3) RETURNING id").await;
+    assert_eq!(
+        first_value(&after_rollback).as_deref(),
+        Some("2"),
+        "a rolled-back DROP/CREATE leaves the original sequence, which continues"
+    );
+}

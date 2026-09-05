@@ -1,0 +1,134 @@
+# `numeric(p, s)`, as a real PostgreSQL 19beta1 answers it — tier 2's hard half
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap: "numeric's text
+# parity, because PostgreSQL prints the *declared* scale exactly and this is the type ADR 0031 has
+# been refusing on those grounds since unit 0"). OID 1700, varlena, `typcategory` N.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The scale is part of the value, and it is what ADR 0031 refused `avg(int8)` over.**
+#     `1.0`, `1.00` and `1.000` are three different texts for one number and all three are stored
+#     and printed as written. A declared scale forces it: `1.0::numeric(10,3)` prints `1.000` and
+#     `1.5::numeric(10,2)` prints `1.50`. Any implementation that normalises trailing zeros is
+#     wrong on the first row of this file.
+#   * **Rounding is half away from zero, everywhere, and never banker's.** The discriminating case
+#     is `1.245::numeric(10,2)`, which is **1.25** — half-to-even would give `1.24`. `round(2.5)`
+#     is 3, `round(3.5)` is 4, `round(-2.5)` is -3, and `2.5::numeric::int` is 3. One rule for the
+#     cast, the function and the assignment.
+#   * **Arithmetic scale is computed, not inherited, and each operator has its own rule.**
+#     `1.50 * 1.50` is `2.2500` — multiplication **adds** the scales. `1.5::numeric(10,2) +
+#     1.5::numeric(10,2)` is `3.00`. Division picks a scale of its own: `1::numeric / 2` is
+#     `0.50000000000000000000` (20 digits) while `6.0 / 2.0` is `3.0000000000000000` (16). And
+#     `2 ^ 10` is `1024.0000000000000`, not `1024`.
+#   * **`NaN` is a `numeric` value and it sorts as the largest one.** `'NaN' = 'NaN'` is **`t`**
+#     and `'NaN' > 1` is **`t`** — the opposite of IEEE, and the opposite of what `float8` does.
+#     `'NaN'::numeric / 0` is `NaN` where `1 / 0` is `22012 division by zero`.
+#   * **`NaN` fits a `numeric(10,2)` and `Infinity` does not.** Both are values of the unqualified
+#     type; only one survives a typmod, and the `22003` says which: "cannot hold an infinite
+#     value" against "must round to an absolute value less than 10^1".
+#   * **`NaN::int` is `0A000`, not `22003`.** `cannot convert NaN to integer` — a
+#     feature-not-supported code from a cast, which is the one SQLSTATE nobody would predict here.
+#   * **Negative scale is legal.** `numeric(10,-2)` is a real type: `12345.6789` stored in it is
+#     `12300`, and `format_type(1700, 786434)` is `numeric(11,-2)`. Bounds are precision 1..1000
+#     and scale **-1000..1000**, and both messages shout: `NUMERIC precision 1001 must be between
+#     1 and 1000`.
+#   * **The typmod is `((p << 16) | s) + 4`** — a third encoding, next to `varchar`'s length+4 and
+#     `timestamp`'s bare precision. Measured: `format_type(1700, 655366)` is `numeric(10,2)`, and
+#     655366 is `(10 << 16) | 2` plus 4. And `numeric(10)` is `numeric(10,0)`: a bare precision
+#     means scale zero, not "no scale".
+#   * **`0.1 + 0.2 = 0.3` is `t` here and `f` for `float8`.** That is the whole reason the type
+#     exists, and it is one line of this file.
+#   * **`numeric + float8` is `double precision`** — the exact type loses to the inexact one in
+#     promotion, where `numeric + int4` stays `numeric`.
+#   * **`22P03` is not in this file and cannot be.** It is `invalid binary representation`, which
+#     only the extended protocol's binary format can produce; `psql` sends text. The on-wire shape
+#     is recorded instead — `numeric_send(1.5)` is `\x000200000000000100011388` — so an
+#     implementation of the binary path has the bytes to check against.
+DROP TABLE IF EXISTS nm		-
+SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'	oid,name,smallint,regproc,"char"	1700|numeric|-1|numeric_in|N
+SELECT pg_typeof(1.5), pg_typeof(1.5::numeric), pg_typeof(sum(1.5::numeric)), pg_typeof(avg(1::int8))	regtype,regtype,regtype,regtype	numeric|numeric|numeric|numeric
+SELECT format_type(1700, -1), format_type(1700, 655366), format_type(1700, 786434)	text,text,text	numeric|numeric(10,2)|numeric(11,-2)
+CREATE TABLE nm (id int8 PRIMARY KEY, n numeric, d numeric(10,2))		-
+INSERT INTO nm VALUES (1, 1.5, 1.5)		-
+INSERT INTO nm VALUES (2, 1.000, 1.245)		-
+INSERT INTO nm VALUES (3, -2.25, -2.25)		-
+INSERT INTO nm VALUES (4, 'NaN', 'NaN')		-
+INSERT INTO nm VALUES (5, 'Infinity', 0)		-
+INSERT INTO nm VALUES (6, '-Infinity', 0)		-
+INSERT INTO nm VALUES (7, NULL, NULL)		-
+SELECT id, n, d FROM nm ORDER BY id	bigint,numeric,numeric(10,2)	1|1.5|1.50 ; 2|1.000|1.25 ; 3|-2.25|-2.25 ; 4|NaN|NaN ; 5|Infinity|0.00 ; 6|-Infinity|0.00 ; 7|\N|\N
+SELECT id, n FROM nm ORDER BY n	bigint,numeric	6|-Infinity ; 3|-2.25 ; 2|1.000 ; 1|1.5 ; 5|Infinity ; 4|NaN ; 7|\N
+SELECT id, n FROM nm ORDER BY n DESC	bigint,numeric	7|\N ; 4|NaN ; 5|Infinity ; 1|1.5 ; 2|1.000 ; 3|-2.25 ; 6|-Infinity
+SELECT id FROM nm WHERE n IS NULL	bigint	7
+SELECT id FROM nm WHERE n = 1.5	bigint	1
+SELECT id FROM nm WHERE n = 'NaN'	bigint	4
+SELECT id FROM nm WHERE n > 0 ORDER BY id	bigint	1 ; 2 ; 4 ; 5
+SELECT id FROM nm WHERE n IN (1.5, -2.25) ORDER BY id	bigint	1 ; 3
+SELECT count(*), count(n), min(n), max(n) FROM nm	bigint,bigint,numeric,numeric	7|6|-Infinity|NaN
+SELECT sum(d) FROM nm	numeric	NaN
+SELECT avg(d) FROM nm	numeric	NaN
+INSERT INTO nm VALUES (8, 0, 100.0)		-
+SELECT 1.5::numeric, 1.5::decimal, '1.5'::numeric, NUMERIC '1.5'	numeric,numeric,numeric,numeric	1.5|1.5|1.5|1.5
+SELECT 1.0::numeric, 1.00::numeric, 1.000::numeric	numeric,numeric,numeric	1.0|1.00|1.000
+SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)	numeric(10,2),numeric(10,0),numeric(10,0)	1.50|2|2
+SELECT 1.0::numeric(10,3)	numeric(10,3)	1.000
+SELECT 1.235::numeric(10,2), 1.245::numeric(10,2), 1.255::numeric(10,2)	numeric(10,2),numeric(10,2),numeric(10,2)	1.24|1.25|1.26
+SELECT (-1.235)::numeric(10,2), (-1.245)::numeric(10,2)	numeric(10,2),numeric(10,2)	-1.24|-1.25
+SELECT '1e5'::numeric, '1E5'::numeric, '1.5e-3'::numeric	numeric,numeric,numeric	100000|100000|0.0015
+SELECT 12345678901234567890123456789012345678901234567890::numeric	numeric	12345678901234567890123456789012345678901234567890
+SELECT (10::numeric ^ 100)::text	text	10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+SELECT 'NaN'::numeric, 'nan'::numeric	numeric,numeric	NaN|NaN
+SELECT 'Infinity'::numeric, '-Infinity'::numeric, 'inf'::numeric	numeric,numeric,numeric	Infinity|-Infinity|Infinity
+SELECT 'NaN'::numeric(10,2)	numeric(10,2)	NaN
+SELECT 'Infinity'::numeric(10,2)	!22003 numeric field overflow DETAIL: A field with precision 10, scale 2 cannot hold an infinite value.
+SELECT 100.0::numeric(3,2)	!22003 numeric field overflow DETAIL: A field with precision 3, scale 2 must round to an absolute value less than 10^1.
+SELECT 9.5::numeric(1,0)	!22003 numeric field overflow DETAIL: A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+SELECT 12345.6789::numeric(10,-2)	numeric(10,-2)	12300
+SELECT 1.5::numeric(1000,1000)	!22003 numeric field overflow DETAIL: A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+SELECT 1.5::numeric(1000,1001)	!22023 NUMERIC scale 1001 must be between -1000 and 1000
+SELECT 1.5::numeric(-1,0)	!22023 NUMERIC precision -1 must be between 1 and 1000
+SELECT 'abc'::numeric	!22P02 invalid input syntax for type numeric: "abc"
+SELECT ''::numeric	!22P02 invalid input syntax for type numeric: ""
+SELECT 0.1::numeric + 0.2::numeric = 0.3::numeric	boolean	t
+SELECT 0.1::float8 + 0.2::float8 = 0.3::float8	boolean	f
+SELECT 1.5::numeric(10,2) + 1.5::numeric(10,2), 1.5::numeric(10,2) * 2	numeric,numeric	3.00|3.00
+SELECT 1.50::numeric * 1.50::numeric	numeric	2.2500
+SELECT 6.0::numeric / 2.0::numeric	numeric	3.0000000000000000
+SELECT 1::numeric / 3	numeric	0.33333333333333333333
+SELECT 1::numeric / 2	numeric	0.50000000000000000000
+SELECT 1::int4 / 2	integer	0
+SELECT 1::numeric / 0	!22012 division by zero
+SELECT 'NaN'::numeric / 0	numeric	NaN
+SELECT 10::numeric % 3	numeric	1
+SELECT 2::numeric ^ 10, 2::numeric ^ 0.5	numeric,numeric	1024.0000000000000|1.4142135623730950
+SELECT 9223372036854775807::numeric + 1	numeric	9223372036854775808
+SELECT round(1.245, 2), trunc(1.999, 2), ceil(1.1), floor(1.9)	numeric,numeric,numeric,numeric	1.25|1.99|2|1
+SELECT round(2.5), round(3.5), round(-2.5)	numeric,numeric,numeric	3|4|-3
+SELECT scale(1.500), scale(1.5::numeric(10,3))	integer,integer	3|3
+SELECT 1.5::numeric::text, '1.5'::text::numeric	text,numeric	1.5|1.5
+SELECT 1.5::numeric(10,2)::text	text	1.50
+SELECT 'NaN'::numeric::text, 'Infinity'::numeric::text, '-Infinity'::numeric::text	text,text,text	NaN|Infinity|-Infinity
+SELECT 1.5::numeric::int, 2.5::numeric::int, 0.5::numeric::int, 1.5::numeric::int8	integer,integer,integer,bigint	2|3|1|2
+SELECT 1.5::numeric::float8, 1.5::float8::numeric	double precision,numeric	1.5|1.5
+SELECT 'NaN'::numeric::float8, 'Infinity'::numeric::float8	double precision,double precision	NaN|Infinity
+SELECT 'NaN'::numeric::int	!0A000 cannot convert NaN to integer
+SELECT 'Infinity'::numeric::int	!0A000 cannot convert infinity to integer
+SELECT (2147483647::numeric + 1)::int4	!22003 integer out of range
+SELECT numeric_send(1.5::numeric)	bytea	\x000200000000000100011388
+SELECT to_char(1.5::numeric, 'FM999.00'), to_char(1234.5::numeric, '9,999.99')	text,text	1.50| 1,234.50
+SELECT 1.5::numeric = 1.5::float8	boolean	t
+SELECT 1.5::numeric(10,2) = 1.50::numeric(10,2), 1.5::numeric = 1.50::numeric	boolean,boolean	t|t
+SELECT 'NaN'::numeric = 'NaN'::numeric, 'NaN'::numeric > 1	boolean,boolean	t|t
+SELECT pg_typeof(1.5::numeric(10,2) + 1::int4), pg_typeof(1.5::numeric + 1.5::float8)	regtype,regtype	numeric|double precision
+SELECT sum(x) FROM (VALUES (1::int8), (2::int8)) v(x)	numeric	3
+SELECT avg(x) FROM (VALUES (1::int8), (2::int8)) v(x)	numeric	1.5000000000000000
+SELECT greatest(1.5::numeric, 2.5::numeric), least(1.5::numeric, 2.5::numeric)	numeric,numeric	2.5|1.5
+SELECT NULL::numeric IS NULL, 1.5::numeric = NULL	boolean,boolean	t|\N

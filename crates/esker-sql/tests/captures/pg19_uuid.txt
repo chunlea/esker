@@ -1,0 +1,92 @@
+# `uuid`, as a real PostgreSQL 19beta1 answers it — tier 2
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap). OID 2950,
+# sixteen bytes fixed, `typcategory` U. `ActiveRecord`'s `t.uuid` and every `id: :uuid` primary
+# key land here.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`min(uuid)` and `max(uuid)` do not exist.** `42883 function min(uuid) does not exist` —
+#     and yet `<`, `>`, `uuid_cmp` and `ORDER BY` all work, so the type has a total order and no
+#     aggregate over it. Checked against `pg_proc` rather than inferred: no `min`/`max` takes 2950.
+#     This is ADR 0031's `min(boolean)` finding a second time, and it is the reason that finding
+#     was written down as a rule — **the aggregate set is per type and cannot be derived from
+#     whether the type is ordered.** `count(uuid)` does exist; `sum` and `avg` do not.
+#   * **Input is far more permissive than output.** All five of these are the same value —
+#     hyphenated, upper case, **no hyphens at all**, wrapped in **braces**, and hyphenated in the
+#     *wrong places* — and every one of them prints back as canonical lower-case hyphenated:
+#     `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`. An implementation that validated the shape rather
+#     than the sixteen bytes would reject four inputs a real server accepts.
+#   * **But whitespace is not trimmed.** A single trailing space is `22P02`, where `'  integer  '`
+#     is a fine `regtype`. Permissive about separators, strict about padding.
+#   * **Every input failure is `22P02`**, with the offending string quoted — one message for a
+#     wrong length, a wrong character, an empty string and an unbalanced brace alike. Unlike
+#     `date` and `time`, there is no range error, because every sixteen-byte string is a `uuid`.
+#   * **A typmod is refused, not ignored.** `uuid(10)` is
+#     `42601 type modifier is not allowed for type "uuid"` — a fourth typmod error message, next
+#     to `varchar`'s `22023`, `numeric`'s shouting `22023`, and `timestamp`'s silent clamp.
+#   * **`uuid::bytea` is the sixteen raw bytes** (`\xa0eebc999c0b4ef8bb6d6bb9bd380a11`), and
+#     `uuid::int` is `42846`. The value is bytes, never a number.
+#   * **`gen_random_uuid()`, `uuidv4()` and `uuidv7()` are all built in** and need no extension.
+#     They cannot be captured by value — what is pinned here is what is invariant about them.
+DROP TABLE IF EXISTS ud		-
+SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'uuid'	oid,name,smallint,regproc,"char"	2950|uuid|16|uuid_in|U
+SELECT pg_typeof('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid), format_type(2950, -1)	regtype,text	uuid|uuid
+CREATE TABLE ud (id int8 PRIMARY KEY, u uuid)		-
+INSERT INTO ud VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')		-
+INSERT INTO ud VALUES (2, '00000000-0000-0000-0000-000000000000')		-
+INSERT INTO ud VALUES (3, 'ffffffff-ffff-ffff-ffff-ffffffffffff')		-
+INSERT INTO ud VALUES (4, '{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12}')		-
+INSERT INTO ud VALUES (5, NULL)		-
+SELECT id, u FROM ud ORDER BY id	bigint,uuid	1|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 ; 2|00000000-0000-0000-0000-000000000000 ; 3|ffffffff-ffff-ffff-ffff-ffffffffffff ; 4|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12 ; 5|\N
+SELECT id, u FROM ud ORDER BY u	bigint,uuid	2|00000000-0000-0000-0000-000000000000 ; 1|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 ; 4|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12 ; 3|ffffffff-ffff-ffff-ffff-ffffffffffff ; 5|\N
+SELECT id, u FROM ud ORDER BY u DESC	bigint,uuid	5|\N ; 3|ffffffff-ffff-ffff-ffff-ffffffffffff ; 4|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12 ; 1|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 ; 2|00000000-0000-0000-0000-000000000000
+SELECT id FROM ud WHERE u IS NULL	bigint	5
+SELECT id FROM ud WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'	bigint	1
+SELECT id FROM ud WHERE u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'	bigint	1
+SELECT id FROM ud WHERE u > '00000000-0000-0000-0000-000000000000' ORDER BY id	bigint	1 ; 3 ; 4
+SELECT id FROM ud WHERE u IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'ffffffff-ffff-ffff-ffff-ffffffffffff') ORDER BY id	bigint	1 ; 3
+SELECT count(*), count(u) FROM ud	bigint,bigint	5|4
+SELECT min(u) FROM ud	!42883 function min(uuid) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(u) FROM ud	!42883 function max(uuid) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT sum(u) FROM ud	!42883 function sum(uuid) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT avg(u) FROM ud	!42883 function avg(uuid) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'a0eebc99-9c0b4ef8-bb6d-6bb9bd380a11'::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT '00000000-0000-0000-0000-000000000000'::uuid, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid	uuid,uuid	00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid	!22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a111'::uuid	!22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a111"
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380g11'::uuid	!22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380g11"
+SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid	!22P02 invalid input syntax for type uuid: "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 '::uuid	!22P02 invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 "
+SELECT ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid	!22P02 invalid input syntax for type uuid: " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+SELECT 'not-a-uuid'::uuid	!22P02 invalid input syntax for type uuid: "not-a-uuid"
+SELECT ''::uuid	!22P02 invalid input syntax for type uuid: ""
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::text	text	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::text::uuid	uuid	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::varchar	character varying	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::char(8)	character(8)	a0eebc99
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::bytea	bytea	\xa0eebc999c0b4ef8bb6d6bb9bd380a11
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::int	!42846 cannot cast type uuid to integer
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::json	!42846 cannot cast type uuid to json
+SELECT 'uuid(10)'::regtype::oid	!42601 type modifier is not allowed for type "uuid"
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid(10)	!42601 type modifier is not allowed for type "uuid"
+SELECT '00000000-0000-0000-0000-000000000000'::uuid < 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid	boolean	t
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid	boolean	t
+SELECT uuid_cmp('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, '00000000-0000-0000-0000-000000000000'::uuid)	integer	1
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 1	!42883 operator does not exist: uuid = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'	boolean	t
+SELECT gen_random_uuid() IS NOT NULL, length(gen_random_uuid()::text)	boolean,integer	t|36
+SELECT uuidv4() IS NOT NULL, uuidv7() IS NOT NULL	boolean,boolean	t|t
+SELECT NULL::uuid IS NULL, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = NULL	boolean,boolean	t|\N

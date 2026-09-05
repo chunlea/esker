@@ -1,0 +1,112 @@
+# `col_description`, `obj_description` and `pg_get_partkeydef`, as a real PostgreSQL 19beta1
+# answers them.
+#
+# NOT types. `col_description` is **rung 3's blocker** at `443074a` and boot statement 15;
+# `obj_description` is boot statements 29 and 32; `pg_get_partkeydef` is 31. All three come from
+# `ActiveRecord`'s `columns()` and schema-dump path, and none of them had oracle evidence.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, because `COMMENT ON` writes rows to
+# `pg_description` — a system catalog — and this directory's rule is that a write probe never
+# escapes a transaction. The final `SELECT count(*) … FROM pg_class` proves it left nothing behind.
+# Error probes are wrapped in `SAVEPOINT` / `ROLLBACK TO` so one refusal does not abort the block
+# and turn every line after it into `25P02`.
+#
+# **A consequence of that rule, stated rather than hidden:** `sesscap.py` fills the declared-types
+# column by asking `\gdesc` in a *second* session, which runs after the `ROLLBACK` — so every
+# statement that names the temporary table has an **empty** types column here. That is the price of
+# not writing to the oracle, and it is the right trade: the rows and the errors are the
+# specification, and the declared type of `text` is already pinned by the `pg_typeof` line below.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **All three answer NULL far more often than they raise.** No comment on the column is NULL;
+#     no comment on the table is NULL; an **out-of-range attnum** (`99`, `-1`) is NULL, not an
+#     error; an **OID that does not exist at all** (`999999`) is NULL for all three; a NULL
+#     argument is NULL. There is no "not found" error anywhere in this file — every failure below
+#     is an *arity* failure.
+#   * **`col_description(oid, 0)` returns the TABLE's comment, not a column's.** `pg_description`
+#     keys a table comment as `objsubid = 0`, and `col_description` does not special-case it. So
+#     attnum 0 is the one subscript that is neither out of range nor a column. An implementation
+#     that returned NULL for 0 would be wrong on the one value most likely to be passed by accident.
+#   * **`obj_description`'s catalog-name argument is not validated.**
+#     `obj_description(oid, 'nosuchcatalog')` is **NULL**, not an error — the name is used to
+#     filter `pg_description.classoid` and a name that matches nothing simply matches nothing. And
+#     the one-argument form still exists: `obj_description(oid)` answers the same as
+#     `obj_description(oid, 'pg_class')` here.
+#   * **`pg_get_partkeydef` on a non-partitioned relation is NULL, not an error** — and so is
+#     `pg_get_partkeydef` on an *index*. It answers only for a partitioned table, and then it
+#     answers the strategy and the key: `RANGE (r)`, `LIST (s)`, `HASH (id, r)` — upper-case
+#     strategy, one space, the key list parenthesised.
+#   * **`COMMENT ON … IS ''` is the same as `IS NULL`.** Checked with a guard column so an empty
+#     string could not be mistaken for no row: after `IS ''`, `col_description` `IS NULL` is **`t`**
+#     and `length()` is NULL. PostgreSQL deletes the `pg_description` row rather than storing an
+#     empty comment, so there is no way to observe a comment that is the empty string.
+#   * **Every arity failure is `42883`, and the DETAIL says *number*, not types.**
+#     `col_description(regclass)`, `obj_description()`, `pg_get_partkeydef()` and
+#     `pg_get_partkeydef(regclass, integer)` all answer
+#     `DETAIL: No function of that name accepts the given number of arguments.` — the same sentence
+#     `current_schemas()` and `format_type(23)` give, and *not* the "given argument types" sentence
+#     a wrong-type call gets.
+#   * **All three return `text`**, confirmed by `pg_typeof` on the same line so the declared type is
+#     pinned even though the rolled-back table leaves the `\gdesc` column empty.
+BEGIN		-
+CREATE TABLE cf (id int8 PRIMARY KEY, a int4, b text)		-
+COMMENT ON TABLE cf IS 'the table comment'		-
+COMMENT ON COLUMN cf.a IS 'the column comment'		-
+SELECT pg_typeof(obj_description('cf'::regclass, 'pg_class')), pg_typeof(col_description('cf'::regclass, 2)), pg_typeof(pg_get_partkeydef('cf'::regclass))		text|text|text
+SELECT 'r', obj_description('cf'::regclass)		r|the table comment
+SELECT 'r', obj_description('cf'::regclass, 'pg_class')		r|the table comment
+SELECT 'r', obj_description('cf'::regclass, 'nosuchcatalog')		r|\N
+SELECT 'r', obj_description('cf'::regclass, 'pg_type')		r|\N
+SELECT 'r', col_description('cf'::regclass, 1)		r|\N
+SELECT 'r', col_description('cf'::regclass, 2)		r|the column comment
+SELECT 'r', col_description('cf'::regclass, 3)		r|\N
+SELECT 'r', col_description('cf'::regclass, 0)		r|the table comment
+SELECT 'r', col_description('cf'::regclass, 99)		r|\N
+SELECT 'r', col_description('cf'::regclass, -1)		r|\N
+SELECT 'r', pg_get_partkeydef('cf'::regclass)		r|\N
+SELECT 'r', pg_get_partkeydef('cf'::regclass) IS NULL		r|t
+SELECT 'r', pg_get_partkeydef('cf_pkey'::regclass)		r|\N
+SELECT 'r', obj_description('cf_pkey'::regclass, 'pg_class')		r|\N
+SELECT 'r', obj_description(999999), obj_description(999999, 'pg_class'), col_description(999999, 1), pg_get_partkeydef(999999)	text,text,text,text,text	r|\N|\N|\N|\N
+SELECT 'r', obj_description(NULL), col_description(NULL, 1), col_description('cf'::regclass, NULL), pg_get_partkeydef(NULL)		r|\N|\N|\N|\N
+SAVEPOINT s1		-
+SELECT col_description('cf'::regclass)	!42883 function col_description(regclass) does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT obj_description()	!42883 function obj_description() does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT pg_get_partkeydef()	!42883 function pg_get_partkeydef() does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+SELECT pg_get_partkeydef('cf'::regclass, 1)	!42883 function pg_get_partkeydef(regclass, integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+SELECT col_description('cf'::regclass, 2, 3)	!42883 function col_description(regclass, integer, integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s5		-
+COMMENT ON COLUMN cf.a IS ''		-
+SELECT 'r', col_description('cf'::regclass, 2) IS NULL, length(col_description('cf'::regclass, 2))		r|t|\N
+COMMENT ON TABLE cf IS ''		-
+SELECT 'r', obj_description('cf'::regclass, 'pg_class') IS NULL, length(obj_description('cf'::regclass, 'pg_class'))		r|t|\N
+COMMENT ON TABLE cf IS 'back again'		-
+SELECT 'r', obj_description('cf'::regclass, 'pg_class'), col_description('cf'::regclass, 0)		r|back again|back again
+COMMENT ON TABLE cf IS NULL		-
+SELECT 'r', obj_description('cf'::regclass, 'pg_class') IS NULL, col_description('cf'::regclass, 0) IS NULL		r|t|t
+CREATE TABLE cfp (id int8, r int4) PARTITION BY RANGE (r)		-
+SELECT 'r', pg_get_partkeydef('cfp'::regclass)		r|RANGE (r)
+CREATE TABLE cfp2 (id int8, r int4, s text) PARTITION BY LIST (s)		-
+SELECT 'r', pg_get_partkeydef('cfp2'::regclass)		r|LIST (s)
+CREATE TABLE cfp3 (id int8, r int4) PARTITION BY HASH (id, r)		-
+SELECT 'r', pg_get_partkeydef('cfp3'::regclass)		r|HASH (id, r)
+COMMENT ON TABLE cfp IS 'a partitioned table'		-
+SELECT 'r', obj_description('cfp'::regclass, 'pg_class'), pg_get_partkeydef('cfp'::regclass)		r|a partitioned table|RANGE (r)
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('cf','cfp','cfp2','cfp3')	bigint	0
+SELECT count(*) FROM pg_description d JOIN pg_class c ON c.oid = d.objoid WHERE c.relname IN ('cf','cfp','cfp2','cfp3')	bigint	0

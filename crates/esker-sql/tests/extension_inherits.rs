@@ -35,10 +35,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT pg_extension.extname, n.nspname AS schema FROM pg_extension JOIN pg_namespace n ON pg_extension.extnamespace = n.oid",
             "Boot statement 23. One row on a real server — `plpgsql` in `pg_catalog` — and none \
              here, because this node has no extensions to name.",
+            "UNMEASURED",
         ),
         (
             "SELECT extname, extnamespace FROM pg_extension",
             "The same row, read directly.",
+            "UNMEASURED",
         ),
     ],
 };

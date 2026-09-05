@@ -26,6 +26,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "CREATE VIEW v_union AS SELECT id, a FROM vb UNION SELECT id, c FROM vb2;",
         "`0A000 UNION is not supported`: a set operation is a query feature this node does not \
          have, so the view cannot be created. Nothing about the dependency edge differs.",
+        "pg19_view_debts.txt:40",
     )],
 };
 

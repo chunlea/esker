@@ -62,6 +62,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              right `attnum`, which is what the catalog describing itself buys. The second half of \
              the difference is the oid column: an `oid` there and a `bigint` here, the same trade \
              `pg_class.oid` already declares everywhere.",
+            "pg19_catalog_namespace.txt:59",
         ),
         (
             "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
@@ -73,6 +74,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              column to be declared as; `ColumnType::Oid` exists and is what `pg_stat_activity` \
              uses, so closing this is a pass over the catalog's own column lists rather than a \
              type-surface change — a unit of its own, and one that would move eleven views at once.",
+            "pg19_catalog_namespace.txt:61",
         ),
         (
             "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND \
@@ -87,6 +89,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `pg_index` has nothing for it. `ActiveRecord` reads that as \"no primary key\", which \
              is what it reads for a view — true of a computed relation, and the answer it can act \
              on.",
+            "pg19_catalog_namespace.txt:73",
         ),
         (
             "SELECT 'r', count(*) AS catalog_tables_listed FROM information_schema.tables WHERE \
@@ -100,6 +103,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              views are their own surface with their own rules — `table_type`, \
              `is_insertable_into`, a row per view as well as per table — and closing this one \
              means capturing that surface, not extending this unit.",
+            "pg19_catalog_namespace.txt:76",
         ),
         (
             "SELECT 'r', count(*) AS catalog_columns_listed FROM information_schema.columns WHERE \
@@ -109,6 +113,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              ten. So even a version of this view that listed the catalog would not answer 34 — \
              which is what says the two questions are separate, and that this one is about how \
              wide the catalog is rather than about which schema it is in.",
+            "pg19_catalog_namespace.txt:86",
         ),
     ],
 };

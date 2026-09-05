@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type \
              WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname",
             "no array type for a shape here; every other column agrees",
+            "UNMEASURED",
         ),
     ],
 };

@@ -18,6 +18,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          `plan::Update` gained here, and `lower_delete` refuses the clause by name. It is in this \
          capture so that the day it is needed its answer is already measured — `ActiveRecord` \
          sends the subquery form for `delete_all` (`tests/write_in_subquery.rs`), not this one.",
+        "UNMEASURED",
     )],
 };
 

@@ -25,6 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              against — the same machinery the arithmetic below needs — and until there is one the \
              text differs while the **value** does not: the row reads `\\x41` either way, which is \
              the line above this one.",
+            "UNMEASURED",
         ),
         (
             "SELECT length(convert_to('hello', 'UTF8'))",
@@ -32,6 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              because it is the statement that would prove `convert_to` counted the bytes rather \
              than the characters. The two disagree only on multi-byte input, and the byte string \
              itself is checked directly in the test below.",
+            "UNMEASURED",
         ),
         (
             "SELECT pg_typeof(random()), pg_typeof(concat('a','b')), pg_typeof(convert_to('A','UTF8')), pg_typeof(CURRENT_DATE)",
@@ -39,6 +41,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              corpus that would use it to prove a declared type. The four types it would report \
              are what `PlainFunc::result_type` returns, and the `\\gdesc` column of every other \
              line here checks them the long way.",
+            "UNMEASURED",
         ),
         // **Both arithmetic entries are deleted** (ADR 0031, rule 2). They recorded that this
         // node had no arithmetic operator of any kind, so `random() * 100` and `1 + 1` — two of
@@ -54,6 +57,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the table is created** rather than when the first row is written — the expression is \
              resolved at DDL time here as it is there, which is what stops a table whose every \
              insert would fail.",
+            "UNMEASURED",
         ),
     ],
 };

@@ -29,6 +29,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              been built here. Both refuse with `0A000`; what is missing is the action, not the \
              partition rule, and `CREATE UNIQUE INDEX` two lines above proves the rule itself in \
              PostgreSQL's own words",
+            "pg19_partition.txt:87",
         ),
         (
             "SELECT 'r', tableoid::regclass::text, city_id, logdate, peaktemp FROM \
@@ -41,6 +42,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              **first** statement in the capture this node refuses, so the thirty-seven after it \
              are swallowed by the aborted block and counted rather than declared — every one of \
              them is asserted directly in this file instead",
+            "pg19_partition.txt:100",
         ),
         (
             "ALTER TABLE \"measurements\" DETACH PARTITION \"measurements_concepcion\"",
@@ -49,12 +51,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `FOR VALUES` on the attach — does not parse at all under its PostgreSQL dialect. \
              Neither spelling is in `postgresql_specific_schema.rb`: the capture probes them, the \
              suite never sends them. `0A000` naming the action is what this node answers",
+            "pg19_partition.txt:122",
         ),
         (
             "ALTER TABLE \"measurements\" ATTACH PARTITION \"measurements_concepcion\" FOR VALUES IN (2)",
             "The other half of the parser gap above, and the half that carries a bound — \
              `FOR VALUES IN (2)` has nowhere to go in `sqlparser`\u{2019}s ClickHouse-shaped \
              `AttachPartition`. Refused by name",
+            "pg19_partition.txt:126",
         ),
     ],
 };

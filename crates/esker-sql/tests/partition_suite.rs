@@ -64,6 +64,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              being `\"char\"` there and `text` here shows up in the answer. `relhassubclass` agrees. \
              Every value in the column is identical; only the name of the type it is stored under \
              differs, which is the trade every `pg_catalog` column in this crate makes",
+        "pg19_partition_suite.txt:147",
     )],
 };
 

@@ -15,6 +15,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../provenance/mod.rs"]
+mod provenance;
+
 use std::sync::Arc;
 
 use esker_sql::backend::{Backend, MemoryBackend};
@@ -67,7 +70,7 @@ pub(crate) struct Divergences {
     /// Statements whose rows agree and whose declared types do not.
     pub(crate) types: &'static [&'static str],
     /// Statements answered differently, each with the reason.
-    pub(crate) answers: &'static [(&'static str, &'static str)],
+    pub(crate) answers: &'static [provenance::Divergence],
 }
 
 /// A node the corpus is replayed against.
@@ -253,6 +256,8 @@ fn parse(corpus: &str) -> Vec<Probe> {
 
 /// Replays a bind corpus and asserts every answer, with the declared divergences held both ways.
 pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
+    // The same rule the parity harness runs, and for the same reason (ADR 0075).
+    provenance::check(divergences.answers);
     let mut node = Node::new();
     let mut mismatched = Vec::new();
     let mut type_mismatched = Vec::new();
@@ -274,7 +279,7 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
         let listed = divergences
             .answers
             .iter()
-            .position(|(statement, _)| *statement == sql);
+            .position(|(statement, ..)| *statement == sql);
         // **Run it even when it is listed.** A replay is stateful, so a statement skipped here is
         // a row this node never wrote and every line after it sees a different table than
         // PostgreSQL did. A corpus of `SELECT`s hid that; one whose divergences are `DELETE`s
@@ -340,7 +345,7 @@ pub(crate) fn replay(corpus: &str, divergences: &Divergences) -> usize {
     );
     // Rule 2, decided per entry: an entry is stale only when **every** occurrence of its
     // statement agreed. One that still covers a second occurrence stays.
-    for (at, (sql, _)) in divergences.answers.iter().enumerate() {
+    for (at, (sql, ..)) in divergences.answers.iter().enumerate() {
         let occurrences = listed_seen.iter().filter(|&&seen| seen == at).count();
         let agreements = listed_agreements
             .iter()

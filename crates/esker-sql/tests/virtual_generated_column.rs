@@ -36,6 +36,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "`UPPER(name)` against `upper(name)`: the stored text against PostgreSQL's deparse of its \
          own parse tree. Same expression, same values; reproducing the deparser is `ruleutils.c` \
          and is declared rather than attempted, exactly as for `pg_get_viewdef`.",
+        "pg19_virtual_generated_column.txt:40",
     )],
 };
 

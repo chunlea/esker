@@ -1,0 +1,121 @@
+# An `enum` type as a COLUMN and as VALUES — what `enum_test.rb` sends after the `CREATE TYPE`.
+#
+# `captures/pg19_create_type.txt` pins the DDL (`AS ENUM`, `AS RANGE`, composite) and
+# `captures/pg19_do_block.txt` pins the `DO $$ … $$` wrapper `create_enum` actually emits. Neither
+# says what happens once a column has the type, which is where the tests spend their assertions.
+#
+# Things reasoning would get wrong:
+#
+# * **An enum does not sort alphabetically.** It sorts by `enumsortorder`, the declaration order, so
+#   `'sad' < 'ok' < 'happy'` — the reverse of alphabetical for these three labels. `ORDER BY` on the
+#   column, the comparison operators and `array_agg(… ORDER BY enum.enumsortorder)` in AR's own
+#   `enum_types` query all depend on it.
+# * **`ALTER TYPE … ADD VALUE` is allowed inside a transaction and the new label is not usable in
+#   it.** PostgreSQL raises `55P04 unsafe use of new value of enum type` for the *use*, not the
+#   `ALTER`. `enum_test.rb:137-139` adds three values, and the suite runs its tests inside a
+#   transaction, so this is the answer the harness sees rather than a hypothetical.
+# * **The label is not a string as far as the catalog is concerned.** `format_type` gives the type's
+#   *name* (`mood`), `typtype` is `'e'`, the labels live in `pg_enum`, and the column default comes
+#   back from `pg_get_expr` as `'happy'::mood` — the dumper reads all three.
+# * **An unquoted literal reaches the column through an assignment cast.**
+#   `INSERT INTO postgresql_enums VALUES (1, 'sad')` (enum_test.rb:60) never names the type; the
+#   `unknown` literal is resolved against the column. `'sad'::text::mood` and `'sad'::mood` are the
+#   explicit spellings, and a bad label is `22P02`, not a check-constraint violation.
+# * **The aggregate set is per type here too** — this file asks `min`/`max` over an enum column and
+#   records the answer rather than assuming, on the ADR 0031 rule that it cannot be derived.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing behind. `\gdesc` runs
+# in a second session after that rollback, so statements naming `mood` or `pge` have an **empty**
+# declared-types column; the `pg_typeof` lines pin the types instead.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TABLE pge (id serial primary key, current_mood mood)		-
+# ---- enum_types() verbatim (postgresql_adapter.rb:533) — what the dumper reads ----
+SELECT 'r', type.typname AS name, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname	text,name,name,name[]	r|mood|public|{sad,ok,happy}
+SELECT 'r', e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder	text,name,real	r|sad|1 ; r|ok|2 ; r|happy|3
+SELECT 'r', t.typname, t.typtype, t.typcategory, t.typlen, t.typinput, t.typbasetype FROM pg_type t WHERE t.typname = 'mood'	text,name,"char","char",smallint,regproc,oid	r|mood|e|E|4|enum_in|0
+# ---- the column, as `column_definitions` reads it ----
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"pge"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('pge_id_seq'::regclass)|t ; r|current_mood|mood|\N|f
+# ---- values: the insert enum_test.rb sends, with no cast in it ----
+INSERT INTO pge VALUES (1, 'sad')		-
+SELECT 'r', id, current_mood FROM pge ORDER BY id		r|1|sad
+UPDATE pge SET current_mood = 'happy' WHERE id = 1		-
+SELECT 'r', current_mood FROM pge WHERE id = 1		r|happy
+INSERT INTO pge VALUES (2, 'ok')		-
+INSERT INTO pge (id) VALUES (3)		-
+SELECT 'r', id, current_mood IS NULL FROM pge ORDER BY id		r|1|f ; r|2|f ; r|3|t
+SELECT 'r', count(*) FROM pge WHERE current_mood = 'ok'		r|1
+SELECT 'r', pg_typeof('sad'::mood), pg_typeof(current_mood) FROM pge WHERE id = 1		r|mood|mood
+SELECT 'r', 'sad'::mood::text, 'sad'::text::mood, 'sad'::mood = 'sad'		r|sad|sad|t
+# ---- the order is the DECLARATION order, not the alphabet ----
+SELECT 'r', 'sad'::mood < 'ok'::mood, 'ok'::mood < 'happy'::mood, 'happy'::mood > 'sad'::mood		r|t|t|t
+SELECT 'r', id, current_mood FROM pge WHERE current_mood IS NOT NULL ORDER BY current_mood		r|2|ok ; r|1|happy
+SELECT 'r', enum_range(NULL::mood), enum_first(NULL::mood), enum_last(NULL::mood)		r|{sad,ok,happy}|sad|happy
+SELECT 'r', enum_range('sad'::mood, 'ok'::mood)		r|{sad,ok}
+# ---- aggregates over an enum column: asked, not assumed ----
+SELECT 'r', min(current_mood), max(current_mood) FROM pge		r|ok|happy
+SAVEPOINT a1		-
+SELECT 'r', sum(current_mood) FROM pge	!42883 function sum(mood) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO a1		-
+SELECT 'r', count(DISTINCT current_mood) FROM pge		r|2
+# ---- a label that is not in the type ----
+SAVEPOINT a2		-
+INSERT INTO pge VALUES (4, 'angry')	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+SELECT 'r', 'angry'::mood	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO a3		-
+SAVEPOINT a4		-
+SELECT 'r', current_mood = 'angry' FROM pge WHERE id = 1	!22P02 invalid input value for enum mood: "angry"
+ROLLBACK TO a4		-
+# ---- a default, and how the dumper gets it back (test_enum_defaults, test_schema_dump) ----
+ALTER TABLE pge ADD COLUMN good_mood mood DEFAULT 'happy' NOT NULL		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"pge"'::regclass AND a.attname = 'good_mood'		r|good_mood|mood|'happy'::mood|t
+SELECT 'r', good_mood FROM pge ORDER BY id		r|happy ; r|happy ; r|happy
+# ---- an array of the enum ----
+SELECT 'r', ARRAY['sad','happy']::mood[], pg_typeof(ARRAY['sad'::mood])		r|{sad,happy}|mood[]
+ALTER TABLE pge ADD COLUMN moods mood[]		-
+INSERT INTO pge (id, moods) VALUES (5, ARRAY['sad','ok']::mood[])		-
+SELECT 'r', moods, array_length(moods, 1) FROM pge WHERE moods IS NOT NULL		r|{sad,ok}|2
+# ---- ALTER TYPE ADD VALUE inside a transaction: the ALTER is fine, the USE is not ----
+ALTER TYPE mood ADD VALUE 'angry' BEFORE 'ok'		-
+ALTER TYPE mood ADD VALUE 'nervous' AFTER 'ok'		-
+ALTER TYPE mood ADD VALUE 'glad'		-
+ALTER TYPE mood ADD VALUE IF NOT EXISTS 'glad'		-
+SELECT 'r', e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder	text,name,real	r|sad|1 ; r|angry|1.5 ; r|ok|2 ; r|nervous|2.5 ; r|happy|3 ; r|glad|4
+SAVEPOINT a5		-
+SELECT 'r', 'angry'::mood	!55P04 unsafe use of new value "angry" of enum type mood HINT: New enum values must be committed before they can be used.
+ROLLBACK TO a5		-
+SAVEPOINT a6		-
+INSERT INTO pge (id, current_mood) VALUES (6, 'glad')	!55P04 unsafe use of new value "glad" of enum type mood HINT: New enum values must be committed before they can be used.
+ROLLBACK TO a6		-
+# ---- renaming a value and the type (test_rename_enum_value, test_rename_enum) ----
+ALTER TYPE mood RENAME VALUE 'ok' TO 'okay'		-
+SELECT 'r', array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'mood'	text,name[]	r|{sad,angry,okay,nervous,happy,glad}
+SELECT 'r', current_mood FROM pge WHERE id = 2		r|okay
+SAVEPOINT a7		-
+ALTER TYPE mood RENAME VALUE 'nosuchlabel' TO 'x'	!22023 "nosuchlabel" is not an existing enum label
+ROLLBACK TO a7		-
+ALTER TYPE mood RENAME TO feeling		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '"pge"'::regclass AND a.attname = 'current_mood'		r|current_mood|feeling
+ALTER TYPE feeling RENAME TO mood		-
+# ---- dropping it: the column is a dependency (test_drop_enum) ----
+SAVEPOINT a8		-
+DROP TYPE mood	!2BP01 cannot drop type mood because other objects depend on it DETAIL: column moods of table pge depends on type mood[] HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO a8		-
+SAVEPOINT a9		-
+DROP TYPE nosuchenum	!42704 type "nosuchenum" does not exist
+ROLLBACK TO a9		-
+DROP TYPE IF EXISTS nosuchenum		-
+CREATE TYPE unused AS ENUM ()		-
+SELECT 'r', count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'unused'	text,bigint	r|0
+DROP TYPE unused		-
+DROP TABLE pge		-
+DROP TYPE mood		-
+ROLLBACK		-
+# ---- proof the oracle is as it was ----
+SELECT count(*) FROM pg_type WHERE typname IN ('mood','feeling','unused')	bigint	0
+SELECT count(*) FROM pg_class WHERE relname = 'pge'	bigint	0

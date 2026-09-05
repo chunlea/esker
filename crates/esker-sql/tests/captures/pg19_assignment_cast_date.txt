@@ -1,0 +1,95 @@
+# A `date` column assigned a `timestamp with time zone` — the assignment cast `insert_all` relies on.
+#
+# **Run 51 ranking #4: `column "…" is of type date but expression is of type timestamp with time
+# zone`, 57 tests over 2 files** — 58 of the 59 raises are `insert_all_test.rb`, one is
+# `instrumentation_test.rb`. No test writes that cast. The statement was traced out of the failing
+# file with the runner's SQL hook and it is AR filling the timestamp columns of `books`:
+#
+#     INSERT INTO "books" ("name","author_id","created_at","updated_at","updated_on")
+#     VALUES ('New Book', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+#     ON CONFLICT ("id") DO UPDATE SET updated_at=…
+#
+# `books.updated_on` is `t.date` (`test/schema/schema.rb:157`) while `created_at`/`updated_at` are
+# `datetime`, and `insert_all` writes `CURRENT_TIMESTAMP` — a `timestamptz` — into all three. It is
+# the same expression landing in two different column types, and PostgreSQL accepts it because there
+# is an **assignment** cast from `timestamptz` to `date`.
+#
+# Things reasoning would get wrong:
+#
+# * **Assignment context is not expression context.** `INSERT INTO t (d) VALUES (CURRENT_TIMESTAMP)`
+#   is fine; `SELECT … WHERE d = CURRENT_TIMESTAMP` is **not**, and neither is a comparison in an
+#   `ON CONFLICT` predicate. `pg_cast.castcontext` is `'a'` for this pair — allowed when assigning to
+#   a column, not when combining values. An implementation with one cast table for both contexts is
+#   wrong in one direction or the other.
+# * **The result depends on the session `TimeZone`.** `timestamptz` -> `date` is "which calendar day
+#   is that instant, here", so the same instant is two different dates in two time zones. The rows
+#   below take the same value in `UTC` and in `Pacific/Auckland` and they differ. The conversion
+#   happens **once, at assignment**: the row inserted under `Pacific/Auckland` reads back as the same
+#   date after `SET TimeZone = 'UTC'`, because what was stored is a date and not an instant.
+# * **The reverse direction is `'i'`, implicit** — `date` -> `timestamp` and `date` -> `timestamptz`
+#   need no cast at all, which is why the asymmetry cannot be modelled as one "compatible" relation.
+# * **`ON CONFLICT … DO UPDATE SET` is assignment context too**, including `excluded.<col>`.
+# * **What has no assignment cast raises `42804` and names both types**, which is the message shape a
+#   refusal has to match.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+SELECT 'r', current_setting('TimeZone')	text,text	r|Etc/UTC
+# ---- what the catalog says about the pair, in both directions ----
+SELECT 'r', castsource::regtype, casttarget::regtype, castcontext, castmethod FROM pg_cast WHERE casttarget = 'date'::regtype ORDER BY castsource::regtype::text	text,regtype,regtype,"char","char"	r|timestamp without time zone|date|a|f ; r|timestamp with time zone|date|a|f
+SELECT 'r', castsource::regtype, casttarget::regtype, castcontext FROM pg_cast WHERE castsource = 'date'::regtype ORDER BY casttarget::regtype::text	text,regtype,regtype,"char"	r|date|timestamp without time zone|i ; r|date|timestamp with time zone|i
+# ---- the table, as `schema.rb` declares the three columns ----
+CREATE TABLE bk (id serial primary key, name character varying(255), created_at timestamp(6) without time zone, updated_at timestamp(6) without time zone, updated_on date)		-
+# ---- the statement AR sends ----
+INSERT INTO "bk" ("name","created_at","updated_at","updated_on") VALUES ('New Book', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)		-
+SELECT 'r', name, updated_on, pg_typeof(updated_on), pg_typeof(created_at) FROM bk		r|New Book|2026-09-04|date|timestamp without time zone
+SELECT 'r', updated_on = CURRENT_DATE FROM bk		r|t
+# ---- the same expression, in expression context, is refused ----
+SAVEPOINT d1		-
+SELECT 'r', count(*) FROM bk WHERE updated_on = CURRENT_TIMESTAMP		r|0
+ROLLBACK TO d1		-
+SELECT 'r', count(*) FROM bk WHERE updated_on = CURRENT_TIMESTAMP::date		r|1
+# ---- UPDATE is assignment context as well ----
+UPDATE bk SET updated_on = CURRENT_TIMESTAMP		-
+SELECT 'r', updated_on FROM bk		r|2026-09-04
+UPDATE bk SET updated_on = now()		-
+SELECT 'r', updated_on FROM bk		r|2026-09-04
+# ---- ON CONFLICT ... DO UPDATE SET, including excluded ----
+CREATE UNIQUE INDEX bk_name_uq ON bk (name)		-
+INSERT INTO "bk" ("name","updated_on") VALUES ('New Book', CURRENT_TIMESTAMP) ON CONFLICT ("name") DO UPDATE SET updated_on = CURRENT_TIMESTAMP		-
+INSERT INTO "bk" ("name","updated_on") VALUES ('New Book', CURRENT_TIMESTAMP) ON CONFLICT ("name") DO UPDATE SET updated_on = excluded.updated_on		-
+SELECT 'r', count(*), max(updated_on) FROM bk		r|1|2026-09-04
+# ---- the cast is a calendar-day question, so the time zone changes the answer ----
+SET TimeZone = 'UTC'		-
+SELECT 'r', '2011-01-01 23:30:00+00'::timestamptz::date, '2011-01-01 23:30:00+00'::timestamptz	text,date,timestamp with time zone	r|2011-01-01|2011-01-01 23:30:00+00
+SET TimeZone = 'Pacific/Auckland'		-
+SELECT 'r', '2011-01-01 23:30:00+00'::timestamptz::date, '2011-01-01 23:30:00+00'::timestamptz	text,date,timestamp with time zone	r|2011-01-02|2011-01-02 12:30:00+13
+INSERT INTO "bk" ("name","updated_on") VALUES ('tz probe', '2011-01-01 23:30:00+00'::timestamptz)		-
+SELECT 'r', name, updated_on FROM bk WHERE name = 'tz probe'		r|tz probe|2011-01-02
+SET TimeZone = 'UTC'		-
+SELECT 'r', name, updated_on FROM bk WHERE name = 'tz probe'		r|tz probe|2011-01-02
+RESET TimeZone		-
+# ---- the other direction needs no cast at all ----
+CREATE TABLE bk2 (d date, ts timestamp, tstz timestamptz)		-
+INSERT INTO bk2 (d) VALUES (CURRENT_DATE)		-
+UPDATE bk2 SET ts = d, tstz = d		-
+SELECT 'r', d, ts, tstz IS NOT NULL FROM bk2		r|2026-09-04|2026-09-04 00:00:00|t
+SELECT 'r', pg_typeof(d + 1), pg_typeof(ts), CURRENT_DATE = CURRENT_TIMESTAMP::date FROM bk2		r|date|timestamp without time zone|t
+# ---- and where there is no assignment cast, the message names both types ----
+SAVEPOINT d2		-
+INSERT INTO bk2 (d) VALUES (1)	!42804 column "d" is of type date but expression is of type integer HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO d2		-
+SAVEPOINT d3		-
+UPDATE bk2 SET d = 'not a date'	!22007 invalid input syntax for type date: "not a date"
+ROLLBACK TO d3		-
+SAVEPOINT d4		-
+INSERT INTO bk2 (d) VALUES ('2011-01-01'::text)	!42804 column "d" is of type date but expression is of type text HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO d4		-
+SELECT 'r', count(*) FROM pg_cast WHERE casttarget = 'date'::regtype AND castcontext = 'a'	text,bigint	r|2
+DROP TABLE bk		-
+DROP TABLE bk2		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('bk','bk2','bk_name_uq')	bigint	0

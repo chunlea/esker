@@ -24,12 +24,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              rule. The ambiguity itself is not reachable here until two functions share a name — \
              `DROP FUNCTION` selects by name when no argument list is written, which is what the \
              agreeing lines above check.",
+            "UNMEASURED",
         ),
         (
             "DROP FUNCTION IF EXISTS lower",
             "The same, and it is worth its own line because `IF EXISTS` does **not** rescue it on \
              a real server: `42725` is not absence. Both servers agree that the clause changes \
              nothing here; they disagree only about whether the name is ambiguous.",
+            "UNMEASURED",
         ),
     ],
 };

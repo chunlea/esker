@@ -1,0 +1,83 @@
+# `operator does not exist: integer + text` — and the bind parameter actually behind it.
+#
+# **Run 50 ranking: 19 tests over 4 files** (`eager_load_includes_full_sti_class_test.rb` 16,
+# `eager_load_nested_include_test.rb`, `autosave_association_test.rb`, `dirty_test.rb`). The board's
+# wording invites the wrong fix. **No test adds a string to a number.** The statement was traced out
+# of the failing file with the runner's own SQL hook, and it is AR's counter-cache update:
+#
+#     UPDATE "posts" SET "tags_count" = COALESCE("posts"."tags_count", 0) + $1 WHERE "posts"."id" = $2
+#
+# There is no `text` in it. `$1` is a **bind parameter**, and the node has resolved it to `text`
+# before looking at what it is added to. PostgreSQL resolves the other way: an untyped parameter
+# takes its type from the context it appears in, and the rows below record what it decides for this
+# exact statement — `PREPARE` plus `pg_prepared_statements.parameter_types` says so without needing
+# the extended protocol, which is why this capture can be in the three-column format at all
+# (`pg19_bind_parameters.txt` needed four).
+#
+# Things reasoning would get wrong:
+#
+# * **`unknown` is not `text`.** `SELECT 1 + '2'` works — the literal is `unknown` and resolves to
+#   `integer`. It is only an explicit `text` that has no `+` operator with `integer`. Defaulting an
+#   unresolved parameter or literal to `text` turns every one of these into a missing operator.
+# * **A parameter's type comes from where it is used**, including through `COALESCE`, and PostgreSQL
+#   reports the resolution it made in `pg_prepared_statements.parameter_types`.
+# * **Two parameters with nothing to resolve against is the error case** (`42P18`), and it names
+#   `$1` — that is what "could not determine data type" looks like when it is genuinely undecidable.
+# * **`||` is not `+`.** `text || integer` resolves happily; the `+` shape is the one to fix.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE posts (id serial primary key, tags_count integer DEFAULT 0, title character varying(255))		-
+INSERT INTO posts (id, tags_count, title) VALUES (1, 5, 'one')		-
+# ---- the statement AR sends, prepared, and the types PostgreSQL gives its parameters ----
+PREPARE cc AS UPDATE "posts" SET "tags_count" = COALESCE("posts"."tags_count", 0) + $1 WHERE "posts"."id" = $2		-
+SELECT 'r', name, parameter_types FROM pg_prepared_statements WHERE name = 'cc'	text,text,regtype[]	r|cc|{integer,integer}
+EXECUTE cc(1, 1)		-
+SELECT 'r', id, tags_count FROM posts ORDER BY id		r|1|6
+EXECUTE cc(-2, 1)		-
+SELECT 'r', id, tags_count FROM posts ORDER BY id		r|1|4
+DEALLOCATE cc		-
+# ---- the same resolution in the shapes around it ----
+PREPARE p1 AS SELECT 1 + $1		-
+SELECT 'r', parameter_types FROM pg_prepared_statements WHERE name = 'p1'	text,regtype[]	r|{integer}
+PREPARE p2 AS SELECT COALESCE(NULL::integer, 0) + $1		-
+SELECT 'r', parameter_types FROM pg_prepared_statements WHERE name = 'p2'	text,regtype[]	r|{integer}
+PREPARE p3 AS SELECT tags_count + $1 FROM posts		-
+SELECT 'r', parameter_types FROM pg_prepared_statements WHERE name = 'p3'	text,regtype[]	r|{integer}
+PREPARE p4 AS SELECT title || $1 FROM posts		-
+SELECT 'r', parameter_types FROM pg_prepared_statements WHERE name = 'p4'	text,regtype[]	r|{text}
+SELECT 'r', name, parameter_types FROM pg_prepared_statements ORDER BY name	text,text,regtype[]	r|p1|{integer} ; r|p2|{integer} ; r|p3|{integer} ; r|p4|{text}
+DEALLOCATE ALL		-
+# ---- and the case that genuinely cannot be resolved ----
+SAVEPOINT i1		-
+PREPARE p5 AS SELECT $1 + $2	!42725 operator is not unique: unknown + unknown DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
+ROLLBACK TO i1		-
+# ---- unknown resolves; text does not ----
+SELECT 'r', 1 + '2'	text,integer	r|3
+SELECT 'r', pg_typeof(1 + '2'), pg_typeof('2'), pg_typeof('2'::text)	text,regtype,regtype,regtype	r|integer|unknown|text
+SAVEPOINT i2		-
+SELECT 'r', 1 + 'x'	!22P02 invalid input syntax for type integer: "x"
+ROLLBACK TO i2		-
+SAVEPOINT i3		-
+SELECT 'r', 1 + '2'::text	!42883 operator does not exist: integer + text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO i3		-
+SAVEPOINT i4		-
+SELECT 'r', '2'::text + 1	!42883 operator does not exist: text + integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO i4		-
+SAVEPOINT i5		-
+SELECT 'r', tags_count + title FROM posts	!42883 operator does not exist: integer + character varying DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO i5		-
+# ---- what does work in that direction ----
+SELECT 'r', 1 + '2'::integer, 1 + '2'::numeric, 1 + '2'::text::integer, 1::text || '2'	text,integer,numeric,integer,text	r|3|3|3|12
+SELECT 'r', pg_typeof(1 + '2'::numeric), pg_typeof(1::text || '2')	text,regtype,regtype	r|numeric|text
+SELECT 'r', 1 + NULL IS NULL, pg_typeof(1 + NULL)	text,boolean,regtype	r|t|integer
+# ---- the operator catalog for `+`, which is what "does not exist" is read out of ----
+SELECT 'r', oprname, oprleft::regtype, oprright::regtype, oprresult::regtype FROM pg_operator WHERE oprname = '+' AND oprleft = 'integer'::regtype ORDER BY oprright::regtype::text	text,name,regtype,regtype,regtype	r|+|integer|bigint|bigint ; r|+|integer|date|date ; r|+|integer|integer|integer ; r|+|integer|smallint|integer
+SELECT 'r', count(*) FROM pg_operator WHERE oprname = '+' AND 'text'::regtype IN (oprleft, oprright)	text,bigint	r|0
+DROP TABLE posts		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'posts'	bigint	0
+SELECT count(*) FROM pg_prepared_statements	bigint	0

@@ -81,15 +81,21 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `tests/pg_catalog.rs` asserts `1083|time|…|time_in` in ActiveRecord's own query — \
              and the missing column belongs to the catalog surface, not to this type. The row \
              for `timetz` would be absent in any case.",
+            "pg19_time.txt:49",
         ),
-        ("SELECT pg_typeof('12:34:56'::time)", FUNCTIONS),
-        ("SELECT sum(t) FROM tq", INTERVAL),
-        ("SELECT avg(t) FROM tq", INTERVAL),
+        (
+            "SELECT pg_typeof('12:34:56'::time)",
+            FUNCTIONS,
+            "pg19_time.txt:50",
+        ),
+        ("SELECT sum(t) FROM tq", INTERVAL, "pg19_time.txt:66"),
+        ("SELECT avg(t) FROM tq", INTERVAL, "pg19_time.txt:67"),
         (
             "SELECT '12:34:56'::time(-1)",
             "Both refuse with `42601`; the text differs. PostgreSQL's parser stops at the `-` and \
              says so; `sqlparser` says `Expected: literal int, found: -`. A negative precision is \
              a syntax error on both sides and neither reaches this type.",
+            "pg19_time.txt:84",
         ),
         (
             "SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)",
@@ -98,14 +104,28 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `varchar` half agrees, and the same `::char(5)` of any over-long string diverges the \
              same way — but this statement is where the corpus meets it, so it is recorded here \
              and belongs to `bpchar`'s cast path.",
+            "pg19_time.txt:86",
         ),
         (
             "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
             INTERVAL,
+            "pg19_time.txt:87",
         ),
-        ("SELECT '1 day 02:00:00'::interval::time", INTERVAL),
-        ("SELECT '12:34:56'::time::timetz", TIMETZ),
-        ("SELECT '12:34:56'::timetz::time", TIMETZ),
+        (
+            "SELECT '1 day 02:00:00'::interval::time",
+            INTERVAL,
+            "pg19_time.txt:88",
+        ),
+        (
+            "SELECT '12:34:56'::time::timetz",
+            TIMETZ,
+            "pg19_time.txt:89",
+        ),
+        (
+            "SELECT '12:34:56'::timetz::time",
+            TIMETZ,
+            "pg19_time.txt:90",
+        ),
         (
             "SELECT '12:34:56'::time + '12:34:56'::time",
             "Both refuse, with different codes and for different reasons. PostgreSQL has **too \
@@ -113,13 +133,23 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              candidate operator`, because a `time` can promote to an `interval` in more than one \
              way — where this node has none and says `0A000`. The one addition in this type that \
              is an error rather than a missing feature, and it closes when `interval` lands.",
+            "pg19_time.txt:101",
         ),
         (
             "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
             FUNCTIONS,
+            "pg19_time.txt:102",
         ),
-        ("SELECT date_part('minute', '12:34:56'::time)", FUNCTIONS),
-        ("SELECT '12:34:56'::time = '12:34:56'::timetz", TIMETZ),
+        (
+            "SELECT date_part('minute', '12:34:56'::time)",
+            FUNCTIONS,
+            "pg19_time.txt:103",
+        ),
+        (
+            "SELECT '12:34:56'::time = '12:34:56'::timetz",
+            TIMETZ,
+            "pg19_time.txt:105",
+        ),
         (
             "SELECT '12:34:56'::time = 1",
             "Both refuse with `42883` and name a different integer: PostgreSQL says `integer` \
@@ -127,15 +157,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              an unsuffixed integer literal as `int8`. A pre-existing divergence of the literal, \
              not of this type — every type's `= 1` says it — and it closes when integer literals \
              are typed by width.",
+            "pg19_time.txt:106",
         ),
         (
             "SELECT greatest('12:00:00'::time, '13:00:00'::time), least('12:00:00'::time, \
              '13:00:00'::time)",
             FUNCTIONS,
+            "pg19_time.txt:107",
         ),
         (
             "SELECT '12:34:56'::timetz, '12:34:56+02'::timetz, '12:34:56+02'::timetz::text",
             TIMETZ,
+            "pg19_time.txt:109",
         ),
     ],
 };

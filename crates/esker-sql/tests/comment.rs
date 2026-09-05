@@ -44,10 +44,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', objoid::regclass::text, objsubid, description FROM pg_description WHERE \
              objoid = 'cm3'::regclass ORDER BY objsubid",
             "pg_description is not a view here; the comments are fields of the table record",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', count(*) FROM pg_description WHERE description = 'qualified table comment'",
             "pg_description is not a view here; the comments are fields of the table record",
+            "UNMEASURED",
         ),
     ],
 };

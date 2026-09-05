@@ -40,11 +40,19 @@ row that moves, breaks the citation exactly the way a stale expected value shoul
 
 | | |
 |---|---|
-| declared-divergence rows | **446** across 96 test files |
-| appear verbatim in a `captures/` file | **261** |
-| do not | **185** |
+| declared-divergence rows | **528** across 122 test files |
+| cite a capture line | **321** |
+| `UNMEASURED` | **207** |
 
-**185 is the number this plan exists to shrink, and it may not grow.** A unit that adds a
+**Corrected.** The first sweep of this file said 446/261/185. It counted with a regex that only saw
+rows whose first element is a plain string literal and whose `answers:` block it could delimit — so
+it missed every row declared in a separate `const`, every row opening with a **raw** string, and
+several blocks entirely. The numbers above come from the scanner that fills the citations, which is
+checked two ways: 468 of 470 inline rows resolve to a statement in their own corpus, and the
+compiler rejects a row it mis-split. **A number nobody could reproduce was the first thing this
+plan should have caught about itself.**
+
+**207 is the number this plan exists to shrink, and it may not grow.** A unit that adds a
 divergence adds a capture with it, or writes `UNMEASURED` where a reader can count it.
 
 Not finding a capture is not evidence of fabrication: most of the 185 were measured by a lane in an

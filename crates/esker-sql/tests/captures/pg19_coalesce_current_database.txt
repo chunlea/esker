@@ -1,0 +1,85 @@
+# `COALESCE` and `current_database()` — as a real PostgreSQL 19beta1 answers them.
+#
+# Two rows of run 45's failure ranking, 22 tests, and both are ordinary SQL rather than a type gap:
+#
+#   * **`the function COALESCE is not supported`** — 18 tests across `cascaded_eager_loading_test.rb`,
+#     `eager_load_includes_full_sti_class_test.rb`, `eager_load_nested_include_test.rb`. It is emitted
+#     by `active_record/counter_cache.rb:121` (`COALESCE(comments_count, 0)`),
+#     `relation.rb:1418` (`coalesce(attribute, 0)`) and `arel/factory_methods.rb:45`, so it reaches
+#     the server in both cases; the statements below use both spellings.
+#   * **`the function current_database is not supported`** — 4 tests. It is the adapter's own, from
+#     `postgresql/schema_statements.rb:230-258`, and appears in four queries pinned verbatim here:
+#     `SELECT current_database()`, and three `… FROM pg_database WHERE datname = current_database()`
+#     for the encoding, the collation and the ctype.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`.
+#
+# **Two values here belong to the oracle container, not to PostgreSQL**: the database is named
+# `esker`, and `datcollate`/`datctype` are `en_US.utf8`. What the suite needs is that the queries
+# answer at all and with the right types.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`COALESCE` is not a function and does not fail like one.** With no arguments it is
+#     **`42601 syntax error at or near ")"`** — a parse error, not `42883 function does not exist`.
+#     It is a syntactic construct in the grammar, so an implementation that registers it in a
+#     function table gets the arity error wrong.
+#   * **It has its own type-mismatch error naming itself**: `COALESCE(1, 'x'::text)` is
+#     **`42804 COALESCE types integer and text cannot be matched`**. But `COALESCE(1,
+#     'notanumber')` — with an *unknown* literal rather than a typed one — is
+#     `22P02 invalid input syntax for type integer`, because the literal is coerced to the first
+#     argument's type instead of being compared to it. Same pair of arguments, two different
+#     failures depending on whether the second one carries a type.
+#   * **The result type is the unification of the arguments, not the first one's.**
+#     `COALESCE(NULL::int4, 0)` is `integer`, `COALESCE(NULL::text, 'x')` is `text`, and
+#     **`COALESCE(1, 2.5)` is `numeric`** — the integer is promoted.
+#   * **`COALESCE(sum(x), 0)` over an empty set is `0`, not NULL** — the aggregate answers NULL and
+#     `COALESCE` catches it. That is exactly what `counter_cache.rb` relies on, and it is why the
+#     `sum(...) IS NULL` row is pinned beside it.
+#   * **`current_database()` returns `name`, not `text`** — the same type as `current_schema()`, and
+#     it joins directly against `pg_database.datname` in three of the adapter's four queries.
+#   * **`COALESCE` preserves that type through**: `COALESCE(NULL, current_database())` is still
+#     `name`.
+BEGIN		-
+SELECT 'r', current_database()	text,name	r|esker
+SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()	text,name	r|UTF8
+SELECT 'r', datcollate FROM pg_database WHERE datname = current_database()	text,text	r|en_US.utf8
+SELECT 'r', datctype FROM pg_database WHERE datname = current_database()	text,text	r|en_US.utf8
+SELECT 'r', pg_typeof(current_database())	text,regtype	r|name
+SELECT 'r', COALESCE(NULL, 1), COALESCE(1, 2), COALESCE(NULL, NULL, 3)	text,integer,integer,integer	r|1|1|3
+SELECT 'r', COALESCE(NULL::int4, NULL::int4) IS NULL	text,boolean	r|t
+SELECT 'r', coalesce(NULL, 'a'), COALESCE('b', 'c')	text,text,text	r|a|b
+SELECT 'r', pg_typeof(COALESCE(NULL::int4, 0)), pg_typeof(COALESCE(NULL::text, 'x')), pg_typeof(COALESCE(1, 2.5))	text,regtype,regtype,regtype	r|integer|text|numeric
+CREATE TABLE cc (id bigserial primary key, comments_count integer, type character varying, title character varying, author_name character varying)		-
+INSERT INTO cc (comments_count, type, title, author_name) VALUES (NULL, NULL, 'T1', NULL)		-
+INSERT INTO cc (comments_count, type, title, author_name) VALUES (7, 'Post', 'T2', 'Ann')		-
+INSERT INTO cc (comments_count, type, title, author_name) VALUES (0, NULL, NULL, 'Bob')		-
+SELECT 'r', id, COALESCE(comments_count, 0) FROM cc ORDER BY id		r|1|0 ; r|2|7 ; r|3|0
+SELECT 'r', id, COALESCE(type, title) FROM cc ORDER BY id		r|1|T1 ; r|2|Post ; r|3|\N
+SELECT 'r', id, coalesce(author_name, title) FROM cc ORDER BY id		r|1|T1 ; r|2|Ann ; r|3|Bob
+SELECT 'r', id FROM cc ORDER BY coalesce(author_name, title), id		r|2 ; r|3 ; r|1
+SELECT 'r', COALESCE(sum(comments_count), 0) FROM cc		r|7
+SELECT 'r', COALESCE(sum(comments_count), 0) FROM cc WHERE id > 999		r|0
+SELECT 'r', sum(comments_count) IS NULL FROM cc WHERE id > 999		r|t
+UPDATE cc SET comments_count = COALESCE(comments_count, 0) + 1 WHERE id = 1		-
+SELECT 'r', id, comments_count FROM cc ORDER BY id		r|1|1 ; r|2|7 ; r|3|0
+SAVEPOINT s1		-
+SELECT COALESCE()	!42601 syntax error at or near ")"
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+SELECT COALESCE(1, 'notanumber')	!22P02 invalid input syntax for type integer: "notanumber"
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+SELECT COALESCE(1, 'x'::text)	!42804 COALESCE types integer and text cannot be matched
+ROLLBACK TO s3		-
+SELECT 'r', COALESCE(1, NULL) + COALESCE(NULL, 2)	text,integer	r|3
+SELECT 'r', COALESCE(NULL, current_database())	text,name	r|esker
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'cc'	bigint	0

@@ -22,6 +22,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `^`/`$` are string anchors rather than line anchors — is asserted directly in \
              `dot_matches_a_newline_and_the_anchors_are_the_strings`, with the newline written \
              into an ordinary literal instead",
+            "pg19_regex_match.txt:86",
         ),
         (
             "SELECT 'r', 'abc' ~ '(?i)ABC'",
@@ -29,6 +30,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              grant for this unit is the ERE subset. Refused by name (`0A000`) rather than \
              approximated: a node that ignored the flag would answer `f` where a real server \
              answers `t`, which is a wrong answer rather than a gap",
+            "pg19_regex_match.txt:92",
         ),
         (
             "SELECT 'r', 'aab' ~ '^(a)\\1b$'",
@@ -36,6 +38,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              ERE from a backtracking engine, and taking it would mean giving up the linear-time \
              matcher that keeps a user\u{2019}s pattern from being a denial of service. Refused by \
              name, for the same reason `(?i)` is",
+            "pg19_regex_match.txt:95",
         ),
     ],
 };

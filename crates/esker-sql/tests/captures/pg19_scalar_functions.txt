@@ -1,0 +1,85 @@
+# `concat`, `convert_to`, `now`, `CURRENT_DATE`/`CURRENT_TIMESTAMP` and `random` — the five scalar
+# functions `postgresql_specific_schema.rb`'s `CREATE TABLE "defaults"` calls, as a real PostgreSQL
+# 19beta1 answers them.
+#
+# NOT types. Run 34 measured that statement 738 needs these and nothing else once the arithmetic
+# and the `DEFAULT` rewrite are both present: `random()`, `concat(…)`, `convert_to(…)`, `now()` and
+# `CURRENT_DATE` were all `0A000 the function … is not supported` on `main`. This was the last item
+# on either schema file with no oracle evidence.
+#
+# **Run 34's other finding is the reason this file exists at all.** Run 28 had reported
+# `DEFAULT now()` and `DEFAULT CURRENT_TIMESTAMP` as *accepted*, which looked like the functions
+# being present. They were accepted by the old `DEFAULT` whitelist; as ordinary expressions both
+# are refused. Deleting that whitelist — correct, and what `bfcc744` does — therefore **exposes**
+# five missing functions rather than clearing the statement.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way. It writes nothing.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`concat` ignores NULL; it does not propagate it.** `concat('a', NULL, 'b')` is **`ab`**,
+#     not NULL — the opposite of `||`, where one NULL operand makes the whole result NULL. And
+#     `concat_ws('-', 'a', NULL, 'b')` is **`a-b`**, with one separator, not `a--b`: the skipped
+#     argument takes its separator with it.
+#   * **`concat` takes any type and stringifies it**, with the *type's own* output text, not SQL
+#     literal syntax: `concat('a', 1, true, '2020-01-01'::date, ARRAY[1,2])` is
+#     **`a1t2020-01-01{1,2}`** — `true` becomes `t` and the array keeps its braces. It is
+#     `VARIADIC "any"`, so `concat()` with no argument at all is `42883 … does not exist` with
+#     `DETAIL: No function of that name accepts the given number of arguments.`
+#   * **`now()`, `CURRENT_TIMESTAMP` and `statement_timestamp()` are the same instant** — all three
+#     compare equal inside one statement, because they are the *transaction* timestamp.
+#     `clock_timestamp()` is the one that moves, and it is `>=` the others. A node that made
+#     `now()` read the wall clock per call would break `now() = CURRENT_TIMESTAMP`.
+#   * **The temporal keywords have five different types**, and they are not interchangeable:
+#     `now()` and `CURRENT_TIMESTAMP` are `timestamp with time zone`, `LOCALTIMESTAMP` is
+#     `timestamp without time zone`, `CURRENT_DATE` is `date`, `CURRENT_TIME` is
+#     `time with time zone`, `LOCALTIME` is `time without time zone`.
+#   * **`CURRENT_DATE` is a keyword, not a function.** `CURRENT_DATE()` is
+#     `42601 syntax error at or near "("` — there are no parentheses to add. But
+#     `CURRENT_TIMESTAMP(0)` *is* legal, because that spelling takes a precision — and it
+#     **rounds** rather than truncating: `CURRENT_TIMESTAMP(0) = date_trunc('second',
+#     CURRENT_TIMESTAMP)` is `f` while `>=` is `t`.
+#   * **`convert_to` returns `bytea`, and its errors are `22023`.** `convert_to('A','UTF8')` is
+#     `\x41`; an unknown encoding is `22023 invalid destination encoding name "NOSUCHENCODING"`.
+#     `length(convert_to('é','UTF8'))` is **2** — the byte length, where `length('é')` would be 1.
+#   * **Volatility, from `pg_proc` rather than from reasoning**: `concat` **STABLE**, `convert_to`
+#     **STABLE**, `now` **STABLE**, `random` **VOLATILE**. Three of the four are not volatile, which
+#     is the same point `pg19_default_uuid.txt` makes about DEFAULT and is why a volatility test is
+#     the wrong gate anywhere.
+#   * **The values of `now()` and `random()` cannot be captured** — they are a clock and a PRNG. What
+#     is pinned instead is what is invariant: the equalities above, `random() >= 0 AND random() < 1`,
+#     and the arity errors.
+SELECT proname, provolatile, pronargs FROM pg_proc WHERE proname IN ('concat','convert_to','now') ORDER BY proname, pronargs	name,"char",smallint	concat|s|1 ; convert_to|s|2 ; now|s|0
+SELECT proname, provolatile FROM pg_proc WHERE proname = 'random' AND pronargs = 0	name,"char"	random|v
+SELECT 'g', concat('Ruby ', 'on ', 'Rails')	text,text	g|Ruby on Rails
+SELECT 'g', concat('a')	text,text	g|a
+SELECT 'g', concat('a', NULL, 'b')	text,text	g|ab
+SELECT 'g', concat(1, 2.5, true)	text,text	g|12.5t
+SELECT 'g', concat('a', 1, true, '2020-01-01'::date, ARRAY[1,2])	text,text	g|a1t2020-01-01{1,2}
+SELECT 'g', concat_ws('-', 'a', NULL, 'b')	text,text	g|a-b
+SELECT 'g', length(concat('Ruby ', 'on ', 'Rails'))	text,integer	g|13
+SELECT pg_typeof(concat('a','b'))	regtype	text
+SELECT 'g', concat()	!42883 function concat() does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT 'g', convert_to('A', 'UTF8')	text,bytea	g|\x41
+SELECT 'g', convert_to('Ruby', 'UTF8')	text,bytea	g|\x52756279
+SELECT 'g', length(convert_to('é', 'UTF8')), length('é')	text,integer,integer	g|2|1
+SELECT pg_typeof(convert_to('A', 'UTF8'))	regtype	bytea
+SELECT 'g', convert_to('A', 'NOSUCHENCODING')	!22023 invalid destination encoding name "NOSUCHENCODING"
+SELECT 'g', now() = now()	text,boolean	g|t
+SELECT 'g', now() = CURRENT_TIMESTAMP	text,boolean	g|t
+SELECT 'g', now() = statement_timestamp()	text,boolean	g|t
+SELECT 'g', clock_timestamp() >= statement_timestamp()	text,boolean	g|t
+SELECT 'g', CURRENT_DATE = now()::date	text,boolean	g|t
+SELECT 'g', CURRENT_TIMESTAMP::date = CURRENT_DATE	text,boolean	g|t
+SELECT pg_typeof(now()), pg_typeof(CURRENT_TIMESTAMP), pg_typeof(LOCALTIMESTAMP)	regtype,regtype,regtype	timestamp with time zone|timestamp with time zone|timestamp without time zone
+SELECT pg_typeof(CURRENT_DATE), pg_typeof(CURRENT_TIME), pg_typeof(LOCALTIME)	regtype,regtype,regtype	date|time with time zone|time without time zone
+SELECT 'g', CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)	text,boolean	g|t
+SELECT 'g', CURRENT_TIMESTAMP(0) >= date_trunc('second', CURRENT_TIMESTAMP)	text,boolean	g|t
+SELECT 'g', CURRENT_DATE()	!42601 syntax error at or near "("
+SELECT 'g', now(1)	!42883 function now(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT 'g', random() >= 0 AND random() < 1	text,boolean	g|t
+SELECT 'g', random(1)	!42883 function random(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.

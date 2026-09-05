@@ -19,7 +19,7 @@ mod parity;
 /// Nothing: the corpus builds its own tables, because what they are is the thing under test.
 const FIXTURE: &[&str] = &[];
 
-const DIVERGENCES: &[(&str, &str)] = &[
+const DIVERGENCES: &[(&str, &str, &str)] = &[
     // `serial` was here and is gone: ADR 0033 gave this node an `int4`, which was the whole of
     // the argument for refusing it. The entry's removal is the record that the gap closed --
     // the harness fails a divergence that has started agreeing, so this could not have been
@@ -34,6 +34,7 @@ const DIVERGENCES: &[(&str, &str)] = &[
         "information_schema is unit 5. Captured here because it is how a client asks whether the \
          identity column came out NOT NULL, and the answer is worth having on file before the \
          unit that serves it",
+        "UNMEASURED",
     ),
 ];
 

@@ -1,0 +1,68 @@
+# Building a `UNIQUE` index or constraint over rows that already break it.
+#
+# **ADR 0020's recorded gap, and `unique_constraint.rs` has carried it as a named wrong answer**:
+# "Nothing here validates existing rows when an index is created; every index is
+# `SchemaState::Public` from the first statement." Measured on this node, that is half true —
+# `CREATE UNIQUE INDEX` does refuse, `ALTER TABLE … ADD CONSTRAINT … UNIQUE` does not, and neither
+# catches a duplicate that exists only under `NULLS NOT DISTINCT`.
+#
+# Things reasoning would get wrong:
+#
+#   * **The two statements raise different messages.** Building an index says `could not create
+#     unique index "…"` and an `INSERT` says `duplicate key value violates unique constraint "…"`.
+#     Both are `23505` and both carry a `DETAIL` naming the key, but the sentence is not the same —
+#     a node that reused the insert message would answer a statement that never inserted anything.
+#   * **`ADD CONSTRAINT … UNIQUE` uses the *index* sentence**, because that is what it builds.
+#   * **`NULLS DISTINCT` is the default and admits any number of NULLs**; `NULLS NOT DISTINCT`
+#     makes two NULLs a duplicate, and the `DETAIL` spells the value `(null)`.
+#   * **The `DETAIL` names the first duplicate found**, not every one.
+#   * A `PRIMARY KEY` added over duplicates is the same refusal with its own sentence.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`.
+
+BEGIN;		-
+
+CREATE TABLE uoe (id bigint PRIMARY KEY, a int, b int, c int);		-
+INSERT INTO uoe VALUES (1, 5, NULL, 1), (2, 5, NULL, 2);		-
+
+-- ------------------------------------------------- CREATE UNIQUE INDEX over a real duplicate		-
+SAVEPOINT s1;		-
+CREATE UNIQUE INDEX uoe_a ON uoe (a);	!23505 could not create unique index "uoe_a" DETAIL: Key (a)=(5) is duplicated.
+ROLLBACK TO s1;		-
+
+-- ------------------------------------------------- ADD CONSTRAINT … UNIQUE over the same		-
+SAVEPOINT s2;		-
+ALTER TABLE uoe ADD CONSTRAINT uoe_a_uq UNIQUE (a);	!23505 could not create unique index "uoe_a_uq" DETAIL: Key (a)=(5) is duplicated.
+ROLLBACK TO s2;		-
+
+-- ------------------------------------------------- NULLS DISTINCT is the default and admits both		-
+CREATE UNIQUE INDEX uoe_b ON uoe (b);		-
+SELECT indexdef FROM pg_indexes WHERE indexname = 'uoe_b';	text	CREATE UNIQUE INDEX uoe_b ON public.uoe USING btree (b)
+DROP INDEX uoe_b;		-
+
+-- ------------------------------------------------- NULLS NOT DISTINCT makes two NULLs a duplicate		-
+SAVEPOINT s3;		-
+CREATE UNIQUE INDEX uoe_b2 ON uoe (b) NULLS NOT DISTINCT;	!23505 could not create unique index "uoe_b2" DETAIL: Key (b)=(null) is duplicated.
+ROLLBACK TO s3;		-
+SAVEPOINT s4;		-
+ALTER TABLE uoe ADD CONSTRAINT uoe_b_uq UNIQUE NULLS NOT DISTINCT (b);	!23505 could not create unique index "uoe_b_uq" DETAIL: Key (b)=(null) is duplicated.
+ROLLBACK TO s4;		-
+
+-- ------------------------------------------------- a PRIMARY KEY over duplicates		-
+SAVEPOINT s5;		-
+ALTER TABLE uoe ADD CONSTRAINT uoe_a_pk PRIMARY KEY (a);	!42P16 multiple primary keys for table "uoe" are not allowed
+ROLLBACK TO s5;		-
+
+-- ------------------------------------------------- and the ones that succeed		-
+CREATE UNIQUE INDEX uoe_c ON uoe (c);		-
+ALTER TABLE uoe ADD CONSTRAINT uoe_c_uq UNIQUE (c);		-
+SELECT conname, contype FROM pg_constraint WHERE conrelid = 'uoe'::regclass AND contype = 'u' ORDER BY conname;		uoe_c_uq|u
+-- a multi-column key is a duplicate only when the whole tuple repeats		-
+CREATE UNIQUE INDEX uoe_ac ON uoe (a, c);		-
+INSERT INTO uoe VALUES (3, 5, NULL, 3);		-
+SAVEPOINT s6;		-
+INSERT INTO uoe VALUES (4, 5, NULL, 3);	!23505 duplicate key value violates unique constraint "uoe_c" DETAIL: Key (c)=(3) already exists.
+ROLLBACK TO s6;		-
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'uoe%';	bigint	0

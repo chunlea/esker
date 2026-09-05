@@ -38,6 +38,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              nothing — there is no relation for the clause to hold — so what a source rewrite \
              would buy is one row nobody asks for, where every other C1 rewrite in this crate \
              bought a statement `ActiveRecord` actually sends.",
+            "UNMEASURED",
         ),
         (
             "SELECT id FROM lk UNION SELECT id FROM lk FOR UPDATE",
@@ -47,6 +48,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the same `0A000` — and this node has no `UNION` at all, so the more specific message \
              names a rule it can never reach. It becomes reachable the day `UNION` lands, and this \
              line is what will say so.",
+            "pg19_row_locking.txt:87",
         ),
     ],
 };

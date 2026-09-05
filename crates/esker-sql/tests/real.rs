@@ -30,6 +30,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          because it is the shortest statement that tells `real`'s text from `double precision`'s \
          — `0.33333334` against `0.3333333333333333` — and `the_text_is_f32_wide` asserts the \
          same thing through a column, which is a shape this node can write.",
+        "UNMEASURED",
     )],
 };
 

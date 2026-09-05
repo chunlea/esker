@@ -1,0 +1,105 @@
+# `DROP ... CASCADE`, an inline `FOREIGN KEY` in `CREATE TABLE`, and
+# `ALTER TABLE ... ENABLE/DISABLE TRIGGER ALL` — as a real PostgreSQL 19beta1 answers them.
+#
+# NOT types. These are the **three shapes that appeared for the first time at `9de9519`**, when
+# `pg_class` and `pg_namespace` landed and `schema-probe.rb` got 299 statements deeper into
+# `activerecord/test/schema/schema.rb` (402 → 701 reached). They are 22 of that file's 60 remaining
+# refusals — 8, 6 and 8 — and nothing had oracle evidence for any of them.
+#
+# The statement texts below are the shapes `ActiveRecord` actually emits, taken from
+# `triage/schema-probe-9de9519.txt` rather than invented.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own tables, dropping whatever a previous run left. They are deliberately not
+# dropped at the end: `sesscap.py` asks `\gdesc` for the declared types in a *second* session, and
+# a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`ALTER TABLE ... DISABLE TRIGGER ALL` is not one statement — Rails sends the whole schema's
+#     worth in ONE message, semicolon-separated**, and that makes it **all-or-nothing**. Measured:
+#     `ALTER TABLE mp1 ADD COLUMN zz int;ALTER TABLE nosuchtable ADD COLUMN yy int` fails, and `zz`
+#     is **not** added — a multi-statement simple Query runs inside an implicit transaction, so one
+#     bad table rolls back every disable before it. Sent as two separate messages instead, the
+#     first one's effect **survives**. Same two statements, opposite outcome, decided only by
+#     whether they shared a message. A node that executed a multi-statement string one statement at
+#     a time without a transaction around them would leave the schema half-disabled.
+#   * **`DROP ... CASCADE` reports what it destroyed, on a channel this format cannot hold.**
+#     Dropping a table two foreign keys point at prints
+#     `NOTICE:  drop cascades to 2 other objects` followed by a `DETAIL:` whose **second and later
+#     lines carry no prefix at all**:
+#
+#         NOTICE:  drop cascades to 2 other objects
+#         DETAIL:  drop cascades to constraint cc_a_fkey on table cc
+#         drop cascades to constraint cc_b_fkey on table cc
+#
+#     `sesscap.py` records rows and errors, not notices, so a cascading `DROP` captured as a line
+#     would put that DETAIL text in the **rows** column. The cascading case is therefore described
+#     here and the lines below drop only tables with no dependents — the same treatment
+#     `jsonb_pretty` and the `CASE` expression index get. What *is* captured is the refusal you get
+#     without `CASCADE`, which is the half an implementation has to get right first.
+#   * **Without `CASCADE` the refusal is `2BP01`, and it names the constraint and the fix.**
+#     `cannot drop table fkp because other objects depend on it`, `DETAIL: constraint fk_name on
+#     table fkc depends on table fkp`, `HINT: Use DROP ... CASCADE to drop the dependent objects
+#     too.` A code in the `2B` class, which appears nowhere else in this corpus.
+#   * **`IF EXISTS` and `CASCADE` are independent.** `DROP TABLE IF EXISTS x CASCADE` on a table
+#     that never existed is a plain success with no notice; without `IF EXISTS` it is
+#     `42P01 table "x" does not exist` — note **`table`**, where almost every other `42P01` in this
+#     corpus says `relation`.
+#   * **A named inline constraint keeps its name; an unnamed one is generated as
+#     `<table>_<column>_fkey`.** `CONSTRAINT fk_name FOREIGN KEY (fk_id) REFERENCES fkp (pk_id)`
+#     stays `fk_name`, and the column-level shorthand `a int8 REFERENCES fkp (pk_id)` becomes
+#     `fkc3_a_fkey`. Rails always writes the long named form, so an implementation that only
+#     generated names would still have to accept one.
+#   * **`pg_get_constraintdef` re-prints the definition without the space Rails wrote**:
+#     `REFERENCES fkp(pk_id)`, not `REFERENCES fkp (pk_id)`. The stored form is normalised, as it
+#     is for index predicates.
+#   * **Two different refusals for a bad reference**, and the second is the one nobody predicts:
+#     a missing table is `42P01`, but referencing a column with **no unique constraint** is
+#     `42830 there is no unique constraint matching given keys for referenced table "fkp"`.
+#   * **A self-referencing foreign key inside `CREATE TABLE` works** — the table is visible to its
+#     own constraint before it exists.
+#   * **`DISABLE TRIGGER ALL` on a table with no triggers is a success, not a no-op error**, and
+#     `ALL` and `USER` are both accepted. A named trigger that does not exist is
+#     `42704 trigger "x" for table "y" does not exist`. (`ALL` also touches the internal foreign-key
+#     triggers, which is why a real server requires superuser for it; this capture runs as one and
+#     so cannot show the non-superuser refusal — it is named here rather than guessed at.)
+DROP TABLE IF EXISTS fkc CASCADE		-
+DROP TABLE IF EXISTS fkc2 CASCADE		-
+DROP TABLE IF EXISTS fkc3 CASCADE		-
+DROP TABLE IF EXISTS fkr CASCADE		-
+DROP TABLE IF EXISTS fkself CASCADE		-
+DROP TABLE IF EXISTS fkp CASCADE		-
+CREATE TABLE fkp (pk_id int8 PRIMARY KEY, n text)		-
+CREATE TABLE fkc (id bigserial primary key, fk_id int8 NOT NULL, CONSTRAINT fk_name FOREIGN KEY (fk_id) REFERENCES fkp (pk_id) )		-
+CREATE TABLE fkc2 (a int8, b int8, CONSTRAINT c1 FOREIGN KEY (a) REFERENCES fkp (pk_id) , CONSTRAINT c2 FOREIGN KEY (b) REFERENCES fkp (pk_id) )		-
+CREATE TABLE fkc3 (a int8 REFERENCES fkp (pk_id))		-
+CREATE TABLE fkself (id int8 PRIMARY KEY, parent int8, CONSTRAINT fk_self FOREIGN KEY (parent) REFERENCES fkself (id))		-
+SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc'::regclass ORDER BY conname	name,"char",text	fk_name|f|FOREIGN KEY (fk_id) REFERENCES fkp(pk_id) ; fkc_fk_id_not_null|n|NOT NULL fk_id ; fkc_id_not_null|n|NOT NULL id ; fkc_pkey|p|PRIMARY KEY (id)
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc2'::regclass AND contype = 'f' ORDER BY conname	name,text	c1|FOREIGN KEY (a) REFERENCES fkp(pk_id) ; c2|FOREIGN KEY (b) REFERENCES fkp(pk_id)
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc3'::regclass AND contype = 'f'	name,text	fkc3_a_fkey|FOREIGN KEY (a) REFERENCES fkp(pk_id)
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkself'::regclass AND contype = 'f'	name,text	fk_self|FOREIGN KEY (parent) REFERENCES fkself(id)
+CREATE TABLE fkbad (a int8, CONSTRAINT fk_broken FOREIGN KEY (a) REFERENCES nosuchtable (id))	!42P01 relation "nosuchtable" does not exist
+CREATE TABLE fkbad2 (a int8, CONSTRAINT fk_b FOREIGN KEY (a) REFERENCES fkp (n))	!42830 there is no unique constraint matching given keys for referenced table "fkp"
+INSERT INTO fkp VALUES (1, 'x')		-
+INSERT INTO fkc (fk_id) VALUES (1)		-
+INSERT INTO fkc (fk_id) VALUES (99)	!23503 insert or update on table "fkc" violates foreign key constraint "fk_name" DETAIL: Key (fk_id)=(99) is not present in table "fkp".
+DROP TABLE fkp	!2BP01 cannot drop table fkp because other objects depend on it DETAIL: constraint fk_name on table fkc depends on table fkp HINT: Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE IF EXISTS nosuchtable_at_all CASCADE		-
+DROP TABLE nosuchtable_at_all CASCADE	!42P01 table "nosuchtable_at_all" does not exist
+CREATE TABLE fkr (a int8)		-
+DROP TABLE IF EXISTS fkr RESTRICT		-
+ALTER TABLE fkself DISABLE TRIGGER ALL		-
+ALTER TABLE fkself ENABLE TRIGGER ALL		-
+ALTER TABLE fkself DISABLE TRIGGER USER		-
+ALTER TABLE fkself ENABLE TRIGGER USER		-
+ALTER TABLE fkself DISABLE TRIGGER nosuchtrigger	!42704 trigger "nosuchtrigger" for table "fkself" does not exist
+ALTER TABLE nosuchtable DISABLE TRIGGER ALL	!42P01 relation "nosuchtable" does not exist
+ALTER TABLE fkself DISABLE TRIGGER ALL;ALTER TABLE fkc DISABLE TRIGGER ALL		-
+ALTER TABLE fkself ENABLE TRIGGER ALL;ALTER TABLE fkc ENABLE TRIGGER ALL		-
+ALTER TABLE fkself DISABLE TRIGGER ALL;ALTER TABLE nosuchtable DISABLE TRIGGER ALL	!42P01 relation "nosuchtable" does not exist
+SELECT relname, relhastriggers FROM pg_class WHERE relname IN ('fkc','fkself') ORDER BY relname	name,boolean	fkc|t ; fkself|t

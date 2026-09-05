@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', 'a=>1, b=>2'::hstore - 'a'::text, 'a=>1'::hstore ?& ARRAY['a']",
             "hstore's - and ?& operators are not built",
+            "UNMEASURED",
         ),
     ],
 };

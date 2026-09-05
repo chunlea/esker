@@ -1,0 +1,93 @@
+# Resetting a primary-key sequence after fixtures load with explicit ids — as a real PostgreSQL
+# 19beta1 answers it.
+#
+# **Run 45 ranking: 10 tests across 4 files** all failing with
+# `duplicate key value violates unique constraint "posts_pkey"` / `"authors_pkey"` —
+# `adapter_test.rb`, `callbacks_test.rb`, `cascaded_eager_loading_test.rb`,
+# `connection_handling_test.rb`.
+#
+# **They are almost certainly one gap, not ten.** Those are the suite's own fixture tables. Fixtures
+# are inserted with **explicit** ids, which does not advance the sequence, so the next
+# ActiveRecord `create` asks for `nextval` and gets `1` — a row that already exists. Rails avoids
+# this by calling `reset_pk_sequence!` after loading fixtures, and
+# `postgresql/schema_statements.rb:227-251` shows exactly what that emits:
+#
+#     -- pk_and_sequence_for(table): a five-table catalog join, pinned verbatim below
+#     SELECT MAX("id") FROM "posts"
+#     SELECT seqmin FROM pg_sequence WHERE seqrelid = '"posts_id_seq"'::regclass   -- only if MAX is NULL
+#     SELECT setval('"posts_id_seq"', <max>, <max ? true : false>)
+#
+# The first four statements of this file reproduce the failure the suite reports, and the rest pin
+# the reset that removes it. So a lane fixing `setval` should expect the ranking row to disappear
+# rather than shrink.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Inserting explicit ids does not touch the sequence.** After `INSERT INTO posts (id, title)
+#     VALUES (1,…),(2,…),(3,…)` the sequence still reads `last_value 1, is_called f`, and the next
+#     defaulted insert is `23505 … DETAIL: Key (id)=(1) already exists.` — the ranking row, exactly.
+#   * **`is_called` is the whole of the third argument's meaning.** `setval(seq, 3, true)` sets
+#     `last_value 3, is_called t` and the next `nextval` is **4**; `setval(seq, 1, false)` sets
+#     `last_value 1, is_called f` and the next `nextval` is **1**. Rails passes `true` when the table
+#     has rows and `false` when `MAX(pk)` is NULL, which is why both forms are pinned here.
+#   * **`setval` returns the value it set**, as `bigint`, and the two-argument form defaults
+#     `is_called` to true — `setval(seq, 10)` then insert gives `11`.
+#   * **`currval` is session state and fails before any `nextval` in that session**, with
+#     `55000 currval of sequence "untouched_seq" is not yet defined in this session`. That is why
+#     this whole corpus is captured in **one** psql session: a runner that opened a connection per
+#     statement would record that error for every row and be wrong about all of them.
+#   * **`lastval()` is not per-sequence** — it answers the last `nextval` of *any* sequence in the
+#     session, and here it agrees with `currval` only because that was the last one touched.
+#   * **The sequence's own metadata lives in `pg_sequence`, not in the sequence relation.**
+#     `seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle` = `1|1|9223372036854775807|1|1|f`,
+#     while `last_value`/`is_called` are read by selecting **from the sequence itself**. Two
+#     different reads, and `reset_pk_sequence!` uses both.
+#   * **`pg_get_serial_sequence` returns a schema-qualified `text`** — `public.posts_id_seq` — while
+#     the name Rails passes to `setval` is the quoted bare name `"posts_id_seq"`. Both resolve.
+#   * **A missing sequence is `42P01 relation "nosuchseq" does not exist`**, the ordinary relation
+#     error, not a sequence-specific one.
+BEGIN		-
+CREATE TABLE posts (id bigserial primary key, title character varying)		-
+INSERT INTO posts (id, title) VALUES (1, 'a'), (2, 'b'), (3, 'c')		-
+SELECT 'r', last_value, is_called FROM posts_id_seq		r|1|f
+SAVEPOINT s1		-
+INSERT INTO posts (title) VALUES ('collide')	!23505 duplicate key value violates unique constraint "posts_pkey" DETAIL: Key (id)=(1) already exists.
+ROLLBACK TO s1		-
+SELECT attr.attname, nsp.nspname, seq.relname FROM pg_class seq, pg_attribute attr, pg_depend dep, pg_constraint cons, pg_namespace nsp WHERE seq.oid = dep.objid AND seq.relkind = 'S' AND attr.attrelid = dep.refobjid AND attr.attnum = dep.refobjsubid AND attr.attrelid = cons.conrelid AND attr.attnum = cons.conkey[1] AND seq.relnamespace = nsp.oid AND cons.contype = 'p' AND dep.classid = 'pg_class'::regclass AND dep.refobjid = '"posts"'::regclass		id|public|posts_id_seq
+SELECT MAX("id") FROM "posts"		3
+SELECT 'r', setval('"posts_id_seq"', 3, true)		r|3
+SELECT 'r', last_value, is_called FROM posts_id_seq		r|3|t
+INSERT INTO posts (title) VALUES ('after reset') RETURNING id		4
+SELECT 'r', id, title FROM posts ORDER BY id		r|1|a ; r|2|b ; r|3|c ; r|4|after reset
+CREATE TABLE authors (id bigserial primary key, name character varying)		-
+SELECT 'r', MAX("id") IS NULL FROM "authors"		r|t
+SELECT 'r', seqmin FROM pg_sequence WHERE seqrelid = '"authors_id_seq"'::regclass		r|1
+SELECT 'r', setval('"authors_id_seq"', 1, false)		r|1
+SELECT 'r', last_value, is_called FROM authors_id_seq		r|1|f
+INSERT INTO authors (name) VALUES ('first') RETURNING id		1
+SELECT 'r', setval('"authors_id_seq"', 10)		r|10
+INSERT INTO authors (name) VALUES ('eleven') RETURNING id		11
+SELECT 'r', currval('"authors_id_seq"'), lastval()		r|11|11
+SELECT 'r', nextval('"authors_id_seq"')		r|12
+SELECT 'r', seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle FROM pg_sequence WHERE seqrelid = '"authors_id_seq"'::regclass		r|1|1|9223372036854775807|1|1|f
+SELECT 'r', pg_get_serial_sequence('posts', 'id')	text,text	r|public.posts_id_seq
+SAVEPOINT s2		-
+SELECT setval('"nosuchseq"', 1, true)	!42P01 relation "nosuchseq" does not exist
+ROLLBACK TO s2		-
+SELECT 'r', currval('"posts_id_seq"')		r|4
+CREATE SEQUENCE untouched_seq		-
+SAVEPOINT s3		-
+SELECT currval('untouched_seq')	!55000 currval of sequence "untouched_seq" is not yet defined in this session
+ROLLBACK TO s3		-
+SELECT 'r', pg_typeof(setval('"posts_id_seq"', 3, true)), pg_typeof(nextval('"posts_id_seq"'))		r|bigint|bigint
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('posts','authors','posts_id_seq','authors_id_seq')	bigint	0

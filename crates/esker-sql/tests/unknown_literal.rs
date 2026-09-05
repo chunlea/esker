@@ -59,58 +59,69 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              This node's bare constant is `int8`, so the string reads and the comparison answers \
              `f`. Nothing here is wrong about `unknown` — it is the width of the constant it \
              resolves against, and it closes when `int4` exists.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = '9223372036854775808'",
             "the same, one width further out: both raise `22003`, and PostgreSQL names `integer` \
              where this node names `bigint`.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = 'x'",
             "the same `22P02` for the same input, naming `bigint` where a real server names \
              `integer` — the constant on the left is `int4` there and `int8` here. Five \
              statements below differ in exactly this word and nothing else.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = ''",
             "the `int4` naming, as above. The empty string is not a zero on either server.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'x' = 1",
             "the `int4` naming, with the sides swapped.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = '1.5'",
             "the `int4` naming. `int4in` and `int8in` both refuse a fractional part; only the \
              word differs.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = ' '",
             "the `int4` naming. Whitespace is trimmed by both input functions and what is left \
              is empty.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 = '1e0'",
             "the `int4` naming. Neither integer input function takes an exponent — that is \
              `numeric`'s syntax, and `1.5 = '1.5e0'` above shows it accepted where the type has \
              it.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 IN ('x')",
             "the `int4` naming, reached through the list rather than through `=`. That it is the \
              same message is the point: `IN` types its list by the same rule and inherits the \
              same divergence, exactly as it inherited the bug.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'a' IN ('a', 1)",
             "the `int4` naming, in the case where the **operand** is the `unknown` the list \
              types. The rule under test is working — `'a'` is being read as an integer because \
              the `1` is in the list — and only the width of that integer differs.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1 IN (NULL, 'x')",
             "the `int4` naming. What this line is really pinning is that the coercion runs at \
              **plan time**: both servers raise rather than letting the NULL decide the answer.",
+            "UNMEASURED",
         ),
         // --- `numeric`: the type a decimal constant is ----------------------------------------
         (
@@ -121,10 +132,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              about 17, so both are 0.1 and it answers `t`. Every decimal in the block above \
              agrees, because `double` reproduces `numeric` for every value it can hold — ADR \
              0031's rule, and its backlog.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1.5 = 'x'",
             "the same divergence in a message: `numeric` there, `double precision` here.",
+            "UNMEASURED",
         ),
         // **`SELECT 1 = 1.0` stood here and is deleted** (ADR 0031, rule 2). The entry recorded
         // the promotion as unfixable without breaking its own counterexample, `9007199254740993 =
@@ -135,11 +148,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT id FROM unk WHERE id = 1.0",
             "the same promotion, against a column: `0A000` naming the assignment. A refusal \
              rather than a wrong answer, and it was here before this unit.",
+            "UNMEASURED",
         ),
         (
             "SELECT id FROM unk WHERE id = 1.5",
             "the same `0A000`. A real server answers no rows, having compared 1 against 1.5 as \
              `numeric`.",
+            "UNMEASURED",
         ),
         // --- a cast of a *number*, which now runs ----------------------------------------------
         //
@@ -156,8 +171,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              evidence for case 3 — that an explicit type is *not* `unknown`, so `1 = '1'::text` \
              is `42883` where `1 = '1'` is `t`. This node cannot express the distinction on the \
              numeric side and so cannot get it wrong there: the quoted string is `unknown`.",
+            "UNMEASURED",
         ),
-        ("SELECT '1'::text = 1", "a cast, as above."),
+        ("SELECT '1'::text = 1", "a cast, as above.", "UNMEASURED"),
         // --- the collation, already declared ---------------------------------------------------
         (
             "SELECT 'B' < 'a'",
@@ -166,6 +182,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              this project compiles neither. The capture container is `en_US.utf8`, where `B` \
              sorts after `a`. It arrives here because case 2 makes two `unknown`s `text` — which \
              is the rule working, and then the comparison is the one already written down.",
+            "UNMEASURED",
         ),
     ],
 };

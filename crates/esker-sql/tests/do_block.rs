@@ -45,10 +45,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`42704`: a user type's name does not resolve through `::regtype`, which is a gap in \
              the cast rather than in the `DO` block — the type is in `pg_type` on the line above. \
              Run 57's `type \"…\" does not exist` row, b4's unit.",
+            "pg19_do_create_enum.txt:44",
         ),
         (
             "SELECT count(*) FROM pg_enum WHERE enumtypid = 'unused'::regtype;",
             "The same `::regtype` gap, on the enum with an empty label list.",
+            "pg19_do_create_enum.txt:70",
         ),
     ],
 };

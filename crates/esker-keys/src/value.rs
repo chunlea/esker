@@ -170,7 +170,7 @@ pub enum ColumnType {
     ///
     /// **A different grammar from [`ColumnType::TsVector`], not a different spelling of it**:
     /// `'a b'` is a two-lexeme tsvector and a *syntax error* as a tsquery, which is measured in
-    /// `captures/pg19_tsvector.txt`.
+    /// `crates/esker-sql/tests/captures/pg19_tsvector.txt`.
     TsQuery,
     /// PostgreSQL's `tsrange`: a range of `timestamp without time zone`.
     ///
