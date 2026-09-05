@@ -178,3 +178,28 @@ fn explain_names_the_table_and_not_the_alias() {
         "the plan does not name the table: {plan:?}"
     );
 }
+
+/// **The name in a plan is the relation's, not the row's key.** Outside `public` a relation is
+/// stored as `schema ++ NUL ++ name` ([ADR 0071](../../../docs/adr/0071-a-relation-name-is-keyed-by-its-schema.md)),
+/// and `EXPLAIN` printed that composite verbatim — a NUL byte in the middle of a `QUERY PLAN` row.
+///
+/// PostgreSQL prints the **bare** name here and adds the schema only under `VERBOSE`, which this
+/// node does not honour. Measured on 19beta1 over a table in `b4_other`:
+///
+/// ```text
+/// EXPLAIN (COSTS FALSE) SELECT * FROM b4_other.t           Seq Scan on t
+/// EXPLAIN (COSTS FALSE, VERBOSE) SELECT * FROM b4_other.t  Seq Scan on b4_other.t
+/// ```
+#[test]
+fn explain_names_a_relation_outside_public_without_its_schema() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA other",
+        "CREATE TABLE other.t (a int8 PRIMARY KEY)",
+    ]);
+    let plan = node.rows("EXPLAIN SELECT * FROM other.t").concat().concat();
+    assert!(
+        !plan.contains('\u{0}'),
+        "a stored name reached a client: {plan:?}"
+    );
+    assert!(plan.contains("Seq Scan on t"), "{plan:?}");
+}
