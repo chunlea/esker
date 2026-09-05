@@ -186,8 +186,13 @@ impl Cluster {
     /// see the thing that cost `range_test.rb` a test.
     pub fn session(&self) -> Session {
         Session {
-            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT)
-                .sharing_sequence_blocks(Arc::clone(&self.sequences)),
+            executor: Executor::new(
+                Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                TENANT,
+                esker_sql::session::register(),
+            )
+            .sharing_sequence_blocks(Arc::clone(&self.sequences)),
         }
     }
 

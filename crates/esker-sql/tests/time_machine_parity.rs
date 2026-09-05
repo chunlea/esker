@@ -156,6 +156,7 @@ fn answer(script: &str) -> String {
         Arc::clone(&backend) as Arc<dyn Backend>,
         Arc::new(Catalog::new()),
         1,
+        esker_sql::session::register(),
     );
 
     // The table PostgreSQL's capture used, so a statement naming it is about a table and not about

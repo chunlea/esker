@@ -136,8 +136,13 @@ fn a_second_session_cannot_take_a_lock_the_first_holds() {
     let catalog = Arc::new(Catalog::new());
     let locks = Arc::new(Locks::new());
     let session = || {
-        Executor::new(Arc::clone(&backend), Arc::clone(&catalog), 1)
-            .sharing_advisory_locks(Arc::clone(&locks))
+        Executor::new(
+            Arc::clone(&backend),
+            Arc::clone(&catalog),
+            1,
+            esker_sql::session::register(),
+        )
+        .sharing_advisory_locks(Arc::clone(&locks))
     };
     let (mut a, mut b) = (session(), session());
 

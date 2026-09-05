@@ -601,6 +601,7 @@ fn ready_with(rows: &[Row], source: Option<Arc<dyn FragmentSource>>) -> Executor
         Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
         Arc::new(Catalog::new()),
         1,
+        esker_sql::session::register(),
     );
     if let Some(source) = source {
         node = node.asking_fragments_of(source);

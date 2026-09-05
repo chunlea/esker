@@ -56,6 +56,7 @@ pub mod pgwire;
 pub mod plan;
 pub mod row;
 pub mod sequence;
+pub mod session;
 pub mod sqlstate;
 pub mod time_machine;
 pub mod value;

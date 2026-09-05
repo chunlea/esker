@@ -286,6 +286,10 @@ impl ReDriver {
             Arc::clone(&self.backend),
             Arc::clone(&self.catalog),
             self.tenant,
+            // A re-drive is a session like any other: it runs statements, so it is something
+            // `pg_stat_activity` should be able to show and something a cancel could name. A real
+            // server lists its background workers there too.
+            crate::session::register(),
         )
     }
 

@@ -27,7 +27,7 @@
 pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
-mod cancel;
+pub(crate) mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
@@ -83,6 +83,14 @@ pub struct Executor {
     /// Who this session is, in that table. Handed out once at construction and never reused, so a
     /// lock released by one session cannot be mistaken for a later one's.
     session: crate::advisory::Session,
+    /// **Who this session is**, for `pg_stat_activity` and for a cancellation to name.
+    ///
+    /// Required at construction rather than defaulted, and the reason is a scar: a defaulted method
+    /// is how two lanes' halves once merged cleanly and never joined. An `Executor` that could be
+    /// built without saying who it is would be a session `pg_stat_activity` cannot see, and the
+    /// view would need a second code path for the ones it cannot — which is the thing this change
+    /// exists to remove.
+    identity: crate::session::Backend,
 
     pub(crate) tenant: u64,
     /// The database this session is connected to, which is the tenant above under its name.
@@ -615,7 +623,12 @@ impl Executor {
 
     /// An executor over a store and a shared catalog cache.
     #[must_use]
-    pub fn new(backend: Arc<dyn Backend>, catalog: Arc<Catalog>, tenant: u64) -> Self {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        catalog: Arc<Catalog>,
+        tenant: u64,
+        identity: crate::session::Backend,
+    ) -> Self {
         let locks = Arc::new(crate::advisory::Locks::new());
         let session = locks.session();
         Executor {
@@ -623,6 +636,7 @@ impl Executor {
             catalog,
             locks,
             session,
+            identity,
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
             open: None,
@@ -3261,6 +3275,16 @@ impl Execute for Executor {
         // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
         // the precedence `deadline_from` keeps.
         let _clock = cancel::until(self.statement_deadline());
+        // **The cancellation flag is installed here, not by the protocol layer.** It was in
+        // pgwire's blocking closure while only a connection had an identity, which left every
+        // in-process session — a `Pair`, a `Cluster`, a re-drive — uncancellable: `cancel::check`
+        // found no flag on the thread and a `pg_cancel_backend` that had already returned `true`
+        // stopped nothing. One identity, one place that arms it.
+        let _flag = cancel::with_session(self.identity.pid, Arc::clone(&self.identity.cancel));
+        // **What `pg_stat_activity` shows while this runs**, cleared by the guard however the
+        // statement ends. This is where an in-process session gets a `query` column too: the
+        // executor is the one layer every session goes through, socket or not.
+        let _running = self.identity.running(parsed.source());
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
         if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {

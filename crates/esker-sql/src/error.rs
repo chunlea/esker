@@ -270,6 +270,15 @@ pub enum SqlError {
     #[error("canceling statement due to statement timeout")]
     StatementTimeout,
 
+    /// A statement somebody asked to stop: `pg_cancel_backend()` or the protocol's
+    /// `CancelRequest`.
+    ///
+    /// **`57014` and PostgreSQL's own sentence.** The same code as a statement timeout and a
+    /// different message, which is the pattern `55P03` already follows for its two conditions —
+    /// the code says what happened to the statement and the sentence says who did it.
+    #[error("canceling statement due to user request")]
+    QueryCanceled,
+
     /// Two transactions waiting for each other's rows. **`40P01`**, and exactly one of them gets
     /// it — measured on PostgreSQL 19, where the survivor's *both* updates landed.
     ///
@@ -915,6 +924,14 @@ pub enum SqlError {
     /// `RAISE NOTICE | WARNING | INFO '<text>'` inside a `DO` block: the raised text, verbatim.
     ///
     /// Its severity is the level that was written, which is the whole of what a client sees —
+
+    /// `DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$` — the raised text is the whole message.
+    ///
+    /// **An error and not a notice**, which is the distinction ADR 0058 refused to blur: routing
+    /// it through the notice path would turn a failed statement into a successful one, and inside
+    /// a transaction block a real server aborts here. `P0001`, measured.
+    #[error("{0}")]
+    RaisedException(String),
     /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
     /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
     #[error("{message}")]
@@ -2419,12 +2436,13 @@ impl SqlError {
             | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_)
             | SqlError::UndefinedTextSearchConfig(_) => sqlstate::UNDEFINED_OBJECT,
+            SqlError::RaisedException(_) => sqlstate::RAISE_EXCEPTION,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
             SqlError::ReservedSchemaName(_) => sqlstate::RESERVED_NAME,
             SqlError::LockNotAvailable(_) | SqlError::LockTimeout => sqlstate::LOCK_NOT_AVAILABLE,
-            SqlError::StatementTimeout => sqlstate::QUERY_CANCELED,
+            SqlError::StatementTimeout | SqlError::QueryCanceled => sqlstate::QUERY_CANCELED,
             SqlError::Deadlock => sqlstate::DEADLOCK_DETECTED,
             SqlError::WrongObjectType { .. }
             | SqlError::CannotChangeMatview(_)

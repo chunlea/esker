@@ -50,7 +50,11 @@ struct Sessions {
 }
 
 impl Executors for Sessions {
-    fn for_session(&self, database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        database: &str,
+        identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         // **The directory decides the tenant**, and it is read once per connection rather than
         // per statement: the answer cannot change under a session, because dropping the database
         // it is serving is `55006` (ADR 0052).
@@ -58,14 +62,18 @@ impl Executors for Sessions {
         let tenant = esker_sql::catalog::database_id(&*txn, database)?
             .ok_or_else(|| esker_sql::SqlError::UndefinedDatabase(database.to_owned()))?;
         let _ = txn.rollback();
-        let mut executor =
-            Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), tenant)
-                .serving_database(database)
-                .sharing_advisory_locks(Arc::clone(&self.locks))
-                // **The node's, not this connection's** — a pooled client is the normal client,
-                // and a block per connection is what made five inserts answer 1, 33, 65, 97, 129
-                // (ADR 0072).
-                .sharing_sequence_blocks(Arc::clone(&self.sequences));
+        let mut executor = Executor::new(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.catalog),
+            tenant,
+            identity,
+        )
+        .serving_database(database)
+        .sharing_advisory_locks(Arc::clone(&self.locks))
+        // **The node's, not this connection's** — a pooled client is the normal client,
+        // and a block per connection is what made five inserts answer 1, 33, 65, 97, 129
+        // (ADR 0072).
+        .sharing_sequence_blocks(Arc::clone(&self.sequences));
         if let Some(report) = &self.columnar {
             executor = executor.reporting_columnar_to(Arc::clone(report));
         }

@@ -247,6 +247,11 @@ pub const DUPLICATE_COLUMN: &str = "42701";
 pub const DUPLICATE_OBJECT: &str = "42710";
 /// An index name that resolves to nothing.
 pub const UNDEFINED_OBJECT: &str = "42704";
+
+/// `P0001 raise_exception` — what `RAISE EXCEPTION` in a `DO` block answers, with the raised text
+/// as the whole message. PostgreSQL's own class `P0` is "PL/pgSQL Error", and this is its first
+/// member.
+pub const RAISE_EXCEPTION: &str = "P0001";
 /// A name that exists and is the wrong kind of thing — `DROP TABLE` naming an index. Not
 /// `42P01`: the object is there, it is just not what the statement can act on. Captured, because
 /// collapsing the two would tell a user their index does not exist.
@@ -332,6 +337,7 @@ mod tests {
         ("WARNING", super::WARNING),
         ("PROTOCOL_VIOLATION", super::PROTOCOL_VIOLATION),
         ("FEATURE_NOT_SUPPORTED", super::FEATURE_NOT_SUPPORTED),
+        ("RAISE_EXCEPTION", super::RAISE_EXCEPTION),
         (
             "INVALID_TEXT_REPRESENTATION",
             super::INVALID_TEXT_REPRESENTATION,
