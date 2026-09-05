@@ -114,7 +114,7 @@ impl Parsed {
                 },
             ));
         }
-        let mut lowered = lower_statement(&self.statement)?;
+        let mut lowered = lower_statement(&self.statement, self.parameter_namespace())?;
         // `WITH [NO] DATA` was cut off the source so the statement would parse.
         if let plan::Statement::CreateMaterializedView(create) = &mut lowered
             && let Some(with_data) = self.with_data()
@@ -334,7 +334,10 @@ fn is_true(value: &str) -> bool {
     clippy::too_many_lines,
     reason = "one arm per statement kind; splitting it would hide the vocabulary rather than clarify it"
 )]
-fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
+fn lower_statement(
+    statement: &Statement,
+    parameter_namespace: Option<&str>,
+) -> Result<plan::Statement> {
     match statement {
         Statement::CreateTable(create) => {
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
@@ -376,7 +379,10 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
         Statement::DropFunction(drop) => {
             Ok(plan::Statement::DropFunction(lower_drop_function(drop)?))
         }
-        Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(alter)?)),
+        Statement::AlterTable(alter) => Ok(plan::Statement::AlterTable(lower_alter_table(
+            alter,
+            parameter_namespace,
+        )?)),
         Statement::CreateSequence {
             temporary,
             if_not_exists,
@@ -668,7 +674,8 @@ fn lower_statement(statement: &Statement) -> Result<plan::Statement> {
             refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
             refuse_if(options.is_some(), "EXPLAIN with options")?;
             let _ = describe_alias;
-            let inner = lower_statement(statement)?;
+            // A nested statement carries no storage parameter of its own.
+            let inner = lower_statement(statement, None)?;
             // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
             // it is executed for a `SELECT`, where the point of it is the `ScanStats` a columnar
             // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
@@ -1331,8 +1338,25 @@ fn set_feature_name(set: &sqlparser::ast::Set) -> String {
 /// user who wrote `fillfactor` is told about `fillfactor`, not about `ALTER TABLE`.
 fn lower_storage_parameters(
     options: &[sqlparser::ast::SqlOption],
+    namespace: Option<&str>,
 ) -> Result<plan::AlterTableAction> {
     use sqlparser::ast::SqlOption;
+
+    // **A namespace is semantic, not syntactic.** `sqlparser` cannot read the dot, so
+    // `crate::parse::strip_parameter_namespace` lifts it off and the answer is decided here, where
+    // the names are known. Measured: `toast.` is accepted by a real server and `esker.` is
+    // `22023 unrecognized parameter namespace "esker"` — an error about a *name*, which is why
+    // answering `42601` for either would break contract C1.
+    if let Some(namespace) = namespace {
+        if !namespace.eq_ignore_ascii_case("toast") {
+            return Err(SqlError::UnrecognizedParameterNamespace(
+                namespace.to_owned(),
+            ));
+        }
+        // `toast.<anything>` is accepted and changes nothing here: this node has no TOAST, so the
+        // parameter has nowhere to land and a real server's answer is the tag either way.
+        return Ok(plan::AlterTableAction::SetColumnarReplicas { replicas: None });
+    }
 
     let [SqlOption::KeyValue { key, value }] = options else {
         // More than one at a time would have to be applied atomically or not at all, and there is
@@ -2275,7 +2299,10 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     clippy::too_many_lines,
     reason = "one block per ALTER action; splitting it would hide the vocabulary rather than clarify it"
 )]
-fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTable> {
+fn lower_alter_table(
+    alter: &sqlparser::ast::AlterTable,
+    parameter_namespace: Option<&str>,
+) -> Result<plan::AlterTable> {
     // `ONLY` is about inheritance, which there is none of here; honouring it silently would be
     // honouring a word we do not implement.
     refuse_if(alter.only, "ALTER TABLE ONLY")?;
@@ -2288,7 +2315,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<plan::AlterTa
     let mut actions = Vec::with_capacity(alter.operations.len());
     for operation in &alter.operations {
         if let AlterTableOperation::SetOptionsParens { options } = operation {
-            actions.push(lower_storage_parameters(options)?);
+            actions.push(lower_storage_parameters(options, parameter_namespace)?);
             continue;
         }
         if let AlterTableOperation::AddConstraint {

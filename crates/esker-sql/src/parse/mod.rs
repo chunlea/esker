@@ -284,6 +284,11 @@ pub struct Parsed {
     /// ([`Parsed::lower`]). Every other rewrite in this module keeps the tree and adds to it;
     /// this one is the exception, and it is why the field carries the whole statement.
     raise: Option<(String, crate::error::Severity)>,
+    /// The namespace lifted off a storage parameter — `toast` in `SET (toast.x = 1)`.
+    ///
+    /// `sqlparser` cannot read the dot, so it comes out in `parse` and the decision — accepted,
+    /// or `22023` naming the namespace — is made where the names are known.
+    parameter_namespace: Option<String>,
     /// Whether a `CREATE DOMAIN` said `NOT NULL`, which `sqlparser` 0.62.0 cannot read
     /// ([`strip_domain_not_null`]).
     domain_not_null: bool,
@@ -365,6 +370,15 @@ impl Parsed {
     #[must_use]
     pub fn raised(&self) -> Option<&(String, crate::error::Severity)> {
         self.raise.as_ref()
+    }
+
+    /// The namespace a storage parameter was written with, if any.
+    ///
+    /// `toast` for `SET (toast.x = 1)`. `None` means the parameter had no namespace — the ordinary
+    /// case — not that it had one this node liked.
+    #[must_use]
+    pub fn parameter_namespace(&self) -> Option<&str> {
+        self.parameter_namespace.as_deref()
     }
 
     /// Whether a `CREATE DOMAIN` said `NOT NULL`.
@@ -500,6 +514,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = with_data_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
+    // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
+    let namespaced = strip_parameter_namespace(sql, &scanned);
+    let sql = namespaced.as_ref().map_or(sql, |(text, _)| text.as_str());
     let refresh = read_refresh(sql);
     let sql = match (&guarded, &raise, &refresh) {
         (Some(rewritten), _, _) => rewritten.as_str(),
@@ -519,6 +536,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 statement,
                 class,
                 source: sql.to_owned(),
+                parameter_namespace: namespaced.as_ref().map(|(_, ns)| ns.clone()),
                 concurrently,
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
@@ -639,6 +657,51 @@ impl DoLanguage<'_> {
 /// **`EXCEPTION` is deliberately not here.** It is an error — `P0001` with the raised text as the
 /// whole message — and routing it through the notice path would turn a failed statement into a
 /// successful one. It stays refused by name until something needs it.
+/// Lifts the **namespace** off a storage parameter, returning the rewritten statement and the
+/// namespace that was there.
+///
+/// `ALTER TABLE t SET (toast.autovacuum_enabled = false)` is valid PostgreSQL and `sqlparser`
+/// 0.62.0 cannot read it: `SetOptionsParens` wants `key = value` and stops at the dot with
+/// `Expected: =, found: .`. **That makes a valid PostgreSQL statement a syntax error here, which
+/// contract C1 forbids** — and it is a syntax error about a name, where PostgreSQL's own answer is
+/// semantic: `toast.` is accepted and `esker.` is `22023 unrecognized parameter namespace "esker"`.
+/// A parser cannot tell those apart, so the namespace comes out here and the decision is made
+/// where the names are known.
+///
+/// Only inside the parentheses of a `SET`, and only on a `key` — a dot means something else almost
+/// everywhere and lifting it generally would rewrite qualified column names.
+fn strip_parameter_namespace(sql: &str, scanned: &Scan<'_>) -> Option<(String, String)> {
+    if !starts_with_words(&scanned.words, &["ALTER", "TABLE"]) {
+        return None;
+    }
+    let open = sql.find('(')?;
+    let close = sql.rfind(')')?;
+    if close < open || !sql.get(..open)?.to_ascii_uppercase().contains(" SET") {
+        return None;
+    }
+    let inside = sql.get(open + 1..close)?;
+    let (key, rest) = inside.split_once('=')?;
+    let (namespace, name) = key.trim().split_once('.')?;
+    // One dot and two ordinary names: anything else is not a namespaced parameter.
+    if namespace.is_empty()
+        || name.is_empty()
+        || !namespace.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some((
+        format!(
+            "{}({} ={}{}",
+            sql.get(..open)?,
+            name,
+            rest,
+            sql.get(close..)?
+        ),
+        namespace.to_owned(),
+    ))
+}
+
 /// Cuts `NOT NULL` out of a `CREATE DOMAIN`, returning the rest of the statement.
 ///
 /// `sqlparser` 0.62.0 reads a domain's `DEFAULT` and its `CHECK` and stops at `NOT NULL`
