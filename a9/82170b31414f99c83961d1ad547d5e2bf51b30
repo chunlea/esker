@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/mod.rs
+  s_dc640bf0df4adb::t_5c05c809cb89ee 333-339
+crates/esker-sql/tests/statement_cancellation.rs
+  s_dc640bf0df4adb::t_33ca1f5b2f1068 212-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a982170b31414f99c83961d1ad547d5e2bf51b30",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
