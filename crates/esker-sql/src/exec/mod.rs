@@ -1012,6 +1012,7 @@ impl Executor {
             Statement::CreateMaterializedView(create) => {
                 ddl::create_materialized_view(self, txn, create)
             }
+            Statement::CreateTableAs(create) => ddl::create_table_as(self, txn, create),
             Statement::RefreshMaterializedView(refresh) => {
                 ddl::refresh_materialized_view(self, txn, refresh)
             }
@@ -3428,6 +3429,7 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::CreateMaterializedView(create) => {
             vec![format!("Create Materialized View on {}", create.name)]
         }
+        Statement::CreateTableAs(create) => vec![format!("Create Table As on {}", create.name)],
         Statement::RefreshMaterializedView(refresh) => {
             vec![format!("Refresh Materialized View on {}", refresh.name)]
         }
