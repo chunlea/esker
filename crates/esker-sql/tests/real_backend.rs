@@ -659,3 +659,51 @@ fn the_range_files_own_round_gives_the_ids_postgresql_gives() {
          makes `PostgresqlRange.first` return a fixture"
     );
 }
+
+/// **An explicit id never moves a sequence**, which is what separates the two servers in
+/// `range_test.rb`.
+///
+/// r1's PG-side capture (run 86) overturned the reading this lane and the coordinator had both
+/// been working from: there is **no `reset_pk_sequence!` anywhere in that test's path** — 890
+/// statements and not one `setval` or `nextval` on `postgresql_ranges_id_seq`. So on 19beta1 the
+/// five explicit-id fixtures leave the sequence completely alone, `last_value` is still `1` with
+/// `is_called` `f`, the `create!` gets id **1**, and `PostgresqlRange.first` returns the row the
+/// test just made. That is why PostgreSQL passes.
+///
+/// The three things to check are therefore the sequence's own state and the next id, with no
+/// `setval` in sight anywhere.
+#[test]
+fn an_explicit_id_does_not_move_the_sequence() {
+    let cluster = Cluster::start();
+    let mut session = cluster.session();
+    session
+        .run("CREATE TABLE pr (id bigserial PRIMARY KEY, note text)")
+        .unwrap();
+    for id in 101..=105 {
+        session
+            .run(&format!(
+                "INSERT INTO pr (id, note) VALUES ({id}, 'fixture')"
+            ))
+            .unwrap();
+    }
+
+    // `1 | f` on 19beta1: nothing has drawn from it, so it has not been called and its `last_value`
+    // is still the start.
+    assert_eq!(
+        session.rows("SELECT last_value, is_called FROM pr_id_seq"),
+        [[Some("1".to_owned()), Some("f".to_owned())]],
+        "five explicit ids must leave the sequence untouched"
+    );
+
+    // And the created row is **1**, below the fixtures, which is what makes `.first` the new row.
+    assert_eq!(
+        session.rows("INSERT INTO pr (note) VALUES ('created') RETURNING id"),
+        [[Some("1".to_owned())]],
+        "the next id is the sequence's first value, not max(id) + 1"
+    );
+    assert_eq!(
+        session.rows("SELECT id FROM pr ORDER BY id ASC LIMIT 1"),
+        [[Some("1".to_owned())]],
+        "`PostgresqlRange.first` is the created row"
+    );
+}
