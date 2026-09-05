@@ -1,0 +1,31 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_609bbbdbf3c419::t_855e5a1d2fb6b7 843-847,849,2192-2193,2201
+crates/esker-sql/src/exec/bind.rs
+  s_609bbbdbf3c419::t_1dce7ff4331e5f 929-937,1227-1231
+crates/esker-sql/src/exec/mod.rs
+  s_609bbbdbf3c419::t_e53e2b89236cb2 2860-2877
+crates/esker-sql/src/parse/lower.rs
+  s_609bbbdbf3c419::t_35e73640c0b506 4878-4892
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_609bbbdbf3c419::t_96fda2b76d922b 151-152
+crates/esker-sql/tests/regtype_user_probe.rs
+  s_609bbbdbf3c419::t_252b5be6f89a83 1-65
+docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md
+  s_609bbbdbf3c419::t_40f9aff87ff936 89-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0ffa69e9654ea0550629dcd76730fadd281d2866",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
