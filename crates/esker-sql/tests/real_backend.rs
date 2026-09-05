@@ -560,25 +560,21 @@ fn consecutive_serial_ids_are_consecutive() {
         "five inserts on one connection are five consecutive ids"
     );
 
-    // And across connections: the second one takes its own block, so its ids are not the first
-    // one's — but each connection's own run is still consecutive, which is what a reserved block
-    // means. That the two blocks differ is `SEQUENCE_BATCH`'s declared gap and not this.
+    // **And a second connection on the same node continues the run**, which is the whole of
+    // ADR 0072 and the thing a per-connection block could not do: `ActiveRecord`'s pool is five,
+    // so five inserts used to be five blocks — `1, 33, 65, 97, 129` where PostgreSQL gives
+    // `1, 2, 3, 4, 5`. The gap that is left is a *cross-node* one.
     let mut other = cluster.session();
     for value in 6..=8 {
         other
             .run(&format!("INSERT INTO ser (v) VALUES ({value})"))
             .unwrap();
     }
-    let theirs: Vec<i64> = other
-        .rows("SELECT id FROM ser WHERE v > 5 ORDER BY id")
-        .into_iter()
-        .map(|row| row[0].as_deref().unwrap_or_default().parse().unwrap_or(0))
-        .collect();
-    assert_eq!(theirs.len(), 3);
     assert_eq!(
-        theirs[1] - theirs[0],
-        1,
-        "the second connection's own ids are consecutive too: {theirs:?}"
+        other.rows("SELECT id FROM ser ORDER BY id"),
+        (1..=8)
+            .map(|id| vec![Some(id.to_string())])
+            .collect::<Vec<_>>(),
+        "a pooled client on one node sees one consecutive run, not a block per connection"
     );
-    assert_eq!(theirs[2] - theirs[1], 1, "{theirs:?}");
 }

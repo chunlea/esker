@@ -454,6 +454,13 @@ pub struct IndexKey {
     pub part: KeyPart,
     /// Which way it is stored, and where its NULLs go.
     pub order: KeyOrder,
+    /// The **operator class** written after the column, or `None` for the type's default.
+    ///
+    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// the key underneath is the ordered one every key here is, and this is what
+    /// `pg_index.indclass` reports and `pg_get_indexdef` prints. `ActiveRecord`'s schema dumper
+    /// reads it back, which is the whole reason it is stored.
+    pub opclass: Option<String>,
 }
 
 impl IndexKey {
@@ -465,6 +472,7 @@ impl IndexKey {
         IndexKey {
             part: KeyPart::Column(at),
             order: KeyOrder::ASCENDING,
+            opclass: None,
         }
     }
 
@@ -4286,6 +4294,7 @@ mod tests {
                     descending: true,
                     nulls_first: false,
                 },
+                opclass: None,
             },
         ];
         let encoded = record::encode_table(&table).unwrap();

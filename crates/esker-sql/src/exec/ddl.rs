@@ -4386,6 +4386,11 @@ fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> R
     Ok(table.sequences.iter().map(|sequence| sequence.id).collect())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one `CREATE INDEX`, and the operator-class checks (ADR 0070) belong beside the key \
+              they are about rather than in a pass that would read the same list again"
+)]
 pub(super) fn create_index(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -4447,6 +4452,7 @@ pub(super) fn create_index(
             Ok(IndexKey {
                 part,
                 order: key.order,
+                opclass: key.opclass.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;

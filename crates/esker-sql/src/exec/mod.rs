@@ -128,11 +128,18 @@ pub struct Executor {
     /// Row ids reserved for this session but not yet handed out: `table_id -> (next, end)`.
     /// See [`Executor::next_row_id`].
     row_ids: std::collections::BTreeMap<u64, (u64, u64)>,
-    /// One session's reserved block per sequence: the next value it will hand out and the first
-    /// value past its block. See [`Executor::next_sequence_value`].
-    sequences: std::collections::BTreeMap<u64, (i64, i64)>,
-    //  Held blocks are dropped when their sequence is (`exec::ddl::drop_one_table`), so this does
-    //  not grow with the number of tables a long-lived connection has created and dropped.
+    /// **The node's** reserved blocks, not this session's — one allocator for every session the
+    /// process serves, joined by [`Executor::sharing_sequence_blocks`] the way the advisory-lock
+    /// table is, and private to this executor when nobody hands one in
+    /// ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)).
+    ///
+    /// A block held per *connection* is invisible to a client with one and glaring to one that
+    /// pools: five inserts on a five-connection pool answered `1, 33, 65, 97, 129` where
+    /// PostgreSQL gives `1, 2, 3, 4, 5`, and it cost `range_test.rb` a test.
+    ///
+    /// Held blocks are dropped when their sequence is (`exec::ddl::drop_one_table`), so this does
+    /// not grow with the number of tables a long-lived node has created and dropped.
+    sequences: Arc<crate::sequence::Blocks>,
     /// The sequences this session has a `currval` for, which is **not** the same set as the ones
     /// it holds a block of.
     ///
@@ -625,7 +632,7 @@ impl Executor {
             parameters: savepoint::Parameters::new(),
             block_parameters: None,
             row_ids: std::collections::BTreeMap::new(),
-            sequences: std::collections::BTreeMap::new(),
+            sequences: Arc::new(crate::sequence::Blocks::default()),
             currval_defined: std::collections::BTreeSet::new(),
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
@@ -1578,7 +1585,7 @@ impl Executor {
                 SequenceFunc::CurrVal => self
                     .currval_defined
                     .contains(&sequence.id)
-                    .then(|| self.sequences.get(&sequence.id).map(|(next, _)| next - 1))
+                    .then(|| self.sequences.last_taken(self.tenant, sequence.id))
                     .flatten()
                     // **The sequence's own name, not the spelling that reached it**: by here the
                     // name has resolved, and `currval('"public"."s"')` is about the sequence `s`.
@@ -1596,7 +1603,7 @@ impl Executor {
             .ok_or(SqlError::SequenceNotYetDefined(None))?;
         self.currval_defined
             .contains(&id)
-            .then(|| self.sequences.get(&id).map(|(next, _)| next - 1))
+            .then(|| self.sequences.last_taken(self.tenant, id))
             .flatten()
             .ok_or(SqlError::SequenceNotYetDefined(None))
     }
@@ -1674,7 +1681,7 @@ impl Executor {
         );
         txn.commit()?;
         // `currval` answers the value that was set, whether or not it was called -- measured.
-        self.sequences.insert(sequence_id, (value + 1, value + 1));
+        self.sequences.set(self.tenant, sequence_id, value);
         self.last_sequence = Some(sequence_id);
         self.currval_defined.insert(sequence_id);
         Ok(value)
@@ -1925,7 +1932,7 @@ impl Executor {
     /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
     /// because a value that was never handed out is not one this session last took.
     pub(super) fn forget_sequence_block(&mut self, sequence_id: u64) {
-        self.sequences.remove(&sequence_id);
+        self.sequences.forget(self.tenant, sequence_id);
         self.currval_defined.remove(&sequence_id);
         if self.last_sequence == Some(sequence_id) {
             self.last_sequence = None;
@@ -1941,7 +1948,7 @@ impl Executor {
     /// count to be visible at all.
     #[must_use]
     pub fn held_sequence_blocks(&self) -> usize {
-        self.sequences.len()
+        self.sequences.held_for(self.tenant)
     }
 
     /// Sets one sequence back to its start — the counter **and** this session's block.
@@ -1962,36 +1969,33 @@ impl Executor {
 
     /// has with exactly this behaviour, and neither server offers gap-freeness.
     fn next_sequence_value(&mut self, sequence_id: u64) -> Result<i64> {
-        if let Some((next, end)) = self.sequences.get_mut(&sequence_id)
-            && *next < *end
-        {
-            let value = *next;
-            *next += 1;
-            self.last_sequence = Some(sequence_id);
-            self.currval_defined.insert(sequence_id);
-            return Ok(value);
-        }
-
-        let mut txn = self.backend.begin()?;
-        let first = match crate::catalog::allocate_sequence_values(
-            &mut *txn,
-            self.tenant,
-            sequence_id,
-            crate::catalog::SEQUENCE_BATCH,
-        ) {
-            Ok(first) => first,
-            Err(error) => {
-                let _ = txn.rollback();
-                return Err(error);
-            }
-        };
-        txn.commit()?;
-        let batch = i64::try_from(crate::catalog::SEQUENCE_BATCH).unwrap_or(i64::MAX);
-        self.sequences
-            .insert(sequence_id, (first + 1, first.saturating_add(batch)));
+        let backend = Arc::clone(&self.backend);
+        let tenant = self.tenant;
+        let value =
+            self.sequences
+                .next(tenant, sequence_id, crate::catalog::SEQUENCE_BATCH, || {
+                    let mut txn = backend.begin()?;
+                    match crate::catalog::allocate_sequence_values(
+                        &mut *txn,
+                        tenant,
+                        sequence_id,
+                        crate::catalog::SEQUENCE_BATCH,
+                    ) {
+                        Ok(first) => {
+                            txn.commit()?;
+                            Ok(first)
+                        }
+                        Err(error) => {
+                            let _ = txn.rollback();
+                            Err(error)
+                        }
+                    }
+                })?;
+        // **`currval` and `lastval` stay this session's**, because that is what they are on a real
+        // server: the value *this* session last took, not one the node did.
         self.last_sequence = Some(sequence_id);
         self.currval_defined.insert(sequence_id);
-        Ok(first)
+        Ok(value)
     }
 
     /// Adds a notice for the session to send before this statement's `CommandComplete`.
@@ -2034,6 +2038,18 @@ impl Executor {
     pub fn sharing_advisory_locks(mut self, locks: Arc<crate::advisory::Locks>) -> Self {
         self.session = locks.session();
         self.locks = locks;
+        self
+    }
+
+    /// Joins this executor to the **node's** sequence allocator, so every session the process
+    /// serves hands out consecutive values of one sequence rather than a block each.
+    ///
+    /// The shape [`Executor::sharing_advisory_locks`] has and for the same reason: an executor
+    /// built without one gets a private allocator, which is right for a single-session test and is
+    /// what keeps the corpus replay honest (ADR 0072).
+    #[must_use]
+    pub fn sharing_sequence_blocks(mut self, blocks: Arc<crate::sequence::Blocks>) -> Self {
+        self.sequences = blocks;
         self
     }
 
