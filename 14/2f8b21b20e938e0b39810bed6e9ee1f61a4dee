@@ -1,0 +1,27 @@
+crates/esker-engine/src/db/compact.rs
+  s_2bed4ac2b1c944::t_7a8f4662b7a0bd 7,15-35,54,66-143,308-311,313-322,326-331,336,338,345-360,591
+crates/esker-engine/src/db/mod.rs
+  s_2bed4ac2b1c944::t_04d79ae8ec9718 161-163,533
+crates/esker-engine/src/db/open.rs
+  s_2bed4ac2b1c944::t_623b227de7ec94 145
+crates/esker-engine/tests/db.rs
+  s_2bed4ac2b1c944::t_308c3d579ccede 1782-1926
+docs/adr/0079-compaction-concurrency-reserves-the-output-range.md
+  s_2bed4ac2b1c944::t_815a3d392aebb7 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "142f8b21b20e938e0b39810bed6e9ee1f61a4dee",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
