@@ -2440,7 +2440,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         } => {
             let operand = resolve(operand, scope)?;
             if let Ok(from) = expr_type(&operand, scope)
-                && !crate::catalog::pg_catalog::casts_to(from, *to)
+                && !pg_catalog::casts_to(from, *to)
             {
                 return Err(SqlError::CannotCast {
                     from: from.name(),

@@ -376,18 +376,6 @@ pub enum Expr {
         /// Its argument.
         operand: Box<Expr>,
     },
-    /// `<expr>::text`, evaluated per row.
-    ///
-    /// The **output function** of whatever the operand turns out to be, which is what a cast to
-    /// `text` is on a real server — `42::text` is `42` and `1.0::float8::text` is `1`, because
-    /// each is what that type prints. Only `text` is a target here: every other cast in this crate
-    /// is folded at plan time over a literal, and a per-row cast is needed exactly where the
-    /// operand is a column.
-    ///
-    /// A `character(n)` is the one operand where the cast is not the identity on the stored text:
-    /// it **strips** the padding, so a `char(3)` holding `x` casts to `x` and prints as `x  `.
-    /// Measured, and the reason `tests/typmod.rs` could declare that pair as a divergence before
-    /// this existed.
     /// `expr::<type>` where the value is not known until there is a row, and the target is not
     /// `text`.
     ///
@@ -409,6 +397,18 @@ pub enum Expr {
         /// that type would.
         typmod: i32,
     },
+    /// `<expr>::text`, evaluated per row.
+    ///
+    /// The **output function** of whatever the operand turns out to be, which is what a cast to
+    /// `text` is on a real server — `42::text` is `42` and `1.0::float8::text` is `1`, because
+    /// each is what that type prints. Only `text` is a target here: every other cast in this crate
+    /// is folded at plan time over a literal, and a per-row cast is needed exactly where the
+    /// operand is a column.
+    ///
+    /// A `character(n)` is the one operand where the cast is not the identity on the stored text:
+    /// it **strips** the padding, so a `char(3)` holding `x` casts to `x` and prints as `x  `.
+    /// Measured, and the reason `tests/typmod.rs` could declare that pair as a divergence before
+    /// this existed.
     ToText {
         /// What to cast.
         operand: Box<Expr>,

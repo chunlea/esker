@@ -685,7 +685,8 @@ fn substitute_outer(node: &mut Node, outer: &[Datum], depth: usize) {
     for_each_node_expr_mut(node, &mut |expr| substitute_in_expr(expr, outer, depth));
 }
 
-/// [`substitute_in_expr`] over a list, which is what an `ARRAY[…]`'s elements are.
+/// [`substitute_in_expr`] over a list, which is what an `ARRAY[…]`'s elements are — and over the
+/// one operand a cast has, so both arms are one line in the match rather than four.
 fn substitute_in_each(elements: &mut [Expr], outer: &[Datum], depth: usize) {
     for element in elements {
         substitute_in_expr(element, outer, depth);
@@ -694,7 +695,6 @@ fn substitute_in_each(elements: &mut [Expr], outer: &[Datum], depth: usize) {
 
 fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
     match expr {
-        Expr::Array { elements, .. } => substitute_in_each(elements, outer, depth),
         Expr::Outer { level, at, .. } if *level == depth => {
             *expr = Expr::Literal(match outer.get(*at) {
                 // A NULL has no type to carry and needs none: every comparison with one is NULL.
@@ -715,15 +715,15 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             substitute_in_expr(left, outer, depth);
             substitute_in_expr(right, outer, depth);
         }
+        // Every node with exactly one child, in one arm — `IsNull` and `Negate` had their own
+        // beside this one, doing the same thing.
         Expr::Not(inner)
         | Expr::Cast { operand: inner, .. }
         | Expr::ToText { operand: inner, .. }
-        | Expr::Scalar { operand: inner, .. } => {
-            substitute_in_expr(inner, outer, depth);
-        }
-        Expr::IsNull { operand, .. } | Expr::Negate(operand) => {
-            substitute_in_expr(operand, outer, depth);
-        }
+        | Expr::Scalar { operand: inner, .. }
+        | Expr::IsNull { operand: inner, .. }
+        | Expr::Negate(inner) => substitute_in_expr(inner, outer, depth),
+        Expr::Array { elements, .. } => substitute_in_each(elements, outer, depth),
         Expr::AnyArray { operand, array } => {
             substitute_in_expr(operand, outer, depth);
             substitute_in_expr(array, outer, depth);

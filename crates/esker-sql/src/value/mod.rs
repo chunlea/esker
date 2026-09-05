@@ -183,25 +183,6 @@ pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
     u32::try_from(typmod).ok()
 }
 
-/// A value as the column's **typmod** requires it, or the error PostgreSQL raises instead.
-///
-/// The three types that take a number each do something different with it, which is the whole of
-/// the unit ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md),
-/// `tests/corpus/pg19_typmod.txt`):
-///
-/// * **`varchar(n)` refuses.** Longer is `22001`, on `INSERT` and `UPDATE` alike. Trailing spaces
-///   count: `'abc '` is four characters and `v = 'abc '` finds no row that holds `'abc'`.
-/// * **`character(n)` pads.** Shorter is padded with spaces to exactly `n`, and longer is the same
-///   `22001`. Those are one rule, not two: a value stored padded makes plain byte comparison *be*
-///   PostgreSQL's blank-insensitive comparison, so `c = 'x'`, `c = 'x  '` and `c = 'x    '` all
-///   match a `char(3)` holding `x`, and an index key over it still holds "equal values encode
-///   identically". That invariant is why `character(n)` waited for the typmod: without an `n`
-///   there is nowhere to pad to.
-/// * **`timestamp(p)` rounds**, half away from zero, and carries — `.999999` at `timestamp(3)` is
-///   the next whole second. `timestamp::round_to_precision` holds the two surprises.
-///
-/// A NULL and a column with no typmod are returned untouched, which is every column this crate
-/// had before version 4 of the catalog record.
 /// [`fit_to_typmod`] for an **explicit cast**, where a string too long is truncated rather than
 /// refused.
 ///
@@ -238,6 +219,25 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     })
 }
 
+/// A value as the column's **typmod** requires it, or the error PostgreSQL raises instead.
+///
+/// The three types that take a number each do something different with it, which is the whole of
+/// the unit ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md),
+/// `tests/corpus/pg19_typmod.txt`):
+///
+/// * **`varchar(n)` refuses.** Longer is `22001`, on `INSERT` and `UPDATE` alike. Trailing spaces
+///   count: `'abc '` is four characters and `v = 'abc '` finds no row that holds `'abc'`.
+/// * **`character(n)` pads.** Shorter is padded with spaces to exactly `n`, and longer is the same
+///   `22001`. Those are one rule, not two: a value stored padded makes plain byte comparison *be*
+///   PostgreSQL's blank-insensitive comparison, so `c = 'x'`, `c = 'x  '` and `c = 'x    '` all
+///   match a `char(3)` holding `x`, and an index key over it still holds "equal values encode
+///   identically". That invariant is why `character(n)` waited for the typmod: without an `n`
+///   there is nowhere to pad to.
+/// * **`timestamp(p)` rounds**, half away from zero, and carries — `.999999` at `timestamp(3)` is
+///   the next whole second. `timestamp::round_to_precision` holds the two surprises.
+///
+/// A NULL and a column with no typmod are returned untouched, which is every column this crate
+/// had before version 4 of the catalog record.
 pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
     if typmod == NO_TYPMOD {
         return Ok(value);

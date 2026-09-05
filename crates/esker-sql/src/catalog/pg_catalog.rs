@@ -2001,7 +2001,7 @@ pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 15] = [
 /// form to go through, and it is why `text -> integer` works with no row at all. Without it this
 /// refused `txt::integer`, which is the commonest cast in any suite.
 ///
-/// The categories come from [`typcategory`] rather than a list written here, so "which types are
+/// The categories come from `typcategory` rather than a list written here, so "which types are
 /// strings" is answered once. `castcontext` is not read: explicit is the widest of the three, so
 /// any row licenses one.
 #[must_use]
