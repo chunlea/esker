@@ -136,6 +136,57 @@ async fn a_join_over_columnar_tables_answers_what_the_row_engine_answers() {
     gate.stop().await;
 }
 
+/// **The third silence, closed.** `EXPLAIN` names an engine for a join.
+///
+/// `crates/esker-sql/src/exec/mod.rs` used to call the router only for a select with no joins, so
+/// a joined plan carried no decision and printed no `Engine:` line at all — while `SELECT *` over
+/// the same table printed `Engine: rows` with a reason. ADR 0040 Decision 3 lists two deliberate
+/// silences and this was a third, undocumented one: a reader debugging *"why is my join not on
+/// the columns"* got nothing back.
+///
+/// Every join now says which rule refused it, and two of them are checked by name — because a
+/// refusal for the wrong reason is a bug that a test asserting only "it fell back" would pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_names_an_engine_for_a_join() {
+    let gate = Gate::start().await;
+    gate.fill_join().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        for query in JOIN_QUERIES_THAT_MUST_ROUTE
+            .iter()
+            .chain(JOIN_QUERIES_THAT_MUST_REFUSE.iter().map(|(query, _)| query))
+        {
+            let plan = explain(&mut session, &format!("EXPLAIN {query}"));
+            assert!(
+                plan.contains("Engine:"),
+                "a joined plan printed no engine line, which is the silence this closes:\n{plan}"
+            );
+        }
+
+        // The two conditions that are checked today name themselves. The rest refuse with "not
+        // yet", which is the honest sentence for a half that is not built.
+        let left = explain(
+            &mut session,
+            "EXPLAIN SELECT count(*) FROM f LEFT JOIN d ON f.dk = d.k",
+        );
+        assert!(
+            left.contains("LEFT JOIN"),
+            "a LEFT JOIN must say so:\n{left}"
+        );
+        let materialised = explain(
+            &mut session,
+            "EXPLAIN SELECT count(*) FROM f JOIN d ON f.dk = d.bucket",
+        );
+        assert!(
+            materialised.contains("non-unique"),
+            "a non-unique inner column must say so:\n{materialised}"
+        );
+    });
+
+    gate.stop().await;
+}
+
 /// The other half: a join the rewrite must not take, and does not.
 ///
 /// Green today and green afterwards, which is the point — it is the guard that says the join

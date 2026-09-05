@@ -47,7 +47,7 @@ use crate::fragment::{Answer, FragmentSource, Shard};
 use crate::plan::routing::{
     Columnar, Decision, Engine, Finish, Output, Reason, Run, Setting, Shape,
 };
-use crate::plan::{AggregateFunc, AggregateSpec, Expr, Node, routing};
+use crate::plan::{AggregateFunc, AggregateSpec, Expr, Node, Probe, routing};
 use crate::value::{Datum, PgDatum};
 
 /// Built, or the decision that says why not.
@@ -160,75 +160,58 @@ fn replace_aggregate(node: &mut Node, replacement: Node) {
     clippy::too_many_lines,
     reason = "one rule per block, each with its reason"
 )]
-fn consider(
-    txn: &dyn Txn,
-    tenant: u64,
-    table: &TableDef,
-    source: Option<&dyn FragmentSource>,
-    setting: Setting,
-    planned: &Planned,
-) -> Routed<Built> {
-    if setting == Setting::Row {
-        return Err(Decision::rows(Reason::Override(Setting::Row)));
-    }
-    let Some(source) = source else {
-        return Err(Decision::rows(Reason::NoFragmentService));
-    };
-    // ADR 0022 Decision 2 rule 2, and the only rule here that is about a wrong answer rather than
-    // a slow one: a learner has not seen this transaction's uncommitted writes, so a read that
-    // must see them cannot be answered there at any price.
-    if txn.has_written() {
-        return Err(Decision::rows(Reason::NotExpressible(
-            "a read of a transaction's own writes",
-        )));
-    }
-
-    // **Before any question about the plan's shape.** A table nobody asked for a columnar copy of
-    // has no second engine to choose between, and every reason after this one describes a *choice*
-    // — which `EXPLAIN` then prints. Deciding it here is what keeps an ordinary table's plan from
-    // growing a line about a feature it is not using.
-    let replicas = replicas(txn, tenant, table.id);
-    if replicas == 0 {
-        return Err(Decision::rows(Reason::NotAsked));
-    }
-
-    let Some(aggregate) = find_aggregate(&planned.node) else {
-        return Err(Decision::rows(Reason::NotExpressible("this plan's shape")));
-    };
-    let Node::Aggregate {
-        input,
-        keys,
-        aggregates,
-        having,
-        grouped,
-    } = aggregate
-    else {
-        unreachable!("find_aggregate returns an Aggregate");
-    };
-
-    // The scan under it, and the filter between them if there is one.
-    let (filter, scan) = match &**input {
-        Node::Filter { input, predicate } => (Some(predicate), &**input),
-        other => (None, other),
-    };
-    let Node::SeqScan {
-        table_id, narrowed, ..
+/// Which of the semi-join rewrite's conditions this join fails, as `EXPLAIN` will print it.
+///
+/// `docs/plans/phase-16-mpp.md` §J3. A join reaches the columnar path by becoming a **semi-join**:
+/// the inner side's key set is read on this node and pushed into the outer table's fragment as a
+/// membership test. That substitution is exact only under conditions the plan tree already
+/// records, and each of them refuses with its own sentence — because a refusal for the wrong
+/// reason is a bug that still passes a test which only checks that it fell back.
+///
+/// Every arm here refuses today. The one that would route says so, which is the honest way to
+/// carry an unfinished half: the reader is told the shape is expressible and this build does not
+/// do it yet, rather than being told nothing or being told a lie about the shape.
+fn why_this_join_stays_on_rows(scan: &Node) -> &'static str {
+    let Node::NestedLoop {
+        left_join,
+        probe,
+        residual,
+        inner_view,
+        inner_plan,
+        ..
     } = scan
     else {
-        // A point get or an index lookup, which rule 1 keeps on rows; a join or a catalog view,
-        // which no fragment expresses. Both answer `Bounded` only when they really are bounded.
-        return Err(Decision::rows(match scan {
-            Node::PointGet { .. } | Node::IndexLookup { .. } => Reason::Bounded,
-            _ => Reason::NotExpressible("this access path"),
-        }));
+        return "this access path";
     };
-    if *narrowed {
-        return Err(Decision::rows(Reason::Bounded));
+    if *left_join {
+        // A LEFT JOIN keeps an unmatched outer row with every inner column NULL; a filter removes
+        // it. The two answers differ by exactly the rows the join exists to preserve.
+        return "a LEFT JOIN, whose unmatched rows a filter would drop";
     }
+    if inner_view.is_some() || inner_plan.is_some() {
+        return "a join whose inner side is a catalog view or a derived table";
+    }
+    if !matches!(probe, Probe::PrimaryKey { .. } | Probe::UniqueIndex { .. }) {
+        // The condition the whole rewrite rests on: only a unique inner key makes "at most one
+        // inner row per outer row" true, and only that makes a membership test preserve a count.
+        return "a join on a non-unique inner column, where one outer row may match many";
+    }
+    if residual.is_some() {
+        return "a join with a condition the probe did not express";
+    }
+    "a join this build does not yet push down as a semi-join"
+}
 
-    // Every table column the fragment must read, in table order: the grouping keys, the aggregate
-    // arguments, and everything the filter names. The projection is the only place a table column
-    // index appears in a fragment, so this list is also what decides the ratio.
+/// Every table column the fragment must read, in table order and deduplicated.
+///
+/// The grouping keys, the aggregate arguments, and everything the filter names. The projection is
+/// the only place a table column index appears in a fragment (`docs/DESIGN.md` §16.2), so this
+/// list is also what decides the ratio.
+fn columns_the_fragment_reads(
+    keys: &[Expr],
+    aggregates: &[AggregateSpec],
+    filter: Option<&Expr>,
+) -> Routed<Vec<usize>> {
     let mut columns: Vec<usize> = Vec::new();
     for key in keys {
         columns.push(ordinal(key).ok_or_else(|| {
@@ -252,6 +235,96 @@ fn consider(
     }
     columns.sort_unstable();
     columns.dedup();
+    Ok(columns)
+}
+
+/// The rules that hold whatever the plan looks like, answered before its shape is examined.
+///
+/// **Order matters and is the argument.** A table nobody asked for a columnar copy of has no
+/// second engine to choose between, and every reason after this one describes a *choice* — which
+/// `EXPLAIN` then prints. Deciding it here is what keeps an ordinary table's plan from growing a
+/// line about a feature it is not using (ADR 0040 Decision 3's first deliberate silence).
+fn before_the_shape<'a>(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    source: Option<&'a dyn FragmentSource>,
+    setting: Setting,
+) -> Routed<(&'a dyn FragmentSource, u8)> {
+    if setting == Setting::Row {
+        return Err(Decision::rows(Reason::Override(Setting::Row)));
+    }
+    let Some(source) = source else {
+        return Err(Decision::rows(Reason::NoFragmentService));
+    };
+    // ADR 0022 Decision 2 rule 2, and the only rule here that is about a wrong answer rather than
+    // a slow one: a learner has not seen this transaction's uncommitted writes, so a read that
+    // must see them cannot be answered there at any price.
+    if txn.has_written() {
+        return Err(Decision::rows(Reason::NotExpressible(
+            "a read of a transaction's own writes",
+        )));
+    }
+    let replicas = replicas(txn, tenant, table.id);
+    if replicas == 0 {
+        return Err(Decision::rows(Reason::NotAsked));
+    }
+    Ok((source, replicas))
+}
+
+/// The unbounded sequential scan a fragment needs, or the reason this access path is not one.
+///
+/// A point get or an index lookup is what ADR 0022 rule 1 keeps on rows; a join names which of the
+/// semi-join conditions refused it; a catalog view is a shape no fragment expresses. Each answers
+/// `Bounded` only when it really is bounded.
+fn the_scan_under_it(scan: &Node) -> Routed<(u64, bool)> {
+    match scan {
+        Node::SeqScan {
+            table_id, narrowed, ..
+        } => Ok((*table_id, *narrowed)),
+        Node::PointGet { .. } | Node::IndexLookup { .. } => Err(Decision::rows(Reason::Bounded)),
+        Node::NestedLoop { .. } => Err(Decision::rows(Reason::NotExpressible(
+            why_this_join_stays_on_rows(scan),
+        ))),
+        _ => Err(Decision::rows(Reason::NotExpressible("this access path"))),
+    }
+}
+
+fn consider(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    source: Option<&dyn FragmentSource>,
+    setting: Setting,
+    planned: &Planned,
+) -> Routed<Built> {
+    let (source, replicas) = before_the_shape(txn, tenant, table, source, setting)?;
+
+    let Some(aggregate) = find_aggregate(&planned.node) else {
+        return Err(Decision::rows(Reason::NotExpressible("this plan's shape")));
+    };
+    let Node::Aggregate {
+        input,
+        keys,
+        aggregates,
+        having,
+        grouped,
+    } = aggregate
+    else {
+        unreachable!("find_aggregate returns an Aggregate");
+    };
+
+    // The scan under it, and the filter between them if there is one.
+    let (filter, scan) = match &**input {
+        Node::Filter { input, predicate } => (Some(predicate), &**input),
+        other => (None, other),
+    };
+    let (table_id, narrowed) = the_scan_under_it(scan)?;
+    if narrowed {
+        return Err(Decision::rows(Reason::Bounded));
+    }
+
+    let columns = columns_the_fragment_reads(keys, aggregates, filter)?;
 
     let slot = |column: usize| -> u32 {
         u32::try_from(columns.binary_search(&column).unwrap_or(0)).unwrap_or(0)
@@ -290,10 +363,7 @@ fn consider(
     }
 
     let mut fragment = esker_columnar::Fragment::aggregate(
-        esker_columnar::TableRef {
-            tenant,
-            table_id: *table_id,
-        },
+        esker_columnar::TableRef { tenant, table_id },
         projection,
         group_by,
         asks,
@@ -330,7 +400,7 @@ fn consider(
     }
     Ok(Built {
         columnar: Columnar {
-            table_id: *table_id,
+            table_id,
             table: planned.table.clone(),
             fragment,
             outputs,

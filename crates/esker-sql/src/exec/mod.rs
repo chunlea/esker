@@ -1833,8 +1833,12 @@ impl Executor {
             .from
             .as_ref()
             .is_some_and(|from| from.derived.is_some());
+        // **Joins reach the router now, and most of them still refuse.** They were excluded
+        // outright, which meant a joined plan carried no engine decision and `EXPLAIN` printed no
+        // `Engine:` line at all — a third deliberate silence where ADR 0040 Decision 3 lists two,
+        // and the one a reader debugging "why is my join not on the columns" meets
+        // (`docs/plans/phase-16-mpp.md` §J1). `consider` now names which rule refused.
         if let Some(table) = table.as_deref()
-            && inners.is_empty()
             && !derived_from
         {
             fragment::route(
