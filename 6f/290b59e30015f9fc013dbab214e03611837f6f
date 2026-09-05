@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_41ac17bec7f4bd 3832-3833,3842-3866
+crates/esker-sql/tests/schema_cascade_sequence.rs
+  s_6f7019c05b578b::t_c818b99e42db0b 1-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6f290b59e30015f9fc013dbab214e03611837f6f",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
