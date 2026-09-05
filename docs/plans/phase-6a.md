@@ -444,6 +444,20 @@ merely refused well.
 Thirty-seven features, ninety-five statements. G13 (`TABLE t`) and `ABORT` from G22 are closed:
 both are documented synonyms and are now rewritten rather than refused.
 
+> **Those two numbers are stale, and the table below does not agree with them either.** Counted on
+> 2026-09-04: `KNOWN_GAPS` in `tests/syntax_corpus.rs` holds **84 statements across 36 features**,
+> the table below has **37 rows summing to 89**, and this sentence says 37 and 95. Closures have
+> been landing in the code and in individual rows without the totals being re-derived, and nothing
+> reads the totals — `the_register_still_describes_what_the_parser_does` compares the *statements*,
+> which is why the drift survived.
+>
+> **The durable number is the difference, not either total.** The table has counted five statements
+> the code does not for as long as both have been moving: it was 90 against 85 before the two
+> closures that landed on 2026-09-04, and 89 against 84 after them. Whatever those five are, they
+> are not what has been closing. Re-deriving all three needs the row-by-row audit that would name
+> them, which is a unit of its own; this is a note so that the next reader does not trust the
+> sentence above it.
+
 G32 to G39 came from one sweep of the `ALTER TABLE` grammar while `ADD COLUMN` was being built
 (§11, the ALTER continuation). The corpus had fifteen `ALTER TABLE` lines and the grammar has some
 thirty actions, so **eighteen statements PostgreSQL 19 accepts were coming back `42601`** — contract
@@ -488,7 +502,7 @@ rather than to add the lines a feature happens to need.
 | G34 | tablespaces | 2 | `ALTER TABLE t SET TABLESPACE ts;` | admin / DDL only |
 | G35 | table access methods | 1 | `ALTER TABLE t SET ACCESS METHOD heap;` | admin / DDL only |
 | G36 | clustering, and the OID legacy | 3 | `ALTER TABLE t CLUSTER ON i;` | admin / DDL only |
-| G37 | resetting storage parameters | 2 | `ALTER TABLE t RESET (fillfactor);` | admin / DDL only |
+| G37 | a multi-action `ALTER TABLE` whose first action is itself a gap | 1 | `ALTER TABLE t SET LOGGED, SET (fillfactor = 50);` | admin / DDL only — **`RESET (…)` closed**, read from the source and accepted for every name as a real server does |
 | G38 | table inheritance | 2 | `ALTER TABLE t INHERIT u;` | admin / DDL only |
 | G39 | a table of a composite type | 2 | `ALTER TABLE t OF sometype;` | admin / DDL only |
 
