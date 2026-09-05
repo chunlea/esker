@@ -30,11 +30,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use esker_client::wire::{Body, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
-use esker_client::{Router, TxnClient};
+use esker_client::{Error, Router, TxnClient};
 
 #[path = "txn_cluster/mod.rs"]
 mod txn_cluster;
@@ -81,10 +81,60 @@ impl Boundary {
     }
 }
 
+/// How long a caller here keeps re-asking while the office is moving under it.
+const WHILE_THE_OFFICE_MOVES: Duration = Duration::from_secs(30);
+
+/// Whether an answer is the leadership moving rather than the store deciding something.
+///
+/// The two the arm of 2026-09-04 21:45 produced, three runs in nine at fourteen busy threads:
+///
+/// ```text
+/// AmbiguousResult { method: TxnPrewrite, source: Closed {
+///     detail: "region 1 stopped leading with this proposal in its log; it may still commit" } }
+/// RetriesExhausted { attempts: 9, source: NotLeader { region_id: 2, leader_hint: None } }
+/// ```
+///
+/// Nothing else is retried here. A `TxnConflict`, a `LockNotCleared`, a refusal of any kind is
+/// the store *answering*, and this file exists to assert on those — turning one into thirty
+/// seconds of retries would hide the finding rather than report it.
+fn the_office_moved(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::AmbiguousResult { .. } | Error::RetriesExhausted { .. }
+    )
+}
+
+/// Re-asks while [`the_office_moved`], and fails with the whole error otherwise.
+///
+/// **Why repeating is safe here, and only here.** Every verb these tests send is idempotent at a
+/// fixed timestamp: a prewrite for one `start_ts`, a commit for one `(start_ts, commit_ts)`, a
+/// rollback of one `start_ts`, and a read. `Closed { "…it may still commit" }` means the entry may
+/// yet apply, so a caller that must not double-apply branches on `Error::changed_nothing` instead
+/// — see its doc comment. A second apply of any of these cannot be observed, which is what makes
+/// the retry honest rather than a way of passing.
+fn retrying<T>(what: &str, mut attempt: impl FnMut() -> Result<T, Error>) -> T {
+    let deadline = Instant::now() + WHILE_THE_OFFICE_MOVES;
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match attempt() {
+            Ok(answer) => return answer,
+            Err(error) => {
+                assert!(the_office_moved(&error), "{what}: {error:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: the office was still moving after {attempts} attempts in \
+                     {WHILE_THE_OFFICE_MOVES:?}; the last answer was {error:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 fn call(router: &Router, request: TxnKvReq) -> TxnKvResp {
-    router
-        .call(&Body::Txn(request))
-        .expect("the call reaches a store")
+    let body = Body::Txn(request);
+    retrying("the call reaches a store", || router.call(&body))
         .into_txn_kv()
         .expect("a TxnKv answer")
 }
@@ -163,10 +213,16 @@ fn abandon_at(cluster: &Cluster, router: &Router, boundary: Boundary, value: &[u
 
 /// What a reader that arrives afterwards sees on both keys.
 fn read_both(client: &TxnClient) -> (Option<Bytes>, Option<Bytes>) {
-    let txn = client.begin().expect("a snapshot");
-    let primary = txn.get(PRIMARY).expect("the primary reads");
-    let secondary = txn.get(SECONDARY).expect("the secondary reads");
-    (primary, secondary)
+    // The whole read, not each half: a `get` that meets an abandoned transaction resolves it,
+    // and that resolution is a *mutation* which the office can move under -- which is why a read
+    // came back `AmbiguousResult { method: TxnRollback, .. }`. Retrying one half against a
+    // snapshot whose other half already failed would compare two different instants.
+    retrying("a reader that arrives after the crash", || {
+        let txn = client.begin()?;
+        let primary = txn.get(PRIMARY)?;
+        let secondary = txn.get(SECONDARY)?;
+        Ok((primary, secondary))
+    })
 }
 
 /// One boundary, end to end: abandon there, change the leadership under it, and read.
@@ -342,7 +398,7 @@ fn a_live_lock_is_waited_for_rather_than_killed() {
 
     let client = cluster.client_within(5, Duration::from_secs(20)).unwrap();
     let txn = client.begin().unwrap();
-    let seen = txn.get(PRIMARY).expect("the read waits out a live lease");
+    let seen = retrying("the read waits out a live lease", || txn.get(PRIMARY));
     owner.join().expect("the owner commits");
     assert_eq!(
         seen.as_deref(),
