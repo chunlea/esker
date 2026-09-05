@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/query.rs
+  s_609bbbdbf3c419::t_371713aada2b68 3474-3483,3487-3493
+crates/esker-sql/tests/where_predicate.rs
+  s_609bbbdbf3c419::t_1198533b65c820 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8b455544826c4ae9fec3db59035535566f9b4824",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
