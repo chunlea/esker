@@ -3432,6 +3432,30 @@ pub(super) fn create_view(
     }
     // Proves the body before it is stored, and gives the shape its columns are checked against.
     let shape = view_shape(executor, txn, &create.definition, &create.columns)?;
+    // **A replacement may append columns and may not rename or drop one.** Measured on 19beta1;
+    // this node accepted both, which is a wrong answer rather than a missing feature — a silent
+    // rename breaks every query written against the old name. Surfaced by the view corpus once
+    // writing through a view stopped aborting the block, so the statements after it were compared
+    // for the first time.
+    //
+    // A view stored before record version 30 publishes no columns at all, and there is nothing to
+    // compare it against; such a replacement is allowed rather than refused on missing evidence.
+    if create.or_replace
+        && let Some(previous) = catalog::view(txn, executor.tenant, &name)?
+        && !previous.columns.is_empty()
+    {
+        if shape.len() < previous.columns.len() {
+            return Err(SqlError::CannotDropViewColumns);
+        }
+        for (before, after) in previous.columns.iter().zip(&shape) {
+            if before.name != after.name {
+                return Err(SqlError::CannotRenameViewColumn {
+                    from: before.name.clone(),
+                    to: after.name.clone(),
+                });
+            }
+        }
+    }
     let id = catalog::allocate_id(txn, executor.tenant)?;
     catalog::create_view(
         txn,
