@@ -1,0 +1,19 @@
+crates/esker-keys/proptest-regressions/row.txt
+  s_dc640bf0df4adb::t_0b93e823c3b66e 13-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fb9fe3a65b645fc981c2c9a22c0ef7afdfdb5f51",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
