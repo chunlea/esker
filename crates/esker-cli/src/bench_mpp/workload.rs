@@ -147,6 +147,40 @@ pub(crate) fn load(pg: &mut Pg, shape: Shape) -> Result<u64, String> {
     Ok(statements)
 }
 
+/// Loads `shape.rows` more rows, numbered from `after`.
+///
+/// The same generator as [`load`], continuing the key space rather than restarting it, so the
+/// table grows past another split threshold instead of colliding with itself.
+pub(crate) fn load_more(pg: &mut Pg, shape: Shape, after: u64) -> Result<(), String> {
+    let mut rng = Pcg32::from_seed(shape.seed ^ after);
+    let mut sql = String::with_capacity(1 << 20);
+    let mut id = after + 1;
+    let last_row = after + shape.rows;
+    while id <= last_row {
+        let last = (id + shape.batch - 1).min(last_row);
+        sql.clear();
+        let _ = write!(sql, "INSERT INTO {FACT} VALUES ");
+        for row in id..=last {
+            if row > id {
+                sql.push(',');
+            }
+            let amount = rng.range_inclusive(0, 999_999);
+            let _ = write!(
+                sql,
+                "({row},{},{},{},{amount},'label-{}','{}')",
+                row % DAYS,
+                row % GROUPS_LOW,
+                row % shape.groups_high,
+                row % 8,
+                payload(row)
+            );
+        }
+        pg.run(&sql)?;
+        id = last + 1;
+    }
+    Ok(())
+}
+
 /// A 32-byte payload from a small dictionary.
 ///
 /// Compressible, like real text: an incompressible column would put a floor under every ratio and

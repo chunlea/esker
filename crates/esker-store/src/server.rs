@@ -3431,6 +3431,37 @@ fn refused(
 /// different question — a run whose only word on a key is a tombstone resolves it to nothing, and
 /// an older run's live-looking row then survives a delete (`esker-store/tests/columnar_differential`
 /// was built for exactly that regression).
+/// A region bound in the byte form a run's `__key` column holds.
+///
+/// **Measured, because the obvious form is wrong.** A region owns a range of the **user** key
+/// space and its record stores the bound raw (`crate::split`: a split key "knows nothing of a `'x'`
+/// prefix or a timestamp suffix"). A run's key is what `columnar::region::versioned` wrote:
+/// `esker_txn::key::write` minus its namespace byte, which is `enc(user_key) ++ !ts` — the
+/// **memcomparable group encoding** (`esker_keys::encode_bytes`), not the raw bytes. Comparing one
+/// against the other dropped rows the region owned, and the two forms differ visibly:
+///
+/// ```text
+/// __key  [116, 0,0,0,0,0,0,0, 255, 1, 0,0,0,0,0,0,0, 255, 1, 114, 128, …]
+/// bound  [116, 0,0,0,0,0,0,0,      1, 0,0,0,0,0,0,0,      1, 114, 128, …]
+/// ```
+///
+/// The marker byte after each eight-byte group is the whole of the difference, and it is what makes
+/// the encoding **prefix-free** — which is also why the comparison is exact once both sides are in
+/// it: `enc(k)` is never a prefix of `enc(b)` unless `k == b`, so the `!ts` suffix can never carry a
+/// key across a bound. A key equal to the bound sorts *after* it and is excluded, which is right —
+/// a region's end is the next region's first key.
+///
+/// An empty bound stays empty: it means unbounded, and encoding it would produce a group that
+/// bounds something.
+fn as_run_key(bound: &[u8]) -> Vec<u8> {
+    if bound.is_empty() {
+        return Vec::new();
+    }
+    let mut encoded = esker_txn::key::prefix(bound);
+    encoded.remove(0);
+    encoded
+}
+
 fn evaluate(
     fs: &dyn FileSystem,
     runs: &crate::columnar::region::TableRuns,
@@ -3495,8 +3526,8 @@ fn evaluate(
             // different halves and `docs/plans/phase-8-learner.md` §store unit 4 says why neither
             // is sufficient alone.
             range: Some(esker_columnar::KeyRange {
-                start: region.start_key.to_vec(),
-                end: region.end_key.to_vec(),
+                start: as_run_key(&region.start_key),
+                end: as_run_key(&region.end_key),
             }),
             // MVCC at **read** time (ADR 0022 Decision 4): the runs hold every version as
             // committed, and which of them a caller may see is a property of when it is reading.
@@ -4277,5 +4308,40 @@ mod tests {
         ] {
             assert!(store.property(name).is_some(), "{name} is not reported");
         }
+    }
+
+    /// **A region bound and a run's key must be the same byte form**, and the raw bound is not it.
+    ///
+    /// This is the assertion the unit tests behind the region-scoping fix did not have, and its
+    /// absence is why they passed while a real cluster answered 52 rows for 200. They compared
+    /// synthetic keys against synthetic bounds — both raw, both agreeing — where the product
+    /// compares a run's `enc(user_key) ++ !ts` against a region record's *raw* bound.
+    ///
+    /// So it asserts the relationship rather than an answer: the encoded bound is a **prefix** of
+    /// every version of that key, and the raw bound is not a prefix of anything. The second half is
+    /// what fails on the old code.
+    #[test]
+    fn a_region_bound_is_a_prefix_of_every_run_key_for_that_row() {
+        // A SQL row key: `'t' ++ tenant ++ table_id ++ …`, which is what a region bound holds.
+        let row = esker_keys::row::row_key(1, 1, &[esker_keys::value::Datum::Int8(7)])
+            .expect("a row key");
+
+        let bound = super::as_run_key(&row);
+        for ts in [1_u64, 42, u64::MAX] {
+            let mut run_key = esker_txn::key::write(&row, ts);
+            // What `columnar::region::versioned` stores: the same bytes without the namespace byte.
+            run_key.remove(0);
+            assert!(
+                run_key.starts_with(&bound),
+                "a version at {ts} does not start with its own region bound\n  key   {run_key:?}\n  bound {bound:?}"
+            );
+            assert!(
+                !run_key.starts_with(&row),
+                "the RAW bound is not a prefix — comparing it against a run key is the defect"
+            );
+        }
+
+        // Unbounded stays unbounded: encoding an empty bound would bound something.
+        assert!(super::as_run_key(b"").is_empty());
     }
 }

@@ -320,6 +320,14 @@ impl Fragments {
 }
 
 impl FragmentSource for Fragments {
+    /// **`true`, and it is not a courtesy.** This source synthesises one shard per split and
+    /// answers each from its own scripted result, so a fragment sees exactly its region's rows —
+    /// which is what the production store will do once its columnar copy is region-scoped, and
+    /// what the fold tests below are the proof of.
+    fn runs_are_region_scoped(&self) -> bool {
+        true
+    }
+
     fn shards(&self, _start: &[u8], _end: &[u8]) -> esker_sql::Result<Vec<Shard>> {
         Ok((0..self.regions().len().max(1))
             .map(|at| Shard {

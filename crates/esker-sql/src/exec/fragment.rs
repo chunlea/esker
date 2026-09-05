@@ -570,6 +570,44 @@ fn projected_columns(
     Ok(columns)
 }
 
+/// Every region of the table's range, or the reason not to ask any of them.
+fn the_shards_to_ask(
+    source: &dyn FragmentSource,
+    tenant: u64,
+    table: &TableDef,
+) -> Routed<Vec<Shard>> {
+    // Last, because it is the only step that costs a round trip: a query the rule was never going
+    // to route should not pay for a routing table.
+    let (start, end) = esker_keys::row::table_row_range(tenant, table.id);
+    let shards = source
+        .shards(&start, &end)
+        .map_err(|_| Decision::rows(Reason::NoFragmentService))?;
+    // **A source that cannot scope a fragment to one region may not have more than one.**
+    //
+    // Measured on a real four-store cluster on 2026-09-05: a table in four regions, a columnar
+    // learner on each, every fragment answered — and every aggregate came back **four times** its
+    // true value, because a learner's columnar runs are not scoped to the region the fragment
+    // asked about, so every row is counted once per region (`docs/bench/mpp-baseline.md` §10).
+    //
+    // The rule is keyed on what the **source declares**, not on a shard count, and the difference
+    // matters: multi-shard folding is correct — `tests/routing.rs` and `tests/routing_aggregate.rs`
+    // prove it against a source that scopes properly — so a rule about shard counts would have
+    // called a working mechanism broken. What is broken is one store's columnar copy, and the
+    // source that speaks for that store is the one that says so.
+    //
+    // Temporary. `FragmentSource::runs_are_region_scoped` answering `true` retires it, and
+    // `esker-cli/tests/multi_region_differential.rs` going green is what earns the flip.
+    if shards.len() > 1 && !source.runs_are_region_scoped() {
+        return Err(Decision::rows(Reason::NotExpressible(
+            "a table in more than one region: this store's columnar copy is not region-scoped",
+        )));
+    }
+    if shards.is_empty() || !shards.iter().all(Shard::is_columnar) {
+        return Err(Decision::rows(Reason::NoLearner));
+    }
+    Ok(shards)
+}
+
 fn consider(
     txn: &dyn Txn,
     tenant: u64,
@@ -661,15 +699,7 @@ fn consider(
         return Err(decision);
     }
 
-    // Last, because it is the only step that costs a round trip: a query the rule was never going
-    // to route should not pay for a routing table.
-    let (start, end) = esker_keys::row::table_row_range(tenant, table.id);
-    let shards = source
-        .shards(&start, &end)
-        .map_err(|_| Decision::rows(Reason::NoFragmentService))?;
-    if shards.is_empty() || !shards.iter().all(Shard::is_columnar) {
-        return Err(Decision::rows(Reason::NoLearner));
-    }
+    let shards = the_shards_to_ask(source, tenant, table)?;
 
     let mut fallback = aggregate.clone();
     if let Node::Aggregate { having, .. } = &mut fallback {

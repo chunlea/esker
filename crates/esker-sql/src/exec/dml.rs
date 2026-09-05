@@ -339,6 +339,40 @@ pub(super) fn assign_default(value: Datum, ty: ColumnType) -> Result<Datum> {
             _ => Ok(Datum::Int8(rounded)),
         };
     }
+    // **An integer into a narrower integer**, which is PostgreSQL's numeric assignment cast and
+    // has the *short* `22003`. Without this the value left through `to_text` and came back through
+    // the type's **input function** — a different path with a different sentence: this node said
+    // `value "5000000000" is out of range for type integer` where a real server says
+    // `integer out of range`. Measured on 19beta1: `SELECT 5000000000::integer`,
+    // `INSERT INTO t4 SELECT 5000000000::bigint` and `UPDATE t4 SET a = 5000000000::bigint` are
+    // all the short one, and only a *string* — `'5000000000'::integer` — gets the long one.
+    //
+    // A constant is narrowed in the planner and always had the right message; this is the path a
+    // value takes when it is not a constant, which is where `ON UPDATE CASCADE` carries a
+    // `bigserial` parent's key into an `integer` child.
+    if let Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) = value {
+        let wide = match value {
+            Datum::Int2(v) => i64::from(v),
+            Datum::Int4(v) => i64::from(v),
+            Datum::Int8(v) => v,
+            _ => unreachable!("the pattern above admits three variants"),
+        };
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        match ty {
+            ColumnType::Int2 => {
+                return i16::try_from(wide)
+                    .map(Datum::Int2)
+                    .map_err(|_| out_of_range());
+            }
+            ColumnType::Int4 => {
+                return i32::try_from(wide)
+                    .map(Datum::Int4)
+                    .map_err(|_| out_of_range());
+            }
+            ColumnType::Int8 => return Ok(Datum::Int8(wide)),
+            _ => {}
+        }
+    }
     match value.to_text() {
         Some(text) => Datum::from_text(ty, &text),
         None => Ok(Datum::Null),
@@ -1931,11 +1965,37 @@ fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::CheckViolation {
                 constraint: check.name.clone(),
                 relation: table.name.clone(),
-                row: super::index::render_values(row),
+                row: failing_row(table, row),
             });
         }
     }
     Ok(())
+}
+
+/// The row a `DETAIL: Failing row contains (…)` names: **the columns a user can see**.
+///
+/// Rendering the stored row printed two things PostgreSQL does not. Column 0 of a table with no
+/// primary key is the internal row id ([`crate::catalog::INTERNAL_ROW_ID_NAME`]), and a column
+/// `DROP COLUMN` tombstoned is still in the row (ADR 0051) — so a one-column table reported three
+/// values. Measured on 19beta1:
+///
+/// ```text
+/// CREATE TABLE pk_auto (id integer NOT NULL);   INSERT INTO pk_auto DEFAULT VALUES
+///     DETAIL:  Failing row contains (null).             -- this node said (1, null)
+/// CREATE TABLE t3 (a int NOT NULL, b text);     INSERT INTO t3 (b) VALUES ('x')
+///     DETAIL:  Failing row contains (null, x).          -- this node said (1, null, x)
+/// ```
+///
+/// [`TableDef::user_columns`] is the same iterator `SELECT *` expands to, which is the definition
+/// of the set PostgreSQL prints here.
+fn failing_row(table: &TableDef, row: &[Datum]) -> String {
+    // `get` rather than an index: the row and the column list are built together and cannot
+    // disagree, and a message is not the place to find out otherwise.
+    let visible: Vec<Datum> = table
+        .user_columns()
+        .filter_map(|(at, _)| row.get(at).cloned())
+        .collect();
+    super::index::render_values(&visible)
 }
 
 fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
@@ -1960,7 +2020,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
             return Err(SqlError::NotNullViolationInRelation {
                 column: column.name.clone(),
                 relation: table.name.clone(),
-                row: Some(super::index::render_values(row)),
+                row: Some(failing_row(table, row)),
             });
         }
     }

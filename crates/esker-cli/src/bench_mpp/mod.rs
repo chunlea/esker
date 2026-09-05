@@ -385,6 +385,137 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
 /// **Nothing here fails the run.** A statement that errors is the result; the point is to say what
 /// the path does across a region boundary, and a harness that stopped at the first error would
 /// report one fact where there are several.
+/// ADR 0040's first and third questions, in one table: does a fragment go to each region, and do
+/// the two engines **agree**.
+fn the_three_questions(pg: &mut Pg, shape: Shape) {
+    println!();
+    println!("## The three questions, with learners placed");
+    println!();
+    println!("| statement | engine | fragments | answer | agree |");
+    println!("|---|---|---|---|---|");
+    let mut compared = 0;
+    let mut disagreed = 0;
+    for (label, sql) in workload::diagnostics(shape) {
+        let rows = answer_on(&mut *pg, "row", &sql);
+        let columns = answer_on(&mut *pg, "columnar", &sql);
+        // **Values, not row counts.** Two engines returning three rows each is not agreement;
+        // this milestone's whole risk is a *wrong number* that has the right shape.
+        let agree = match (&rows, &columns) {
+            (Ok(rows), Ok(columns)) => {
+                compared += 1;
+                if rows == columns {
+                    "yes".to_owned()
+                } else {
+                    disagreed += 1;
+                    // **The values, not the verdict.** A disagreement between these two engines is
+                    // the worst failure this feature can have (ADR 0022), and "NO" in a table cell
+                    // cannot be told from a harness that compares two things it should not.
+                    println!();
+                    println!("<!-- DISAGREEMENT on `{sql}`");
+                    println!("     rows:     {rows:?}");
+                    println!("     columnar: {columns:?} -->");
+                    "**NO**".to_owned()
+                }
+            }
+            (Err(_), Err(_)) => "both refused".to_owned(),
+            _ => "one side only".to_owned(),
+        };
+        let plan = (*pg)
+            .run("SET esker.engine = 'auto'")
+            .and_then(|()| pg.query(&format!("EXPLAIN ANALYZE {sql}")))
+            .map(|answer| answer.text())
+            .unwrap_or_default();
+        println!(
+            "| {label} | {} | {} | {} | {agree} |",
+            // **The line, not the word.** `rows` says a fallback happened and not why, and the
+            // why is the whole of what a reader can act on — a refusal for the wrong reason is
+            // indistinguishable from the right one at this width.
+            engine_line(&plan).replace("Engine: ", ""),
+            fragment_text(&plan),
+            outcome_text(&columns),
+        );
+    }
+    println!();
+    println!("**{compared} statements answered by both engines, {disagreed} disagreements.**");
+}
+
+/// One statement on one engine: its values, or the error that stood in for them.
+fn answer_on(pg: &mut Pg, engine: &str, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+    pg.run(&format!("SET esker.engine = '{engine}'"))?;
+    pg.query(sql).map(|answer| answer.rows)
+}
+
+/// `N of M` from a plan's fragment line, or `—` for a plan that asked none.
+fn fragment_text(plan: &str) -> String {
+    let (asked, answered) = fragments_of(plan);
+    if asked == 0 {
+        "—".to_owned()
+    } else {
+        format!("{answered} of {asked}")
+    }
+}
+
+/// What a statement did, for a table cell.
+fn outcome_text(answer: &Result<Vec<Vec<Option<String>>>, String>) -> String {
+    match answer {
+        Ok(rows) => format!("{} row(s)", rows.len()),
+        Err(why) => format!("**{}**", first_line(why)),
+    }
+}
+
+/// **Does the region cache refresh when a table splits under a connection that is already open?**
+///
+/// ADR 0040's second question, and the one a matrix cannot answer: every statement above ran on a
+/// cache that learned the topology *after* the splits. So the same connection scans, then more
+/// rows are loaded until the table has split again, then it scans once more — and the second scan
+/// is over a topology this session was never told about. It is what
+/// `esker-client`'s "the refusal's bounds are believed over the cache" exists for, because the
+/// store learns of its own split before the driver does.
+fn cache_refresh(cluster: &Cluster, pg: &mut Pg, shape: Shape) -> Result<(), String> {
+    println!();
+    println!("## Does the cache refresh when the table splits underneath it?");
+    println!();
+    pg.run("SET esker.engine = 'row'")?;
+    let scan = format!("SELECT count(*) FROM {}", workload::FACT);
+    let before_regions = cluster.regions()?.len();
+    let before = pg.query(&scan)?.scalar()?.to_owned();
+    println!("- the session scans at **{before_regions} region(s)**: {before} rows");
+
+    let more = Shape {
+        rows: shape.rows,
+        ..shape
+    };
+    let started = Instant::now();
+    // **Past the row the matrix inserted, not past the row count.** `insert past the split` above
+    // writes `rows + 1`, so starting there is a duplicate key — which is what it was.
+    workload::load_more(pg, more, shape.rows + 1)?;
+    println!(
+        "- {} more rows loaded in {:.0?}, on the same connection",
+        shape.rows,
+        started.elapsed()
+    );
+
+    let after_regions = cluster.regions()?.len();
+    let after = pg.query(&scan)?;
+    let after = after.scalar()?.to_owned();
+    println!("- the same session scans again at **{after_regions} region(s)**: {after} rows");
+    if after_regions > before_regions {
+        println!();
+        println!(
+            "The table split from {before_regions} to {after_regions} regions under a connection \
+             that was already open, and the next scan on it answered — so the cache was repaired \
+             by the refusal it caused rather than by being told."
+        );
+    } else {
+        println!();
+        println!(
+            "> The table did **not** split further ({before_regions} → {after_regions}), so this \
+             says nothing about a refresh."
+        );
+    }
+    Ok(())
+}
+
 /// Watches columnar placement until every region has a learner or the window closes.
 ///
 /// **Sampled over minutes, not read once.** PD reaches a store only by answering its region
@@ -491,23 +622,8 @@ fn diagnose(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Resul
         );
     }
 
-    println!();
-    println!("## What each statement does, on each engine");
-    println!();
-    println!("| statement | engine | outcome |");
-    println!("|---|---|---|");
-    for (label, sql) in workload::diagnostics(shape) {
-        for engine in ["row", "columnar"] {
-            let outcome = match pg.run(&format!("SET esker.engine = '{engine}'")) {
-                Ok(()) => match pg.query(&sql) {
-                    Ok(answer) => format!("{} row(s)", answer.rows.len()),
-                    Err(why) => format!("**{}**", first_line(&why)),
-                },
-                Err(why) => format!("**SET failed: {}**", first_line(&why)),
-            };
-            println!("| {label} | {engine} | {outcome} |");
-        }
-    }
+    the_three_questions(&mut pg, shape);
+    cache_refresh(cluster, &mut pg, shape)?;
     println!();
     println!("| load average at end | {} |", loadavg());
     if options.keep {
