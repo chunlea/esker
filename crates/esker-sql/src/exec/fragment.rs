@@ -1454,15 +1454,12 @@ pub(super) fn evaluate(columnar: &mut Columnar, source: &dyn FragmentSource, ts:
         // `min_apply_index` is zero and that is the whole of what a SQL node can honestly say: the
         // learner's `ReadIndex` round is what makes the answer fresh (ADR 0022 Decision 4, and
         // `docs/plans/phase-10-routing.md` §2).
-        let answer = match source.evaluate(&shard, &bytes, ts, 0) {
-            Ok(answer) => answer,
-            Err(_) => match re_routed(source, &shard, &mut repairs) {
-                Some(fresh) => {
-                    shards.splice(at..at, fresh);
-                    continue;
-                }
-                None => return refused(columnar, shards.len(), "a region could not be reached"),
-            },
+        let Ok(answer) = source.evaluate(&shard, &bytes, ts, 0) else {
+            let Some(fresh) = re_routed(source, &shard, &mut repairs) else {
+                return refused(columnar, shards.len(), "a region could not be reached");
+            };
+            shards.splice(at..at, fresh);
+            continue;
         };
         let (result, cost) = match answer {
             Answer::Answered { result, stats } => (result, stats),
