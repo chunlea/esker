@@ -1,0 +1,36 @@
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 263-272,2427
+crates/esker-sql/src/exec/cancel.rs
+  h_44076b318daf9c 1-49
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 2396-2424
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 30,318,321,335-420,1100-1116,2977-2980,3243-3247
+crates/esker-sql/src/parameter.rs
+  h_44076b318daf9c 28-33,491-494,496-500
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 757-764,1115,1143,1277,1279-1280,1310-1312
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 271-277
+crates/esker-sql/tests/discard_all.rs
+  h_44076b318daf9c 87-92
+crates/esker-sql/tests/statement_cancellation.rs
+  h_44076b318daf9c 1-118
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 245,422,424-427,435,465-473,475,479
+docs/adr/0071-a-relation-name-is-keyed-by-its-schema.md
+  h_44076b318daf9c 1-56
+docs/plans/roles-and-user-schemas.md
+  h_44076b318daf9c 1-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2f1e2d673d56e81b5288e052919313cc128a7d8b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
