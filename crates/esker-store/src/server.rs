@@ -880,10 +880,26 @@ impl Store {
     /// The raft state is left alone. The snapshot about to be adopted overwrites it wholesale, and
     /// destroying it first would turn a failed transfer into a peer that has lost its log as well
     /// as its data.
+    ///
+    /// **The columnar copy goes**, on the same reasoning as
+    /// [`reclaim_retired_range`](Self::reclaim_retired_range): a copy is derived from a range that
+    /// is about to be emptied and refilled, and the refill arrives as a snapshot — bytes written
+    /// into the column families with no entry to apply, so nothing tees them
+    /// ([`crate::columnar::region::ColumnarSlot::saw`]). Left in the map it would be reattached by
+    /// `host_region` holding what it held before the transfer, which is a copy of a region that no
+    /// longer exists. `saw` catches that at the next entry either way; dropping it here closes it
+    /// where it opens.
     async fn retire_region_now(self: &Arc<Self>, region_id: u64) {
         let Some(state) = self.regions.remove(region_id) else {
             return;
         };
+        {
+            let mut slots = self
+                .columnar
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.remove(&region_id);
+        }
         if let Some(peer) = state.peer() {
             let peer = Arc::clone(peer);
             let _ = tokio::task::spawn_blocking(move || peer.stop()).await;

@@ -142,7 +142,7 @@ impl Db {
             compact: Mutex::new(CompactState::default()),
             compact_wanted: Condvar::new(),
             compaction_done: Condvar::new(),
-            compacting: Mutex::new(BTreeSet::new()),
+            compacting: Mutex::new(crate::db::compact::Reservations::default()),
             pending_outputs: Mutex::new(BTreeSet::new()),
             compact_pointers: Mutex::new(BTreeMap::new()),
             compactions: AtomicU64::new(0),
