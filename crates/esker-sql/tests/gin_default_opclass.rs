@@ -82,27 +82,29 @@ fn a_tsvector_column_is_a_gin_key_and_only_a_gin_key() {
     );
 }
 
-/// **`btree` and `gist` over a `tsvector` stay refused, and by our own sentence.**
+/// **`btree` over a `tsvector` stays refused, and by our own sentence.**
 ///
-/// PostgreSQL accepts both — `tsvector_ops` is their default class too — so this is a divergence
+/// PostgreSQL accepts it — `tsvector_ops` is `btree`'s default class too — so this is a divergence
 /// and it says so with `0A000` naming the construct, contract C2. It must **not** be spelled
 /// `42704 … has no default operator class`, which is the error a real server does not give: the
 /// brief for this change assumed it did, and `pg_opclass` says otherwise.
 ///
-/// `gist` is the same case as `gin` one word away — the order is unread there too — and is left
-/// refused deliberately until somebody needs it, rather than widened on the strength of an
-/// argument nothing exercises.
+/// **This is the one method where the order matters**, which is what keeps the `gin`/`gist`
+/// widening from being "every method is fine": a btree index *is* its key order, and this node's
+/// order for a `tsvector` is its bytes' rather than `tsvector_ops`'.
+///
+/// `gist` used to be refused here beside them and is not any more — see
+/// [`a_tsvector_column_is_a_gin_key_and_only_a_gin_key`]'s sibling below.
 ///
 /// **`hash` and `brin` are where the `42704` really lives**, measured: a `tsvector` has no default
 /// class for either. This node refuses those methods outright, one statement earlier, so it never
 /// reaches the type — a different sentence for a different reason, and both are honest.
 #[test]
-fn btree_and_gist_over_a_tsvector_are_a_declared_divergence() {
+fn btree_over_a_tsvector_is_a_declared_divergence() {
     let mut node = parity::Node::new(FIXTURE);
     for sql in [
         "CREATE INDEX i_bt ON things USING btree (name_vector)",
         "CREATE INDEX i_bare ON things (name_vector)",
-        "CREATE INDEX i_gist ON things USING gist (name_vector)",
     ] {
         let answer = node.answer(sql).to_string();
         assert_eq!(
@@ -167,4 +169,29 @@ fn a_varchar_still_has_no_gin_default() {
             .to_string(),
         "(a command, no result set)"
     );
+}
+
+/// **`gist` over a `tsvector` is the same case as `gin`, and now answers the same.**
+///
+/// `tsvector_ops` is `gist`'s default class too — `corpus/pg19_gin_tsvector.txt` records
+/// `CREATE INDEX gtv_gist_col ON gtv USING gist (tsv)` as accepted — and a `gist` index is not read
+/// in key order any more than a GIN one is, so ADR 0066's amendment covers it word for word. It
+/// was left refused at v32 only because nothing exercised it; the capture row was already there.
+///
+/// **`btree` stays refused**, which is what keeps this from being "every method is fine": there
+/// the order of the key *is* the index.
+#[test]
+fn gist_over_a_tsvector_answers_as_gin_does() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.answer("CREATE INDEX i_gist ON things USING gist (name_vector)")
+            .to_string(),
+        "(a command, no result set)"
+    );
+    // And it writes, the same assertion the gin column key carries.
+    node.run(
+        "INSERT INTO things (id, name, name_vector) VALUES (1, 'a', to_tsvector('english', 'a'))",
+    )
+    .unwrap();
+    assert_eq!(node.rows("SELECT name FROM things"), [["a".to_owned()]]);
 }

@@ -745,9 +745,13 @@ pub const SEQUENCE_BATCH: u64 = 32;
 /// structure every index here actually has (ADR 0070).
 pub const BTREE_ACCESS_METHOD: &str = "btree";
 
-/// The access method a `USING gin` index records, and the only other one with a default
-/// operator class this node resolves.
+/// The access method a `USING gin` index records.
 pub const GIN_ACCESS_METHOD: &str = "gin";
+
+/// The access method a `USING gist` index records. Like `gin`, it is never read in key order, so
+/// the two admit the same keys — see [ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)'s
+/// amendment.
+pub const GIST_ACCESS_METHOD: &str = "gist";
 
 /// Every operator class this node knows: its name, the access method it belongs to, and the type
 /// it accepts.
@@ -767,15 +771,26 @@ pub const OPERATOR_CLASSES: [(&str, &str, ColumnType); 4] = [
     ("varchar_pattern_ops", "btree", ColumnType::Varchar),
 ];
 
-/// The three types `gin` indexes with no operator class written, measured on 19beta1.
+/// Whether `ty` resolves a default operator class under `method` with no class written, measured
+/// on 19beta1 from `pg_opclass` where `opcdefault`.
 ///
-/// An **array** of any element type (`array_ops`), `jsonb` (`jsonb_ops`) and `tsvector`
-/// (`tsvector_ops`). Only the first is reachable today: `jsonb` and `tsvector` are not index keys
-/// here at all ([`esker_keys::row::is_index_key`]), and that gate answers before this one — so the
-/// two are listed for the rule's sake and refused a layer down, with their own sentence.
-fn has_a_gin_default(ty: ColumnType) -> bool {
-    esker_keys::array::ArrayValue::element_of(ty).is_some()
-        || matches!(ty, ColumnType::Jsonb | ColumnType::TsVector)
+/// `gin` has three — an **array** of any element type (`array_ops`), `jsonb` (`jsonb_ops`) and
+/// `tsvector` (`tsvector_ops`). `gist` has a longer list of which only `tsvector` is an index key
+/// here; the rest (`box`, `point`, `polygon`, `circle`, `inet`, `ltree`, `tsquery`, the ranges)
+/// are types [`esker_keys::row::is_index_key`] refuses outright, so listing them would be a rule
+/// with no caller. `jsonb` is the same story under `gin`.
+///
+/// **`btree` is not here** and is handled by its caller: its default is the ordered key encoding
+/// itself, which every index in this node is.
+fn has_a_default_class(method: &str, ty: ColumnType) -> bool {
+    match method {
+        GIN_ACCESS_METHOD => {
+            esker_keys::array::ArrayValue::element_of(ty).is_some()
+                || matches!(ty, ColumnType::Jsonb | ColumnType::TsVector)
+        }
+        GIST_ACCESS_METHOD => ty == ColumnType::TsVector,
+        _ => false,
+    }
 }
 
 /// Whether a column of `ty` may be indexed with `class` under `method`, and the sentence a real
@@ -809,7 +824,7 @@ pub fn check_operator_class(method: &str, class: Option<&str>, ty: ColumnType) -
         // `gist` has its own longer list (`box`, `point`, `ltree`, the ranges, `tsquery`,
         // `tsvector`); none of it is reachable here yet, so it is recorded in
         // `tests/gin_default_opclass.rs` rather than encoded as a rule nothing exercises.
-        if method == GIN_ACCESS_METHOD && has_a_gin_default(ty) {
+        if has_a_default_class(method, ty) {
             return Ok(());
         }
         return Err(SqlError::NoDefaultOperatorClassFor {
