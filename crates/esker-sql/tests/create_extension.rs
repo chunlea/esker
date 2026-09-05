@@ -103,6 +103,10 @@ fn the_two_extension_views_agree() {
             // `ltree` joined them with `ltree_test.rb`'s type, at the oracle's own 1.3 where the
             // two string extensions are at 1.8.
             vec!["ltree", "1.3", "\\N"],
+            // `pg_trgm` joined them with the operator-class surface (ADR 0070), at the oracle's
+            // own 1.6. Its *functions* are a named gap; what it brings here is `gin_trgm_ops` and
+            // `gist_trgm_ops`, which is what `schema_test.rb` writes.
+            vec!["pg_trgm", "1.6", "\\N"],
             vec!["pgcrypto", "1.4", "\\N"],
             vec!["plpgsql", "1.0", "1.0"],
             vec!["uuid-ossp", "1.1", "1.1"],

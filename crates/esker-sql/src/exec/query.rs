@@ -3570,7 +3570,22 @@ fn figure_column_name(expr: &Expr) -> String {
         Expr::Aggregate(call) => call.func.name().to_owned(),
         Expr::Scalar { func, .. } => func.name().to_owned(),
         Expr::Uuid(func) => func.name().to_owned(),
-        Expr::CatalogFunc(call) => call.func.name().to_owned(),
+        // **An operator expression is `?column?`, a function call is its own name.** Six of
+        // these variants are spelled as symbols — `||`, `->`, `?`, `@>`, `&&`, `@@` — and a real
+        // server names none of them after the symbol: measured, every one is `?column?` while
+        // `abs(-1)` is `abs`. Told apart by the spelling rather than by a list, so a seventh
+        // operator-shaped variant is named right the day it is added.
+        //
+        // Only reachable for `||` since `||` over text was built; before that the statement was
+        // refused and the rule was never asked. The other five have the same latent answer.
+        Expr::CatalogFunc(call) => {
+            let name = call.func.name();
+            if name.starts_with(|first: char| first.is_ascii_alphabetic() || first == '_') {
+                name.to_owned()
+            } else {
+                "?column?".to_owned()
+            }
+        }
         Expr::Sequence(call) => call.func.name().to_owned(),
         Expr::SetFunc(call) => call.name.clone(),
         // The keyword-shaped calls, named after the keyword and lower-cased — measured, all of
