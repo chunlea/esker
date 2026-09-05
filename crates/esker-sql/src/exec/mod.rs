@@ -3357,6 +3357,9 @@ impl Execute for Executor {
     }
 
     fn begin(&mut self, read_only: bool) -> Result<()> {
+        // `idle in transaction` from here until the block ends — the state that tells an
+        // operator this session is holding locks and doing nothing (`pg_stat_activity`).
+        self.identity.in_transaction(true);
         // A second `BEGIN` never reaches here: the session answers it with PostgreSQL's warning
         // and leaves the block alone.
         self.savepoints.clear();
@@ -3424,6 +3427,7 @@ impl Execute for Executor {
     }
 
     fn commit(&mut self) -> Result<()> {
+        self.identity.in_transaction(false);
         // **Before anything else the commit does**, because a check that fails means the
         // transaction does not commit at all. A real server rolls it back and this does too: the
         // rows the block wrote are not there afterwards, measured.
@@ -3471,6 +3475,7 @@ impl Execute for Executor {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.identity.in_transaction(false);
         // A check owed by a transaction that is not committing is a check nobody will ever run,
         // and `SET CONSTRAINTS` is undone with everything else the block did.
         self.constraints.borrow_mut().clear();
