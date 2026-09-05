@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 8ae6228e8bbb70abe790320c328f028c6390743c005175672d30db89a17ac49d # shrinks to (_types, rows) = ([Time], [[Time(0)], [Time(1)]])
 cc b275ee780d1f46aa334844320223f4396f926d8f60d759d83c31711f58c1e886 # shrinks to (_types, rows) = ([Time], [[Time(0)], [Time(1)]])
+cc c3399f83884055f78dad78fff9b96e9d95645ca2054cbb5b257d351e35e2d53b # shrinks to (_types, rows) = ([RegType], [[RegType { oid: 0, name: "" }], [RegType { oid: 1, name: "" }]])

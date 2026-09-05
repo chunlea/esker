@@ -430,6 +430,15 @@ pub enum ColumnType {
     /// wraps rather than refusing — and `4294967296` is `22003`. It is the type every catalog
     /// identifier really has.
     Oid,
+    /// `regtype` — **an oid that prints as a type's name**
+    /// ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+    ///
+    /// Not a spelling of [`ColumnType::Oid`]: the two share a representation and a comparison, and
+    /// differ only in the output function, which is the one thing `ColumnType` is allowed to
+    /// distinguish. Measured — `'text'::regtype < 'int4'::regtype` is **false**, because the
+    /// comparison is `25 < 23` and not the names; and `'text'::regtype = 25` is true against an
+    /// uncast integer.
+    RegType,
     /// `boolean[]`. **The sixteen below are not sixteen features.** Every base type on a real
     /// server has an array type, and `pg_type.typarray` points at it; a `typarray` naming a row
     /// that is not there is worse than a zero, because a client walks the link in both directions
@@ -467,6 +476,8 @@ pub enum ColumnType {
     OidArray,
     /// `citext[]`.
     CitextArray,
+    /// `regtype[]`, which is what an `ARRAY['text'::regtype]` is.
+    RegTypeArray,
 }
 
 /// The address family a `Datum::Inet` names: 4 for IPv4, 6 for IPv6, and the **first** byte of an
@@ -482,7 +493,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 85] = [
+    pub const ALL: [ColumnType; 87] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -514,6 +525,7 @@ impl ColumnType {
         ColumnType::Uuid,
         ColumnType::Interval,
         ColumnType::Oid,
+        ColumnType::RegType,
         ColumnType::Int8Array,
         ColumnType::Int4Array,
         ColumnType::Int2Array,
@@ -535,6 +547,7 @@ impl ColumnType {
         ColumnType::JsonbArray,
         ColumnType::OidArray,
         ColumnType::CitextArray,
+        ColumnType::RegTypeArray,
         ColumnType::DateRange,
         ColumnType::NumRange,
         ColumnType::Int8Range,
@@ -744,6 +757,23 @@ pub enum Datum {
     Uuid([u8; 16]),
     /// [`ColumnType::Oid`], as the unsigned it is.
     Oid(u32),
+    /// [`ColumnType::RegType`]: the oid **and** the name it prints as
+    /// ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+    ///
+    /// **Compared by the oid alone**, which is measured and is the whole reason this is not a
+    /// text: `'text'::regtype < 'int4'::regtype` is false because 25 < 23 is, and
+    /// `'text'::regtype = 25` is true against an uncast integer.
+    ///
+    /// The name rides along because deriving it needs the catalog and this crate must not have one
+    /// (invariant 7). It is resolved where the value is produced — the seam
+    /// `CatalogFunc::UserRegType` already sits on — so a type a `CREATE TYPE` made prints its own
+    /// name. An oid with no type carries its digits, which is what a real server prints for one.
+    RegType {
+        /// The oid, which is the value.
+        oid: u32,
+        /// What it prints as.
+        name: Box<str>,
+    },
     /// One of the four array types: its elements, their shape, and where they are subscripted
     /// from (`crate::array`).
     ///
@@ -826,7 +856,13 @@ impl PartialEq for Datum {
                     bits: bb,
                 },
             ) => av == bv && ab == bb,
-            (Datum::Oid(a), Datum::Oid(b)) => a == b,
+            // A `regtype` beside the `oid` it is: the oid alone decides, because two spellings of
+            // one type are one value and the name is only how it prints —
+            // `'int4'::regtype = 'integer'::regtype` is `t` on a real server. **The two are still
+            // separate pairs**: this is representation equality, and a row holding an `oid` is not
+            // a row holding a `regtype`.
+            (Datum::Oid(a), Datum::Oid(b))
+            | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. }) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
@@ -942,6 +978,7 @@ impl Datum {
             Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Interval { .. } => ColumnType::Interval,
             Datum::Oid(_) => ColumnType::Oid,
+            Datum::RegType { .. } => ColumnType::RegType,
             Datum::Numeric(_) => ColumnType::Numeric,
             // The array's own element type decides which of the four it is, so a value always
             // knows what it is without being told.

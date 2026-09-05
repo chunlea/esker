@@ -140,6 +140,14 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         Datum::Int4(v) | Datum::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Four bytes, unsigned — its own width, like the `int4` it is not.
         Datum::Oid(v) => out.extend_from_slice(&v.to_le_bytes()),
+        // **The oid and the name together**, because the name cannot be recovered from the oid
+        // without a catalog and this crate must not have one (invariant 7). Four bytes then a
+        // length-prefixed string, which is `Datum::Oid` followed by `Datum::Text`.
+        Datum::RegType { oid, name } => {
+            out.extend_from_slice(&oid.to_le_bytes());
+            varint::put_u64(name.len() as u64, out);
+            out.extend_from_slice(name.as_bytes());
+        }
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Sixteen bytes, fixed, so no length precedes them.
         Datum::Uuid(v) => out.extend_from_slice(v),
@@ -447,6 +455,23 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
             (Datum::Oid(u32::from_le_bytes(*head)), rest)
         }
+        ColumnType::RegType => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let (len, consumed) = varint::get_u64(rest)
+                .map_err(|error| corrupt(format!("regtype name length: {error}")))?;
+            let len =
+                usize::try_from(len).map_err(|_| corrupt("column longer than this machine"))?;
+            let (body, rest) = rest[consumed..]
+                .split_at_checked(len)
+                .ok_or_else(|| corrupt(format!("a regtype name of {len} bytes is truncated")))?;
+            (
+                Datum::RegType {
+                    oid: u32::from_le_bytes(*head),
+                    name: text_from_utf8(body)?.into(),
+                },
+                rest,
+            )
+        }
         ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -477,6 +502,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::OidArray
+        | ColumnType::RegTypeArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -654,7 +680,12 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // not an index key at all: `point = point` is `42883` on a real server and a key space
         // needs an order the type does not have. The column type is refused in
         // `decode_key_column`, which is where the error a caller sees comes from.
-        Datum::Null | Datum::Point { .. } | Datum::Geometry { .. } => {}
+        // A `regtype` joins them: it is not an index key either, and for a reason of its own —
+        // its value is the oid and its name is only how it prints, so a key over one would have to
+        // choose between an order that matches the comparison and one a human would expect. It is
+        // refused in `decode_key_column` through `is_index_key`, which is where the error comes
+        // from; no column can be declared as one, so nothing reaches this.
+        Datum::Null | Datum::Point { .. } | Datum::Geometry { .. } | Datum::RegType { .. } => {}
         Datum::Int8(v)
         | Datum::TimestampTz(v)
         | Datum::Timestamp(v)
@@ -1102,6 +1133,8 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Line
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::RegType
+            | ColumnType::RegTypeArray
             | ColumnType::Xml
             | ColumnType::XmlArray
             // **`ltree[]` is not a key and `ltree` is.** An array key is built out of its
@@ -1146,6 +1179,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     }
     let decoded = |error: codec::CodecError| corrupt(format!("index key column: {error}"));
     Ok(match ty {
+        // Refused by `is_index_key` above, and refused again here: a type missing from either list
+        // is still refused by the other, which is the direction a disagreement has to fail in.
+        ColumnType::RegType | ColumnType::RegTypeArray => return Err(not_a_key()),
         ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -1967,6 +2003,15 @@ mod tests {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
+            // Any oid with any name, because the row codec must return both unchanged and neither
+            // constrains the other: an oid with no type carries its own digits, and two spellings
+            // of one type carry different names for one value.
+            ColumnType::RegType => (any::<u32>(), "[a-z ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegType {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             // **Every `f64` including the ones that are not numbers**, because the round trip is
             // over the bits: a point holding `NaN` is a row a client can write and has to read
             // back unchanged.
@@ -2040,6 +2085,7 @@ mod tests {
             | ColumnType::JsonArray
             | ColumnType::JsonbArray
             | ColumnType::OidArray
+            | ColumnType::RegTypeArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray

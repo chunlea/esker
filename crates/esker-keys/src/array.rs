@@ -85,6 +85,7 @@ impl ArrayValue {
     pub fn array_of(element: ColumnType) -> Option<ColumnType> {
         Some(match element {
             ColumnType::Int8 => ColumnType::Int8Array,
+            ColumnType::RegType => ColumnType::RegTypeArray,
             ColumnType::Int4 => ColumnType::Int4Array,
             ColumnType::Int2 => ColumnType::Int2Array,
             ColumnType::Numeric => ColumnType::NumericArray,
@@ -132,6 +133,7 @@ impl ArrayValue {
     pub fn element_of(array: ColumnType) -> Option<ColumnType> {
         Some(match array {
             ColumnType::Int8Array => ColumnType::Int8,
+            ColumnType::RegTypeArray => ColumnType::RegType,
             ColumnType::Int4Array => ColumnType::Int4,
             ColumnType::Int2Array => ColumnType::Int2,
             ColumnType::NumericArray => ColumnType::Numeric,

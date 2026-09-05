@@ -1,26 +1,141 @@
-# `regtype` — as PostgreSQL 19beta1 answers it, which is **an oid that prints as a name**.
+# `'x'::regtype` and `oid::regtype`, as a real PostgreSQL 19beta1 answers them.
 #
-# Captured 2026-09-05 against 127.0.0.1:55432 in one `BEGIN … ROLLBACK`, unaligned with
-# `fieldsep '|'`. This is the spec for ADR 0077 and for the three-gap census behind run 92's six
-# ARRAY rows — `ActiveRecord`'s `can_perform_case_insensitive_comparison_for?`
-# (`postgresql_adapter.rb:1081`), whose answer is `r12`/`r13`/`r14`.
+# NOT a type — a **cast**, and the one statement standing between this node and a number. At
+# `ae0c8d5` tier 1's types are all in and `ActiveRecord` still cannot boot: rung 2 stops on
+# `SELECT 'integer'::regtype::oid` and all 367 suite files that never load stop on
+# `SELECT 'character varying(1024)'::regtype::oid`, both from
+# `ConnectionAdapters::PostgreSQL::Quoting#lookup_cast_type`. ADR 0033 scoped this cast with the
+# type surface — "neither moves the ladder alone" — and the types landed without it.
 #
-# Five things reasoning would get wrong, and `r5` is the one that decides the model:
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It creates nothing and drops nothing.
 #
-#   * **A `regtype` orders by its oid, not by its name.** `'text'::regtype < 'int4'::regtype` is
-#     **false**, because 25 < 23 is false — alphabetically `int4` would sort first. So the value is
-#     the number and the name is only how it prints.
-#   * **`'text'::regtype = 25` is true.** It compares against a bare integer with no cast, which no
-#     text-shaped model can reproduce.
-#   * **An oid that is not a type prints as the number and is not an error** (`r16`), while a
-#     *name* that is not a type is `42704` (`r15`). The two directions do not match.
-#   * **`::oidvector` prints digits, not names** (`r7`): `ARRAY['text'::regtype]::oidvector` is
-#     `25`, which is exactly what `proargtypes` holds (`r8`).
-#   * `'int4'::regtype` prints `integer` — the **canonical** name, not the spelling written.
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
 #
-# `r14` is the control: `lower(integer)` does not exist and `integer` does not cast to anything
-# `lower` takes, so the probe is **false** for an integer column. A model that answered `t` to
-# everything would pass `r12` and `r13` and be wrong.
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A typmod is parsed, validated, and then thrown away.**
+#     `'character varying(1024)'::regtype::oid` is **1043**, the same OID as the bare spelling,
+#     and `'character varying(1024)'::regtype` *prints* `character varying` with no length. But it
+#     is not ignored: `'character varying(0)'` is `22023 length for type varchar must be at least
+#     1` and `10485761` is `cannot exceed 10485760`. An implementation that stripped `(...)` before
+#     looking the name up would return the right OID for every input and the wrong answer for the
+#     two that must fail. This is the exact shape `ActiveRecord` sends.
+#   * **Quoting defeats the alias table.** `'integer'::regtype` is 23; `'"integer"'::regtype` is
+#     `42704 type "integer" does not exist`. `integer` is a *grammar* alias resolved by the type
+#     parser; `int4` is the `pg_type.typname`. Quote it and only the catalog is consulted — so
+#     `'"int4"'` is 23 and `'"integer"'` is not a type at all. Same rule, second face:
+#     `'pg_catalog.int4'` is 23 and `'pg_catalog.integer'` is `42704`, because a schema qualifier
+#     also takes the catalog path.
+#   * **Two SQLSTATEs, and the empty string picks the rarer one.** An unknown name is
+#     `42704 type "nosuchtype" does not exist`; an unparseable one is `42601` — `''` is
+#     `invalid type name ""` and `'integer(4)'` is `syntax error at or near "("`. `integer` takes
+#     no typmod where `character varying` does, so which spelling may carry a number is part of
+#     the alias table and not a property of typmods.
+#   * **`float(p)` is the exception to "the typmod is discarded", and it is the one that would
+#     silently return the wrong OID.** `'character varying(1024)'::regtype::oid` is 1043, the same
+#     as bare — but `'float(24)'::regtype::oid` is **700** (`real`) where `'float'` and
+#     `'float(53)'` are **701** (`double precision`). The number does not qualify a type here, it
+#     *chooses* one: 1–24 bits is `real`, 25–53 is `double precision`, and outside that it is
+#     `22023 precision for type float must be at least 1 bit` / `must be less than 54 bits`.
+#     An implementation that stripped the typmod and looked up `float` would answer 701 for
+#     `float(24)` and be wrong about the type a client is told.
+#   * **The reverse direction never fails.** `999999::regtype` prints `999999` rather than raising
+#     — an OID with no `pg_type` row renders as its own number. Only the *text* direction has an
+#     error path.
+#   * **`serial` is not a type here either.** `'serial'::regtype` is `42704`, which is the catalog
+#     agreeing with ADR 0033: `serial` is an `integer` plus a default and it has no OID.
+#   * **The canonical name is not the input.** `'time'::regtype` prints `time without time zone`
+#     and `'timestamptz'::regtype` prints `timestamp with time zone`. `::regtype::text` is the
+#     canonical spelling, not the one that was written.
+#   * **Array dimensions are ignored and the internal name works.** `'integer[]'`, `'integer[][]'`,
+#     `'integer[3]'` and `'_int4'` are all 1007, and `1007::regtype` prints back `integer[]`.
+#   * **`timestamp(9)` is not an error anywhere.** `'timestamp(9)'::regtype` is 1114, and
+#     `CREATE TABLE t (a timestamp(9))` *succeeds* with `WARNING: TIMESTAMP(9) precision reduced
+#     to maximum allowed, 6` and stores `atttypmod` 6. Out-of-range precision clamps for
+#     `timestamp` where out-of-range length raises for `varchar`. (The warning is not in the lines
+#     below: this capture records `ERROR` and PostgreSQL's warnings are not part of the format.)
+#   * **`numeric`'s bound message shouts.** `22023 NUMERIC precision 1001 must be between 1 and
+#     1000` — upper-case type name, where `varchar`'s and `char`'s say `varchar` and `char` in
+#     lower case. Three types, three vocabularies, in one SQLSTATE.
+SELECT 'integer'::regtype::oid	oid	23
+SELECT 'int'::regtype::oid, 'int4'::regtype::oid	oid,oid	23|23
+SELECT 'character varying'::regtype::oid, 'varchar'::regtype::oid	oid,oid	1043|1043
+SELECT 'character'::regtype::oid, 'char'::regtype::oid, 'bpchar'::regtype::oid	oid,oid,oid	1042|1042|1042
+SELECT 'timestamp'::regtype::oid, 'timestamp without time zone'::regtype::oid	oid,oid	1114|1114
+SELECT 'timestamptz'::regtype::oid, 'timestamp with time zone'::regtype::oid	oid,oid	1184|1184
+SELECT 'bool'::regtype::oid, 'boolean'::regtype::oid	oid,oid	16|16
+SELECT 'text'::regtype::oid, 'bytea'::regtype::oid	oid,oid	25|17
+SELECT 'int8'::regtype::oid, 'bigint'::regtype::oid	oid,oid	20|20
+SELECT 'int2'::regtype::oid, 'smallint'::regtype::oid	oid,oid	21|21
+SELECT 'float4'::regtype::oid, 'real'::regtype::oid	oid,oid	700|700
+SELECT 'float8'::regtype::oid, 'double precision'::regtype::oid	oid,oid	701|701
+SELECT 'float'::regtype::oid, 'float(24)'::regtype::oid, 'float(25)'::regtype::oid, 'float(53)'::regtype::oid	oid,oid,oid,oid	701|700|701|701
+SELECT 'float(0)'::regtype::oid	!22023 precision for type float must be at least 1 bit
+SELECT 'float(54)'::regtype::oid	!22023 precision for type float must be less than 54 bits
+SELECT pg_typeof(NULL::float), pg_typeof(NULL::float(24)), pg_typeof(NULL::float(25))	regtype,regtype,regtype	double precision|real|double precision
+SELECT 'decimal'::regtype::oid, pg_typeof(NULL::decimal), pg_typeof(NULL::decimal(10,2))	oid,regtype,regtype	1700|numeric|numeric
+SELECT 'oid'::regtype::oid, 'name'::regtype::oid, 'regtype'::regtype::oid	oid,oid,oid	26|19|2206
+SELECT 'date'::regtype::oid, 'time'::regtype::oid, 'interval'::regtype::oid	oid,oid,oid	1082|1083|1186
+SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, 'time with time zone'::regtype::oid	oid,oid,oid	1083|1266|1266
+SELECT 'numeric'::regtype::oid, 'decimal'::regtype::oid	oid,oid	1700|1700
+SELECT 'uuid'::regtype::oid, 'json'::regtype::oid, 'jsonb'::regtype::oid	oid,oid,oid	2950|114|3802
+SELECT 'character varying(1024)'::regtype::oid	oid	1043
+SELECT 'character varying(1)'::regtype::oid	oid	1043
+SELECT 'numeric(10,2)'::regtype::oid	oid	1700
+SELECT 'timestamp(6)'::regtype::oid	oid	1114
+SELECT 'timestamp(9)'::regtype::oid	oid	1114
+SELECT 'character varying(0)'::regtype::oid	!22023 length for type varchar must be at least 1
+SELECT 'character varying(10485761)'::regtype::oid	!22023 length for type varchar cannot exceed 10485760
+SELECT 'character(0)'::regtype::oid	!22023 length for type char must be at least 1
+SELECT 'numeric(1001,0)'::regtype::oid	!22023 NUMERIC precision 1001 must be between 1 and 1000
+SELECT 'numeric(0,0)'::regtype::oid	!22023 NUMERIC precision 0 must be between 1 and 1000
+SELECT 'integer(4)'::regtype::oid	!42601 syntax error at or near "("
+SELECT 'timestamp(-1)'::regtype::oid	!42601 syntax error at or near "-"
+SELECT 'INTEGER'::regtype::oid, 'Integer'::regtype::oid	oid,oid	23|23
+SELECT '  integer  '::regtype::oid	oid	23
+SELECT 'int4 '::regtype::oid, ' int4'::regtype::oid	oid,oid	23|23
+SELECT '"int4"'::regtype::oid	oid	23
+SELECT '"varchar"'::regtype::oid	oid	1043
+SELECT '"integer"'::regtype::oid	!42704 type "integer" does not exist
+SELECT 'pg_catalog.int4'::regtype::oid	oid	23
+SELECT 'pg_catalog.integer'::regtype::oid	!42704 type "pg_catalog.integer" does not exist
+SELECT 'public.integer'::regtype::oid	!42704 type "public.integer" does not exist
+SELECT 'serial'::regtype::oid	!42704 type "serial" does not exist
+SELECT 'bigserial'::regtype::oid	!42704 type "bigserial" does not exist
+SELECT 'nosuchtype'::regtype::oid	!42704 type "nosuchtype" does not exist
+SELECT 'nosuchtype'::regtype	!42704 type "nosuchtype" does not exist
+SELECT ''::regtype::oid	!42601 invalid type name ""
+SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, 'text[]'::regtype::oid	oid,oid,oid	1007|1007|1009
+SELECT 'integer[][]'::regtype::oid, 'integer[3]'::regtype::oid	oid,oid	1007|1007
+SELECT '_int4'::regtype::oid	oid	1007
+SELECT 'integer'::regtype	regtype	integer
+SELECT 'character varying(1024)'::regtype	regtype	character varying
+SELECT 'time'::regtype, 'timestamptz'::regtype	regtype,regtype	time without time zone|timestamp with time zone
+SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype, 'interval'::regtype	regtype,regtype,regtype,regtype,regtype,regtype	date|numeric|uuid|json|jsonb|interval
+SELECT 'integer'::regtype::text, 'character varying'::regtype::text	text,text	integer|character varying
+SELECT 23::regtype, 1043::regtype	regtype,regtype	integer|character varying
+SELECT 1007::regtype, 1009::regtype	regtype,regtype	integer[]|text[]
+SELECT 999999::regtype	regtype	999999
+SELECT 999999::regtype::text	text	999999
+SELECT '1'::regtype	regtype	1
+SELECT 'integer'::regtype = 23	boolean	t
+SELECT 'integer'::regtype::oid = 23	boolean	t
+SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)	regtype,regtype	regtype|oid
+SELECT format_type('integer'::regtype::oid, 4)	text	integer
+SELECT format_type(1043, 1028), format_type(1114, 6), format_type(1082, -1)	text,text,text	character varying(1024)|timestamp(6) without time zone|date
+SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN ('date','time','numeric','uuid','json','jsonb','interval') ORDER BY oid	oid,name,smallint,"char"	114|json|-1|U ; 1082|date|4|D ; 1083|time|8|D ; 1186|interval|16|T ; 1700|numeric|-1|N ; 2950|uuid|16|U ; 3802|jsonb|-1|U
+
+# ============================================================================================
+# **A second session, 2026-09-05**, taken for ADR 0077 — the same type, asked the questions the
+# first capture did not: how it *orders*, what it compares against, and what an oid that is no
+# type does. The lines above are unchanged and every citation into them still resolves.
+#
+# `r5` is the one that decides the model: `'text'::regtype < 'int4'::regtype` is **false**, because
+# it is `25 < 23` and not the names. A regtype orders by its oid.
+# ============================================================================================
 
 BEGIN;		-
 SELECT 'r1', 'integer'::regtype, 'int4'::regtype, 'character varying'::regtype, 'text'::regtype;		r1|integer|integer|character varying|text

@@ -1263,6 +1263,14 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
 )]
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
+        // Oid zero, which is `InvalidOid` and prints as its digits: what stands in is never read,
+        // only its type is.
+        ColumnType::RegType => crate::value::regtype_of_oid(0),
+        ColumnType::RegTypeArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+            ColumnType::RegType,
+            1,
+            Vec::new(),
+        )),
         // The origin, which is a point like any other: what stands in is never read, only its
         // type is.
         ColumnType::Point => Datum::Point { x: 0.0, y: 0.0 },
