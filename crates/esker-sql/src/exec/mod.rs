@@ -330,6 +330,13 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 });
             }
             crate::backend::Lock::Held { by, .. } => {
+                // **A waiter is cancellable, and this loop is the only place that can notice.**
+                // `pg_sleep` polls `cancel` between its steps and stops; this loop watched only
+                // its own deadline, so a `pg_cancel_backend` from another session set a flag
+                // nothing on this path read — the function answered `true` and the waiter waited
+                // on. It is the shape an application actually cancels: a statement stuck behind
+                // somebody else's lock, which is `transaction_test.rb`'s last failure.
+                cancel::check()?;
                 if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
