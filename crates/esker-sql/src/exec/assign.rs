@@ -13,9 +13,16 @@
 //!
 //! The datetime family, from `tests/corpus/pg19_values_catalog_function.txt`: `CURRENT_TIMESTAMP`
 //! and `CURRENT_DATE` go into a `timestamp` column, `CURRENT_TIME` and `LOCALTIME` do not.
+//!
+//! **The numeric family and the string types joined them**, off `pg_cast` rather than off a guess
+//! — [`crate::value::has_assignment_cast`] carries the query and the two rules it produced. Before
+//! that, `UPDATE t SET int4col = int8col` was `42804` where a real server casts and answers `22003`
+//! only if the value does not fit, and `UPDATE t SET textcol = int4col` was refused outright.
+//!
 //! Everything else keeps the strict rule until a capture shows otherwise — a cast invented here
 //! would be this node accepting a statement a real server refuses, which is the failure ADR 0031
-//! ranks above a refusal because nothing reports it.
+//! ranks above a refusal because nothing reports it. `money` and `interval → time` are the two
+//! that `pg_cast` has and this node still refuses; they are named there rather than approximated.
 
 use esker_keys::value::Datum;
 
@@ -55,11 +62,18 @@ pub(super) fn into_column(
     if value.fits(column.ty) {
         return Ok(value);
     }
-    coerce(&value, column.ty).ok_or_else(|| SqlError::DatatypeMismatchInColumn {
-        column: column.name.clone(),
-        column_type: column.ty.name().to_owned(),
-        // A NULL fits every column and never reaches here, so a value with no type cannot either.
-        expression_type: value.column_type().map_or("unknown", PgType::name),
+    // **Three answers, not two.** `None` is "no cast exists", which is the `42804`; `Some(Err)` is
+    // "the cast exists and this value fails it", which is a `22003` about the value and must not
+    // be reported as a type mismatch. Measured: `UPDATE w SET i4 = i8` where the `i8` holds
+    // 5000000000 is `22003 integer out of range` on a real server, not `42804`.
+    coerce(&value, column.ty).unwrap_or_else(|| {
+        Err(SqlError::DatatypeMismatchInColumn {
+            column: column.name.clone(),
+            column_type: column.ty.name().to_owned(),
+            // A NULL fits every column and never reaches here, so a value with no type cannot
+            // either.
+            expression_type: value.column_type().map_or("unknown", PgType::name),
+        })
     })
 }
 
@@ -70,7 +84,7 @@ pub(super) fn into_column(
 /// microseconds for the same instant and the conversion between them is the identity. The day a
 /// session zone means anything else, this is one of the places that has to learn about it — and
 /// `crate::value::PgDatum::pg_cmp`'s arm for the same pair is the other.
-fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
+fn coerce(value: &Datum, ty: ColumnType) -> Option<Result<Datum>> {
     // **An array's cast is its element's cast**, which is PostgreSQL's own rule and the reason
     // this is one arm rather than sixteen: `ARRAY['one','two']` is a `text[]` and a
     // `character varying(255)[]` column takes it, exactly as a bare `'one'` goes into a
@@ -86,16 +100,38 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
         coerced.element = want;
         for element in &mut coerced.values {
             if let Some(datum) = element.take() {
-                *element = Some(if datum.fits(want) {
+                let converted = if datum.fits(want) {
                     datum
                 } else {
-                    coerce(&datum, want)?
-                });
+                    // **An element that fails its own cast fails the statement**, and with the
+                    // element's error rather than the array's: `'{5000000000}'::bigint[]` into an
+                    // `integer[]` column is `22003 integer out of range`, the same sentence the
+                    // scalar gets. A `?` on the outer `Option` would have reported it as "no cast
+                    // exists" and answered `42804` about the arrays instead.
+                    match coerce(&datum, want)? {
+                        Ok(datum) => datum,
+                        Err(error) => return Some(Err(error)),
+                    }
+                };
+                *element = Some(converted);
             }
         }
-        return Some(Datum::Array(coerced));
+        return Some(Ok(Datum::Array(coerced)));
     }
-    Some(match (value, ty) {
+    // **The numeric family and the string types go to the rule this node already had.**
+    // `crate::value::assignment_cast` is PostgreSQL's assignment cast written out — a float into an
+    // integer rounds half to *even* (`rint`, what `dtoi4` calls), a `numeric` rounds half *away
+    // from zero*, an integer into a narrower integer raises the **short** `22003`, and everything
+    // else takes the type's own input function. It was reachable only from a column `DEFAULT`, so
+    // the same value narrowed in a `DEFAULT` and was refused in a `SET`; this is the second caller
+    // rather than a second copy.
+    //
+    // Gated by [`crate::value::has_assignment_cast`], because the rule's text tail would otherwise
+    // accept `UPDATE t SET i4 = txt` — which a real server refuses.
+    if crate::value::has_assignment_cast(value.column_type(), ty) {
+        return Some(crate::value::assignment_cast(value.clone(), ty));
+    }
+    Some(Ok(match (value, ty) {
         (Datum::TimestampTz(micros), ColumnType::Timestamp) => Datum::Timestamp(*micros),
         (Datum::Timestamp(micros), ColumnType::TimestampTz) => Datum::TimestampTz(*micros),
         // **A date is the midnight it names**, the same promotion `pg_cmp` makes to compare one
@@ -119,7 +155,7 @@ fn coerce(value: &Datum, ty: ColumnType) -> Option<Datum> {
             Datum::Date(crate::value::date::from_micros(*micros)?)
         }
         _ => return None,
-    })
+    }))
 }
 
 /// The user type a column was declared as **when that type rewrites its values**, or `None`.

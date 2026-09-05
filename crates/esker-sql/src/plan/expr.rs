@@ -2261,8 +2261,11 @@ impl Literal {
             // column then fails with `int4`'s own `22003` rather than with a type mismatch.
             //
             // A `Literal` is a constant in the statement, never a column reference, so this
-            // settles a *literal's* type and does not widen assignment between two columns:
-            // `int8[]` into an `integer[]` column is still `42804`, from `exec::assign`.
+            // settles a *literal's* type. It used to add that "`int8[]` into an `integer[]` column
+            // is still `42804`, from `exec::assign`", and **that was wrong about PostgreSQL**:
+            // measured, `UPDATE t SET int4arr = int8arr` is accepted, because an array's cast is
+            // its element's and `bigint → integer` is an assignment cast. `exec::assign::coerce`
+            // does it now, element by element, and so does the arm below this one.
             Literal::Typed(value)
                 if matches!(**value, Datum::Array(_))
                     && esker_keys::array::ArrayValue::element_of(ty).is_some() =>
@@ -2286,6 +2289,18 @@ impl Literal {
                     Some(text) => Datum::from_text(ty, &text),
                     None => mismatch(),
                 }
+            }
+            // **A typed literal that PostgreSQL would assign-cast.** `VALUES (7::bigint)` into an
+            // `integer` column is accepted on a real server and was `42804` here, because this arm
+            // asked `fits` — storage equality — where assignment context asks a wider question.
+            // The gate is `pg_cast` read off the server; the conversion is the one a `DEFAULT`
+            // already used, so an overflow is the *short* `22003 integer out of range` rather than
+            // the input function's longer sentence.
+            //
+            // After the two arms above, not before: an array and a `B'…'` literal have their own
+            // measured rules and this must not take them.
+            Literal::Typed(value) if crate::value::has_assignment_cast(value.column_type(), ty) => {
+                crate::value::assignment_cast((**value).clone(), ty)
             }
             Literal::Typed(_) => mismatch(),
 

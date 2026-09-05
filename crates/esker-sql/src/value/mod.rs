@@ -303,6 +303,218 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     })
 }
 
+/// One value as another type's, in **assignment context** — PostgreSQL's assignment cast.
+///
+/// **Three callers, one rule.** A column `DEFAULT` (`exec::dml::assign_default`, which is where
+/// this was written and where it stayed too long), an `INSERT`/`UPDATE` target list
+/// (`exec::assign::coerce`), and a literal that already carries a type
+/// (`plan::expr::Literal::assign`). The second and third reached a `42804` instead, so the same
+/// value narrowed in a `DEFAULT` and was refused in a `SET` — two paths disagreeing is what said
+/// the rule belonged in one place.
+///
+/// The expression's type is rarely the column's — `now()` is a `timestamptz` filling a `date`,
+/// `concat` a `text` filling a `varchar` — and PostgreSQL coerces the default to the column when
+/// the table is created, so a row never sees the difference.
+///
+/// **This does not decide *whether* a cast exists**; [`has_assignment_cast`] does, and every
+/// caller that is not a `DEFAULT` must ask it first. The tail here is a text round trip through
+/// the target type's input function, which would happily turn `'abc'` into a refusal-shaped
+/// `22P02` where a real server answers `42804` before ever looking at the value.
+///
+/// **A timestamp to a date is not a text round trip.** Both are counts from 2000-01-01, so the
+/// conversion is a division; going through text would print a zone offset that `date`'s input
+/// function then has to re-parse, and would answer the wrong day for the last hours of one.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`in_range` checks the bound first, which is what makes each cast exact"
+)]
+pub fn assignment_cast(value: Datum, ty: ColumnType) -> Result<Datum> {
+    if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
+        return Ok(value);
+    }
+    if let (ColumnType::Date, Datum::Timestamp(micros) | Datum::TimestampTz(micros)) = (ty, &value)
+    {
+        return Ok(Datum::Date(
+            i32::try_from(micros.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
+        ));
+    }
+    // **A float into an integer rounds, and it rounds half to *even*.** Measured on 19beta1:
+    // `0.5` is `0`, `1.5` is `2`, `2.5` is `2`, `3.5` is `4`, and the negatives mirror it. That is
+    // `rint`, which is what PostgreSQL's `dtoi4` calls — **not** the away-from-zero rounding a
+    // `numeric` gets, where `0.5` is `1` and `2.5` is `3`. The two casts differ and the difference
+    // is measurable in one statement, so they are written as two rules rather than one.
+    //
+    // Going through text instead was a wrong answer rather than a rounding difference: it refused
+    // the row outright, which is how `random() * 100` into an `integer` column — statement 738's
+    // own default — reported `22P02` where a real server stores a number.
+    if let Datum::Double(_) | Datum::Real(_) = value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        let raw = match value {
+            Datum::Double(raw) => raw,
+            Datum::Real(raw) => f64::from(raw),
+            _ => unreachable!("the pattern above admits only the two floats"),
+        };
+        let rounded = raw.round_ties_even();
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        // The bound is checked before the conversion, because casting an out-of-range `f64` to an
+        // integer saturates in Rust and would store the limit where a real server raises `22003`.
+        return match ty {
+            ColumnType::Int2 => in_range(rounded, f64::from(i16::MIN), f64::from(i16::MAX))
+                .map(|value| Datum::Int2(value as i16))
+                .ok_or_else(out_of_range),
+            ColumnType::Int4 => in_range(rounded, f64::from(i32::MIN), f64::from(i32::MAX))
+                .map(|value| Datum::Int4(value as i32))
+                .ok_or_else(out_of_range),
+            _ => in_range(
+                rounded,
+                -9_223_372_036_854_775_808.0,
+                9_223_372_036_854_775_807.0,
+            )
+            .map(|value| Datum::Int8(value as i64))
+            .ok_or_else(out_of_range),
+        };
+    }
+    // **A `numeric` into an integer rounds the other way**, half *away from zero* — the comment
+    // above says so and nothing implemented it, so this fell to the text path and refused the row:
+    // `22P02 invalid input syntax for type integer: "10.50"` for a value PostgreSQL stores as 11.
+    // Measured in one session against the float rule beside it: `12.5::numeric` is **13** and
+    // `-12.5::numeric` is **-13**, where `12.5::float8` is **12**.
+    if let Datum::Numeric(number) = &value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        let rounded = numeric::round_half_away_to_integer(number);
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        return match ty {
+            ColumnType::Int2 => i16::try_from(rounded)
+                .map(Datum::Int2)
+                .map_err(|_| out_of_range()),
+            ColumnType::Int4 => i32::try_from(rounded)
+                .map(Datum::Int4)
+                .map_err(|_| out_of_range()),
+            _ => Ok(Datum::Int8(rounded)),
+        };
+    }
+    // **An integer into a narrower integer**, which is PostgreSQL's numeric assignment cast and
+    // has the *short* `22003`. Without this the value left through `to_text` and came back through
+    // the type's **input function** — a different path with a different sentence: this node said
+    // `value "5000000000" is out of range for type integer` where a real server says
+    // `integer out of range`. Measured on 19beta1: `SELECT 5000000000::integer`,
+    // `INSERT INTO t4 SELECT 5000000000::bigint` and `UPDATE t4 SET a = 5000000000::bigint` are
+    // all the short one, and only a *string* — `'5000000000'::integer` — gets the long one.
+    //
+    // A constant is narrowed in the planner and always had the right message; this is the path a
+    // value takes when it is not a constant, which is where `ON UPDATE CASCADE` carries a
+    // `bigserial` parent's key into an `integer` child.
+    if let Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) = value {
+        let wide = match value {
+            Datum::Int2(v) => i64::from(v),
+            Datum::Int4(v) => i64::from(v),
+            Datum::Int8(v) => v,
+            _ => unreachable!("the pattern above admits three variants"),
+        };
+        let out_of_range = || SqlError::IntegerLiteralOutOfRange(ty.name());
+        match ty {
+            ColumnType::Int2 => {
+                return i16::try_from(wide)
+                    .map(Datum::Int2)
+                    .map_err(|_| out_of_range());
+            }
+            ColumnType::Int4 => {
+                return i32::try_from(wide)
+                    .map(Datum::Int4)
+                    .map_err(|_| out_of_range());
+            }
+            ColumnType::Int8 => return Ok(Datum::Int8(wide)),
+            _ => {}
+        }
+    }
+    match value.to_text() {
+        Some(text) => Datum::from_text(ty, &text),
+        None => Ok(Datum::Null),
+    }
+}
+
+/// A rounded float, if it is inside an integer type's range — NaN and the infinities are not.
+fn in_range(value: f64, low: f64, high: f64) -> Option<f64> {
+    (value >= low && value <= high).then_some(value)
+}
+
+/// Whether PostgreSQL has an **assignment cast** from `from` to `to`.
+///
+/// The authority is `pg_cast`, read off 19beta1 rather than reasoned about:
+///
+/// ```sql
+/// SELECT castsource::regtype, casttarget::regtype FROM pg_cast WHERE castcontext = 'a'
+/// ```
+///
+/// Two rules cover everything this node needs from those rows, and one of them is not in the table
+/// at all:
+///
+/// * **The numeric family casts to itself in both directions.** Narrowing is `'a'` in `pg_cast`
+///   (`bigint→integer`, `numeric→smallint`, `double precision→real`, …) and widening is `'i'`,
+///   which assignment context also allows. Only the *value* can then fail, with `22003`.
+/// * **Everything casts *to* a string type and nothing casts *from* one.** That pair is
+///   PostgreSQL's I/O-conversion rule rather than a `pg_cast` row — there is no `integer→text`
+///   entry — and the asymmetry is what keeps this from being "cast anything to anything".
+///   Measured, in assignment context: `UPDATE t SET txt = i4` is accepted and
+///   `UPDATE t SET i4 = txt` is `42804 … HINT: You will need to rewrite or cast the expression.`
+/// * `json` and `jsonb` are `'a'` to each other, which is one row and one arm.
+///
+/// The datetime family is **not** here: `exec::assign::coerce` already carries it, arm by arm,
+/// with the measurement that produced each one, and moving it would be a rewrite rather than this
+/// change.
+///
+/// **What is deliberately absent**, because it is in `pg_cast` and was not measured end to end:
+/// `money` (a target of `integer` and `numeric`, a source to `numeric` — its text carries a
+/// currency symbol, so [`assignment_cast`]'s text tail is not obviously the conversion) and
+/// `interval → time`. Both stay `42804`, named rather than guessed at.
+#[must_use]
+pub fn has_assignment_cast(from: Option<ColumnType>, to: ColumnType) -> bool {
+    let Some(from) = from else {
+        return false;
+    };
+    if is_string_type(to) {
+        return true;
+    }
+    if is_string_type(from) {
+        return false;
+    }
+    if is_numeric_type(from) && is_numeric_type(to) {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (ColumnType::Json, ColumnType::Jsonb) | (ColumnType::Jsonb, ColumnType::Json)
+    )
+}
+
+/// PostgreSQL's numeric category, restricted to the types this node has.
+///
+/// `money` is in that category on a real server and is left out on purpose — see
+/// [`has_assignment_cast`].
+#[must_use]
+fn is_numeric_type(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Int2
+            | ColumnType::Int4
+            | ColumnType::Int8
+            | ColumnType::Numeric
+            | ColumnType::Real
+            | ColumnType::Double
+    )
+}
+
+/// The string category: what everything casts to and nothing casts from.
+#[must_use]
+fn is_string_type(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+    )
+}
+
 /// A value as the column's **typmod** requires it, or the error PostgreSQL raises instead.
 ///
 /// The three types that take a number each do something different with it, which is the whole of
