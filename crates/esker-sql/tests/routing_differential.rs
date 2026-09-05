@@ -113,7 +113,12 @@ async fn the_two_engines_agree_while_a_writer_keeps_committing() {
             .name("differential-writer".to_owned())
             .spawn(move || {
                 let mut session = Session {
-                    executor: Executor::new(backend, catalog, TENANT),
+                    executor: Executor::new(
+                        backend,
+                        catalog,
+                        TENANT,
+                        esker_sql::session::register(),
+                    ),
                 };
                 let mut id = 1_000_i64;
                 while !stop.load(Ordering::Relaxed) {
@@ -410,9 +415,14 @@ impl Gate {
     /// A session on this node, reporting columnar placement to PD and able to ask a fragment.
     fn session(&self) -> Session {
         Session {
-            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT)
-                .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>)
-                .asking_fragments_of(Arc::clone(&self.fragments)),
+            executor: Executor::new(
+                Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                TENANT,
+                esker_sql::session::register(),
+            )
+            .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>)
+            .asking_fragments_of(Arc::clone(&self.fragments)),
         }
     }
 

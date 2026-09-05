@@ -635,6 +635,7 @@ fn node() -> Executor {
         Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
         Arc::new(Catalog::new()),
         1,
+        esker_sql::session::register(),
     )
 }
 

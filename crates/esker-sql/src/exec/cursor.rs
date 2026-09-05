@@ -2447,6 +2447,31 @@ fn catalog_function(
             // `void`, which prints as the empty string.
             Datum::Text(String::new())
         }
+        // **Which session is asking.** The pid rides on the thread with the cancellation flag,
+        // installed by `Executor::execute`, because the expression evaluator is handed a
+        // transaction and a catalog and has no other way to know.
+        CatalogFunc::PgBackendPid => super::cancel::current_pid()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map_or(Datum::Null, Datum::Int4),
+        // **Cancels another session's statement, or this one's.**
+        //
+        // Cancelling yourself stops the statement that asked, measured against PG19: probing
+        // `pg_cancel_backend(pg_backend_pid())` answered `canceling statement due to user request`
+        // rather than a row. So the flag is set and then read straight back, which is what turns a
+        // self-cancel into an error here instead of a value.
+        CatalogFunc::PgCancelBackend => {
+            let Some(pid) = args
+                .first()
+                .and_then(Datum::to_text)
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            else {
+                // Strict, as on a real server: `pg_cancel_backend(NULL)` is NULL.
+                return Ok(Datum::Null);
+            };
+            let asked = crate::session::cancel_pid(pid);
+            super::cancel::check()?;
+            Datum::Bool(asked)
+        }
         // **The transaction's instant**, so two calls in one transaction are equal and their
         // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
         //

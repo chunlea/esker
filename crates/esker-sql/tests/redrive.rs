@@ -185,6 +185,7 @@ impl Cluster {
                 Arc::clone(&backend) as Arc<dyn Backend>,
                 Arc::clone(&catalog),
                 TENANT,
+                esker_sql::session::register(),
             ),
             redriver: ReDriver::new(
                 Arc::clone(&backend) as Arc<dyn Backend>,

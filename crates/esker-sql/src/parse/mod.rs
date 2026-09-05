@@ -231,6 +231,12 @@ impl StatementClass {
 pub struct Parsed {
     statement: Statement,
     class: StatementClass,
+    /// What the client sent, kept so `pg_stat_activity` can show a running statement.
+    ///
+    /// The **whole** input rather than this statement's slice of it, which is what a real server
+    /// reports: one `Query` message carrying three statements shows all three in `query` while any
+    /// of them is running.
+    source: String,
     /// `CONCURRENTLY` on a `DROP INDEX`, which the parser cannot carry.
     ///
     /// `sqlparser` 0.62.0's `Statement::Drop` has no field for it, so the statement does not parse
@@ -313,6 +319,12 @@ pub struct Refresh {
 }
 
 impl Parsed {
+    /// What the client sent.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// What kind of statement this is.
     #[must_use]
     pub fn class(&self) -> &StatementClass {
@@ -506,6 +518,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
             Parsed {
                 statement,
                 class,
+                source: sql.to_owned(),
                 concurrently,
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),

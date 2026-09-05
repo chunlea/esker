@@ -142,7 +142,12 @@ fn discarding_all_clears_the_session() {
     use esker_sql::pgwire::session::Session;
 
     let backend = Arc::new(MemoryBackend::new()) as Arc<dyn Backend>;
-    let mut executor = Executor::new(backend, Arc::new(Catalog::new()), 1);
+    let mut executor = Executor::new(
+        backend,
+        Arc::new(Catalog::new()),
+        1,
+        esker_sql::session::register(),
+    );
     let mut session = Session::new();
     let mut out = Vec::new();
 

@@ -40,6 +40,7 @@ impl Node {
             Arc::clone(&backend) as Arc<dyn Backend>,
             Arc::clone(&catalog),
             TENANT,
+            esker_sql::session::register(),
         );
         Node {
             backend,
@@ -495,6 +496,7 @@ fn other_session(node: &Node) -> Node {
             Arc::clone(&node.backend) as Arc<dyn Backend>,
             Arc::clone(&node.catalog),
             TENANT,
+            esker_sql::session::register(),
         ),
     }
 }
@@ -780,6 +782,7 @@ fn leased_node() -> (Arc<Leased>, Executor) {
         Arc::clone(&backend) as Arc<dyn Backend>,
         Arc::new(Catalog::new()),
         TENANT,
+        esker_sql::session::register(),
     );
     (backend, executor)
 }
