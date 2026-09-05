@@ -2769,19 +2769,19 @@ fn lower_alter_table(
         let mut primary_key = false;
         let mut generated: Option<String> = None;
         let mut default = None;
+        let mut default_expr: Option<String> = None;
         for option in &column_def.options {
             let named = match &option.option {
                 // A **folded** default is stored as the column's missing value and the decoder
                 // pads with it, so no row is rewritten (ADR 0019's pad rule generalised;
                 // `catalog::ColumnDef::missing`).
                 //
-                // An **expression** default is refused here, and this is the one place where
-                // generalising the `DEFAULT` clause did not widen what is accepted. PostgreSQL
-                // takes it and **rewrites the table**, so every row already stored gets its own
-                // value — measured: `atthasmissing` comes back false for one. This `ALTER` is
-                // defined not to rewrite, so honouring the clause would leave those rows NULL
-                // where a real server gives them values, which is a wrong answer rather than a
-                // gap. `CREATE TABLE` has no rows to rewrite and takes the same expression.
+                // An **expression** default is carried through to the executor, which does
+                // rewrite the rows. This was refused here on the argument that accepting it and
+                // padding NULL would be a wrong answer rather than a gap — right about the
+                // consequence, and the answer was to stop padding rather than to keep refusing.
+                // The executor can see the rows and fills each one from the expression, which is
+                // the road `ADD COLUMN … GENERATED ALWAYS AS` already took.
                 ColumnOption::Default(expr) => {
                     // **A user-defined type's default is folded by the executor, not here.** The
                     // column's `ty` is a placeholder until the catalog has been read, so folding
@@ -2792,14 +2792,7 @@ fn lower_alter_table(
                     } else {
                         ty
                     };
-                    let (folded, unfolded) = column_default(expr, ty)?;
-                    if let Some(unfolded) = unfolded {
-                        return Err(SqlError::unsupported(format!(
-                            "ALTER TABLE ... ADD COLUMN ... DEFAULT {unfolded}, which would \
-                             rewrite every row"
-                        )));
-                    }
-                    default = folded;
+                    (default, default_expr) = column_default(expr, ty)?;
                     continue;
                 }
                 ColumnOption::NotNull => {
@@ -2869,9 +2862,11 @@ fn lower_alter_table(
                 ty,
                 user_type_name,
                 typmod,
-                // Always: an expression default is refused above, because this `ALTER` cannot
-                // rewrite the rows a real server would.
-                default_expr: None,
+                // **Carried, and the executor backfills from it.** A volatile default cannot
+                // be one constant in the catalog, so a row that predates the column has to be
+                // written — which is a fact about the rows and therefore the executor's, like the
+                // `NOT NULL` and `serial` decisions above.
+                default_expr,
                 not_null,
                 default,
                 sequence: serial_identity(&column_def.data_type),
