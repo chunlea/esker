@@ -641,3 +641,113 @@ The message would settle it in one line, and it is already diagnostic: `assert_q
 every peer's `term/commit/applied/last` from before the kill, so the next occurrence says which
 peers held the entry and which did not. Nobody has captured it yet — the same gap as §6's sighting,
 and for the same reason.
+
+## 14. The eighth sighting: a redirect with nowhere to follow it to
+
+`esker-store::snapshot a_snapshot_replacing_a_held_region_routes_through_a_retire` failed in g1's
+gate on 2026-09-04 at **35.854 s**, inside a 3421-test run that otherwise passed. The same test had
+been seen twice that afternoon at ~65 s and both times the 60 s `AWAIT_DEADLINE` was named as the
+suspect. This failure is under that deadline, so the deadline was never the mechanism.
+
+The message said so on its own:
+
+```
+writing b"k00058" never succeeded after 9046 attempts in 30.000411395s;
+last answer peer is not the leader of region 1;
+last asked store 1, whose peer says leader=Some(Some(2))
+```
+
+Nine thousand attempts at ~300/s, every one to store 1, which named peer 2 as the leader every
+time. That is not a slow write. It is a loop with nothing to do with the answer it is given.
+
+### What was already right, and why it did not help
+
+`put` follows `NotLeader`'s hint. That landed earlier in this file with
+`a_write_follows_the_office_when_it_moves`, and the reasoning in its doc comment is correct: an
+election moves no epoch, so re-asking the peer that just disclaimed leadership asks a question
+already answered.
+
+But the hint names a **peer**, and `put` can only ask the stores its *caller* hands it:
+
+```rust
+let store = group[at % group.len()];
+```
+
+`announce_a_snapshot_and_await_the_retire` wrote keys 40..60 through `&[&first.store]` — a group of
+one — and it does so **after** `AddPeer` has made peer 2 a voter. So `at % 1` is 0 whatever the
+hint says. There was a redirect, and nowhere to follow it to.
+
+### Why the test that proves the fix could not catch the bug
+
+`a_write_follows_the_office_when_it_moves` passes `&[&first.store, &second.store]`. It proves the
+hint is *read*, and it hands `put` the group that already contains the answer — the one thing the
+failing call site did not have. A green redirect test and a livelocked redirect are consistent:
+the test exercises the branch, never the precondition it depends on.
+
+This is the same shape as the memo *a test can pass on the mechanism it is not testing*.
+
+### The audit
+
+Every one-store `put` in the file, and whether a second voter can exist when it runs:
+
+| site | group | second voter possible? |
+|---|---|---|
+| `a_write_follows_the_office_when_it_moves` (before) | `&[&first.store]` | no — `second` is not open yet |
+| `a_region_reaches_a_store_that_never_had_it` 0..40 | `&[&first.store]` | no — before `open(second)` |
+| the transfer test's `key(100)` | `&[&first.store]` | no — before `open(second)` |
+| the retire test's 0..40 | `&[&first.store]` | no — before `open(second)` |
+| **`announce_a_snapshot_and_await_the_retire` 40..60** | **`&[&first.store]`** | **yes — after `AddPeer`** |
+| two single-node tests | `&[&node.store]` | no — one store is the cluster |
+
+One at-risk site, and it is the one that failed.
+
+### The fix, and the guard that would have found it first
+
+1. The call site passes both stores.
+2. `put` now fails **at once** when the hint names a peer hosted on a store it was not given,
+   printing the peer, its store, and the group. No number of retries reaches a store a caller did
+   not hand over, so spending the deadline only re-proves the first refusal.
+3. `a_put_says_which_store_it_was_not_given` pins that, and the setup both redirect tests need is
+   extracted into `two_voters_with_the_office_on_the_second` rather than duplicated.
+
+### Red first, and with no load at all
+
+The office moved on purpose, exactly as §5's method says. Without the guard:
+
+```
+writing b"k00001" never succeeded after 8398 attempts in 30.003246871s;
+last answer peer is not the leader of region 1;
+last asked store 1, whose peer says leader=Some(Some(2))
+```
+
+The gate's message, reproduced on demand in 32 s under **zero** spinning threads — the sighting
+needed load only because it needed an election, and an election can be asked for. With the guard:
+the three redirect tests pass in 2.37 s, and `esker-store` is 318/318.
+
+**Sighting seven of eight was a test defect; so is this one.** Still nothing fixed by changing a
+budget.
+
+## 15. `promotion` at 300 s: my instrument, not a verdict
+
+The unit-0 arm ran the five load-sensitive tests eight times each at 14 busy threads. Four were
+clean:
+
+| test | runs | failed | worst |
+|---|---|---|---|
+| `snapshot` retire | 8 | 0 | 5.07 s |
+| `cluster_start` | 8 | 0 | 0.63 s |
+| `sim_sweep` | 8 | 0 | 18.97 s |
+| `crash_through_the_client` | 8 | 0 | 23.37 s |
+| `promotion` | 5 | **1 (rc=124)** | 300.06 s |
+
+`rc=124` is GNU `timeout` firing at my own 300 s cap. It is not the test's verdict, and it destroyed
+the diagnosis: promotion's internal budgets are `PROMOTION_DEADLINE` 30 s, `put` 90 s, the split
+wait 60 s, and the watch loop **180 s**. A legitimate slow path — 300 writes, a split, two stores
+opening, then the watch — can exceed 300 s without any defect, so an outer cap of 300 s cannot tell
+"failed" from "needed longer", and it pre-empted the `leader_progress` instrumentation added in §5
+for exactly this moment.
+
+The same test passed at 13.550 s in g1's gate and at 10.132 s in this lane's crate run. The next
+measurement needs a budget **above the sum of the test's own deadlines** (600 s), so that whatever
+fires is the test's own assertion with the leader's `matched/next/is_learner/pending_snapshot`
+attached. Recorded as open, and deliberately not called a sighting: nothing has failed yet.

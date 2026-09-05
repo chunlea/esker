@@ -244,7 +244,7 @@ async fn put(group: &[&Arc<Store>], region: &Region, key: Bytes, value: &[u8]) {
                 // out, every remaining attempt re-asks a follower that has already answered, so
                 // the deadline is spent re-proving what the first refusal said. That is what
                 // 9046 attempts in 30.000411395s were, all to store 1, which answered
-                // `leader=Some(2)` every time (`docs/plans/debt-c7.md` section 11). The peer
+                // `leader=Some(2)` every time (`docs/plans/debt-c7.md` section 14). The peer
                 // list of the store that refused says where the office went, so say it.
                 if let esker_proto::ProtoError::NotLeader {
                     leader_hint: Some(peer_id),
