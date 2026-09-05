@@ -1,0 +1,19 @@
+crates/esker-sql/src/error.rs
+  s_609bbbdbf3c419::t_c9a1879f05fb26 1874-1876
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "281386d48c7dec9d916e83d5846ef5e77a09164f",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
