@@ -1000,7 +1000,41 @@ it needs and paying to read and discard it on every fragment. Doing (1) without 
 the correctness of an answer depends on a *build-time* decision, which is the shape that made this
 defect invisible for a whole phase.
 
-### Where this stands on main, 2026-09-05 — and it is not yet safe
+### What the measurement said, and it was neither of the two things I expected
+
+Both halves were written, unit-tested and counterfactual-proven, and the real cluster still
+disagreed — **52 rows for 200** with both on, **357 for 200** with only the build scoped. So the
+next step was one measurement rather than another fix, and it took one run: log a run's `__key`
+beside the region's bound.
+
+```text
+__key  [116, 0,0,0,0,0,0,0, 255, 1, 0,0,0,0,0,0,0, 255, 1, 114, 128, …]
+bound  [116, 0,0,0,0,0,0,0,      1, 0,0,0,0,0,0,0,      1, 114, 128, …]
+```
+
+**A run's key is memcomparable-encoded and a region's bound is raw.** `esker_txn::key::write` is
+`'x' ++ enc(user_key) ++ !ts` — the module header says so in its first paragraph — and
+`columnar::region::versioned` stores that without the namespace byte, while `crate::split` stores a
+bound as the plain user key. The marker byte after each eight-byte group is the whole difference.
+
+Encoding the bound (`as_run_key`) makes the comparison exact, and **prefix-freeness is why**:
+`enc(k)` is never a prefix of `enc(b)` unless `k == b`, so the `!ts` suffix can never carry a key
+across a bound, and a key equal to a bound sorts after it and is excluded — which is right, since a
+region's end is the next region's first key.
+
+It also answers the 357: **the scan range alone is sufficient for correctness**, because it filters
+whatever the copy holds. The build scoping is still worth having — it stops each store keeping N
+times the data and reading it to discard it — but the resume replay and a Raft snapshot carrying a
+parent's rows no longer need scoping for the *answer* to be right. That is the "not alternatives"
+argument coming out the other way round from how it was written: (2) is the correctness half and
+(1) is the cost half.
+
+**The unit tests could not have caught it**, and that is the lesson worth keeping: they compared
+synthetic keys against synthetic bounds — both raw, both agreeing — where the product compares an
+encoded key against a raw bound. `server::tests::a_region_bound_is_a_prefix_of_every_run_key_for_that_row`
+now asserts the *relationship* instead of an answer, and its second half fails on the old code.
+
+### Where this stood on main, 2026-09-05 — closed by this batch
 
 **Main carries the scan range (`f0ba6f29`) without the `mpp` lane's guard**, so a multi-region
 columnar query on today's main answers **52 for 200** with nothing stopping it. The range is applied
@@ -1010,6 +1044,8 @@ columnar path, so nothing here is red because of it — which is the reason to w
 than rely on noticing. The guard batch (`FragmentSource::runs_are_region_scoped`, answering `false`
 until the differential's columnar arm is green) is what closes the window, and
 `ClientFragments::runs_are_region_scoped` must not be flipped to `true` before then.
+**Closed:** the differential's columnar arm is green on a real cluster (3/3 runs), and the flip
+landed with it.
 
 ### Two things settled while reading, which narrow (2) before it is written
 
