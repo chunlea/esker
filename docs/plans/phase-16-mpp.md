@@ -935,3 +935,62 @@ The sentence the fix puts in `catch_up`'s doc: **a fragment is fresh enough when
 complete through the read index — not when the row state machine is.** The `ReadIndex` round
 establishes what the region has committed; only the copy's own manifest index says what the copy can
 answer about.
+
+### Correction, after re-reading the dump against the workload
+
+J13 above reads the failure as "the copy holds the stream and not the history". Re-reading the
+dump against the SQL that produced it says something narrower and much more useful.
+
+The four rows the test inserts arrive in **one statement**, so they are **one transaction and one
+Raft entry**:
+
+```sql
+INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')
+```
+
+Everything after it touches those rows again, one at a time: `UPDATE id = 1`, `DELETE id = 3`,
+`UPDATE id = 2`. So if the copy missed **that single entry** and nothing else, what a fragment
+answers is:
+
+| row | later write | in the copy? |
+|---|---|---|
+| 1 | `UPDATE ... 'ada lovelace'` | yes, at its new value |
+| 2 | `UPDATE ... region 'east'` | yes, at its new value |
+| 3 | `DELETE` — a tombstone | correctly absent |
+| 4 | **none** | **absent** |
+| 5, 6 | inserted later | yes |
+
+That is the dump, exactly — `'ada lovelace'` and `'east'` included. **One entry was missed, not a
+history**, and `id 4` is the only row whose visible state depended on it. The distinction matters
+because "the copy never converted history" and "the copy dropped one entry" have different fixes,
+and the first was about to be built.
+
+The missed entry is also the only one that **predates the columnar record**: it commits before
+`ALTER TABLE t SET (columnar_replicas = 1)` does. An apply that reaches `ColumnarSlot::commit`
+before that record exists finds no copy to feed and caches the miss — correctly — and the record's
+own commit clears the cache. What has to hold after that is that the *next* open converts the
+region's history, and the walk in `columnar::region::convert` does exactly that. Reading every path
+between the two shows each of them defended in isolation, which is itself the finding: this is not
+visible without an experiment.
+
+### The property the tests pin
+
+Two, at the two levels where the claim can be made.
+
+`esker-store/tests/columnar_region.rs` —
+`a_copy_opened_before_the_region_had_rows_still_answers_for_them`. Fully deterministic, no Raft, no
+threads, no timing. A copy is **opened** over a region holding none of the table (which is what a
+fragment arriving in the placement gap does), the rows then arrive **without a tee** — which is what
+a Raft snapshot install is, bytes written into the column families with no entry applied — and one
+later entry is teed. A copy that is already open is never re-walked, so `ensure` short-circuits and
+the answer is the teed row alone. This is the mechanism written down as a property, and it is red
+against the code as it stands.
+
+`esker-store/tests/snapshot.rs` —
+`a_placed_columnar_learner_answers_for_the_rows_that_predate_it`. The twin of
+`a_placed_columnar_learner_holds_what_the_leader_holds`, which proves the learner's **row** column
+families hold what the leader's do and stops there — deliberately, because when it was written the
+fragment service was the thing it stood in for. This asks the fragment service itself, through the
+same `Service` the server dispatches through, so `Store::serve_fragment` runs whole: the epoch
+check, the role check and the catch-up. Nothing anywhere asserted that a *placed* learner answers a
+fragment for rows committed before it existed.
