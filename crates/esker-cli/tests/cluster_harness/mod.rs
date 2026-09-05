@@ -216,17 +216,63 @@ impl Cluster {
     }
 
     /// Runs a statement and fails the test if the server refused it.
+    ///
+    /// **`25006` is waited out rather than failed on.** A SQL node takes connections before it
+    /// holds a schema lease, and until it does every write is *"this node's schema lease has
+    /// expired and the placement driver is unreachable"*. It is a startup race, not a refusal —
+    /// `esker bench-mpp` learned it the same way, six runs in — so readiness here means a node
+    /// that accepts a **write**, not one that answers.
     pub fn run(&self, sql: &str) {
-        let answer = self.query(sql);
-        assert!(
-            !answer.contains("ERROR"),
-            "`{sql}` was refused: {}",
-            answer.trim()
-        );
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let answer = self.query(sql);
+            if !answer.contains("ERROR") {
+                return;
+            }
+            assert!(
+                answer.contains("25006") && Instant::now() < deadline,
+                "`{sql}` was refused: {}",
+                answer.trim()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// How many regions the cluster holds, from the placement driver's own routing table.
     pub fn regions(&self) -> usize {
+        self.region_lines().count()
+    }
+
+    /// How many regions have a columnar learner, from PD's own routing table.
+    pub fn regions_with_a_learner(&self) -> usize {
+        self.region_lines()
+            .filter(|line| line.contains('C'))
+            .count()
+    }
+
+    /// Waits until every region has a columnar learner.
+    ///
+    /// A series and not a reading: placement costs one region heartbeat an operator and PD does
+    /// one region at a time, so a count that climbs was latency and a single sample cannot tell
+    /// that from a count that sits.
+    pub fn wait_for_learners(&self, seconds: u64) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let (regions, with) = (self.regions(), self.regions_with_a_learner());
+            if regions > 0 && with == regions {
+                eprintln!("harness: {with} of {regions} regions have a columnar learner");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {with} of {regions} regions got a columnar learner within {seconds}s"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// One line per region from `region ls`, the header and trailer dropped.
+    fn region_lines(&self) -> std::vec::IntoIter<String> {
         let listed = Command::new(esker_cli())
             .args([
                 "region",
@@ -243,7 +289,9 @@ impl Cluster {
                     .next()
                     .is_some_and(|first| first.parse::<u64>().is_ok())
             })
-            .count()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
