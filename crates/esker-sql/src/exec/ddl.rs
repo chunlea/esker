@@ -3586,19 +3586,70 @@ pub(super) fn create_materialized_view(
     let columns = matview_columns(&planned, &create.columns)?;
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
-    let table = matview_table(
+    let table = table_from_query(
         table_id,
         name,
         columns,
-        &create.definition,
-        create.with_data,
+        Some(catalog::MatviewDef {
+            definition: create.definition.clone(),
+            populated: create.with_data,
+        }),
     );
     catalog::create_table(txn, executor.tenant, &table)?;
     executor.catalog_written = true;
     if create.with_data {
-        fill_matview(executor, txn, &table, rows)?;
+        fill_from_query(executor, txn, &table, rows)?;
     }
     Ok(Outcome::done("CREATE MATERIALIZED VIEW"))
+}
+
+/// `CREATE TABLE name [ (col, …) ] AS <query>`.
+///
+/// The same four steps `create_materialized_view` takes — plan and run the query, type the
+/// relation **from the plan**, create it, fill it — with the definition thrown away instead of
+/// kept. A table from a query is an ordinary table: measured on 19beta1, the new relation has no
+/// `NOT NULL`, no default, no primary key and no index, although `SELECT id FROM people` reads a
+/// `bigserial primary key`. Nothing here has to drop those, because nothing here copies them —
+/// the columns come from the query's output and carry only its types.
+///
+/// **The tag is `SELECT <n>`, not `CREATE TABLE AS`.** Measured: PostgreSQL reports the row count
+/// it wrote, the way `INSERT … SELECT` does, and a client that counts rows off the tag would be
+/// told nothing by a `CREATE` tag.
+///
+/// `WITH NO DATA` is not handled: the corpus never sends it — the string appears nowhere in
+/// `activerecord` — and inventing a rule for it is what
+/// `docs/adr/0031-rails-compatibility-is-measured.md` exists to prevent.
+pub(super) fn create_table_as(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateTableAs,
+) -> Result<Outcome> {
+    catalog::pg_catalog::refuse_write(&create.name)?;
+    let name = if create.name.contains(catalog::SCHEMA_SEPARATOR) {
+        create.name.clone()
+    } else {
+        let schema = executor.creation_schema(txn)?;
+        catalog::qualify(&schema, &create.name)
+    };
+    if existing_relation(executor, txn, &name)?.is_some() {
+        if create.if_not_exists {
+            executor.notice(SqlError::AlreadyExistsSkipping(create.name.clone()));
+            return Ok(Outcome::done("CREATE TABLE AS"));
+        }
+        return Err(SqlError::DuplicateTable(create.name.clone()));
+    }
+
+    let select = matview_body(&create.definition)?;
+    let (planned, rows) = executor.planned_rows(txn, &select)?;
+    let columns = matview_columns(&planned, &create.columns)?;
+    let written = rows.len();
+
+    let table_id = catalog::allocate_id(txn, executor.tenant)?;
+    let table = table_from_query(table_id, name, columns, None);
+    catalog::create_table(txn, executor.tenant, &table)?;
+    executor.catalog_written = true;
+    fill_from_query(executor, txn, &table, rows)?;
+    Ok(Outcome::done(format!("SELECT {written}")))
 }
 
 /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`.
@@ -3644,7 +3695,7 @@ pub(super) fn refresh_materialized_view(
     } else {
         Vec::new()
     };
-    fill_matview(executor, txn, &table, rows)?;
+    fill_from_query(executor, txn, &table, rows)?;
 
     // **`WITH NO DATA` on a refresh un-populates it**, so a read afterwards is `55000` again
     // rather than an honest-looking empty answer.
@@ -3786,12 +3837,16 @@ fn matview_columns(planned: &super::query::Planned, declared: &[String]) -> Resu
 /// **No primary key**, measured: `pg_constraint` and `pg_index` are both empty for a fresh one, and
 /// `view_test.rb`'s `test_does_not_assume_id_column_as_primary_key` asserts exactly that. So it
 /// takes the internal row id every keyless table takes, at position 0.
-fn matview_table(
+/// A relation built **from a query** rather than from declarations: the columns are the plan's,
+/// and column 0 is the internal row id, because such a relation has no key of its own.
+///
+/// Shared by `CREATE MATERIALIZED VIEW` and `CREATE TABLE … AS`, which differ only in whether the
+/// definition is kept — `matview` is `None` for the second, and that is the whole difference.
+fn table_from_query(
     id: u64,
     name: String,
     columns: Vec<ColumnDef>,
-    definition: &str,
-    populated: bool,
+    matview: Option<catalog::MatviewDef>,
 ) -> TableDef {
     let mut with_row_id = Vec::with_capacity(columns.len() + 1);
     with_row_id.push(ColumnDef {
@@ -3811,10 +3866,7 @@ fn matview_table(
     });
     with_row_id.extend(columns);
     TableDef {
-        matview: Some(catalog::MatviewDef {
-            definition: definition.to_owned(),
-            populated,
-        }),
+        matview,
         on_commit: catalog::OnCommit::PreserveRows,
         id,
         persistence: catalog::Persistence::Permanent,
@@ -3842,7 +3894,7 @@ fn matview_table(
 }
 
 /// Writes what the definition produced, through the ordinary row-writing path.
-fn fill_matview(
+fn fill_from_query(
     executor: &mut Executor,
     txn: &mut dyn Txn,
     table: &TableDef,

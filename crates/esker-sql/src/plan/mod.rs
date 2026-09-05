@@ -35,9 +35,9 @@ pub use ddl::{
     AddValuePosition, AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, AlterType,
     AlterTypeAction, Column, ColumnDefault, Comment, CommentObject, CreateDatabase,
     CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateRole, CreateSchema,
-    CreateSequence, CreateTable, CreateTrigger, CreateType, CreateView, DropDatabase,
-    DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole, DropSchema,
-    DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
+    CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView,
+    DropDatabase, DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole,
+    DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
     KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
     choose_relation_name, foreign_key_name, index_name, index_name_addition, make_object_name,
     primary_key_name, sequence_name, unique_constraint_name,
@@ -118,6 +118,8 @@ pub enum Statement {
     /// `CREATE MATERIALIZED VIEW` — a table that carries the `SELECT` its rows came from
     /// ([ADR 0064](../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
     CreateMaterializedView(CreateMaterializedView),
+    /// `CREATE TABLE … AS <query>` — a table whose columns are typed from the query's plan.
+    CreateTableAs(CreateTableAs),
     /// `REFRESH MATERIALIZED VIEW` — the statement that recomputes those rows.
     RefreshMaterializedView(RefreshMaterializedView),
     /// `DROP MATERIALIZED VIEW`.
@@ -253,6 +255,7 @@ impl Statement {
             // A materialized view **writes rows**: creating and refreshing one both run the
             // definition and store what it produced (ADR 0064).
             Statement::CreateMaterializedView(_) => Some("CREATE MATERIALIZED VIEW"),
+            Statement::CreateTableAs(_) => Some("CREATE TABLE AS"),
             Statement::RefreshMaterializedView(_) => Some("REFRESH MATERIALIZED VIEW"),
             Statement::DropMaterializedView(_) => Some("DROP MATERIALIZED VIEW"),
             // A catalog write like the rest, so a read-only or time-travelling block refuses it.
@@ -321,6 +324,7 @@ impl Statement {
             Statement::Truncate(_) => "TRUNCATE TABLE",
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateMaterializedView(_) => "CREATE MATERIALIZED VIEW",
+            Statement::CreateTableAs(_) => "CREATE TABLE AS",
             Statement::RefreshMaterializedView(_) => "REFRESH MATERIALIZED VIEW",
             Statement::DropMaterializedView(_) => "DROP MATERIALIZED VIEW",
             Statement::CreateExtension(_) => "CREATE EXTENSION",

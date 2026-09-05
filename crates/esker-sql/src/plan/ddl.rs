@@ -363,6 +363,31 @@ pub struct CreateView {
 ///
 /// [ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md):
 /// this creates a **table** that carries its definition, so the `SELECT` is planned once here the
+/// `CREATE TABLE name [ (col, …) ] AS <query>`.
+///
+/// A table whose **shape is the query's**: the columns are typed from the plan, and nothing else
+/// of the source comes across — measured on 19beta1, the new relation has no `NOT NULL`, no
+/// default, no primary key and no index, although `SELECT id FROM people` reads a
+/// `bigserial primary key`.
+///
+/// Deliberately a sibling of [`CreateMaterializedView`] rather than a field on
+/// [`CreateTable`](super::CreateTable): the two share every step — plan the query, type the
+/// relation from the plan, create it, fill it — and differ only in whether the definition is kept.
+/// `CreateTable`'s executor builds columns from *declarations*, of which this statement has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableAs {
+    /// The relation's name, folded.
+    pub name: String,
+    /// `CREATE TABLE t (a, b) AS …` — the names it gives its columns, or empty when it takes them
+    /// from the query.
+    pub columns: Vec<String>,
+    /// The `SELECT`, as text, rendered back through the parser for the reason
+    /// [`CreateMaterializedView::definition`] is.
+    pub definition: String,
+    /// `IF NOT EXISTS`.
+    pub if_not_exists: bool,
+}
+
 /// way a view's is and then run to fill the rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateMaterializedView {

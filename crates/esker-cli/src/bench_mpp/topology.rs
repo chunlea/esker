@@ -507,3 +507,20 @@ pub(crate) fn columnar_spread(regions: &[Region]) -> (usize, usize) {
     }
     (with_a_learner, stores.len())
 }
+
+/// The distinct stores a columnar learner sits on, ascending.
+///
+/// [`columnar_spread`] returns how many; this returns which, and the difference matters in the
+/// report. "2 distinct stores" on a four-store cluster is arithmetic a reader can argue with;
+/// "stores 1 and 3" is a placement they can go and look at.
+pub(crate) fn learner_stores(regions: &[Region]) -> Vec<u64> {
+    let mut stores: Vec<u64> = regions
+        .iter()
+        .flat_map(|region| region.peers.iter())
+        .filter(|peer| peer.role == PeerRole::ColumnarLearner)
+        .map(|peer| peer.store_id)
+        .collect();
+    stores.sort_unstable();
+    stores.dedup();
+    stores
+}
