@@ -11,40 +11,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use esker_sql::backend::{Backend as _, MemoryBackend};
+use esker_sql::backend::MemoryBackend;
 use esker_sql::catalog::Catalog;
-use esker_sql::exec::Executor;
-use esker_sql::pgwire::server::{Auth, Config, Executors, bind, serve_on};
-use esker_sql::pgwire::session::Execute;
+use esker_sql::node::Sessions;
+use esker_sql::pgwire::server::{Auth, Config, bind, serve_on};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "parity_harness/mod.rs"]
 mod parity;
-
-/// One `Executor` per session over one store — what `bin/esker-sql.rs` builds, minus the parts a
-/// cancellation does not touch.
-struct Sessions {
-    store: Arc<dyn esker_sql::backend::Backend>,
-    catalog: Arc<Catalog>,
-}
-
-impl Executors for Sessions {
-    fn for_session(
-        &self,
-        database: &str,
-        identity: esker_sql::session::Backend,
-    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
-        Ok(Box::new(
-            Executor::new(
-                Arc::clone(&self.store),
-                Arc::clone(&self.catalog),
-                1,
-                identity,
-            )
-            .serving_database(database),
-        ))
-    }
-}
 
 /// What one statement answered.
 #[derive(Debug, Default)]
@@ -134,7 +108,7 @@ fn data_row(body: &[u8]) -> Vec<String> {
             row.push(String::new());
             continue;
         }
-        let len = len as usize;
+        let len = usize::try_from(len).expect("a non-negative length");
         row.push(String::from_utf8_lossy(&body[at..at + len]).into_owned());
         at += len;
     }
@@ -155,7 +129,11 @@ async fn listen(
                 auth: Auth::Trust,
                 ..Config::default()
             },
-            Arc::new(Sessions { store, catalog }),
+            // **The library's, not a double.** A hand-rolled `Executors` here is the drift
+            // `esker_sql::node` exists to end: `psql_smoke`'s own double had silently dropped
+            // `sharing_sequence_blocks`, so the one harness that spoke the wire protocol ran with
+            // ADR 0072 switched off. The node this test serves is the node the binary serves.
+            Arc::new(Sessions::new(store, catalog)),
         )
         .await;
     });
