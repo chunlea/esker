@@ -86,3 +86,13 @@ whose printed form depends on the catalog. Refused by name, which is the honest 
 * The alternative, comparing an `oid` against a `text` at the comparison site, is the shortcut this
   project retired: it answers the one statement that motivated it, leaves `::oidvector` unbuilt,
   and leaves `'text'::regtype < 'int4'::regtype` wrong for anybody who asks.
+* **A user-defined type's `regtype` is still text**, and this is the half of the decision that is
+  not built. `'color'::regtype` over a type a `CREATE TYPE` made goes through
+  `CatalogFunc::UserRegType`, which resolves the name against the catalog at execution and answers
+  a `Datum::Text` — so `pg_typeof('color'::regtype)` says `text` there and `regtype` for every
+  built-in, and `'color'::regtype = <oid>` does not compare. Nothing regressed (the `regtype_user`
+  corpus is unchanged) and nothing in the suite reaches it, but the model is applied to one half of
+  the type and the other half is a follow-up, not a difference of opinion.
+* `format_type` took an oid and had to learn that a `regtype` is one. Four corpora caught that in a
+  single run, which is what one shared accessor with a missing arm looks like — and is why the
+  arm sits beside `Datum::Oid`'s rather than in a second function.
