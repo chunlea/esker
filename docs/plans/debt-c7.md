@@ -1041,3 +1041,60 @@ Solo timing is unchanged: 6 tests in 1.12 s, exactly as before the retry.
 
 **Ten sightings. Still none fixed by changing a budget** — and the one deadline this wave did add
 (§18's 30 s) replaced a stopwatch on an event, leaving the negative proof's clock untouched.
+
+## 21. A handle taken before the office moved, twice more — and a third crate says `leader = None`
+
+The gate of the `2a4bf8f1` merge ran at load average 86–115, driven by two other lanes' containers
+and macOS storage churn rather than by anything of this lane's, and lost eight tests across four
+crates. Most are that load. Two are not, and both were worth the run.
+
+### `cluster.rs:401` — `node 2 is missing key-15`
+
+```rust
+let mut leader = settled_leader(&nodes).await;
+let peer = nodes[leader].store.peer().unwrap();   // <- before the writes
+for index in 0..16 { proposed(&nodes, &mut leader, &command).await; }
+let applied = peer.status().await.unwrap().applied;
+wait_for_applied(&nodes, applied).await;
+```
+
+`proposed` **follows the office when it moves** — that is what it was added for. So the handle taken
+before the loop can belong to a *former* leader, whose applied index is short of the run that was
+just written. `wait_for_applied` then waits for an index every node passed long ago and returns at
+once, and the assertions sample mid-replication. `key-15` is the last of the sixteen, which is
+exactly what a short wait looks like.
+
+Not a replication defect, and worth saying plainly: no acknowledged write was lost. Every one of
+the sixteen was acknowledged by `proposed` and every one arrives; the test simply looked too early.
+
+Two sites had it — `a_write_on_the_leader_reaches_every_peer` as well — and a **third did not**:
+
+```rust
+// Bound *after* the write: if the first leader stepped down the write was served elsewhere,
+// and every assertion below is about the node that currently leads.
+let peer = nodes[leader].store.peer().unwrap();
+```
+
+That comment was already in this file, at `a_read_index_is_not_behind_what_is_applied`, written by
+whoever fixed that site. The lesson was learned once and not carried to its two neighbours. Both
+now bind after the write and cite it.
+
+This is the fifth time in this wave: §16, §17, §18's postscript, §20, and now here. **A handle or a
+fact captured before the office can move, then used as though it still holds.**
+
+### `snapshot.rs:233` — `leader=Some(None)`, a third crate agreeing
+
+```
+writing b"k00086" never succeeded after 3689 attempts in 30.000054507s;
+last answer peer is not the leader of region 1; last asked store 2, whose peer says leader=Some(None)
+```
+
+`Some(None)` is a peer that exists and believes **nobody** leads — §19's leaderless region, reached
+now from `esker-store::snapshot` as well as from `promotion` (§19) and from `esker-client`'s router
+(§20, `NotLeader { leader_hint: None }`). Three test families, three crates, one state.
+
+§14's guard is correctly silent here: it fires when a hint points outside the group, and there is no
+hint when no peer knows a leader. `put` round-robins and spends its deadline, which is the right
+behaviour against a region that cannot answer. **Nothing to fix in the test** — this is more
+evidence for the debt already logged against the raft/store core, and the strongest yet, because
+each crate reaches it by a different path.
