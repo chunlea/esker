@@ -2318,6 +2318,14 @@ pub enum SqlError {
     #[error("snapshot \"{0}\" does not exist")]
     SnapshotDoesNotExist(String),
 
+    /// A function argument a real server refuses with `22023` and a sentence of its own.
+    ///
+    /// `split_part(text, sep, 0)` is `field position must not be zero` and
+    /// `substr(text, from, -1)` is `negative substring length not allowed` — measured, and both
+    /// are the server's words rather than a description of them.
+    #[error("{0}")]
+    InvalidFunctionArgument(&'static str),
+
     /// A `SET` whose value the parameter cannot read.
     #[error("invalid value for parameter \"{name}\": \"{value}\"")]
     InvalidParameterValue {
@@ -2788,7 +2796,8 @@ impl SqlError {
             // PostgreSQL reads an authorization name as a *parameter value* and an owner as an
             // object reference. Measured, both.
             | SqlError::UndefinedRoleForAuthorization(_)
-            | SqlError::UnrecognizedParameterNamespace(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::UnrecognizedParameterNamespace(_)
+            | SqlError::InvalidFunctionArgument(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT

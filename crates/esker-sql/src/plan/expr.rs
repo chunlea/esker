@@ -738,7 +738,13 @@ impl CatalogFuncCall {
             CatalogFunc::TsStrip
             | CatalogFunc::SetWeight
             | CatalogFunc::TsRank
-            | CatalogFunc::TsMatch => true,
+            | CatalogFunc::TsMatch
+            // The three string functions, `i` on a real server — measured with the rest of the
+            // family rather than assumed, since `concat` next door is `STABLE`.
+            | CatalogFunc::SplitPart
+            | CatalogFunc::StrPos
+            | CatalogFunc::Substr
+            | CatalogFunc::Substring => true,
             _ => false,
         }
     }
@@ -1096,6 +1102,32 @@ pub enum CatalogFunc {
     /// `concat(NULL, NULL)` is the empty string. Each argument is rendered by its own output
     /// function, so `concat('n=', 42, ' t=', true)` is `n=42 t=t` and a `numeric` keeps its scale.
     Concat,
+    /// `split_part(text, sep, n)`: the `n`th field, counting from 1 — or from the **end** when
+    /// `n` is negative.
+    ///
+    /// Measured on 19beta1, and the edges are most of it: past the end is the empty string rather
+    /// than NULL, `-1` is the last field, an empty separator gives the whole string back, and
+    /// **`n = 0` is an error** — `22023 field position must not be zero`, not an empty answer.
+    SplitPart,
+    /// `strpos(haystack, needle)`: the 1-based position of the first match, `0` for none.
+    ///
+    /// An empty needle is `1`, measured — it matches at the start rather than nowhere.
+    StrPos,
+    /// `substr(text, from[, count])`: the substring, 1-based and clamped.
+    ///
+    /// **`from` may be zero or negative**, and the clamp is what makes those work: the result is
+    /// the characters at positions `max(from, 1) ..= from + count - 1`, so `substr('hello', -1, 3)`
+    /// is `h` — positions -1, 0 and 1, of which only 1 exists. Without a `count` it runs to the
+    /// end, and a `from` past the end is the empty string.
+    Substr,
+    /// `substring(text, from[, count])` and `substring(text FROM from [FOR count])`: the same
+    /// function as [`CatalogFunc::Substr`], under the name a real server prints back.
+    ///
+    /// **Two variants for one behaviour, because the output column is named after the spelling.**
+    /// Measured: `substring('abc' FROM 2)` and `substring('abc', 2)` are both `substring`, and
+    /// `substr('abc', 2)` is `substr`. Folding them would rename a column in every schema dump
+    /// that uses the long spelling.
+    Substring,
     /// `replace(text, from, to)`: every occurrence of `from` in `text`, replaced.
     ///
     /// Three rules that a `str::replace` gets right and one it does not, all measured on 19beta1:
@@ -1202,6 +1234,10 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
+            () if name.eq_ignore_ascii_case("split_part") => Some(CatalogFunc::SplitPart),
+            () if name.eq_ignore_ascii_case("strpos") => Some(CatalogFunc::StrPos),
+            () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
+            () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
             () if name.eq_ignore_ascii_case("replace") => Some(CatalogFunc::Replace),
             () if name.eq_ignore_ascii_case("convert_to") => Some(CatalogFunc::ConvertTo),
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
@@ -1311,6 +1347,10 @@ impl CatalogFunc {
             CatalogFunc::ClockTimestamp => "clock_timestamp",
             CatalogFunc::Random => "random",
             CatalogFunc::Concat => "concat",
+            CatalogFunc::SplitPart => "split_part",
+            CatalogFunc::StrPos => "strpos",
+            CatalogFunc::Substr => "substr",
+            CatalogFunc::Substring => "substring",
             CatalogFunc::Replace => "replace",
             CatalogFunc::ConvertTo => "convert_to",
         }
@@ -1351,7 +1391,8 @@ impl CatalogFunc {
             | CatalogFunc::HstoreBuild
             | CatalogFunc::TsMatch
             | CatalogFunc::TsRank
-            | CatalogFunc::SetWeight => &[2],
+            | CatalogFunc::SetWeight
+            | CatalogFunc::StrPos => &[2],
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
@@ -1361,7 +1402,9 @@ impl CatalogFunc {
             // the name and the flag saying which half of the `regtype` was asked for.
             // `ts_headline` joins them: `(config, text, query)`, or two arguments taking
             // `default_text_search_config`.
-            CatalogFunc::RangeBuild
+            CatalogFunc::Substr
+            | CatalogFunc::Substring
+            | CatalogFunc::RangeBuild
             | CatalogFunc::PgGetExpr
             | CatalogFunc::UserRegType
             | CatalogFunc::TsHeadline => &[2, 3],
@@ -1414,7 +1457,7 @@ impl CatalogFunc {
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
             CatalogFunc::Concat => &CONCAT_ARITIES,
-            CatalogFunc::Replace => &[3],
+            CatalogFunc::SplitPart | CatalogFunc::Replace => &[3],
         }
     }
 
@@ -1448,6 +1491,9 @@ impl CatalogFunc {
             | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
+            | CatalogFunc::SplitPart
+            | CatalogFunc::Substr
+            | CatalogFunc::Substring
             | CatalogFunc::Replace
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
             // this node has no `regtype`, and what it prints is the name either way.
@@ -1480,6 +1526,8 @@ impl CatalogFunc {
             | CatalogFunc::LtreeNlevel
             // `numnode` counts the nodes of a query, operators included.
             | CatalogFunc::NumNode
+            // `strpos` is a position, and `0` for "not found" rather than NULL.
+            | CatalogFunc::StrPos
             // `integer` on a real server, and the column `pg_stat_activity.pid` is declared as.
             | CatalogFunc::PgBackendPid => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
