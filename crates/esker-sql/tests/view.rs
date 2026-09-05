@@ -97,8 +97,16 @@ fn every_view_answer_is_postgresql_19_s() {
         CORPUS_FIXTURE,
         &DIVERGENCES,
     );
+    // **The whole file, not a floor of convenience.** `> 40` would have let coverage halve in
+    // silence, which is the failure this corpus has already had twice: a refusal this node makes
+    // and PostgreSQL does not aborts the transaction, and every statement after it comes back
+    // `25P02` and is never compared by anybody. Both times, closing one refusal is what revealed
+    // what the rest of the file had been saying — five answers and three types on the last
+    // occasion. 73 is every statement in it; a change that compares fewer has hidden something and
+    // should have to say so.
     assert!(
-        checked > 40,
-        "only {checked} statements ran; the corpus did not load"
+        checked >= 73,
+        "only {checked} of the corpus's 73 statements were compared; something aborted the block \
+         and hid the rest"
     );
 }
