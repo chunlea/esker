@@ -238,3 +238,71 @@ fn a_committed_session_no_longer_answers_a_hunt_for_its_last_statement() {
         );
     }
 }
+
+/// **The hunt with no `ORDER BY` finds the session that is *running* the statement.**
+///
+/// `transaction_test.rb` picks the first row of
+/// `SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'` and cancels it. Both the
+/// holder and the waiter match — the holder because its query text is retained while it sits idle
+/// in its transaction, which is a real server's behaviour and this node's — so which one comes
+/// first decides whether the test cancels the blocked thread it means to or its own.
+///
+/// **PostgreSQL's order here is not reproducible and this does not try to reproduce it.**
+/// `pg_stat_activity` is read out of the `PGPROC` slot array and slots are reused, so its order is
+/// neither pid nor connection order. Measured on PG19, three sessions opened a second apart:
+///
+/// ```text
+/// connected  46822, then 46830, then 46838
+/// returned   46830 | 46822 | 46838
+/// ```
+///
+/// So this asserts the node's own rule — running sessions first — which answers the question the
+/// hunt is actually asking.
+#[test]
+fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
+    let pair = Pair::new(&[
+        "CREATE TABLE samples (id bigint primary key, value bigint)",
+        "INSERT INTO samples VALUES (1, 1)",
+    ]);
+    let (b_pid, hears_b_pid) = channel();
+    let (b_says, hears_b) = channel();
+
+    let sessions = pair.sessions();
+    let victim = std::thread::spawn(move || {
+        let mut node = sessions.session();
+        let _ = b_pid.send(node.rows("SELECT pg_backend_pid()")[0][0].clone());
+        node.run("BEGIN").unwrap();
+        node.run("SET lock_timeout = '20s'").unwrap();
+        reached(&b_says, "B is about to block");
+        let _ = node.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE");
+    });
+
+    // A takes the row first and then sits idle inside its transaction, which is the state that
+    // retains its query text and makes it match the hunt.
+    let mut a = pair.session();
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
+    a.run("BEGIN").unwrap();
+    a.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE")
+        .unwrap();
+    let waiter = hears_b_pid.recv().expect("B says who it is");
+    edge(&hears_b, "B is about to block");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut watcher = pair.session();
+    let hunt = watcher.rows(&format!(
+        "SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE' \
+         AND pid IN ({a_pid}, {waiter})"
+    ));
+    assert_eq!(
+        hunt.len(),
+        2,
+        "both the holder and the waiter match, as they do on a real server: {hunt:?}"
+    );
+    assert_eq!(
+        hunt[0][0], waiter,
+        "the blocked session comes first; the holder {a_pid} is idle in its transaction"
+    );
+
+    a.run("ROLLBACK").unwrap();
+    let _ = victim.join();
+}
