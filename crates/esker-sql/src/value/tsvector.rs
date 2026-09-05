@@ -218,6 +218,103 @@ fn syntax(chars: &[char]) -> SqlError {
     }
 }
 
+/// The text-search configurations this node has. `pg_ts_config` reports the same two.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Config {
+    /// Lowercase, keep everything, stem nothing.
+    Simple,
+    /// Lowercase, drop the stop words, stem the rest.
+    English,
+}
+
+impl Config {
+    /// Resolves a configuration name, schema-qualified or not.
+    ///
+    /// **A name this node does not have is `42704`**, which is the sentence a real server gives an
+    /// unknown one — measured as `to_tsvector('nosuchconfig', 'a')`. A name PostgreSQL *does* have
+    /// and this node does not (`french`, say) takes the same answer, which is consistent with
+    /// `pg_ts_config` reporting two rows rather than thirty-two, and is declared in the corpus.
+    pub fn resolve(name: &str) -> Result<Self> {
+        match name.strip_prefix("pg_catalog.").unwrap_or(name) {
+            "simple" => Ok(Config::Simple),
+            "english" => Ok(Config::English),
+            other => Err(SqlError::UndefinedTextSearchConfig(other.to_owned())),
+        }
+    }
+}
+
+/// `to_tsvector(config, text)`.
+///
+/// **Positions are token indices, assigned before anything is dropped.** The capture is explicit:
+/// `'The Fat Cats ate a rat'` is `'ate':4 'cat':3 'fat':2 'rat':6` under `english` — nothing at 1
+/// or 5, because `the` and `a` were numbered and then removed. Numbering the survivors instead
+/// would give `'ate':3 'cat':2 'fat':1 'rat':4`, which is a different value.
+#[must_use]
+pub fn to_tsvector(config: Config, text: &str) -> Vec<Lexeme> {
+    canonical(to_lexemes(config, text))
+}
+
+/// The same pipeline **in token order**, which is what the query side needs.
+///
+/// `to_tsvector` sorts, because a tsvector is a set; a `tsquery` is an expression and its operands
+/// keep the order they were written in — `plainto_tsquery('english', 'the fat cats')` is
+/// `'fat' & 'cat'` and **not** `'cat' & 'fat'`. Sharing the sorted version between the two was a
+/// real bug, caught by the captured answer.
+#[must_use]
+pub fn to_lexemes(config: Config, text: &str) -> Vec<Lexeme> {
+    let mut lexemes = Vec::new();
+    for (at, token) in tokens(text) {
+        let folded = token.to_lowercase();
+        let word = match config {
+            Config::Simple => folded,
+            // Measured: the list is consulted **before** the stemmer, so `only` is dropped rather
+            // than stemmed to `onli`. `crate::value::stopwords` carries the probe that shows it.
+            Config::English => {
+                if crate::value::stopwords::is_stop_word(&folded) {
+                    continue;
+                }
+                crate::value::stemmer::stem(&folded)
+            }
+        };
+        if word.is_empty() {
+            continue;
+        }
+        lexemes.push(Lexeme {
+            word,
+            positions: vec![(at, Weight::D)],
+        });
+    }
+    lexemes
+}
+
+/// The word tokens of a text, numbered from one.
+///
+/// A token is a run of alphanumerics; everything else separates. That is narrower than a real
+/// server's parser, which also recognises URLs, hosts, file paths and numbers as their own token
+/// types — none of which the suite writes, and each of which would be a *different lexeme*, so the
+/// gap is a gap and not a wrong answer waiting to happen.
+fn tokens(text: &str) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            current.push(c);
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out.into_iter()
+        .enumerate()
+        // Positions are `u16` on a real server and saturate rather than wrap; a text with more
+        // than 65,535 tokens is not something the suite writes, and stopping the count is the
+        // conservative answer.
+        .map(|(i, token)| (u16::try_from(i + 1).unwrap_or(u16::MAX), token))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +322,53 @@ mod tests {
     /// Every expectation here is a row of `captures/pg19_tsvector.txt`, not a rule reasoned about.
     fn canon(text: &str) -> String {
         to_text(&from_text(text).expect("a valid tsvector"))
+    }
+
+    /// **The capture's own two rows, side by side**, which is what proves the position model:
+    /// the same 1..6 numbering under both configurations, with `english` dropping two of them and
+    /// **not** renumbering the rest.
+    #[test]
+    fn to_tsvector_is_what_postgresql_answers() {
+        let text = "The Fat Cats ate a rat";
+        assert_eq!(
+            to_text(&to_tsvector(Config::English, text)),
+            "'ate':4 'cat':3 'fat':2 'rat':6"
+        );
+        assert_eq!(
+            to_text(&to_tsvector(Config::Simple, text)),
+            "'a':5 'ate':4 'cats':3 'fat':2 'rat':6 'the':1"
+        );
+    }
+
+    /// Two occurrences of one stem are one lexeme with both positions, and the irregular past
+    /// tense is a lexeme of its own — `'ran':3 'run':1,2`.
+    #[test]
+    fn repeated_stems_merge_their_positions() {
+        assert_eq!(
+            to_text(&to_tsvector(Config::English, "running runs ran")),
+            "'ran':3 'run':1,2"
+        );
+    }
+
+    /// `to_tsvector('english', '')` is the empty tsvector, which prints as nothing.
+    #[test]
+    fn an_empty_text_is_an_empty_tsvector() {
+        assert_eq!(to_text(&to_tsvector(Config::English, "")), "");
+        // And a text that is nothing but stop words is empty too, which is the same value.
+        assert_eq!(to_text(&to_tsvector(Config::English, "the a of")), "");
+    }
+
+    /// A configuration this node does not have is `42704`, with a real server's own sentence.
+    #[test]
+    fn an_unknown_configuration_is_undefined_rather_than_unsupported() {
+        let error = Config::resolve("nosuchconfig").expect_err("no such configuration");
+        assert_eq!(
+            error.to_string(),
+            "text search configuration \"nosuchconfig\" does not exist"
+        );
+        assert!(Config::resolve("english").is_ok());
+        assert!(Config::resolve("pg_catalog.english").is_ok());
+        assert!(Config::resolve("simple").is_ok());
     }
 
     #[test]

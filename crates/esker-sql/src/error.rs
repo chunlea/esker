@@ -533,6 +533,14 @@ pub enum SqlError {
     #[error("syntax error in tsquery: \"{0}\"")]
     TsQuerySyntax(String),
 
+    /// `to_tsvector('nosuchconfig', 'a')`: a text search configuration this node does not have.
+    ///
+    /// **`42704`**, and the sentence is a real server's own, measured. A name PostgreSQL *does*
+    /// have and this node does not takes the same answer, which is what `pg_ts_config` reporting
+    /// two rows rather than thirty-two commits it to.
+    #[error("text search configuration \"{0}\" does not exist")]
+    UndefinedTextSearchConfig(String),
+
     /// `to_tsquery('english', 'fat &')`: an operator with nothing to apply to. A **different**
     /// sentence from [`SqlError::TsQuerySyntax`] for a different fault, both `42601`, both
     /// measured rather than reasoned about.
@@ -2399,7 +2407,8 @@ impl SqlError {
             | SqlError::UndefinedExtension(_)
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::CascadeDropsView(_)
-            | SqlError::UndefinedTablespace(_) => sqlstate::UNDEFINED_OBJECT,
+            | SqlError::UndefinedTablespace(_)
+            | SqlError::UndefinedTextSearchConfig(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
