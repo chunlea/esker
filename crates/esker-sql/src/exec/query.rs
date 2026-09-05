@@ -4104,10 +4104,26 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
                     .iter()
                     .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
             };
+            // **A fifth spelling, and it is `all` where the others are `any`** — which is why it
+            // was missed. `jsonb || jsonb` merges documents; a jsonb column beside a **text** one
+            // is `text || text` on a real server, because no `jsonb || text` operator exists. So
+            // the quantifier is what the evaluator uses (`args.iter().all(is_jsonb_typed)`), and
+            // the two have to agree or the rows and the declared type part company.
+            //
+            // They had. `a || b` over two jsonb columns merged correctly and said `text`, the same
+            // wrong-declaration bug `->` had one arm below — found by auditing this arm after
+            // fixing that one, not by a failing test.
+            let all_jsonb = !call.args.is_empty()
+                && call
+                    .args
+                    .iter()
+                    .all(|arg| matches!(expr_type(arg, scope), Ok(ColumnType::Jsonb)));
             // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
             // already right — it was only the *declared* type that said `text`, which a client
             // binds against.
-            if of(ColumnType::Hstore) {
+            if all_jsonb {
+                ColumnType::Jsonb
+            } else if of(ColumnType::Hstore) {
                 ColumnType::Hstore
             } else if of(ColumnType::Ltree) {
                 ColumnType::Ltree

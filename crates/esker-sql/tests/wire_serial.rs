@@ -264,6 +264,42 @@ async fn an_array_constructor_over_a_column_describes_its_element_type() {
     }
 }
 
+/// **`||` over two jsonb columns is a `jsonb`**, which is the third instance of the same bug.
+///
+/// The evaluator merges documents when **all** operands are jsonb-typed, and `expr_type` declared
+/// `text` — so the rows were a merged document and the client was told a string. Found by auditing
+/// the `||` arm after fixing `->`, which is the arm whose own comment says the rows were right and
+/// only the declared type was wrong. It is `all` where the neighbouring rules are `any`, because a
+/// jsonb column beside a **text** one is `text || text` on a real server: there is no
+/// `jsonb || text` operator. That quantifier is what made it a separate mistake.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concat_of_two_jsonb_columns_describes_jsonb() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE c (a jsonb, b jsonb, t text)").await;
+    wire.run(r#"INSERT INTO c VALUES ('{"x":1}', '{"y":2}', 'z')"#)
+        .await;
+
+    for (sql, want) in [
+        ("SELECT a || b FROM c", vec![3802]),
+        // A jsonb beside a text is `text || text`, so it is text — the quantifier's other side.
+        ("SELECT a || t FROM c", vec![25]),
+        ("SELECT t || t FROM c", vec![25]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong type"
+        );
+    }
+}
+
 /// The first column of the first `DataRow` in a reply, as text.
 fn first_value(reply: &[u8]) -> Option<String> {
     let (_, body) = frames(reply).into_iter().find(|(tag, _)| *tag == 'D')?;
