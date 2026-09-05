@@ -1,55 +1,70 @@
-# `jsonb` gets a representation of its own
+# `jsonb`'s representation — asked, and answered by measurement
 
-**Status**: queued, after `serial_test.rb`'s remaining two. Not before `pg_trgm`/GIN — 48 tests sit
-behind that and none behind this.
+**Status**: closed. The unit this file was written to plan turned out not to exist; what it was
+really about — `||` as document merge — is done, and the premise behind the rest was wrong.
 
-## Why
+## What this file used to say
 
-`jsonb` has **no `Datum` variant**. It is a `Datum::Text`, where `hstore`, `ltree`, `citext`,
-`tsvector` and `tsquery` each have one. So at the value layer nothing can tell a `jsonb` from a
-string, and every operator the two share has to guess.
+That `jsonb` has no `Datum` of its own — it is a `Datum::Text`, where `hstore`, `ltree`, `citext`
+and `tsvector` each have a variant — and that this breaks
+[ADR 0042](../adr/0042-a-type-shares-a-representation-only-if-it-shares-a-comparison.md): a type
+may share another's representation **only if it shares its comparison**, and two documents that
+differ in key order or whitespace are equal as `jsonb` and unequal as `text`.
 
-[ADR 0042](../adr/0042-a-type-shares-a-representation-only-if-it-shares-a-comparison.md) is the
-rule this breaks: a type may share another's representation **only if it shares its comparison**.
-`jsonb` does not share `text`'s. Two documents that differ only in key order or in whitespace are
-equal as `jsonb` and unequal as `text`; `{"a":1}` and `{"a": 1}` are the same document and two
-different strings. The node already normalises on input — `'{"a":1}'::jsonb` prints `{"a": 1}` —
-which is what has kept the equality *mostly* right, and normalisation is not the same as sharing a
-comparison.
+## Why that was wrong
 
-## What it costs today
+The text `jsonb` shares is **canonical**. `value::json::canonicalise` runs on every value on the
+way in (`value::mod`'s `ColumnType::Jsonb` arm) and does all three normalisations at once:
 
-`||`. The operator means five things and is told apart by its operands
-([ADR 0070](../adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md) is a
-different symbol with the same shape of problem): hstore merge, ltree concatenation, tsvector
-concatenation-with-renumbering, array append, and string concatenation. `jsonb || jsonb` is a
-sixth — **document merge** — and it cannot be reached, because by the time the evaluator sees the
-operands they are two `Datum::Text`s.
+* keys reordered **by length, then bytes** — PostgreSQL's own `jsonb` key order, not lexicographic,
+  so `{"z":1,"aa":2}` stores as `{"z": 1, "aa": 2}`;
+* duplicate keys dropped with the **last** winning;
+* every separator normalised to exactly one space.
 
-Guarded rather than answered, in two places, so the wrong answer is not shipped:
+Measured against 19beta1 on each axis. So two documents equal as `jsonb` are already the same
+string, and text's comparison **is** jsonb's. That is precisely the condition ADR 0042 permits
+sharing under — the rule is not "never share", it is "share only when the comparison comes too".
 
-* the **lowerer** refuses when either operand is syntactically a cast or typed string to
-  `json`/`jsonb`, which is where `'{"a":1}'::jsonb` is still visible — a literal cast is folded
-  away before the executor sees it;
-* the **evaluator** refuses when either operand is an `Expr::Ordinal` whose `ty` is `Json` or
-  `Jsonb`, which is how a jsonb *column* reaches it.
+It is the same argument the six geometric shapes settled: the canonicalisation is the subject and
+the storage is not.
 
-Both give the `0A000` the operator gave before `||` over text existed. A value that arrives as a
-bound parameter is the residue and is not guarded — nothing in the suite sends one.
+## What was actually missing, and is now done
 
-## What the unit is
+`||`. The operator means six things and is told apart by its operands — hstore merge, ltree
+concatenation, tsvector concatenation-with-renumbering, array append, string concatenation, and
+**jsonb document merge**. The last had no implementation, so it was refused.
 
-1. `Datum::Jsonb(String)` beside `Datum::Text`, carrying the normalised document.
-2. Its comparison: key order and whitespace insignificant, so `=` and `ORDER BY` mean what
-   PostgreSQL means. This is the ADR 0042 obligation and the reason the variant has to exist.
-3. `||` as document merge, right operand winning on a duplicate key — captured, not reasoned.
-4. Delete both guards above and the corpus's declared refusal rows; the ratchet will insist.
-5. The same question for `json`, which is **not** `jsonb`: it preserves key order, whitespace and
-   duplicate keys, so it may genuinely be a `text` — and if so that should be written down rather
-   than left as an accident.
+`value::json::concat` implements it, from a capture of every combination on 19beta1:
 
-## What to capture first
+| left | right | answer |
+|---|---|---|
+| `{"a":1,"b":2}` | `{"b":3,"c":4}` | `{"a": 1, "b": 3, "c": 4}` — the **right** wins a shared key |
+| `{"a":{"x":1}}` | `{"a":{"y":2}}` | `{"a": {"y": 2}}` — **not** a deep merge |
+| `[1,2]` | `[3]` | `[1, 2, 3]` |
+| `[1,2]` | `3` | `[1, 2, 3]` |
+| `{"a":1}` | `[1]` | `[{"a": 1}, 1]` |
+| `"x"` | `"y"` | `["x", "y"]` |
+| `null` | `null` | `[null, null]` |
 
-`||`, `=`, `ORDER BY`, `->`/`->>`, `@>` and `jsonb_build_object` over documents that differ only in
-key order, in whitespace, and in duplicate keys — the three axes on which `jsonb` and `text`
-disagree. Then `json` beside each, which should differ from `jsonb` on all three.
+One special case and one rule: both objects merge; otherwise each side reads as an array and they
+concatenate.
+
+Two things measurement settled that reasoning would have got wrong:
+
+* **`jsonb || text` is not an operator.** A jsonb column beside a text column falls back to
+  `text || text` and answers `{"a": 1}x`. A merge that fired on *one* jsonb operand would corrupt
+  ordinary concatenation, so both sides must be jsonb — with a bare literal counting, because
+  `'{"a":1}'::jsonb || 'tail'` coerces the literal and fails `22P02`.
+* **`json` has no `||` at all** — `42883 operator does not exist: json || json`. The corpus briefly
+  claimed PostgreSQL concatenated them as text; nobody had measured it.
+
+## What is genuinely left, and it is small
+
+**Ordering.** `ORDER BY` on a `jsonb` column sorts by text here and by type rank there:
+`null < string < number < boolean < array < object`, measured with `row_number()`. Canonical text
+gives the right *equality* and not the right *order*. Nothing in the suite has asked for it; when
+something does, it is a comparison function over the parsed value, not a new representation.
+
+`json`'s own status is unchanged and correct: it keeps key order, whitespace and duplicates, has no
+equality operator on a real server (`42883 operator does not exist: json = json`), and really is a
+validated string.
