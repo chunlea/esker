@@ -2551,11 +2551,6 @@ impl SqlError {
             // reads like a missing feature ("not automatically updatable") is spelled by
             // PostgreSQL as an object that is not in the state the statement needs.
             SqlError::ViewNotUpdatable { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-            // `42P16` for both: a replacement that renames or drops a column is an invalid *table
-            // definition*, which is the class PostgreSQL puts a view's shape rules in.
-            SqlError::CannotRenameViewColumn { .. } | SqlError::CannotDropViewColumns => {
-                sqlstate::INVALID_TABLE_DEFINITION
-            }
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference
@@ -2835,7 +2830,12 @@ impl SqlError {
             SqlError::ExclusionViolation { .. } | SqlError::ExclusionNotCreatable { .. } => {
                 sqlstate::EXCLUSION_VIOLATION
             }
-            SqlError::MultiplePrimaryKeys(_) => sqlstate::INVALID_TABLE_DEFINITION,
+            // `42P16` for all three: a table with two primary keys, and a view replacement that
+            // renames or drops a column, are each an invalid *table definition* — which is the
+            // class PostgreSQL puts a view's shape rules in too.
+            SqlError::MultiplePrimaryKeys(_)
+            | SqlError::CannotRenameViewColumn { .. }
+            | SqlError::CannotDropViewColumns => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }
