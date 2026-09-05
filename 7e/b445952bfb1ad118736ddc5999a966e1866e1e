@@ -1,0 +1,78 @@
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 53-57,65-76
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 1462-1480,1483,1500-1509,1513-1515,1517
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 86-93,626-631,639,3278-3281
+crates/esker-sql/src/exec/redrive.rs
+  h_44076b318daf9c 289-292
+crates/esker-sql/src/lib.rs
+  h_44076b318daf9c 59
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 234-239,322-327,521
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 84-96,132,164,222-228,350,416,526-530,533,539,541-546
+crates/esker-sql/src/session.rs
+  h_44076b318daf9c 3-8,21,26,28,30-80,117-118,126,134-159,161,173
+crates/esker-sql/tests/advisory_lock.rs
+  h_44076b318daf9c 139-145
+crates/esker-sql/tests/bind_harness/mod.rs
+  h_44076b318daf9c 82-87
+crates/esker-sql/tests/cluster/mod.rs
+  h_44076b318daf9c 189-195
+crates/esker-sql/tests/ddl.rs
+  h_44076b318daf9c 56,109
+crates/esker-sql/tests/discard_all.rs
+  h_44076b318daf9c 145-150
+crates/esker-sql/tests/insert.rs
+  h_44076b318daf9c 46
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 380-386
+crates/esker-sql/tests/parameters.rs
+  h_44076b318daf9c 33-38
+crates/esker-sql/tests/parity_harness/mod.rs
+  h_44076b318daf9c 279-280
+crates/esker-sql/tests/pd_wiring.rs
+  h_44076b318daf9c 69
+crates/esker-sql/tests/pgwire_tls.rs
+  h_44076b318daf9c 37-41
+crates/esker-sql/tests/psql_smoke.rs
+  h_44076b318daf9c 28-32,107-111,567-571,573-579
+crates/esker-sql/tests/redrive.rs
+  h_44076b318daf9c 188
+crates/esker-sql/tests/redrive_live.rs
+  h_44076b318daf9c 71-76
+crates/esker-sql/tests/routing.rs
+  h_44076b318daf9c 638
+crates/esker-sql/tests/routing_aggregate.rs
+  h_44076b318daf9c 604
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 116-121,418-425
+crates/esker-sql/tests/schema_change.rs
+  h_44076b318daf9c 43,499,785
+crates/esker-sql/tests/select.rs
+  h_44076b318daf9c 35-40
+crates/esker-sql/tests/slt_harness/mod.rs
+  h_44076b318daf9c 140-145
+crates/esker-sql/tests/sqllogictest.rs
+  h_44076b318daf9c 89-94
+crates/esker-sql/tests/time_machine.rs
+  h_44076b318daf9c 49,125
+crates/esker-sql/tests/time_machine_parity.rs
+  h_44076b318daf9c 159
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 77,774-778
+crates/esker-sql/tests/update_delete.rs
+  h_44076b318daf9c 31-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7eb445952bfb1ad118736ddc5999a966e1866e1e",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
