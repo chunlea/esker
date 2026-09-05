@@ -294,15 +294,30 @@ fn named_relations<'a>(
         if entry.derived.is_some() || entry.values.is_some() || entry.function.is_some() {
             continue;
         }
-        // The relation as the catalog knows it, which may be written `schema.relation`.
-        let relation = entry.name.rsplit('.').next().unwrap_or(&entry.name);
+        // **Both sides are compared at the same qualification**, which is the half that was
+        // missing. A `TableDef`'s name is unique across the tenant and therefore *qualified*
+        // (`rails_pg_schema_user1.schema_things`), while what a statement writes is usually bare —
+        // so a bare-to-qualified comparison matched nothing for every table outside the session's
+        // default schema, and a `$1` compared with `id integer` was typed against nothing and fell
+        // back to text: `operator does not exist: integer = text`
+        // (`schema_authorization_test.rb`'s `test_auth_with_bind`).
+        //
+        // A qualified entry is matched whole, so that `FROM a.t JOIN b.t` cannot resolve both of
+        // its halves to whichever `t` the list happens to hold first.
         let Some(def) = tables
             .iter()
-            .find(|candidate| candidate.name == relation)
+            .find(|candidate| {
+                if entry.name.contains(crate::catalog::SCHEMA_SEPARATOR) {
+                    candidate.name == entry.name
+                } else {
+                    bare(&candidate.name) == entry.name
+                }
+            })
             .map(AsRef::as_ref)
         else {
             continue;
         };
+        let relation = bare(&entry.name);
         named.push((
             entry.alias.clone().unwrap_or_else(|| relation.to_owned()),
             def,
@@ -316,8 +331,23 @@ fn named_relations<'a>(
 fn under_own_names(tables: &[std::sync::Arc<TableDef>]) -> Vec<Named<'_>> {
     tables
         .iter()
-        .map(|def| (def.name.clone(), def.as_ref()))
+        // **Bare**, because that is the name a predicate writes: `UPDATE schema_things SET … WHERE
+        // schema_things.id = $1` qualifies with the relation, never with its schema.
+        .map(|def| (bare(&def.name).to_owned(), def.as_ref()))
         .collect()
+}
+
+/// A relation name without its schema.
+///
+/// **The separator is a NUL, not a dot** (`catalog::SCHEMA_SEPARATOR`), and getting that wrong is
+/// invisible in the one schema everybody tests in: `catalog::qualify` leaves a `public` relation's
+/// name *bare*, so a dot-splitting version of this strips nothing and still compares equal there.
+/// It is every other schema that breaks, which is why this surfaced only under
+/// `SET SESSION AUTHORIZATION`.
+fn bare(name: &str) -> &str {
+    name.rsplit(crate::catalog::SCHEMA_SEPARATOR)
+        .next()
+        .unwrap_or(name)
 }
 
 fn walk_select(
