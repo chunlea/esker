@@ -1,0 +1,14 @@
+crates/esker-cli/src/bench_mpp/mod.rs
+  h_44076b318daf9c 99-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bda9deabea8da5f7e8901aa58825caf6df0ea1ef",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
