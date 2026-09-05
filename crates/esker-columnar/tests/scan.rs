@@ -273,6 +273,7 @@ fn pruning_changes_nothing_but_the_work() {
                 prune: false,
                 widening: None,
                 visibility: None,
+                range: None,
             },
         )
         .unwrap();

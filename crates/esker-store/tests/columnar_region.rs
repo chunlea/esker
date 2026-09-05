@@ -122,6 +122,7 @@ fn read(slot: &ColumnarSlot, db: &Db, ts: u64) -> Vec<(i64, String)> {
         &ScanOptions {
             prune: true,
             widening: None,
+            range: None,
             visibility: Some(Visibility {
                 key_columns: vec![key_column],
                 ts_column,
