@@ -1490,7 +1490,13 @@ impl Executor {
         // running them here is what puts the fallback in the *same* transaction at the *same*
         // snapshot as the plan it replaces.
         if let Some(source) = self.fragments.clone() {
-            fragment::resolve(&mut planned.node, &*source, txn.start_ts());
+            fragment::resolve(
+                &mut planned.node,
+                &*txn,
+                self.tenant,
+                &*source,
+                txn.start_ts(),
+            );
         }
         // And the subqueries, for the same reason and in the same place: a `Cursor` has a row and
         // no transaction, so running them here is what puts their answers in the *same*
@@ -1893,14 +1899,19 @@ impl Executor {
             .from
             .as_ref()
             .is_some_and(|from| from.derived.is_some());
+        // **Joins reach the router now, and most of them still refuse.** They were excluded
+        // outright, which meant a joined plan carried no engine decision and `EXPLAIN` printed no
+        // `Engine:` line at all — a third deliberate silence where ADR 0040 Decision 3 lists two,
+        // and the one a reader debugging "why is my join not on the columns" meets
+        // (`docs/plans/phase-16-mpp.md` §J1). `consider` now names which rule refused.
         if let Some(table) = table.as_deref()
-            && inners.is_empty()
             && !derived_from
         {
             fragment::route(
                 txn,
                 self.tenant,
                 table,
+                &inner_refs,
                 self.fragments.as_deref(),
                 self.engine(),
                 &mut planned,
@@ -1921,7 +1932,13 @@ impl Executor {
                     // run, and a plan that only described one would be reporting an estimate this
                     // node does not have.
                     if let Some(source) = self.fragments.clone() {
-                        fragment::resolve(&mut planned.node, &*source, txn.start_ts());
+                        fragment::resolve(
+                            &mut planned.node,
+                            txn,
+                            self.tenant,
+                            &*source,
+                            txn.start_ts(),
+                        );
                     }
                     subquery::resolve(&mut planned.node, txn, self.tenant)?;
                     let mut cursor = cursor::Cursor::open(txn, self.tenant, &planned.node)?;

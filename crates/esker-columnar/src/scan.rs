@@ -484,7 +484,9 @@ fn needed_slots(fragment: &Fragment, width: usize) -> Vec<bool> {
                     stack.push(left);
                     stack.push(right);
                 }
-                Expr::Not(operand) | Expr::IsNull { operand, .. } => stack.push(operand),
+                Expr::Not(operand) | Expr::IsNull { operand, .. } | Expr::In { operand, .. } => {
+                    stack.push(operand);
+                }
             }
         }
     }

@@ -47,7 +47,7 @@ use crate::fragment::{Answer, FragmentSource, Shard};
 use crate::plan::routing::{
     Columnar, Decision, Engine, Finish, Output, Reason, Run, Setting, Shape,
 };
-use crate::plan::{AggregateFunc, AggregateSpec, Expr, Node, routing};
+use crate::plan::{AggregateFunc, AggregateSpec, BinaryOp, Expr, Node, Probe, routing};
 use crate::value::{Datum, PgDatum};
 
 /// Built, or the decision that says why not.
@@ -99,11 +99,12 @@ pub(super) fn route(
     txn: &dyn Txn,
     tenant: u64,
     table: &TableDef,
+    inners: &[&TableDef],
     source: Option<&dyn FragmentSource>,
     setting: Setting,
     planned: &mut Planned,
 ) {
-    let decision = match consider(txn, tenant, table, source, setting, planned) {
+    let decision = match consider(txn, tenant, table, inners, source, setting, planned) {
         Ok(built) => return apply(planned, built),
         Err(reason) => reason,
     };
@@ -160,75 +161,56 @@ fn replace_aggregate(node: &mut Node, replacement: Node) {
     clippy::too_many_lines,
     reason = "one rule per block, each with its reason"
 )]
-fn consider(
-    txn: &dyn Txn,
-    tenant: u64,
-    table: &TableDef,
-    source: Option<&dyn FragmentSource>,
-    setting: Setting,
-    planned: &Planned,
-) -> Routed<Built> {
-    if setting == Setting::Row {
-        return Err(Decision::rows(Reason::Override(Setting::Row)));
-    }
-    let Some(source) = source else {
-        return Err(Decision::rows(Reason::NoFragmentService));
-    };
-    // ADR 0022 Decision 2 rule 2, and the only rule here that is about a wrong answer rather than
-    // a slow one: a learner has not seen this transaction's uncommitted writes, so a read that
-    // must see them cannot be answered there at any price.
-    if txn.has_written() {
-        return Err(Decision::rows(Reason::NotExpressible(
-            "a read of a transaction's own writes",
-        )));
-    }
-
-    // **Before any question about the plan's shape.** A table nobody asked for a columnar copy of
-    // has no second engine to choose between, and every reason after this one describes a *choice*
-    // — which `EXPLAIN` then prints. Deciding it here is what keeps an ordinary table's plan from
-    // growing a line about a feature it is not using.
-    let replicas = replicas(txn, tenant, table.id);
-    if replicas == 0 {
-        return Err(Decision::rows(Reason::NotAsked));
-    }
-
-    let Some(aggregate) = find_aggregate(&planned.node) else {
-        return Err(Decision::rows(Reason::NotExpressible("this plan's shape")));
-    };
-    let Node::Aggregate {
-        input,
-        keys,
-        aggregates,
-        having,
-        grouped,
-    } = aggregate
-    else {
-        unreachable!("find_aggregate returns an Aggregate");
-    };
-
-    // The scan under it, and the filter between them if there is one.
-    let (filter, scan) = match &**input {
-        Node::Filter { input, predicate } => (Some(predicate), &**input),
-        other => (None, other),
-    };
-    let Node::SeqScan {
-        table_id, narrowed, ..
+/// Which of the semi-join rewrite's conditions this join fails, as `EXPLAIN` will print it.
+///
+/// `docs/plans/phase-16-mpp.md` §J3. A join reaches the columnar path by becoming a **semi-join**:
+/// the inner side's key set is read on this node and pushed into the outer table's fragment as a
+/// membership test. That substitution is exact only under conditions the plan tree already
+/// records, and each of them refuses with its own sentence — because a refusal for the wrong
+/// reason is a bug that still passes a test which only checks that it fell back.
+///
+/// `None` is no objection — the shape becomes a semi-join and [`absorb_join`] builds it.
+fn why_this_join_stays_on_rows(scan: &Node) -> Option<&'static str> {
+    let Node::NestedLoop {
+        left_join,
+        probe,
+        residual,
+        inner_view,
+        inner_plan,
+        ..
     } = scan
     else {
-        // A point get or an index lookup, which rule 1 keeps on rows; a join or a catalog view,
-        // which no fragment expresses. Both answer `Bounded` only when they really are bounded.
-        return Err(Decision::rows(match scan {
-            Node::PointGet { .. } | Node::IndexLookup { .. } => Reason::Bounded,
-            _ => Reason::NotExpressible("this access path"),
-        }));
+        return Some("this access path");
     };
-    if *narrowed {
-        return Err(Decision::rows(Reason::Bounded));
+    if *left_join {
+        // A LEFT JOIN keeps an unmatched outer row with every inner column NULL; a filter removes
+        // it. The two answers differ by exactly the rows the join exists to preserve.
+        return Some("a LEFT JOIN, whose unmatched rows a filter would drop");
     }
+    if inner_view.is_some() || inner_plan.is_some() {
+        return Some("a join whose inner side is a catalog view or a derived table");
+    }
+    if !matches!(probe, Probe::PrimaryKey { .. } | Probe::UniqueIndex { .. }) {
+        // The condition the whole rewrite rests on: only a unique inner key makes "at most one
+        // inner row per outer row" true, and only that makes a membership test preserve a count.
+        return Some("a join on a non-unique inner column, where one outer row may match many");
+    }
+    if residual.is_some() {
+        return Some("a join with a condition the probe did not express");
+    }
+    None
+}
 
-    // Every table column the fragment must read, in table order: the grouping keys, the aggregate
-    // arguments, and everything the filter names. The projection is the only place a table column
-    // index appears in a fragment, so this list is also what decides the ratio.
+/// Every table column the fragment must read, in table order and deduplicated.
+///
+/// The grouping keys, the aggregate arguments, and everything the filter names. The projection is
+/// the only place a table column index appears in a fragment (`docs/DESIGN.md` §16.2), so this
+/// list is also what decides the ratio.
+fn columns_the_fragment_reads(
+    keys: &[Expr],
+    aggregates: &[AggregateSpec],
+    filter: Option<&Expr>,
+) -> Routed<Vec<usize>> {
     let mut columns: Vec<usize> = Vec::new();
     for key in keys {
         columns.push(ordinal(key).ok_or_else(|| {
@@ -252,7 +234,386 @@ fn consider(
     }
     columns.sort_unstable();
     columns.dedup();
+    Ok(columns)
+}
 
+/// The rules that hold whatever the plan looks like, answered before its shape is examined.
+///
+/// **Order matters and is the argument.** A table nobody asked for a columnar copy of has no
+/// second engine to choose between, and every reason after this one describes a *choice* — which
+/// `EXPLAIN` then prints. Deciding it here is what keeps an ordinary table's plan from growing a
+/// line about a feature it is not using (ADR 0040 Decision 3's first deliberate silence).
+fn before_the_shape<'a>(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    source: Option<&'a dyn FragmentSource>,
+    setting: Setting,
+) -> Routed<(&'a dyn FragmentSource, u8)> {
+    if setting == Setting::Row {
+        return Err(Decision::rows(Reason::Override(Setting::Row)));
+    }
+    let Some(source) = source else {
+        return Err(Decision::rows(Reason::NoFragmentService));
+    };
+    // ADR 0022 Decision 2 rule 2, and the only rule here that is about a wrong answer rather than
+    // a slow one: a learner has not seen this transaction's uncommitted writes, so a read that
+    // must see them cannot be answered there at any price.
+    if txn.has_written() {
+        return Err(Decision::rows(Reason::NotExpressible(
+            "a read of a transaction's own writes",
+        )));
+    }
+    let replicas = replicas(txn, tenant, table.id);
+    if replicas == 0 {
+        return Err(Decision::rows(Reason::NotAsked));
+    }
+    Ok((source, replicas))
+}
+
+/// The unbounded sequential scan a fragment needs, or the reason this access path is not one.
+///
+/// A point get or an index lookup is what ADR 0022 rule 1 keeps on rows; a join names which of the
+/// semi-join conditions refused it; a catalog view is a shape no fragment expresses. Each answers
+/// `Bounded` only when it really is bounded.
+fn the_scan_under_it(scan: &Node) -> Routed<(u64, bool)> {
+    match scan {
+        Node::SeqScan {
+            table_id, narrowed, ..
+        } => Ok((*table_id, *narrowed)),
+        Node::PointGet { .. } | Node::IndexLookup { .. } => Err(Decision::rows(Reason::Bounded)),
+        Node::NestedLoop { .. } => Err(Decision::rows(Reason::NotExpressible(
+            why_this_join_stays_on_rows(scan).unwrap_or("a join this build cannot express"),
+        ))),
+        _ => Err(Decision::rows(Reason::NotExpressible("this access path"))),
+    }
+}
+
+/// The conjuncts of an `AND` chain, flattened. A non-`AND` expression is one conjunct.
+fn conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut out = conjuncts(left);
+            out.extend(conjuncts(right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+/// Rebuilds `expr` with every column position shifted down by `outer_width`.
+///
+/// **A whitelist, not a general walk, and that is deliberate.** A rebase that missed one
+/// expression variant would leave an ordinal pointing at the wrong column and return a wrong
+/// answer silently — the failure this whole milestone exists to avoid. So exactly two shapes are
+/// accepted, `column op literal` and its mirror, and every other conjunct refuses. `d.bucket = 1`
+/// is the shape the measured query has; a richer grammar is worth having only with a test per
+/// variant behind it.
+fn rebased_onto_the_inner_row(expr: &Expr, outer_width: usize) -> Option<Expr> {
+    let Expr::Binary { op, left, right } = expr else {
+        return None;
+    };
+    let shift = |side: &Expr| -> Option<Expr> {
+        match side {
+            Expr::Ordinal { at, ty, typmod } => Some(Expr::Ordinal {
+                at: at.checked_sub(outer_width)?,
+                ty: *ty,
+                typmod: *typmod,
+            }),
+            Expr::Literal(literal) => Some(Expr::Literal(literal.clone())),
+            _ => None,
+        }
+    };
+    match (&**left, &**right) {
+        (Expr::Ordinal { .. }, Expr::Literal(_)) | (Expr::Literal(_), Expr::Ordinal { .. }) => {
+            Some(Expr::Binary {
+                op: *op,
+                left: Box::new(shift(left)?),
+                right: Box::new(shift(right)?),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Every column position in `expr`, as a set.
+fn ordinals_of(expr: &Expr) -> Vec<usize> {
+    let mut out = Vec::new();
+    collect_columns(expr, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Splits the join's `WHERE` by which side each conjunct names.
+///
+/// An outer-only conjunct goes into the fragment; an inner-only one filters the key set; one
+/// naming **both** is a condition over the *pair*, which is not a semi-join at all and refuses.
+fn split_by_side(
+    filter: Option<&Expr>,
+    outer_filter: Option<&Expr>,
+    outer_width: usize,
+) -> Routed<(Vec<Expr>, Vec<Expr>)> {
+    let plain = |reason: &'static str| Decision::rows(Reason::NotExpressible(reason));
+    let mut outer_side: Vec<Expr> = outer_filter.into_iter().cloned().collect();
+    let mut inner_side: Vec<Expr> = Vec::new();
+    for conjunct in filter.map(conjuncts).unwrap_or_default() {
+        let ordinals = ordinals_of(conjunct);
+        if ordinals.iter().all(|at| *at < outer_width) {
+            outer_side.push(conjunct.clone());
+        } else if ordinals.iter().all(|at| *at >= outer_width) {
+            inner_side.push(
+                rebased_onto_the_inner_row(conjunct, outer_width)
+                    .ok_or_else(|| plain("a join condition over a shape this build cannot move"))?,
+            );
+        } else {
+            return Err(plain("a join condition naming both sides"));
+        }
+    }
+    Ok((outer_side, inner_side))
+}
+
+/// What a join, absorbed, leaves for the fragment to be built from.
+struct Absorbed {
+    /// The outer table's scan.
+    table_id: u64,
+    narrowed: bool,
+    /// The predicate the fragment carries: the outer side's own, and every conjunct of the
+    /// join's `WHERE` that names only outer columns.
+    filter: Option<Expr>,
+    /// How to read the inner key set, when a join was absorbed.
+    semi: Option<routing::SemiJoin>,
+    /// The outer table column the membership test is applied to.
+    outer_column: Option<usize>,
+}
+
+/// Turns `Aggregate { [Filter] { NestedLoop … } }` into a scan the fragment can express, by
+/// rewriting the join as a **semi-join** (`docs/plans/phase-16-mpp.md` §J3).
+///
+/// Every refusal names its own condition, because a refusal for the wrong reason is a bug that
+/// still passes a test which only checks that the query fell back.
+fn absorb_join(
+    scan: &Node,
+    filter: Option<&Expr>,
+    tenant: u64,
+    outer: &TableDef,
+    inners: &[&TableDef],
+) -> Routed<Absorbed> {
+    let plain = |reason: &'static str| Decision::rows(Reason::NotExpressible(reason));
+    let Node::NestedLoop {
+        outer: outer_side,
+        inner_table_id,
+        inner_columns,
+        probe,
+        ..
+    } = scan
+    else {
+        return Err(plain(
+            why_this_join_stays_on_rows(scan).unwrap_or("this access path"),
+        ));
+    };
+    if let Some(refusal) = why_this_join_stays_on_rows(scan) {
+        return Err(plain(refusal));
+    }
+
+    // The outer side must itself be the shape a fragment expresses: an unbounded scan, with its
+    // own filter if it has one.
+    let (outer_filter, outer_scan) = match &**outer_side {
+        Node::Filter { input, predicate } => (Some(predicate), &**input),
+        other => (None, other),
+    };
+    let (table_id, narrowed) = the_scan_under_it(outer_scan)?;
+
+    let inner = inners
+        .iter()
+        .find(|def| def.id == *inner_table_id)
+        .ok_or_else(|| plain("a join whose inner table this node cannot resolve"))?;
+    if !inner.child_scans.is_empty() {
+        // A scan of an inherited table returns its children's rows too, and the key plan built
+        // below reads only the table's own range. Refused rather than silently reading less.
+        return Err(plain("a join whose inner table has children"));
+    }
+    let [key_column] = inner.primary_key[..] else {
+        return Err(plain(
+            "a join whose inner key is not a single primary-key column",
+        ));
+    };
+    let key_def = inner
+        .columns
+        .get(key_column)
+        .ok_or_else(|| plain("a join whose inner key names no column"))?;
+
+    let (fragment_conjuncts, key_conjuncts) =
+        split_by_side(filter, outer_filter, outer.columns.len())?;
+
+    let (Probe::PrimaryKey { outer: at } | Probe::UniqueIndex { outer: at, .. }) = probe else {
+        return Err(plain(
+            why_this_join_stays_on_rows(scan).unwrap_or("this access path"),
+        ));
+    };
+
+    let (start, end) = esker_keys::row::table_row_range(tenant, inner.id);
+    let mut keys = Node::SeqScan {
+        table_id: inner.id,
+        columns: inner_columns.clone(),
+        start,
+        end,
+        narrowed: false,
+        inherited: Vec::new(),
+    };
+    if let Some(predicate) = key_conjuncts
+        .into_iter()
+        .reduce(|left, right| Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    {
+        keys = Node::Filter {
+            input: Box::new(keys),
+            predicate,
+        };
+    }
+    let keys = Node::Project {
+        input: Box::new(keys),
+        exprs: vec![Expr::Ordinal {
+            at: key_column,
+            ty: key_def.ty,
+            typmod: key_def.typmod,
+        }],
+    };
+
+    Ok(Absorbed {
+        table_id,
+        narrowed,
+        filter: fragment_conjuncts
+            .into_iter()
+            .reduce(|left, right| Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+        semi: Some(routing::SemiJoin {
+            keys: Box::new(keys),
+            outer_slot: 0,
+            inner_table: inner.name.clone(),
+        }),
+        outer_column: Some(*at),
+    })
+}
+
+/// One columnar type per projection slot, or the refusal for a column with no columnar type.
+fn slot_types_of(table: &TableDef, columns: &[usize]) -> Routed<Vec<esker_columnar::ColumnType>> {
+    let types: Vec<esker_columnar::ColumnType> = columns
+        .iter()
+        .filter_map(|column| {
+            table
+                .columns
+                .get(*column)
+                .and_then(|def| column_type(def.ty))
+        })
+        .collect();
+    if types.len() == columns.len() {
+        Ok(types)
+    } else {
+        Err(Decision::rows(Reason::NotExpressible(
+            "a column this table's record does not describe",
+        )))
+    }
+}
+
+/// The scan a fragment will be built over: a plain one absorbs nothing, a join becomes a
+/// semi-join or refuses saying which rule stopped it (`docs/plans/phase-16-mpp.md` §J3).
+fn absorbed_scan(
+    scan: &Node,
+    filter: Option<&Expr>,
+    tenant: u64,
+    table: &TableDef,
+    inners: &[&TableDef],
+) -> Routed<Absorbed> {
+    match scan {
+        Node::NestedLoop { .. } => absorb_join(scan, filter, tenant, table, inners),
+        other => {
+            let (table_id, narrowed) = the_scan_under_it(other)?;
+            Ok(Absorbed {
+                table_id,
+                narrowed,
+                filter: filter.cloned(),
+                semi: None,
+                outer_column: None,
+            })
+        }
+    }
+}
+
+/// The fragment's projection: what the aggregate needs, plus the outer join column.
+///
+/// The membership test a semi-join pushes down reads that column, and the projection is the only
+/// place a table column index appears in a fragment (`docs/DESIGN.md` §16.2) — so a join that did
+/// not add it here would name a slot the fragment never asked for.
+fn projected_columns(
+    keys: &[Expr],
+    aggregates: &[AggregateSpec],
+    filter: Option<&Expr>,
+    outer_column: Option<usize>,
+) -> Routed<Vec<usize>> {
+    let mut columns = columns_the_fragment_reads(keys, aggregates, filter)?;
+    if let Some(column) = outer_column {
+        columns.push(column);
+        columns.sort_unstable();
+        columns.dedup();
+    }
+    Ok(columns)
+}
+
+fn consider(
+    txn: &dyn Txn,
+    tenant: u64,
+    table: &TableDef,
+    inners: &[&TableDef],
+    source: Option<&dyn FragmentSource>,
+    setting: Setting,
+    planned: &Planned,
+) -> Routed<Built> {
+    let (source, replicas) = before_the_shape(txn, tenant, table, source, setting)?;
+
+    let Some(aggregate) = find_aggregate(&planned.node) else {
+        return Err(Decision::rows(Reason::NotExpressible("this plan's shape")));
+    };
+    let Node::Aggregate {
+        input,
+        keys,
+        aggregates,
+        having,
+        grouped,
+    } = aggregate
+    else {
+        unreachable!("find_aggregate returns an Aggregate");
+    };
+
+    // The scan under it, and the filter between them if there is one.
+    let (filter, scan) = match &**input {
+        Node::Filter { input, predicate } => (Some(predicate), &**input),
+        other => (None, other),
+    };
+    let absorbed = absorbed_scan(scan, filter, tenant, table, inners)?;
+    let Absorbed {
+        table_id,
+        narrowed,
+        filter,
+        mut semi,
+        outer_column,
+    } = absorbed;
+    if narrowed {
+        return Err(Decision::rows(Reason::Bounded));
+    }
+
+    let filter = filter.as_ref();
+    let columns = projected_columns(keys, aggregates, filter, outer_column)?;
     let slot = |column: usize| -> u32 {
         u32::try_from(columns.binary_search(&column).unwrap_or(0)).unwrap_or(0)
     };
@@ -273,27 +634,14 @@ fn consider(
         .filter_map(|key| ordinal(key).map(&slot))
         .collect();
 
-    // One columnar type per projection slot, for the comparison check below.
-    let slot_types: Vec<esker_columnar::ColumnType> = columns
-        .iter()
-        .filter_map(|column| {
-            table
-                .columns
-                .get(*column)
-                .and_then(|def| column_type(def.ty))
-        })
-        .collect();
-    if slot_types.len() != columns.len() {
-        return Err(Decision::rows(Reason::NotExpressible(
-            "a column this table's record does not describe",
-        )));
+    let slot_types = slot_types_of(table, &columns)?;
+
+    if let (Some(semi), Some(column)) = (semi.as_mut(), outer_column) {
+        semi.outer_slot = slot(column);
     }
 
     let mut fragment = esker_columnar::Fragment::aggregate(
-        esker_columnar::TableRef {
-            tenant,
-            table_id: *table_id,
-        },
+        esker_columnar::TableRef { tenant, table_id },
         projection,
         group_by,
         asks,
@@ -330,7 +678,7 @@ fn consider(
     }
     Ok(Built {
         columnar: Columnar {
-            table_id: *table_id,
+            table_id,
             table: planned.table.clone(),
             fragment,
             outputs,
@@ -339,6 +687,7 @@ fn consider(
             shards,
             fallback: Box::new(fallback),
             run: None,
+            semi_join: semi,
         },
         having: having.clone(),
     })
@@ -932,8 +1281,28 @@ fn replicas(txn: &dyn Txn, tenant: u64, table_id: u64) -> u8 {
 /// it finds unresolved rather than answering an empty result. Doing it here also means the
 /// fallback runs *in the same transaction, at the same snapshot* — the whole of why a routing
 /// decision cannot change an answer.
-pub(super) fn resolve(node: &mut Node, source: &dyn FragmentSource, ts: u64) {
+pub(super) fn resolve(
+    node: &mut Node,
+    txn: &dyn Txn,
+    tenant: u64,
+    source: &dyn FragmentSource,
+    ts: u64,
+) {
     if let Node::Columnar(columnar) = node {
+        // **The key set, read here and not while planning.** Planning does no I/O; this runs in
+        // the same transaction at the same snapshot as both the fragment and the fallback, which
+        // is what makes absorbing a join unable to change an answer
+        // (`docs/plans/phase-16-mpp.md` §J2).
+        if let Err(why) = push_the_semi_join_down(columnar, txn, tenant) {
+            columnar.decision = Decision::rows(Reason::Refused(why));
+            columnar.run = Some(Run {
+                asked: 0,
+                answered: 0,
+                stats: ScanStats::default(),
+                rows: None,
+            });
+            return;
+        }
         let run = evaluate(columnar, source, ts);
         columnar.run = Some(run);
         // **The node stays even when it fell back.** Replacing it with its own fallback would
@@ -948,9 +1317,65 @@ pub(super) fn resolve(node: &mut Node, source: &dyn FragmentSource, ts: u64) {
         | Node::Project { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
-        | Node::Distinct { input } => resolve(input, source, ts),
+        | Node::Distinct { input } => resolve(input, txn, tenant, source, ts),
         _ => {}
     }
+}
+
+/// Reads the inner key set and folds it into the fragment's filter as an `Expr::In`.
+///
+/// Does nothing for a fragment that absorbed no join. A refusal here is a *reason*, not an error:
+/// the caller answers it with the row plan the node already carries, at this same snapshot.
+fn push_the_semi_join_down(
+    columnar: &mut Columnar,
+    txn: &dyn Txn,
+    tenant: u64,
+) -> Result<(), &'static str> {
+    let Some(semi) = columnar.semi_join.as_ref() else {
+        return Ok(());
+    };
+    let mut cursor = crate::exec::cursor::Cursor::open(txn, tenant, &semi.keys)
+        .map_err(|_| "the join's inner side could not be read")?;
+    let mut values: Vec<esker_columnar::Value> = Vec::new();
+    while let Some(row) = cursor.next().map_err(|_| "the join's inner side failed")? {
+        // **A NULL key matches nothing**, in the join and in the membership test alike, so it is
+        // dropped rather than carried — and `Expr::In` refuses a list holding one (ADR 0074).
+        let Some(datum) = row.first() else { continue };
+        if matches!(datum, Datum::Null) {
+            continue;
+        }
+        // `datum_to_value` answers `Null` for a vocabulary it cannot carry, and a key silently
+        // turned into a NULL would be a membership test that quietly matched the wrong rows.
+        let value = datum_to_value(datum);
+        if matches!(value, esker_columnar::Value::Null) {
+            return Err("a join key of a type no fragment carries");
+        }
+        values.push(value);
+        if values.len() > esker_columnar::fragment::MAX_IN_VALUES {
+            return Err("a join whose inner side has more keys than a fragment carries");
+        }
+    }
+    // Strictly ascending in `pg_cmp` order, which is what the decoder requires and what gives the
+    // evaluator its binary search (ADR 0074 Decision 2).
+    values.sort_by(esker_columnar::Value::pg_cmp);
+    values.dedup_by(|left, right| left.pg_cmp(right) == std::cmp::Ordering::Equal);
+    if values.is_empty() {
+        // An inner side with no rows means the join matches nothing. `Expr::In` refuses an empty
+        // list, so this is expressed as a predicate that is false for every row instead.
+        columnar.fragment.filter = Some(esker_columnar::Expr::Literal(
+            esker_columnar::Value::Bool(false),
+        ));
+        return Ok(());
+    }
+    let membership = esker_columnar::Expr::In {
+        operand: Box::new(esker_columnar::Expr::Column(semi.outer_slot)),
+        values,
+    };
+    columnar.fragment.filter = Some(match columnar.fragment.filter.take() {
+        Some(existing) => esker_columnar::Expr::And(Box::new(existing), Box::new(membership)),
+        None => membership,
+    });
+    Ok(())
 }
 
 /// Asks every region for its fragment and finishes what comes back.

@@ -284,6 +284,31 @@ pub struct Columnar {
     pub fallback: Box<crate::plan::Node>,
     /// What actually happened, filled in when the plan runs. `None` in a plan that has not.
     pub run: Option<Run>,
+    /// The join this fragment absorbed, when it absorbed one.
+    ///
+    /// A join reaches the columnar path by becoming a **semi-join**: the inner side's key set is
+    /// read here and pushed into the outer table's fragment as a membership test
+    /// (`docs/plans/phase-16-mpp.md` §J2, §J3). The keys cannot be collected while planning —
+    /// planning does no I/O — so what the plan carries is *how to read them*, and
+    /// `crate::exec::fragment::resolve` reads them in the **same transaction at the same
+    /// snapshot** as the fragment and the fallback. That shared snapshot is the whole of why
+    /// absorbing a join cannot change an answer.
+    pub semi_join: Option<SemiJoin>,
+}
+
+/// How to read the key set a semi-join pushes down, and where it goes in the fragment.
+///
+/// Exact only when at most one inner row can match an outer row, which is what
+/// `Probe::PrimaryKey` and `Probe::UniqueIndex` mean and what `crate::exec::fragment` checks
+/// before building one. Every other join shape refuses and says which rule refused it.
+#[derive(Debug, Clone)]
+pub struct SemiJoin {
+    /// A plan producing one column: the inner side's join keys, already filtered.
+    pub keys: Box<crate::plan::Node>,
+    /// The fragment projection slot holding the outer side's join column.
+    pub outer_slot: u32,
+    /// The inner table's name, for `EXPLAIN`.
+    pub inner_table: String,
 }
 
 /// One column of a columnar node's output row.

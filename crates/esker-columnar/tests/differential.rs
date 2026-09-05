@@ -175,6 +175,21 @@ fn eval(expr: &Expr, row: &[Value]) -> Value {
             (Some(false), Some(false)) => Value::Bool(false),
             _ => Value::Null,
         },
+        // **A linear scan on purpose.** The crate's evaluator binary-searches an ascending list;
+        // this one walks it. Two implementations that shared the search would agree about a
+        // mis-sorted list by sharing the same mistake, and the ordering is exactly what the
+        // decoder's "strictly ascending" rule is there to guarantee.
+        Expr::In { operand, values } => {
+            let probe = eval(operand, row);
+            if probe.is_null() {
+                return Value::Null;
+            }
+            Value::Bool(
+                values
+                    .iter()
+                    .any(|value| value.pg_cmp(&probe) == std::cmp::Ordering::Equal),
+            )
+        }
         Expr::Compare { op, left, right } => {
             let (left, right) = (eval(left, row), eval(right, row));
             if left.is_null() || right.is_null() {
