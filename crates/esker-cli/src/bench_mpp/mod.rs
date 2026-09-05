@@ -240,8 +240,11 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     // later, after the load -- says anything is wrong. It was wrong here for exactly that reason,
     // and this is the check that turns it into fifteen seconds and a topology.
     let voters = wait_for_the_replica_target(cluster)?;
+    // Said as "carries", not "reached": with `--peer` the leader has the membership in hand at
+    // once, so a few milliseconds here is the peer list being honoured rather than PD having
+    // done anything. What it rules out is the wedge — a region stuck below its target for ever.
     println!(
-        "every region reached {} voters in {voters:.1?}",
+        "every region carries {} voters after {voters:.1?}",
         esker_pd::schedule::TARGET_REPLICAS
     );
 
