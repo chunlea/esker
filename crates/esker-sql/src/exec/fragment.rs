@@ -637,6 +637,10 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::TextArray
         | Row::Hstore
         | Row::HstoreArray
+        | Row::TsVector
+        | Row::TsQuery
+        | Row::TsVectorArray
+        | Row::TsQueryArray
         | Row::Citext
         | Row::TsRange
         | Row::TstzRange
@@ -729,6 +733,8 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         | Datum::Citext(_)
         | Datum::Ltree(_)
         | Datum::Hstore(_)
+        | Datum::TsVector(_)
+        | Datum::TsQuery(_)
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),

@@ -526,6 +526,19 @@ pub enum SqlError {
     #[error("syntax error in hstore: {0}")]
     HstoreSyntax(String),
 
+    /// `'a b'::tsquery`: two operands with no operator between them — which is exactly what a
+    /// valid `tsvector` looks like, and is the difference between the two grammars.
+    ///
+    /// **`42601`**, and the sentence is `tsqueryin`'s own, measured on 19beta1.
+    #[error("syntax error in tsquery: \"{0}\"")]
+    TsQuerySyntax(String),
+
+    /// `to_tsquery('english', 'fat &')`: an operator with nothing to apply to. A **different**
+    /// sentence from [`SqlError::TsQuerySyntax`] for a different fault, both `42601`, both
+    /// measured rather than reasoned about.
+    #[error("no operand in tsquery: \"{0}\"")]
+    TsQueryNoOperand(String),
+
     /// A string that is not one of an enum's labels.
     ///
     /// **`22P02`, the input-syntax class**, and the sentence is a different one from
@@ -2341,6 +2354,8 @@ impl SqlError {
             // **PostgreSQL's own class for this**: an option its `CREATE DATABASE` does not have
             // is a syntax error there and not a feature refusal. Measured.
             | SqlError::HstoreSyntax(_)
+            | SqlError::TsQuerySyntax(_)
+            | SqlError::TsQueryNoOperand(_)
             | SqlError::UnrecognizedDatabaseOption(_)
             // **A syntax error and not a `22P02`**, which is `ltree`'s own choice on a real
             // server: the input function reports where the path stopped being a path.

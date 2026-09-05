@@ -2811,6 +2811,8 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::NumericArray => 22,
             ColumnType::TextArray => 23,
             ColumnType::HstoreArray => 26,
+            ColumnType::TsVectorArray => 81,
+            ColumnType::TsQueryArray => 82,
             ColumnType::Int8
             | ColumnType::Int4
             | ColumnType::Int2
@@ -2837,6 +2839,8 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Jsonb => 5,
             // A family of its own: an hstore compares only with an hstore.
             ColumnType::Hstore => 27,
+            ColumnType::TsVector => 83,
+            ColumnType::TsQuery => 84,
             // Its own family: a citext compares only with a citext and with an `unknown`.
             ColumnType::Citext => 28,
             // A family each: a range compares only with a range of the same subtype.

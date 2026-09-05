@@ -138,6 +138,15 @@ pub enum CatalogView {
     /// `gist` — and a row for a method nothing can be built with would be a claim rather than a
     /// report. Declared: `hash`, `gin`, `spgist` and `brin` are on a real server and not here.
     PgAm,
+    /// The text-search configurations this node has, which is **not** the thirty-two a real
+    /// server's `initdb` creates.
+    ///
+    /// The same rule `PgAm` above states: a row for a configuration nothing can be tokenised with
+    /// would be a claim rather than a report. `simple` and `english` are the two this node
+    /// implements and the two `captures/pg19_tsvector.txt` exercises; the other thirty are a
+    /// declared divergence in `tests/tsvector.rs` rather than thirty rows that answer `0A000` the
+    /// moment anyone uses them.
+    PgTsConfig,
     /// Every stored function: what `CREATE FUNCTION` wrote and nothing else — this node has no
     /// built-in functions in `pg_proc`, which is a declared divergence.
     PgProc,
@@ -235,7 +244,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 33] = [
+    pub const ALL: [CatalogView; 34] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -248,6 +257,7 @@ impl CatalogView {
         CatalogView::PgExtension,
         CatalogView::PgInherits,
         CatalogView::PgAm,
+        CatalogView::PgTsConfig,
         CatalogView::PgProc,
         CatalogView::PgTrigger,
         CatalogView::PgLanguage,
@@ -288,6 +298,7 @@ impl CatalogView {
             CatalogView::PgAvailableExtensions => "pg_available_extensions",
             CatalogView::PgInherits => "pg_inherits",
             CatalogView::PgAm => "pg_am",
+            CatalogView::PgTsConfig => "pg_ts_config",
             CatalogView::PgProc => "pg_proc",
             CatalogView::PgTrigger => "pg_trigger",
             CatalogView::PgLanguage => "pg_language",
@@ -388,6 +399,7 @@ impl CatalogView {
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
                 CatalogView::PgAm => 23,
+                CatalogView::PgTsConfig => 32,
                 CatalogView::PgProc => 18,
                 CatalogView::PgTrigger => 19,
                 CatalogView::PgLanguage => 20,
@@ -527,6 +539,14 @@ impl CatalogView {
                 ("oid", ColumnType::Int8),
                 ("amname", ColumnType::Text),
                 ("amtype", ColumnType::Text),
+            ],
+            // `cfgname` is a `name` on a real server, `text` here — the trade every `pg_catalog`
+            // column makes. `cfgnamespace` is the oid a client joins to `pg_namespace`, which is
+            // exactly what the capture's query does.
+            CatalogView::PgTsConfig => &[
+                ("oid", ColumnType::Int8),
+                ("cfgname", ColumnType::Text),
+                ("cfgnamespace", ColumnType::Int8),
             ],
             CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
             // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
@@ -849,6 +869,7 @@ impl CatalogView {
                     Datum::Text("i".to_owned()),
                 ],
             ]),
+            CatalogView::PgTsConfig => Ok(pg_ts_config_rows()),
             // **One row per schema**, `public` included — and `public` is not a record: it is a
             // property of the build, the way the available extensions are, so a tenant that has
             // created nothing still reports it.
@@ -950,6 +971,7 @@ impl CatalogView {
             | CatalogView::PgExtension
             | CatalogView::PgInherits
             | CatalogView::PgAm
+            | CatalogView::PgTsConfig
             | CatalogView::PgProc
             | CatalogView::PgTrigger
             | CatalogView::PgLanguage
@@ -2001,6 +2023,34 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
 }
 
 /// PostgreSQL's own oid for the `btree` access method, which is a fixed catalog id there.
+/// The text-search configurations this node has, in the order `pg_ts_config` reports them.
+///
+/// Two, not thirty-two: see [`CatalogView::PgTsConfig`]. `simple` needs no stemmer at all —
+/// lowercase, split, keep everything — and `english` is the one the suite's index expression
+/// names.
+const TS_CONFIGS: &[(i64, &str)] = &[(1, "english"), (2, "simple")];
+
+/// `pg_ts_config`'s rows.
+///
+/// **Both live in `pg_catalog`**, which is where a real server puts them, so the capture's join to
+/// `pg_namespace` finds them.
+///
+/// The oids are this node's own. PostgreSQL fixes `simple`'s in its catalog headers but creates
+/// the language configurations at `initdb` time, so `english`'s is not a constant anywhere and
+/// inventing one would be a claim. Nothing in the suite or the capture reads either.
+fn pg_ts_config_rows() -> Vec<Vec<Datum>> {
+    TS_CONFIGS
+        .iter()
+        .map(|(oid, name)| {
+            vec![
+                Datum::Int8(*oid),
+                Datum::Text((*name).to_owned()),
+                Datum::Int8(super::pg_relations::as_oid(super::RESERVED_SCHEMAS[0].1)),
+            ]
+        })
+        .collect()
+}
+
 const BTREE_AM_OID: i64 = 403;
 
 /// PostgreSQL's own oid for `gist`, likewise fixed.
@@ -2063,6 +2113,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::LtreeArray => "_ltree",
         ColumnType::LQuery => "lquery",
         ColumnType::Hstore => "hstore",
+        ColumnType::TsVector => "tsvector",
+        ColumnType::TsQuery => "tsquery",
         ColumnType::Citext => "citext",
         ColumnType::TsRange => "tsrange",
         ColumnType::TstzRange => "tstzrange",
@@ -2123,6 +2175,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::OidArray => "_oid",
         ColumnType::CitextArray => "_citext",
         ColumnType::HstoreArray => "_hstore",
+        ColumnType::TsVectorArray => "_tsvector",
+        ColumnType::TsQueryArray => "_tsquery",
         ColumnType::Bool => "bool",
         ColumnType::Bytea => "bytea",
         ColumnType::TimestampTz => "timestamptz",
@@ -2205,6 +2259,8 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         // `U` too, measured beside `ltree`'s.
         | ColumnType::LQuery
         | ColumnType::Hstore
+        | ColumnType::TsVector
+        | ColumnType::TsQuery
         | ColumnType::Uuid
         // **And a `macaddr`**, which a real server groups with them rather than with the two
         // addresses it looks like. Measured.
@@ -2219,6 +2275,8 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
@@ -2274,6 +2332,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray
         | ColumnType::TstzRangeArray
         | ColumnType::Int4RangeArray
@@ -2319,6 +2379,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::LQuery => "lquery_in",
         // `hstore_in`, which is the name the adapter reads to decide the type is hstore.
         ColumnType::Hstore => "hstore_in",
+        ColumnType::TsVector => "tsvectorin",
+        ColumnType::TsQuery => "tsqueryin",
         ColumnType::TsRange => "tsrange_in",
         ColumnType::TstzRange => "tstzrange_in",
         ColumnType::Int4Range => "int4range_in",

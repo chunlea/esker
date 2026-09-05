@@ -1782,6 +1782,10 @@ impl Literal {
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
+                | ColumnType::TsVector
+                | ColumnType::TsQuery
+                | ColumnType::TsVectorArray
+                | ColumnType::TsQueryArray
                 // A number or a boolean is not a citext literal either.
                 | ColumnType::Citext
                 // A number or a boolean is not a range literal either.
@@ -1865,6 +1869,10 @@ impl Literal {
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
+                | ColumnType::TsVector
+                | ColumnType::TsQuery
+                | ColumnType::TsVectorArray
+                | ColumnType::TsQueryArray
                 // A number or a boolean is not a citext literal either.
                 | ColumnType::Citext
                 // A number or a boolean is not a range literal either.
@@ -1957,6 +1965,10 @@ impl Literal {
                 // same `42804` every other pair here gives.
                 | ColumnType::Hstore
                 | ColumnType::HstoreArray
+                | ColumnType::TsVector
+                | ColumnType::TsQuery
+                | ColumnType::TsVectorArray
+                | ColumnType::TsQueryArray
                 // A number or a boolean is not a citext literal either.
                 | ColumnType::Citext
                 // A number or a boolean is not a range literal either.

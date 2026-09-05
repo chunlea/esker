@@ -203,6 +203,12 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // engine, which is correct and slower — and the `Option` here is what says so out loud.
         | StoredType::Hstore
         | StoredType::HstoreArray
+        // Not columnar for hstore's reason exactly: text-shaped, and `esker-columnar`'s
+        // `ColumnType` is a separate enum that would have to learn the type first.
+        | StoredType::TsVector
+        | StoredType::TsQuery
+        | StoredType::TsVectorArray
+        | StoredType::TsQueryArray
         // Not columnar either, and for a sharper reason than hstore's: a citext's comparison is
         // not its bytes', so a columnar run that filtered or sorted one would have to fold, and
         // that crate's `ColumnType` has no way to say so.
@@ -275,6 +281,8 @@ fn value_of(datum: &Datum) -> Value {
         | Datum::Array(_)
         | Datum::Citext(_)
         | Datum::Hstore(_)
+        | Datum::TsVector(_)
+        | Datum::TsQuery(_)
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),

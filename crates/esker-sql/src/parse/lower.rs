@@ -4935,17 +4935,23 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // before `lower_column_type` learned to carry the name. Carried here too and resolved once
         // per statement (ADR 0053); the operand goes with it, because the label is what is looked
         // up.
+        // **A *qualified* name is carried too**, which is what `'some text'::schema_1.text` needs:
+        // `schema_test.rb` puts a `CREATE DOMAIN schema_1.text` in a schema of its own and then
+        // casts to it. This required a single part and so refused every one of them with
+        // `0A000 the type schema_1.text is not supported`, while the *column-type* path beside it
+        // resolved the same spelling — the parser was shared and the lookups were not. The name
+        // goes on whole and `value::split_type_name` reads it where the catalog is.
         if lower_type(data_type).is_err()
             && let DataType::Custom(name, modifiers) = data_type
             && modifiers.is_empty()
-            && name.0.len() == 1
+            && (1..=2).contains(&name.0.len())
             && !is_serial_spelling(data_type)
-            && let Some(part) = name.0.first().and_then(|part| part.as_ident())
+            && name.0.iter().all(|part| part.as_ident().is_some())
         {
             return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                 func: plan::CatalogFunc::UserCast,
                 args: vec![
-                    plan::Expr::Literal(plan::Literal::String(ident(part))),
+                    plan::Expr::Literal(plan::Literal::String(name.to_string())),
                     lower_expr(expr)?,
                 ],
             })));
@@ -6906,6 +6912,11 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         DataType::Int2(None) | DataType::SmallInt(None) => ColumnType::Int2,
         DataType::Float4 | DataType::Real => ColumnType::Real,
         DataType::Text => ColumnType::Text,
+        // **`sqlparser` has a variant for each of these**, so they never reach the `Custom` arm
+        // below and a name-based resolver would never have seen them: the refusal was the
+        // catch-all's, which is why it shouted `TSVECTOR` in `sqlparser`'s own Display casing.
+        DataType::TsVector => ColumnType::TsVector,
+        DataType::TsQuery => ColumnType::TsQuery,
         // Neither takes a typmod, and the refusal is the *parser's*: `json(10)` is a syntax error
         // before it reaches here, like `integer(4)`. ADR 0042.
         DataType::JSON => ColumnType::Json,
