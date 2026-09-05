@@ -730,11 +730,13 @@ fn one(pg: &mut Pg, cluster: &Cluster, query: &Query, arm: Arm) -> Result<Run, S
     let plan = pg.query(&format!("EXPLAIN ANALYZE {}", query.sql))?.text();
     let engine = engine_of(&plan);
     // **Asked for columnar, or asked for anything but.** Not an equality against one spelling:
-    // a plan that never reaches the router prints no `Engine:` line at all, and a join is one.
-    // `crates/esker-sql/src/exec/mod.rs`'s guard is `inners.is_empty()`, so `route` is not called
-    // for a join and `EXPLAIN` says nothing about an engine — which is correct behaviour and
-    // *not* one of the two silences ADR 0040 Decision 3 lists. An equality against "rows" here
-    // would fail the join arm of every run and report it as a routing fault.
+    // a plan that never reaches the router prints no `Engine:` line at all — a point read is one.
+    //
+    // A join **was** one, and this comment said so: `crates/esker-sql/src/exec/mod.rs`'s guard was
+    // `inners.is_empty()`, so `route` was never called for a join. The semi-join push-down removed
+    // that guard and taught `EXPLAIN` to name an engine for a join, which is the third silence
+    // ADR 0040 Decision 3 does not list. Both halves of the old note are now false, and leaving
+    // them would have kept the join arm asserting the row engine for ever.
     let must_be_columnar = arm == Arm::Columnar && query.columnar_is_possible;
     if must_be_columnar != (engine == "columnar") {
         let wanted = if must_be_columnar {
