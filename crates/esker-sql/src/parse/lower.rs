@@ -825,7 +825,7 @@ fn lower_statement(
             // become `EXPLAIN (ANALYZE, BUFFERS) …` and `EXPLAIN (VERBOSE, ANALYZE, FORMAT JSON) …`
             // (`explain_test.rb`). The whole list was refused, so three of that file's five tests
             // could not run at all.
-            let analyze = explain_options(*analyze, options)?;
+            let analyze = explain_options(*analyze, options.as_deref())?;
             // `EXPLAIN VERBOSE` without parentheses asks for the same extra detail `(VERBOSE)`
             // does, and is accepted and ignored for the same reason.
             let _ = verbose;
@@ -1501,7 +1501,7 @@ fn guc_list_item(value: &Expr) -> String {
 /// refusal that says what is missing.
 fn explain_options(
     already: bool,
-    options: &Option<Vec<sqlparser::ast::UtilityOption>>,
+    options: Option<&[sqlparser::ast::UtilityOption]>,
 ) -> Result<bool> {
     let mut analyze = already;
     let Some(options) = options else {
@@ -1516,13 +1516,15 @@ fn explain_options(
         match (name.as_str(), arg.as_deref()) {
             // `ANALYZE` and `ANALYZE true` run the statement; `ANALYZE false` does not.
             ("ANALYZE", None | Some("TRUE")) => analyze = true,
-            ("ANALYZE", Some("FALSE")) => {}
-            (
+            // `ANALYZE false` joins the options that change nothing, for the same reason they do:
+            // there is no extra detail to show and no statement to run.
+            ("ANALYZE", Some("FALSE"))
+            | (
                 "VERBOSE" | "COSTS" | "BUFFERS" | "SETTINGS" | "WAL" | "TIMING" | "SUMMARY"
                 | "GENERIC_PLAN" | "MEMORY",
                 _,
-            ) => {}
-            ("FORMAT", None | Some("TEXT")) => {}
+            )
+            | ("FORMAT", None | Some("TEXT")) => {}
             ("FORMAT", Some(other)) => {
                 return Err(SqlError::unsupported(format!("EXPLAIN (FORMAT {other})")));
             }
