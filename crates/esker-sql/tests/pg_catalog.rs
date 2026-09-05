@@ -262,6 +262,9 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `uuid` is the tenth type in ADR 0033's tier 2 and the ninth of the twenty
             // refusals in `postgresql_specific_schema.rb`.
             vec!["2950", "uuid", "0", ",", "uuid_in", "\\N", "b", "0"],
+            // **`tsvector` is one of ActiveRecord's forty names**, and this node now has it, so
+            // the row appears where before the type was simply missing from the surface.
+            vec!["3614", "tsvector", "0", ",", "tsvectorin", "\\N", "b", "0"],
             vec!["3802", "jsonb", "0", ",", "jsonb_in", "\\N", "b", "0"],
             // **Last, because its oid is in the user range.** An extension's types are allocated
             // when it is installed, so a real server's hstore is above 16384 too and this query
@@ -299,14 +302,15 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **Thirty-four rows**, which is every array
+    // 9 — array types, found by their element type. **Thirty-five rows**, which is every array
     // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
     // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
     // is an array at all. It answered nothing while this node had no arrays and five rows while
     // it had five; sixteen more arrived with the unit that made every `typarray` name a row that
     // exists, which is what `TypeError: can't quote Array` was. `_hstore` and `_citext` are not
     // here and are not missing: an extension's element oid is above 16384 and is not in the
-    // adapter's fixed list at all.
+    // adapter's fixed list at all. `_tsvector` is the thirty-fifth and arrived with the
+    // `tsvector` type: **3614 was already in the adapter's list**, waiting for a row.
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
@@ -588,6 +592,16 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "2951".to_owned(),
                 "_uuid".to_owned(),
                 "2950".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "3643".to_owned(),
+                "_tsvector".to_owned(),
+                "3614".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

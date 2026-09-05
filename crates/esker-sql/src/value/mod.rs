@@ -2488,6 +2488,8 @@ mod tests {
                 matches!(
                     ty,
                     ColumnType::Text
+                        | ColumnType::TsVector
+                        | ColumnType::TsQuery
                         | ColumnType::Varchar
                         | ColumnType::Bpchar
                         | ColumnType::Json
@@ -2497,6 +2499,8 @@ mod tests {
                         | ColumnType::LQuery
                         | ColumnType::Hstore
                         | ColumnType::HstoreArray
+                        | ColumnType::TsVectorArray
+                        | ColumnType::TsQueryArray
                         | ColumnType::Citext
                         | ColumnType::TsRange
                         | ColumnType::TstzRange
