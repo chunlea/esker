@@ -3186,13 +3186,35 @@ impl Executor {
         //
         // A name that is not there is still not this function's error to raise: the statement will
         // reach it and report it with the message that statement uses.
-        bind::table_names(statement)
+        let mut found = Vec::new();
+        for name in bind::table_names(statement)
             .into_iter()
             .map(|name| self.resolve_unqualified(txn, name))
             .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter_map(|name| view.table(&name).transpose())
-            .collect()
+        {
+            if let Some(table) = view.table(&name)? {
+                found.push(table);
+            // **A view is a relation with typed columns, and this is the one pass that needs
+            // them.** `View::table` does not answer for a view — a view is planned as a derived
+            // table, so the read path never wants a `TableDef` — but that rewrite happens after
+            // `Bind`, and dropping the name here left `bind::infer` nothing to type against: every
+            // `$n` in a statement naming a view kept the `text` fallback. See
+            // [`crate::catalog::ViewDef::as_table`], which declines for a view stored before
+            // record version 30 rather than inventing types it does not have.
+            //
+            // `Executor::described_in` needs the same list and had the same hole, by a different
+            // route: it expanded the view into a derived table *before* typing, and a derived
+            // table is exactly what the typer skips. Both halves answered `42883 operator does not
+            // exist: bigint = text` for a plain read of a view — a disagreement
+            // `describe_resolves_like_execute` exists to catch and could not, because it prepared
+            // no statement naming a view. It does now.
+            } else if let Some(def) = crate::catalog::view(txn, self.tenant, &name)?
+                && let Some(table) = def.as_table()
+            {
+                found.push(std::sync::Arc::new(table));
+            }
+        }
+        Ok(found)
     }
 
     /// This transaction's view of the catalog, pinned to one version.
@@ -3973,17 +3995,32 @@ impl Executor {
         // it makes. `SELECT * FROM v` through the simple protocol answered all along, which is
         // what made it look like a catalog gap rather than a describe one.
         //
-        // Before the parameters are typed, so a `$1` compared against a view's column is typed
-        // against the column and not against nothing, and before the subqueries are planned,
-        // because a view may be named inside one.
+        // **The parameters are typed first**, and this comment used to claim the opposite — that
+        // expanding the view before typing was what let a `$1` be typed against the view's column
+        // "and not against nothing". It does the reverse. After the rewrite the view is a *derived
+        // table*, and `bind::named_relations` skips derived entries precisely because they have no
+        // `TableDef` to type against, so expanding first threw away the last thing that could have
+        // typed the parameter: `Describe` of `SELECT name FROM v WHERE id = $1` answered
+        // `42883 operator does not exist: bigint = text` — the same defect the execute path had,
+        // reached by a different road.
+        //
+        // Typing needs the statement as written, where `FROM v` is a plain entry and `tables_for`
+        // can hand it the view's columns; everything after this line needs the expansion. So the
+        // order is: type, then expand. `tables` is untouched by the move for an `INSERT`, `UPDATE`
+        // or `DELETE` — `expand_views` only rewrites a `SELECT` — and those are the three that read
+        // it again below for their `RETURNING` fields.
+        let tables = self.tables_for(txn, &statement)?;
+        let types = bind::infer(&statement, &tables, declared);
+        let parameters = types.iter().copied().map(ColumnType::oid).collect();
+
+        // The expansion itself is still required, and for its own reason: a derived table's shape
+        // is what a `Describe` answers, and before it `FROM v` reached `relation_of` as a table
+        // name. It runs before the subqueries are planned, because a view may be named inside one.
         if let Statement::Select(select) = &mut statement
             && self.names_a_view(txn, select)?
         {
             self.expand_views(txn, select)?;
         }
-        let tables = self.tables_for(txn, &statement)?;
-        let types = bind::infer(&statement, &tables, declared);
-        let parameters = types.iter().copied().map(ColumnType::oid).collect();
 
         // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
         // is run, so a placeholder of the right type is all the planner needs to answer the shape.
