@@ -31,8 +31,13 @@ mod parity;
 /// Nothing: the corpus builds its own table.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// Where the capture stops being about the type and starts being about the functions.
-const PART_2: &str = "# ---- part 2:";
+/// Where the capture stops being about values and starts being about the two GIN indexes.
+///
+/// Parts 1 and 2 replay: the declaration and round trip, and the whole function and operator
+/// surface. Part 3 is `schema_test.rb`'s setup and waits on the operator-class machinery
+/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
+/// which is another lane's unit.
+const PART_3: &str = "# ---- part 3:";
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
@@ -44,6 +49,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', a.typname AS array_of_tsvector FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'tsvector'",
         "SELECT 'r', c.relname, a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'tsv' AND a.attnum > 0 ORDER BY a.attnum",
     ],
+    // **The corpus format cannot express this row, and the answer is right.** A row's columns are
+    // separated by `|` and a `tsquery`'s *or* operator **is** `|`, so the expected side parses
+    // into three fields (`r`, `'fat' `, ` 'cat'`) where this node's answer is two. Both print
+    // identically — the harness's own report shows the same characters on both lines — and only
+    // the structure differs.
+    //
+    // The behaviour is covered where the separator cannot reach it:
+    // `value::tsquery::tests::the_operators_print_the_way_postgresql_prints_them` asserts
+    // `to_tsquery("fat | cat")` renders `'fat' | 'cat'`. Declared here rather than silently
+    // dropped from the corpus, because the corpus is the capture and the capture is right.
     answers: &[
         // **Two configurations, not thirty-two.** `pg_am`'s own comment states the rule this
         // follows: a row for a configuration nothing can be tokenised with would be a claim
@@ -57,6 +72,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // search configuration as a *value*. The three tsvector rows match exactly — `typtype`,
         // `typcategory`, `typdelim` and `typlen` all measured against the oracle.
         (
+            "SELECT 'r', to_tsquery('english', 'fat | cat')",
+            "not a disagreement: the corpus separates a row's columns with `|` and a tsquery's or \
+             operator is `|`, so the expected side parses into three fields where the answer is \
+             two. Both print the same characters. Covered by \
+             `value::tsquery::tests::the_operators_print_the_way_postgresql_prints_them`",
+        ),
+        (
             "SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname",
             "no regconfig type: a configuration is named by a string argument here, never held as \
              a value",
@@ -65,12 +87,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 };
 
 #[test]
-fn every_tsvector_declaration_and_round_trip_is_postgresql_19_s() {
+fn every_tsvector_value_and_operator_answer_is_postgresql_19_s() {
     let whole = include_str!("corpus/pg19_tsvector.txt");
-    let part_one = whole.split_once(PART_2).map_or(whole, |(before, _)| before);
-    let checked = parity::replay(part_one, CORPUS_FIXTURE, &DIVERGENCES);
+    let through_part_two = whole.split_once(PART_3).map_or(whole, |(before, _)| before);
+    let checked = parity::replay(through_part_two, CORPUS_FIXTURE, &DIVERGENCES);
     assert!(
-        checked > 15,
+        checked > 45,
         "only {checked} statements ran; the corpus did not load"
     );
 }

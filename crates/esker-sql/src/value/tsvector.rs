@@ -46,7 +46,10 @@ impl Weight {
         }
     }
 
-    fn of(letter: char) -> Option<Self> {
+    /// The weight a letter names, or `None` for anything that is not one — `setweight`'s second
+    /// argument is a `"char"` and a real server refuses a letter outside `A`–`D`.
+    #[must_use]
+    pub fn of(letter: char) -> Option<Self> {
         match letter {
             'A' | 'a' => Some(Weight::A),
             'B' | 'b' => Some(Weight::B),
@@ -287,6 +290,94 @@ pub fn to_lexemes(config: Config, text: &str) -> Vec<Lexeme> {
     lexemes
 }
 
+/// `a || b`: the two lexeme sets, with **`b`'s positions shifted by `a`'s maximum**.
+///
+/// Measured both ways round, and they differ — which is the whole reason a tsvector needed a
+/// `Datum` of its own rather than riding on `Text`:
+///
+/// ```text
+/// to_tsvector('english','fat cat') || to_tsvector('english','thin dog') -> 'cat':2 'dog':4 'fat':1 'thin':3
+/// to_tsvector('english','thin dog') || to_tsvector('english','fat cat') -> 'cat':4 'dog':2 'fat':3 'thin':1
+/// ```
+pub fn concat(left: &str, right: &str) -> Result<String> {
+    let left = from_text(left)?;
+    let shift = left
+        .iter()
+        .flat_map(|lexeme| lexeme.positions.iter().map(|(at, _)| *at))
+        .max()
+        .unwrap_or(0);
+    let mut merged = left;
+    for mut lexeme in from_text(right)? {
+        for position in &mut lexeme.positions {
+            position.0 = position.0.saturating_add(shift);
+        }
+        merged.push(lexeme);
+    }
+    Ok(to_text(&canonical(merged)))
+}
+
+/// `ts_headline(config, text, query)`: the text with every matching token wrapped in `<b>`.
+///
+/// Measured on 19beta1:
+///
+/// ```text
+/// ts_headline('english','The Fat Cats ate a rat', to_tsquery('english','cat'))
+///   -> The Fat <b>Cats</b> ate a rat
+/// ts_headline('english','The Fat Cats ate a rat', to_tsquery('english','fat & cat'))
+///   -> The <b>Fat</b> <b>Cats</b> ate a rat
+/// ts_headline('english','The Fat Cats ate a rat', to_tsquery('english','dog'))
+///   -> The Fat Cats ate a rat
+/// ```
+///
+/// Three rules fall out of those three lines. **A token is matched by its stem and printed as it
+/// was written** — `cat` matches `Cats`, and the markup goes round `Cats`. **The separators
+/// survive**, so the answer is the input with tags inserted rather than a rebuilt string. And **no
+/// match is the text unchanged**, not an empty string.
+///
+/// What this does not do is PostgreSQL's *fragment* selection: a real server can return a window of
+/// a long document with `MaxWords`/`MinWords`, and this returns the whole text every time. The two
+/// agree for any text shorter than the default window, which is every text the suite has, and the
+/// difference is declared rather than hidden.
+#[must_use]
+pub fn headline(config: Config, text: &str, query_lexemes: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        let folded = token.to_lowercase();
+        let stem = match config {
+            Config::Simple => folded,
+            Config::English => {
+                if crate::value::stopwords::is_stop_word(&folded) {
+                    String::new()
+                } else {
+                    crate::value::stemmer::stem(&folded)
+                }
+            }
+        };
+        if !stem.is_empty() && query_lexemes.contains(&stem) {
+            out.push_str("<b>");
+            out.push_str(token);
+            out.push_str("</b>");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
 /// The word tokens of a text, numbered from one.
 ///
 /// A token is a run of alphanumerics; everything else separates. That is narrower than a real
@@ -369,6 +460,41 @@ mod tests {
         assert!(Config::resolve("english").is_ok());
         assert!(Config::resolve("pg_catalog.english").is_ok());
         assert!(Config::resolve("simple").is_ok());
+    }
+
+    /// The capture's three `ts_headline` rows, which between them fix all three rules.
+    #[test]
+    fn ts_headline_marks_what_the_query_names() {
+        let query = |text: &str| {
+            crate::value::tsquery::lexemes(
+                &crate::value::tsquery::to_tsquery(Config::English, text)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        let text = "The Fat Cats ate a rat";
+        // Matched by **stem**, printed as **written**: `cat` marks up `Cats`.
+        assert_eq!(
+            headline(Config::English, text, &query("cat")),
+            "The Fat <b>Cats</b> ate a rat"
+        );
+        assert_eq!(
+            headline(Config::English, text, &query("fat & cat")),
+            "The <b>Fat</b> <b>Cats</b> ate a rat"
+        );
+        // No match is the text unchanged, not an empty string.
+        assert_eq!(headline(Config::English, text, &query("dog")), text);
+    }
+
+    /// **The separators survive**, which is what makes this an insertion into the input rather
+    /// than a rebuild of it: two spaces stay two, and the punctuation keeps its place.
+    #[test]
+    fn headline_returns_the_input_with_tags_inserted() {
+        let query = vec!["cat".to_owned()];
+        assert_eq!(
+            headline(Config::English, "a  cat, and", &query),
+            "a  <b>cat</b>, and"
+        );
     }
 
     #[test]

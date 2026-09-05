@@ -85,6 +85,57 @@ the shape a timeout hides: the test was recorded as a standing flake with an own
 module instead of aborting 22 tests in. `docs/acceptance/v1.md` §0 now dates the flag rather than
 requiring it.
 
+### What each row said, beside what was true
+
+The verdicts above say what closed each debt; they do not say what the register believed. Both are
+kept, because the interesting part of a stale row is usually **which question it asked** — and a
+reader who sees only the correction cannot tell a row that was wrong from a row that was answering
+a different question.
+
+**#3, as it stood:**
+
+> **`Db::ingest` refuses any overlap, tombstones included.** `DbInner::place` refuses three ways:
+> against another file in the same ingest, the memtable, and any level of the current version. c6
+> verified this as the one item of eight that HEAD still owes.
+
+`DbInner::place` returns a **level**, and its own doc comment says so: *"Placement, not permission:
+`first_conflicting_key` has already decided whether the file may be adopted at all."* The row read
+three range comparisons as three refusals. The refusal is `first_conflicting_key`, and since
+`616954e8` it refuses on a shared **key** — which is the whole point, because `esker-txn` puts the
+MVCC version *in* the key, so two files can interleave across a range and share nothing.
+
+**#5, as it stood:**
+
+> **`crash_through_the_client` starves under load.** Fails 6 runs in 10 under 24 spinning threads
+> **in one container** … The child is killed on a **wall clock** while the writes it should
+> interrupt are CPU-bound.
+
+Every sentence was true of the tree c6 measured and none of it was true of the tree the register
+was written against: `46166886` had already replaced the wall clock with a count of acknowledged
+writes, three hours earlier. The row is a correct diagnosis carried past its own fix.
+
+**#6, as it stood:**
+
+> Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it
+> as a **standing flake** with an owner and treats the exclusive pass as evidence it is the same
+> contention rather than a defect of its own.
+
+The exclusive pass was evidence of the opposite. Four loads made it a cliff — 0.38 / 0.31 / 0.32 s
+and then 60.05 s FAILED — and a cliff is a state change, not contention. Behind it were two product
+defects, and the second was only found by measuring whether the first had closed the hole.
+
+**#8, as it stood:**
+
+> Setting `failure_persistence: None` under `cfg(miri)` … would make the plain documented command
+> true — and matters because the failure looks like the gate *failing* rather than the gate *not
+> running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state
+> the flag.
+
+The row was right about the fix, right about why it mattered, and wrong only in the last sentence:
+documenting the flag is what made it look not-urgent, and a gate that reads as failing is worth
+three lines the day it is noticed. Both documents now carry the bare command with the flag dated
+rather than required.
+
 ### #7 `join_cost` — **closed by c7's diagnosis and a change to the test's shape**
 
 Recorded as "unexplained, not diagnosed": one failure in a full parallel run, 3/3 in isolation.
