@@ -10,7 +10,9 @@
 //! what a `23505` message quotes back, and a client that matches on the constraint name would not
 //! recognise ours if we invented them.
 
-use crate::catalog::{ExprShape, Identity, KeyOrder, ReferentialAction, fold_identifier};
+use crate::catalog::{
+    ExprShape, Identity, KeyOrder, MAX_IDENTIFIER_BYTES, ReferentialAction, fold_identifier,
+};
 use crate::value::{ColumnType, Datum};
 
 /// `CREATE TABLE`.
@@ -600,6 +602,12 @@ pub struct CreateIndex {
     pub table: String,
     /// The key, in key order.
     pub keys: Vec<IndexKeyPart>,
+    /// The **access method** written after `USING`, folded — `btree` when none was.
+    ///
+    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// the index built underneath is the ordered one every index here is, and this is what
+    /// `pg_class.relam` and `pg_get_indexdef` report.
+    pub access_method: String,
     /// Whether a duplicate is refused.
     pub unique: bool,
     /// `IF NOT EXISTS`.
@@ -802,25 +810,30 @@ pub struct DropIndex {
 }
 
 /// `<table>_pkey`, PostgreSQL's name for an unnamed primary key constraint.
+///
+/// **No column part at all**, which is the one derived name that has none — `makeObjectName` is
+/// called with a null second name, so a 63-byte table keeps 58 of its bytes here and only 56
+/// under [`sequence_name`] for a column called `id`.
 #[must_use]
 pub fn primary_key_name(table: &str) -> String {
-    derived(&[table, "pkey"])
+    make_object_name(table, None, "pkey")
 }
 
 /// `<table>_<column>…_key`, PostgreSQL's name for an unnamed `UNIQUE` constraint.
 #[must_use]
 pub fn unique_constraint_name(table: &str, columns: &[String]) -> String {
-    let mut parts = vec![table];
-    parts.extend(columns.iter().map(String::as_str));
-    parts.push("key");
-    derived(&parts)
+    make_object_name(
+        table,
+        Some(&name_addition(columns.iter().map(String::as_str))),
+        "key",
+    )
 }
 
 /// `<table>_<column>_seq`, PostgreSQL's name for the sequence behind a `bigserial` or an identity
 /// column. Measured: `pg_get_serial_sequence('s1','id')` answers `public.s1_id_seq`.
 #[must_use]
 pub fn sequence_name(table: &str, column: &str) -> String {
-    derived(&[table, column, "seq"])
+    make_object_name(table, Some(column), "seq")
 }
 
 /// `<table>_<column>_fkey`, PostgreSQL's name for an unnamed foreign key constraint.
@@ -829,19 +842,24 @@ pub fn sequence_name(table: &str, column: &str) -> String {
 /// `fxe_p_fkey`. Every referencing column contributes, the way an index's do.
 #[must_use]
 pub fn foreign_key_name(table: &str, columns: &[String]) -> String {
-    let mut parts = vec![table];
-    parts.extend(columns.iter().map(String::as_str));
-    parts.push("fkey");
-    derived(&parts)
+    make_object_name(
+        table,
+        Some(&name_addition(columns.iter().map(String::as_str))),
+        "fkey",
+    )
 }
 
 /// `<table>_<column>…_idx`, PostgreSQL's name for an unnamed index.
 #[must_use]
 pub fn index_name(table: &str, keys: &[IndexKeyPart]) -> String {
-    let mut parts = vec![table.to_owned()];
-    parts.extend(keys.iter().map(key_part_name));
-    parts.push("idx".to_owned());
-    derived(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+    make_object_name(table, Some(&index_name_addition(keys)), "idx")
+}
+
+/// What the key parts contribute to a derived index name, before the table and the label are
+/// joined on: `ChooseIndexNameAddition`.
+#[must_use]
+pub fn index_name_addition(keys: &[IndexKeyPart]) -> String {
+    name_addition(keys.iter().map(key_part_name))
 }
 
 /// What one key part contributes to a derived index name.
@@ -866,20 +884,136 @@ fn key_part_name(key: &IndexKeyPart) -> String {
     }
 }
 
-/// Joins the parts and applies the same 63-byte limit every identifier has.
+/// The column half of a derived name: the parts joined with `_`, and **stopped** once it is at
+/// least as long as one identifier.
 ///
-/// PostgreSQL also disambiguates a derived name that is already taken by appending a number; that
-/// is not done here, and a collision is reported as the `42P07` it is rather than silently renamed
-/// — `TODO(post-v1)`, and a deliberate difference rather than an oversight, because a server that
-/// quietly renames an index makes `DROP INDEX` guesswork.
-fn derived(parts: &[&str]) -> String {
-    let joined = parts.join("_");
-    fold_identifier(&joined, true).0
+/// `ChooseIndexNameAddition`, which builds into a buffer of `2 * NAMEDATALEN` and breaks out of
+/// the loop the moment the buffer has reached `NAMEDATALEN` — so a long key list contributes at
+/// most one part past 63 bytes and the rest are not joined at all. [`make_object_name`] then
+/// truncates what comes out, which is why the cap is not visible for any name a test writes; it is
+/// here so that a hundred-column key does not build a kilobyte of string to throw away.
+fn name_addition(parts: impl Iterator<Item = impl AsRef<str>>) -> String {
+    let mut out = String::new();
+    for part in parts {
+        if !out.is_empty() {
+            out.push('_');
+        }
+        out.push_str(part.as_ref());
+        if out.len() >= MAX_IDENTIFIER_BYTES {
+            break;
+        }
+    }
+    out
+}
+
+/// PostgreSQL's `makeObjectName`: `<name1>_<name2>_<label>`, made to fit in one identifier by
+/// **taking characters off the longer of the two names** until it does.
+///
+/// The label and the separators are never what gives way — that is the whole point of the
+/// function, and it is why a 63-byte table still gets a sequence whose name ends in `_seq`.
+/// `name2` is [`None`] for a primary key, which is the one derived name with no column part, and
+/// then there is no separator for it either.
+///
+/// Measured on 19beta1 against a table named with exactly `NAMEDATALEN - 1` characters, which is
+/// what `LongerSequenceNameDetectionTest` uses. All three of its sequences come out at exactly 63
+/// bytes with a different amount of table left in each:
+///
+/// | column | sequence | table bytes kept |
+/// |---|---|---|
+/// | `id` | `long_table_…_for_seri_id_seq` | 56 |
+/// | `seq` | `long_table_…_for_ser_seq_seq` | 55 |
+/// | `bigseq` | `long_table_…_for__bigseq_seq` | 52 |
+///
+/// The third keeps the trailing `_` of the table name and then adds the separator, which is the
+/// double underscore — a join-then-truncate would have produced none of these three.
+#[must_use]
+pub fn make_object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
+    // `NAMEDATALEN - 1 - overhead`, where the overhead is the label, its separator, and the
+    // separator before `name2` when there is one.
+    let overhead = usize::from(name2.is_some()) + label.len() + 1;
+    let available = MAX_IDENTIFIER_BYTES.saturating_sub(overhead);
+    let mut keep1 = name1.len();
+    let mut keep2 = name2.map_or(0, str::len);
+    // "This logic could be expressed without a loop, but it's simple and obvious as a loop" —
+    // and it is the loop that makes the two names give way alternately once they are equal,
+    // which is what decides where a tie lands.
+    while keep1 + keep2 > available {
+        if keep1 > keep2 {
+            keep1 -= 1;
+        } else if keep2 > 0 {
+            keep2 -= 1;
+        } else {
+            // Only reachable if the label alone does not fit, which no label here is long
+            // enough to do. Truncating the label would produce a name that means something
+            // else, so the name is left over-long and `fold_identifier` clips it below.
+            break;
+        }
+    }
+    let mut out = String::with_capacity(MAX_IDENTIFIER_BYTES);
+    out.push_str(clip(name1, keep1));
+    if let Some(name2) = name2 {
+        out.push('_');
+        out.push_str(clip(name2, keep2));
+    }
+    out.push('_');
+    out.push_str(label);
+    // A no-op for every name the budget above produced; the one thing that could still be over is
+    // the unreachable branch, and a name that cannot be stored is worse than a short one.
+    fold_identifier(&out, true).0
+}
+
+/// The first `at` **bytes** of `s`, backed up to a character boundary — `pg_mbcliplen`.
+///
+/// Cutting a multi-byte character in half would leave a name that is not UTF-8, which the catalog
+/// would refuse to read back.
+fn clip(s: &str, mut at: usize) -> &str {
+    if at >= s.len() {
+        return s;
+    }
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    &s[..at]
+}
+
+/// The name a derived relation actually gets: [`make_object_name`], and then **a counter on the
+/// label** for as long as `taken` says the name is in use.
+///
+/// PostgreSQL's `ChooseRelationName`. The counter joining the *label* rather than the finished
+/// name is not a detail — it changes the answer whenever the name is long enough to truncate,
+/// because a longer label leaves less room and the name is rebuilt from the full parts. Measured
+/// on 19beta1: a 56-character table with an `id serial` whose plain name `<56>_id_seq` was already
+/// taken got **`<55>_id_seq1`**, one character shorter in the table half. Appending `1` to the
+/// truncated name would have given `<56>_id_seq1`, which is 64 bytes and not what the server
+/// chose.
+///
+/// A *given* name that is taken is an error and never comes here; only a name this node derived is
+/// disambiguated, because there is nothing of the user's to collide with.
+pub fn choose_relation_name<E>(
+    name1: &str,
+    name2: Option<&str>,
+    label: &str,
+    mut taken: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<String, E> {
+    let mut modlabel = label.to_owned();
+    for pass in 1..=u32::MAX {
+        let candidate = make_object_name(name1, name2, &modlabel);
+        if !taken(&candidate)? {
+            return Ok(candidate);
+        }
+        modlabel = format!("{label}{pass}");
+    }
+    // Four billion relations of one derived name is not reachable, and answering the plain name
+    // lets the caller's own duplicate check give the error rather than inventing one here.
+    Ok(make_object_name(name1, name2, label))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexKeyPart, KeyPartName, index_name, primary_key_name, unique_constraint_name};
+    use super::{
+        IndexKeyPart, KeyPartName, choose_relation_name, index_name, primary_key_name,
+        sequence_name, unique_constraint_name,
+    };
     use crate::catalog::MAX_IDENTIFIER_BYTES;
     use crate::catalog::{ExprShape, KeyOrder};
 
@@ -938,6 +1072,75 @@ mod tests {
     fn a_derived_name_is_truncated_like_any_other_identifier() {
         let long = "x".repeat(70);
         assert_eq!(primary_key_name(&long).len(), MAX_IDENTIFIER_BYTES);
+    }
+
+    /// `LongerSequenceNameDetectionTest`'s table, which is `NAMEDATALEN - 1` characters exactly,
+    /// and the three sequences PostgreSQL 19beta1 named for it.
+    ///
+    /// **The `_seq` is never what gives way.** All three are 63 bytes and a different amount of
+    /// the table survives in each, because the budget is spent on the *column* first. Joining the
+    /// parts and clipping the result — which is what this did before — makes all three the same
+    /// string, and then the adapter cannot find the sequence it just created.
+    #[test]
+    fn a_63_byte_table_still_gets_a_name_ending_in_seq() {
+        let long = "long_table_name_to_test_sequence_name_detection_for_serial_cols";
+        assert_eq!(long.len(), MAX_IDENTIFIER_BYTES);
+        for (column, expected) in [
+            (
+                "id",
+                "long_table_name_to_test_sequence_name_detection_for_seri_id_seq",
+            ),
+            (
+                "seq",
+                "long_table_name_to_test_sequence_name_detection_for_ser_seq_seq",
+            ),
+            // The table's own trailing `_` survives and the separator follows it, which is the
+            // double underscore. Nothing about it is special-cased; it is what is left of the
+            // table after 52 bytes.
+            (
+                "bigseq",
+                "long_table_name_to_test_sequence_name_detection_for__bigseq_seq",
+            ),
+        ] {
+            let name = sequence_name(long, column);
+            assert_eq!(name, expected, "sequence for {column}");
+            assert_eq!(name.len(), MAX_IDENTIFIER_BYTES, "sequence for {column}");
+        }
+        // A primary key has no column part at all, so it keeps two more bytes than the shortest
+        // column here would leave it.
+        assert_eq!(
+            primary_key_name(long),
+            "long_table_name_to_test_sequence_name_detection_for_serial_pkey"
+        );
+    }
+
+    /// **The counter joins the label, and the name is then rebuilt** — measured on 19beta1 with a
+    /// 56-character table whose plain sequence name was already taken by a `CREATE SEQUENCE`.
+    ///
+    /// The server answered `<55 a's>_id_seq1`: the table half gave up a character to make room for
+    /// the `1`. Appending the counter to the finished name would have given `<56>_id_seq1`, which
+    /// is 64 bytes and is not a name a real server ever produced. For a short name the two rules
+    /// agree, which is why `foo_bar_baz_id_seq1` alone does not decide it.
+    #[test]
+    fn a_collision_counter_joins_the_label_and_the_name_is_rebuilt() {
+        let taken = "a".repeat(56);
+        let plain = sequence_name(&taken, "id");
+        assert_eq!(plain.len(), MAX_IDENTIFIER_BYTES);
+
+        let chosen = choose_relation_name(&taken, Some("id"), "seq", |candidate| {
+            Ok::<_, ()>(candidate == plain)
+        })
+        .unwrap();
+        assert_eq!(chosen, format!("{}_id_seq1", "a".repeat(55)));
+        assert_eq!(chosen.len(), MAX_IDENTIFIER_BYTES);
+
+        // `CollidedSequenceNameTest`'s own pair, where no truncation happens and the counter looks
+        // like a plain suffix.
+        let short = choose_relation_name("foo", Some("bar_baz_id"), "seq", |candidate| {
+            Ok::<_, ()>(candidate == "foo_bar_baz_id_seq")
+        })
+        .unwrap();
+        assert_eq!(short, "foo_bar_baz_id_seq1");
     }
 }
 

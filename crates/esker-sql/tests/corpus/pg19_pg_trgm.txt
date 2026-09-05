@@ -26,7 +26,9 @@ SELECT 'r', pg_get_indexdef('trains_np'::regclass)		r|CREATE INDEX trains_np ON 
 SELECT 'r', pg_get_indexdef('trains_gist'::regclass)		r|CREATE INDEX trains_gist ON public.trains USING gist (description gist_trgm_ops)
 SELECT 'r', pg_get_indexdef('trains_plain'::regclass)		r|CREATE INDEX trains_plain ON public.trains USING btree (name)
 SELECT 'r', c.relname, am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname LIKE 'trains_%' ORDER BY 1	text,name,name	r|trains_desc|btree ; r|trains_gist|gist ; r|trains_np|btree ; r|trains_pkey|btree ; r|trains_plain|btree ; r|trains_position|gin
+SAVEPOINT u1		-
 SELECT 'r', i.indexrelid::regclass::text, o.opcname FROM pg_index i JOIN LATERAL unnest(i.indclass::oid[]) WITH ORDINALITY AS u(cls, n) ON true JOIN pg_opclass o ON o.oid = u.cls WHERE i.indrelid = 'trains'::regclass ORDER BY 1, u.n		r|trains_np|text_ops ; r|trains_position|gin_trgm_ops ; r|trains_desc|text_pattern_ops ; r|trains_pkey|int8_ops ; r|trains_plain|text_ops ; r|trains_gist|gist_trgm_ops ; r|trains_np|text_pattern_ops
+ROLLBACK TO SAVEPOINT u1		-
 INSERT INTO trains (name, description, position) VALUES ('a', 'bee', 'front'), ('b', 'sea', 'rear')		-
 SELECT 'r', count(*) FROM trains WHERE position LIKE '%ron%'		r|1
 SELECT 'r', name FROM trains WHERE description = 'sea'		r|b

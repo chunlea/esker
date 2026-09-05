@@ -67,6 +67,19 @@ impl Blocks {
         }
         let first = allocate()?;
         let batch = i64::try_from(batch).unwrap_or(i64::MAX);
+        // **Every reservation says so**, because a block boundary is invisible from the outside:
+        // a client sees `1` and then `33` and cannot tell whether the sequence was re-created,
+        // re-read or merely drawn from twice. `RUST_LOG=esker_sql::sequence=debug` on the node
+        // turns one pass of a suite into the list of which sequence each block was taken against
+        // and what it started at, which is what a `+32 per test` climb needs in order to be
+        // attributed rather than guessed at.
+        tracing::debug!(
+            tenant,
+            sequence_id,
+            first,
+            last = first.saturating_add(batch) - 1,
+            "reserved a sequence block"
+        );
         held.insert(
             (tenant, sequence_id),
             (first + 1, first.saturating_add(batch)),

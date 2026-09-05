@@ -257,7 +257,7 @@ struct Key<'a> {
     /// The access method `pg_get_indexdef` names and `pg_am` agrees with. `btree` for everything
     /// this node builds; `gist` for an exclusion constraint, which is recorded and enforced by a
     /// scan (`crate::exec::dml::check_exclusions`).
-    method: &'static str,
+    method: &'a str,
     /// A partial index's predicate as it is stored — one pair of parentheses short of how it
     /// prints ([`parenthesised`]).
     predicate: Option<&'a str>,
@@ -335,7 +335,16 @@ impl Key<'_> {
                         .unwrap_or_default(),
                     KeyPart::Expression { expr, shape, .. } => shape.listed(expr),
                 };
-                format!("{part}{}", key.order.suffix())
+                // **The operator class goes between the column and the direction**, which is
+                // where a real server prints it: `USING gin ("position" gin_trgm_ops)` and
+                // `USING btree (name, "position" text_pattern_ops)`. Nothing is printed for the
+                // type's default, which is what an unwritten class means (ADR 0070).
+                let opclass = key
+                    .opclass
+                    .as_deref()
+                    .map(|class| format!(" {class}"))
+                    .unwrap_or_default();
+                format!("{part}{opclass}{}", key.order.suffix())
             })
             .collect()
     }
@@ -413,7 +422,9 @@ fn key_of<'a>(relation: &RelationRow, table: &'a TableDef) -> Option<Key<'a>> {
                 unique: index.unique,
                 primary: false,
                 exclusion: false,
-                method: "btree",
+                // **The method the index was declared with**, which for `USING gin` is `gin` —
+                // recorded, with the ordered index every index here is underneath it (ADR 0070).
+                method: &index.access_method,
                 predicate: index.predicate.as_deref(),
                 // **`indisvalid` is the schema state, read honestly.** An index that is not
                 // `Public` is one no reader may use (ADR 0020), and `indisvalid` is exactly the

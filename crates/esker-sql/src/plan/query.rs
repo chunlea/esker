@@ -122,11 +122,37 @@ impl TableRef {
             .and_then(|derived| derived.plan.as_deref())
     }
 
-    /// The name a qualifier in this query has to write: the alias if there is one, the table's own
-    /// name otherwise.
+    /// What makes two `FROM` entries the *same* entry, which is not what makes them referable.
+    ///
+    /// The alias where there is one, and otherwise the **qualified** name — so `s1.things` twice is
+    /// `42712 table name "things" specified more than once` and `s1.things, s2.things` is allowed,
+    /// measured both ways. Those two share an implicit alias and are still two relations a query
+    /// can tell apart, by writing the qualifier or by aliasing them.
+    ///
+    /// [`Self::referred_as`] is the other half and deliberately not this: one decides identity,
+    /// the other decides reference.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The name a qualifier in this query has to write: the alias if there is one, and the table's
+    /// **unqualified** name otherwise.
+    ///
+    /// A `FROM` item's implicit alias is the relation name without its schema — measured, both
+    /// halves: `SELECT things.name FROM test_schema.things` resolves, and so does the fully
+    /// qualified `test_schema.things.name`. Returning the stored name here answered `42P01
+    /// missing FROM-clause entry for table "things"` for the first, which is the shape
+    /// `schema_test.rb` writes and the one `corpus/pg19_tsvector.txt` part 3 needs.
+    ///
+    /// The name is stored `schema ++ NUL ++ relation` outside `public`
+    /// ([`crate::catalog::qualify`]), so the split is on a byte a relation name cannot contain
+    /// rather than on a dot a quoted one could.
     #[must_use]
     pub fn referred_as(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.name)
+        self.alias
+            .as_deref()
+            .unwrap_or_else(|| crate::catalog::split_qualified(&self.name).1)
     }
 }
 

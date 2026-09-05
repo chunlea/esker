@@ -38,7 +38,8 @@ pub use ddl::{
     DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole, DropSchema,
     DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
     KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
-    foreign_key_name, index_name, primary_key_name, sequence_name, unique_constraint_name,
+    choose_relation_name, foreign_key_name, index_name, index_name_addition, make_object_name,
+    primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
 pub use expr::{

@@ -15,21 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &["SELECT relkind, relname FROM pg_class WHERE relname = 's1'"],
     answers: &[
         (
-            "SELECT seqstart, seqincrement, seqmin, seqmax, seqcycle, seqcache FROM pg_sequence \
-             WHERE seqrelid = 's1'::regclass",
-            "**`pg_sequence` is not implemented** — contract C2. The two columns this unit fills, \
-             `seqstart` and `seqincrement`, are in the catalog record and are proven the way a \
-             client actually observes them: by what `nextval` answers. The other four are bounds \
-             and a cache size this node does not have, which is why the clauses that set them are \
-             refused by name below rather than stored and ignored — a view reporting a `seqmax` \
-             nothing enforces would be a wrong answer rather than a gap.",
-        ),
-        (
-            "SELECT seqstart, seqincrement FROM pg_sequence WHERE seqrelid = 's2'::regclass",
-            "The same view, and the line that would show `START 101` was recorded. `nextval` \
-             answers `101` on the line above it, which is the same fact where a client reads it.",
-        ),
-        (
             "CREATE SEQUENCE s4 AS smallint",
             "`AS <type>` narrows the counter, and narrowing changes when a sequence runs out. \
              This node counts in `i64` whatever it fills; taking the word and counting wider \

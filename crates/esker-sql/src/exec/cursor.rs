@@ -1130,6 +1130,90 @@ impl Env<'_> {
 ///
 /// Split out of [`catalog_function`] for the reason [`range_function`] is: one family, and that
 /// function is long enough already.
+/// Whether a `||` operand is **declared** `json` or `jsonb`, which is a question the values cannot
+/// answer.
+///
+/// `jsonb` has no `Datum` of its own — it is a `Datum::Text`, where `hstore`, `ltree`, `citext`
+/// and `tsvector` each have a variant — so by the time this operator has two values in hand a
+/// document and a string are the same thing. Concatenating them is a **wrong answer** where
+/// refusing is a gap, and [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md)
+/// ranks a wrong answer worse, so the declared type is read from the plan instead and the operator
+/// gives back the `0A000` it gave before `||` over text existed.
+///
+/// A column is an [`Expr::Ordinal`], which carries its type for exactly this kind of question —
+/// the same reason it carries `typmod` so a `character(3)` can be told from a `text`. A *literal*
+/// cast is folded away before the executor sees it, so `'{"a":1}'::jsonb` is caught one layer up,
+/// in `parse::lower`, where the `::jsonb` is still written down.
+///
+/// The real fix is `docs/plans/jsonb-representation.md`: `jsonb` gets a `Datum` and `||` becomes
+/// document merge.
+fn is_json_typed(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ordinal {
+            ty: ColumnType::Json | ColumnType::Jsonb,
+            ..
+        }
+    )
+}
+
+/// `text || anynonarray`, `anynonarray || text` and `text || text` — PostgreSQL's string
+/// concatenation, and the plainest meaning of the symbol.
+///
+/// Three rules, measured on 19beta1 in one rolled-back session:
+///
+/// * **The answer is `text` whatever went in.** `'x'::varchar || 'y'::varchar` is `text`, not
+///   `character varying` — `pg_typeof` says so — and a date, a numeric or a uuid contributes the
+///   characters it prints as: `'d' || '2024-01-02'::date` is `d2024-01-02`.
+/// * **It is strict.** `'a' || NULL` and `NULL || 'a'` are both NULL, which is exactly what
+///   separates the operator from `concat()`, whose whole point is that it skips a NULL —
+///   `concat('a', NULL, 'b')` is `ab`. The two are next to each other in the corpus for that.
+/// * **At least one side has to be text.** `1 || 2` is not integer concatenation, it is
+///   `42883 operator does not exist: integer || integer`, and `true || false` the same with
+///   `boolean`. PostgreSQL has no `anynonarray || anynonarray`, so neither does this.
+fn text_concat(left: Option<&Datum>, right: Option<&Datum>) -> Result<Datum> {
+    let textual = |value: Option<&Datum>| {
+        matches!(
+            value.and_then(Datum::column_type),
+            Some(ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext)
+        )
+    };
+    // A NULL operand has no type to speak for it, so it cannot be the one that makes this string
+    // concatenation — but it also cannot make it a type error, because on a real server the
+    // *other* side's `text` is what resolves the operator and the answer is then NULL.
+    let untyped = |value: Option<&Datum>| matches!(value, Some(Datum::Null) | None);
+    if !textual(left) && !textual(right) && !untyped(left) && !untyped(right) {
+        return Err(SqlError::UndefinedOperator {
+            left: left
+                .and_then(Datum::column_type)
+                .map_or("unknown", PgType::name)
+                .to_owned(),
+            op: "||",
+            right: right
+                .and_then(Datum::column_type)
+                .map_or("unknown", PgType::name)
+                .to_owned(),
+        });
+    }
+    let (Some(left), Some(right)) = (left, right) else {
+        return Ok(Datum::Null);
+    };
+    if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
+        return Ok(Datum::Null);
+    }
+    // **A boolean contributes `true`, not `t`.** `PgDatum::to_text` renders what a client is
+    // *shown* — `t`/`f`, which is what psql prints — and `||` concatenates what the value casts
+    // to, which for a boolean is the word. Measured: `'a' || true` is `atrue`.
+    let cast = |value: &Datum| match value {
+        Datum::Bool(flag) => Some((if *flag { "true" } else { "false" }).to_owned()),
+        other => PgDatum::to_text(other),
+    };
+    let (Some(left), Some(right)) = (cast(left), cast(right)) else {
+        return Ok(Datum::Null);
+    };
+    Ok(Datum::Text(left + &right))
+}
+
 fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
     use crate::plan::CatalogFunc;
     use crate::value::hstore;
@@ -2710,6 +2794,25 @@ fn catalog_function(
         // is on the left.
         CatalogFunc::HstoreContains if matches!(args.first(), Some(Datum::Range { .. })) => {
             range_value_function(CatalogFunc::RangeContains, &args)?
+        }
+        // **`||` over text is the *string* concatenation operator**, which is what the symbol
+        // means before it means anything else — and it was the one spelling of it this node
+        // refused, with `0A000 || over text is not supported`, while the type dispatch in
+        // `exec::query` had already been answering `text` for it.
+        //
+        // Fifth spelling, and the last one that is not a family of its own (arrays and `jsonb`
+        // are). Told apart by the operands like the four above it: this arm is reached only when
+        // **no** operand is an hstore, an ltree or a tsvector, because a bare `Datum::Text` beside
+        // one of those is the `unknown` literal that belongs to *that* type's operator.
+        CatalogFunc::HstoreConcat
+            if !args.iter().any(|value| {
+                matches!(
+                    value,
+                    Datum::Hstore(_) | Datum::Ltree(_) | Datum::TsVector(_)
+                )
+            }) && !call.args.iter().any(is_json_typed) =>
+        {
+            text_concat(args.first(), args.get(1))?
         }
         // **`||` over two tsvectors concatenates and renumbers**, which is not what `||` over two
         // strings does: the right operand's positions are shifted by the left's maximum, so
