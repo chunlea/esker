@@ -285,3 +285,71 @@ is unreachable from SQL until a SQL table can occupy more than one region.
 
 This is `esker-store`'s and is escalated rather than acted on: a measurement must not change what it
 measures, and this lane does not own that crate.
+
+
+## 9. The multi-region correctness half — 2026-09-05
+
+ADR 0073 landed and a SQL table splits. §8 said the fragment-count axis was now reachable and that
+re-measuring was what this file owed. **The correctness half was run first, and it says the timing
+half cannot be run yet.**
+
+`esker bench-mpp --diagnose` — the mode that reports what each path *does* instead of timing it,
+never failing on a statement, because what a path does across a boundary is the result:
+
+```bash
+esker-cli bench-mpp --stores 4 --rows 120000 --groups-high 2000 --batch 5000 \
+    --diagnose --region-split-size 4194304
+```
+
+The table split into **10 regions**, confirmed from each region's own leader. Then, on **both
+engines**:
+
+| statement | row | columnar |
+|---|---|---|
+| `count(*)`, whole table | `08006 … key is not in region 1` | same |
+| aggregate with a filter | `08006` | same |
+| `GROUP BY`, low and high cardinality | `08006` | same |
+| the join (semi-join shape) | `08006` | same |
+| range scan across the boundary | `08006` | same |
+| full row scan, ordered | `08006` | same |
+| **point read below the split** | **1 row** | 1 row |
+| **point read past the split** | **1 row** | 1 row |
+| **insert past the split** | **committed** | (duplicate key, proving the first did) |
+
+### What that means, stated carefully
+
+**Routing, the region cache and the write path all follow a boundary.** A point read at either end
+of the table answers, and a write past the split commits. So the region cache is not simply stale
+and the router is not simply wrong.
+
+**A scan does not.** It asks the first region for keys the first region does not hold, and
+`KeyNotInRegion` reaches the client as `08006` instead of moving on to the next region. It is
+below the engine choice — both engines fail identically — so it is the row scan path, not the
+fragment path, and not this milestone's routing.
+
+**The cost is scale-out from SQL.** The moment a table grows past its split threshold, every
+`SELECT` that is not a point read stops working. This is the first build in which that can happen,
+which is why it has not been seen before.
+
+### What is answered and what is not
+
+ADR 0040's questions this run was meant to answer — does one fragment go to each region, does the
+client's cache refresh on `EpochNotMatch`, do the engines agree across regions — **cannot be
+answered while no scan completes.** Nothing here contradicts them; they are simply not reachable
+past the failure above. Also unanswered: **0 of 10 regions had a columnar learner**, so the
+columnar path was never exercised multi-region at all.
+
+### The red test
+
+`crates/esker-cli/tests/cross_region_scan.rs` reproduces it in **12 seconds** — 200 rows of 4 KiB
+across a 256 KiB threshold, six regions, one `count(*)` — against the real binaries, speaking the
+wire itself so it cannot skip. It is red, and it is handed to whoever owns `esker-client` and
+`esker-sql`'s cursor rather than fixed here: those are not this lane's paths.
+
+**It must not land while it is red.** A red test on `main` is a broken gate for every lane.
+
+### The timing half is blocked on this
+
+The exchange verdict's re-measure (§8) and the join's before/after both need a multi-region scan
+to complete. Neither can be taken until the scan path is fixed, and no quiet window will change
+that. The single-region numbers in §7 stand and remain labelled as such.

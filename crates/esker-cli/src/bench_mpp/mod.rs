@@ -41,6 +41,7 @@ mod probe;
 mod topology;
 mod workload;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,12 @@ pub(crate) struct BenchMppOptions {
     pub(crate) seed: u64,
     /// Keep the data directory after the run.
     pub(crate) keep: bool,
+    /// Report what each statement does on each engine instead of timing anything.
+    ///
+    /// The correctness half of a multi-region run: it never fails on a statement, it records what
+    /// the statement did — an answer or an error, with the code — so a path that breaks across a
+    /// region boundary is *evidence* rather than a benchmark that stopped.
+    pub(crate) diagnose: bool,
     /// Leave the join out of the timed set.
     ///
     /// It costs tens of seconds where the aggregates cost tens of milliseconds, and it cannot
@@ -102,6 +109,7 @@ impl Default for BenchMppOptions {
             base_port: 24_160,
             seed: 20_260_904,
             keep: false,
+            diagnose: false,
             no_join: false,
             // **The shipped defaults, which is what the working reference uses.** Shortening
             // them to 2 s places a columnar learner in seconds rather than fifty, and asks PD to
@@ -249,6 +257,9 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     // silent: the SQL node answers, the load succeeds, and only the columnar wait -- five minutes
     // later, after the load -- says anything is wrong. It was wrong here for exactly that reason,
     // and this is the check that turns it into fifteen seconds and a topology.
+    if options.diagnose {
+        return diagnose(cluster, options, shape);
+    }
     let voters = wait_for_the_replica_target(cluster)?;
     // Said as "carries", not "reached": with `--peer` the leader has the membership in hand at
     // once, so a few milliseconds here is the peer list being honoured rather than PD having
@@ -360,6 +371,130 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     println!();
     report(&runs, &queries);
     Ok(())
+}
+
+/// Statements run on each engine, with what each did, and the region map they ran against.
+///
+/// **Nothing here fails the run.** A statement that errors is the result; the point is to say what
+/// the path does across a region boundary, and a harness that stopped at the first error would
+/// report one fact where there are several.
+fn diagnose(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result<(), String> {
+    wait_for_the_replica_target(cluster)?;
+    let mut pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+    let writable = Instant::now();
+    while let Err(why) = workload::create(&mut pg) {
+        if !why.contains("25006") || writable.elapsed() >= WRITABLE_TIMEOUT {
+            return Err(why);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
+    }
+    let started = Instant::now();
+    let statements = workload::load(&mut pg, shape)?;
+    println!(
+        "loaded {} rows in {statements} statements in {:.1?}",
+        shape.rows,
+        started.elapsed()
+    );
+    let _ = pg.run(&format!(
+        "ALTER TABLE {} SET (columnar_replicas = 1)",
+        workload::FACT
+    ));
+
+    println!();
+    println!("## The region map, from each region's own leader");
+    println!();
+    let regions = cluster.regions()?;
+    println!("| region | start | end | peers |");
+    println!("|---|---|---|---|");
+    for region in &regions {
+        let peers: Vec<String> = region
+            .peers
+            .iter()
+            .map(|peer| {
+                format!(
+                    "{}@store{}{}",
+                    peer.peer_id,
+                    peer.store_id,
+                    role_tag(peer.role)
+                )
+            })
+            .collect();
+        println!(
+            "| {} | {} | {} | {} |",
+            region.id,
+            hex_head(&region.start_key),
+            hex_head(&region.end_key),
+            peers.join(" ")
+        );
+    }
+    let (with_a_learner, on_stores) = topology::columnar_spread(&regions);
+    println!();
+    println!(
+        "**{} regions**, {with_a_learner} with a columnar learner, on {on_stores} distinct stores.",
+        regions.len()
+    );
+    if regions.len() < 2 {
+        println!();
+        println!(
+            "> The table did **not** split. Everything below is single-region and says nothing \
+             about a boundary."
+        );
+    }
+
+    println!();
+    println!("## What each statement does, on each engine");
+    println!();
+    println!("| statement | engine | outcome |");
+    println!("|---|---|---|");
+    for (label, sql) in workload::diagnostics(shape) {
+        for engine in ["row", "columnar"] {
+            let outcome = match pg.run(&format!("SET esker.engine = '{engine}'")) {
+                Ok(()) => match pg.query(&sql) {
+                    Ok(answer) => format!("{} row(s)", answer.rows.len()),
+                    Err(why) => format!("**{}**", first_line(&why)),
+                },
+                Err(why) => format!("**SET failed: {}**", first_line(&why)),
+            };
+            println!("| {label} | {engine} | {outcome} |");
+        }
+    }
+    println!();
+    println!("| load average at end | {} |", loadavg());
+    if options.keep {
+        println!("(the cluster's data was kept)");
+    }
+    Ok(())
+}
+
+/// The role letter `esker region ls` uses.
+fn role_tag(role: esker_proto::PeerRole) -> &'static str {
+    match role {
+        esker_proto::PeerRole::Voter => "",
+        esker_proto::PeerRole::Learner => "L",
+        esker_proto::PeerRole::ColumnarLearner => "C",
+    }
+}
+
+/// The first eight bytes of a region bound, as hex; `+inf` for the empty upper bound.
+fn hex_head(key: &[u8]) -> String {
+    if key.is_empty() {
+        return "(unbounded)".to_owned();
+    }
+    let head = key.iter().take(8).fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    });
+    if key.len() > 8 {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// One line of an error, so a table cell stays a table cell.
+fn first_line(text: &str) -> String {
+    text.lines().last().unwrap_or(text).trim().to_owned()
 }
 
 /// Waits until every region has the cluster's replica target in voters.
