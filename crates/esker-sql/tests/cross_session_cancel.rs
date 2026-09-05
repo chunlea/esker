@@ -141,18 +141,32 @@ fn a_blocked_statement_is_cancelled_by_the_session_holding_its_row() {
     let _ = a_says.send("A holds it");
     let _ = hears_a;
 
-    // The Rails hunt, verbatim — no `state` filter and no `pid <> pg_backend_pid()`.
+    // The Rails hunt, verbatim — no `state` filter and no `pid <> pg_backend_pid()` — and its
+    // **first row**, which is the whole of what this asserts.
+    //
+    // **Waiting until that row is somebody else is not a weakening of it.** A holds the row and
+    // is idle inside its transaction, so its own retained `FOR UPDATE` matches this predicate
+    // too; until B's statement is actually running there is only one row to return and it is A's.
+    // The Rails test spends a `sleep(0.5)` on exactly that window and a gate under load can
+    // outlast it — which is how this failed once at 3,571 tests: the hunt found A, A cancelled
+    // *itself*, its block ended, the row was freed and B simply succeeded (`left: None`). So the
+    // loop waits for the waiter to be visible and then asserts what the ordering decides: that
+    // the first row is the running session and not the idle holder.
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
     let mut pid = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let rows = a.rows("SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'");
-        if let Some(found) = rows.first().and_then(|row| row.first()) {
-            pid = Some(found.clone());
-            break;
+        match rows.first().and_then(|row| row.first()) {
+            Some(found) if *found != a_pid => {
+                pid = Some(found.clone());
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    let pid = pid.expect("the blocked waiter must be visible with its statement");
+    let pid = pid
+        .expect("the hunt's first row must become the blocked waiter rather than the idle holder");
 
     // **One request, which is what the Rails test issues.**
     assert_eq!(
