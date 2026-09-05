@@ -107,6 +107,20 @@ fn a_multi_region_table_is_never_answered_wrongly() {
     let regions = cluster.wait_for_a_split(120);
     cluster.wait_for_learners(180);
 
+    // **Placement is not readiness**, and the difference is exactly the confusion this test must
+    // not make: a learner that exists and has not caught up refuses, the planner answers from the
+    // rows, and "columnar agreed" would then mean "columnar never ran". Waited for before the
+    // declaration is read, because the declaration is read out of a plan.
+    if cluster
+        .query_on("auto", "EXPLAIN SELECT count(*) FROM ledger")
+        .contains("Engine: columnar")
+        || !cluster
+            .query_on("auto", "EXPLAIN SELECT count(*) FROM ledger")
+            .contains(GUARD)
+    {
+        cluster.wait_until_fragments_answer("SELECT count(*) FROM ledger", 180);
+    }
+
     // **The declaration, read end to end.** `EXPLAIN` is where a `FragmentSource` that says it
     // cannot scope a fragment to one region becomes visible, and reading it here rather than
     // hard-coding a state is what lets one test hold in both.

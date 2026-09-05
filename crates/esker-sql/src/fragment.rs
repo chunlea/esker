@@ -86,13 +86,17 @@ impl ClientFragments {
 }
 
 impl FragmentSource for ClientFragments {
-    /// **`false` until the columnar copy is region-scoped**, which is `esker-store`'s
-    /// ([ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md) says so in the sentence
-    /// that priced this as "a performance bound, not a wrong answer" — it is not, see
-    /// `docs/bench/mpp-baseline.md` §10).
+    /// **`true`, since the store scoped a learner's columnar runs to the region asked about.**
     ///
-    /// Flipping it to `true` is what retires the guard, and what proves the flip is
-    /// `crates/esker-cli/tests/multi_region_differential.rs` going green.
+    /// It read `false` for one day, and the day is the point. [ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md)
+    /// priced a fragment that reads past its region as "a performance bound, not a wrong answer";
+    /// measured on a four-store cluster on 2026-09-05 it was a wrong answer, and a silent one — a
+    /// four-region table answered `count(*)` as **four times** its true value, every fragment
+    /// having answered about the whole copy (`docs/bench/mpp-baseline.md` §10). What stood in the
+    /// gap was the planner keeping any multi-region query on the rows, keyed on this method.
+    ///
+    /// What earned the flip is `crates/esker-cli/tests/multi_region_differential.rs` going green
+    /// against real binaries, and that test is what keeps it earned.
     fn runs_are_region_scoped(&self) -> bool {
         true
     }
