@@ -86,7 +86,12 @@ impl Node {
     fn new() -> Self {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         Node {
-            executor: Executor::new(backend, Arc::new(Catalog::new()), 1),
+            executor: Executor::new(
+                backend,
+                Arc::new(Catalog::new()),
+                1,
+                esker_sql::session::register(),
+            ),
         }
     }
 }

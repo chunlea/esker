@@ -66,6 +66,7 @@ impl Node {
                 Arc::clone(&self.backend),
                 Arc::clone(&cluster.catalog),
                 TENANT,
+                esker_sql::session::register(),
             )
             .reporting_columnar_to(Arc::clone(&self.conn) as Arc<dyn ColumnarReport>),
         }

@@ -30,7 +30,12 @@ impl Node {
     fn loaded() -> Self {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let mut node = Node {
-            executor: Executor::new(backend, Arc::new(Catalog::new()), 1),
+            executor: Executor::new(
+                backend,
+                Arc::new(Catalog::new()),
+                1,
+                esker_sql::session::register(),
+            ),
         };
         node.plain("CREATE TABLE t (id int8 PRIMARY KEY, name text, at timestamptz, ok bool)")
             .unwrap();

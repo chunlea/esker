@@ -762,6 +762,21 @@ pub enum CatalogFunc {
     /// for exactly that. So it sleeps in short steps and checks `crate::exec::cancel` between
     /// them, and a `pg_sleep` that could not be cut short would be worse than not having one.
     PgSleep,
+    /// `pg_cancel_backend(pid)`: asks the session at `pid` to stop its statement, and answers
+    /// whether there was one to ask.
+    ///
+    /// **`false` for an unknown pid, and no `WARNING` with it — a declared divergence.** PostgreSQL
+    /// says `WARNING: PID 999999 is not a PostgreSQL backend process` beside the `false` (measured
+    /// against PG19). The expression evaluator here has no channel to raise a notice on, and giving
+    /// it one is a wider change than this function; the boolean, which is what a caller branches
+    /// on, is the same.
+    PgCancelBackend,
+    /// `pg_backend_pid()`: the pid of the session asking.
+    ///
+    /// Wanted because `pg_stat_activity` now lists **every** session in the process, so "my
+    /// row" is no longer "the only row" — a client that wants its own pid has to be able to
+    /// say so, and on a real server this is how.
+    PgBackendPid,
     /// `obj_description(oid)` and `obj_description(oid, catalog)`: an object's comment.
     ///
     /// NULL for the same reason. The catalog-name argument is **not validated** on a real server —
@@ -1125,6 +1140,10 @@ impl CatalogFunc {
             }
             () if name.eq_ignore_ascii_case("col_description") => Some(CatalogFunc::ColDescription),
             () if name.eq_ignore_ascii_case("pg_sleep") => Some(CatalogFunc::PgSleep),
+            () if name.eq_ignore_ascii_case("pg_cancel_backend") => {
+                Some(CatalogFunc::PgCancelBackend)
+            }
+            () if name.eq_ignore_ascii_case("pg_backend_pid") => Some(CatalogFunc::PgBackendPid),
             () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
             () if name.eq_ignore_ascii_case("array_position") => Some(CatalogFunc::ArrayPosition),
             () if name.eq_ignore_ascii_case("array_lower") => Some(CatalogFunc::ArrayLower),
@@ -1153,6 +1172,8 @@ impl CatalogFunc {
             CatalogFunc::PgGetSerialSequence => "pg_get_serial_sequence",
             CatalogFunc::ColDescription => "col_description",
             CatalogFunc::PgSleep => "pg_sleep",
+            CatalogFunc::PgCancelBackend => "pg_cancel_backend",
+            CatalogFunc::PgBackendPid => "pg_backend_pid",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
             CatalogFunc::PgGetTriggerdef => "pg_get_triggerdef",
@@ -1299,14 +1320,16 @@ impl CatalogFunc {
             // `strip(v)` and `numnode(q)` take one and only one, and so does `pg_sleep`.
             | CatalogFunc::TsStrip
             | CatalogFunc::NumNode
-            | CatalogFunc::PgSleep => &[1],
+            | CatalogFunc::PgSleep
+            | CatalogFunc::PgCancelBackend => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
             | CatalogFunc::LocalTime
             | CatalogFunc::StatementTimestamp
             | CatalogFunc::ClockTimestamp
-            | CatalogFunc::Random => &[0],
+            | CatalogFunc::Random
+            | CatalogFunc::PgBackendPid => &[0],
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
             CatalogFunc::Concat => &CONCAT_ARITIES,
@@ -1373,7 +1396,9 @@ impl CatalogFunc {
             | CatalogFunc::Cardinality
             | CatalogFunc::LtreeNlevel
             // `numnode` counts the nodes of a query, operators included.
-            | CatalogFunc::NumNode => ColumnType::Int4,
+            | CatalogFunc::NumNode
+            // `integer` on a real server, and the column `pg_stat_activity.pid` is declared as.
+            | CatalogFunc::PgBackendPid => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
             CatalogFunc::PathIsOpen
@@ -1387,7 +1412,8 @@ impl CatalogFunc {
             | CatalogFunc::RangeUpperInf
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
-            | CatalogFunc::TsMatch => ColumnType::Bool,
+            | CatalogFunc::TsMatch
+            | CatalogFunc::PgCancelBackend => ColumnType::Bool,
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
