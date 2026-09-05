@@ -1793,12 +1793,16 @@ fn approximate_size_counts_a_range_across_the_memtable_and_the_files() {
 /// error surfaced to the caller. Reserving the output range as well is what stops the second plan
 /// starting ([ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)).
 ///
-/// Twenty attempts because one is not evidence: the original A/B was 1/20 against 0/20, so a
-/// single green run of a single attempt would have said nothing either way.
+/// **Sixty attempts, and the number is arithmetic rather than taste.** The defect appeared once
+/// in twenty, so a twenty-attempt test would catch a regression about two times in three — it
+/// would go green against the broken code a third of the time, which is a test that lies at a
+/// rate. Sixty puts that at about nineteen in twenty, and the whole loop costs a few seconds
+/// because the filesystem is in memory.
 #[test]
 fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
+    const ATTEMPTS: usize = 60;
     let mut failures = Vec::new();
-    for attempt in 0..20 {
+    for attempt in 0..ATTEMPTS {
         let (_, fs) = memfs();
         let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
         // Six rounds over the same 200 keys, so L0 fills with files that overlap each other --
@@ -1840,7 +1844,7 @@ fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
     }
     assert!(
         failures.is_empty(),
-        "compact_range refused a legal concurrent workload {} times in 20: {failures:?}",
+        "compact_range refused a legal concurrent workload {} times in {ATTEMPTS}: {failures:?}",
         failures.len(),
     );
 }
@@ -1864,6 +1868,7 @@ fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
 /// left.
 #[test]
 fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
+    const WRITES: u32 = 8_000;
     let (_, fs) = memfs();
     let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
 
@@ -1878,26 +1883,38 @@ fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
         .unwrap();
     }
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compactions_before = db.compactions_run();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = Arc::clone(&db);
-    let flag = Arc::clone(&stop);
+    let finished = Arc::clone(&done);
     let hand = std::thread::spawn(move || {
-        // Enough to keep L0 filling for the whole loop, and a end to it: see the note above.
-        for n in 0..8_000u32 {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
+        // Fresh keys, so L0 keeps filling and the pool keeps finding work. Bounded, so the
+        // database does not outgrow what the compactions can drain -- see the note above.
+        for n in 0..WRITES {
             let _unused = writer.put(
                 cf::DEFAULT,
                 format!("bg-{n:06}").as_bytes(),
                 b"y".repeat(256).as_slice(),
             );
         }
+        finished.store(true, std::sync::atomic::Ordering::Release);
     });
 
-    // Rewrite the asserted keys between compactions, so their newest version is somewhere the
-    // compactions are actively moving rather than settled at the bottom.
-    for round in 0..4u32 {
+    // **The loop ends when the writer does, and that is what makes this concurrent.** Stopping
+    // the writer when the loop had had enough was the other way round, and it let the loop
+    // finish first: the writer got 718 writes in before it was told to stop, so the compactions
+    // it was supposed to contend with ran against a database nobody else was touching. The test
+    // passed, in a tenth of a second, having tested nothing. `overlapping` counts the rounds
+    // that really did run alongside the writer, and asserting on it is what stops that coming
+    // back.
+    let mut round = 0u32;
+    let mut overlapping = 0u32;
+    // A ceiling so that a writer wedged for any reason fails this as a slow test rather than
+    // hanging it, and a floor so the compactions keep going briefly after the writes stop.
+    while round < 4 || (!done.load(std::sync::atomic::Ordering::Acquire) && round < 60) {
+        if !done.load(std::sync::atomic::Ordering::Acquire) {
+            overlapping += 1;
+        }
         for i in 0..300u32 {
             db.put(
                 cf::DEFAULT,
@@ -1908,19 +1925,30 @@ fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
         }
         db.compact_range(cf::DEFAULT, None, None)
             .unwrap_or_else(|why| panic!("round {round}: {why}"));
+        round += 1;
     }
-
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let last = round - 1;
     hand.join().unwrap();
 
+    assert!(
+        overlapping >= 1,
+        "no round ran while the writer was writing, so nothing here was concurrent with anything"
+    );
+    assert!(
+        db.compactions_run() > compactions_before,
+        "no compaction ran at all, so there was nothing to contend over"
+    );
+
+    let expected = format!("round{last}");
     let missing: Vec<u32> = (0..300u32)
         .filter(|i| {
-            get(&db, format!("key-{i:04}").as_bytes()).as_deref() != Some(b"round3".as_slice())
+            get(&db, format!("key-{i:04}").as_bytes()).as_deref() != Some(expected.as_bytes())
         })
         .collect();
     assert!(
         missing.is_empty(),
-        "{} keys did not read back their newest value after concurrent compaction: {missing:?}",
+        "{} keys did not read back their newest value after {round} rounds of concurrent \
+         compaction ({overlapping} of them alongside the writer): {missing:?}",
         missing.len(),
     );
 }

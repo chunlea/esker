@@ -100,9 +100,22 @@ not ranges; the property's doc in `db/mod.rs` says so, and this ADR does not alt
 ## Tests
 
 - `esker-engine/tests/db.rs::a_writer_alongside_compact_range_never_makes_it_report_corruption` —
-  the reproduction, kept: twenty attempts with a writer, zero errors. One attempt would have proved
-  nothing against a 1-in-20 rate.
+  the reproduction, kept. **Sixty attempts, and the number is arithmetic**: the defect appeared once
+  in twenty, so a twenty-attempt test would go green against the broken code about a third of the
+  time — a test that lies at a rate. Sixty puts detection near nineteen in twenty and costs a couple
+  of seconds on an in-memory filesystem. Verified red three times out of three with the range check
+  neutered (1, 3 and 5 failures of 60), and green with it.
 - `esker-engine/tests/db.rs::a_sustained_writer_and_repeated_compactions_lose_no_key` — a writer,
   the pool and repeated `compact_range` calls working the same levels at once, asserting every key
   reads back its newest value. A rule that serialised the wrong thing could drop an output and lose
   a key while returning `Ok`.
+
+  It **asserts that it stressed anything**, and that is not ceremony. Two earlier versions of it
+  were worthless in opposite directions. The first let the writer run unthrottled for the whole
+  loop, so each round had more to compact than the last and `compact_range(None, None)` chased a
+  database growing faster than it drained — 456 other tests finished while that one spun at 350%
+  CPU past seventy seconds. Bounding the writer fixed that and introduced the opposite fault: the
+  compaction loop now finished *first*, the writer was stopped after 718 writes, and the test passed
+  in a tenth of a second having contended with nothing. So the loop's exit condition is the writer
+  finishing, and the test counts the rounds that really did run alongside it and fails if that is
+  zero. Eight consecutive runs, all green, all between 0.9 and 1.4 s.
