@@ -3690,16 +3690,7 @@ pub(super) fn create_role(
         });
         return Ok(Outcome::done("CREATE ROLE"));
     }
-    catalog::create_role(
-        txn,
-        &create.name,
-        catalog::RoleFlags {
-            login: create.login,
-            superuser: create.superuser,
-            create_db: create.create_db,
-            create_role: create.create_role,
-        },
-    )?;
+    catalog::create_role(txn, &create.name, create.flags)?;
     Ok(Outcome::done("CREATE ROLE"))
 }
 

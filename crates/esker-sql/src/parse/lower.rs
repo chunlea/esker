@@ -471,10 +471,15 @@ fn lower_statement(
                 // `CREATE USER` was rewritten to `CREATE ROLE … LOGIN` before the parser saw it,
                 // so `Some(true)` here is that rewrite arriving — and a bare `CREATE ROLE` is
                 // `None`, which is `NOLOGIN`, which is what a real server does.
-                login: create.login.unwrap_or(false),
-                superuser: create.superuser.unwrap_or(false),
-                create_db: create.create_db.unwrap_or(false),
-                create_role: create.create_role.unwrap_or(false),
+                flags: catalog::RoleFlags {
+                    // `CREATE USER` was rewritten to `CREATE ROLE … LOGIN` before the parser saw
+                    // it, so `Some(true)` here is that rewrite arriving; a bare `CREATE ROLE` is
+                    // `None`, which is `NOLOGIN`, which is what a real server does.
+                    login: create.login.unwrap_or(false),
+                    superuser: create.superuser.unwrap_or(false),
+                    create_db: create.create_db.unwrap_or(false),
+                    create_role: create.create_role.unwrap_or(false),
+                },
                 if_not_exists: create.if_not_exists,
             }))
         }

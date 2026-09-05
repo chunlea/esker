@@ -1126,6 +1126,12 @@ pub(super) fn decode_role(bytes: &[u8]) -> Result<(u64, RoleFlags)> {
 /// all three — a role created without `SUPERUSER` is not a superuser. `rolinherit` is deliberately
 /// *not* here: its default is `true`, so a zero bit would read as the wrong answer for every role
 /// written before it, and it is `true` for every role this node can make.
+// **Four bools on purpose.** `struct_excessive_bools` is aimed at a struct whose flags are really
+// a state machine wearing booleans; these are not. They are four independent attributes that
+// PostgreSQL itself keeps as four independent columns — `rolsuper`, `rolcreatedb`, `rolcreaterole`,
+// `rolcanlogin` — and any role may have any combination. Folding them into an enum would claim they
+// are mutually exclusive, which would be a worse description than the lint is objecting to.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoleFlags {
     /// `LOGIN` — the one attribute that distinguishes `CREATE USER` from `CREATE ROLE`.

@@ -3142,7 +3142,7 @@ pub fn role_by_name(txn: &dyn Txn, name: &str) -> Result<Option<RoleDef>> {
 }
 
 /// Records a new role. `42710` if the name is taken.
-pub fn create_role(txn: &mut dyn Txn, name: &str, flags: record::RoleFlags) -> Result<()> {
+pub fn create_role(txn: &mut dyn Txn, name: &str, flags: RoleFlags) -> Result<()> {
     if txn.get(&record::role_key(name))?.is_some() {
         return Err(SqlError::RoleAlreadyExists(name.to_owned()));
     }

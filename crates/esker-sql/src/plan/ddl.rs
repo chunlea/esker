@@ -290,16 +290,16 @@ pub struct CreateSchema {
 pub struct CreateRole {
     /// The role's name, folded.
     pub name: String,
-    /// `LOGIN` — implied by `CREATE USER`, absent from a bare `CREATE ROLE`.
-    pub login: bool,
-    /// `SUPERUSER`. **Recorded and not honoured**: nothing here checks a privilege, so this is
-    /// what `pg_roles.rolsuper` reports and nothing more. It was accepted and dropped before,
-    /// which is worse — a client that asked for it was told yes and then shown `f`.
-    pub superuser: bool,
-    /// `CREATEDB`, on the same terms.
-    pub create_db: bool,
-    /// `CREATEROLE`, on the same terms.
-    pub create_role: bool,
+    /// What the statement asked for: `LOGIN` (implied by `CREATE USER`), `SUPERUSER`, `CREATEDB`,
+    /// `CREATEROLE`.
+    ///
+    /// **The catalog's own type, not four bools repeated here.** They are one set of attributes
+    /// travelling from the parser to the record, and giving each layer its own copy would be three
+    /// places for them to disagree — and three `struct_excessive_bools` allowances for one reason.
+    ///
+    /// Recorded, not honoured: nothing here checks a privilege. Reporting what was asked is
+    /// honest; reporting the opposite, which is what dropping them did, is not.
+    pub flags: crate::catalog::RoleFlags,
     /// `IF NOT EXISTS`.
     pub if_not_exists: bool,
 }
