@@ -1827,6 +1827,24 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
     use crate::plan::Literal;
     Ok(match expr {
         Expr::Ordinal { at, .. } => row.get(*at).cloned().unwrap_or(Datum::Null),
+        // **The element type comes from the plan, not from the values.** Resolution settled it
+        // once against the scope, so every row builds the same type of array — a row whose
+        // elements all happen to be NULL must not produce a differently-typed array from the one
+        // before it.
+        Expr::Array { elements, element } => {
+            let mut values = Vec::with_capacity(elements.len());
+            for expr in elements {
+                values.push(match evaluate_in(expr, row, env)? {
+                    Datum::Null => None,
+                    value => Some(value),
+                });
+            }
+            Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                element.unwrap_or(ColumnType::Text),
+                1,
+                values,
+            ))
+        }
         // The type was settled when the expression was resolved. Where it was not — a `DEFAULT`
         // evaluated by the DDL path, which never resolves against a row — the operands' own types
         // answer the same question, and a NULL operand makes the question moot.

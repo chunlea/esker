@@ -1,0 +1,45 @@
+# `ARRAY[…]` whose elements are not constants — as PostgreSQL 19beta1 answers it.
+#
+# **Run 92: 6 tests, unchanged from run 89** — `uniqueness_validation_test.rb` (3),
+# `case_insensitive_comparison_test.rb` (1), `postgresql_adapter_test.rb` (1), `uuid_test.rb` (1).
+# All six are one statement: `postgresql_adapter.rb:1081`'s
+# `can_perform_case_insensitive_comparison_for?`, which joins `pg_proc` to `pg_cast` on
+# `ARRAY[casttarget]::oidvector = proargtypes`. A constructor over a **column** cannot fold at
+# lowering, which is what "an ARRAY constructor over anything but constants" was.
+#
+# Things reasoning would get wrong:
+#
+#   * **The widening is not order sensitive.** `ARRAY[n, m]` and `ARRAY[m, n]` over
+#     `(integer, bigint)` are both `bigint[]`, so a fold that keeps "the last type seen" is wrong
+#     half the time — `a6` and `a6b` are the pair that says so.
+#   * **The element type is the column's own, not the widest this node stores.** `ARRAY[n]` over an
+#     `integer` column is `integer[]` and not `bigint[]`.
+#   * **An array holding a NULL is not a NULL array**: `ARRAY[t] IS NULL` is false where `t` is
+#     NULL, and the value equals `'{NULL}'`. So a NULL element is an element.
+#   * A literal beside a column does not make the array `text[]` — `ARRAY[n, 5]` is `integer[]`;
+#     it is a *string* that does.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`.
+
+BEGIN;		-
+CREATE TABLE ac (id int8, n integer, m bigint, t text, d numeric);		-
+INSERT INTO ac VALUES (1, 7, 8, 'x', 1.5), (2, NULL, 9, NULL, 2.5);		-
+
+-- ------------------------------------------------- one element, and the element is a column		-
+SELECT 'a1', ARRAY[n] FROM ac ORDER BY id;		a1|{7} ; a1|{NULL}
+SELECT 'a2', ARRAY[n, m] FROM ac ORDER BY id;		a2|{7,8} ; a2|{NULL,9}
+SELECT 'a3', ARRAY[t, 'lit'] FROM ac ORDER BY id;		a3|{x,lit} ; a3|{NULL,lit}
+SELECT 'a4', ARRAY[n, 5] FROM ac ORDER BY id;		a4|{7,5} ; a4|{NULL,5}
+SELECT 'a5', ARRAY[d, n] FROM ac ORDER BY id;		a5|{1.5,7} ; a5|{2.5,NULL}
+SELECT 'a10', ARRAY[upper(t)] FROM ac ORDER BY id;		a10|{X} ; a10|{NULL}
+
+-- ------------------------------------------------- the type, which is the widest element's		-
+SELECT 'a6', pg_typeof(ARRAY[n]), pg_typeof(ARRAY[n, m]), pg_typeof(ARRAY[d, n]) FROM ac LIMIT 1;		a6|integer[]|bigint[]|numeric[]
+SELECT 'a6b', pg_typeof(ARRAY[m, n]), pg_typeof(ARRAY[n, d]) FROM ac LIMIT 1;		a6b|bigint[]|numeric[]
+
+-- ------------------------------------------------- and it behaves like any other array		-
+SELECT 'a7', ARRAY[n] = ARRAY[7] FROM ac ORDER BY id;		a7|t ; a7|f
+SELECT 'a8', array_length(ARRAY[n, m], 1) FROM ac ORDER BY id;		a8|2 ; a8|2
+SELECT 'a9', ARRAY[t] IS NULL, ARRAY[t] = '{NULL}' FROM ac ORDER BY id;		a9|f|f ; a9|f|t
+SELECT 'a11', ARRAY[n]::text FROM ac ORDER BY id;		a11|{7} ; a11|{NULL}
+ROLLBACK;		-

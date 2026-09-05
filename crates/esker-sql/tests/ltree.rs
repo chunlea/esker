@@ -29,21 +29,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', '{a.b,c.d}'::ltree[], pg_typeof('{a.b}'::ltree[])",
     ],
     answers: &[
-        // **`COLLATE` is not lowered here at all**, and it is a parser gap for every type rather
-        // than one of `ltree`'s: `sqlparser` gives it as an infix it has no parser for in one
-        // spelling and an expression this crate refuses in the other. The two statements are here
-        // because a byte-ordered comparison is the *control* for the ltree ordering above them —
-        // the pair is what proves the two orders differ — and this node's own answer to that
-        // control is in the statement above: `ORDER BY path` gives the labels' order, which is
-        // not what a byte sort would.
+        // **`COLLATE` used to be the reason both of these were here**, and it is not any more:
+        // `C` and `POSIX` name byte order, which is what a memcomparable key gives, so the clause
+        // is honoured ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+        // The comparison below it agreed the moment that landed and its entry is gone.
+        //
+        // What is left is `ltree`'s own ordering: `ORDER BY path::text COLLATE "C"` sorts the
+        // *text* of the paths, and this node's `ltree` is stored as its text, so the two orders
+        // are the same here and are not on a real server, where an `ltree` sorts by label. The
+        // control statement above — `ORDER BY path` — is where that difference is visible.
         (
             "SELECT 'r', path FROM ltrees ORDER BY path::text COLLATE \"C\"",
-            "COLLATE is not lowered here, for any type",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', 'a.b'::ltree < 'a-b'::ltree, 'a.b' < 'a-b' COLLATE \"C\"",
-            "COLLATE is not lowered here, for any type",
+            "an ltree sorts by label on a real server and by its text here",
             "UNMEASURED",
         ),
     ],
