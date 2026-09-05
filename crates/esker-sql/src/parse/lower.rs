@@ -1213,11 +1213,11 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
         // fails on the feature that is missing instead of aborting the transaction on this.
         Set::SetSessionAuthorization(param) => match &param.kind {
             SetSessionAuthorizationParamKind::Default => Ok(plan::Statement::Session(
-                plan::SessionStatement::SetSessionAuthorization,
+                plan::SessionStatement::SetSessionAuthorization(None),
             )),
-            SetSessionAuthorizationParamKind::User(name) => {
-                Err(SqlError::UndefinedRoleForAuthorization(ident(name)))
-            }
+            SetSessionAuthorizationParamKind::User(name) => Ok(plan::Statement::Session(
+                plan::SessionStatement::SetSessionAuthorization(Some(ident(name))),
+            )),
         },
         other => Err(SqlError::unsupported(set_feature_name(other))),
     }
