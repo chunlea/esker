@@ -1,13 +1,15 @@
 //! `esker` — command line tools for the Esker key-value store.
 //!
 //! `server` runs a store; `raw` talks to one. `sst-dump`, `wal-dump` and `manifest-dump`
-//! inspect the three on-disk formats, `bench` drives a workload against a real database, and
+//! inspect the three on-disk formats, `bench` drives a workload against a real database,
+//! `bench-mpp` measures a distributed aggregate on a cluster it starts, and
 //! `region` arrives with the layer it inspects (`docs/DESIGN.md` §12).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod args;
 mod bench;
+mod bench_mpp;
 mod bench_pd;
 mod bench_remote;
 mod bench_txn;
@@ -57,6 +59,18 @@ fn run_sst_store(command: &args::SstStoreCommand) -> ExitCode {
     }
 }
 
+/// `bench-mpp`, out of line for the same reason [`run_sst_store`] is: `main` stays a dispatch
+/// table, and clippy holds it to a hundred lines.
+fn run_bench_mpp(options: &bench_mpp::BenchMppOptions) -> ExitCode {
+    match bench_mpp::run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("esker bench-mpp: {reason}");
+            ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match args::parse(std::env::args().skip(1)) {
         Ok(Command::Version) => {
@@ -84,6 +98,7 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         },
+        Ok(Command::BenchMpp(options)) => run_bench_mpp(&options),
         Ok(Command::SstDump(options)) => {
             let mut stdout = std::io::stdout().lock();
             match sst_dump::run(&options, &mut stdout) {
