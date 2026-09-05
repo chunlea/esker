@@ -2857,13 +2857,24 @@ impl Executor {
             // while still wanting the name — so position does not decide it. What is left, and
             // is declared in `tests/regtype_user.rs`, is `WHERE enumtypid = 'mood'::regtype`,
             // which wants the oid from a position that cannot say so.
-            return Ok(Some(if *want_oid {
-                Expr::Literal(Literal::Typed(Box::new(Datum::Oid(
-                    u32::try_from(def.oid).unwrap_or(u32::MAX),
-                ))))
-            } else {
-                Expr::Literal(Literal::String(crate::catalog::display_name(&def.name)))
-            }));
+            // **A `regtype`, not the name as text** — the half ADR 0077 recorded as unbuilt,
+            // and the catalog read that resolves the name has the oid in hand anyway. It prints
+            // the same, so nothing that only reads the value changes; what moves is `pg_typeof`,
+            // and the comparison, which is the oid's — so `WHERE enumtypid = 'mood'::regtype`
+            // now answers from a position that cannot say it wanted the oid. That was this
+            // function's own declared reason for the `want_oid` flag, and it is why the flag can
+            // stay: `::oid` still asks for an `oid` and gets one.
+            let oid = u32::try_from(def.oid).unwrap_or(u32::MAX);
+            return Ok(Some(Expr::Literal(Literal::Typed(Box::new(
+                if *want_oid {
+                    Datum::Oid(oid)
+                } else {
+                    Datum::RegType {
+                        oid,
+                        name: crate::catalog::display_name(&def.name).into(),
+                    }
+                },
+            )))));
         }
         if call.func != crate::plan::CatalogFunc::UserCast {
             return Ok(None);

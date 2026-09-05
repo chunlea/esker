@@ -179,18 +179,40 @@ impl Statement {
     /// The executor asks so that every later lookup in the same transaction reads through the
     /// shared cache instead of filling it: after this statement the transaction can see its own
     /// uncommitted DDL, and nothing uncommitted may be published to the node (`crate::catalog`).
-    /// `EXPLAIN` is false because it runs nothing.
+    ///
+    /// # This is a deny-list, and it is one on purpose
+    ///
+    /// It was an allow-list of five statements — `CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX` and
+    /// `COMMENT` — and **`ALTER TABLE` was not among them**. So every `ALTER` published its
+    /// transaction's uncommitted table to a cache the whole node reads, and a transaction that
+    /// then rolled back left it there. The cache is keyed by catalog *version*, and a version is
+    /// not a transaction identity: the next transaction to reach that same number was handed the
+    /// rolled-back one's table. Two `ALTER`s were needed to line the numbers up, which is why the
+    /// bug reproduced at exactly two and not at one or three
+    /// (`tests/rolled_back_ddl_cache.rs`).
+    ///
+    /// Naming what does **not** write the catalog inverts the cost of forgetting. A new statement
+    /// left off an allow-list is a silent wrong answer; left off this list it is a cache this
+    /// transaction stops using, which costs a lookup and nothing else. Every arm below is a
+    /// statement that reads or writes *rows*, or touches no stored state at all.
     #[must_use]
     pub fn writes_catalog(&self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Statement::CreateTable(_)
-                | Statement::DropTable(_)
-                | Statement::CreateIndex(_)
-                | Statement::DropIndex(_)
-                // A comment is a field of the table record, so setting one rewrites it — and
-                // every later lookup in this transaction has to see the row it wrote.
-                | Statement::Comment(_)
+            // Rows, not definitions. These are the hot path, and marking one of them true would
+            // turn the cache off for the rest of every transaction that wrote a row.
+            Statement::Insert(_)
+                | Statement::Select(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                // Runs nothing.
+                | Statement::Explain(..)
+                // A message to the client, and `SET`/`SHOW`, which are session state and not
+                // catalog state — `crate::parameter` owns them and no cache reads them.
+                | Statement::Raise { .. }
+                | Statement::Session(_)
+                // Reads of history (`docs/adr/0021-time-machine.md`).
+                | Statement::TimeMachine(_)
         )
     }
 
