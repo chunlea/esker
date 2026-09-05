@@ -496,10 +496,15 @@ fn updatable(
     };
     let body = Executor::view_body(&view)?;
     let refuse = |detail: &str| {
+        let (gerund, upper) = verb.hint_parts();
         Err(SqlError::ViewNotUpdatable {
             verb: verb.word().to_owned(),
             view: name.to_owned(),
             detail: detail.to_owned(),
+            hint: format!(
+                "To enable {gerund} the view, provide an INSTEAD OF {upper} trigger or an \
+                 unconditional ON {upper} DO INSTEAD rule."
+            ),
         })
     };
 
@@ -636,6 +641,21 @@ impl Verb {
             Verb::Insert => "insert into",
             Verb::Update => "update",
             Verb::Delete => "delete from",
+        }
+    }
+
+    /// The `HINT`'s two halves, which differ per verb and were measured together:
+    ///
+    /// ```text
+    /// To enable updating the view,     … INSTEAD OF UPDATE trigger … ON UPDATE DO INSTEAD rule.
+    /// To enable inserting into the view … INSTEAD OF INSERT trigger … ON INSERT DO INSTEAD rule.
+    /// To enable deleting from the view  … INSTEAD OF DELETE trigger … ON DELETE DO INSTEAD rule.
+    /// ```
+    fn hint_parts(self) -> (&'static str, &'static str) {
+        match self {
+            Verb::Insert => ("inserting into", "INSERT"),
+            Verb::Update => ("updating", "UPDATE"),
+            Verb::Delete => ("deleting from", "DELETE"),
         }
     }
 }

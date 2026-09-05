@@ -30,6 +30,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_plain'",
         r"SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks'''",
         r"SELECT 'r', viewname, definition FROM pg_views WHERE viewname = 'ebooks'''",
+        // **The same three facts about three more statements**, comparable only since the write
+        // through a view stopped aborting the block: `character varying(3)` for the
+        // `information_schema` flags, and `name` / `"char"` for the `pg_catalog` ones. The values
+        // agree in every case; it is the declared type that differs.
+        "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_distinct'",
+        "SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks_mat'",
+        "SELECT 'r', matviewname FROM pg_matviews WHERE matviewname = 'ebooks_mat'",
     ],
     answers: &[
         (
@@ -57,13 +64,41 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // statement before this one aborted the transaction and this was never compared. It is a
         // pre-existing gap and not a view-formatting one: an `INSERT` through an automatically
         // updatable view is not implemented, so the insert path does not know the name.
+        // **Writing through a view is no longer a divergence** — the entry that stood here said
+        // "its own unit", and this is that unit. What follows is what closing it *surfaced*: five
+        // statements the aborted transaction had been swallowing, none of them about writing
+        // through a view, and each recorded as a gap rather than a choice.
         (
-            "INSERT INTO ebooks_plain (name, cover, status, format) VALUES ('Written Through', \
-             'hard', 0, 'ebook')",
-            "`42P01`: writing **through** a view is its own feature. `is_updatable` now answers \
-             `YES` for this view, which is the right answer about the *query* — PostgreSQL would \
-             accept the insert and this node does not. Its own unit; the read side is complete.",
-            "pg19_view.txt:58",
+            "SELECT 'r', pg_get_viewdef('ebooks_plain'::regclass, true)",
+            "The **formatting** divergence two entries above, reached through a third spelling: \
+             PostgreSQL prints a view's body through its own renderer, one column per line. Only \
+             comparable at all now that the insert before it stopped aborting the block.",
+            "pg19_view.txt:72",
+        ),
+        (
+            "CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name AS title, cover, status, \
+             format, 'x'::text AS extra FROM books WHERE format = 'ebook'",
+            "**A gap, not a choice.** PostgreSQL refuses `42P16 cannot change name of view column \
+             \"name\" to \"title\"` and this node accepts the replacement — a wrong answer, which \
+             ADR 0031 ranks below a refusal. `CREATE OR REPLACE VIEW` must keep the existing \
+             columns' names and may only append. Surfaced by closing the insert above.",
+            "pg19_view.txt:76",
+        ),
+        (
+            "CREATE OR REPLACE VIEW ebooks_plain AS SELECT id, name FROM books WHERE format = \
+             'ebook'",
+            "The other half of the same gap: PostgreSQL refuses `42P16 cannot drop columns from \
+             view` and this node accepts it. One unit with the entry above.",
+            "pg19_view.txt:79",
+        ),
+        (
+            "DROP TABLE books",
+            "Two differences in one dependency message, both in the `DETAIL` and neither about \
+             views being writable. PostgreSQL **quotes** a dependent's name when it needs quoting \
+             — `view \"ebooks'\"` against this node's `view ebooks'` — and where several views \
+             depend on the table it names a different one of them. Both were hidden behind the \
+             aborted block until now.",
+            "pg19_view.txt:86",
         ),
     ],
 };

@@ -135,6 +135,9 @@ pub enum SqlError {
         view: String,
         /// Which property makes it non-updatable, in PostgreSQL's words.
         detail: String,
+        /// The two ways out, in PostgreSQL's words. Verb-specific, and measured for all three
+        /// rather than extrapolated from one.
+        hint: String,
     },
 
     /// Contract C2. The statement parsed and we will not run it — the feature is named so the
@@ -2915,6 +2918,7 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::ViewNotUpdatable { detail, .. } => Some(detail.clone()),
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
             }
@@ -3071,6 +3075,7 @@ impl SqlError {
     )]
     pub fn hint(&self) -> Option<String> {
         match self {
+            SqlError::ViewNotUpdatable { hint, .. } => Some(hint.clone()),
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
             SqlError::RangeSubtypeNotOrdered(_) => Some(
                 "You must specify an operator class for the range type or define a default \
