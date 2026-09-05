@@ -453,6 +453,58 @@ async fn a_schema_change_in_a_transaction_settles_the_sequence_either_way() {
     );
 }
 
+/// **The other user types keep their own type across the bind**, which the enum fix took away.
+///
+/// `ColumnDef::user_type` is set for every `CREATE TYPE`, not only for an enum, so reading "this
+/// column has a user type" as "this column is an enum" made a bound parameter arrive as `text` for
+/// a **domain** and for a **user-defined range** as well. Both are then refused by the assignment,
+/// which is a P1 shape: two `range_test.rb` tests and one in `domain_test.rb` went from passing to
+/// `DatatypeMismatch`, and the enum tests they were fixed beside stayed green.
+///
+/// The two columns here are the two the suite actually has: `custom_money` is
+/// `domain_test.rb`'s `CREATE DOMAIN custom_money AS numeric(8,2)`, and `floatrange` is
+/// `range_test.rb`'s `CREATE TYPE floatrange AS RANGE (subtype = float8)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_domain_and_a_range_bind_as_themselves_not_as_text() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE DOMAIN custom_money AS numeric(8,2)").await;
+    wire.run("CREATE TYPE floatrange AS RANGE (subtype = float8)")
+        .await;
+    wire.run("CREATE TABLE pd (id int8, price custom_money, float_range floatrange)")
+        .await;
+
+    for (sql, value, want) in [
+        (
+            "INSERT INTO pd (id, price) VALUES (1, $1) RETURNING price",
+            "4.2",
+            "4.20",
+        ),
+        (
+            "INSERT INTO pd (id, float_range) VALUES (2, $1) RETURNING float_range",
+            "[0.5,0.7]",
+            "[0.5,0.7]",
+        ),
+    ] {
+        let reply = wire.send(&extended(sql, &[value])).await;
+        assert!(
+            !frames(&reply).iter().any(|(tag, _)| *tag == 'E'),
+            "{sql} with {value:?} was refused: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+        assert_eq!(
+            first_value(&reply).as_deref(),
+            Some(want),
+            "{sql}: a bound value for a non-enum user type keeps the column's own type"
+        );
+    }
+}
+
 /// **An enum crosses both boundaries as its label**, in and out.
 ///
 /// Run 89's `invalid input syntax for type smallint: "ok"` — 3 tests across `enum_test.rb` and

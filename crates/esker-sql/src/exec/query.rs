@@ -2379,6 +2379,27 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 )]
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
+        // **The element type is settled here and nowhere else.** A constructor over constants
+        // never reaches this arm — it folded at lowering, where what was written settles the type
+        // — so every element here is an expression whose type needs a scope. The widest wins in
+        // PostgreSQL's order, which is the same rule the folded path applies to literals.
+        Expr::Array { elements, .. } => {
+            let mut resolved = Vec::with_capacity(elements.len());
+            let mut element = None;
+            for expr in elements {
+                let expr = resolve(expr, scope)?;
+                let ty = expr_type(&expr, scope)?;
+                element = Some(match element {
+                    None => ty,
+                    Some(so_far) => wider_element(so_far, ty),
+                });
+                resolved.push(expr);
+            }
+            Expr::Array {
+                elements: resolved,
+                element,
+            }
+        }
         Expr::Like {
             operand,
             pattern,
@@ -3145,6 +3166,44 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             Expr::Literal(blank_pad(retype(*ty, literal, op, true)?, *ty, *typmod)),
             right.clone(),
         ),
+        // **A constructor gives the other side its array type**, which is the mirror of the
+        // subscript rule below and the same failure if it is missing: `ARRAY[t] = '{x}'` compared
+        // a `Datum::Array` against a `Datum::Text` and answered **`f` for every row**, including
+        // the rows that match — a wrong answer that looks like an empty result rather than an
+        // error. The element type is settled by then, which is what makes the array type
+        // answerable here without a scope.
+        //
+        // **Only an `unknown` string**, which is the doctrine this whole function is about: a
+        // folded `ARRAY[7]` is a `bigint[]` here and an `integer[]` on a real server, so retyping
+        // it against the constructor turned a working comparison into
+        // `42883 integer[] = bigint[]`. A literal that already has a type is left to the pair
+        // rules below, exactly as it is beside a column.
+        (
+            Expr::Array {
+                element: Some(ty), ..
+            },
+            Expr::Literal(literal @ Literal::String(_)),
+        ) => {
+            let array =
+                esker_keys::array::ArrayValue::array_of(*ty).unwrap_or(ColumnType::TextArray);
+            (
+                left.clone(),
+                Expr::Literal(retype(array, literal, op, false)?),
+            )
+        }
+        (
+            Expr::Literal(literal @ Literal::String(_)),
+            Expr::Array {
+                element: Some(ty), ..
+            },
+        ) => {
+            let array =
+                esker_keys::array::ArrayValue::array_of(*ty).unwrap_or(ColumnType::TextArray);
+            (
+                Expr::Literal(retype(array, literal, op, true)?),
+                right.clone(),
+            )
+        }
         // **A subscript takes the other side's type**, which is the same rule an `= ANY`'s
         // elements follow and for the same reason: an array is text here, so its elements have no
         // type of their own and what gives them one is what they are compared against. Without
@@ -3875,11 +3934,52 @@ fn fits(value: i64, ty: ColumnType) -> bool {
     }
 }
 
+/// The type an `ARRAY[…]` takes when two of its elements disagree, which is **not** order
+/// sensitive: `ARRAY[bigint, integer]` and `ARRAY[integer, bigint]` are both `bigint[]`. Measured
+/// on 19beta1 along with `ARRAY[numeric, integer]` being `numeric[]` and any string making the
+/// whole array `text[]`.
+///
+/// A rank rather than a pair table: PostgreSQL resolves the constructor by finding the type every
+/// element can be converted to, and among these that is simply the widest.
+fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
+    fn rank(ty: ColumnType) -> u8 {
+        match ty {
+            ColumnType::Int2 => 1,
+            ColumnType::Int4 => 2,
+            ColumnType::Int8 | ColumnType::Oid => 3,
+            ColumnType::Real => 4,
+            ColumnType::Double => 5,
+            ColumnType::Numeric => 6,
+            // A string makes the whole array `text[]`, which is the top of this order and the
+            // reason it is a rank at all: every other type has a text form and none of them is
+            // reachable from one.
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 7,
+            // Two elements of one unranked type are that type; two different ones cannot both
+            // convert, and the last one written is what this answered before the rank existed.
+            _ => 0,
+        }
+    }
+    if left == right {
+        return left;
+    }
+    match (rank(left), rank(right)) {
+        (0, _) | (_, 0) => right,
+        (l, r) if l >= r => left,
+        _ => right,
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // Both operands, then the promotion table — the same table the evaluator uses, so the
         // type a client is told matches the values it is sent.
         Expr::Negate(operand) => crate::value::arith::negate_type(expr_type(operand, scope)?)?,
+        // Settled at resolution and carried, for the reason `Arithmetic::ty` is: a client is told
+        // the column's type before any row is read. An unresolved one has no element type yet, and
+        // `text[]` is what an all-`unknown` constructor would have been anyway.
+        Expr::Array { element, .. } => element
+            .and_then(esker_keys::array::ArrayValue::array_of)
+            .unwrap_or(ColumnType::TextArray),
         Expr::Arithmetic {
             op, left, right, ..
         } => arithmetic_type(*op, left, right, scope)?,

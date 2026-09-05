@@ -76,6 +76,14 @@ const VIRTUAL_GENERATED: &str = "v";
 /// feature at all — the argument `pg_range` already makes.
 const NO_COLLATION: i64 = 0;
 
+/// `pg_collation` oids, as PostgreSQL numbers them — measured, `C` is 950 and `POSIX` 951, and
+/// `default` (the database's own, a locale on the oracle and byte order here) is 100.
+const C_COLLATION: i64 = 950;
+/// The second name for byte order.
+const POSIX_COLLATION: i64 = 951;
+/// What a collatable type carries when nothing overrides it.
+const DEFAULT_COLLATION: i64 = 100;
+
 /// Every `pg_attribute` row this tenant has.
 pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = Relations::read(txn, tenant)?;
@@ -236,6 +244,7 @@ fn columns_of<'a>(
                             .map(|column| (Cow::Borrowed(column), Some(*at))),
                         KeyPart::Expression { ty, .. } => Some((
                             Cow::Owned(ColumnDef {
+                                collation: None,
                                 name: key.attname(table).to_owned(),
                                 ty: *ty,
                                 typmod: crate::value::NO_TYPMOD,
@@ -279,6 +288,7 @@ fn columns_of<'a>(
             .map(|_| {
                 vec![(
                     Cow::Owned(ColumnDef {
+                        collation: None,
                         name: "expr".to_owned(),
                         ty: ColumnType::Text,
                         typmod: crate::value::NO_TYPMOD,
@@ -386,8 +396,53 @@ fn attribute(
             .to_owned(),
         ),
         Datum::Bool(column.dropped),
-        Datum::Int8(NO_COLLATION),
+        Datum::Int8(attcollation(column)),
     ]
+}
+
+/// `attcollation`: the collation this column was declared with, or its **type's** default.
+///
+/// A real server says `950` for `COLLATE "C"`, `951` for `POSIX`, `100` for a collatable column
+/// that named none, and `0` for a column of a type that has no collation at all — measured. The
+/// gap between the first two and the third is the whole of `ActiveRecord`'s read-back:
+/// `a.attcollation <> t.typcollation` names only the columns that asked
+/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+fn attcollation(column: &ColumnDef) -> i64 {
+    match column.collation.as_deref() {
+        Some(name) if name.eq_ignore_ascii_case("C") => C_COLLATION,
+        Some(name) if name.eq_ignore_ascii_case("POSIX") => POSIX_COLLATION,
+        _ => typcollation(column.ty),
+    }
+}
+
+/// `typcollation`: `100` for the types that have an ordering to override, `0` for the rest.
+///
+/// The same number a real server reports, and the reason a column that named no collation reads
+/// back as none: it equals its type's, so the `<>` in the read-back is false.
+pub(crate) fn typcollation(ty: ColumnType) -> i64 {
+    match ty {
+        // **An array is collatable where its element is** — measured, `_text` and `_varchar` are
+        // both `100`, and `CREATE TABLE arr (a text[] COLLATE "C")` is accepted and stores `950`.
+        // Which follows: comparing two arrays compares their elements, so the collation the
+        // elements would use is the one the array uses.
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Citext
+        | ColumnType::TextArray
+        | ColumnType::VarcharArray
+        | ColumnType::BpcharArray
+        | ColumnType::CitextArray => DEFAULT_COLLATION,
+        _ => NO_COLLATION,
+    }
+}
+
+/// Whether a `COLLATE` clause may name this type at all, which is PostgreSQL's own rule and not a
+/// second list: a type is collatable exactly when it has a `typcollation` to override. Anything
+/// else is `42804 collations are not supported by type <name>` — measured for `integer` and for
+/// `uuid`, which is why this asks the type rather than naming the two that were tried.
+pub(crate) fn collatable(ty: ColumnType) -> bool {
+    typcollation(ty) != NO_COLLATION
 }
 
 /// What `pg_get_expr(adbin, adrelid)` prints for one column, or `None` for a column with no

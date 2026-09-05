@@ -152,6 +152,11 @@ fn for_each_from_mut(select: &mut Select, visit: &mut impl FnMut(&mut TableRef))
 /// Into every sub-select an expression holds.
 fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef)) {
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                for_each_subquery_mut(element, visit);
+            }
+        }
         Expr::Subquery(sub) => {
             for_each_from_mut(&mut sub.select, visit);
             if let Some(operand) = &mut sub.operand {
