@@ -488,25 +488,64 @@ async fn a_compare_and_swap_over_the_wire_is_ordered_by_raft() {
 /// 22 ms later. Nothing was ever lost, and the assertion has not been weakened to say so — the
 /// missing wait was added, and the durability half was made explicit rather than inferred from
 /// the convergence half.
+///
+/// # What counts as acknowledged here, and what a lost write would look like
+///
+/// **A write is acknowledged exactly when its `propose` returned `Ok`, and nothing else is.** That
+/// `Ok` has a proof behind it: [`RaftPeer::propose`] is answered by `complete_proposal`, whose one
+/// call site is the end of the apply path, so it means *this entry applied on this peer* — which
+/// means it committed, which means a majority held it in their logs (`maybe_commit` takes
+/// `matched[quorum - 1]` under §5.4.2). Every other resolution answers `Err`.
+///
+/// So an `Err` is **not** an acknowledgement, and an *ambiguous* one least of all: `is_ambiguous`
+/// is `RequestOutcome::Unknown`, the store saying it does not know whether the entry will commit.
+/// A key whose propose answered that must never enter `acknowledged` — the list is the test's
+/// entire claim, and one unearned entry in it turns this into an assertion the cluster never made.
+///
+/// **A real lost write shows up in one of two places, and they fail differently:**
+///
+/// * before the kill, [`assert_quorum_holds`] — fewer than a quorum hold the acknowledged entry in
+///   their logs, so the acknowledgement did not mean what it says. This is the durability half and
+///   it cannot be a lag, because it is a fact about the log at the instant the answer returned;
+/// * after the election and `wait_for_applied`, the loop at the end — a survivor's `default`
+///   column family does not hold `key -> value`, and still does not ten seconds later. This is the
+///   convergence half.
+///
+/// The fix for an ambiguous answer therefore has exactly one shape: **retry until `Ok`, and record
+/// only then**. Dropping the write instead would shorten the list and let the test pass while
+/// checking less; recording it anyway would demand a value the cluster never promised.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
     let mut nodes = start_cluster(3).await;
-    let leader = settled_leader(&nodes).await;
+    let mut leader = settled_leader(&nodes).await;
 
     // Acknowledged writes: each `propose` returns only once the command has applied.
     let mut acknowledged = Vec::new();
     for index in 0..12_u32 {
         let key = format!("acked-{index:02}");
-        nodes[leader]
-            .store
-            .peer()
-            .unwrap()
-            .propose(&Command::Put {
-                key: Bytes::from(key.clone().into_bytes()),
-                value: Bytes::from(index.to_be_bytes().to_vec()),
-            })
-            .await
-            .unwrap();
+        let command = Command::Put {
+            key: Bytes::from(key.clone().into_bytes()),
+            value: Bytes::from(index.to_be_bytes().to_vec()),
+        };
+        // **An ambiguous answer is not an acknowledgement, and this used to `unwrap` one.** A
+        // leader that steps down with the proposal in its log answers `it may still commit`, which
+        // is `Unknown` — seen once in twenty-five runs at fourteen busy threads, and read from
+        // outside as this test failing, which reads as invariant 1. Retried rather than recorded:
+        // repeating is safe *here* because every write is an idempotent `Put` of one fixed value
+        // from a single writer, so a second apply cannot be observed — the same argument
+        // `promotion.rs`'s `put` makes, and the same handling five other store tests already use.
+        //
+        // The leader is re-derived rather than reused: the answer means it is no longer leading,
+        // and it is also the node this test kills later.
+        loop {
+            match nodes[leader].store.peer().unwrap().propose(&command).await {
+                Ok(_) => break,
+                Err(error) if error.is_ambiguous() || error.is_retryable() => {
+                    leader = settled_leader(&nodes).await;
+                }
+                Err(error) => panic!("proposing {key}: {error}"),
+            }
+        }
         // The leader's log index for this write, so a failure can say whether a survivor is
         // missing the entry or merely has not applied it yet.
         let at = nodes[leader]
@@ -539,7 +578,7 @@ async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
     let _ = handle.shutdown().await;
 
     // Two of three is still a quorum, so the survivors elect one of themselves.
-    let new_leader = settled_leader(&nodes).await;
+    let mut new_leader = settled_leader(&nodes).await;
     assert_eq!(nodes.len(), 2);
 
     // **The survivors' state machines have to catch up before their data is read.**
@@ -581,16 +620,30 @@ async fn no_acknowledged_write_is_lost_when_the_leader_is_killed() {
     }
 
     // And the cluster still takes writes.
-    nodes[new_leader]
-        .store
-        .peer()
-        .unwrap()
-        .propose(&Command::Put {
-            key: Bytes::from_static(b"after"),
-            value: Bytes::from_static(b"the-kill"),
-        })
-        .await
-        .unwrap();
+    // **The second unwrapped propose, and it fails the same way.** The survivors have just
+    // elected; the one this write is addressed to can step down again, or refuse as a non-leader,
+    // before it applies. Seventy-five runs of the unfixed test at fourteen busy threads failed
+    // twelve times — eight at the write loop above and **four here** — so fixing only the first
+    // would have left a third of the failures and read as the fix not working.
+    let after = Command::Put {
+        key: Bytes::from_static(b"after"),
+        value: Bytes::from_static(b"the-kill"),
+    };
+    loop {
+        match nodes[new_leader]
+            .store
+            .peer()
+            .unwrap()
+            .propose(&after)
+            .await
+        {
+            Ok(_) => break,
+            Err(error) if error.is_ambiguous() || error.is_retryable() => {
+                new_leader = settled_leader(&nodes).await;
+            }
+            Err(error) => panic!("writing after the kill: {error}"),
+        }
+    }
     assert_eq!(
         esker_store::rawkv::get(nodes[new_leader].store.db(), b"after")
             .unwrap()
