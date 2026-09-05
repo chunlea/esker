@@ -2426,7 +2426,22 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 // the text for everything else, evaluated once per row. Folding the rest would
                 // give every row the instant `CREATE TABLE` ran, or every row the same UUID and a
                 // primary key that refuses the second insert.
-                ColumnOption::Default(expr) => (default, default_expr) = column_default(expr, ty)?,
+                //
+                // **A user-defined type's default is folded by the executor, not here** — the
+                // same guard `ALTER TABLE … ADD COLUMN` has, and this statement did not. The
+                // column's `ty` is an `int2` placeholder until the catalog has been read (ADR
+                // 0050), so folding `'blue'` against it hands a label to the `int2` input
+                // function: `invalid input syntax for type smallint: "blue"`, which is exactly
+                // what `t.enum … default: "blue"` produced. `text` keeps the label as written and
+                // `exec::ddl` turns it into the ordinal, where the type's labels are known.
+                ColumnOption::Default(expr) => {
+                    let written = if user_type_name.is_some() {
+                        ColumnType::Text
+                    } else {
+                        ty
+                    };
+                    (default, default_expr) = column_default(expr, written)?;
+                }
                 ColumnOption::Unique(constraint) => {
                     let (deferrable, deferred) =
                         unique_deferrable(constraint.characteristics.as_ref())?;
