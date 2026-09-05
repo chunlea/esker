@@ -1,0 +1,23 @@
+crates/esker-sql/tests/captures/pg19_time_zone.txt
+  s_609bbbdbf3c419::t_1980d9b0df0cce 1-103
+deny.toml
+  s_609bbbdbf3c419::t_f88a2002c20aa1 24-26
+docs/adr/0079-the-time-zone-table-is-data-the-reader-is-ours.md
+  s_609bbbdbf3c419::t_85b32fcd1b40f7 1-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d2008590ea5a1be75d10bb58dafd83d8711f6d45",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
