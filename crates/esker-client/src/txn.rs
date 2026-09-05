@@ -136,6 +136,37 @@ pub const MAX_SCAN_REGIONS: usize = 64;
 /// would make a busy key look like a broken cluster.
 pub const MAX_LOCK_RESOLUTIONS: u32 = 8;
 
+/// How many times one page of a scan will re-ask the authority where its region ended.
+///
+/// A page is refused when the split that moved its boundary landed after the route was cached, so
+/// each refresh follows a real split and makes real progress — which is why this is a small count
+/// and not a deadline. Four, because the measured case is a table splitting under a bulk load and
+/// one was demonstrably too few (`Transaction::scan_region`).
+pub const SCAN_ROUTE_REFRESHES: usize = 4;
+
+/// Whether `[start_key, end_key)` — a region, as the store named it — contains `key`.
+///
+/// An empty `end_key` is the end of the key space; an empty `start_key` is its beginning.
+fn owns(start_key: &Bytes, end_key: &Bytes, key: &Bytes) -> bool {
+    start_key.as_ref() <= key.as_ref() && (end_key.is_empty() || key.as_ref() < end_key.as_ref())
+}
+
+/// A scan page's end: the caller's, or the region's, whichever comes first.
+///
+/// **An empty key means "the end of the key space" on both sides**, and they mean it in opposite
+/// directions here — an empty `boundary` is the last region, so the caller's own `end` stands; an
+/// empty `end` is an unbounded scan, so the region's boundary is what bounds this page. Reading
+/// either one as a literal empty string would clamp every page to nothing.
+fn clamp_end(end: &[u8], boundary: &Bytes) -> Bytes {
+    if boundary.is_empty() {
+        return Bytes::copy_from_slice(end);
+    }
+    if end.is_empty() || boundary.as_ref() < end {
+        return boundary.clone();
+    }
+    Bytes::copy_from_slice(end)
+}
+
 /// Where timestamps come from (`CLAUDE.md` invariant 6).
 ///
 /// The one seam between this client and the placement driver's oracle. It is a trait for the
@@ -777,24 +808,19 @@ impl Transaction {
         let mut cursor = Bytes::copy_from_slice(start);
 
         for _ in 0..self.max_scan_regions {
-            let page = self.scan_page(&cursor, end, limit)?;
+            let (page, next) = self.scan_region(&cursor, end, limit)?;
             merged.extend(page);
             if merged.len() >= limit as usize {
                 break;
             }
-            // Where this region ended is where the next one starts. An empty `end_key` is the
-            // end of the key space, so a region carrying one is the last there is.
-            let Some(next) = self
-                .router
-                .cached_route(&cursor)
-                .map(|route| route.region.end_key)
-                .filter(|next| !next.is_empty())
-            else {
+            // An empty `end_key` is the end of the key space, so a region carrying one is the
+            // last there is and the range is exhausted.
+            if next.is_empty() {
                 break;
-            };
+            }
             // Past the range the caller asked for, or not moving. The second is the guard that
-            // matters: a cache entry naming a region that ends at or before the cursor would
-            // otherwise ask the same region for ever.
+            // matters: a route naming a region that ends at or before the cursor would otherwise
+            // ask the same region for ever.
             if (!end.is_empty() && next.as_ref() >= end) || next <= cursor {
                 break;
             }
@@ -808,6 +834,85 @@ impl Transaction {
             };
         }
         Ok(merged.into_iter().take(limit as usize).collect())
+    }
+
+    /// One region's worth of a scan, and where that region ends.
+    ///
+    /// # The range must not leave the region, and this is what that costs
+    ///
+    /// A store refuses a `Scan` whose range is not *contained* by the region it reaches —
+    /// `RegionMeta::check_range`, and it is right to: invariant 5 says a store never serves a
+    /// range it no longer owns, and a scan that came back holding only the first region's keys
+    /// with no error would be the silent wrong answer that rule exists to prevent. So the client
+    /// is what has to move. This asks who owns `cursor`, clamps the page to that region's end,
+    /// and answers the boundary so the walk above can carry on from it.
+    ///
+    /// Sending the caller's whole `end` to the first region is what made **every** SQL scan across
+    /// a boundary fail with `08006 key is not in region 1` the moment a table first grew past the
+    /// split threshold ([ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+    /// The walk was already here and already correct; what it asked for was not.
+    ///
+    /// # Why it asks again, and why a *few* times
+    ///
+    /// The region cache is a hint (`docs/DESIGN.md` §10), and a hint taken before a split names a
+    /// region wider than the one that now exists — so the clamp is computed from a boundary that
+    /// has moved and the store refuses again. `KeyNotInRegion` is *terminal* for the router,
+    /// which is correct, because no amount of waiting fixes routing; what fixes it is asking the
+    /// authority, which is what a refreshed attempt does.
+    ///
+    /// **One refresh is not enough, measured.** The first version allowed exactly one, on the
+    /// reasoning that two attempts say "the cache was stale" and a loop would say "the cluster is
+    /// splitting faster than we can read". A cluster just past a bulk load *is* splitting that
+    /// fast: `cross_region_scan` loaded a table into five regions and the sixth appeared **while
+    /// the queries ran**, so a scan could lose its route twice and answer
+    /// `08006 key is not in region 7`. Each refresh is authoritative and each one follows a real
+    /// split, so the budget is small and fixed rather than a deadline — [`SCAN_ROUTE_REFRESHES`].
+    ///
+    /// **The timestamp does not move between pages.** `scan_page` reads `self.read_ts()` every
+    /// time, and that is the transaction's, so the regions of one scan are read at one snapshot —
+    /// a scan that re-stamped per region would be a scan that saw a row twice or not at all.
+    fn scan_region(
+        &self,
+        cursor: &Bytes,
+        end: &[u8],
+        limit: u32,
+    ) -> Result<(Vec<(Bytes, Bytes)>, Bytes)> {
+        let mut boundary = self.router.route(cursor)?.region.end_key;
+        let mut refreshes = 0;
+        loop {
+            match self.scan_page(cursor, &clamp_end(end, &boundary), limit) {
+                Ok(pairs) => return Ok((pairs, boundary)),
+                Err(Error::Store(ProtoError::KeyNotInRegion {
+                    start_key, end_key, ..
+                })) if refreshes < SCAN_ROUTE_REFRESHES => {
+                    refreshes += 1;
+                    boundary = if owns(&start_key, &end_key, cursor) {
+                        // **The store just named the range it actually owns, so believe it.**
+                        // Asking the placement driver instead is what the first version did, and
+                        // it did not work: the store knows about its own split the instant it
+                        // happens and the driver learns at the next heartbeat, so a refresh
+                        // during that window hands back the same too-wide boundary and the
+                        // retries burn out in microseconds. The refusal is the newer fact.
+                        end_key
+                    } else {
+                        // The cursor is not in that region at all, so this is stale *routing*
+                        // rather than a stale boundary, and the authority is what fixes it.
+                        self.router
+                            .locate(cursor)?
+                            .map(|route| route.region.end_key)
+                            .ok_or_else(|| {
+                                Error::Store(ProtoError::KeyNotInRegion {
+                                    key: cursor.clone(),
+                                    region_id: 0,
+                                    start_key: Bytes::new(),
+                                    end_key: Bytes::new(),
+                                })
+                            })?
+                    };
+                }
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     /// One region's worth of a scan.

@@ -101,4 +101,72 @@ fn a_scan_reads_a_table_that_spans_more_than_one_region() {
         vec![ROWS.to_string()],
         "the scan did not count every row of a {regions}-region table"
     );
+
+    // **The shapes that read rows rather than count them.** A `count(*)` can be right while the
+    // walk is wrong in ways an aggregate hides — a page dropped in the middle changes the count
+    // and a page dropped at the *end* of a region does too, but neither says which rows were
+    // lost. These do: each one names the rows it expects, and each crosses every boundary.
+    for (sql, expected, what) in [
+        (
+            "SELECT count(*) FROM ledger WHERE amount > 0",
+            vec![ROWS.to_string()],
+            "a filtered aggregate",
+        ),
+        (
+            "SELECT count(*) FROM ledger WHERE id % 2 = 0",
+            vec![(ROWS / 2).to_string()],
+            "a filter that keeps half of every region",
+        ),
+        (
+            "SELECT min(id) FROM ledger",
+            vec!["1".to_string()],
+            "the first row, in the first region",
+        ),
+        (
+            "SELECT max(id) FROM ledger",
+            vec![ROWS.to_string()],
+            "the last row, in the last region",
+        ),
+        (
+            "SELECT id FROM ledger ORDER BY id DESC LIMIT 1",
+            vec![ROWS.to_string()],
+            "an ordered read whose answer lives in the last region",
+        ),
+        (
+            "SELECT count(*) FROM ledger WHERE id BETWEEN 2 AND 199",
+            vec!["198".to_string()],
+            "a range scan that starts and ends inside different regions",
+        ),
+        (
+            "SELECT count(DISTINCT id) FROM ledger",
+            vec![ROWS.to_string()],
+            "every key, distinct, across every region",
+        ),
+    ] {
+        let answer = cluster.query(sql);
+        assert!(
+            !answer.contains("key is not in region"),
+            "{what} still asked one region for the whole table:\n{answer}"
+        );
+        assert_eq!(rows_of(&answer), expected, "{what}: {sql}");
+    }
+
+    // **`GROUP BY`, whose groups must not be split by the walk.** A region boundary falls in the
+    // middle of the id space, so a walk that restarted its grouping per page would answer two
+    // partial groups where there is one.
+    let answer = cluster
+        .query("SELECT count(*) FROM (SELECT id % 4 AS bucket FROM ledger GROUP BY id % 4) g");
+    assert!(
+        !answer.contains("key is not in region"),
+        "GROUP BY still asked one region for the whole table:\n{answer}"
+    );
+    assert_eq!(
+        rows_of(&answer),
+        vec!["4".to_string()],
+        "four buckets, whatever the boundaries"
+    );
+
+    // **The table kept splitting while these ran** — five regions at load, six by here — which is
+    // why the scan's route repair has a budget rather than a single retry.
+    eprintln!("{} region(s) by the end", cluster.regions());
 }
