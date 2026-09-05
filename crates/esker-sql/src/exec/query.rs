@@ -2281,8 +2281,15 @@ fn pinned(ordinals: &[usize], equalities: &[(usize, Datum)]) -> Option<Vec<Datum
 ///
 /// One entry point for both, because `SET body = c.body || '!'` is the same resolution as
 /// `SET body = body || '!'` against a scope with one more table in it.
+///
+/// **This used to refuse a subquery here**, naming it — `docs/plans/phase-12-subquery.md` §4
+/// deferred the whole write path and the refusal was that promise kept. The `WHERE` half landed
+/// with `tests/write_in_subquery.rs` and the `SET` half is `tests/update_set_subquery.rs`; what
+/// makes it work is that the assignment's subqueries are planned and the uncorrelated ones run
+/// **once, before the first row** (`exec::dml::plan_assignment_subqueries`), so by the time this
+/// runs there is a plan behind each one. A `RETURNING` list still refuses, and still through
+/// `subquery::refuse_in`.
 pub(super) fn resolve_against_scope(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
-    crate::exec::subquery::refuse_in(expr, "an UPDATE assignment")?;
     resolve(expr, scope)
 }
 
