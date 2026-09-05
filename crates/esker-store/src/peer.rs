@@ -751,6 +751,18 @@ impl PeerCore {
             .write(batch, &WriteOptions::unsynced())?;
         self.applied_index = entry.index;
 
+        // **Every entry, committing or not, and before the tee.** A columnar copy is fed only by
+        // what applies here, so the one thing it cannot work out for itself is whether it was told
+        // about an entry at all — and a copy that missed one can answer without a row. A snapshot
+        // install is what opens that gap: it writes committed versions straight into the column
+        // families with no entry to apply, and the first entry after it is the only moment the gap
+        // is visible (`crate::columnar::region::ColumnarSlot::saw`).
+        if let Some(slot) = self.columnar.as_ref()
+            && self.is_columnar_learner()
+        {
+            slot.saw(entry.index);
+        }
+
         // The columnar copy, after the row state and never before it: what it ingests is read back
         // out of the `write` column family this batch just landed, so the two engines cannot
         // disagree about what was committed (`crate::columnar::region`).

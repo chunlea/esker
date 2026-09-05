@@ -977,14 +977,12 @@ visible without an experiment.
 
 Two, at the two levels where the claim can be made.
 
-`esker-store/tests/columnar_region.rs` —
-`a_copy_opened_before_the_region_had_rows_still_answers_for_them`. Fully deterministic, no Raft, no
-threads, no timing. A copy is **opened** over a region holding none of the table (which is what a
-fragment arriving in the placement gap does), the rows then arrive **without a tee** — which is what
-a Raft snapshot install is, bytes written into the column families with no entry applied — and one
-later entry is teed. A copy that is already open is never re-walked, so `ensure` short-circuits and
-the answer is the teed row alone. This is the mechanism written down as a property, and it is red
-against the code as it stands.
+`esker-store/tests/columnar_resume.rs` —
+`a_copy_not_told_of_every_entry_re_walks_instead_of_answering`. Fully deterministic, no threads and
+no timing, next to the resume rule it is the missing half of. A copy is opened and **kept**, rows
+then arrive **without a tee** on a log compacted past everything the copy holds — both halves of a
+snapshot install — and one further entry is applied and teed, which is what makes the copy's indices
+look continuous again. The re-walk has to be decided at that entry or not at all.
 
 `esker-store/tests/snapshot.rs` —
 `a_placed_columnar_learner_answers_for_the_rows_that_predate_it`. The twin of
@@ -994,3 +992,69 @@ fragment service was the thing it stood in for. This asks the fragment service i
 same `Service` the server dispatches through, so `Store::serve_fragment` runs whole: the epoch
 check, the role check and the catch-up. Nothing anywhere asserted that a *placed* learner answers a
 fragment for rows committed before it existed.
+
+### The defect, and the one-line reason it hid
+
+`ColumnarSlot::ensure` short-circuits when the table is already open. The rule that would have
+caught this **already exists**: `resume` refuses a manifest older than the log's truncation point,
+because the entries it would replay are gone, and `columnar_resume.rs` has had a test for it since
+ADR 0038. It is only ever consulted **on the way in**. A copy that is already open never goes
+through that door again.
+
+What puts a copy on the wrong side of that rule is a **snapshot install**. A replica that falls
+behind its leader's compaction boundary is repaired by one; a snapshot writes committed versions
+straight into the column families, so no entry applies and `RaftPeer::tee_columnar` never runs, onto
+a log that begins after the snapshot's index. A copy that was behind when that happened is missing
+every version in between and neither path leads back: the log cannot replay them and nothing
+re-walks. Entries after the snapshot are teed normally, which is why the copy then looks current and
+answers confidently.
+
+`Store::fetch_snapshot` replaces such a region through `Store::retire_region_now` — which has
+exactly one caller, this one. It removes the region and stops the peer, and **leaves the columnar
+slot in the store's map**; the function that does drop it, `reclaim_retired_range`, is on the other
+retirement path and says in its own comment why the slot must go first. So `host_region` reattaches
+the copy that was there before.
+
+That is also why it was 3/3 green alone. Alone, the learner never falls behind.
+
+### The fix
+
+`ColumnarSlot::saw(index)` is called for **every entry a columnar learner applies**, committing or
+not, and drops every open copy when that entry did not follow the last one the slot was told about.
+The next `ensure` then re-opens, and `resume`'s existing rule sends it to a re-walk.
+
+### The first version of this fix was wrong, and the way it was wrong is the lesson
+
+It compared the highest index the slot had seen against the log's truncation point, **on the read
+path**, when a fragment asks. It passed its test and it does not work: the peer carries on applying,
+and a single entry teed after the gap advances the index past the truncation point again. Asked a
+moment later, nothing distinguishes that copy from one that saw everything. The test passed because
+it teed nothing after the truncation — a test passing on the mechanism it was not testing.
+
+**A gap is a fact about the moment it happens**, and the evidence for it is destroyed by the next
+entry. That is why the check is at the tee and not at the read, and why `saw` is told about entries
+that commit nothing: a prewrite commits nothing and applies, so a detector fed only by commits sees
+a gap at every transaction and a detector fed by every entry sees one only when there really is one.
+
+It also closes the second half of J13's original hypothesis for free. A peer that applies entries
+before its region record calls it a columnar learner tees none of them; the first entry after the
+role lands is a gap, and the copies are dropped and re-walked.
+
+Red-first: `a_copy_not_told_of_every_entry_re_walks_instead_of_answering` fails on the unfixed code
+and passes with the fix; the whole of `columnar_resume`, `columnar_region`, `columnar_differential`
+and `snapshot` is green with it.
+
+### What was not built, and why
+
+**The gate on `catch_up`** — reading `ColumnarApply::applied_index()` against `min_apply_index` —
+was specified and is not here, for two reasons. `applied_index()` is `runs.applied()`, the *durable
+manifest* index, which moves only on a seal; `catch_up` runs before `slot.table()` seals, so between
+seals it names less than the copy holds and the gate would refuse fragments that are perfectly
+fresh. And in this failure the copy was not behind by its own reckoning — it had been teed entries
+well past the missing one — so a copy-index gate would not have refused this answer. It remains a
+reasonable safety net against *other* ways a copy can lag, against `complete_index` and after a
+seal; it is not what closes this.
+
+**The tee half** — an entry applied while `is_columnar_learner()` is still false — is real and
+self-healing: the copy's first open rebuilds from the region's committed state, which covers every
+such entry. Not this bug, and recorded here rather than silently dropped.
