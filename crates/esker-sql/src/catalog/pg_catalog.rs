@@ -1777,7 +1777,7 @@ fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Ve
             Datum::Int8(max),
             Datum::Int8(min),
             // `CACHE 1`: a block is reserved by the node and not by the sequence
-            // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-the-connection.md)),
+            // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)),
             // so nothing here caches and a client reading this is told so.
             Datum::Int8(1),
             Datum::Bool(false),

@@ -44,7 +44,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **`last_value` counts the block that was reserved, not the rows that were inserted.**
         // Two `INSERT`s give `2` on a real server and `32` here, because a sequence hands out
         // `catalog::SEQUENCE_BATCH` at a time to the node that asks
-        // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-the-connection.md)),
+        // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)),
         // and `last_value` reports how far the counter has been drawn down rather than how far it
         // has been used. `is_called` agrees, and so do **the ids themselves** — the two rows above
         // this one are `1` and `2` on both servers, which is what an `INSERT ... RETURNING` and a
