@@ -85,6 +85,52 @@ fn query(sql: &str) -> Vec<u8> {
     out
 }
 
+/// `Parse`/`Bind`/`Execute`/`Sync` for one statement with text-format parameters — the extended
+/// protocol, which is what `ActiveRecord` speaks because it prepares by default.
+///
+/// The simple-query path above already answers correctly, and `range_test.rb` does not use it:
+/// its fixture inserts are `INSERT INTO … VALUES ($1, $2, …)` prepared once and bound per row.
+/// That is the one combination none of this lane's tests had crossed — the in-process `describe`
+/// probe covered the executor, not the wire.
+fn extended(sql: &str, params: &[&str]) -> Vec<u8> {
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    // Parse: unnamed statement, no declared parameter types — the server infers them, which is
+    // what `ActiveRecord` leaves it to do.
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+
+    // Bind: unnamed portal of the unnamed statement, every parameter in text format.
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&i16::try_from(params.len()).unwrap().to_be_bytes());
+    for value in params {
+        bind.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+        bind.extend_from_slice(value.as_bytes());
+    }
+    bind.extend_from_slice(&0i16.to_be_bytes());
+
+    // Execute the unnamed portal to completion, then Sync so the server answers ReadyForQuery.
+    let mut execute = vec![0u8];
+    execute.extend_from_slice(&0i32.to_be_bytes());
+
+    let mut out = frame(b'P', &parse);
+    out.extend_from_slice(&frame(b'B', &bind));
+    // `Describe` the portal too, which is what a client that wants the row shape sends and the
+    // step the first version of this hypothesis suspected of drawing a value.
+    out.extend_from_slice(&frame(b'D', &[b'P', 0]));
+    out.extend_from_slice(&frame(b'E', &execute));
+    out.extend_from_slice(&frame(b'S', &[]));
+    out
+}
+
 fn frames(bytes: &[u8]) -> Vec<(char, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = 0;
@@ -154,7 +200,12 @@ impl Wire {
     }
 
     async fn run(&mut self, sql: &str) -> Vec<u8> {
-        self.client.write_all(&query(sql)).await.unwrap();
+        self.send(&query(sql)).await
+    }
+
+    /// Whatever bytes the caller built — the extended protocol's five messages, in one write.
+    async fn send(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.client.write_all(bytes).await.unwrap();
         self.client.flush().await.unwrap();
         self.drain().await
     }
@@ -227,5 +278,68 @@ async fn without_the_node_s_blocks_each_connection_takes_its_own() {
         ["1", "33", "1", "33", "1", "33", "1", "33"],
         "with a block per connection the second session starts a whole batch on — this is the \
          `1, 33` the file shows, and it is what ADR 0072 removed from the product"
+    );
+}
+
+/// **The fixture insert as `ActiveRecord` actually sends it**: prepared, with the id bound as a
+/// parameter, over the wire, on the backend r1's node runs.
+///
+/// `range_test.rb`'s `setup` inserts its five fixtures with explicit ids through the extended
+/// protocol — `Parse`/`Bind`/`Describe`/`Execute` — and only then does the `create!` that the test
+/// reads back. Every probe of that path so far has been a simple query or an in-process executor;
+/// this is the combination the file uses and none of them did.
+///
+/// The assertion is PostgreSQL's: an explicit id does not move the sequence, so `last_value` is
+/// still the start, `is_called` is false, and the first row that leaves the id to the sequence
+/// gets **1**.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_explicit_id_insert_does_not_move_the_sequence() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut ddl = Wire::open(Arc::clone(&node)).await;
+    let mut writer = Wire::open(Arc::clone(&node)).await;
+
+    ddl.run("CREATE TABLE px (id bigserial PRIMARY KEY, v int8)")
+        .await;
+
+    // The five fixtures, prepared and bound exactly as the file sends them — and on a *second*
+    // connection, because a pool need not give the schema change and the inserts the same one.
+    for id in 101..=105 {
+        let reply = writer
+            .send(&extended(
+                "INSERT INTO px (id, v) VALUES ($1, $2)",
+                &[&id.to_string(), "0"],
+            ))
+            .await;
+        assert!(
+            !frames(&reply).iter().any(|(tag, _)| *tag == 'E'),
+            "the prepared fixture insert failed: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+    }
+
+    // What r1 reads after each CREATE, read here after the fixtures instead.
+    let seq = ddl.run("SELECT last_value, is_called FROM px_id_seq").await;
+    assert_eq!(
+        first_value(&seq).as_deref(),
+        Some("1"),
+        "five prepared explicit-id inserts moved last_value"
+    );
+
+    // And the create!, which is what the test reads back.
+    let created = writer
+        .send(&extended(
+            "INSERT INTO px (v) VALUES ($1) RETURNING id",
+            &["1"],
+        ))
+        .await;
+    assert_eq!(
+        first_value(&created).as_deref(),
+        Some("1"),
+        "the first row that leaves the id to the sequence is 1, not a block on"
     );
 }
