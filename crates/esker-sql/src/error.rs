@@ -2673,6 +2673,8 @@ impl SqlError {
             SqlError::RangeBoundsOutOfOrder => sqlstate::DATA_EXCEPTION,
             SqlError::InvalidXmlContent(_) => sqlstate::INVALID_XML_CONTENT,
             SqlError::MalformedRangeLiteral { .. }
+            // A record literal that will not read is the same class as a range one that will not.
+            | SqlError::MalformedRecordLiteral(_)
             | SqlError::InvalidCidrValue(_)
             | SqlError::InvalidBinaryDigit(_)
             | SqlError::InvalidHexadecimalDigit(_)
@@ -2693,9 +2695,7 @@ impl SqlError {
             | SqlError::SetvalOutOfBounds { .. }
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
-            SqlError::MalformedArrayLiteral { .. } | SqlError::MalformedRecordLiteral(_) => {
-                sqlstate::INVALID_TEXT_REPRESENTATION
-            }
+            SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
             SqlError::EmptyArrayType | SqlError::IndeterminateParameterType(_) => {
                 sqlstate::INDETERMINATE_DATATYPE
             }

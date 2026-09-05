@@ -42,8 +42,7 @@ pub fn parse(text: &str) -> Result<Vec<Option<String>>> {
     let mut quoted_here = false;
     let mut chars = body.chars().peekable();
     let mut in_quotes = false;
-    loop {
-        let Some(c) = chars.next() else { break };
+    while let Some(c) = chars.next() {
         match c {
             '\\' => current.push(chars.next().ok_or_else(malformed)?),
             '"' if in_quotes => {
