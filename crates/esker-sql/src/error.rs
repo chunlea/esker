@@ -110,6 +110,33 @@ pub enum SqlError {
     #[error("set-returning functions are not allowed in DEFAULT expressions")]
     DefaultSetReturning,
 
+    /// A write on a view that is not **auto-updatable**, in PostgreSQL's own three sentences.
+    ///
+    /// A simple view — one relation, no `DISTINCT`, no grouping, no `LIMIT`, every projection a
+    /// plain column — is written through onto the table underneath, which is what
+    /// `view_test.rb`'s `UpdateableViewTest` does four times. Anything else is refused, and the
+    /// refusal is measured rather than composed (19beta1):
+    ///
+    /// ```text
+    /// ERROR:  cannot update view "h1agg"
+    /// DETAIL:  Views that return aggregate functions are not automatically updatable.
+    /// HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an
+    ///        unconditional ON UPDATE DO INSTEAD rule.
+    /// ```
+    ///
+    /// The verb is carried because a real server writes three different ones — `cannot insert
+    /// into view`, `cannot update view`, `cannot delete from view` — rather than one sentence with
+    /// a hole in it.
+    #[error("cannot {verb} view \"{view}\"")]
+    ViewNotUpdatable {
+        /// `insert into`, `update` or `delete from`.
+        verb: String,
+        /// The view's name, as the user wrote it.
+        view: String,
+        /// Which property makes it non-updatable, in PostgreSQL's words.
+        detail: String,
+    },
+
     /// Contract C2. The statement parsed and we will not run it — the feature is named so the
     /// message reads the way PostgreSQL's own does.
     #[error("{0} is not supported")]
@@ -2488,6 +2515,10 @@ impl SqlError {
         match self {
             // **`0A000`, not `2BP01`** — measured. A `DROP` of the same table is a dependency
             // error; PostgreSQL spells the truncate refusal as a missing feature.
+            // **`55000`, not `0A000`** — measured, and it is the surprising one: a refusal that
+            // reads like a missing feature ("not automatically updatable") is spelled by
+            // PostgreSQL as an object that is not in the state the statement needs.
+            SqlError::ViewNotUpdatable { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DefaultColumnReference

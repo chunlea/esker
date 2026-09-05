@@ -3816,7 +3816,11 @@ impl Executor {
     /// `DROP COLUMN` that dropped a sequence then found its `pg_class` row still there, and eight
     /// tests with no view in them went red on it. `crate::catalog::view` is a plain read of this
     /// transaction and cannot do that.
-    fn view_named(&self, txn: &dyn Txn, name: &str) -> Result<Option<crate::catalog::ViewDef>> {
+    pub(super) fn view_named(
+        &self,
+        txn: &dyn Txn,
+        name: &str,
+    ) -> Result<Option<crate::catalog::ViewDef>> {
         if name.is_empty() {
             return Ok(None);
         }
@@ -3881,7 +3885,7 @@ impl Executor {
     }
 
     /// A view's stored `SELECT`, parsed and lowered.
-    fn view_body(view: &crate::catalog::ViewDef) -> Result<crate::plan::Select> {
+    pub(super) fn view_body(view: &crate::catalog::ViewDef) -> Result<crate::plan::Select> {
         let parsed = crate::parse::parse_statements(&view.definition)?;
         let [statement] = parsed.as_slice() else {
             return Err(SqlError::Internal(format!(
