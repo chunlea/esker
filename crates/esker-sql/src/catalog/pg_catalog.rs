@@ -131,13 +131,25 @@ pub enum CatalogView {
     /// `PARTITION BY` here, so the emptiness is complete rather than provisional. Empty on a real
     /// server too until something partitions.
     PgInherits,
-    /// The index access methods, which is **two**: `btree` and `gist`.
+    /// The index access methods, which is **three**: `btree`, `gin` and `gist`.
     ///
-    /// A real server has six. These two are the ones this node's own `pg_class.relam` can point
-    /// at — everything a `CREATE INDEX` builds is a btree, and an `EXCLUDE` constraint records
-    /// `gist` — and a row for a method nothing can be built with would be a claim rather than a
-    /// report. Declared: `hash`, `gin`, `spgist` and `brin` are on a real server and not here.
+    /// A real server has six. These three are the ones this node's own `pg_class.relam` can point
+    /// at — a `CREATE INDEX` may be declared `USING gin` or `USING gist` and is *recorded* as
+    /// such ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
+    /// and an `EXCLUDE` constraint records `gist` — and a row for a method nothing can be built
+    /// with would be a claim rather than a report. Declared: `hash`, `spgist` and `brin` are on a
+    /// real server and not here, and `USING` one of them is still refused.
     PgAm,
+    /// The operator classes a `CREATE INDEX` may name, which is **four**.
+    ///
+    /// The same rule `PgAm` states: a class nothing can be declared with would be a claim rather
+    /// than a report. These four are the ones `crate::catalog::OPERATOR_CLASSES` accepts —
+    /// `gin_trgm_ops`, `gist_trgm_ops`, `text_pattern_ops` and `varchar_pattern_ops` — and each
+    /// is *recorded* on the index that names it while the index underneath stays the ordered one
+    /// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+    /// A real server has hundreds, and the `hash` halves of the two `_pattern_ops` are among the
+    /// ones missing here because `USING hash` is refused.
+    PgOpclass,
     /// The text-search configurations this node has, which is **not** the thirty-two a real
     /// server's `initdb` creates.
     ///
@@ -244,7 +256,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 34] = [
+    pub const ALL: [CatalogView; 35] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -257,6 +269,7 @@ impl CatalogView {
         CatalogView::PgExtension,
         CatalogView::PgInherits,
         CatalogView::PgAm,
+        CatalogView::PgOpclass,
         CatalogView::PgTsConfig,
         CatalogView::PgProc,
         CatalogView::PgTrigger,
@@ -298,6 +311,7 @@ impl CatalogView {
             CatalogView::PgAvailableExtensions => "pg_available_extensions",
             CatalogView::PgInherits => "pg_inherits",
             CatalogView::PgAm => "pg_am",
+            CatalogView::PgOpclass => "pg_opclass",
             CatalogView::PgTsConfig => "pg_ts_config",
             CatalogView::PgProc => "pg_proc",
             CatalogView::PgTrigger => "pg_trigger",
@@ -399,6 +413,7 @@ impl CatalogView {
                 CatalogView::PgExtension => 14,
                 CatalogView::PgInherits => 15,
                 CatalogView::PgAm => 23,
+                CatalogView::PgOpclass => 34,
                 CatalogView::PgTsConfig => 32,
                 CatalogView::PgProc => 18,
                 CatalogView::PgTrigger => 19,
@@ -539,6 +554,16 @@ impl CatalogView {
                 ("oid", ColumnType::Int8),
                 ("amname", ColumnType::Text),
                 ("amtype", ColumnType::Text),
+            ],
+            // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
+            // `opcdefault` a boolean; the three oids are `oid` there and this node's own types
+            // here, the trade every `pg_catalog` column makes.
+            CatalogView::PgOpclass => &[
+                ("oid", ColumnType::Int8),
+                ("opcname", ColumnType::Text),
+                ("opcmethod", ColumnType::Int8),
+                ("opcintype", ColumnType::Int8),
+                ("opcdefault", ColumnType::Bool),
             ],
             // `cfgname` is a `name` on a real server, `text` here — the trade every `pg_catalog`
             // column makes. `cfgnamespace` is the oid a client joins to `pg_namespace`, which is
@@ -857,10 +882,34 @@ impl CatalogView {
             // `amtype` `i` — an index method, which is what both of these are. A real server's
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
+            // **One row per class this node accepts**, with `opcdefault` `f` for every one —
+            // measured, and it is why none of them is what a column gets when no class is
+            // written. The oid is this node's own, in the extension range for the same reason
+            // hstore's is: a real server allocates an extension's classes at `CREATE EXTENSION`
+            // time and a client reads them by `opcname`.
+            CatalogView::PgOpclass => Ok(super::OPERATOR_CLASSES
+                .iter()
+                .enumerate()
+                .map(|(at, (name, method, ty))| {
+                    use crate::value::PgType as _;
+                    vec![
+                        Datum::Int8(OPCLASS_OID_BASE + i64::try_from(at).unwrap_or(0)),
+                        Datum::Text((*name).to_owned()),
+                        Datum::Int8(access_method_by_name(method)),
+                        Datum::Int8(i64::from(ty.oid())),
+                        Datum::Bool(false),
+                    ]
+                })
+                .collect()),
             CatalogView::PgAm => Ok(vec![
                 vec![
                     Datum::Int8(BTREE_AM_OID),
                     Datum::Text("btree".to_owned()),
+                    Datum::Text("i".to_owned()),
+                ],
+                vec![
+                    Datum::Int8(GIN_AM_OID),
+                    Datum::Text("gin".to_owned()),
                     Datum::Text("i".to_owned()),
                 ],
                 vec![
@@ -968,6 +1017,7 @@ impl CatalogView {
             | CatalogView::InformationSchemaDomains
             | CatalogView::PgRange
             | CatalogView::PgCollation
+            | CatalogView::PgOpclass
             | CatalogView::PgExtension
             | CatalogView::PgInherits
             | CatalogView::PgAm
@@ -1196,12 +1246,13 @@ fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
 /// lowering, which has no catalog to ask (`crate::parse::lower`), and every statement the suite
 /// sends installs the extension first — so it is a gap nothing measured reaches, recorded here
 /// rather than in a divergence nothing would exercise.
-const AVAILABLE_EXTENSIONS: [(&str, &str); 6] = [
+const AVAILABLE_EXTENSIONS: [(&str, &str); 7] = [
     ("citext", "1.8"),
     ("hstore", "1.8"),
     // Measured on the oracle, like the rest: `ltree` is at **1.3** where the two string
     // extensions are at 1.8.
     ("ltree", "1.3"),
+    ("pg_trgm", "1.6"),
     ("pgcrypto", "1.4"),
     ("plpgsql", "1.0"),
     ("uuid-ossp", "1.1"),
@@ -1994,7 +2045,19 @@ fn pg_class_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<D
                     .map_or(Datum::Null, |bound| {
                         Datum::Text(super::partition_bound_definition(bound))
                     }),
-                Datum::Int8(access_method_oid(relation.kind)),
+                // **The method the index was *declared* with**, which for `USING gin` is `gin`
+                // even though what is built underneath is the ordered index every index here is
+                // (ADR 0070). `pg_get_indexdef` and `ActiveRecord`'s schema dumper both read it.
+                Datum::Int8(
+                    relations
+                        .table(relation)
+                        .zip(relation.index_at)
+                        .and_then(|(table, at)| table.indexes.get(at))
+                        .map_or_else(
+                            || access_method_oid(relation.kind),
+                            |index| access_method_by_name(&index.access_method),
+                        ),
+                ),
                 // **The owning table's, for every relation it owns.** A `bigserial`'s sequence
                 // and every index — the primary key's included — report the table's persistence
                 // on a real server, and `ALTER TABLE … SET LOGGED` moves all of them in one
@@ -2055,6 +2118,26 @@ const BTREE_AM_OID: i64 = 403;
 
 /// PostgreSQL's own oid for `gist`, likewise fixed.
 const GIST_AM_OID: i64 = 783;
+
+/// PostgreSQL's own oid for `gin`, likewise fixed.
+const GIN_AM_OID: i64 = 2742;
+
+/// Where this node's operator-class oids start.
+///
+/// **Not PostgreSQL's own**, and deliberately: `gin_trgm_ops` is an extension's class and its oid
+/// is allocated at `CREATE EXTENSION` time on a real server, so the number differs per database
+/// and a client reads the class by `opcname` — which is what `ActiveRecord`'s schema dumper does.
+/// The same call `HSTORE_OID` made, one catalog over.
+const OPCLASS_OID_BASE: i64 = 16500;
+
+/// The oid of an access method by the name an index was declared with (ADR 0070).
+fn access_method_by_name(name: &str) -> i64 {
+    match name {
+        "gin" => GIN_AM_OID,
+        "gist" => GIST_AM_OID,
+        _ => BTREE_AM_OID,
+    }
+}
 
 /// `pg_class.relam`: the access method an index is built with, and **zero** for anything that is
 /// not an index — which is what a real server reports for a table, so a join to `pg_am` drops it.

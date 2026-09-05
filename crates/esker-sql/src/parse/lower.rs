@@ -2877,25 +2877,32 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         !create.alter_options.is_empty(),
         "CREATE INDEX with table options",
     )?;
-    if let Some(using) = &create.using
-        && !matches!(using, IndexType::BTree)
-    {
-        // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is a
-        // different complaint: `amcaninclude` is a property of the access method, checked before
-        // anything about the index is built, so `USING hash (…) INCLUDE (…)` is refused for the
-        // payload rather than for the method. Measured for `hash` and for `brin`, one sentence
-        // with the name substituted.
-        if create.include.is_empty() {
-            // Every index here is a range of the ordered key space, which is what a btree is.
-            // Saying `USING hash` and getting one would be a different index than the user asked
-            // for.
-            return Err(SqlError::unsupported(format!("an index USING {using}")));
+    // **`gin` and `gist` are recorded; `hash` and `brin` are still refused**
+    // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+    // The two that are recorded are the two the suite writes, and what is built underneath is the
+    // ordered index every index here is — the catalog says what was asked for and nothing claims a
+    // trigram search is accelerated. The two that are refused have no operator class this node
+    // knows either, so recording one would be a name with nothing behind it.
+    let access_method = match &create.using {
+        None | Some(IndexType::BTree) => catalog::BTREE_ACCESS_METHOD.to_owned(),
+        Some(using) => {
+            let name = using.to_string().to_ascii_lowercase();
+            if !matches!(name.as_str(), "gin" | "gist") {
+                // **PostgreSQL's own sentence comes first when there is an `INCLUDE`**, and it is
+                // a different complaint: `amcaninclude` is a property of the access method,
+                // checked before anything about the index is built, so `USING hash (…) INCLUDE
+                // (…)` is refused for the payload rather than for the method. Measured for `hash`
+                // and for `brin`, one sentence with the name substituted.
+                if create.include.is_empty() {
+                    return Err(SqlError::unsupported(format!("an index USING {using}")));
+                }
+                return Err(SqlError::AccessMethodWithoutInclude(name));
+            }
+            name
         }
-        return Err(SqlError::AccessMethodWithoutInclude(
-            using.to_string().to_ascii_lowercase(),
-        ));
-    }
+    };
     Ok(plan::CreateIndex {
+        access_method,
         // Kept as text and lowered per row, the same trade a `CHECK` makes — and normalised the
         // way `pg_get_indexdef` prints it, which is one pair of parentheses however it was
         // written (`unwrap_nested`).
@@ -7102,6 +7109,7 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
         .iter()
         .map(|column| {
             index_key_options(column)?;
+            refuse_if(column.operator_class.is_some(), "an index operator class")?;
             // `UNIQUE (a DESC)` and `PRIMARY KEY (a NULLS FIRST)` are **syntax errors** on a real
             // server — measured, `42601 syntax error at or near "DESC"` — because a constraint's
             // grammar has no direction in it at all. Refused by name rather than accepted and
@@ -7126,8 +7134,12 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
 }
 
 /// The options a key part may not carry, whichever kind of key it is in.
+///
+/// **An operator class is no longer one of them in a `CREATE INDEX`** — it is recorded there
+/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md))
+/// — and it is still refused in a *constraint*, where a real server's grammar has no place for
+/// one: `UNIQUE (a text_pattern_ops)` is a syntax error there.
 fn index_key_options(column: &IndexColumn) -> Result<()> {
-    refuse_if(column.operator_class.is_some(), "an index operator class")?;
     refuse_if(column.column.with_fill.is_some(), "WITH FILL")?;
     Ok(())
 }

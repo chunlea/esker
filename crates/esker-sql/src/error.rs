@@ -1776,6 +1776,38 @@ pub enum SqlError {
     #[error("data type {0} has no default operator class for access method \"btree\"")]
     NoDefaultOperatorClass(&'static str),
 
+    /// `CREATE INDEX … USING gin(name)` where the type has no default class **for that method**.
+    /// The same sentence [`SqlError::NoDefaultOperatorClass`] gives, with the method named too —
+    /// measured, and the two are one message with the access method substituted.
+    #[error("data type {ty} has no default operator class for access method \"{method}\"")]
+    NoDefaultOperatorClassFor {
+        /// The column's type, as a message names it.
+        ty: String,
+        /// The access method the index was declared with.
+        method: String,
+    },
+
+    /// `USING btree(name gin_trgm_ops)`: a class that exists for another method, or not at all.
+    /// **`42704`**, and it names the method — measured for a real class in the wrong place and for
+    /// a name nobody defined, one sentence for both.
+    #[error("operator class \"{class}\" does not exist for access method \"{method}\"")]
+    NoSuchOperatorClass {
+        /// The class as written, folded.
+        class: String,
+        /// The access method it was written under.
+        method: String,
+    },
+
+    /// `USING btree(id text_pattern_ops)`: a class that exists for the method and not for the
+    /// column's type. **`42804`**, a different class from the two above, measured beside them.
+    #[error("operator class \"{class}\" does not accept data type {ty}")]
+    OperatorClassRejectsType {
+        /// The class as written.
+        class: String,
+        /// The column's type, as a message names it.
+        ty: String,
+    },
+
     /// `CREATE TYPE … AS RANGE (subtype = point)`: the **same** `42704` and the same message,
     /// with a different `HINT`. Measured: a range needs its subtype ordered, because ordering the
     /// bounds is what a range *is*, so the two types with no btree operator class are the two a
@@ -2394,6 +2426,8 @@ impl SqlError {
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
             | SqlError::NoDefaultOperatorClass(_)
+            | SqlError::NoDefaultOperatorClassFor { .. }
+            | SqlError::NoSuchOperatorClass { .. }
             | SqlError::RangeSubtypeNotOrdered(_)
             | SqlError::UndefinedLanguage(_)
             | SqlError::UndefinedTrigger { .. }
@@ -2446,7 +2480,10 @@ impl SqlError {
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. }
             | SqlError::CannotCastColumnAutomatically { .. }
-            | SqlError::CannotCastDefaultAutomatically { .. } => sqlstate::DATATYPE_MISMATCH,
+            | SqlError::CannotCastDefaultAutomatically { .. }
+            // **`42804` and not the `42704` its two neighbours get**: the class exists and the
+            // *type* is what it will not take. Measured beside them.
+            | SqlError::OperatorClassRejectsType { .. } => sqlstate::DATATYPE_MISMATCH,
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
@@ -2847,7 +2884,9 @@ impl SqlError {
                  operator class for the subtype."
                     .to_owned(),
             ),
-            SqlError::NoDefaultOperatorClass(_) => Some(
+            // The same HINT, and it is the same sentence: `NoDefaultOperatorClass` is this one
+            // without an access method named.
+            SqlError::NoDefaultOperatorClass(_) | SqlError::NoDefaultOperatorClassFor { .. } => Some(
                 "You must specify an operator class for the index or define a default operator class for the data type."
                     .to_owned(),
             ),

@@ -590,6 +590,13 @@ pub struct IndexDef {
     pub unique: bool,
     /// The key, in key order: a column of the table or an expression over the row.
     pub keys: Vec<IndexKey>,
+    /// The **access method** the index was declared with — `btree` unless `USING` said otherwise.
+    ///
+    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// what is built underneath is the ordered index every index here is, and this is what
+    /// `pg_class.relam` and `pg_get_indexdef` report. **Nothing claims a trigram search is
+    /// accelerated** — no plan mentions it and `EXPLAIN` never names a trigram scan.
+    pub access_method: String,
     /// Where this index is in a staged schema change (ADR 0020).
     ///
     /// [`SchemaState::Public`] for an index that was built the old way — one statement, one
@@ -713,6 +720,84 @@ pub const ROW_ID_BATCH: u64 = 256;
 /// [`allocate_row_ids`] gives — the counter is one key, and one durable bump per row would make
 /// every concurrent insert into a table contend on it.
 pub const SEQUENCE_BATCH: u64 = 32;
+
+/// What an index's access method is when `USING` did not say — PostgreSQL's own default, and the
+/// structure every index here actually has (ADR 0070).
+pub const BTREE_ACCESS_METHOD: &str = "btree";
+
+/// Every operator class this node knows: its name, the access method it belongs to, and the type
+/// it accepts.
+///
+/// Measured on 19beta1 — `pg_opclass` joined to `pg_am` and `pg_type` — and it is deliberately
+/// short: these five are the ones `schema_test.rb` writes and the ones a class name can therefore
+/// mean here. **`opcdefault` is `f` for every one of them**, which is why none of them is what a
+/// column gets when no class is written.
+///
+/// `text_pattern_ops` and `varchar_pattern_ops` exist for **both** `btree` and `hash` on a real
+/// server; only the btree halves are here, because `USING hash` is refused
+/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+pub const OPERATOR_CLASSES: [(&str, &str, ColumnType); 4] = [
+    ("gin_trgm_ops", "gin", ColumnType::Text),
+    ("gist_trgm_ops", "gist", ColumnType::Text),
+    ("text_pattern_ops", "btree", ColumnType::Text),
+    ("varchar_pattern_ops", "btree", ColumnType::Varchar),
+];
+
+/// Whether a column of `ty` may be indexed with `class` under `method`, and the sentence a real
+/// server gives when it may not.
+///
+/// **Three different refusals**, measured one at a time and each its own class:
+///
+/// | | |
+/// |---|---|
+/// | `USING gin(name)` — no class and no default | `42704 data type character varying has no default operator class for access method "gin"` |
+/// | `USING btree(name gin_trgm_ops)` | `42704 operator class "gin_trgm_ops" does not exist for access method "btree"` |
+/// | `USING btree(id text_pattern_ops)` | `42804 operator class "text_pattern_ops" does not accept data type bigint` |
+///
+/// A `btree` with no class written is the type's default and is always fine — that is every index
+/// this node had before ADR 0070.
+pub fn check_operator_class(method: &str, class: Option<&str>, ty: ColumnType) -> Result<()> {
+    use crate::value::PgType as _;
+    let Some(class) = class else {
+        // **Only `btree` has a default here**, which is the ordered key encoding itself. A `gin`
+        // or `gist` index with no class named has nothing to record and nothing to build.
+        if method == BTREE_ACCESS_METHOD {
+            return Ok(());
+        }
+        return Err(SqlError::NoDefaultOperatorClassFor {
+            ty: ty.name().to_owned(),
+            method: method.to_owned(),
+        });
+    };
+    let Some((_, _, accepts)) = OPERATOR_CLASSES
+        .iter()
+        .find(|(name, owner, _)| *name == class && *owner == method)
+    else {
+        return Err(SqlError::NoSuchOperatorClass {
+            class: class.to_owned(),
+            method: method.to_owned(),
+        });
+    };
+    // **A `varchar` column takes a `text` class**, which is what a real server does through binary
+    // coercibility: `text_pattern_ops` is over `text` and `USING btree(name text_pattern_ops)` on
+    // a `character varying` column is accepted — measured, and it is the shape `schema_test.rb`
+    // writes. What is refused is a type from another family, which `bigint` is.
+    let compatible = *accepts == ty
+        || matches!(
+            (accepts, ty),
+            (
+                ColumnType::Text | ColumnType::Varchar,
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
+            )
+        );
+    if compatible {
+        return Ok(());
+    }
+    Err(SqlError::OperatorClassRejectsType {
+        class: class.to_owned(),
+        ty: ty.name().to_owned(),
+    })
+}
 
 /// The relation id every **derived table** wears: `FROM (SELECT …) AS t`.
 ///
@@ -3913,6 +3998,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef {
+                access_method: super::BTREE_ACCESS_METHOD.to_owned(),
                 id: id + 1,
                 name: "accounts_email_key".into(),
                 unique: true,
@@ -3963,7 +4049,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "21",               // catalog format version
+                "22",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -4056,7 +4142,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "21",       // catalog format version
+                "22",       // catalog format version
                 "03312e31", // varint 3, "1.1"
             )
         );
@@ -4138,7 +4224,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "21",                 // catalog format version
+                "22",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -4241,6 +4327,12 @@ mod tests {
                 // (ADR 0064). A table written before 31 has no byte here at all and decodes the
                 // same way — an ordinary table, which is all any of them could have been.
                 "00",
+                // Version 34, and the seventeenth section: each index's access method, then one
+                // operator class per key part. This table has one index of one key, so it is
+                // `btree` and an empty class — the type's default, which is every index a version
+                // 33 catalog could hold
+                // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+                "05627472656500",
             )
         );
         assert_eq!(record::decode_table(&encoded).unwrap(), accounts(7));
@@ -5191,6 +5283,7 @@ mod tests {
         let mut adding = backend.begin().unwrap();
         let mut with_more = accounts(1);
         with_more.indexes.push(IndexDef {
+            access_method: super::BTREE_ACCESS_METHOD.to_owned(),
             id: 5,
             name: "accounts_id_idx".into(),
             unique: false,
@@ -5252,6 +5345,7 @@ mod tests {
 
         let mut clash = table.clone();
         clash.indexes.push(IndexDef {
+            access_method: super::BTREE_ACCESS_METHOD.to_owned(),
             id: 9,
             name: "accounts".into(),
             unique: false,
@@ -5456,7 +5550,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "21",               // catalog format version
+                "22",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

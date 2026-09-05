@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 33;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 34;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -1949,6 +1949,19 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         }
     }
 
+    // Version 34. The **operator class** of each key part, seventeenth section and on the end for
+    // the same reason: an index written before 34 reads back with none, which is what every index
+    // a version 33 catalog could hold had — an operator class was parsed and thrown away until
+    // [ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md).
+    // An empty string is "the type's default", and the parser cannot produce an empty class name,
+    // so the two cannot be confused — the rule the predicate and the expression sections follow.
+    for index in &table.indexes {
+        put_str(&index.access_method, &mut out);
+        for key in &index.keys {
+            put_str(key.opclass.as_deref().unwrap_or(""), &mut out);
+        }
+    }
+
     Ok(out)
 }
 
@@ -1963,6 +1976,27 @@ fn read_check_validated(reader: &mut Reader<'_>, checks: &mut [CheckDef]) -> Res
     }
     for check in checks {
         check.validated = reader.flag()?;
+    }
+    Ok(())
+}
+
+/// The version 34 tail: each index's access method, then one operator class per key part.
+///
+/// Read **last**, after version 31's materialized view, because the sections come off in the order
+/// they went on. An index written before 34 answers `None` for every part — the type's default,
+/// which is what an index whose class was thrown away in the parser had (ADR 0070).
+fn read_index_opclasses(reader: &mut Reader<'_>, indexes: &mut [IndexDef]) -> Result<()> {
+    if reader.version < 34 {
+        return Ok(());
+    }
+    for index in indexes.iter_mut() {
+        // An empty method is impossible — every index has one and `btree` is what an unwritten
+        // `USING` means — so this reads back exactly what was written.
+        index.access_method = reader.string()?;
+        for key in &mut index.keys {
+            let opclass = reader.string()?;
+            key.opclass = (!opclass.is_empty()).then_some(opclass);
+        }
     }
     Ok(())
 }
@@ -2541,6 +2575,8 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             id,
             name,
             unique,
+            // Version 34 overwrites this from the record; anything older had only btree.
+            access_method: super::BTREE_ACCESS_METHOD.to_owned(),
             keys,
             state,
             state_since,
@@ -2607,6 +2643,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     let on_commit = read_on_commit(&mut reader)?;
     read_check_validated(&mut reader, &mut checks)?;
     let matview = read_matview(&mut reader)?;
+    read_index_opclasses(&mut reader, &mut indexes)?;
     reader.finish()?;
 
     Ok(TableDef {

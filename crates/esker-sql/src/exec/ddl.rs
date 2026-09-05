@@ -736,6 +736,8 @@ fn unique_indexes(
             .collect::<Result<Vec<_>>>()?;
         indexes.push(IndexDef {
             id: catalog::allocate_id(txn, executor.tenant)?,
+            // A `UNIQUE` constraint's index takes no `USING`, so it is a btree by construction.
+            access_method: catalog::BTREE_ACCESS_METHOD.to_owned(),
             name: constraint
                 .name
                 .clone()
@@ -1504,6 +1506,7 @@ fn copy_parent_indexes(
                 id: catalog::allocate_id(txn, executor.tenant)?,
                 name: plan::index_name(&table.name, &keys),
                 unique: index.unique,
+                access_method: catalog::BTREE_ACCESS_METHOD.to_owned(),
                 keys: mine,
                 include: Vec::new(),
                 predicate: index.predicate.clone(),
@@ -2576,6 +2579,7 @@ fn add_unique_constraint(
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: true,
+        access_method: catalog::BTREE_ACCESS_METHOD.to_owned(),
         keys: ordinals.into_iter().map(IndexKey::column).collect(),
         nulls_not_distinct: constraint.nulls_not_distinct,
         constraint: Some(match (constraint.deferrable, constraint.deferred) {
@@ -4457,6 +4461,19 @@ pub(super) fn create_index(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // **The operator class is checked against the method and the column's type** (ADR 0070): a
+    // class this node does not have, or one that belongs to another method, or one the column's
+    // type does not take, is refused rather than written down. Recording a class nothing verified
+    // would put a `CREATE INDEX` a real server rejects into this catalog, which is the half of
+    // the decision that keeps the recording honest.
+    for (key, part) in keys.iter().zip(&create.keys) {
+        let ty = key
+            .position()
+            .and_then(|at| table.columns.get(at))
+            .map_or(ColumnType::Text, |column| column.ty);
+        catalog::check_operator_class(&create.access_method, part.opclass.as_deref(), ty)?;
+    }
+
     // A predicate naming a column the table does not have is `42703` here, not an internal error
     // at the first write — the same rule, and the same reason, as a `CHECK`'s.
     if let Some(predicate) = &create.predicate {
@@ -4472,6 +4489,7 @@ pub(super) fn create_index(
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
         unique: create.unique,
+        access_method: create.access_method.clone(),
         keys,
         include,
         predicate: create.predicate.clone(),

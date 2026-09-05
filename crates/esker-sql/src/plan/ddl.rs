@@ -569,6 +569,12 @@ pub struct CreateIndex {
     pub table: String,
     /// The key, in key order.
     pub keys: Vec<IndexKeyPart>,
+    /// The **access method** written after `USING`, folded — `btree` when none was.
+    ///
+    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// the index built underneath is the ordered one every index here is, and this is what
+    /// `pg_class.relam` and `pg_get_indexdef` report.
+    pub access_method: String,
     /// Whether a duplicate is refused.
     pub unique: bool,
     /// `IF NOT EXISTS`.
