@@ -1,0 +1,21 @@
+crates/esker-sql/src/plan/mod.rs
+  s_609bbbdbf3c419::t_5c445c61b93226 182-197,200,202-215
+crates/esker-sql/tests/rolled_back_ddl_cache.rs
+  s_609bbbdbf3c419::t_a8cd8209c649b7 1-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3d18a0079d891ff3e5555f8ffbdb922f1961d14d",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
