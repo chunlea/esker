@@ -91,6 +91,12 @@ impl Parsed {
         // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
         // statement it is a disguised form of, so the whole lowering is this.
         if let Some((message, severity)) = self.raised() {
+            // **`RAISE EXCEPTION` is a failure, not a message about one.** It leaves here as an
+            // error so that the statement fails, the transaction aborts inside a block, and the
+            // client reads `P0001` — none of which a notice does.
+            if *severity == crate::error::Severity::Error {
+                return Err(SqlError::RaisedException(message.clone()));
+            }
             return Ok(plan::Statement::Raise {
                 message: message.clone(),
                 severity: *severity,

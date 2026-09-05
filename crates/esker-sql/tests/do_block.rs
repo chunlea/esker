@@ -128,7 +128,8 @@ fn a_body_that_is_not_the_template_is_refused_by_name() {
     for written in [
         // Effects a no-op would swallow.
         "DO $$ BEGIN CREATE TABLE do_made_this (a int); END $$",
-        "DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$",
+        // `RAISE EXCEPTION` **left this list**: it is `P0001` now, through the error path, and
+        // `the_forms_around_the_templates_answer_as_postgresql_does` asserts it there.
         "DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM pg_class; END $$",
         "DO $$ BEGIN NULL; END $$",
         "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$",
@@ -191,10 +192,79 @@ fn raise_notice_and_warning_reach_the_client() {
     for written in [
         "do $$ BEGIN RAISE INFO 'i'; END; $$",
         "do $$ BEGIN RAISE LOG 'l'; END; $$",
-        "do $$ BEGIN RAISE EXCEPTION 'boom'; END; $$",
+        // `EXCEPTION` is **not** in this list any more: it is not a severity this wire lacks, it
+        // is an error, and it answers `P0001`.
         "do $$ BEGIN RAISE WARNING 'a', 'b'; END; $$",
     ] {
         let error = node.run(written).unwrap_err();
         assert_eq!(error.sqlstate(), "0A000", "for {written}");
+    }
+}
+
+/// The forms around the two templates, with the capture's own answers.
+///
+/// **`corpus/pg19_do_block.txt` cannot be replayed as it stands, and that is a property of the
+/// capture rather than of this node.** It is one `BEGIN … ROLLBACK` block, and only the statements
+/// PostgreSQL *errors* on are wrapped in savepoints. Every form this node refuses where PostgreSQL
+/// succeeds — a non-template body, `BEGIN NULL; END`, `CREATE TABLE` inside a block — aborts the
+/// transaction, and the sixteen statements after it answer `25P02`. Declaring a divergence does not
+/// prevent the abort; it only stops the row itself being counted as a disagreement.
+///
+/// So the answers below are taken from that capture line by line, and re-capturing it with a
+/// savepoint per statement is the harness lane's to do. Recorded in `docs/plans/do-blocks.md`.
+#[test]
+fn the_forms_around_the_templates_answer_as_postgresql_does() {
+    let mut node = parity::Node::new(&[]);
+    // **Both `LANGUAGE` spellings reach the templates now**, which is the fix: before this
+    // revision a template body was refused outright if the statement named its language.
+    for sql in [
+        "DO $$ BEGIN RAISE NOTICE 'plain'; END $$",
+        "DO LANGUAGE plpgsql $$ BEGIN RAISE NOTICE 'leading'; END $$",
+        "DO $$ BEGIN RAISE NOTICE 'trailing'; END $$ LANGUAGE plpgsql",
+        // The dollar tag is read from the source and always could be named.
+        "DO $do$ BEGIN RAISE NOTICE 'tagged'; END $do$",
+        "DO $x$ BEGIN RAISE WARNING 'tagged'; END $x$",
+    ] {
+        assert_eq!(
+            node.answer(sql).to_string(),
+            "(a command, no result set)",
+            "{sql}"
+        );
+    }
+
+    // **A language this node does not run is `42704` naming that language**, not `0A000` naming
+    // `DO`: a real server resolves the language before it reads the body, so what is wrong is the
+    // language. Both spellings, because both reach the same decision.
+    for sql in [
+        "DO $$ BEGIN NULL; END $$ LANGUAGE nosuchlang",
+        "DO LANGUAGE nosuchlang $$ BEGIN NULL; END $$",
+    ] {
+        assert_eq!(
+            node.answer(sql).to_string(),
+            "!42704 language \"nosuchlang\" does not exist",
+            "{sql}"
+        );
+    }
+
+    // **`RAISE EXCEPTION` is a failure and must not read as a success.** `P0001` with the raised
+    // text as the whole message, through the error path and never the notice path — the
+    // distinction ADR 0058 refused to blur.
+    assert_eq!(
+        node.answer("DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$")
+            .to_string(),
+        "!P0001 boom"
+    );
+
+    // And what stays refused, by the ruling rather than by an absence: a body that is a program.
+    for sql in [
+        "DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM pg_class; END $$",
+        "DO $$ BEGIN CREATE TABLE do_made_this (a int); END $$",
+        "DO $$ BEGIN NULL; END $$",
+    ] {
+        assert_eq!(
+            node.answer(sql).to_string(),
+            "!0A000 DO is not supported",
+            "{sql}"
+        );
     }
 }

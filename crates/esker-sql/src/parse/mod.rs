@@ -524,16 +524,50 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         .collect())
 }
 
-/// The text between a `DO` statement's dollar quotes, or `None` when this is not a plain `DO`.
+/// The language a `DO` block names, when this node does not run it.
 ///
-/// **`DO LANGUAGE plpgsql $$ … $$` and a trailing `LANGUAGE` are not recognised.** They are
-/// perfectly good PostgreSQL and they reach the refusal table, which names `DO` — a body that says
-/// which language it is in is one this recogniser has no business guessing at.
-fn do_body(sql: &str) -> Option<&str> {
-    let open = sql.find('$')?;
-    // Everything before the quote must be the bare word `DO`.
-    if !sql.get(..open)?.trim().eq_ignore_ascii_case("DO") {
+/// `plpgsql` and an unstated language both answer `None`: those are the ones that go on to the
+/// template recognisers. Anything else is a `42704` the caller raises, and it is decided here
+/// rather than in the refusal table because the table would name `DO` — which is not what is
+/// wrong with `DO $$ … $$ LANGUAGE nosuchlang`.
+fn do_named_language(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, ..] = scanned.words.as_slice() else {
         return None;
+    };
+    if !first.eq_ignore_ascii_case("DO") {
+        return None;
+    }
+    match do_body(sql)?.1 {
+        DoLanguage::Named(name) if !name.eq_ignore_ascii_case("plpgsql") => Some(name.to_owned()),
+        _ => None,
+    }
+}
+
+/// The text between a `DO` statement's dollar quotes, or `None` when this is not a `DO`.
+///
+/// **Both `LANGUAGE` spellings are read**, leading and trailing, and the language named travels out
+/// on [`DoLanguage`] rather than being acted on here. ADR 0058 refused them on the grounds that "a
+/// body that says which language it is in is one this recogniser has no business guessing at" —
+/// which holds for an *unknown* language and not for `plpgsql`, the one already assumed. An
+/// unknown one is `42704` and the caller is where that is decided, because a parser that returned
+/// `None` could not tell the two apart.
+///
+/// The dollar tag may be named — `$do$ … $do$` — and always could be: the tag is read from the
+/// source rather than matched against `$$`.
+fn do_body(sql: &str) -> Option<(&str, DoLanguage<'_>)> {
+    let open = sql.find('$')?;
+    // What precedes the quote is `DO`, optionally followed by `LANGUAGE <name>`.
+    let head = sql.get(..open)?.trim();
+    let mut language = DoLanguage::Unstated;
+    let head_words: Vec<&str> = head.split_whitespace().collect();
+    match head_words.as_slice() {
+        [only] if only.eq_ignore_ascii_case("DO") => {}
+        [verb, keyword, named]
+            if verb.eq_ignore_ascii_case("DO") && keyword.eq_ignore_ascii_case("LANGUAGE") =>
+        {
+            language = DoLanguage::Named(named.trim_matches('\''));
+        }
+        _ => return None,
     }
     let tag_end = sql.get(open + 1..)?.find('$')? + open + 1;
     let tag = sql.get(open..=tag_end)?;
@@ -542,12 +576,45 @@ fn do_body(sql: &str) -> Option<&str> {
     if body_end < body_start {
         return None;
     }
-    // Only whitespace and an optional `;` may follow the closing tag.
-    let tail = sql.get(body_end + tag.len()..)?.trim();
-    if !tail.is_empty() && tail != ";" {
-        return None;
+    // What follows the closing tag is nothing, a `;`, or the trailing `LANGUAGE <name>`.
+    let tail = sql
+        .get(body_end + tag.len()..)?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if !tail.is_empty() {
+        let tail_words: Vec<&str> = tail.split_whitespace().collect();
+        match tail_words.as_slice() {
+            [keyword, named] if keyword.eq_ignore_ascii_case("LANGUAGE") => {
+                // Two `LANGUAGE` clauses is not a statement a real server takes either.
+                if language != DoLanguage::Unstated {
+                    return None;
+                }
+                language = DoLanguage::Named(named.trim_matches('\''));
+            }
+            _ => return None,
+        }
     }
-    sql.get(body_start..body_end)
+    Some((sql.get(body_start..body_end)?, language))
+}
+
+/// Which language a `DO` block said it was in, if it said.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoLanguage<'a> {
+    /// No `LANGUAGE` clause: `plpgsql`, which is PostgreSQL's default for a `DO`.
+    Unstated,
+    /// `LANGUAGE <name>`, as written.
+    Named(&'a str),
+}
+
+impl DoLanguage<'_> {
+    /// Whether this is a language this node runs, which is `plpgsql` and nothing else.
+    fn is_plpgsql(self) -> bool {
+        match self {
+            DoLanguage::Unstated => true,
+            DoLanguage::Named(name) => name.eq_ignore_ascii_case("plpgsql"),
+        }
+    }
 }
 
 /// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's other `DO` body.
@@ -701,7 +768,12 @@ fn strip_do_raise(sql: &str, scanned: &Scan<'_>) -> Option<(String, crate::error
     if !first.eq_ignore_ascii_case("DO") {
         return None;
     }
-    let tokens = tokenize_do_body(do_body(sql)?)?;
+    let (body, language) = do_body(sql)?;
+    // A language this node does not run is the caller's `42704`, not a template match.
+    if !language.is_plpgsql() {
+        return None;
+    }
+    let tokens = tokenize_do_body(body)?;
     if !do_words_match(&tokens, 0, &["BEGIN", "RAISE"]) {
         return None;
     }
@@ -712,8 +784,14 @@ fn strip_do_raise(sql: &str, scanned: &Scan<'_>) -> Option<(String, crate::error
         Some((DoToken::Word(level), _, _)) if level.eq_ignore_ascii_case("WARNING") => {
             crate::error::Severity::Warning
         }
-        // `INFO`, `LOG` and `DEBUG` have no severity token on this wire, and `EXCEPTION` is an
-        // error rather than a notice. Both reach the refusal table.
+        // **`EXCEPTION` is an error, and it travels as one.** `Severity::Error` is what
+        // `lower` turns into a `RaisedException` rather than a notice, which is the distinction
+        // ADR 0058 refused to blur: a failed statement must not read as a successful one.
+        Some((DoToken::Word(level), _, _)) if level.eq_ignore_ascii_case("EXCEPTION") => {
+            crate::error::Severity::Error
+        }
+        // `INFO`, `LOG` and `DEBUG` still have no severity token on this wire, so they reach the
+        // refusal table — downgrading one prints the wrong word to a client reading exactly it.
         _ => return None,
     };
     let Some((DoToken::Text(message), _, _)) = tokens.get(3) else {
@@ -1031,7 +1109,10 @@ fn strip_do_create_enum(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     if !first.eq_ignore_ascii_case("DO") {
         return None;
     }
-    let body = do_body(sql)?;
+    let (body, language) = do_body(sql)?;
+    if !language.is_plpgsql() {
+        return None;
+    }
     let tokens = tokenize_do_body(body)?;
     let (guarded, at) = match_do_enum_guard(&tokens)?;
     let (from, to) = match_do_enum_create(&tokens, at, guarded)?;
@@ -1774,6 +1855,14 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         Err(SqlError::Syntax {
             message, position, ..
         }) => match recognize_unsupported(sql, &scanned.words) {
+            // **A `DO` naming a language this node does not run is `42704`, not `0A000`.** A real
+            // server resolves the language before it reads the body, so what is wrong is the
+            // language and not `DO` — and the refusal table can only say `DO`. Checked here,
+            // where the parse failure is turned into a refusal, because `sqlparser` has no `DO`
+            // statement and lowering is never reached.
+            Some("DO") if do_named_language(sql, &scanned).is_some() => Err(
+                SqlError::UndefinedLanguage(do_named_language(sql, &scanned).unwrap_or_default()),
+            ),
             Some(feature) => Err(SqlError::unsupported(feature)),
             // Not a feature gap and not valid PostgreSQL either — PostgreSQL 19 answers `42601`
             // for these too, so the code stays. What is added is a `HINT` naming the spelling that

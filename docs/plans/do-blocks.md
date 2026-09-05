@@ -55,6 +55,10 @@ is the case the 'it is a language' reading was right about, and it is 2 tests."*
 > general PL/pgSQL by any reading**, so the ruling and the remaining row point the same way: leave
 > them refused. There is no version of this unit that both honours the ruling and moves the 2.
 
+**Closed question, ruled 2026-09-04.** The two stay refused. They are general PL/pgSQL and the
+ruling excludes it; `docs/acceptance/v1.md`'s divergence row now says so in those words, with the
+run numbers, so the next reader does not re-open it from a stale figure.
+
 ## 3. What is actually worth doing: a capture nothing replays
 
 `crates/esker-sql/tests/corpus/pg19_do_block.txt` is **30 statements captured against PostgreSQL 19
