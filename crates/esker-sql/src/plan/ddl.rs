@@ -936,6 +936,26 @@ fn name_addition(parts: impl Iterator<Item = impl AsRef<str>>) -> String {
 /// double underscore — a join-then-truncate would have produced none of these three.
 #[must_use]
 pub fn make_object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
+    // **The budget belongs to the identifier, never to the schema in front of it.** A stored name
+    // is bare in `public` and `schema ++ NUL ++ name` anywhere else
+    // ([ADR 0071](../../../docs/adr/0071-a-relation-name-is-keyed-by-its-schema.md)), so handing
+    // the qualified form in made the schema and its separator eat into the table's share: a
+    // 60-character table in a one-character schema derived a **61**-byte index name where a real
+    // server derives 63, and a long enough schema would have truncated the separator itself away
+    // and put the index in `public`.
+    //
+    // Invisible in `public`, where the two forms are the same string — which is why
+    // `tests/derived_name_in_a_schema.rs` is in a schema of its own.
+    // Guarded on the **separator**, not on the schema `split_qualified` reports: it answers
+    // `public` for a bare name, so a check against "no schema" is never true and recurses for ever.
+    if let Some((schema, bare)) = name1.split_once(crate::catalog::SCHEMA_SEPARATOR) {
+        return crate::catalog::qualify(schema, &make_object_name_bare(bare, name2, label));
+    }
+    make_object_name_bare(name1, name2, label)
+}
+
+/// [`make_object_name`] once the schema is off, which is where the byte budget is spent.
+fn make_object_name_bare(name1: &str, name2: Option<&str>, label: &str) -> String {
     // `NAMEDATALEN - 1 - overhead`, where the overhead is the label, its separator, and the
     // separator before `name2` when there is one.
     let overhead = usize::from(name2.is_some()) + label.len() + 1;

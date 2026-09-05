@@ -1,0 +1,18 @@
+# `replace(text, from, to)` — against PostgreSQL 19beta1 at 127.0.0.1:55432.
+#
+# Run 89's `the function REPLACE is not supported`, 4 tests: `relations_test.rb` (3) and
+# `unsafe_raw_sql_test.rb` (1). Every use is inside an `ORDER BY`, and between them the four cover
+# each argument position being a column, a constant or a bind:
+#
+#   REPLACE(title, '', '')                                        column, constant, constant
+#   REPLACE('abc', taggings.taggable_type, taggings.taggable_type) constant, column, column
+#   REPLACE(title, 'misc', 'zzzz')                                column, constant, constant
+#   REPLACE(title, ?, ?)                                          column, bind, bind
+#
+# Captured by b4-types on 2026-09-05 in one session.
+SELECT 'r', replace('abcabc','b','X'), replace('abc','',''), replace('abc','','X')		r|aXcaXc|abc|abc
+SELECT 'r', replace('aaa','aa','b'), replace('abc','ABC','x'), replace('abc','abc','')		r|ba|abc|
+SELECT 'r', replace(NULL,'a','b') IS NULL, replace('abc',NULL,'b') IS NULL, replace('abc','a',NULL) IS NULL		r|t|t|t
+SELECT 'r', pg_typeof(replace('a','b','c')), length(replace('abc','b',''))		r|text|2
+SELECT 'r', replace('abc'::varchar,'b','X'), pg_typeof(replace('abc'::varchar,'b','X'))		r|aXc|text
+SELECT 'r', REPLACE('abc','b','X') AS upper_case_name		r|aXc

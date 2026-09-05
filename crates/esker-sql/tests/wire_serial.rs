@@ -452,3 +452,71 @@ async fn a_schema_change_in_a_transaction_settles_the_sequence_either_way() {
         "a rolled-back DROP/CREATE leaves the original sequence, which continues"
     );
 }
+
+/// **An enum crosses both boundaries as its label**, in and out.
+///
+/// Run 89's `invalid input syntax for type smallint: "ok"` — 3 tests across `enum_test.rb` and
+/// `invertible_migration_test.rb`. An enum's value is stored as its position
+/// ([ADR 0050](../../../docs/adr/0050-an-enum-is-its-ordinal.md)), so the `Datum` is an `int2`, and
+/// the ordinal leaked across the boundary in **both** directions:
+///
+/// * a **bound** parameter was read with the column's storage type, so `'ok'` was handed to the
+///   `int2` input function — which is the run-89 error, and it is every `ActiveRecord` write to an
+///   enum column, because `ActiveRecord` prepares;
+/// * `RETURNING` rendered the ordinal straight out, so `INSERT … RETURNING current_mood` answered
+///   `3` where `SELECT current_mood` answered `happy` — one renderer, two output paths, and only
+///   the `SELECT` one used it.
+///
+/// A literal, a `::text` cast and a `WHERE` comparison were all already right, which is what made
+/// the two gaps look like one and neither look like a leak.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enum_crosses_both_boundaries_as_its_label() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        .await;
+    wire.run("CREATE TABLE pe (id int8, current_mood mood)")
+        .await;
+    wire.run("INSERT INTO pe VALUES (1, 'ok')").await;
+
+    for (sql, want) in [
+        ("SELECT current_mood FROM pe", "ok"),
+        ("SELECT current_mood::text FROM pe", "ok"),
+        ("SELECT id FROM pe WHERE current_mood = 'ok'", "1"),
+        (
+            "INSERT INTO pe VALUES (3, 'happy') RETURNING current_mood",
+            "happy",
+        ),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            first_value(&reply).as_deref(),
+            Some(want),
+            "{sql}: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+    }
+
+    // The bound form, which is the one run 89 failed on.
+    let bound = wire
+        .send(&extended(
+            "INSERT INTO pe VALUES (4, $1) RETURNING current_mood",
+            &["ok"],
+        ))
+        .await;
+    assert!(
+        !frames(&bound).iter().any(|(tag, _)| *tag == 'E'),
+        "a bound enum label was refused: {}",
+        String::from_utf8_lossy(&bound).replace('\0', "|")
+    );
+    assert_eq!(
+        first_value(&bound).as_deref(),
+        Some("ok"),
+        "a bound label goes in as the label and comes back as the label"
+    );
+}

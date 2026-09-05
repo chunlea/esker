@@ -1096,6 +1096,17 @@ pub enum CatalogFunc {
     /// `concat(NULL, NULL)` is the empty string. Each argument is rendered by its own output
     /// function, so `concat('n=', 42, ' t=', true)` is `n=42 t=t` and a `numeric` keeps its scale.
     Concat,
+    /// `replace(text, from, to)`: every occurrence of `from` in `text`, replaced.
+    ///
+    /// Three rules that a `str::replace` gets right and one it does not, all measured on 19beta1:
+    /// left to right and **non-overlapping** (`replace('aaa','aa','b')` is `ba`, not `bb`),
+    /// **case-sensitive** (`replace('abc','ABC','x')` is `abc`), strict — any NULL argument gives
+    /// NULL — and the result is `text` whatever went in, so a `varchar` column comes back `text`.
+    ///
+    /// **An empty `from` is a no-op**: `replace('abc','','X')` is `abc`. Rust's `str::replace`
+    /// answers `XaXbXcX` for that, matching between every character, so the empty case is the one
+    /// this cannot delegate.
+    Replace,
     /// `convert_to(text, encoding)`: the bytes `text` has in `encoding`.
     ///
     /// **Strict**, encoding name included: `convert_to('A', NULL)` is NULL. A name that is not an
@@ -1191,6 +1202,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
+            () if name.eq_ignore_ascii_case("replace") => Some(CatalogFunc::Replace),
             () if name.eq_ignore_ascii_case("convert_to") => Some(CatalogFunc::ConvertTo),
             () if name.eq_ignore_ascii_case("format_type") => Some(CatalogFunc::FormatType),
             () if name.eq_ignore_ascii_case("pg_get_expr") => Some(CatalogFunc::PgGetExpr),
@@ -1299,6 +1311,7 @@ impl CatalogFunc {
             CatalogFunc::ClockTimestamp => "clock_timestamp",
             CatalogFunc::Random => "random",
             CatalogFunc::Concat => "concat",
+            CatalogFunc::Replace => "replace",
             CatalogFunc::ConvertTo => "convert_to",
         }
     }
@@ -1401,6 +1414,7 @@ impl CatalogFunc {
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
             CatalogFunc::Concat => &CONCAT_ARITIES,
+            CatalogFunc::Replace => &[3],
         }
     }
 
@@ -1434,6 +1448,7 @@ impl CatalogFunc {
             | CatalogFunc::ToRegClass
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
+            | CatalogFunc::Replace
             // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
             // this node has no `regtype`, and what it prints is the name either way.
             | CatalogFunc::PgTypeof

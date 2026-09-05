@@ -65,6 +65,22 @@ use crate::value::{ColumnType, Datum};
 use crate::value::{PgDatum, PgType};
 
 /// Every parameter's type, indexed from zero for `$1`.
+/// The type a **bound parameter** for this column takes, which is not always the column's own.
+///
+/// An enum is stored as its ordinal ([ADR 0050](../../../docs/adr/0050-an-enum-is-its-ordinal.md)),
+/// so `ColumnDef::ty` is an `int2` — and reading a bound `'ok'` with that gives
+/// `22P02 invalid input syntax for type smallint: "ok"`, which is what run 89 saw from every
+/// `ActiveRecord` write to an enum column, because `ActiveRecord` prepares. A **label** is what a
+/// client sends, so the parameter is read as text and `assign::into_enum` maps it to the ordinal
+/// on the way into the row, exactly as it does for a literal.
+fn parameter_type(column: &crate::catalog::ColumnDef) -> ColumnType {
+    if column.user_type.is_some() {
+        ColumnType::Text
+    } else {
+        column.ty
+    }
+}
+
 pub(super) fn infer(
     statement: &Statement,
     tables: &[std::sync::Arc<TableDef>],
@@ -169,7 +185,7 @@ fn walk(
             for row in &insert.rows {
                 for (target, expr) in targets.iter().zip(row) {
                     if let Expr::Parameter(number) = expr {
-                        seen(*number, table.columns[*target].ty);
+                        seen(*number, parameter_type(&table.columns[*target]));
                     }
                 }
             }
@@ -181,7 +197,7 @@ fn walk(
                     match (table.column(name), value) {
                         // `SET c = $1`: the column's own type, which is the whole of it.
                         (Some(at), Expr::Parameter(number)) => {
-                            seen(*number, table.columns[at].ty);
+                            seen(*number, parameter_type(&table.columns[at]));
                         }
                         // **`SET c = <expression holding $1>`**, which is what a counter cache
                         // sends and what the `$1`-is-`text` bug was: the value is an arithmetic
@@ -484,7 +500,7 @@ fn walk_predicate(
                                 found = None;
                                 break;
                             }
-                            found = Some(candidate.columns[at].ty);
+                            found = Some(parameter_type(&candidate.columns[at]));
                         }
                     }
                     if let Some(ty) = found {
@@ -614,7 +630,7 @@ fn column_type(named: &[Named<'_>], qualifier: Option<&str>, name: &str) -> Opti
             if found.is_some() {
                 return None;
             }
-            found = Some(candidate.columns[at].ty);
+            found = Some(parameter_type(&candidate.columns[at]));
         }
     }
     found
