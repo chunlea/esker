@@ -106,6 +106,7 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
     match request {
         TxnKvReq::Get { key, .. } | TxnKvReq::LatestCommit { key } => key.len() + 2 * PER_FIELD,
         TxnKvReq::Scan { start, end, .. } => start.len() + end.len() + 5 * PER_FIELD,
+        TxnKvReq::ReclaimRange { start, end, .. } => start.len() + end.len() + 3 * PER_FIELD,
         TxnKvReq::Prewrite {
             primary, mutations, ..
         } => {

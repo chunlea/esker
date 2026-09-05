@@ -3181,7 +3181,16 @@ impl Execute for Executor {
     }
 
     fn savepoint(&mut self, name: &str) -> Result<()> {
-        self.savepoints.savepoint(name, self.parameters.clone());
+        // The read set is copied here, with the parameters: a `ROLLBACK TO` has to put back what
+        // the transaction had *read* as well as what it had written, or the commit is validated
+        // against a dependency on a statement that no longer exists (ADR 0062).
+        let reads = self
+            .open
+            .as_ref()
+            .map(|txn| txn.read_set())
+            .unwrap_or_default();
+        self.savepoints
+            .savepoint(name, reads, self.parameters.clone());
         Ok(())
     }
 

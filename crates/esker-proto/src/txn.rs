@@ -12,6 +12,8 @@
 //! 0x0206 ResolveLock   finish someone else's transaction, either way
 //! 0x0207 Heartbeat     extend a live transaction's lock TTL
 //! 0x0208 GcSafepoint   publish the timestamp below which old versions may go
+//! 0x0209 LatestCommit  the newest commit_ts for one key
+//! 0x020A ReclaimRange  clear the storage under a dropped database's key range
 //! ```
 //!
 //! # What is here and what is not
@@ -475,6 +477,28 @@ pub enum TxnKvReq {
         /// The new safepoint. A store never moves its safepoint backwards.
         safepoint: u64,
     },
+    /// Clear the storage under a user-key range whose owner has been dropped
+    /// ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    ///
+    /// **Not a delete, and not addressed to a store.** `DROP DATABASE` has already committed the
+    /// catalog change, so nothing can route into this range any more — which is what makes it safe
+    /// to clear physically instead of writing a tombstone per version. It is addressed to a
+    /// **region** like every other request here, carrying the epoch invariant 5 requires; a range
+    /// that spans regions is the caller's to walk, one region at a time.
+    ///
+    /// The store clamps the range to the region that answers and reports how far it got, so a
+    /// caller resumes rather than restarts.
+    ReclaimRange {
+        /// Inclusive lower bound, a user key.
+        start: Bytes,
+        /// Exclusive upper bound. **Empty means the end of the key space**, the same convention a
+        /// region's `end_key` uses.
+        end: Bytes,
+        /// The commit timestamp of the drop this reclaim belongs to. A store does nothing until
+        /// its safepoint has reached it: a transaction whose snapshot predates the drop may still
+        /// legally read these rows.
+        below_ts: u64,
+    },
     /// **The newest `commit_ts` for one key** — the question a waiter asks instead of guessing
     /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
@@ -501,6 +525,7 @@ impl TxnKvReq {
             Self::ResolveLock { .. } => Method::TxnResolveLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
+            Self::ReclaimRange { .. } => Method::TxnReclaimRange,
             Self::LatestCommit { .. } => Method::TxnLatestCommit,
         }
     }
@@ -516,7 +541,9 @@ impl TxnKvReq {
         match self {
             // A read of one key routes by it, whether the answer is a value or a timestamp.
             Self::Get { key, .. } | Self::LatestCommit { key } => key,
-            Self::Scan { start, .. } => start,
+            // A range's first key, for both: a scan reads from it and a reclaim clears from it,
+            // and either way that is the key the region is chosen by.
+            Self::Scan { start, .. } | Self::ReclaimRange { start, .. } => start,
             Self::Prewrite { mutations, .. } => mutations.first().map_or(&[][..], |m| m.key()),
             Self::Commit { keys, .. }
             | Self::Rollback { keys, .. }
@@ -591,6 +618,15 @@ impl TxnKvReq {
                 out.put_varint(*ttl_ms);
             }
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
+            Self::ReclaimRange {
+                start,
+                end,
+                below_ts,
+            } => {
+                out.put_bytes(start);
+                out.put_bytes(end);
+                out.put_varint(*below_ts);
+            }
             Self::LatestCommit { key } => out.put_bytes(key),
         }
     }
@@ -648,6 +684,11 @@ impl TxnKvReq {
             },
             Method::TxnLatestCommit => Self::LatestCommit {
                 key: take(input, "key")?,
+            },
+            Method::TxnReclaimRange => Self::ReclaimRange {
+                start: take(input, "reclaim.start")?,
+                end: take(input, "reclaim.end")?,
+                below_ts: input.get_varint("reclaim.below_ts")?,
             },
             other => {
                 return Err(DecodeError::invalid(
@@ -731,6 +772,20 @@ pub enum TxnKvResp {
         /// The safepoint the store now holds.
         safepoint: u64,
     },
+    /// How far a [`TxnKvReq::ReclaimRange`] got.
+    ///
+    /// A caller resumes from `cursor` rather than restarting. When the safepoint was too low
+    /// nothing was cleared, `cursor` is the request's own `start` and `finished` is false — which
+    /// is not an error: the caller asks again once the safepoint has moved, and `safepoint` says
+    /// what it is waiting for.
+    ReclaimRange {
+        /// Where the walk reached. The request's `start` when nothing was done.
+        cursor: Bytes,
+        /// Whether this store has nothing left of the range.
+        finished: bool,
+        /// The safepoint in force here, so a caller that got nothing can say why.
+        safepoint: u64,
+    },
 }
 
 impl TxnKvResp {
@@ -754,6 +809,7 @@ impl TxnKvResp {
             Self::ResolveLock { .. } => Method::TxnResolveLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
+            Self::ReclaimRange { .. } => Method::TxnReclaimRange,
             Self::LatestCommit { .. } => Method::TxnLatestCommit,
         }
     }
@@ -780,6 +836,15 @@ impl TxnKvResp {
             Self::ResolveLock { resolved } => out.put_varint(*resolved),
             Self::Heartbeat { ttl_ms } => out.put_varint(*ttl_ms),
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
+            Self::ReclaimRange {
+                cursor,
+                finished,
+                safepoint,
+            } => {
+                out.put_bytes(cursor);
+                out.put_bool(*finished);
+                out.put_varint(*safepoint);
+            }
             // **A `u64` and a flag, not a sentinel.** Zero is not a timestamp, but writing zero for
             // "never committed" would make the absence unreadable the day it is not.
             Self::LatestCommit { newest } => match newest {
@@ -827,6 +892,20 @@ impl TxnKvResp {
             },
             Method::TxnGcSafepoint => Self::GcSafepoint {
                 safepoint: input.get_varint("safepoint")?,
+            },
+            Method::TxnReclaimRange => Self::ReclaimRange {
+                cursor: take(input, "reclaim.cursor")?,
+                finished: match input.get_u8("reclaim.finished")? {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(DecodeError::invalid(
+                            "reclaim.finished",
+                            format!("{other} is not a boolean"),
+                        ));
+                    }
+                },
+                safepoint: input.get_varint("reclaim.safepoint")?,
             },
             Method::TxnLatestCommit => Self::LatestCommit {
                 newest: match input.get_u8("latest_commit.present")? {
@@ -953,6 +1032,14 @@ mod tests {
                 ttl_ms: 1,
             },
             TxnKvReq::GcSafepoint { safepoint: 1 },
+            TxnKvReq::LatestCommit {
+                key: Bytes::from_static(b"k"),
+            },
+            TxnKvReq::ReclaimRange {
+                start: Bytes::from_static(b"d"),
+                end: Bytes::new(),
+                below_ts: 1,
+            },
         ];
         for (index, request) in requests.iter().enumerate() {
             let method = request.method();
@@ -980,6 +1067,8 @@ mod tests {
             Method::TxnResolveLock,
             Method::TxnHeartbeat,
             Method::TxnGcSafepoint,
+            // It deletes data; that it does so by range does not make it a read.
+            Method::TxnReclaimRange,
         ] {
             assert!(method.is_mutation(), "{}", method.name());
         }

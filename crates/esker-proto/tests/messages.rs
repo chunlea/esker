@@ -630,6 +630,21 @@ fn golden_txn_finish_requests() -> Vec<(&'static str, Request)> {
             ),
         ),
         (
+            // The reclaim's row pins the **empty end key**, which is the field an encoder is
+            // most likely to get wrong: it is a length-prefixed empty string and not an omitted
+            // field, because absence and emptiness would otherwise be the same bytes and one of
+            // them means "to the end of the key space" (ADR 0069, and `meta.rs` on `end_key`).
+            "txn-reclaim-range",
+            Request::txn_kv(
+                h,
+                TxnKvReq::ReclaimRange {
+                    start: Bytes::from_static(b"d"),
+                    end: Bytes::new(),
+                    below_ts: TXN_SAFEPOINT,
+                },
+            ),
+        ),
+        (
             "txn-gc-safepoint",
             Request::txn_kv(
                 h,
@@ -765,6 +780,18 @@ fn golden_txn_housekeeping_responses() -> Vec<(&'static str, Response)> {
         (
             "txn-gc-safepoint",
             Response::TxnKv(TxnKvResp::GcSafepoint { safepoint: 1 << 41 }),
+        ),
+        (
+            // `finished: false` with a cursor short of the end is the ordinary answer — the store
+            // cleared one region's worth and the caller comes back. The `safepoint` is echoed so
+            // that the *blocked* answer, which looks identical but for that number, is decodable
+            // by the same reader.
+            "txn-reclaim-range",
+            Response::TxnKv(TxnKvResp::ReclaimRange {
+                cursor: Bytes::from_static(b"f"),
+                finished: false,
+                safepoint: 1 << 41,
+            }),
         ),
     ]
 }
