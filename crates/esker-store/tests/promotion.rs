@@ -198,8 +198,33 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
                     ));
                     continue;
                 };
+                // `leader=None` on every store is the interesting answer and it is ambiguous
+                // on its own: a follower whose election timer keeps being reset and a candidate
+                // that keeps losing look identical from outside. `role` separates them, and the
+                // membership says whether a quorum was ever available -- a range that split into
+                // peers that are still learners has no voters to elect anybody.
+                let raft = peer.status().await.ok();
+                let role = raft.as_ref().map_or_else(
+                    || "unavailable".to_owned(),
+                    |status| format!("{:?}", status.role),
+                );
+                let voted_for = raft.as_ref().and_then(|status| status.voted_for);
+                let membership = state
+                    .region()
+                    .peers
+                    .iter()
+                    .map(|member| {
+                        format!(
+                            "{}@store{}:{:?}",
+                            member.peer_id, member.store_id, member.role
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 seen.push(format!(
-                    "store {id}: peer of region {region_id}, is_leader={}, believes leader={:?}",
+                    "store {id}: region {region_id} term={} is_leader={} believes_leader={:?} \
+                     raft_role={role} voted_for={voted_for:?}; membership [{membership}]",
+                    peer.term(),
                     peer.is_leader(),
                     peer.leader()
                 ));
