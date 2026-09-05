@@ -1,0 +1,16 @@
+crates/esker-cli/tests/cluster_harness/mod.rs
+  h_44076b318daf9c 293-326
+crates/esker-cli/tests/multi_region_differential.rs
+  h_44076b318daf9c 110-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "87d5d9af2963a85926e9639582245c2d5c880a5e",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
