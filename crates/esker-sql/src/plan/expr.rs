@@ -754,6 +754,14 @@ pub enum CatalogFunc {
     /// `objsubid = 0` and this function does not special-case it. Measured; it costs nothing here
     /// and it is the value most likely to be passed by accident.
     ColDescription,
+    /// `pg_sleep(seconds)`: waits, and answers the empty string a `void` prints as.
+    ///
+    /// **Wanted for what can interrupt it, not for what it does.** It is how a client makes a
+    /// statement that is *working* rather than waiting, which is the only way to test that
+    /// `statement_timeout` and a cancel reach a statement at all — `transaction_test.rb` uses it
+    /// for exactly that. So it sleeps in short steps and checks `crate::exec::cancel` between
+    /// them, and a `pg_sleep` that could not be cut short would be worse than not having one.
+    PgSleep,
     /// `obj_description(oid)` and `obj_description(oid, catalog)`: an object's comment.
     ///
     /// NULL for the same reason. The catalog-name argument is **not validated** on a real server —
@@ -1073,6 +1081,7 @@ impl CatalogFunc {
                 Some(CatalogFunc::PgGetSerialSequence)
             }
             () if name.eq_ignore_ascii_case("col_description") => Some(CatalogFunc::ColDescription),
+            () if name.eq_ignore_ascii_case("pg_sleep") => Some(CatalogFunc::PgSleep),
             () if name.eq_ignore_ascii_case("obj_description") => Some(CatalogFunc::ObjDescription),
             () if name.eq_ignore_ascii_case("array_position") => Some(CatalogFunc::ArrayPosition),
             () if name.eq_ignore_ascii_case("array_lower") => Some(CatalogFunc::ArrayLower),
@@ -1100,6 +1109,7 @@ impl CatalogFunc {
             CatalogFunc::PgEncodingToChar => "pg_encoding_to_char",
             CatalogFunc::PgGetSerialSequence => "pg_get_serial_sequence",
             CatalogFunc::ColDescription => "col_description",
+            CatalogFunc::PgSleep => "pg_sleep",
             CatalogFunc::ObjDescription => "obj_description",
             CatalogFunc::PgGetPartkeydef => "pg_get_partkeydef",
             CatalogFunc::PgGetTriggerdef => "pg_get_triggerdef",
@@ -1216,7 +1226,8 @@ impl CatalogFunc {
             | CatalogFunc::PgTypeof
             | CatalogFunc::LtreeNlevel
             | CatalogFunc::LtreeToText
-            | CatalogFunc::TextToLtree => &[1],
+            | CatalogFunc::TextToLtree
+            | CatalogFunc::PgSleep => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
@@ -1246,6 +1257,9 @@ impl CatalogFunc {
             | CatalogFunc::PgGetTriggerdef
             | CatalogFunc::DateRange
             | CatalogFunc::ColDescription
+            // `void` on a real server, which prints as the empty string; `text` here for the same
+            // reason `regclass` is text — what it prints as is what a client sees.
+            | CatalogFunc::PgSleep
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::PgEncodingToChar
             | CatalogFunc::ObjDescription

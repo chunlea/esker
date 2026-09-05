@@ -27,6 +27,7 @@
 pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
+mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
@@ -127,11 +128,18 @@ pub struct Executor {
     /// Row ids reserved for this session but not yet handed out: `table_id -> (next, end)`.
     /// See [`Executor::next_row_id`].
     row_ids: std::collections::BTreeMap<u64, (u64, u64)>,
-    /// One session's reserved block per sequence: the next value it will hand out and the first
-    /// value past its block. See [`Executor::next_sequence_value`].
-    sequences: std::collections::BTreeMap<u64, (i64, i64)>,
-    //  Held blocks are dropped when their sequence is (`exec::ddl::drop_one_table`), so this does
-    //  not grow with the number of tables a long-lived connection has created and dropped.
+    /// **The node's** reserved blocks, not this session's — one allocator for every session the
+    /// process serves, joined by [`Executor::sharing_sequence_blocks`] the way the advisory-lock
+    /// table is, and private to this executor when nobody hands one in
+    /// ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)).
+    ///
+    /// A block held per *connection* is invisible to a client with one and glaring to one that
+    /// pools: five inserts on a five-connection pool answered `1, 33, 65, 97, 129` where
+    /// PostgreSQL gives `1, 2, 3, 4, 5`, and it cost `range_test.rb` a test.
+    ///
+    /// Held blocks are dropped when their sequence is (`exec::ddl::drop_one_table`), so this does
+    /// not grow with the number of tables a long-lived node has created and dropped.
+    sequences: Arc<crate::sequence::Blocks>,
     /// The sequences this session has a `currval` for, which is **not** the same set as the ones
     /// it holds a block of.
     ///
@@ -314,10 +322,10 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 });
             }
             crate::backend::Lock::Held { by, .. } => {
-                if let Some(limit) = deadline
+                if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
-                    return Err(SqlError::LockTimeout);
+                    return Err(which.expired());
                 }
                 let _ = by;
                 // A fixed step rather than an exponential one: the thing being waited for is
@@ -328,6 +336,92 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 waited += WAIT_STEP_MS;
             }
         }
+    }
+}
+
+/// Which parameter bounded a wait, because the two answer **different SQLSTATEs** for the same
+/// observable event.
+///
+/// `lock_deadline` used to return a bare `Option<u64>` — a number with no provenance — and the wait
+/// loop then reported `55P03` whichever parameter produced it. That is right for `lock_timeout` and
+/// wrong for `statement_timeout`, whose `57014` is the code a client maps to "cancelled" rather
+/// than "a lock was busy". `transaction_test.rb` asserts `QueryCanceled`, so it can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    /// `lock_timeout` — `55P03`, `canceling statement due to lock timeout`.
+    Lock,
+    /// `statement_timeout` — `57014`, `canceling statement due to statement timeout`.
+    Statement,
+}
+
+impl Deadline {
+    /// The error this deadline raises when it runs out.
+    fn expired(self) -> SqlError {
+        match self {
+            Deadline::Lock => SqlError::LockTimeout,
+            Deadline::Statement => SqlError::StatementTimeout,
+        }
+    }
+}
+
+/// How long a wait may last and **which parameter said so**, from the two parameters' values.
+///
+/// `lock_timeout` first and `statement_timeout` behind it, which is the order PostgreSQL applies
+/// them in — measured: with both set, the lock timeout is the one that fires. Zero means no limit
+/// for both, which is a real server's default.
+///
+/// A free function rather than a method so the precedence and the provenance can be tested without
+/// standing up an `Executor`: the arm that returns [`Deadline::Statement`] is unreachable through a
+/// session until a non-zero `statement_timeout` is accepted, and an untestable arm is how a wrong
+/// SQLSTATE would sit here unnoticed.
+fn deadline_from(lock_timeout: &str, statement_timeout: &str) -> Option<(u64, Deadline)> {
+    for (value, which) in [
+        (lock_timeout, Deadline::Lock),
+        (statement_timeout, Deadline::Statement),
+    ] {
+        if let Some(ms) = crate::parameter::timeout_ms(value)
+            && ms > 0
+        {
+            return Some((ms, which));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{Deadline, deadline_from};
+
+    /// **The provenance, which is the whole reason this returns a pair.** A wait bounded by
+    /// `statement_timeout` must answer `57014`, and one bounded by `lock_timeout` `55P03`; before
+    /// this the caller had a bare number and answered `55P03` for both.
+    #[test]
+    fn each_parameter_names_itself() {
+        assert_eq!(deadline_from("100ms", "0"), Some((100, Deadline::Lock)));
+        assert_eq!(
+            deadline_from("0", "100ms"),
+            Some((100, Deadline::Statement))
+        );
+    }
+
+    /// With both set the **lock** timeout fires, which is PostgreSQL's order and was measured
+    /// before this function existed. Asserted here so the order cannot be swapped silently.
+    #[test]
+    fn the_lock_timeout_wins_when_both_are_set() {
+        assert_eq!(deadline_from("50ms", "10ms"), Some((50, Deadline::Lock)));
+    }
+
+    /// Zero is "no limit" for both, and two zeroes are not a zero-length deadline.
+    #[test]
+    fn zero_is_no_limit_rather_than_an_instant_one() {
+        assert_eq!(deadline_from("0", "0"), None);
+    }
+
+    /// The two SQLSTATEs, at the point where they are chosen.
+    #[test]
+    fn the_expired_error_differs_by_parameter() {
+        assert_eq!(Deadline::Lock.expired().sqlstate(), "55P03");
+        assert_eq!(Deadline::Statement.expired().sqlstate(), "57014");
     }
 }
 
@@ -538,7 +632,7 @@ impl Executor {
             parameters: savepoint::Parameters::new(),
             block_parameters: None,
             row_ids: std::collections::BTreeMap::new(),
-            sequences: std::collections::BTreeMap::new(),
+            sequences: Arc::new(crate::sequence::Blocks::default()),
             currval_defined: std::collections::BTreeSet::new(),
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
@@ -1010,19 +1104,23 @@ impl Executor {
         )
     }
 
-    fn lock_deadline(&self) -> Option<u64> {
-        for parameter in [
-            crate::parameter::lock_timeout(),
-            crate::parameter::statement_timeout(),
-        ] {
-            let value = self.parameter(parameter);
-            if let Some(ms) = crate::parameter::timeout_ms(&value)
-                && ms > 0
-            {
-                return Some(ms);
-            }
-        }
-        None
+    /// When the statement about to run must stop, from `statement_timeout`.
+    ///
+    /// **Not `lock_timeout`**, which bounds one wait rather than the statement: a session with a
+    /// 50 ms lock timeout and no statement timeout may run a five-second scan, and cutting it off
+    /// would be this node inventing a limit nobody set.
+    fn statement_deadline(&self) -> Option<std::time::Instant> {
+        let value = self.parameter(crate::parameter::statement_timeout());
+        crate::parameter::timeout_ms(&value)
+            .filter(|ms| *ms > 0)
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms))
+    }
+
+    fn lock_deadline(&self) -> Option<(u64, Deadline)> {
+        deadline_from(
+            &self.parameter(crate::parameter::lock_timeout()),
+            &self.parameter(crate::parameter::statement_timeout()),
+        )
     }
 
     fn parameter(&self, parameter: &crate::parameter::Parameter) -> String {
@@ -1487,7 +1585,7 @@ impl Executor {
                 SequenceFunc::CurrVal => self
                     .currval_defined
                     .contains(&sequence.id)
-                    .then(|| self.sequences.get(&sequence.id).map(|(next, _)| next - 1))
+                    .then(|| self.sequences.last_taken(self.tenant, sequence.id))
                     .flatten()
                     // **The sequence's own name, not the spelling that reached it**: by here the
                     // name has resolved, and `currval('"public"."s"')` is about the sequence `s`.
@@ -1505,7 +1603,7 @@ impl Executor {
             .ok_or(SqlError::SequenceNotYetDefined(None))?;
         self.currval_defined
             .contains(&id)
-            .then(|| self.sequences.get(&id).map(|(next, _)| next - 1))
+            .then(|| self.sequences.last_taken(self.tenant, id))
             .flatten()
             .ok_or(SqlError::SequenceNotYetDefined(None))
     }
@@ -1583,7 +1681,7 @@ impl Executor {
         );
         txn.commit()?;
         // `currval` answers the value that was set, whether or not it was called -- measured.
-        self.sequences.insert(sequence_id, (value + 1, value + 1));
+        self.sequences.set(self.tenant, sequence_id, value);
         self.last_sequence = Some(sequence_id);
         self.currval_defined.insert(sequence_id);
         Ok(value)
@@ -1834,7 +1932,7 @@ impl Executor {
     /// longer means anything — the next id was 5 where PostgreSQL gives 1. `currval` goes with it,
     /// because a value that was never handed out is not one this session last took.
     pub(super) fn forget_sequence_block(&mut self, sequence_id: u64) {
-        self.sequences.remove(&sequence_id);
+        self.sequences.forget(self.tenant, sequence_id);
         self.currval_defined.remove(&sequence_id);
         if self.last_sequence == Some(sequence_id) {
             self.last_sequence = None;
@@ -1850,7 +1948,7 @@ impl Executor {
     /// count to be visible at all.
     #[must_use]
     pub fn held_sequence_blocks(&self) -> usize {
-        self.sequences.len()
+        self.sequences.held_for(self.tenant)
     }
 
     /// Sets one sequence back to its start — the counter **and** this session's block.
@@ -1871,36 +1969,33 @@ impl Executor {
 
     /// has with exactly this behaviour, and neither server offers gap-freeness.
     fn next_sequence_value(&mut self, sequence_id: u64) -> Result<i64> {
-        if let Some((next, end)) = self.sequences.get_mut(&sequence_id)
-            && *next < *end
-        {
-            let value = *next;
-            *next += 1;
-            self.last_sequence = Some(sequence_id);
-            self.currval_defined.insert(sequence_id);
-            return Ok(value);
-        }
-
-        let mut txn = self.backend.begin()?;
-        let first = match crate::catalog::allocate_sequence_values(
-            &mut *txn,
-            self.tenant,
-            sequence_id,
-            crate::catalog::SEQUENCE_BATCH,
-        ) {
-            Ok(first) => first,
-            Err(error) => {
-                let _ = txn.rollback();
-                return Err(error);
-            }
-        };
-        txn.commit()?;
-        let batch = i64::try_from(crate::catalog::SEQUENCE_BATCH).unwrap_or(i64::MAX);
-        self.sequences
-            .insert(sequence_id, (first + 1, first.saturating_add(batch)));
+        let backend = Arc::clone(&self.backend);
+        let tenant = self.tenant;
+        let value =
+            self.sequences
+                .next(tenant, sequence_id, crate::catalog::SEQUENCE_BATCH, || {
+                    let mut txn = backend.begin()?;
+                    match crate::catalog::allocate_sequence_values(
+                        &mut *txn,
+                        tenant,
+                        sequence_id,
+                        crate::catalog::SEQUENCE_BATCH,
+                    ) {
+                        Ok(first) => {
+                            txn.commit()?;
+                            Ok(first)
+                        }
+                        Err(error) => {
+                            let _ = txn.rollback();
+                            Err(error)
+                        }
+                    }
+                })?;
+        // **`currval` and `lastval` stay this session's**, because that is what they are on a real
+        // server: the value *this* session last took, not one the node did.
         self.last_sequence = Some(sequence_id);
         self.currval_defined.insert(sequence_id);
-        Ok(first)
+        Ok(value)
     }
 
     /// Adds a notice for the session to send before this statement's `CommandComplete`.
@@ -1943,6 +2038,18 @@ impl Executor {
     pub fn sharing_advisory_locks(mut self, locks: Arc<crate::advisory::Locks>) -> Self {
         self.session = locks.session();
         self.locks = locks;
+        self
+    }
+
+    /// Joins this executor to the **node's** sequence allocator, so every session the process
+    /// serves hands out consecutive values of one sequence rather than a block each.
+    ///
+    /// The shape [`Executor::sharing_advisory_locks`] has and for the same reason: an executor
+    /// built without one gets a private allocator, which is right for a single-session test and is
+    /// what keeps the corpus replay honest (ADR 0072).
+    #[must_use]
+    pub fn sharing_sequence_blocks(mut self, blocks: Arc<crate::sequence::Blocks>) -> Self {
+        self.sequences = blocks;
         self
     }
 
@@ -2883,6 +2990,10 @@ pub(crate) fn for_each_page(
 ) -> Result<()> {
     let mut next = start.to_vec();
     loop {
+        // **Where a long statement actually spends its time.** A page boundary is the natural
+        // check point: fine enough that `statement_timeout` means something on a big table, coarse
+        // enough to cost nothing.
+        cancel::check()?;
         let read = txn.scan(&next, end, SCAN_CHUNK)?;
         let Some((last, _)) = read.last() else {
             return Ok(());
@@ -3145,6 +3256,11 @@ impl Execute for Executor {
     }
 
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
+        // **The statement's clock starts here**, at the one boundary every statement crosses, and
+        // stops when this call returns however it returns (`cancel::Guard`). `statement_timeout`
+        // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
+        // the precedence `deadline_from` keeps.
+        let _clock = cancel::until(self.statement_deadline());
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
         if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {
