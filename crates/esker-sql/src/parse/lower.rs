@@ -870,9 +870,11 @@ fn lower_statement(
             // keywords are folded into the option list rather than handled beside it — and
             // `FORMAT` outside parentheses is a syntax error there, which is why only the
             // parenthesised list can carry one (measured, `EXPLAIN FORMAT JSON SELECT 1`).
+            // `VERBOSE` is accepted and ignored here as it is inside the parentheses, so the
+            // legacy keyword needs no field of its own.
+            let _ = verbose;
             let mut settings = ExplainOptions {
                 analyze: *analyze,
-                verbose: *verbose,
                 ..ExplainOptions::default()
             };
             // **`FORMAT` outside the parentheses is a syntax error on a real server**, and
@@ -8246,15 +8248,15 @@ fn object_name(name: &ObjectName) -> Result<String> {
 #[derive(Debug, Default)]
 struct ExplainOptions {
     analyze: bool,
-    verbose: bool,
-    /// The options that are only meaningful about a run, in the order PostgreSQL checks them
-    /// after its own option loop — which is why they are recorded here and validated at the end
-    /// rather than refused where they are read: `EXPLAIN (TIMING, ANALYZE)` is legal.
-    timing: bool,
-    wal: bool,
-    serialize: bool,
+    /// One flag per name in [`RUN_ONLY`], which is why it is an array and not three fields: the
+    /// order is PostgreSQL's own check order, and the checks happen **after** the whole list is
+    /// read rather than where each option is met — `EXPLAIN (TIMING, ANALYZE)` is legal.
+    run_only: [bool; RUN_ONLY.len()],
     format: plan::ExplainFormat,
 }
+
+/// The options that are only meaningful about a run, in the order PostgreSQL checks them.
+const RUN_ONLY: [&str; 3] = ["WAL", "TIMING", "SERIALIZE"];
 
 impl ExplainOptions {
     /// Reads one `name [value]` pair.
@@ -8264,12 +8266,12 @@ impl ExplainOptions {
         let name = ident(&option.name).to_ascii_lowercase();
         let slot = match name.as_str() {
             "analyze" => &mut self.analyze,
-            "verbose" => &mut self.verbose,
-            "timing" => &mut self.timing,
-            "wal" => &mut self.wal,
-            "serialize" => &mut self.serialize,
+            "timing" => &mut self.run_only[1],
+            "wal" => &mut self.run_only[0],
+            "serialize" => &mut self.run_only[2],
             // Read and discarded: see the type's own note on why these are not refusals.
-            "costs" | "buffers" | "settings" | "summary" | "memory" | "generic_plan" => {
+            "verbose" | "costs" | "buffers" | "settings" | "summary" | "memory"
+            | "generic_plan" => {
                 option_boolean(&name, option.arg.as_ref())?;
                 return Ok(());
             }
@@ -8294,12 +8296,8 @@ impl ExplainOptions {
 
     /// The three checks PostgreSQL makes *after* reading the whole list, in its order.
     fn validate(&self) -> Result<()> {
-        for (asked, name) in [
-            (self.wal, "WAL"),
-            (self.timing, "TIMING"),
-            (self.serialize, "SERIALIZE"),
-        ] {
-            if asked && !self.analyze {
+        for (asked, name) in self.run_only.iter().zip(RUN_ONLY) {
+            if *asked && !self.analyze {
                 return Err(SqlError::ExplainOptionRequiresAnalyze(name));
             }
         }
