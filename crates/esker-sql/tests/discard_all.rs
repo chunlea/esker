@@ -84,26 +84,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              oracle's container — the same offset under another name, and a boot value rather \
              than anything `DISCARD` did.",
         ),
-        // **Two `SET`s this node refuses, both older than this unit and both declared in
-        // `tests/set_parameters.rs`.** They matter here only as the state `DISCARD ALL` is
-        // supposed to reset: what the corpus proves either way is that `statement_timeout` reads
-        // its boot value afterwards, and it does — from `0` to `0` rather than from `31s` to `0`.
-        (
-            "SET statement_timeout = '31s'",
-            "`0A000 a non-zero statement_timeout … is not supported`: nothing here cancels a \
-             running statement, so a non-zero value would be a setting honoured by `SHOW` and \
-             ignored by every statement (`crate::parameter::Parameter::honour`).",
-        ),
+        // **`SET statement_timeout = '31s'` used to be listed here as a refusal and now agrees**:
+        // the statement carries a deadline (`crate::exec::cancel`), so the value is honoured
+        // rather than reported and ignored. What the corpus proves either way is that
+        // `statement_timeout` reads its boot value after a `DISCARD`, and now it proves the
+        // stronger version of it — from `31s` back to `0` rather than from `0` to `0`.
+        // The zone below is still refused and is older than this unit.
         (
             "SET timezone = 'Europe/Paris'",
             "`0A000` naming the zone: `timestamptz` is printed in UTC and nowhere else, so a zone \
              this node will not use is refused rather than reported.",
-        ),
-        (
-            "SELECT 'r', current_setting('statement_timeout')",
-            "`31s` there and `0` here, because the `SET` above never took. The line's purpose is \
-             that `DISCARD TEMP` leaves the parameter alone, and it does — this reads the same \
-             value before and after.",
         ),
         // A syntax error's *message* has never been claimed to be PostgreSQL's (`phase-6a.md` §1);
         // what C1 promises is that a statement a real server accepts is never `42601`. Both refuse
