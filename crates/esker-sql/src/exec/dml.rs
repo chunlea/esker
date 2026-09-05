@@ -1696,7 +1696,8 @@ fn drain(
     // snapshot: `DELETE FROM t WHERE id IN (SELECT id FROM t LIMIT 1)` is not circular and does
     // not loop, and its rows are the ones that were there when it started.
     super::subquery::resolve(&mut node, txn, executor.tenant)?;
-    let mut cursor = cursor::Cursor::open(txn, executor.tenant, &node)?;
+    let path = executor.resolved_search_path(txn)?;
+    let mut cursor = cursor::Cursor::open(txn, executor.tenant, &path, &node)?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {
         rows.push(row);
@@ -1854,7 +1855,7 @@ pub(super) fn exclusion_conflict(
     };
     let mine = identity(row);
     let node = query::matching_rows(None, tenant, table)?;
-    let mut scan = cursor::Cursor::open(txn, tenant, &node)?;
+    let mut scan = cursor::Cursor::open(txn, tenant, &[], &node)?;
     while let Some(existing) = scan.next()? {
         if identity(&existing) == mine || !indexed(&existing)? {
             continue;

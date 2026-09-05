@@ -1334,7 +1334,7 @@ fn push_the_semi_join_down(
     let Some(semi) = columnar.semi_join.as_ref() else {
         return Ok(());
     };
-    let mut cursor = crate::exec::cursor::Cursor::open(txn, tenant, &semi.keys)
+    let mut cursor = crate::exec::cursor::Cursor::open(txn, tenant, &[], &semi.keys)
         .map_err(|_| "the join's inner side could not be read")?;
     let mut values: Vec<esker_columnar::Value> = Vec::new();
     while let Some(row) = cursor.next().map_err(|_| "the join's inner side failed")? {
