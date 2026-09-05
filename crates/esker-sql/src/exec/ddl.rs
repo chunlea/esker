@@ -4349,8 +4349,11 @@ pub(super) fn drop_table(
 
         forgotten.extend(drop_one_table(executor, txn, &table)?);
     }
+    // **On commit, not now.** The block is a node-level reservation and dropping it is not
+    // undone by a rollback, so forgetting it inside the statement made a rolled-back `DROP TABLE`
+    // cost a whole batch — see `Executor::forget_sequence_block_on_commit`.
     for sequence_id in forgotten {
-        executor.forget_sequence_block(sequence_id);
+        executor.forget_sequence_block_on_commit(sequence_id);
     }
     Ok(Outcome::done("DROP TABLE"))
 }
