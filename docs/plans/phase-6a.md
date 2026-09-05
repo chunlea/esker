@@ -483,7 +483,7 @@ rather than to add the lines a feature happens to need.
 | G21 | JSON_QUERY wrapper | 1 | `SELECT JSON_QUERY('{"a":1}', '$' WITH WRAPPER);` | **on the query path** |
 | G22 | transaction modes | 2 | `BEGIN WORK ISOLATION LEVEL SERIALIZABLE READ WRITE DEFERRABLE;` | admin / DDL only |
 | G23 | two-phase commit | 3 | `PREPARE TRANSACTION 'gid';` | admin / DDL only |
-| G24 | role grants and privileges | 5 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only |
+| G24 | role grants and privileges | 4 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only — `CREATE USER` left this row when roles landed; the grants did not |
 | G25 | VACUUM / CLUSTER / CHECKPOINT | 4 | `VACUUM (FULL, ANALYZE, VERBOSE) t;` | admin / DDL only |
 | G26 | cursor MOVE | 1 | `MOVE BACKWARD 1 IN c;` | admin / DDL only |
 | G27 | database and system admin | 7 | `ALTER DATABASE d SET work_mem = '8MB';` | admin / DDL only — **`CREATE DATABASE` left this row**: its option list is read now (ADR 0052, `tests/create_database_options.rs`), so the example moved to one still in the group |

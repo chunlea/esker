@@ -270,8 +270,39 @@ pub struct DropFunction {
 pub struct CreateSchema {
     /// The schema's name, folded.
     pub name: String,
+    /// `AUTHORIZATION u` — the role named, which with no schema name is also the schema's name.
+    ///
+    /// **Carried, checked, and not stored.** The role has to exist for the statement to succeed,
+    /// which is what a client can tell; `pg_namespace` has no owner column and this node enforces
+    /// no ownership, so recording one would be a fact nobody reads. Declared in
+    /// `docs/plans/roles-and-user-schemas.md`.
+    pub owner: Option<String>,
     /// `IF NOT EXISTS`, which turns the `42P06` into a notice and a success.
     pub if_not_exists: bool,
+}
+
+/// `CREATE ROLE name` / `CREATE USER name`.
+///
+/// The two are one statement: `CREATE USER` is rewritten to `CREATE ROLE … LOGIN` before the parser
+/// sees it (`crate::parse::rewrite_user_as_role`), so `login` is the only thing that carries the
+/// difference here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRole {
+    /// The role's name, folded.
+    pub name: String,
+    /// `LOGIN` — implied by `CREATE USER`, absent from a bare `CREATE ROLE`.
+    pub login: bool,
+    /// `IF NOT EXISTS`.
+    pub if_not_exists: bool,
+}
+
+/// `DROP ROLE [IF EXISTS] name` / `DROP USER …`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropRole {
+    /// The roles named, folded.
+    pub names: Vec<String>,
+    /// `IF EXISTS`.
+    pub if_exists: bool,
 }
 
 /// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.

@@ -3094,6 +3094,80 @@ fn seeded(txn: &dyn Txn) -> Result<bool> {
     // One key is enough to answer it: the question is whether *anything* was written.
     Ok(txn.scan(&start, &end, 1)?.is_empty())
 }
+/// One role, as `pg_roles` and `pg_authid` report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDef {
+    /// Its name, which is also its key.
+    pub name: String,
+    /// Its oid, which `pg_namespace.nspowner` joins to.
+    pub oid: u64,
+    /// **`CREATE USER` implies this and `CREATE ROLE` does not**, which is the only thing the two
+    /// statements disagree about. Measured against PG19.
+    pub can_login: bool,
+}
+
+/// Every role in the cluster, by name.
+///
+/// Cluster-wide and not per-tenant: a role made in one database is visible from every other, which
+/// is what a real server does and why the key carries no tenant.
+pub fn roles(txn: &dyn Txn) -> Result<Vec<RoleDef>> {
+    let (start, end) = record::role_range();
+    let mut out = Vec::new();
+    for (key, value) in txn.scan(&start, &end, u32::MAX)? {
+        let (oid, can_login) = record::decode_role(&value)?;
+        out.push(RoleDef {
+            name: record::role_name_of(&key)?,
+            oid,
+            can_login,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// One role by name, or `None`.
+pub fn role_by_name(txn: &dyn Txn, name: &str) -> Result<Option<RoleDef>> {
+    let Some(value) = txn.get(&record::role_key(name))? else {
+        return Ok(None);
+    };
+    let (oid, can_login) = record::decode_role(&value)?;
+    Ok(Some(RoleDef {
+        name: name.to_owned(),
+        oid,
+        can_login,
+    }))
+}
+
+/// Records a new role. `42710` if the name is taken.
+pub fn create_role(txn: &mut dyn Txn, name: &str, can_login: bool) -> Result<()> {
+    if txn.get(&record::role_key(name))?.is_some() {
+        return Err(SqlError::RoleAlreadyExists(name.to_owned()));
+    }
+    // Oids start above the reserved catalog ids so a role's oid can never collide with a relation's
+    // in a join a client writes by hand.
+    let next = match txn.get(&record::next_role_key())? {
+        Some(bytes) => record::decode_schema(&bytes)?,
+        None => FIRST_ROLE_OID,
+    };
+    txn.put(&record::next_role_key(), &record::encode_schema(next + 1));
+    txn.put(
+        &record::role_key(name),
+        &record::encode_role(next, can_login),
+    );
+    bump_version(txn)
+}
+
+/// Forgets one. `42704` — the sentence PostgreSQL uses — if it is not there.
+pub fn drop_role(txn: &mut dyn Txn, name: &str) -> Result<()> {
+    if txn.get(&record::role_key(name))?.is_none() {
+        return Err(SqlError::UndefinedRole(name.to_owned()));
+    }
+    txn.delete(&record::role_key(name));
+    bump_version(txn)
+}
+
+/// Where role oids begin, clear of every reserved relation id.
+const FIRST_ROLE_OID: u64 = 16_384;
 
 /// Records a database. The caller has already decided the name is free.
 ///

@@ -193,6 +193,13 @@ const KIND_VIEW: u8 = b'w';
 /// apart from every other kind here — a reader checking whether a key belongs to a tenant can read
 /// the case rather than the table.
 const KIND_DATABASE: u8 = b'D';
+/// A role. **Upper case because a role is cluster-wide**, which is the convention `D` and `C`
+/// already keep: a lower-case kind is written under a tenant, an upper-case one is not. Roles are
+/// global on a real server — `CREATE USER` in one database is visible from every other — so a role
+/// key carries no tenant, exactly like a database's.
+const KIND_ROLE: u8 = b'R';
+/// The cluster's role-oid counter, for the same reason `C` exists for databases.
+const KIND_NEXT_ROLE: u8 = b'Q';
 
 /// The next database id, one counter for the cluster.
 const KIND_NEXT_DATABASE: u8 = b'C';
@@ -1051,6 +1058,65 @@ pub(super) fn database_name_of(key: &[u8]) -> Result<String> {
         .strip_prefix(prefix.as_slice())
         .ok_or_else(|| corrupt("a database key outside the directory range"))?;
     String::from_utf8(tail.to_vec()).map_err(|_| corrupt("a database name that is not UTF-8"))
+}
+
+/// `'m' ++ "sql" ++ 'R' ++ name`. The name is the whole tail, so no name can be a prefix of
+/// another — the property [`name_key`] relies on for the same reason.
+#[must_use]
+pub(super) fn role_key(name: &str) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_ROLE]].concat();
+    suffix.extend_from_slice(name.as_bytes());
+    prefix::meta_key(&suffix)
+}
+
+/// Every role in the cluster: the range [`role_key`] writes into.
+#[must_use]
+pub(super) fn role_range() -> (Vec<u8>, Vec<u8>) {
+    let start = role_key("");
+    let mut end = start.clone();
+    // The byte after the kind, so the range covers every name and nothing of the next kind.
+    if let Some(last) = end.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    (start, end)
+}
+
+/// The role name out of a key [`role_key`] wrote.
+pub(super) fn role_name_of(key: &[u8]) -> Result<String> {
+    let prefix = role_key("");
+    let tail = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| corrupt("a role key outside the role range"))?;
+    String::from_utf8(tail.to_vec()).map_err(|_| corrupt("a role name that is not UTF-8"))
+}
+
+/// `'m' ++ "sql" ++ 'Q'`, the cluster's role-oid counter.
+#[must_use]
+pub(super) fn next_role_key() -> Vec<u8> {
+    prefix::meta_key(&[SQL, &[KIND_NEXT_ROLE]].concat())
+}
+
+/// A role record: the version byte, its oid, and its flags.
+///
+/// **One flag byte rather than seven booleans**, because six of the seven are `false` for every
+/// role this node can make and the seventh — `rolcanlogin` — is the only one `CREATE USER` and
+/// `CREATE ROLE` differ on. A bit per flag leaves room for the rest without another version.
+pub(super) fn encode_role(oid: u64, can_login: bool) -> Vec<u8> {
+    let mut out = vec![CATALOG_FORMAT_VERSION];
+    // Little-endian in a body, as every other record here writes an id — a key is sorted and a
+    // body is not.
+    out.extend_from_slice(&oid.to_le_bytes());
+    out.push(u8::from(can_login));
+    out
+}
+
+/// Reads one back.
+pub(super) fn decode_role(bytes: &[u8]) -> Result<(u64, bool)> {
+    let mut reader = Reader::new(bytes)?;
+    let oid = reader.u64_le()?;
+    let flags = reader.byte()?;
+    reader.finish()?;
+    Ok((oid, flags & 1 == 1))
 }
 
 /// A database record: the version byte and the tenant id it is.

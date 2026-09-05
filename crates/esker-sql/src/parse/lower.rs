@@ -461,6 +461,20 @@ fn lower_statement(
         // `CREATE SCHEMA [IF NOT EXISTS] name`. **The suite writes the nested form**
         // (`CREATE SCHEMA s CREATE TABLE t (…)`) which `sqlparser` 0.62.0 cannot read at all — a
         // C1 gap in the plan's register, and the reason `schema_test.rb` is still out of reach.
+        Statement::CreateRole(create) => {
+            let [name] = create.names.as_slice() else {
+                // PostgreSQL takes one name; `sqlparser` models a list.
+                return Err(SqlError::unsupported("CREATE ROLE with more than one name"));
+            };
+            Ok(plan::Statement::CreateRole(plan::CreateRole {
+                name: object_name(name)?,
+                // `CREATE USER` was rewritten to `CREATE ROLE … LOGIN` before the parser saw it,
+                // so `Some(true)` here is that rewrite arriving — and a bare `CREATE ROLE` is
+                // `None`, which is `NOLOGIN`, which is what a real server does.
+                login: create.login.unwrap_or(false),
+                if_not_exists: create.if_not_exists,
+            }))
+        }
         Statement::CreateSchema {
             schema_name,
             if_not_exists,
@@ -477,12 +491,20 @@ fn lower_statement(
                 "CREATE SCHEMA ... DEFAULT COLLATE",
             )?;
             refuse_if(clone.is_some(), "CREATE SCHEMA ... CLONE")?;
-            let SchemaName::Simple(name) = schema_name else {
-                // `AUTHORIZATION` names an owner, and there are no roles here.
-                return Err(SqlError::unsupported("CREATE SCHEMA ... AUTHORIZATION"));
+            // **`AUTHORIZATION u` with no schema name creates a schema *named* `u`.** The name is
+            // derived rather than optional, measured against PG19 — and it is the shape
+            // `schema_authorization_test.rb` sends, which is why this arm exists at all. Its
+            // refusal used to read "there are no roles here"; there are now.
+            let (name, owner) = match schema_name {
+                SchemaName::Simple(name) => (object_name(name)?, None),
+                SchemaName::UnnamedAuthorization(owner) => (ident(owner), Some(ident(owner))),
+                SchemaName::NamedAuthorization(name, owner) => {
+                    (object_name(name)?, Some(ident(owner)))
+                }
             };
             Ok(plan::Statement::CreateSchema(plan::CreateSchema {
-                name: object_name(name)?,
+                name,
+                owner,
                 if_not_exists: *if_not_exists,
             }))
         }
@@ -648,6 +670,17 @@ fn lower_statement(
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                // **Neither `CASCADE` nor `RESTRICT` on a role**, as on a real server: what would
+                // depend on one is the objects it owns, and this node records no ownership to
+                // cascade through. `DROP USER` arrives here as `DROP ROLE`
+                // (`crate::parse::rewrite_user_as_role`).
+                ObjectType::Role => {
+                    refuse_if(*cascade, "DROP ROLE ... CASCADE")?;
+                    plan::Statement::DropRole(plan::DropRole {
+                        names,
+                        if_exists: *if_exists,
+                    })
+                }
                 // **No `CASCADE` and no `RESTRICT`.** PostgreSQL's `DROP DATABASE` takes neither —
                 // there is nothing outside a database that can depend on it — so a spelling that
                 // carries one is refused rather than ignored.
