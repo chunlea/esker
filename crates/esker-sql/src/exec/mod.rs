@@ -1246,6 +1246,18 @@ impl Executor {
             .unwrap_or_default()
     }
 
+    /// What the session decides about the rows a cursor produces: the resolved `search_path` and
+    /// the `IntervalStyle`.
+    ///
+    /// The path is resolved by the caller because resolving it reads the catalog and needs a
+    /// transaction; everything else here is session state and is read from the parameters.
+    fn settings<'a>(&self, search_path: &'a [String]) -> cursor::Settings<'a> {
+        cursor::Settings {
+            search_path,
+            interval_style: self.interval_style(),
+        }
+    }
+
     /// Whether `client_min_messages` lets a message of this severity out.
     ///
     /// PostgreSQL's ordering, and the two levels this node actually raises are `NOTICE` and
@@ -1546,7 +1558,8 @@ impl Executor {
             // qualified only when its schema is off the path, so the answer is a property of this
             // session and has to travel with the plan.
             let path = self.resolved_search_path(&*txn)?;
-            let mut cursor = cursor::Cursor::open(&*txn, self.tenant, &path, &planned.node)?;
+            let mut cursor =
+                cursor::Cursor::open(&*txn, self.tenant, self.settings(&path), &planned.node)?;
             while let Some(row) = cursor.next()? {
                 raw.push(row);
             }
@@ -1988,7 +2001,12 @@ impl Executor {
                     }
                     subquery::resolve(&mut planned.node, txn, self.tenant)?;
                     let path = self.resolved_search_path(txn)?;
-                    let mut cursor = cursor::Cursor::open(txn, self.tenant, &path, &planned.node)?;
+                    let mut cursor = cursor::Cursor::open(
+                        txn,
+                        self.tenant,
+                        self.settings(&path),
+                        &planned.node,
+                    )?;
                     while cursor.next()?.is_some() {}
                 }
                 ExplainSubject::Plan(Box::new(planned))

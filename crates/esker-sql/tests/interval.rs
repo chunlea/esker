@@ -1,18 +1,20 @@
 //! `interval`, against PostgreSQL 19beta1 — tier 2, and what every `time` arithmetic answers.
 //!
-//! # The output style is the gap this type creates
+//! # The output style was the gap this type created, and it is closed
 //!
 //! There are **four**, and `ActiveRecord` asks for the one that is not the default:
 //! `SET intervalstyle = iso_8601` is its **third** boot statement, so `P1D` and not `1 day` is
-//! what Rails expects to read back. `crate::parameter` already accepts the setting and reports
-//! it, and says it is inert — which was true while there was no interval type. There is one now.
+//! what Rails expects to read back. The note here used to say that `crate::parameter` accepted the
+//! setting, reported it and did nothing with it — "which was true while there was no interval
+//! type. There is one now." — and that closing it meant threading a session setting into value
+//! formatting, which no type had needed before.
 //!
-//! This node prints the `postgres` style always. Closing it means threading the session's
-//! setting into value formatting, which no type has needed before and which is not this unit's:
-//! the three readings under a non-default style are trimmed from the corpus, with the reason
-//! written in its header, because all four are the *same statement text* and the harness keys a
-//! divergence by that text — one of the four agrees, so the key would have to be both listed and
-//! not.
+//! It is threaded (`tests/interval_style.rs`), and what the gap cost while it stood is the reason
+//! to record rather than the plumbing: `OID::Interval#cast_value` **rescues a parse failure by
+//! returning `nil`**, so two `interval_test.rb` tests read no value at all and nothing anywhere
+//! said why. A wrong dialect is not a wrong answer here, it is a missing one.
+//!
+//! The corpus's style tail is back with it — all four readings, all agreeing.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

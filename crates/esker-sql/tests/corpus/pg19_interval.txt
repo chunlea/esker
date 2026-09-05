@@ -55,14 +55,15 @@
 #   * **`interval(9)` is not an error** — `'interval(9)'::regtype` is 1186 — the same silent
 #     tolerance `timestamp(9)` and `time(7)` have.
 #
-# THE STYLE TAIL IS TRIMMED, AND THIS SAYS SO
+# THE STYLE TAIL IS BACK, AND THIS SAYS WHY IT WAS EVER GONE
 #
 # The capture ends with the same SELECT under four `IntervalStyle` settings. Three of those four
-# lines are gone from this copy: the statement text is identical in all four, the harness keys a
-# divergence by that text, and the last one — after `RESET` — *agrees*, so the same key would have
-# to be both listed and not. The `SET` statements are kept, because they are answered; what is
-# dropped is the three readings under a style this node does not print in. `tests/interval.rs`
-# declares the gap as `STYLE`, and `captures/pg19_interval.txt` in the harness has all four.
+# lines used to be missing from this copy, because this node printed the `postgres` style whatever
+# the setting said: the statement text is identical in all four, the harness keys a divergence by
+# that text, and the last one — after `RESET` — agreed, so the same key would have had to be both
+# listed and not. All four **agree** now (`tests/interval_style.rs`, and
+# `tests/corpus/pg19_interval_style.txt` for fifty-three more values), so there is no key to
+# collide and the tail is restored under ADR 0031 rule 2.
 DROP TABLE IF EXISTS iv		-
 SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'interval'	oid,name,smallint,regproc,"char"	1186|interval|16|interval_in|T
 SELECT pg_typeof('1 day'::interval), format_type(1186, -1)	regtype,text	interval|interval
@@ -133,8 +134,11 @@ SELECT '1 day'::interval = 1	!42883 operator does not exist: interval = integer 
 SELECT greatest('1 day'::interval, '2 days'::interval), least('1 day'::interval, '2 days'::interval)	interval,interval	2 days|1 day
 SELECT NULL::interval IS NULL, '1 day'::interval = NULL	boolean,boolean	t|\N
 SET IntervalStyle TO 'iso_8601'		-
+SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	P1Y2M3DT4H5M6S|P1D|P-1D
 SET IntervalStyle TO 'sql_standard'		-
+SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	+1-2 +3 +4:05:06|1 0:00:00|-1 0:00:00
 SET IntervalStyle TO 'postgres_verbose'		-
+SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs|@ 1 day|@ 1 day ago
 RESET IntervalStyle		-
 SELECT '1 year 2 mons 3 days 04:05:06'::interval, '1 day'::interval, '-1 day'::interval	interval,interval,interval	1 year 2 mons 3 days 04:05:06|1 day|-1 days
 SELECT '5'::interval, '0'::interval, '1.5'::interval, '90'::interval	interval,interval,interval,interval	00:00:05|00:00:00|00:00:01.5|00:01:30

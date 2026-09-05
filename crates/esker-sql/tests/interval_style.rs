@@ -111,11 +111,11 @@ fn every_path_to_the_client_uses_the_style() {
 /// jsonb_build_object('a', ...)      {"a": "P1Y"}
 /// ```
 ///
-/// Here the style is applied where a row **leaves for a client** — the `SELECT` funnel and
-/// `RETURNING` — and not inside expression evaluation, which would need the setting to reach
-/// `cursor::Env` and so to be threaded through all seventeen `Cursor::open` calls beside
-/// `search_path` (whose doc comment already says why a session setting has to arrive that way).
-/// That is a session-context refactor and not this unit.
+/// The setting **does** reach expression evaluation now — `SELECT term::text FROM iv` answers
+/// `P6Y5M4DT3H2M1S` — because `cursor::Settings` carries it beside `search_path`. What is left is
+/// narrower and is what this test pins: a cast whose operand is a **literal** is folded at
+/// lowering, where there is no session at all, so `('1 year'::interval)::text` is decided before
+/// any of this runs. `||` is the other one, evaluated in a function that has no `Env`.
 ///
 /// The value below is **this node's, not PostgreSQL's**, with PostgreSQL's in the message: a
 /// placeholder that can only be got rid of by being deleted, which is the shape g1 handed this
@@ -124,12 +124,18 @@ fn every_path_to_the_client_uses_the_style() {
 fn a_cast_to_text_does_not_move_with_the_style_yet() {
     let mut node = parity::Node::new(FIXTURE);
     node.run("SET intervalstyle = 'iso_8601'").unwrap();
+    // The column case, which is what the session now reaches.
+    assert_eq!(
+        node.rows("SELECT term::text FROM iv"),
+        [["P6Y5M4DT3H2M1S".to_owned()]]
+    );
     assert_eq!(
         node.rows("SELECT ('1 year'::interval)::text"),
         [["1 year".to_owned()]],
         "PostgreSQL 19beta1 answers P1Y here: `interval_out` is one function and every cast, \
-         concatenation and format call goes through it. When the session reaches cursor::Env, \
-         delete this test rather than editing it."
+         concatenation and format call goes through it. A cast over a COLUMN follows the \
+         setting here; this one is folded at lowering, where there is no session. When lowering \
+         stops folding an interval's output function, delete this test rather than editing it."
     );
 }
 
@@ -275,5 +281,84 @@ fn a_leading_sign_is_read_the_same_way_under_every_style() {
         "PostgreSQL 19beta1 answers -0-1 -1 +0:00:00 here: under sql_standard the leading \
          negative applies to the day as well. When the input function can see the session, \
          delete this test rather than editing it."
+    );
+}
+
+/// **A column's stored `DEFAULT` is rendered through the same output function**, which is the whole
+/// of `test_schema_dump_with_default_value`.
+///
+/// `pg_get_expr` prints a stored constant by *printing* it, so one catalog row has two texts:
+///
+/// ```text
+/// IntervalStyle = postgres   '3 years'::interval        '00:00:01.235'::interval(3)
+/// IntervalStyle = iso_8601   'P3Y'::interval            'PT1.235S'::interval(3)
+/// ```
+///
+/// Traced through Rails by g1: `extract_value_from_default("'3 years'::interval")` gives
+/// `"3 years"`, `Duration.parse` raises, `cast_value` answers `nil`, and the column spec gets **no
+/// `default:` key at all** — which is exactly the dump line run 100 reports.
+#[test]
+fn a_column_default_prints_under_the_session_style() {
+    const DEFAULTS: &str = "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
+                            JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+                            WHERE d.adrelid = 'ivd'::regclass ORDER BY a.attnum";
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE ivd (a interval DEFAULT 'P3Y', b interval(3) DEFAULT '1.23456 seconds')",
+    ]);
+    assert_eq!(
+        node.rows(DEFAULTS),
+        [
+            ["'3 years'::interval".to_owned()],
+            ["'00:00:01.235'::interval".to_owned()]
+        ]
+    );
+    node.run("SET intervalstyle = 'iso_8601'").unwrap();
+    assert_eq!(
+        node.rows(DEFAULTS),
+        [
+            ["'P3Y'::interval".to_owned()],
+            ["'PT1.235S'::interval".to_owned()]
+        ]
+    );
+    // `information_schema.columns` reads the same expression and must not disagree with it.
+    assert_eq!(
+        node.rows(
+            "SELECT column_default FROM information_schema.columns \
+             WHERE table_name = 'ivd' ORDER BY ordinal_position"
+        ),
+        [
+            ["'P3Y'::interval".to_owned()],
+            ["'PT1.235S'::interval".to_owned()]
+        ]
+    );
+}
+
+/// **The cast a stored default names carries the typmod for an `interval` and for nothing else.**
+///
+/// `constant_expression`'s doc states as a general rule that the cast is "the column's type written
+/// bare — no length and no precision", and every other parameterised type obeys it. Measured by g1,
+/// one table, under `iso_8601`:
+///
+/// ```text
+/// e interval(3)  DEFAULT 'PT4.5S'        'PT4.5S'::interval(3)       <- carries it
+/// l varchar(5)   DEFAULT 'ab'            'ab'::character varying     <- bare
+/// o time(2)      DEFAULT '01:02:03.456'  '01:02:03.456'::time without time zone
+/// ```
+///
+/// This node writes it bare for all of them, so the value below is **its own** with PostgreSQL's in
+/// the message. `ActiveRecord` reads only the quoted half — `extract_value_from_default` — so the
+/// dump is unaffected; what it costs is a client that re-parses the whole expression.
+#[test]
+fn a_default_s_cast_drops_the_interval_precision() {
+    let mut node = parity::Node::new(&["CREATE TABLE ivp (a interval(3) DEFAULT 'PT4.5S')"]);
+    node.run("SET intervalstyle = 'iso_8601'").unwrap();
+    assert_eq!(
+        node.rows(
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'ivp'::regclass"
+        ),
+        [["'PT4.5S'::interval".to_owned()]],
+        "PostgreSQL 19beta1 answers 'PT4.5S'::interval(3): the typmod survives in an interval's \
+         default cast where varchar(5) and time(2) both print theirs bare. When \
+         constant_expression takes the typmod, delete this test rather than editing it."
     );
 }

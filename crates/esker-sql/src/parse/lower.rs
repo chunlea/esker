@@ -1694,9 +1694,33 @@ fn lower_storage_parameters(
 ///
 /// `DEFAULT NULL` normalises to neither — the same thing as no default, which is what PostgreSQL
 /// makes of it too.
+/// A stored `DEFAULT` under the column's typmod — **for an `interval` and for nothing else**.
+///
+/// Every other parameterised type stores the literal it was written with, unmodified, and only
+/// meets its typmod when a row is inserted. Measured on 19beta1, one table, and the last row is
+/// the proof that this is not caution:
+///
+/// ```text
+/// a interval(3)  DEFAULT '1.23456 seconds'      'PT1.235S'::interval(3)   <- rounded
+/// b time(2)      DEFAULT '01:02:03.456'         '01:02:03.456'::time without time zone
+/// c timestamp(1) DEFAULT '2020-01-01 00:00:00.55'
+///                        '2020-01-01 00:00:00.55'::timestamp without time zone
+/// d numeric(6,2) DEFAULT 1.555                  1.555
+/// e varchar(3)   DEFAULT 'abcdef'               'abcdef'::character varying
+///                                               -- accepted at CREATE TABLE, and
+///                                               -- `INSERT ... DEFAULT VALUES` is then 22001
+/// ```
+fn fit_default(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
+    match ty {
+        ColumnType::Interval => value::fit_to_typmod(value, ty, typmod),
+        _ => Ok(value),
+    }
+}
+
 pub(super) fn column_default(
     expr: &Expr,
     ty: ColumnType,
+    typmod: i32,
 ) -> Result<(Option<Datum>, Option<String>)> {
     let expr = unwrap_nested(expr);
     refuse_default_shapes(expr)?;
@@ -1756,7 +1780,7 @@ pub(super) fn column_default(
         // `int4`, because the cast is one step of a coercion that ends at the column. A literal
         // the type cannot take is that type's own input error, exactly as it would be in a
         // `VALUES` list — `DEFAULT 'not a date'` on a `date` column is `22007` here and there.
-        let value = Datum::from_text(ty, &text)?;
+        let value = fit_default(Datum::from_text(ty, &text)?, ty, typmod)?;
         return Ok((
             Some(value),
             cast.map(|to| cast_default_text(&text, literal, to)),
@@ -2510,7 +2534,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                     } else {
                         ty
                     };
-                    (default, default_expr) = column_default(expr, written)?;
+                    (default, default_expr) = column_default(expr, written, typmod)?;
                 }
                 ColumnOption::Unique(constraint) => {
                     let (deferrable, deferred) =
@@ -2877,7 +2901,7 @@ fn lower_alter_table(
                     } else {
                         ty
                     };
-                    (default, default_expr) = column_default(expr, ty)?;
+                    (default, default_expr) = column_default(expr, ty, typmod)?;
                     continue;
                 }
                 ColumnOption::NotNull => {

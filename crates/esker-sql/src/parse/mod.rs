@@ -2182,6 +2182,7 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 pub(crate) fn fold_column_default(
     expr: &str,
     ty: crate::value::ColumnType,
+    typmod: i32,
 ) -> Result<(Option<crate::value::Datum>, Option<String>)> {
     let not_one = || SqlError::Internal("a stored default is not one expression".to_owned());
     let statements = parse(&format!("SELECT {expr}"))?;
@@ -2192,7 +2193,7 @@ pub(crate) fn fold_column_default(
         return Err(not_one());
     };
     match select.projection.as_slice() {
-        [sqlparser::ast::SelectItem::UnnamedExpr(expr)] => lower::column_default(expr, ty),
+        [sqlparser::ast::SelectItem::UnnamedExpr(expr)] => lower::column_default(expr, ty, typmod),
         _ => Err(not_one()),
     }
 }
