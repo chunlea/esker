@@ -1,0 +1,23 @@
+.config/nextest.toml
+  s_3f615600dbce74::t_673c5a48022209 40,43-60
+crates/esker-sql/src/exec/mod.rs
+  s_3f615600dbce74::t_3004614534b892 94-101,292-297,365,663-664,709-719,1012-1027
+crates/esker-sql/tests/statement_cancellation.rs
+  s_3f615600dbce74::t_9b2baa246b75bd 138-141,151-152,265,275-276,278-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "96c81d7f2cde91affc3dd868ac46ea3b5cad35a3",
+  "prompts": {},
+  "sessions": {
+    "s_3f615600dbce74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "763171d7-06a5-4af8-a3be-00a4e647dd9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
