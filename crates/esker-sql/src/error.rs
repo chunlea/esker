@@ -1871,7 +1871,9 @@ pub enum SqlError {
     /// `COLLATE` naming a collation this node *has*, on a type that has no ordering to override:
     /// `42804 collations are not supported by type integer`. Measured for two types one clause
     /// apart — `CREATE TABLE badx (a uuid COLLATE "C")` and `SELECT 1 COLLATE "C"` — which is why
-    /// the rule asks [`crate::catalog::pg_attribute::collatable`] rather than listing types here.
+    /// the rule asks `catalog::pg_attribute::collatable` — a type is collatable exactly when it
+    /// has a `typcollation` to override — rather than listing types here. Not a link: that
+    /// function is `pub(crate)` and this variant is public.
     ///
     /// The **type** and not the name is what is wrong, so it is a different class from
     /// [`SqlError::UndefinedCollation`]: `C` exists, and `integer` still cannot have one.
