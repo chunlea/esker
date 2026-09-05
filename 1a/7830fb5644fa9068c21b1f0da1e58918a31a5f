@@ -1,0 +1,19 @@
+crates/esker-store/tests/reclaim_range.rs
+  s_e5c0c6e78b5662::t_804c3e1198e869 1-482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1a7830fb5644fa9068c21b1f0da1e58918a31a5f",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
