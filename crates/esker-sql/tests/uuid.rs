@@ -63,10 +63,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              an unsuffixed integer literal as `int8`. A divergence of the literal, not of this \
              type — every type's `= 1` says it.",
         ),
-        (
-            "SELECT gen_random_uuid() IS NOT NULL, length(gen_random_uuid()::text)",
-            FUNCTIONS,
-        ),
+        // **This line used to be here** and now agrees, deleted under ADR 0031 rule 2. What kept
+        // it diverging was `length`'s **declared type** — `text` where a real server says
+        // `integer` — and not the uuid functions, which have answered for a while. The sibling
+        // lines below still carry `FUNCTIONS` because they name functions this node does not have.
         (
             "SELECT uuidv4() IS NOT NULL, uuidv7() IS NOT NULL",
             FUNCTIONS,

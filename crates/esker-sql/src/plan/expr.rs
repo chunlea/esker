@@ -804,6 +804,28 @@ pub enum CatalogFunc {
     HstoreAvals,
     /// `hstore(k, v)` and `hstore(keys[], vals[])`: the two constructors the adapter reaches for.
     HstoreBuild,
+    /// `to_tsvector([config,] text)`: text into a sorted, deduplicated lexeme set.
+    ///
+    /// One argument uses `default_text_search_config`, which this node reports and honours as
+    /// `pg_catalog.english`.
+    ToTsVector,
+    /// `to_tsquery([config,] text)`: the tsquery grammar, with each lexeme put through the
+    /// configuration exactly as a vector's is — which is what lets `@@` meet a vector at all.
+    ToTsQuery,
+    /// `plainto_tsquery([config,] text)`: every word `AND`ed, in the order they were written.
+    PlainToTsQuery,
+    /// `phraseto_tsquery([config,] text)`: every word joined by `<->`, so the order is part of
+    /// the question rather than incidental.
+    PhraseToTsQuery,
+    /// `tsvector @@ tsquery`, and `tsquery @@ tsvector`: **both argument orders exist** and the
+    /// evaluator tells them apart by what it is given, measured.
+    TsMatch,
+    /// `strip(tsvector)`: the lexemes without their positions or weights.
+    TsStrip,
+    /// `setweight(tsvector, "A")`: one weight over every position.
+    SetWeight,
+    /// `numnode(tsquery)`: the nodes in the tree, operators included — `'fat' & 'cat'` is **3**.
+    NumNode,
     /// `lower_inc(range)`, `upper_inc`, `lower_inf`, `upper_inf`: the four bracket questions.
     ///
     /// `lower`/`upper` are **not** here — they are the text functions of the same name, overloaded
@@ -1045,6 +1067,15 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
             () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
             () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
+            () if name.eq_ignore_ascii_case("to_tsvector") => Some(CatalogFunc::ToTsVector),
+            () if name.eq_ignore_ascii_case("to_tsquery") => Some(CatalogFunc::ToTsQuery),
+            () if name.eq_ignore_ascii_case("plainto_tsquery") => Some(CatalogFunc::PlainToTsQuery),
+            () if name.eq_ignore_ascii_case("phraseto_tsquery") => {
+                Some(CatalogFunc::PhraseToTsQuery)
+            }
+            () if name.eq_ignore_ascii_case("strip") => Some(CatalogFunc::TsStrip),
+            () if name.eq_ignore_ascii_case("setweight") => Some(CatalogFunc::SetWeight),
+            () if name.eq_ignore_ascii_case("numnode") => Some(CatalogFunc::NumNode),
             // The three `ltree` functions the corpus asks for. `nlevel('')` is 0, which is what
             // makes the empty path a value rather than a hole.
             () if name.eq_ignore_ascii_case("nlevel") => Some(CatalogFunc::LtreeNlevel),
@@ -1121,6 +1152,14 @@ impl CatalogFunc {
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
+            CatalogFunc::ToTsVector => "to_tsvector",
+            CatalogFunc::ToTsQuery => "to_tsquery",
+            CatalogFunc::PlainToTsQuery => "plainto_tsquery",
+            CatalogFunc::PhraseToTsQuery => "phraseto_tsquery",
+            CatalogFunc::TsMatch => "@@",
+            CatalogFunc::TsStrip => "strip",
+            CatalogFunc::SetWeight => "setweight",
+            CatalogFunc::NumNode => "numnode",
             CatalogFunc::LtreeNlevel => "nlevel",
             CatalogFunc::LtreeToText => "ltree2text",
             CatalogFunc::TextToLtree => "text2ltree",
@@ -1182,7 +1221,9 @@ impl CatalogFunc {
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
-            | CatalogFunc::HstoreBuild => &[2],
+            | CatalogFunc::HstoreBuild
+            | CatalogFunc::TsMatch
+            | CatalogFunc::SetWeight => &[2],
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
@@ -1193,8 +1234,14 @@ impl CatalogFunc {
             CatalogFunc::RangeBuild | CatalogFunc::PgGetExpr | CatalogFunc::UserRegType => &[2, 3],
 
             CatalogFunc::PgGetIndexdef => &[1, 3],
+            // The text-search four take one argument with `default_text_search_config`, or two
+            // naming the configuration.
             CatalogFunc::PgGetConstraintdef
             | CatalogFunc::PgGetViewdef
+            | CatalogFunc::ToTsVector
+            | CatalogFunc::ToTsQuery
+            | CatalogFunc::PlainToTsQuery
+            | CatalogFunc::PhraseToTsQuery
             | CatalogFunc::ObjDescription => &[1, 2],
             CatalogFunc::RangeLowerInc
             | CatalogFunc::RangeUpperInc
@@ -1216,7 +1263,10 @@ impl CatalogFunc {
             | CatalogFunc::PgTypeof
             | CatalogFunc::LtreeNlevel
             | CatalogFunc::LtreeToText
-            | CatalogFunc::TextToLtree => &[1],
+            | CatalogFunc::TextToLtree
+            // `strip(v)` and `numnode(q)` take one and only one.
+            | CatalogFunc::TsStrip
+            | CatalogFunc::NumNode => &[1],
             CatalogFunc::Now
             | CatalogFunc::CurrentDate
             | CatalogFunc::LocalTimestamp
@@ -1281,7 +1331,9 @@ impl CatalogFunc {
             | CatalogFunc::ArrayUpper
             | CatalogFunc::ArrayLength
             | CatalogFunc::Cardinality
-            | CatalogFunc::LtreeNlevel => ColumnType::Int4,
+            | CatalogFunc::LtreeNlevel
+            // `numnode` counts the nodes of a query, operators included.
+            | CatalogFunc::NumNode => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
             CatalogFunc::PathIsOpen
@@ -1294,12 +1346,19 @@ impl CatalogFunc {
             | CatalogFunc::RangeLowerInf
             | CatalogFunc::RangeUpperInf
             | CatalogFunc::HstoreHasKey
-            | CatalogFunc::HstoreContains => ColumnType::Bool,
+            | CatalogFunc::HstoreContains
+            | CatalogFunc::TsMatch => ColumnType::Bool,
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
+            CatalogFunc::ToTsVector | CatalogFunc::TsStrip | CatalogFunc::SetWeight => {
+                ColumnType::TsVector
+            }
+            CatalogFunc::ToTsQuery
+            | CatalogFunc::PlainToTsQuery
+            | CatalogFunc::PhraseToTsQuery => ColumnType::TsQuery,
             CatalogFunc::RangeBuild => ColumnType::TsRange,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.

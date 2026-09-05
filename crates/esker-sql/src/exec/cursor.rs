@@ -1788,6 +1788,16 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // them too: over a string they fold case, over a range they are the bounds. The
             // subtype's value comes back, so `lower(ts_range)` is a `timestamp` — measured — and
             // an absent bound and an empty range are both NULL.
+            // **`length(tsvector)` is the lexeme count, not a character count.** `length` is one
+            // name over several types on a real server, told apart by the operand — the rule this
+            // match already follows for a range's `lower`/`upper`. Measured: the four lexemes of
+            // `'The Fat Cats ate a rat'`.
+            Datum::TsVector(vector) if matches!(func, crate::plan::ScalarFunc::Length) => {
+                Datum::Int4(
+                    i32::try_from(crate::value::tsvector::from_text(&vector)?.len())
+                        .unwrap_or(i32::MAX),
+                )
+            }
             Datum::Range { subtype, text } if !matches!(func, crate::plan::ScalarFunc::Abs) => {
                 let range = range::from_text(*subtype, &text)?;
                 match func {
@@ -2264,6 +2274,113 @@ fn convert_to(text: Option<&Datum>, encoding: Option<&Datum>) -> Result<Datum> {
     clippy::too_many_lines,
     reason = "one arm per catalog function; the list being in one place is what it is for"
 )]
+/// The text-search functions, every answer measured against PostgreSQL 19beta1.
+///
+/// **Strict**: a NULL argument gives NULL, which is what a real server does and what keeps
+/// `name_vector @@ to_tsquery(…)` from claiming a match on a row that has no vector.
+fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
+    use crate::plan::CatalogFunc;
+    use crate::value::{tsquery, tsvector};
+
+    // One argument means `default_text_search_config`, which this node reports as
+    // `pg_catalog.english`; two name the configuration.
+    let (config, subject) = match (args.first(), args.get(1)) {
+        (Some(Datum::Text(name)), Some(subject)) => (tsvector::Config::resolve(name)?, subject),
+        // Everything else takes the default configuration and reads the subject from the first
+        // argument — a one-argument call, and the two-argument ones whose first operand is the
+        // value rather than a configuration name (`setweight`, `@@`).
+        (Some(subject), _) => (tsvector::Config::English, subject),
+        (None, _) => return Ok(Datum::Null),
+    };
+    let text_of = |datum: &Datum| match datum {
+        Datum::Text(text) => Some(text.clone()),
+        _ => None,
+    };
+
+    Ok(match func {
+        CatalogFunc::ToTsVector => match text_of(subject) {
+            Some(text) => Datum::TsVector(tsvector::to_text(&tsvector::to_tsvector(config, &text))),
+            None => Datum::Null,
+        },
+        CatalogFunc::ToTsQuery => match text_of(subject) {
+            Some(text) => query_datum(tsquery::to_tsquery(config, &text)?),
+            None => Datum::Null,
+        },
+        CatalogFunc::PlainToTsQuery => match text_of(subject) {
+            Some(text) => query_datum(tsquery::plainto_tsquery(config, &text)),
+            None => Datum::Null,
+        },
+        CatalogFunc::PhraseToTsQuery => match text_of(subject) {
+            Some(text) => query_datum(tsquery::phraseto_tsquery(config, &text)),
+            None => Datum::Null,
+        },
+        // **`@@` exists in both argument orders**, so the operands decide which is the vector and
+        // which the query rather than the position doing it.
+        CatalogFunc::TsMatch => match (args.first(), args.get(1)) {
+            (Some(Datum::TsVector(vector)), Some(Datum::TsQuery(query)))
+            | (Some(Datum::TsQuery(query)), Some(Datum::TsVector(vector))) => Datum::Bool(
+                tsquery::matches(&tsvector::from_text(vector)?, &tsquery::from_text(query)?),
+            ),
+            _ => Datum::Null,
+        },
+        CatalogFunc::TsStrip => match args.first() {
+            Some(Datum::TsVector(vector)) => {
+                let mut lexemes = tsvector::from_text(vector)?;
+                for lexeme in &mut lexemes {
+                    lexeme.positions.clear();
+                }
+                Datum::TsVector(tsvector::to_text(&lexemes))
+            }
+            _ => Datum::Null,
+        },
+        CatalogFunc::SetWeight => match (args.first(), args.get(1)) {
+            (Some(Datum::TsVector(vector)), Some(Datum::Text(letter))) => {
+                let weight = tsvector::Weight::of(letter.chars().next().unwrap_or('D'))
+                    .ok_or_else(|| SqlError::InvalidTextRepresentation {
+                        ty: "\"char\"",
+                        value: letter.clone(),
+                    })?;
+                let mut lexemes = tsvector::from_text(vector)?;
+                for lexeme in &mut lexemes {
+                    for position in &mut lexeme.positions {
+                        position.1 = weight;
+                    }
+                }
+                Datum::TsVector(tsvector::to_text(&lexemes))
+            }
+            _ => Datum::Null,
+        },
+        CatalogFunc::NumNode => match args.first() {
+            Some(Datum::TsQuery(query)) => Datum::Int4(
+                i32::try_from(tsquery::numnode(&tsquery::from_text(query)?)).unwrap_or(i32::MAX),
+            ),
+            _ => Datum::Null,
+        },
+        other => {
+            return Err(SqlError::Internal(format!(
+                "{} reached the text-search evaluator",
+                other.name()
+            )));
+        }
+    })
+}
+
+/// **A query that is nothing but stop words is not an error and not a NULL** — it is the empty
+/// tsquery, which prints as nothing and matches nothing. Measured: `plainto_tsquery('english',
+/// 'the a of')` answers an empty value with a `NOTICE`, not a failure.
+fn query_datum(query: Option<crate::value::tsquery::Node>) -> Datum {
+    match query {
+        Some(node) => Datum::TsQuery(crate::value::tsquery::to_text(&node)),
+        None => Datum::TsQuery(String::new()),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one dispatch over the whole catalog-function vocabulary; splitting it would put \
+              half the vocabulary somewhere else, which is the argument `esker_keys::row`'s own \
+              type match makes"
+)]
 fn catalog_function(
     call: &crate::plan::CatalogFuncCall,
     row: &[Datum],
@@ -2515,6 +2632,18 @@ fn catalog_function(
         CatalogFunc::HstoreContains if matches!(args.first(), Some(Datum::Range { .. })) => {
             range_value_function(CatalogFunc::RangeContains, &args)?
         }
+        // **`||` over two tsvectors concatenates and renumbers**, which is not what `||` over two
+        // strings does: the right operand's positions are shifted by the left's maximum, so
+        // `a || b` is not `b || a`. Measured both ways round. Told apart here for the reason this
+        // match already tells an hstore's `@>` from a range's — by the operands.
+        CatalogFunc::HstoreConcat if matches!(args.first(), Some(Datum::TsVector(_))) => {
+            match (args.first(), args.get(1)) {
+                (Some(Datum::TsVector(left)), Some(Datum::TsVector(right))) => {
+                    Datum::TsVector(crate::value::tsvector::concat(left, right)?)
+                }
+                _ => Datum::Null,
+            }
+        }
         CatalogFunc::HstoreFetch
         | CatalogFunc::HstoreHasKey
         | CatalogFunc::HstoreContains
@@ -2522,6 +2651,14 @@ fn catalog_function(
         | CatalogFunc::HstoreAkeys
         | CatalogFunc::HstoreAvals
         | CatalogFunc::HstoreBuild => hstore_function(call.func, &args)?,
+        CatalogFunc::ToTsVector
+        | CatalogFunc::ToTsQuery
+        | CatalogFunc::PlainToTsQuery
+        | CatalogFunc::PhraseToTsQuery
+        | CatalogFunc::TsMatch
+        | CatalogFunc::TsStrip
+        | CatalogFunc::SetWeight
+        | CatalogFunc::NumNode => text_search_function(call.func, &args)?,
         // **Strict, each of them**, and `text2ltree` validates: a path that is not a path is
         // `ltree`'s own `42601` here exactly as it is through the cast.
         CatalogFunc::LtreeNlevel => match args.first() {
