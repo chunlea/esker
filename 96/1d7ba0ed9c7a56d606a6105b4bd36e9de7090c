@@ -1,0 +1,26 @@
+crates/esker-cli/src/args.rs
+  h_44076b318daf9c 32,53-54,170-171,242-264,437,1219-1279
+crates/esker-cli/src/bench_mpp/mod.rs
+  h_44076b318daf9c 1-543
+crates/esker-cli/src/bench_mpp/pg.rs
+  h_44076b318daf9c 1-382
+crates/esker-cli/src/bench_mpp/probe.rs
+  h_44076b318daf9c 1-179
+crates/esker-cli/src/bench_mpp/topology.rs
+  h_44076b318daf9c 1-474
+crates/esker-cli/src/bench_mpp/workload.rs
+  h_44076b318daf9c 1-312
+crates/esker-cli/src/main.rs
+  h_44076b318daf9c 4-5,12,62-73,101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "961d7ba0ed9c7a56d606a6105b4bd36e9de7090c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
