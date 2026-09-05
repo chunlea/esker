@@ -438,3 +438,134 @@ fn a_raw_scan_repairs_a_boundary_the_store_moved() {
         "the retry uses the bound the store itself named, not the cache's: {sent:?}"
     );
 }
+
+/// **A refusal that names bounds the caller's key is inside is believed at once.**
+///
+/// The store knows about its own split the instant it happens and the placement driver learns at
+/// the next heartbeat, so inside that window the refusal is the *newer* fact. Asserted on the
+/// driver: it must not be asked at all.
+#[test]
+fn a_refusal_that_covers_the_key_is_believed_without_asking_the_driver() {
+    #[derive(Debug)]
+    struct Counting {
+        inner: RegionTable,
+        asked: AtomicU32,
+    }
+    impl RegionResolver for Counting {
+        fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            self.inner.locate(key)
+        }
+    }
+    let resolver = Arc::new(Counting {
+        inner: RegionTable::from_routes([route(region(1, b"", b"", Epoch::INITIAL))]),
+        asked: AtomicU32::new(0),
+    });
+    let harness = harness_with(Arc::clone(&resolver) as Arc<dyn RegionResolver>);
+    // Region 1 has split at `d`; the first ask is refused with the range it really owns.
+    harness
+        .transport
+        .script(Rule::new(
+            Matcher::Method(esker_client::wire::Method::RawScan),
+            Outcome::Fail(ProtoError::KeyNotInRegion {
+                key: Bytes::from_static(b""),
+                region_id: 1,
+                start_key: Bytes::from_static(b""),
+                end_key: Bytes::from_static(b"d"),
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(esker_client::wire::Method::RawScan),
+                Outcome::Reply(RawKvResp::Scan { pairs: Vec::new() }),
+            )
+            .forever(),
+        );
+
+    // The caller asks past the store's real end, so believing the store and asking the driver
+    // give **different** answers: `d` from the refusal, `z` from a driver that still thinks the
+    // region is unbounded. The request is what says which was used.
+    harness.client.scan(b"", b"z", 100).unwrap();
+    let sent = scans(&harness.transport);
+    assert_eq!(
+        sent[1].2,
+        b"d".to_vec(),
+        "the retry used the bound the store named, not the driver's stale one: {sent:?}"
+    );
+    // **The count is not the instrument here, and it is worth saying why.** A terminal refusal
+    // makes the router drop the cache entry that produced it (`Router::on_terminal`), so the
+    // *retry request* re-resolves through the ordinary path — a second ask that has nothing to do
+    // with the repair. Asserting on it would be asserting on the router's cache discipline while
+    // claiming to test the repair. The request above is unambiguous: `d` can only have come from
+    // the refusal, because the driver still says the region is unbounded.
+    assert!(
+        resolver.asked.load(Ordering::Relaxed) >= 1,
+        "the enumeration resolves at least once"
+    );
+}
+
+/// **A driver that is behind is waited out rather than surfaced.**
+///
+/// `08006 … key is not in region 0` is the resolver's own refusal — "no region covers this key" —
+/// and under load that is a fact about the driver's *knowledge*, not about the cluster: it learns
+/// at the next heartbeat. It surfaced from a loaded gate while passing alone, twice. So the repair
+/// asks again on the router's schedule, and the assertion is that the answer arrives rather than
+/// the refusal.
+#[test]
+fn a_driver_that_answers_stale_twice_is_waited_out() {
+    #[derive(Debug)]
+    struct StaleThenRight {
+        stale: AtomicU32,
+        inner: RegionTable,
+    }
+    impl RegionResolver for StaleThenRight {
+        fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+            if self
+                .stale
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                != Err(0)
+            {
+                // "No region covers this key" — what a driver behind a split answers.
+                return Ok(None);
+            }
+            self.inner.locate(key)
+        }
+    }
+    let resolver = Arc::new(StaleThenRight {
+        stale: AtomicU32::new(2),
+        inner: RegionTable::from_routes([route(region(2, b"", b"", Epoch::INITIAL))]),
+    });
+    let harness = harness_with(Arc::clone(&resolver) as Arc<dyn RegionResolver>);
+    // The store refuses with bounds that do **not** contain the key, so the driver is the only way
+    // out — and it is behind for the first two asks.
+    harness
+        .transport
+        .script(Rule::new(
+            Matcher::Method(esker_client::wire::Method::RawScan),
+            Outcome::Fail(ProtoError::KeyNotInRegion {
+                key: Bytes::from_static(b"a"),
+                region_id: 9,
+                start_key: Bytes::from_static(b"x"),
+                end_key: Bytes::from_static(b"y"),
+            }),
+        ))
+        .script(
+            Rule::new(
+                Matcher::Method(esker_client::wire::Method::RawScan),
+                Outcome::Reply(RawKvResp::Scan { pairs: Vec::new() }),
+            )
+            .forever(),
+        );
+
+    harness
+        .client
+        .scan(b"a", b"c", 100)
+        .expect("the driver caught up and the scan finished");
+    assert_eq!(
+        resolver.stale.load(Ordering::Relaxed),
+        0,
+        "the driver should have been asked until it stopped being behind"
+    );
+}

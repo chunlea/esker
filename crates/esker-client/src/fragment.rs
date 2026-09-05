@@ -141,10 +141,16 @@ impl FragmentClient {
         let mut shards = Vec::new();
         let mut key = Bytes::copy_from_slice(start);
         loop {
-            let mut route = self
-                .router
-                .route(&key)
-                .map_err(|error| terminal(error, Method::FragmentEvaluate))?;
+            // **Repaired, like both scans' enumeration.** `Router::route` raises its own
+            // `KeyNotInRegion` with `region_id == 0` when the driver does not yet cover the key,
+            // and a driver is a heartbeat behind a split. Mapping that straight to the caller is
+            // what put `08006 … key is not in region 0` in front of a `GROUP BY` in a gate — and
+            // it survived making the cluster tests exclusive, which is what showed it was never
+            // contention. One repair, the same one (`router::repair_route`).
+            let mut route = match self.router.route(&key) {
+                Ok(route) => route,
+                Err(refusal) => crate::router::repair_route(&self.router, &key, &refusal)?,
+            };
             // **One confirmation from the authority when the cache lists no learner.** The region
             // cache is a hint repaired by the refusals it causes, and a *missing learner* causes
             // none: a columnar replica joins through a conf change, and a client holding an entry
