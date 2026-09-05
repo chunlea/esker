@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use esker_engine::{Db, LocalFileSystem, Options, WalSyncMode, WriteBatch, WriteOptions, cf};
-use esker_proto::{ProtoError, RawKvReq, RawKvResp, Region, RequestHeader};
+use esker_proto::txn::TxnStatus;
+use esker_proto::{
+    ProtoError, RawKvReq, RawKvResp, Region, RequestHeader, TxnKvReq, TxnKvResp, TxnMutation,
+};
 use esker_raft::{ConfState, Entry, EntryKind, HardState};
 use esker_store::apply::Command;
 use esker_store::pd::{FakePd, PdClient};
@@ -126,6 +129,93 @@ impl Harness {
         }
     }
 
+    /// Commits one key as a client would: prewrite, then commit, each through the replicated
+    /// path and each retried while the routing moves under it.
+    ///
+    /// One key per transaction, because a batch spanning a boundary the split has just drawn is
+    /// two regions' work and this test is about the split, not about cross-region commits.
+    async fn commit(&self, key: &[u8], value: &[u8], start_ts: u64) {
+        let mutation = TxnMutation::Put {
+            key: Bytes::copy_from_slice(key),
+            value: Bytes::copy_from_slice(value),
+            read_ts: None,
+        };
+        self.txn(
+            key,
+            TxnKvReq::Prewrite {
+                start_ts,
+                primary: Bytes::copy_from_slice(key),
+                ttl_ms: 3_000,
+                mutations: vec![mutation],
+            },
+        )
+        .await;
+        self.txn(
+            key,
+            TxnKvReq::Commit {
+                start_ts,
+                commit_ts: start_ts + 1,
+                keys: vec![Bytes::copy_from_slice(key)],
+            },
+        )
+        .await;
+    }
+
+    /// One transactional request, retried while the routing moves under it, refusing anything
+    /// that came back as a Percolator status rather than as an error.
+    async fn txn(&self, key: &[u8], request: TxnKvReq) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let header = self.header_for(key).expect("every key is covered");
+            match self.store.serve_txn(header, request.clone()).await {
+                Ok(TxnKvResp::Prewrite { keys }) => {
+                    assert!(
+                        keys.iter().all(|status| *status == TxnStatus::Ok),
+                        "prewriting {key:?}: {keys:?}"
+                    );
+                    return;
+                }
+                Ok(TxnKvResp::Commit { status }) => {
+                    assert_eq!(status, TxnStatus::Ok, "committing {key:?}");
+                    return;
+                }
+                Ok(other) => panic!("{other:?}"),
+                Err(error) => {
+                    assert!(
+                        error.is_retryable(),
+                        "a transaction on {key:?} failed terminally: {error}"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "a transaction on {key:?} never succeeded"
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+    }
+
+    /// Reads one committed key at `ts`, through whichever region now owns it.
+    async fn read(&self, key: &[u8], ts: u64) -> Option<Bytes> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let header = self.header_for(key).expect("every key is covered");
+            let request = TxnKvReq::Get {
+                key: Bytes::copy_from_slice(key),
+                ts,
+            };
+            match self.store.serve_txn(header, request).await {
+                Ok(TxnKvResp::Get { value }) => return value,
+                Ok(other) => panic!("{other:?}"),
+                Err(error) => {
+                    assert!(error.is_retryable(), "reading {key:?}: {error}");
+                    assert!(Instant::now() < deadline, "reading {key:?} never succeeded");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+    }
+
     async fn get(&self, key: &[u8]) -> Option<Bytes> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -158,6 +248,14 @@ impl Harness {
 
 fn key(n: u32) -> Vec<u8> {
     format!("k{n:06}").into_bytes()
+}
+
+/// The user key of row `n` of one SQL table, built by `esker-keys` — what `esker-sql` hands the
+/// transaction layer, and what the store therefore has to be able to measure and divide.
+fn row_key(n: u32) -> Vec<u8> {
+    let mut key = esker_keys::prefix::table_row_prefix(1, 7);
+    key.extend_from_slice(&n.to_be_bytes());
+    key
 }
 
 /// **The invariant the phase-4 simulator checks globally and this checks locally.** Every region
@@ -344,6 +442,111 @@ async fn ten_splits_under_continuous_writes_lose_nothing() {
         seen.len(),
         written.len(),
         "the regions' scans do not cover everything that was written"
+    );
+}
+
+/// **The finding of `docs/plans/phase-16-mpp.md` §10, through the store rather than through PD.**
+///
+/// A SQL row is the *user key* of a transaction, so it reaches the engine as
+/// `'x' ++ enc(key) ++ !ts` in the Percolator families — and the rows here are short enough to be
+/// inlined into their `write` records, so the `default` family holds not one byte of this table.
+/// Before [ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md) the
+/// region reported `~0` bytes and this stayed at one region until the deadline, at any threshold.
+///
+/// The assertions are the ones the finding needs: the split **happened**, both halves hold data,
+/// and the boundary is a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_of_committed_rows_splits() {
+    let harness = tiny();
+    harness.wait_for_leader().await;
+    assert_eq!(harness.store.regions().len(), 1);
+
+    // Short enough to be inlined into the `write` record, which is what an ordinary SQL row is:
+    // `esker_txn::SHORT_VALUE_MAX_LEN` is 255 and this is under it, so `default` stays empty and
+    // every byte of the region is in `write`.
+    let value = vec![b'v'; 200];
+    const ROWS: u32 = 128;
+    for n in 0..ROWS {
+        harness
+            .commit(&row_key(n), &value, 10 + u64::from(n) * 2)
+            .await;
+    }
+    harness.wait_for_regions(2).await;
+
+    let regions = harness.store.regions().regions();
+    assert_contiguous_partition(&regions);
+    assert_eq!(regions[0].id, 1, "the parent keeps its id");
+
+    // Every half holds rows. A split whose child owns a range with nothing in it is a hole in the
+    // key space wearing a region's clothes, and it is what a boundary drawn from the wrong
+    // keyspace would produce.
+    for region in &regions {
+        let counts = esker_store::snapshot::key_counts(harness.store.db(), region).unwrap();
+        let held: usize = counts.iter().map(|(_, count)| count).sum();
+        assert!(
+            held > 0,
+            "region {} owns {:?}..{:?} and holds nothing: {counts:?}",
+            region.id,
+            region.start_key,
+            region.end_key
+        );
+    }
+
+    // The boundary is a row of the table, not a synthesised midpoint.
+    let boundary = &regions[1].start_key;
+    assert!(
+        (0..ROWS).any(|n| row_key(n) == boundary[..]),
+        "the boundary is not one of the rows: {boundary:?}"
+    );
+
+    // Every epoch moved past the one a cached copy was made at, and a split is not a membership
+    // change.
+    for region in &regions {
+        assert!(
+            region.epoch.version >= 2,
+            "region {} {:?}",
+            region.id,
+            region
+        );
+        assert_eq!(region.epoch.conf_ver, 1);
+    }
+
+    // And nothing was lost: every committed row still reads, through whichever half owns it.
+    let ts = 10 + u64::from(ROWS) * 2;
+    for n in 0..ROWS {
+        assert_eq!(
+            harness.read(&row_key(n), ts).await,
+            Some(Bytes::from(value.clone())),
+            "row {n} was lost by the split"
+        );
+    }
+}
+
+/// The measurement that made the finding, at the layer PD reads it from: a region holding this
+/// table reports bytes, and the two halves' sizes add up to something like the whole.
+///
+/// `region_sizes` is private to the store, so this asks the same question the heartbeat does —
+/// `split::approximate_size` — through the public path the store reports on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_of_committed_rows_reports_its_bytes() {
+    let harness = never();
+    harness.wait_for_leader().await;
+
+    let value = vec![b'v'; 200];
+    const ROWS: u32 = 64;
+    for n in 0..ROWS {
+        harness
+            .commit(&row_key(n), &value, 10 + u64::from(n) * 2)
+            .await;
+    }
+
+    let regions = harness.store.regions().regions();
+    assert_eq!(regions.len(), 1, "this store was told never to split");
+    let size = esker_store::split::approximate_size(harness.store.db(), &regions[0]).unwrap();
+    let written = u64::from(ROWS) * 200;
+    assert!(
+        size >= written / 2,
+        "{ROWS} committed rows of 200 bytes report {size} bytes, which is not a table PD can see"
     );
 }
 
