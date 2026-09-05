@@ -26,7 +26,9 @@ use crate::catalog::pg_catalog;
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::aggregate;
-use crate::plan::{BinaryOp, Expr, Literal, LockWait, Node, Select, SelectItem, SortKey};
+use crate::plan::{
+    BinaryOp, CatalogFunc, Expr, Literal, LockWait, Node, Select, SelectItem, SortKey,
+};
 use crate::row::{self, RowSchema};
 use crate::value::PgType;
 use crate::value::{ColumnType, Datum};
@@ -2385,16 +2387,10 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // PostgreSQL's order, which is the same rule the folded path applies to literals.
         Expr::Array { elements, .. } => {
             let mut resolved = Vec::with_capacity(elements.len());
-            let mut element = None;
             for expr in elements {
-                let expr = resolve(expr, scope)?;
-                let ty = expr_type(&expr, scope)?;
-                element = Some(match element {
-                    None => ty,
-                    Some(so_far) => wider_element(so_far, ty),
-                });
-                resolved.push(expr);
+                resolved.push(resolve(expr, scope)?);
             }
+            let element = array_element_type(&resolved, None, scope)?;
             Expr::Array {
                 elements: resolved,
                 element,
@@ -2611,9 +2607,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // told, and a *wrong value* rather than a refusal (ADR 0031's worst class). The name is
             // known at plan time and nowhere else, so this is where it is answered.
             match (call.func, args.first()) {
-                (crate::plan::CatalogFunc::PgTypeof, Some(Expr::Ordinal { at, .. }))
-                    if args.len() == 1 =>
-                {
+                (CatalogFunc::PgTypeof, Some(Expr::Ordinal { at, .. })) if args.len() == 1 => {
                     match scope.user_type_at(*at) {
                         Some(def) => Expr::Literal(Literal::String(def.name.clone())),
                         None => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
@@ -2626,7 +2620,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // theirs and the array does not, so the value cannot say which array it is.
                 // `hstore` itself no longer needs this — `Datum::Hstore` says so — and neither
                 // does `citext`, which is why the list is one entry rather than three.
-                (crate::plan::CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
+                (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     match expr_type(arg, scope) {
                         // **`json` and `jsonb` join it, and for exactly the same reason**: both
                         // are a canonical `Datum::Text`, so the evaluator would answer `text` for
@@ -2648,12 +2642,8 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // declared type follows from the same decision: `pg_typeof(payload->'b')` is
                 // `jsonb` and `pg_typeof(doc->'a')` is `json`, measured, and an evaluator-only
                 // dispatch answered `text` for both.
-                (crate::plan::CatalogFunc::HstoreFetch, Some(operand)) => {
-                    let func = match expr_type(operand, scope) {
-                        Ok(ColumnType::Jsonb) => crate::plan::CatalogFunc::JsonbFetch,
-                        Ok(ColumnType::Json) => crate::plan::CatalogFunc::JsonFetch,
-                        _ => call.func,
-                    };
+                (CatalogFunc::HstoreFetch, Some(_)) => {
+                    let func = arrow_fetch(call.func, &args, scope);
                     Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall { func, args }))
                 }
                 _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
@@ -4019,6 +4009,101 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
     }
 }
 
+/// The type `||` answers, which is **five types told apart by their operands**.
+///
+/// Every rule here is `any` except the jsonb one, which is `all` — a jsonb column beside a `text`
+/// one is `text || text` on a real server, because no `jsonb || text` operator exists. That
+/// quantifier is what the evaluator uses, and the two must agree or the rows and the declared
+/// type part company. They had: `a || b` over two jsonb columns merged correctly and said `text`.
+fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
+    // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
+    // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
+    // one is enough. Three spellings of one symbol now, and each answers its own type.
+    let of = |want: ColumnType| {
+        call.args
+            .iter()
+            .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
+    };
+    // **A fifth spelling, and it is `all` where the others are `any`** — which is why it
+    // was missed. `jsonb || jsonb` merges documents; a jsonb column beside a **text** one
+    // is `text || text` on a real server, because no `jsonb || text` operator exists. So
+    // the quantifier is what the evaluator uses (`args.iter().all(is_jsonb_typed)`), and
+    // the two have to agree or the rows and the declared type part company.
+    //
+    // They had. `a || b` over two jsonb columns merged correctly and said `text`, the same
+    // wrong-declaration bug `->` had one arm below — found by auditing this arm after
+    // fixing that one, not by a failing test.
+    let all_jsonb = !call.args.is_empty()
+        && call
+            .args
+            .iter()
+            .all(|arg| matches!(expr_type(arg, scope), Ok(ColumnType::Jsonb)));
+    // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
+    // already right — it was only the *declared* type that said `text`, which a client
+    // binds against.
+    if all_jsonb {
+        ColumnType::Jsonb
+    } else if of(ColumnType::Hstore) {
+        ColumnType::Hstore
+    } else if of(ColumnType::Ltree) {
+        ColumnType::Ltree
+    } else if of(ColumnType::TsVector) {
+        ColumnType::TsVector
+    } else {
+        ColumnType::Text
+    }
+}
+
+/// Which fetch a `->` is, from the **declared type of its operand**.
+///
+/// `->` means an hstore's fetch and a document's, and a `jsonb` is a canonical `Datum::Text` here
+/// — so nothing about the values decides it and the plan's own types have to. Asked in two places
+/// that must not disagree: `resolve`, which rewrites the call so the evaluator does the right
+/// fetch, and `expr_type`, which is what a client is **told**.
+///
+/// **Both, because the second was missing and the first alone is a wrong answer.** With only the
+/// rewrite, `payload->'a'` over a column returned the right `{}` and described it as `text`
+/// (oid 25) where a real server says `jsonb` (3802) — and `ActiveRecord` decodes by that oid, so
+/// it handed back the string `"{}"` instead of a Hash. `pg_typeof` could not see it (it folds at
+/// resolution, off the rewritten call) and neither could a rendered value, because `text` and
+/// `json` print identically. Only `ftype()` off the wire can, which is what the test asserts.
+/// The element type of an `ARRAY[…]`, from the type it was resolved with or from its elements.
+///
+/// **Two askers, and the second is why this is a function.** `resolve` settles the type and stores
+/// it on the node; `expr_type` is asked by `output_columns` on the **unresolved** projection, where
+/// the stored type is still `None`. Reading `None` as `text[]` there is the same wrong-declaration
+/// bug `->` had — the rows would be an `integer[]` and the client would be told `text[]`, and
+/// `ActiveRecord` decodes an array by that oid exactly as it decodes a document by `->`'s.
+fn array_element_type(
+    elements: &[Expr],
+    settled: Option<ColumnType>,
+    scope: &Scope<'_>,
+) -> Result<Option<ColumnType>> {
+    if settled.is_some() {
+        return Ok(settled);
+    }
+    let mut widest = None;
+    for element in elements {
+        let ty = expr_type(element, scope)?;
+        widest = Some(match widest {
+            None => ty,
+            Some(so_far) => wider_element(so_far, ty),
+        });
+    }
+    Ok(widest)
+}
+
+fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFunc {
+    if func != CatalogFunc::HstoreFetch {
+        return func;
+    }
+    match args.first().map(|operand| expr_type(operand, scope)) {
+        Some(Ok(ColumnType::Jsonb)) => CatalogFunc::JsonbFetch,
+        Some(Ok(ColumnType::Json)) => CatalogFunc::JsonFetch,
+        _ => func,
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // The type the cast named. Settled at lowering, where the permission was checked too.
@@ -4027,9 +4112,11 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // type a client is told matches the values it is sent.
         Expr::Negate(operand) => crate::value::arith::negate_type(expr_type(operand, scope)?)?,
         // Settled at resolution and carried, for the reason `Arithmetic::ty` is: a client is told
-        // the column's type before any row is read. An unresolved one has no element type yet, and
-        // `text[]` is what an all-`unknown` constructor would have been anyway.
-        Expr::Array { element, .. } => element
+        // the column's type before any row is read. **And computed from the elements when it is
+        // not settled**, because `output_columns` asks this of the *unresolved* projection —
+        // answering `text[]` there is a right value under a wrong declared type, which is what
+        // `->` was doing one arm below.
+        Expr::Array { elements, element } => array_element_type(elements, *element, scope)?
             .and_then(esker_keys::array::ArrayValue::array_of)
             .unwrap_or(ColumnType::TextArray),
         Expr::Arithmetic {
@@ -4051,27 +4138,15 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // `'a=>b'::hstore` constant is a `Datum::Hstore` and not a `Datum::Text`; while it was the
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
-        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::HstoreConcat => {
-            // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
-            // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
-            // one is enough. Three spellings of one symbol now, and each answers its own type.
-            let of = |want: ColumnType| {
-                call.args
-                    .iter()
-                    .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
-            };
-            // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
-            // already right — it was only the *declared* type that said `text`, which a client
-            // binds against.
-            if of(ColumnType::Hstore) {
-                ColumnType::Hstore
-            } else if of(ColumnType::Ltree) {
-                ColumnType::Ltree
-            } else if of(ColumnType::TsVector) {
-                ColumnType::TsVector
-            } else {
-                ColumnType::Text
-            }
+        Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreConcat => {
+            concat_type(call, scope)
+        }
+        // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
+        // the operand — and it needs the same arm here for the same reason that one gives: the
+        // rows were already right and it was the *declared* type that said `text`, which a client
+        // binds against.
+        Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreFetch => {
+            arrow_fetch(call.func, &call.args, scope).result_type()
         }
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,

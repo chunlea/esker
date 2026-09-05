@@ -147,6 +147,159 @@ fn frames(bytes: &[u8]) -> Vec<(char, Vec<u8>)> {
     out
 }
 
+/// Every column's **type oid** from a reply's `RowDescription`, which is the only place a wrong
+/// declared type is visible.
+///
+/// A `RowDescription` field is: name (NUL-terminated), table oid (4), column attnum (2), **type
+/// oid (4)**, type size (2), typmod (4), format (2).
+fn described_oids(reply: &[u8]) -> Vec<u32> {
+    let Some((_, body)) = frames(reply).into_iter().find(|(tag, _)| *tag == 'T') else {
+        return Vec::new();
+    };
+    let count = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut oids = Vec::with_capacity(count);
+    let mut at = 2;
+    for _ in 0..count {
+        let end = body[at..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|n| at + n);
+        let Some(end) = end else { break };
+        // Past the name's NUL, the table oid and the attnum.
+        let oid_at = end + 1 + 4 + 2;
+        if oid_at + 4 > body.len() {
+            break;
+        }
+        oids.push(u32::from_be_bytes([
+            body[oid_at],
+            body[oid_at + 1],
+            body[oid_at + 2],
+            body[oid_at + 3],
+        ]));
+        at = oid_at + 4 + 2 + 4 + 2;
+    }
+    oids
+}
+
+/// **`->` over a column must describe itself as the document type it returns.**
+///
+/// Measured in `captures/pg19_json_arrow_oid.txt`, vendored from r1-harness who found it.
+///
+/// r1-harness, against 19beta1: `json col -> 'a'` is oid **114** and `jsonb col -> 'a'` is
+/// **3802**; both were **25** here, so `json_test.rb` went `0F 2E -> 2F 0E` — the refusal became a
+/// wrong answer, which ADR 0031 ranks the worse of the two. `ActiveRecord` decodes by this oid, so
+/// told `text` it never parses and hands back `"{}"` where the test wants a Hash.
+///
+/// **It has to be asserted here and cannot be asserted anywhere else.** The value is right either
+/// way and `text` and `json` render identically, so no corpus row can see it; `pg_typeof` folds
+/// off the *resolved* call and was right all along, so the one I wrote passed. Only the wire says
+/// so — and only through a **column**, because the literal path types correctly.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_arrow_over_a_column_describes_the_document_type() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE j (payload jsonb, doc json)").await;
+    wire.run(r#"INSERT INTO j VALUES ('{"a":{},"b":"b"}', '{"a":{},"b":"b"}')"#)
+        .await;
+
+    // `json_test.rb:44`'s own projection, and one of each arrow over each column type.
+    for (sql, want) in [
+        ("SELECT payload->'a', payload->>'b' FROM j", vec![3802, 25]),
+        ("SELECT doc->'a', doc->>'b' FROM j", vec![114, 25]),
+        // The literal path, which was right and must stay right.
+        (r#"SELECT '{"a":{}}'::jsonb->'a'"#, vec![3802]),
+        (r#"SELECT '{"a":{}}'::json->'a'"#, vec![114]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong types: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+    }
+}
+
+/// **`ARRAY[…]` over a column describes its element type**, which is the same bug one node over.
+///
+/// `output_columns` types the projection from the **unresolved** expression, and the constructor's
+/// element type is settled at *resolution* — so a `SELECT ARRAY[n]` over an `integer` column was
+/// described as `text[]` (oid 1009) where a real server says `integer[]` (1007). Found by looking
+/// for the shape r1-harness found in `->`, not by a failing test: the rows are identical either
+/// way, so nothing but the wire can see it, and `pg_typeof` reads the resolved call and was right.
+///
+/// The oids are PostgreSQL's own: `_int4` 1007, `_int8` 1016, `_text` 1009, `_numeric` 1231.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_array_constructor_over_a_column_describes_its_element_type() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE a (n integer, m bigint, t text, d numeric)")
+        .await;
+    wire.run("INSERT INTO a VALUES (7, 8, 'x', 1.5)").await;
+
+    for (sql, want) in [
+        ("SELECT ARRAY[n] FROM a", vec![1007]),
+        ("SELECT ARRAY[m] FROM a", vec![1016]),
+        // The widening, which the corpus already pins by value — here by declared type.
+        ("SELECT ARRAY[n, m] FROM a", vec![1016]),
+        ("SELECT ARRAY[d, n] FROM a", vec![1231]),
+        ("SELECT ARRAY[t, 'lit'] FROM a", vec![1009]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong element type"
+        );
+    }
+}
+
+/// **`||` over two jsonb columns is a `jsonb`**, which is the third instance of the same bug.
+///
+/// The evaluator merges documents when **all** operands are jsonb-typed, and `expr_type` declared
+/// `text` — so the rows were a merged document and the client was told a string. Found by auditing
+/// the `||` arm after fixing `->`, which is the arm whose own comment says the rows were right and
+/// only the declared type was wrong. It is `all` where the neighbouring rules are `any`, because a
+/// jsonb column beside a **text** one is `text || text` on a real server: there is no
+/// `jsonb || text` operator. That quantifier is what made it a separate mistake.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concat_of_two_jsonb_columns_describes_jsonb() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE c (a jsonb, b jsonb, t text)").await;
+    wire.run(r#"INSERT INTO c VALUES ('{"x":1}', '{"y":2}', 'z')"#)
+        .await;
+
+    for (sql, want) in [
+        ("SELECT a || b FROM c", vec![3802]),
+        // A jsonb beside a text is `text || text`, so it is text — the quantifier's other side.
+        ("SELECT a || t FROM c", vec![25]),
+        ("SELECT t || t FROM c", vec![25]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong type"
+        );
+    }
+}
+
 /// The first column of the first `DataRow` in a reply, as text.
 fn first_value(reply: &[u8]) -> Option<String> {
     let (_, body) = frames(reply).into_iter().find(|(tag, _)| *tag == 'D')?;
