@@ -151,8 +151,13 @@ pub struct Violation {
 /// Which half of "reclaimed exactly once, and never while a hosted region overlaps it" broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Half {
-    /// A range that should have been reclaimed was not. Disk, and a peer campaigning for ever.
+    /// A range that should have been reclaimed was not, and the store still holds the region:
+    /// no decision was taken at all. Disk, and a peer campaigning for ever.
     NotReclaimed,
+    /// The store gave the region up and its keys are **still on disk**: a reclaim that started and
+    /// did not finish. Not the same finding as one that never started -- the decision was right,
+    /// so what is in question is the deletion, and ADR 0034's cursor is what has to resume it.
+    ReclaimUnfinished,
     /// A range that should have been left alone was emptied. **Acknowledged writes.**
     ReclaimedWrongly,
     /// The region was retired or kept when the opposite was required, without the keys moving.
@@ -196,7 +201,13 @@ pub fn check(case: &Case, observed: Observed) -> Result<(), Violation> {
     match expected {
         Expected::Reclaim => {
             if observed.keys_left != 0 {
-                return fail(Half::NotReclaimed);
+                // Which of the two it is turns on the region: still hosted means nothing was
+                // decided; gone means the decision was taken and the bytes outlived it.
+                return fail(if observed.still_hosted {
+                    Half::NotReclaimed
+                } else {
+                    Half::ReclaimUnfinished
+                });
             }
             if observed.still_hosted {
                 return fail(Half::WrongHosting);
