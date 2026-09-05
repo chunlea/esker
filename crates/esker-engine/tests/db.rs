@@ -1779,3 +1779,218 @@ fn approximate_size_counts_a_range_across_the_memtable_and_the_files() {
         "a straddling range came out as {straddling} of {flushed}"
     );
 }
+
+/// **A legal caller must not be told its database is corrupt.**
+///
+/// Writing while `compact_range` runs is an ordinary supported workload, and it used to come back
+/// with `column family 0 level 1: files 133 and 132 overlap` — once in twenty attempts with a
+/// writer, and never once in twenty with the writer stopped.
+///
+/// Two `L0 → L1` plans picked different L0 files, which legitimately overlap each other; with L1
+/// empty neither pulled in an L1 file, so their *input* sets were disjoint and both reservations
+/// succeeded. Both then wrote into L1 over the same keys. `check_disjoint` refused the resulting
+/// edit — so nothing reached disk and this was a failed operation rather than lost data — and the
+/// error surfaced to the caller. Reserving the output range as well is what stops the second plan
+/// starting ([ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)).
+///
+/// **Sixty attempts, and the number is arithmetic rather than taste.** The defect appeared once
+/// in twenty, so a twenty-attempt test would catch a regression about two times in three — it
+/// would go green against the broken code a third of the time, which is a test that lies at a
+/// rate. Sixty puts that at about nineteen in twenty, and the whole loop costs a few seconds
+/// because the filesystem is in memory.
+#[test]
+fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
+    // Sixty attempts, a bounded writer per attempt, and a wall-clock budget over the whole thing:
+    // whichever runs out first ends the loop, and falling short of `LEAST` is a failure with a
+    // reason rather than a test that quietly ran three attempts and called itself green.
+    const ATTEMPTS: usize = 60;
+    const LEAST: usize = 20;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+    const WRITES: u32 = 2_000;
+
+    let started = std::time::Instant::now();
+    let mut failures = Vec::new();
+    let mut ran = 0usize;
+    for attempt in 0..ATTEMPTS {
+        if started.elapsed() >= BUDGET {
+            break;
+        }
+        let (_, fs) = memfs();
+        let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
+        // Six rounds over the same 200 keys, so L0 fills with files that overlap each other --
+        // which is the shape that made two plans' inputs disjoint and their outputs not.
+        for round in 0..6u32 {
+            for i in 0..200u32 {
+                db.put(
+                    cf::DEFAULT,
+                    format!("key-{i:04}").as_bytes(),
+                    format!("round{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = Arc::clone(&db);
+        let flag = Arc::clone(&stop);
+        let hand = std::thread::spawn(move || {
+            // **A fixed number of writes, not "until the compaction returns".** Written the other
+            // way, an attempt's work is whatever the scheduler allows: a `compact_range` slowed by
+            // a loaded box is given a bigger database to compact by a writer that is not slowed
+            // with it, and the two chase each other. That is what made this test run past 300 s in
+            // a full-workspace gate having taken 1.7 s in a crate-only run.
+            for n in 0..WRITES {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let _unused = writer.put(
+                    cf::DEFAULT,
+                    format!("bg-{n:06}").as_bytes(),
+                    b"x".repeat(256).as_slice(),
+                );
+            }
+        });
+
+        db.flush(cf::DEFAULT).unwrap();
+        let outcome = db.compact_range(cf::DEFAULT, None, None);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hand.join().unwrap();
+        ran += 1;
+
+        if let Err(why) = outcome {
+            failures.push(format!("attempt {attempt}: {why}"));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "compact_range refused a legal concurrent workload {} times in {ran}: {failures:?}",
+        failures.len(),
+    );
+    // **A slow box makes this red with a reason, never a gate with no end.** Below `LEAST` the
+    // detection rate this test is sized for is not reached, so passing would be a claim it did not
+    // earn: the defect showed once in twenty, and twenty attempts catch a regression about two
+    // times in three.
+    assert!(
+        ran >= LEAST,
+        "only {ran} of {ATTEMPTS} attempts fitted in {BUDGET:?}; this box is too slow for this \
+         test to mean anything, and a test that cannot reach its own detection rate must say so \
+         rather than pass"
+    );
+}
+
+/// **The same contention, sustained, checked for what it actually wrote.**
+///
+/// The test above asks whether `compact_range` returns an error. This asks the harder question:
+/// after a writer, the background pool and repeated `compact_range` calls have all been working
+/// the same levels at once, is every key still readable at its newest value? A reservation rule
+/// that serialised too little would corrupt a level; one that serialised the wrong thing could
+/// drop an output and lose a key while returning `Ok`.
+///
+/// **The writer is bounded, and that is not a detail.** The first version of this test let it run
+/// unthrottled for the whole loop, so every round had more to compact than the last and
+/// `compact_range(None, None)` was chasing a database that grew faster than it drained: 456 other
+/// tests finished while this one spun at 350% CPU past seventy seconds. Reserving the output range
+/// makes that worse rather than better, because `L0 -> L1` is now one compaction at a time — which
+/// is the throughput [ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)
+/// says the invariant costs, observed rather than predicted. A test whose work is unbounded cannot
+/// tell that from a livelock, so the writer stops at a fixed count and the contention is what is
+/// left.
+#[test]
+fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
+    const WRITES: u32 = 8_000;
+    // The wall clock half of the cap below. Declared here with the other item, before any
+    // statement: `clippy::items_after_statements` is denied in this workspace, so an item wedged
+    // in beside the code it belongs to fails `--all-targets` while reading perfectly well.
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let (_, fs) = memfs();
+    let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
+
+    // The keys whose final value is asserted. Written first and rewritten by the loop below, so
+    // they span every level by the time the compactions start moving them.
+    for i in 0..300u32 {
+        db.put(
+            cf::DEFAULT,
+            format!("key-{i:04}").as_bytes(),
+            b"first".as_slice(),
+        )
+        .unwrap();
+    }
+
+    let compactions_before = db.compactions_run();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = Arc::clone(&db);
+    let finished = Arc::clone(&done);
+    let hand = std::thread::spawn(move || {
+        // Fresh keys, so L0 keeps filling and the pool keeps finding work. Bounded, so the
+        // database does not outgrow what the compactions can drain -- see the note above.
+        for n in 0..WRITES {
+            let _unused = writer.put(
+                cf::DEFAULT,
+                format!("bg-{n:06}").as_bytes(),
+                b"y".repeat(256).as_slice(),
+            );
+        }
+        finished.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    // **The loop ends when the writer does, and that is what makes this concurrent.** Stopping
+    // the writer when the loop had had enough was the other way round, and it let the loop
+    // finish first: the writer got 718 writes in before it was told to stop, so the compactions
+    // it was supposed to contend with ran against a database nobody else was touching. The test
+    // passed, in a tenth of a second, having tested nothing. `overlapping` counts the rounds
+    // that really did run alongside the writer, and asserting on it is what stops that coming
+    // back.
+    let mut round = 0u32;
+    let mut overlapping = 0u32;
+    // **A round ceiling and a wall clock, whichever comes first.** The ceiling alone is a cap on
+    // work, not on time: on a box where every round is slow, sixty of them is still unbounded from
+    // a gate's point of view. Both, so a slow machine ends this test rather than extending it.
+    let started = std::time::Instant::now();
+    while round < 4
+        || (!done.load(std::sync::atomic::Ordering::Acquire)
+            && round < 60
+            && started.elapsed() < BUDGET)
+    {
+        if !done.load(std::sync::atomic::Ordering::Acquire) {
+            overlapping += 1;
+        }
+        for i in 0..300u32 {
+            db.put(
+                cf::DEFAULT,
+                format!("key-{i:04}").as_bytes(),
+                format!("round{round}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.compact_range(cf::DEFAULT, None, None)
+            .unwrap_or_else(|why| panic!("round {round}: {why}"));
+        round += 1;
+    }
+    let last = round - 1;
+    hand.join().unwrap();
+
+    assert!(
+        overlapping >= 1,
+        "no round ran while the writer was writing, so nothing here was concurrent with anything; \
+         {round} rounds in {:?}",
+        started.elapsed()
+    );
+    assert!(
+        db.compactions_run() > compactions_before,
+        "no compaction ran at all, so there was nothing to contend over"
+    );
+
+    let expected = format!("round{last}");
+    let missing: Vec<u32> = (0..300u32)
+        .filter(|i| {
+            get(&db, format!("key-{i:04}").as_bytes()).as_deref() != Some(expected.as_bytes())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} keys did not read back their newest value after {round} rounds of concurrent \
+         compaction ({overlapping} of them alongside the writer): {missing:?}",
+        missing.len(),
+    );
+}

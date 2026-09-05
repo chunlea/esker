@@ -861,7 +861,13 @@ load ~13: the fragment answered 4 rows and the row scan 5. The fragment was miss
 ("barbara"). 3/3 green alone at 0.47–2.65 s, so a timing window rather than starvation — and a
 **wrong answer**, which is the failure this whole feature is built to not have.
 
-### What the dump says, and why it is not what it looks like
+**Closed 2026-09-05.** What follows is the finding; the hypotheses it replaced are kept at the end,
+because two of them were wrong in ways worth not repeating.
+
+### One entry, not a history
+
+Every store, **including the columnar learner**, held `id 4` in its row store, and all four reported
+`applied = 40`:
 
 ```text
 min_apply_index  38
@@ -869,90 +875,20 @@ store 4  leader=Some(false)  applied=Some(40)  columnar=true
   id 4: 1 write records, reads as 19 bytes
 ```
 
-Every store, **including the columnar learner**, holds `id 4` in its row store, and all four report
-`applied = 40`. So this is not a replica that is behind: the learner had the write. Its **columnar
-copy** did not, and the fragment was allowed to answer anyway.
+So this was never a replica that was behind. Its **columnar copy** did not have the row, and the
+fragment was allowed to answer anyway.
 
-### The gate proves the wrong thing
-
-`esker-store`'s `Store::catch_up` establishes freshness like this:
-
-```rust
-let index = peer.read_index_as_learner().await?;   // returns once the STATE MACHINE has applied
-if peer.applied_index() >= min_apply_index { return None; }
-```
-
-Both are statements about the **row state machine**. The fragment is answered from the columnar
-copy, which is a different structure fed by `RaftPeer::tee_columnar` during apply. **Applied is not
-copied**, and nothing between the two is checked.
-
-The doc comment above `catch_up` is where the reasoning went — *"the freshness a fragment needs comes
-from the `ReadIndex` round itself, which returns only once the state machine has applied through the
-index it established"*. Every clause is true, and the conclusion does not follow: the state machine
-applying is not the copy holding.
-
-### The number the gate needs already exists
-
-`ColumnarApply::applied_index()` — *"the region apply index the **runs on disk** are complete to"*,
-the manifest claim from
-[ADR 0038](../adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md). Nothing consults
-it at fragment time. That is the whole of the first fix: compare **that** against the read index and
-`min_apply_index`, and refuse `TooFarBehind` when the copy is behind.
-
-With only that fix the query **falls back to the rows** instead of answering wrongly, which is the
-safety property and is worth having on its own even if the second fix takes longer.
-
-### Why the row was skipped rather than merely late — the hypothesis to confirm
-
-`tee_columnar` opens with:
-
-```rust
-let slot = self.columnar.as_ref()?;
-if !self.is_columnar_learner() { return None; }
-```
-
-and `is_columnar_learner()` reads the **region record**, which a peer only learns when the conf
-change naming it a learner applies. An entry committed while that is still `false` is applied to the
-row store and never teed. `entry_applied` is not called for it either, so the copy's own index stays
-behind — which is exactly why gating on the copy's index would have caught this and gating on the
-peer's did not.
-
-If that is confirmed, a gate alone leaves a copy permanently missing the row: it would refuse for
-ever rather than answer wrongly. **A gate that refuses for ever is not a copy**, so the tee needs
-closing too — either the role is known before apply, or the copy catches up from the log the way its
-open path already does.
-
-### How it is being reproduced
-
-**Deterministically, in `esker-store`, and not with a load arm.** The seam is: feed the region an
-entry while `is_columnar_learner()` is false, let the role apply, then ask a fragment. A stress loop
-would reproduce *a* timing window without saying which one; this pins the mechanism. Two red tests,
-because these are two defects — one for the gate, one for the tee.
-
-### What "fresh enough to answer" will mean
-
-The sentence the fix puts in `catch_up`'s doc: **a fragment is fresh enough when the columnar copy is
-complete through the read index — not when the row state machine is.** The `ReadIndex` round
-establishes what the region has committed; only the copy's own manifest index says what the copy can
-answer about.
-
-### Correction, after re-reading the dump against the workload
-
-J13 above reads the failure as "the copy holds the stream and not the history". Re-reading the
-dump against the SQL that produced it says something narrower and much more useful.
-
-The four rows the test inserts arrive in **one statement**, so they are **one transaction and one
-Raft entry**:
+The rows the test inserts arrive in **one statement**, so they are **one transaction and one Raft
+entry**:
 
 ```sql
 INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')
 ```
 
-Everything after it touches those rows again, one at a time: `UPDATE id = 1`, `DELETE id = 3`,
-`UPDATE id = 2`. So if the copy missed **that single entry** and nothing else, what a fragment
-answers is:
+and every later statement touches those rows again, one at a time. A copy that missed **that single
+entry and nothing else** answers exactly what the dump shows:
 
-| row | later write | in the copy? |
+| row | later write | what the fragment answered |
 |---|---|---|
 | 1 | `UPDATE ... 'ada lovelace'` | yes, at its new value |
 | 2 | `UPDATE ... region 'east'` | yes, at its new value |
@@ -960,18 +896,74 @@ answers is:
 | 4 | **none** | **absent** |
 | 5, 6 | inserted later | yes |
 
-That is the dump, exactly — `'ada lovelace'` and `'east'` included. **One entry was missed, not a
-history**, and `id 4` is the only row whose visible state depended on it. The distinction matters
-because "the copy never converted history" and "the copy dropped one entry" have different fixes,
-and the first was about to be built.
+`'ada lovelace'` and `'east'` included. **One entry was lost**, and `id 4` is the only row whose
+visible state depended on it.
 
-The missed entry is also the only one that **predates the columnar record**: it commits before
-`ALTER TABLE t SET (columnar_replicas = 1)` does. An apply that reaches `ColumnarSlot::commit`
-before that record exists finds no copy to feed and caches the miss — correctly — and the record's
-own commit clears the cache. What has to hold after that is that the *next* open converts the
-region's history, and the walk in `columnar::region::convert` does exactly that. Reading every path
-between the two shows each of them defended in isolation, which is itself the finding: this is not
-visible without an experiment.
+### What loses an entry: a snapshot install
+
+A snapshot writes committed versions **straight into the column families**. No entry applies, so
+`RaftPeer::tee_columnar` never runs, and the log it lands on begins after the snapshot's index. A
+replica that falls behind its leader's compaction boundary is repaired by exactly this — which is
+what load does, and why the test was green alone.
+
+`Store::fetch_snapshot` replaces such a region through `Store::retire_region_now`, which stops the
+peer and, until this was fixed, left the columnar slot in the store's map; `host_region` then
+reattached it. The copy that came back was the one that was there before, missing every version
+between where it had got to and the snapshot's index — and with no path back to them, because the
+log cannot replay entries it has truncated and `ColumnarSlot::ensure` short-circuits on a table that
+is already open, so an open copy is never re-walked. Entries after the snapshot are teed normally,
+which is why the copy then looks current and answers confidently.
+
+The refusal rule that covers this **already existed**: `resume` will not replay from a manifest
+older than the log's truncation point, and `columnar_resume.rs` has tested that since
+[ADR 0038](../adr/0038-a-run-manifest-names-the-index-its-runs-are-complete-to.md). It was only ever
+consulted on the way in.
+
+### The fix
+
+`ColumnarSlot::saw(index)`, called for **every entry a columnar learner applies**, committing or
+not, drops every open copy when that entry did not follow the last one the slot was told about. The
+next `ensure` re-opens and the resume rule sends it to a re-walk. `Store::retire_region_now` also
+drops the slot, closing the hole where it opens rather than at the next entry.
+
+Red-first: `a_copy_not_told_of_every_entry_re_walks_instead_of_answering` fails `5` against `6` with
+the check neutered. Green: 335/335 on `-p esker-store --all-features`.
+
+### The three readings that were wrong, and what misled each
+
+**"The gate proves the wrong thing."** `catch_up` establishes freshness with
+`read_index_as_learner` and `peer.applied_index()`, both statements about the **row** state machine,
+while the fragment is answered from the columnar copy. That much is true and is still worth knowing.
+The conclusion drawn from it — that gating on the copy's own index would have caught this — was
+wrong twice over. `ColumnarApply::applied_index()` is `runs.applied()`, the **durable manifest**
+index, which moves only on a seal; `catch_up` runs *before* `slot.table()` seals, so between seals
+it names less than the copy holds and such a gate would refuse fragments that are perfectly fresh.
+And here the copy was not behind by its own reckoning at all — it had been teed entries well past
+the missing one — so the gate would not have refused this answer. Withdrawn by the coordinator once
+the first half was shown.
+
+**"The row was skipped because `is_columnar_learner()` was still false."** An entry applied before
+a peer's region record calls it a columnar learner is genuinely not teed. But the copy's first open
+**rebuilds from the region's committed state**, which covers every such entry, so the gap is real
+and self-healing and was not this. It is closed anyway: the first entry after the role lands is a
+gap in `saw`'s reckoning.
+
+**"The copy holds the stream and not the history."** The shape of the dump invites this, and the
+`INSERT`-as-one-entry reading is what dissolves it. A fix built on it would have aimed at the
+conversion walk, which was correct all along.
+
+### The lesson that cost the most
+
+The first version of the fix compared indices **on the read path**, when a fragment asks. It passed
+its test and it does not work: the peer carries on applying, and one entry teed after the gap
+advances the index past the truncation point again, so a fragment arriving later sees nothing wrong.
+The test passed only because it teed nothing afterwards — a test passing on the mechanism it was not
+testing.
+
+**A gap is a fact about the moment it happens**, and the next entry destroys the evidence. That is
+why the check is on the apply path. And it is fed by every entry rather than by commits, because a
+prewrite commits nothing and still applies, so a detector fed by commits alone would see a gap at
+every transaction.
 
 ### The property the tests pin
 
@@ -993,68 +985,10 @@ same `Service` the server dispatches through, so `Store::serve_fragment` runs wh
 check, the role check and the catch-up. Nothing anywhere asserted that a *placed* learner answers a
 fragment for rows committed before it existed.
 
-### The defect, and the one-line reason it hid
+### Where this was left
 
-`ColumnarSlot::ensure` short-circuits when the table is already open. The rule that would have
-caught this **already exists**: `resume` refuses a manifest older than the log's truncation point,
-because the entries it would replay are gone, and `columnar_resume.rs` has had a test for it since
-ADR 0038. It is only ever consulted **on the way in**. A copy that is already open never goes
-through that door again.
-
-What puts a copy on the wrong side of that rule is a **snapshot install**. A replica that falls
-behind its leader's compaction boundary is repaired by one; a snapshot writes committed versions
-straight into the column families, so no entry applies and `RaftPeer::tee_columnar` never runs, onto
-a log that begins after the snapshot's index. A copy that was behind when that happened is missing
-every version in between and neither path leads back: the log cannot replay them and nothing
-re-walks. Entries after the snapshot are teed normally, which is why the copy then looks current and
-answers confidently.
-
-`Store::fetch_snapshot` replaces such a region through `Store::retire_region_now` — which has
-exactly one caller, this one. It removes the region and stops the peer, and **leaves the columnar
-slot in the store's map**; the function that does drop it, `reclaim_retired_range`, is on the other
-retirement path and says in its own comment why the slot must go first. So `host_region` reattaches
-the copy that was there before.
-
-That is also why it was 3/3 green alone. Alone, the learner never falls behind.
-
-### The fix
-
-`ColumnarSlot::saw(index)` is called for **every entry a columnar learner applies**, committing or
-not, and drops every open copy when that entry did not follow the last one the slot was told about.
-The next `ensure` then re-opens, and `resume`'s existing rule sends it to a re-walk.
-
-### The first version of this fix was wrong, and the way it was wrong is the lesson
-
-It compared the highest index the slot had seen against the log's truncation point, **on the read
-path**, when a fragment asks. It passed its test and it does not work: the peer carries on applying,
-and a single entry teed after the gap advances the index past the truncation point again. Asked a
-moment later, nothing distinguishes that copy from one that saw everything. The test passed because
-it teed nothing after the truncation — a test passing on the mechanism it was not testing.
-
-**A gap is a fact about the moment it happens**, and the evidence for it is destroyed by the next
-entry. That is why the check is at the tee and not at the read, and why `saw` is told about entries
-that commit nothing: a prewrite commits nothing and applies, so a detector fed only by commits sees
-a gap at every transaction and a detector fed by every entry sees one only when there really is one.
-
-It also closes the second half of J13's original hypothesis for free. A peer that applies entries
-before its region record calls it a columnar learner tees none of them; the first entry after the
-role lands is a gap, and the copies are dropped and re-walked.
-
-Red-first: `a_copy_not_told_of_every_entry_re_walks_instead_of_answering` fails on the unfixed code
-and passes with the fix; the whole of `columnar_resume`, `columnar_region`, `columnar_differential`
-and `snapshot` is green with it.
-
-### What was not built, and why
-
-**The gate on `catch_up`** — reading `ColumnarApply::applied_index()` against `min_apply_index` —
-was specified and is not here, for two reasons. `applied_index()` is `runs.applied()`, the *durable
-manifest* index, which moves only on a seal; `catch_up` runs before `slot.table()` seals, so between
-seals it names less than the copy holds and the gate would refuse fragments that are perfectly
-fresh. And in this failure the copy was not behind by its own reckoning — it had been teed entries
-well past the missing one — so a copy-index gate would not have refused this answer. It remains a
-reasonable safety net against *other* ways a copy can lag, against `complete_index` and after a
-seal; it is not what closes this.
-
-**The tee half** — an entry applied while `is_columnar_learner()` is still false — is real and
-self-healing: the copy's first open rebuilds from the region's committed state, which covers every
-such entry. Not this bug, and recorded here rather than silently dropped.
+`Store::retire_region_now` drops the region's columnar slot as well, so the hole is closed where it
+opens and not only at the next entry. The gate on `catch_up` that was originally specified —
+`ColumnarApply::applied_index()` against `min_apply_index` — was withdrawn once the durable-seal
+reading above was shown; if it is ever wanted as a safety net against *other* ways a copy can lag,
+it needs `complete_index` and it needs to run after a seal.

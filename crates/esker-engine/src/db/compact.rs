@@ -4,13 +4,34 @@
 //! the manifest and the threads. Keeping them apart is what lets every rule that can lose data
 //! be tested on a list in memory.
 //!
-//! # Two compactions must not touch one file
+//! # Two compactions must not touch one file, nor write overlapping ranges into one level
 //!
 //! The pool is bounded but not serial (`docs/DESIGN.md` §4.7: two threads), and a compaction
 //! at `L → L+1` reads files at both levels — so one at `L+1 → L+2` can want the same files.
 //! Every plan therefore reserves its inputs by file number before it starts, and a plan that
 //! cannot have all of them is dropped rather than queued: the picker will produce it again in
 //! a moment, against a version that has moved on.
+//!
+//! **The inputs alone are not enough**, and for a long time this section said they were. L0
+//! files legitimately overlap each other, so two `L0 → L1` plans can pick different L0 files;
+//! if L1 is empty or sparse neither pulls in an L1 file, their input sets are disjoint, and
+//! both reservations succeed. Both then write into L1 over overlapping key ranges, and L1 is
+//! no longer a partition of the key space. A caller writing while `compact_range` ran got
+//! `column family 0 level 1: files 133 and 132 overlap` back from a legal workload, once in
+//! twenty attempts, and never once with the writer stopped
+//! ([ADR 0079](../../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)).
+//!
+//! So a plan also reserves the key range it will write, per `(column family, output level)`,
+//! and a plan whose range overlaps a running plan's range in the same level does not start.
+//! The claim is the union of the plan's inputs, which is the widest its outputs can be. Two
+//! compactions into *different* levels never contend, which is what keeps the pool parallel;
+//! two into the same level are ordered, which for `L0 → L1` means one at a time — the same
+//! thing `LevelDB` and `RocksDB` arrive at.
+//!
+//! [`crate::version::builder`]'s `check_disjoint` still validates the level as a version is
+//! built. It is the backstop now rather than the first line: it refuses a bad edit, which
+//! turns the race into a failed operation instead of a corrupt level, and that is what this
+//! rule exists to stop happening at all.
 //!
 //! # A file being written is not garbage
 //!
@@ -30,7 +51,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::compaction::{Compaction, CompactionJob, CompactionOutput, CompactionStats, Picker};
-use crate::dbformat::{SeqNo, extract_tag, tag_seqno};
+use crate::dbformat::{SeqNo, extract_tag, extract_user_key, tag_seqno};
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename::{self, FileKind};
 use crate::iterator::Cursor;
@@ -41,6 +62,84 @@ use crate::version::{CfVersion, FileLocation, FileMeta, Version, VersionEdit};
 use super::iter::table_cursor;
 use super::merge::MergeCursor;
 use super::{ColumnFamily, Db, DbInner, lock, read_lock};
+
+/// What running compactions have claimed.
+///
+/// One structure and one lock, because the two claims are taken and given back together: a plan
+/// that got its files and not its range must leave the files unclaimed too, and a check spread
+/// over two locks is a window where a third plan sees half of one.
+#[derive(Debug, Default)]
+pub(crate) struct Reservations {
+    /// Input file numbers, so two compactions never read the same file.
+    files: BTreeSet<u64>,
+    /// The key range each running compaction will write, per output level.
+    ranges: Vec<ReservedRange>,
+}
+
+impl Reservations {
+    /// How many input **files** are claimed — what `esker.compactions-running` reports, and not
+    /// the number of compactions: one plan over five files counts five.
+    pub(crate) fn files(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// One running compaction's claim on a stretch of one level.
+#[derive(Debug)]
+struct ReservedRange {
+    cf: u32,
+    level: usize,
+    /// User keys, inclusive at both ends.
+    smallest: Vec<u8>,
+    largest: Vec<u8>,
+}
+
+impl ReservedRange {
+    /// Whether two claims cannot both be granted: the same level of the same column family, and
+    /// key ranges that touch.
+    ///
+    /// **User keys, not internal ones.** `check_disjoint` compares internal keys, which order by
+    /// user key and then by sequence number — and a compaction's outputs carry sequence numbers
+    /// its inputs did not, so an internal-key comparison of the *inputs* would be answering about
+    /// keys that will not exist. Comparing user keys claims a little more than the outputs will
+    /// occupy, which is the direction that cannot be wrong.
+    fn overlaps(&self, other: &Self, user: &Arc<dyn crate::dbformat::Comparator>) -> bool {
+        self.cf == other.cf
+            && self.level == other.level
+            && user.cmp(&self.smallest, &other.largest) != std::cmp::Ordering::Greater
+            && user.cmp(&other.smallest, &self.largest) != std::cmp::Ordering::Greater
+    }
+}
+
+/// The widest key range `compaction` can write: the union of its inputs, as user keys.
+///
+/// Its outputs are the merge of those inputs, so they span this range or less. `None` when the
+/// plan has no inputs at all, which the picker does not produce.
+///
+/// Through the **user comparator** rather than by byte order: L0 files are unordered between
+/// themselves and a discharge reaches several levels, so this is a real comparison of bounds and
+/// not a first-and-last of a sorted list — and a database opened with a comparator of its own
+/// would otherwise have its ranges unioned under an order it does not use.
+fn output_range(
+    compaction: &Compaction,
+    user: &Arc<dyn crate::dbformat::Comparator>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut smallest: Option<&[u8]> = None;
+    let mut largest: Option<&[u8]> = None;
+    for file in compaction.all_inputs() {
+        let low = extract_user_key(&file.smallest);
+        let high = extract_user_key(&file.largest);
+        smallest = Some(match smallest {
+            Some(current) if user.cmp(current, low) != std::cmp::Ordering::Greater => current,
+            _ => low,
+        });
+        largest = Some(match largest {
+            Some(current) if user.cmp(current, high) != std::cmp::Ordering::Less => current,
+            _ => high,
+        });
+    }
+    Some((smallest?.to_vec(), largest?.to_vec()))
+}
 
 impl Db {
     /// Compacts everything in `[begin, end]` down through the levels.
@@ -206,25 +305,59 @@ impl DbInner {
         Ok(tombstones)
     }
 
-    /// Claims every input of `compaction`, or nothing at all.
+    /// Claims every input of `compaction` and the range it will write, or nothing at all.
+    ///
+    /// Both halves, and the second is the one that is easy to leave out: see this module's
+    /// header for the L0 case where the inputs are disjoint and the outputs are not.
     fn reserve(&self, compaction: &Compaction) -> Result<bool> {
+        let user = self.comparator.user_comparator();
+        // A plan with no inputs writes nothing and claims no range. The picker does not produce
+        // one; this granting it — as it did before ranges were reserved at all — is what keeps
+        // an empty plan a no-op rather than a caller spinning on a refusal it cannot resolve.
+        let claim = output_range(compaction, user).map(|(smallest, largest)| ReservedRange {
+            cf: compaction.cf,
+            level: compaction.output_level(),
+            smallest,
+            largest,
+        });
         let mut busy = lock(&self.compacting)?;
         if compaction
             .all_inputs()
-            .any(|file| busy.contains(&file.number))
+            .any(|file| busy.files.contains(&file.number))
+        {
+            return Ok(false);
+        }
+        if let Some(claim) = &claim
+            && busy.ranges.iter().any(|held| held.overlaps(claim, user))
         {
             return Ok(false);
         }
         for file in compaction.all_inputs() {
-            busy.insert(file.number);
+            busy.files.insert(file.number);
         }
+        busy.ranges.extend(claim);
         Ok(true)
     }
 
     fn release(&self, compaction: &Compaction) -> Result<()> {
         let mut busy = lock(&self.compacting)?;
         for file in compaction.all_inputs() {
-            busy.remove(&file.number);
+            busy.files.remove(&file.number);
+        }
+        // Recomputed from the same plan, so it is the claim `reserve` pushed. At most one entry
+        // can equal it: two equal claims overlap, and overlapping claims are what `reserve`
+        // refuses.
+        let user = self.comparator.user_comparator();
+        if let Some((smallest, largest)) = output_range(compaction, user) {
+            let level = compaction.output_level();
+            if let Some(at) = busy.ranges.iter().position(|held| {
+                held.cf == compaction.cf
+                    && held.level == level
+                    && held.smallest == smallest
+                    && held.largest == largest
+            }) {
+                busy.ranges.swap_remove(at);
+            }
         }
         drop(busy);
         self.compaction_done.notify_all();
@@ -455,7 +588,7 @@ impl DbInner {
         let mut pointers = lock(&self.compact_pointers)?;
         pointers.insert(
             (compaction.cf, compaction.level),
-            crate::dbformat::extract_user_key(&last.largest).to_vec(),
+            extract_user_key(&last.largest).to_vec(),
         );
         Ok(())
     }
