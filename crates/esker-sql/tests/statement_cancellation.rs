@@ -135,7 +135,10 @@ fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
     let sleeping = std::thread::spawn(move || victim.run("SELECT pg_sleep(10)"));
 
     let mut hunter = pair.session();
-    // The victim has to have started before it can be found; poll rather than sleep a guess.
+    // **Visibly `active`, not merely present.** A row can carry the query text of a statement that
+    // has already finished — `pg_stat_activity` retains it, as a real server does — so matching on
+    // the text alone can find a session that is idle and cancel nothing. The state column is what
+    // says the statement is running *now*.
     let mut pid = None;
     for _ in 0..200 {
         // **`AND pid <> pg_backend_pid()`, and it is not decoration.** This very query contains
@@ -145,7 +148,8 @@ fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
         // only in the full suite when the order flipped. Excluding yourself is why a real server
         // has `pg_backend_pid()`.
         let rows = hunter.rows(
-            "SELECT pid FROM pg_stat_activity              WHERE query LIKE '%pg_sleep%' AND pid <> pg_backend_pid()",
+            "SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep%' \
+             AND state = 'active' AND pid <> pg_backend_pid()",
         );
         if let Some(found) = rows.first().and_then(|row| row.first()) {
             pid = Some(found.clone());
@@ -258,7 +262,7 @@ fn a_statement_waiting_for_a_row_lock_is_cancellable() {
     for _ in 0..300 {
         let rows = hunter.rows(
             "SELECT pid FROM pg_stat_activity \
-             WHERE query LIKE '%SET v = 2%' AND pid <> pg_backend_pid()",
+             WHERE query LIKE '%SET v = 2%' AND state = 'active' AND pid <> pg_backend_pid()",
         );
         if let Some(found) = rows.first().and_then(|row| row.first()) {
             pid = Some(found.clone());
@@ -268,12 +272,17 @@ fn a_statement_waiting_for_a_row_lock_is_cancellable() {
     }
     let pid = pid.expect("the blocked writer must be visible with its statement");
 
-    assert_eq!(
-        hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
-        [["t".to_owned()]]
-    );
-
+    // Asked until it lands, for the reason the sleeping test gives: a cancellation is a request,
+    // and one request being observed is not something a server promises.
     let started = Instant::now();
+    while !blocked.is_finished() && started.elapsed() < Duration::from_secs(10) {
+        assert_eq!(
+            hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
+            [["t".to_owned()]]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     let stopped = blocked
         .join()
         .unwrap()

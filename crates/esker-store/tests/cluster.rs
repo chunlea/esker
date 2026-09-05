@@ -316,7 +316,6 @@ async fn three_stores_elect_a_leader_over_real_tcp() {
 async fn a_write_on_the_leader_reaches_every_peer() {
     let nodes = start_cluster(3).await;
     let mut leader = settled_leader(&nodes).await;
-    let peer = nodes[leader].store.peer().unwrap();
 
     let command = Command::Put {
         key: Bytes::from_static(b"replicated"),
@@ -324,7 +323,21 @@ async fn a_write_on_the_leader_reaches_every_peer() {
     };
     assert_eq!(proposed(&nodes, &mut leader, &command).await, Applied::Done);
 
-    let index = peer.status().await.unwrap().applied;
+    // **Bound *after* the write, for the reason `a_read_index_is_not_behind_what_is_applied`
+    // already gives.** `proposed` follows the office when it moves, so a handle taken before it
+    // can belong to a *former* leader whose applied index is short of the run just written. Then
+    // `wait_for_applied` waits for an index every node passed long ago, and the assertions below
+    // sample mid-replication rather than after it -- which is `node 2 is missing key-15`, the
+    // last key of sixteen, in the gate of 2026-09-04 22:12
+    // (`docs/plans/debt-c7.md` section 21).
+    let index = nodes[leader]
+        .store
+        .peer()
+        .unwrap()
+        .status()
+        .await
+        .unwrap()
+        .applied;
     wait_for_applied(&nodes, index).await;
 
     for (at, node) in nodes.iter().enumerate() {
@@ -381,7 +394,6 @@ async fn a_follower_refuses_a_proposal_and_names_the_leader() {
 async fn a_run_of_writes_replicates_in_order() {
     let nodes = start_cluster(3).await;
     let mut leader = settled_leader(&nodes).await;
-    let peer = nodes[leader].store.peer().unwrap();
 
     for index in 0..16_u32 {
         let command = Command::Put {
@@ -391,7 +403,21 @@ async fn a_run_of_writes_replicates_in_order() {
         proposed(&nodes, &mut leader, &command).await;
     }
 
-    let applied = peer.status().await.unwrap().applied;
+    // **Bound *after* the write, for the reason `a_read_index_is_not_behind_what_is_applied`
+    // already gives.** `proposed` follows the office when it moves, so a handle taken before it
+    // can belong to a *former* leader whose applied index is short of the run just written. Then
+    // `wait_for_applied` waits for an index every node passed long ago, and the assertions below
+    // sample mid-replication rather than after it -- which is `node 2 is missing key-15`, the
+    // last key of sixteen, in the gate of 2026-09-04 22:12
+    // (`docs/plans/debt-c7.md` section 21).
+    let applied = nodes[leader]
+        .store
+        .peer()
+        .unwrap()
+        .status()
+        .await
+        .unwrap()
+        .applied;
     wait_for_applied(&nodes, applied).await;
 
     for (at, node) in nodes.iter().enumerate() {

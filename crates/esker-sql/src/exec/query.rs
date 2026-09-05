@@ -90,7 +90,12 @@ impl<'a> Scope<'a> {
 
     /// One table under its own name, which is every statement that does not write an alias.
     pub(super) fn single(table: &'a TableDef) -> Self {
-        Scope::single_as(table, table.name.clone())
+        // The same implicit alias `plan::TableRef::referred_as` gives: a qualified relation
+        // answers to its bare name.
+        Scope::single_as(
+            table,
+            crate::catalog::split_qualified(&table.name).1.to_owned(),
+        )
     }
 
     /// The target row and the **proposed** row side by side, for an `ON CONFLICT … DO UPDATE`.
@@ -261,7 +266,19 @@ impl<'a> Scope<'a> {
     /// `invalid reference to FROM-clause entry`, with a `HINT` naming the alias. Answering the
     /// first for both would tell a user their table is absent when it is right there.
     fn entry(&self, qualifier: &str) -> Result<usize> {
-        if let Some(index) = self.names.iter().position(|name| name == qualifier) {
+        let mut matches = self
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| *name == qualifier);
+        if let Some((index, _)) = matches.next() {
+            // **Two entries can answer to one bare name** now that a qualified relation keeps its
+            // implicit alias: `FROM s1.things, s2.things` is a `FROM` PostgreSQL allows, and
+            // `things.name` over it is `42P09` there rather than a silent choice of the first —
+            // which is the same reason an ambiguous *column* is refused two screens down.
+            if matches.next().is_some() {
+                return Err(SqlError::AmbiguousTableReference(qualifier.to_owned()));
+            }
             return Ok(index);
         }
         if let Some(index) = self.tables.iter().position(|table| table.name == qualifier) {
@@ -1234,11 +1251,25 @@ fn plan_chain(
     for (join, inner) in select.joins.iter().zip(inners) {
         entries.push((*inner, join.table.referred_as().to_owned()));
     }
-    for (at, (_, name)) in entries.iter().enumerate() {
+    // **Judged on `identity`, not on the referable name.** Two relations of one name in different
+    // schemas share an implicit alias and are still two entries a query may have — measured, a real
+    // server takes `FROM s1.things, s2.things` and refuses only the bare reference to it. Keying
+    // this on `referred_as` refused the `FROM` itself.
+    let identities: Vec<&str> = std::iter::once(
+        select
+            .from
+            .as_ref()
+            .map_or("", crate::plan::TableRef::identity),
+    )
+    .chain(select.joins.iter().map(|join| join.table.identity()))
+    .collect();
+    for (at, name) in identities.iter().enumerate() {
         // The empty name is a derived table with no alias, which PostgreSQL 19 allows and which
         // nothing can refer to -- so two of them are two anonymous relations, not a duplicate.
-        if !name.is_empty() && entries[..at].iter().any(|(_, earlier)| earlier == name) {
-            return Err(SqlError::DuplicateTableName(name.clone()));
+        if !name.is_empty() && identities[..at].contains(name) {
+            return Err(SqlError::DuplicateTableName(
+                crate::catalog::split_qualified(name).1.to_owned(),
+            ));
         }
     }
 
@@ -1679,8 +1710,22 @@ fn from_names(select: &Select) -> Result<(&str, &str)> {
         .joins
         .first()
         .map_or("", |join| join.table.referred_as());
-    if !right.is_empty() && left == right {
-        return Err(SqlError::DuplicateTableName(left.to_owned()));
+    // **Identity, not the referable name** — the same distinction the chain above makes, and the
+    // reason it matters here too: `s1.things` and `s2.things` are both referable as `things` and
+    // are two entries a real server allows. What it refuses is the bare *reference*, which
+    // `Scope::entry` does with `42P09`.
+    let left_identity = select
+        .from
+        .as_ref()
+        .map_or("", crate::plan::TableRef::identity);
+    let right_identity = select
+        .joins
+        .first()
+        .map_or("", |join| join.table.identity());
+    if !right_identity.is_empty() && left_identity == right_identity {
+        return Err(SqlError::DuplicateTableName(
+            crate::catalog::split_qualified(left_identity).1.to_owned(),
+        ));
     }
     Ok((left, right))
 }
@@ -3471,13 +3516,26 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         // through to the arm below so that `WHERE (SELECT max(id) FROM a)` gets PostgreSQL's own
         // sentence with the subquery's type in it — measured, `not type bigint`.
         Expr::Subquery(sub) if sub.value_type() == ColumnType::Bool => Ok(()),
+        // **A boolean is a predicate whatever shape it arrived in**, so the last word belongs to
+        // the type and not to the list above — which is the shapes whose type needs no lookup.
+        // PostgreSQL's rule is `coerce_to_boolean` over the resolved type and nothing else, and
+        // `Aggregation::check_boolean` already writes the same rule for `HAVING`.
+        //
+        // Without the lookup this arm refused every boolean-valued **catalog function** — twelve
+        // of them, `@@`, `&&`, `@>` and `?` among the spellings — with a sentence that is its own
+        // disproof: `argument of WHERE must be type boolean, not type boolean`. A server cannot
+        // refuse a boolean for not being one.
+        //
         // PostgreSQL names the type it got, and a user reading "must be type boolean" without it
         // has to work out which of their columns was the problem. Measured, both clauses:
         // `argument of WHERE must be type boolean, not type bigint`.
-        other => Err(SqlError::DatatypeMismatch(format!(
-            "argument of {clause} must be type boolean, not type {}",
-            expr_type(other, scope).map_or("unknown", ColumnType::name)
-        ))),
+        other => match expr_type(other, scope) {
+            Ok(ColumnType::Bool) => Ok(()),
+            ty => Err(SqlError::DatatypeMismatch(format!(
+                "argument of {clause} must be type boolean, not type {}",
+                ty.as_ref().map_or("unknown", |ty| ty.name())
+            ))),
+        },
     }
 }
 

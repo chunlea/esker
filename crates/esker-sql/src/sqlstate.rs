@@ -237,6 +237,10 @@ pub const AMBIGUOUS_COLUMN: &str = "42702";
 /// A call whose argument types match more than one candidate: `sum('lit')`, where the `unknown`
 /// literal fits every `sum` PostgreSQL has.
 pub const AMBIGUOUS_FUNCTION: &str = "42725";
+/// A bare qualifier that more than one FROM entry answers to — `FROM s1.things, s2.things`,
+/// where both are referable as `things`. Its own class, not `DUPLICATE_ALIAS`: the entries are
+/// allowed and only the reference is undecidable.
+pub const AMBIGUOUS_ALIAS: &str = "42P09";
 /// Two FROM entries under one name — `FROM t JOIN t`, or two aliases spelled the same.
 pub const DUPLICATE_ALIAS: &str = "42712";
 /// `CREATE TABLE` for a name that already exists.
@@ -425,6 +429,7 @@ mod tests {
         ("UNDEFINED_TABLE", super::UNDEFINED_TABLE),
         ("AMBIGUOUS_COLUMN", super::AMBIGUOUS_COLUMN),
         ("AMBIGUOUS_FUNCTION", super::AMBIGUOUS_FUNCTION),
+        ("AMBIGUOUS_ALIAS", super::AMBIGUOUS_ALIAS),
         ("DUPLICATE_ALIAS", super::DUPLICATE_ALIAS),
         ("DUPLICATE_TABLE", super::DUPLICATE_TABLE),
         ("DUPLICATE_COLUMN", super::DUPLICATE_COLUMN),

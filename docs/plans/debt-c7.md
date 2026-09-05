@@ -984,3 +984,209 @@ One arm, 14 threads, GNU `timeout` proved both ways first. It aborted itself bef
 incident. Spinners were killed and verified with `ps -p` — the check that works. The guard cost
 seven runs and prevented a repeat of the 196 that stopped the previous arm; the finding arrived on
 run 1 regardless.
+
+## 20. `txn_crash_boundaries` settled: the same ambiguous result, one crate over
+
+The record said "not settled either way; no message exists". The message existed as soon as anyone
+asked for it — one arm, 14 busy threads, **3 of 9 runs failed**, and the five tests that fail
+together fail for one reason:
+
+```
+:87  the call reaches a store: AmbiguousResult { method: TxnPrewrite,
+       source: Closed { detail: "region 1 stopped leading with this proposal in its log; it may still commit" } }
+:168 the secondary reads:     AmbiguousResult { method: TxnRollback, source: Closed { …it may still commit } }
+:167 the primary reads:       RetriesExhausted { attempts: 9, source: NotLeader { region_id: 1, leader_hint: Some(2) } }
+:168 the secondary reads:     RetriesExhausted { attempts: 9, source: NotLeader { region_id: 2, leader_hint: None } }
+:346 the owner commits:       Any { .. }
+```
+
+`Closed { "region 1 stopped leading with this proposal in its log; it may still commit" }` is
+**the same string, verbatim**, as the durability item at `esker-store/tests/cluster.rs:509` (§13).
+The coordinator's question — *do they have the same ambiguous-result shape before calling them
+load-only* — is answered: yes, one crate over, and it was never load-only.
+
+Three details worth keeping:
+
+* **A read is not exempt.** `read_both` does `txn.get`, and it came back
+  `AmbiguousResult { method: TxnRollback }`: a read that meets an abandoned transaction *resolves*
+  it, and that resolution is a mutation the office can move under. The retry therefore wraps the
+  whole read — begin and both gets — because retrying one half against a snapshot whose other half
+  already failed compares two different instants.
+* **`Any { .. }` was not a separate failure.** The live-lock test's owner thread calls the same
+  `call()`, so its panic was that expect propagating through `join`. One fix, three sites.
+* **`RetriesExhausted { attempts: 9, .. NotLeader { leader_hint: None } }`** is the router giving up
+  while *nobody* held the office — the same state as §19's region 77, seen from the client.
+
+### What was changed, and what deliberately was not
+
+`retrying` re-asks while `the_office_moved(&error)` — `AmbiguousResult` or `RetriesExhausted`, and
+**nothing else**. A `TxnConflict`, a `LockNotCleared`, any refusal, is the store *answering*, and
+this file exists to assert on those; retrying one would turn a finding into thirty seconds of
+silence. Repeating is safe here because every verb is idempotent at a fixed timestamp — a prewrite
+for one `start_ts`, a commit for one `(start_ts, commit_ts)`, a rollback of one `start_ts`, a read
+— so a second apply cannot be observed. A caller that must not double-apply branches on
+`Error::changed_nothing` instead, as its doc comment says; these tests are not that caller.
+
+### Before and after, same arm shape
+
+| | runs | failed | loads seen |
+|---|---|---|---|
+| before | 9 | **3** | failing from load 36 upward |
+| after | 6 | **0** | clean at 51, 64 and 74 |
+
+Small denominators, and said so — but the after-arm ran clean at loads where the before-arm was
+already failing. Both arms stopped themselves on the load ceiling rather than on a count.
+
+Solo timing is unchanged: 6 tests in 1.12 s, exactly as before the retry.
+
+**Ten sightings. Still none fixed by changing a budget** — and the one deadline this wave did add
+(§18's 30 s) replaced a stopwatch on an event, leaving the negative proof's clock untouched.
+
+## 21. A handle taken before the office moved, twice more — and a third crate says `leader = None`
+
+The gate of the `2a4bf8f1` merge ran at load average 86–115, driven by two other lanes' containers
+and macOS storage churn rather than by anything of this lane's, and lost eight tests across four
+crates. Most are that load. Two are not, and both were worth the run.
+
+### `cluster.rs:401` — `node 2 is missing key-15`
+
+```rust
+let mut leader = settled_leader(&nodes).await;
+let peer = nodes[leader].store.peer().unwrap();   // <- before the writes
+for index in 0..16 { proposed(&nodes, &mut leader, &command).await; }
+let applied = peer.status().await.unwrap().applied;
+wait_for_applied(&nodes, applied).await;
+```
+
+`proposed` **follows the office when it moves** — that is what it was added for. So the handle taken
+before the loop can belong to a *former* leader, whose applied index is short of the run that was
+just written. `wait_for_applied` then waits for an index every node passed long ago and returns at
+once, and the assertions sample mid-replication. `key-15` is the last of the sixteen, which is
+exactly what a short wait looks like.
+
+Not a replication defect, and worth saying plainly: no acknowledged write was lost. Every one of
+the sixteen was acknowledged by `proposed` and every one arrives; the test simply looked too early.
+
+Two sites had it — `a_write_on_the_leader_reaches_every_peer` as well — and a **third did not**:
+
+```rust
+// Bound *after* the write: if the first leader stepped down the write was served elsewhere,
+// and every assertion below is about the node that currently leads.
+let peer = nodes[leader].store.peer().unwrap();
+```
+
+That comment was already in this file, at `a_read_index_is_not_behind_what_is_applied`, written by
+whoever fixed that site. The lesson was learned once and not carried to its two neighbours. Both
+now bind after the write and cite it.
+
+This is the fifth time in this wave: §16, §17, §18's postscript, §20, and now here. **A handle or a
+fact captured before the office can move, then used as though it still holds.**
+
+### `snapshot.rs:233` — `leader=Some(None)`, a third crate agreeing
+
+```
+writing b"k00086" never succeeded after 3689 attempts in 30.000054507s;
+last answer peer is not the leader of region 1; last asked store 2, whose peer says leader=Some(None)
+```
+
+`Some(None)` is a peer that exists and believes **nobody** leads — §19's leaderless region, reached
+now from `esker-store::snapshot` as well as from `promotion` (§19) and from `esker-client`'s router
+(§20, `NotLeader { leader_hint: None }`). Three test families, three crates, one state.
+
+§14's guard is correctly silent here: it fires when a hint points outside the group, and there is no
+hint when no peer knows a leader. `put` round-robins and spends its deadline, which is the right
+behaviour against a region that cannot answer. **Nothing to fix in the test** — this is more
+evidence for the debt already logged against the raft/store core, and the strongest yet, because
+each crate reaches it by a different path.
+
+## 22. A bound that had quietly become the verdict
+
+`esker-cli::cluster_start` was one of three reds on the ci-tree gate of `b78dfa7d`, and it passes
+3/3 alone. It is this lane's own test, closed in §1, so the recurrence is this lane's to explain.
+
+The readiness probe is right: it asks the driver a question only a driver answers
+(`ask_the_driver` — handshake plus `PdReq::Status`), it notices a child that exited and prints its
+status, and it names the last refusal when it gives up. None of that changed. What was wrong was
+one constant, and its own doc comment said so:
+
+> It bounds a probe against a socket that accepts and then says nothing, which is the case the
+> probe exists for; the budgets that decide whether a process started are `PD_START_TIMEOUT` and
+> `STORE_START_TIMEOUT`.
+
+At `500 ms` that sentence was false. `request_timeout` bounds the handshake as well as the call,
+and a driver that is up and healthy still has to be *scheduled* to complete a handshake — on a box
+at load average 90 that takes longer than half a second. So every probe timed out, the loop never
+saw an answer, and the start failed at `PD_START_TIMEOUT` blaming a driver that was fine. The
+constant meant to *bound* a probe had become the one that returned the verdict.
+
+### This is a number change, and it is not a budget increase
+
+Said plainly, because this wave has claimed nine times that nothing was fixed by changing a budget,
+and this is a number: **neither deciding budget moved.** `PD_START_TIMEOUT` is still 20 s and
+`STORE_START_TIMEOUT` still 60 s. What changed is a bound that was silently overriding them, so the
+verdict returns to the budgets that were always documented as owning it.
+
+It also costs nothing on the path that matters. A process that has not bound yet refuses the
+**connect**, which returns immediately whatever this value says; `PROBE_TIMEOUT` is only ever spent
+on a socket that accepted and then went quiet — precisely its stated job. Five seconds leaves four
+probes inside the driver's budget and twelve inside the stores'.
+
+The visible cost is the squatter tests, which exist to be answered by a socket that stays silent:
+the file now runs in 12 s rather than about 3. Bounded, and paid in the case the constant is for.
+
+### The shape
+
+§14 found a guard that could not fire because the group was too small. §17 found an `await` between
+a measurement and its use. This is the third of the same family: **a mechanism whose documented
+contract and whose actual behaviour disagreed, with the comment right and the code wrong.** Reading
+the comment against the number was the whole diagnosis; no arm, no reproduction, no message needed.
+
+## 23. Sweeping for the shape that came back six times, and what the wave found
+
+No-load work while the machine was held for another lane's benchmark. Two passes over what this
+lane has written.
+
+### The citations hold
+
+Sections 0–22 cite 7 file paths, 12 commit hashes and a run of cross-references. Checked
+mechanically rather than remembered: every path exists, every hash resolves to a commit, and every
+`§N` names a section that exists. Worth doing because a facts-only document written from memory has
+been wrong here before.
+
+### The sweep: no seventh instance
+
+One shape accounts for six of this wave's findings — **a handle or a fact captured before the office
+can move, then used as though it still holds** (§16 the retire helper's leader, §17 its term across
+an `await`, §18's guard test, §20's ambiguous results, §21's two `peer` bindings, and §22's constant
+that had displaced its own budgets). Searching the tests this lane owns for a seventh:
+
+| searched | result |
+|---|---|
+| every `RequestHeader::new` built from a captured epoch | **clean** — all four re-read `regions().get(id)` each time round the loop |
+| every peer/leader handle bound, then an office-moving call, then reused | 27 candidates, **all false positives**: an `epoch` used inside the very `pd.issue` that "moved" it, or a region descriptor used for assertions, or a handle used before the test's closing `stop()` |
+| every one-store `put` group | `retire.rs` and `sim_sweep.rs` **already carry the §14 audit in prose** — "store 1 is the sole voter and cannot lose an election, so the single store is safe by construction. Widening it would say otherwise" |
+
+A negative worth recording because it is a *stated* negative: the epoch path re-reads everywhere,
+and the two files that could have had §14's defect had already reasoned their way out of it in
+writing. The shape is not endemic; it clustered in the two helpers that were doing the most.
+
+### The tally
+
+Eleven sightings reached this lane. What they were:
+
+| | count |
+|---|---|
+| product defects | **2** (`cluster_start`'s readiness probe, §1 — and its own constant, §22) |
+| test defects | **7** (`sim_sweep` ×3 and its clock §18, `promotion`, `cluster_chaos`, `snapshot`'s three faces §14/16/17, `cluster.rs` ×2 §21, `txn_crash_boundaries` §20) |
+| already closed by another lane | **1** (`crash_through_the_client`) |
+| handed to the core, not this lane's to fix | **1** (the leaderless region, §19) |
+
+Two of those "test defects" were committed **by this lane, during this wave**, while writing up the
+very rule they broke (§18's guard test, and §21 inheriting a helper that had learned the lesson at
+one of its three sites). That is the honest shape of the count, and the reason the sweep above was
+worth running rather than assumed.
+
+**The rule held to the end: not one of the eleven was fixed by raising a budget that decides a
+verdict.** §18 replaced a stopwatch on an event with a wait on the event and left the negative
+proof's clock untouched; §22 moved a *bound* that had displaced the two budgets documented as
+owning the decision, and neither of those moved. Both are number changes and both say so.
