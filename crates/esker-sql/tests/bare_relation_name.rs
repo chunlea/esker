@@ -113,3 +113,56 @@ fn a_three_part_reference_is_named_rather_than_answered() {
         "!0A000 the qualified column s2.things.name is not supported"
     );
 }
+
+/// **The implicit alias has to reach every statement that has a `FROM` item**, not only the
+/// `SELECT` the census happened to stop on. Each of these is measured on 19beta1 and each keeps
+/// working there; a fix that reached one scope constructor and not the others would pass the test
+/// above and fail here.
+#[test]
+fn every_statement_with_a_from_item_gets_the_implicit_alias() {
+    let mut node = parity::Node::new(&[
+        "CREATE SCHEMA s1",
+        "CREATE TABLE s1.things (id int8, name text)",
+        "CREATE TABLE s1.other (id int8, tag text)",
+        "INSERT INTO s1.things VALUES (1, 'a'), (2, 'b')",
+        "INSERT INTO s1.other VALUES (1, 'x')",
+    ]);
+
+    node.run("UPDATE s1.things SET name = 'z' WHERE things.id = 1")
+        .unwrap();
+    node.run("DELETE FROM s1.things WHERE things.id = 2")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT name FROM s1.things"),
+        [["z".to_owned()]],
+        "the UPDATE and the DELETE each acted on the row the bare name named"
+    );
+
+    // A join names one side by its alias and the other by its bare name, and then both bare.
+    assert_eq!(
+        node.rows("SELECT t.id FROM s1.things t JOIN s1.other ON other.id = t.id"),
+        [["1".to_owned()]]
+    );
+    assert_eq!(
+        node.rows("SELECT things.id FROM s1.things JOIN s1.other ON other.id = things.id"),
+        [["1".to_owned()]]
+    );
+
+    // A correlated subquery reaches the outer scope by the outer relation's bare name.
+    assert_eq!(
+        node.rows(
+            "SELECT id FROM s1.things WHERE EXISTS (SELECT 1 FROM s1.other WHERE other.id = things.id)"
+        ),
+        [["1".to_owned()]]
+    );
+
+    assert_eq!(
+        node.rows("SELECT id FROM s1.things ORDER BY things.id"),
+        [["1".to_owned()]]
+    );
+
+    // `INSERT … SELECT` would be the seventh shape and is out of reach for a reason of its own:
+    // this node refuses the construct entirely (`0A000 INSERT ... SELECT`), so there is no scope
+    // for an implicit alias to be missing from. Left out rather than asserted, because a test that
+    // stops on a different gap says nothing about this one.
+}

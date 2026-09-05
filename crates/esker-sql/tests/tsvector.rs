@@ -10,18 +10,26 @@
 //! a value is its canonical text, so equality, ordering and an index over the column are the text
 //! machinery's.
 //!
-//! # This slice replays part 1, and the corpus holds all of it
+//! # This slice replays parts 1 and 2, and the corpus holds all of it
 //!
 //! `corpus/pg19_tsvector.txt` is `captures/pg19_tsvector.txt` **byte for byte** — the harness's
 //! captures directory is not in git, so this copy is the capture's only backup and it is kept
-//! whole. The replay below stops at the capture's own `part 2` marker, because the parts after it
-//! need a stemmer (`to_tsvector('english', …)`) and the GIN indexes, and those are separate
-//! landable slices.
+//! whole. The replay takes the file in prefixes as the machinery underneath it lands: part 1 is
+//! the declaration and round trip, part 2 the value and operator surface once there was a stemmer.
 //!
-//! **A prefix rather than a list of declared divergences**, and the reason is mechanical: a
-//! declared divergence over a statement that *raises* here and *succeeds* on PostgreSQL still
-//! aborts the transaction, and every later statement in the file then answers `25P02`. Fifty
-//! declarations would have hidden the file behind the first of them.
+//! **Part 3 is one statement away.** `schema_test.rb`'s two schemas, `tsvector` column and two GIN
+//! indexes now all answer as a real server does except
+//! `CREATE INDEX … USING gin (name_vector)` — a `tsvector` **column** key, which
+//! [`esker_keys::row::is_index_key`] refuses because a `tsvector`'s byte order is not its printed
+//! order ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)). The *expression*
+//! index over `to_tsvector('english', …)` — the same type — is accepted and writes, so the two
+//! paths disagree with each other and reconciling them is an ADR decision rather than a fix.
+//!
+//! **Why it is a prefix and not a list of declared divergences**: a declared divergence over a
+//! statement that *raises* here and *succeeds* on PostgreSQL still aborts the transaction, and
+//! every later statement in the file then answers `25P02`. Fifty declarations would have hidden
+//! the file behind the first of them — and part 3 demonstrated it twice over, since one refusal
+//! swallowed fourteen statements and left a single one visible.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -31,12 +39,12 @@ mod parity;
 /// Nothing: the corpus builds its own table.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// Where the capture stops being about values and starts being about the two GIN indexes.
+/// Where the capture stops, which is now a single statement rather than a section.
 ///
-/// Parts 1 and 2 replay: the declaration and round trip, and the whole function and operator
-/// surface. Part 3 is `schema_test.rb`'s setup and waits on the operator-class machinery
-/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
-/// which is another lane's unit.
+/// Everything above this marker replays; inside part 3 the two schemas, the column, both
+/// expression indexes and every readback agree, and `USING gin (name_vector)` does not. The
+/// marker stays until that is decided, because the capture is one transaction and a refusal
+/// inside it swallows every statement after.
 const PART_3: &str = "# ---- part 3:";
 
 /// What this node answers differently, and why.
