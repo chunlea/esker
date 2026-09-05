@@ -1779,6 +1779,10 @@ impl ColumnDef {
             ColumnType::Timestamp | ColumnType::TimestampTz => {
                 value::precision_of_typmod(self.typmod)
             }
+            // **Not the same arithmetic.** An interval's typmod packs a field mask beside the
+            // precision, so the number is read rather than returned
+            // ([`value::interval_typmod_of_precision`]).
+            ColumnType::Interval => value::interval_precision_of_typmod(self.typmod),
             _ => None,
         }
     }

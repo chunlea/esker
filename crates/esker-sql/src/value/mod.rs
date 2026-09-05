@@ -183,6 +183,53 @@ pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
     u32::try_from(typmod).ok()
 }
 
+/// The largest fractional-seconds precision PostgreSQL keeps, for every type that has one.
+pub const MAX_TIME_PRECISION: u32 = 6;
+
+/// Every interval field kept — the high half of a typmod written as `interval(p)`.
+const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+
+/// The low half of an interval typmod when **no** precision was written.
+const INTERVAL_NO_PRECISION: i32 = 0xFFFF;
+
+/// The typmod a declared precision makes for `interval(p)`, which is **not** the precision.
+///
+/// PostgreSQL packs `(range_mask << 16) | precision`, with `0xFFFF` in the low half meaning no
+/// precision was written and `0x7FFF` in the high half meaning every field is kept. Measured on
+/// 19beta1, one `format_type(1186, …)` at a time:
+///
+/// ```text
+/// -1           interval                  2147418115   interval(3)     -- 0x7FFF0003
+/// 2147418118   interval(6)               589823       interval day    -- 0x0008FFFF, a mask
+/// 67698687     interval day to hour      3            ERROR:  invalid INTERVAL typmod: 0x3
+/// ```
+///
+/// **That last line is why this arithmetic exists** rather than storing `p`: a bare precision is
+/// not an interval typmod at all, and [`crate::catalog::ColumnDef::typmod`] is handed to clients
+/// raw on two wire surfaces. The field mask is a different question and stays a declared
+/// divergence — it says which fields a value *keeps*, which is semantics and not a width.
+#[must_use]
+pub fn interval_typmod_of_precision(precision: u32) -> i32 {
+    let precision = i32::try_from(precision.min(MAX_TIME_PRECISION)).unwrap_or(0);
+    (INTERVAL_FULL_RANGE << 16) | precision
+}
+
+/// The declared precision back out of an interval typmod, or `None` for one that has none.
+///
+/// `None` covers both a typmod of `-1` and a field mask like `interval day`, whose low half is
+/// `0xFFFF`. A mask this node never stores can still arrive through a hand-written `format_type`.
+#[must_use]
+pub fn interval_precision_of_typmod(typmod: i32) -> Option<u32> {
+    if typmod < 0 {
+        return None;
+    }
+    let precision = typmod & INTERVAL_NO_PRECISION;
+    if precision == INTERVAL_NO_PRECISION {
+        return None;
+    }
+    u32::try_from(precision).ok()
+}
+
 /// [`fit_to_typmod`] for an **explicit cast**, where a string too long is truncated rather than
 /// refused.
 ///
@@ -450,6 +497,12 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         // `format_type(1083, 0)`, which is `time(0) without time zone` and not the bare name.
         (ColumnType::Time, _) => match precision_of_typmod(typmod) {
             Some(precision) => format!("time({precision}) without time zone"),
+            None => ty.name().to_owned(),
+        },
+        // `interval(3)` — a suffix, unlike `timestamp`'s, and read out of a packed typmod
+        // rather than off the number itself ([`interval_typmod_of_precision`]).
+        (ColumnType::Interval, _) => match interval_precision_of_typmod(typmod) {
+            Some(precision) => format!("interval({precision})"),
             None => ty.name().to_owned(),
         },
         // `numeric(10,2)`, and `numeric(11,-2)` — the scale is signed and prints signed.
