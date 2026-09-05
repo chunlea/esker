@@ -30,10 +30,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              >= y AND a <= x)` — so this is a parser item and not an executor one, the same family \
              as the `CREATE DATABASE` option list and the `EXCLUDE` constraint. Nothing \
              `ActiveRecord` sends uses it: all fifteen failing statements are the plain form.",
+            "pg19_between.txt:35",
         ),
         (
             "SELECT 'r', id FROM bt WHERE id NOT BETWEEN SYMMETRIC 3 AND 2 ORDER BY id",
             "The same gap in its negated spelling.",
+            "pg19_between.txt:36",
         ),
         (
             "SELECT 'r', 5 BETWEEN 1 AND 10 AS plain, 5 BETWEEN 10 AND 1 AS reversed, 5 BETWEEN \
@@ -42,6 +44,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              columns are the plain and reversed forms, which this node answers correctly — the \
              refusal is the whole *statement's*, because one unreadable keyword in it stops the \
              parse. The two facts it would have proved are proved by the rows above it instead.",
+            "pg19_between.txt:37",
         ),
     ],
 };

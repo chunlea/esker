@@ -76,6 +76,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT (SELECT max(id) FROM sq_a) + 0",
         "the operator `+` is `0A000` naming itself and was before this unit. The subquery in \
              it runs the moment arithmetic does.",
+        "UNMEASURED",
     )],
 };
 

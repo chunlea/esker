@@ -1,0 +1,120 @@
+# `CREATE SERVER` / `CREATE FOREIGN TABLE` / `DROP SERVER` — `foreign_table_test.rb`, verbatim.
+#
+# **This file is an ADR 0031 contract violation, not a ranking row.** Run 47 found
+# `foreign_table_test.rb` answering ten `DROP SERVER`s with the parser's expected-token list; run 50
+# found its neighbour doing the same — `syntax error: sql parser error: Expected: COLLATION,
+# CONNECTOR, DATABASE, EXTENSION, FUNCTION, INDEX, OPERATOR, POLICY, PROCEDURE, ROLE, SCHEMA,
+# SECRET, SEQUENCE, …`, 10 raises. C2 requires a refusal that **names the feature**; a token list is
+# category (a), the one class the contract forbids outright. Neither run's raises appear in any
+# ranking row, because each of those tests had already been counted on the
+# `extension "postgres_fdw" is not available` its `setup` raised first. So this capture is here to
+# say what the four statements are and what a real server answers, so the refusal can name them.
+#
+# The four, from `foreign_table_test.rb:22-44` and `:47-50`, with the test's own arguments:
+#
+#     CREATE SERVER foreign_server FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname '<arunit2>')
+#     CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server
+#     CREATE FOREIGN TABLE foreign_professors (id int, name character varying NOT NULL)
+#       SERVER foreign_server OPTIONS (table_name 'professors')
+#     DROP SERVER IF EXISTS foreign_server CASCADE
+#
+# Things reasoning would get wrong:
+#
+# * **A foreign table is a data source but not a table.** `test_table_exists` asserts
+#   `table_exists?` is **false** for one while `data_source_exists?` is **true**, and that is one
+#   `relkind` letter: AR maps `BASE TABLE` to `'r','p'`, `VIEW` to `'v','m'` and `FOREIGN TABLE` to
+#   `'f'` (`postgresql/schema_statements.rb:1171-1176`). Answering `f` as `r` passes the wrong test.
+# * **`CREATE SERVER` validates nothing.** The database named in `OPTIONS (dbname …)` need not exist
+#   — no connection is made until something reads the foreign table, and *that* is where the error
+#   comes from. The rows below show both: a server pointing at a database that does not exist is
+#   created happily, and the `SELECT` through it is what fails.
+# * **A foreign table's columns are its own declaration**, not the remote's. They live in
+#   `pg_attribute` like any other relation; the mapping to the remote is `pg_foreign_table.ftoptions`.
+# * **`DROP SERVER … CASCADE` takes the user mapping and every foreign table with it**, which is why
+#   the test's teardown is one statement. Both are dependencies and both refuse a bare `DROP SERVER`
+#   with `2BP01`: dropping the foreign table is **not** enough, the user mapping holds it too. The
+#   rows below take them off one at a time to show it.
+# * **Nothing connects until something reads.** The loopback probe below fails at `SELECT` time with
+#   `08001`, naming the role the wrapper tried — the server and the mapping were both created
+#   without complaint. That is the fact the probe is here for; which role a container happens to
+#   accept is not. The `NOTICE`/`DETAIL` a cascade prints is described here
+#   rather than captured, because `sesscap.py` records continuation lines with no prefix in the rows
+#   column.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK` — `CREATE SERVER`, `CREATE USER MAPPING` and
+# `CREATE FOREIGN TABLE` are all transactional — and the `SELECT count(*)` lines after the
+# `ROLLBACK` prove it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE EXTENSION IF NOT EXISTS "postgres_fdw"		-
+SELECT 'r', fdwname, fdwhandler <> 0 AS has_handler, fdwvalidator <> 0 AS has_validator FROM pg_foreign_data_wrapper WHERE fdwname = 'postgres_fdw'	text,name,boolean,boolean	r|postgres_fdw|t|t
+# ---- the test's four statements, with its own arguments ----
+CREATE SERVER foreign_server FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'activerecord_unittest2')		-
+SELECT 'r', srvname, srvoptions FROM pg_foreign_server WHERE srvname = 'foreign_server'	text,name,text[]	r|foreign_server|{dbname=activerecord_unittest2}
+SELECT 'r', s.srvname, w.fdwname FROM pg_foreign_server s JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw WHERE s.srvname = 'foreign_server'	text,name,name	r|foreign_server|postgres_fdw
+CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server		-
+SELECT 'r', srvname, usename FROM pg_user_mappings WHERE srvname = 'foreign_server'	text,name,name	r|foreign_server|esker
+CREATE FOREIGN TABLE foreign_professors (id int, name character varying NOT NULL) SERVER foreign_server OPTIONS (table_name 'professors')		-
+SELECT 'r', ftoptions FROM pg_foreign_table t JOIN pg_class c ON c.oid = t.ftrelid WHERE c.relname = 'foreign_professors'	text,text[]	r|{table_name=professors}
+# ---- what the catalog calls it, and the one letter the two AR questions turn on ----
+SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'foreign_professors'	text,name,"char"	r|foreign_professors|f
+SELECT 'r', count(*) FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'foreign_professors' AND c.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+SELECT 'r', count(*) FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'foreign_professors' AND c.relkind IN ('f') AND n.nspname = ANY (current_schemas(false))	text,bigint	r|1
+SELECT 'r', c.relname, c.relkind FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f') AND c.relname = 'foreign_professors'	text,name,"char"	r|foreign_professors|f
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"foreign_professors"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|f ; r|name|character varying|t
+SELECT 'r', foreign_table_name, foreign_server_name FROM information_schema.foreign_tables WHERE foreign_table_name = 'foreign_professors'	text,name,name	r|foreign_professors|foreign_server
+# ---- CREATE SERVER validated nothing: the read is where the missing database is noticed ----
+SAVEPOINT f1		-
+SELECT 'r', count(*) FROM foreign_professors	!08001 could not connect to server "foreign_server" DETAIL: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "postgres" does not exist
+ROLLBACK TO f1		-
+# ---- a server that points somewhere real, and a foreign table that can actually be read ----
+CREATE SERVER loopback_server FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'esker', host '127.0.0.1', port '5432')		-
+CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_server OPTIONS (user 'esker')		-
+CREATE FOREIGN TABLE ft_class (relname name) SERVER loopback_server OPTIONS (schema_name 'pg_catalog', table_name 'pg_class')		-
+SAVEPOINT f2		-
+SELECT 'r', count(*) > 0 AS could_read FROM ft_class		r|t
+ROLLBACK TO f2		-
+# ---- the errors around the four statements ----
+SAVEPOINT f3		-
+CREATE SERVER foreign_server FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'x')	!42710 server "foreign_server" already exists
+ROLLBACK TO f3		-
+SAVEPOINT f4		-
+CREATE SERVER other_server FOREIGN DATA WRAPPER nosuchwrapper OPTIONS (dbname 'x')	!42704 foreign-data wrapper "nosuchwrapper" does not exist
+ROLLBACK TO f4		-
+SAVEPOINT f5		-
+CREATE FOREIGN TABLE ft_orphan (id int) SERVER nosuchserver	!42704 server "nosuchserver" does not exist
+ROLLBACK TO f5		-
+SAVEPOINT f6		-
+DROP SERVER nosuchserver	!42704 server "nosuchserver" does not exist
+ROLLBACK TO f6		-
+DROP SERVER IF EXISTS nosuchserver		-
+# ---- ALTER, which the adapter never sends but the grammar has to place ----
+ALTER SERVER foreign_server OPTIONS (SET dbname 'activerecord_unittest')		-
+SELECT 'r', srvoptions FROM pg_foreign_server WHERE srvname = 'foreign_server'	text,text[]	r|{dbname=activerecord_unittest}
+ALTER FOREIGN TABLE foreign_professors ADD COLUMN extra integer		-
+SELECT 'r', count(*) FROM pg_attribute WHERE attrelid = '"foreign_professors"'::regclass AND attnum > 0 AND NOT attisdropped		r|3
+# ---- a server with a foreign table on it will not drop without CASCADE ----
+SAVEPOINT f7		-
+DROP SERVER foreign_server	!2BP01 cannot drop server foreign_server because other objects depend on it DETAIL: user mapping for esker on server foreign_server depends on server foreign_server HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO f7		-
+DROP FOREIGN TABLE foreign_professors		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'foreign_professors'	text,bigint	r|0
+# ...and it still will not drop, because the USER MAPPING depends on it too
+SAVEPOINT f8		-
+DROP SERVER foreign_server	!2BP01 cannot drop server foreign_server because other objects depend on it DETAIL: user mapping for esker on server foreign_server depends on server foreign_server HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO f8		-
+DROP USER MAPPING FOR CURRENT_USER SERVER foreign_server		-
+DROP SERVER foreign_server		-
+SELECT 'r', count(*) FROM pg_foreign_server WHERE srvname = 'foreign_server'	text,bigint	r|0
+# ---- the teardown statement, on the server that still has a foreign table ----
+DROP SERVER IF EXISTS loopback_server CASCADE		drop cascades to foreign table ft_class
+SELECT 'r', count(*) FROM pg_foreign_server WHERE srvname = 'loopback_server'	text,bigint	r|0
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'ft_class'	text,bigint	r|0
+SELECT 'r', count(*) FROM pg_user_mappings WHERE srvname IN ('foreign_server','loopback_server')	text,bigint	r|0
+DROP EXTENSION IF EXISTS "postgres_fdw" CASCADE		-
+ROLLBACK		-
+# ---- proof the oracle is as it was ----
+SELECT count(*) FROM pg_foreign_server	bigint	0
+SELECT count(*) FROM pg_class WHERE relname IN ('foreign_professors','ft_class')	bigint	0
+SELECT count(*) FROM pg_extension WHERE extname = 'postgres_fdw'	bigint	0

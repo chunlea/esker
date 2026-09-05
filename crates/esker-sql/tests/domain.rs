@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              here, which is the standing difference in the **schema model** rather than anything \
              about domains: this node has one schema for its built-in types and a real server puts \
              them in `pg_catalog`. `pg_type`'s `typnamespace` column already carries that note.",
+            "pg19_domain.txt:38",
         ),
         (
             "SELECT 'r', format_type(a.atttypid, a.atttypmod), t.typtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'dm_shadow'::regclass AND a.attname = 'c'",
@@ -50,6 +51,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              resolution to walk the `search_path` ahead of the built-in vocabulary, which is a \
              unit of its own and not one `schema_test.rb` needs: measured, that file raises this \
              shape **zero** times now and `format_type` agrees on the spelling either way.",
+            "pg19_domain.txt:41",
         ),
     ],
 };

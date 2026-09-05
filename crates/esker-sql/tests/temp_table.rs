@@ -45,6 +45,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          `UNLOGGED` is cut out of the source before parsing (`crate::parse::strip_unlogged`), and \
          the strip deliberately does not match the two together — so the combination reaches the \
          parser and fails there, exactly as it does on a real server.",
+        "pg19_temp_table.txt:96",
     )],
 };
 

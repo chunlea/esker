@@ -23,12 +23,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              (`CreateIndex::include: Vec<Ident>`), so an ordering inside it is a *syntax* error \
              before the lowering is reached. PostgreSQL refuses it too, with `42P17` and its own \
              sentence; both refuse, and what differs is which layer says so",
+            "pg19_include_index.txt:74",
         ),
         (
             "CREATE INDEX \"ci_opclass\" ON \"companies\" (\"firm_id\") INCLUDE (\"name\" \
              varchar_pattern_ops)",
             "The other half of the same parser gap — an operator class has nowhere to go in a \
              `Vec<Ident>` either. `42P17` there, `42601` here",
+            "pg19_include_index.txt:77",
         ),
         (
             "ALTER TABLE \"companies\" ADD CONSTRAINT \"companies_u_include\" UNIQUE \
@@ -37,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `sqlparser`\u{2019}s `UniqueConstraint` has no `include` field, so the constraint \
              spelling does not parse — and `ADD CONSTRAINT ... UNIQUE` is an action this node has \
              never had in any case. The index spelling, which is what statement 787 writes, runs",
+            "pg19_include_index.txt:88",
         ),
         (
             "SELECT \'r\', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = \
@@ -45,12 +48,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the previous statement would have added does not exist here, so this answers no rows \
              where a real server answers one. Not a `25P02` cascade — the block is not aborted, \
              the object is simply absent — so it is declared rather than counted",
+            "pg19_include_index.txt:89",
         ),
         (
             "SELECT \'r\', pg_get_indexdef(\'companies_u_include\'::regclass)",
             "The same absence, one statement later, and this one is `42P01` because `::regclass` \
              resolves a name that was never created. Both close together the day `ADD CONSTRAINT \
              ... UNIQUE` and `sqlparser`\u{2019}s `UniqueConstraint::include` do",
+            "pg19_include_index.txt:90",
         ),
     ],
 };

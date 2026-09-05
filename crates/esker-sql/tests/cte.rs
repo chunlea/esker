@@ -50,25 +50,30 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              is on the keyword rather than on a recursive *body*: a real server runs this one, \
              because the body does not recurse. A second evaluation model is a phase, not a unit \
              (`docs/plans/phase-12-subquery.md` §4).",
+            "UNMEASURED",
         ),
         (
             "WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
              SELECT * FROM t",
             "`WITH RECURSIVE`, and `UNION ALL` under it, both `0A000` by name.",
+            "UNMEASURED",
         ),
         (
             "WITH t AS (DELETE FROM ct_b WHERE id = 12 RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item is `0A000` naming itself: the read path is this phase \
              and the write path needs the same expressions resolved against a statement that is \
              already writing.",
+            "UNMEASURED",
         ),
         (
             "WITH t AS (INSERT INTO ct_b VALUES (99, 1, 1) RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item, as above.",
+            "UNMEASURED",
         ),
         (
             "WITH t AS (UPDATE ct_b SET v = 1 WHERE id = 10 RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item, as above.",
+            "UNMEASURED",
         ),
     ],
 };

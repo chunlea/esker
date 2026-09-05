@@ -1,0 +1,108 @@
+# `CREATE TYPE` — `AS RANGE`, `AS (…)` composite and `AS ENUM` — as a real PostgreSQL 19beta1
+# answers them.
+#
+# **Run 45 ranking row 3: 51 tests across 3 files**, and the three files want three different forms.
+# Taken verbatim from the tests' own `setup`:
+#
+#   * `adapters/postgresql/range_test.rb:19` (46 tests) — **two statements in one `execute`**:
+#     `CREATE TYPE floatrange AS RANGE ( subtype = float8, subtype_diff = float8mi );
+#      CREATE TYPE stringrange AS RANGE ( subtype = varchar );`
+#   * `adapters/postgresql/composite_test.rb:19` (4 tests) —
+#     `CREATE TYPE full_address AS ( city VARCHAR(90), street VARCHAR(90) );`
+#   * `adapters/postgresql/timestamp_test.rb:196` (1 test) —
+#     `CREATE TYPE custom_time_format AS ENUM ('past', 'present', 'future');`
+#
+# So the row is not "enums": it is **ranges first**, by nine to one.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
+#
+# **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
+# The `SELECT count(*)` at the end proves it left nothing behind and answers `0`. The `\gdesc` pass
+# runs after the rollback, so statements naming these types have an **empty** declared-types column;
+# the `pg_typeof` line pins `"char"` for `typtype` and `typcategory`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`typtype` and `typcategory` are different one-letter codes and both matter**: range is
+#     `r`/`R`, composite `c`/`C`, enum `e`/`E`. A composite additionally has `typrelid <> 0` — it
+#     owns a `pg_class` row, which is how its fields are stored; a range and an enum do not.
+#   * **Creating a range type creates its array type too**: `typarray` is `floatrange[]`, with no
+#     statement asking for it.
+#   * **A bare decimal literal will not go into a `float8` range.**
+#     `floatrange(1.0, 5.0) @> 3.0` is **`42883 operator does not exist: floatrange @> numeric`**
+#     with the "add explicit type casts" HINT — because `3.0` is `numeric`, not `float8`. With
+#     `3.0::float8` it answers `t`. The constructor accepts `1.0` happily; only the operator is
+#     strict, so an implementation can pass the `CREATE` and the constructor and still fail here.
+#   * **A custom range prints and behaves like the built-in ones**: `[1,5)`, half-open, with
+#     `lower`, `upper`, `&&` and `isempty` all defined. `pg_range` carries `rngsubtype`
+#     (`double precision`), `rngsubdiff` (`float8mi`) and an **empty** `rngcanonical` — the
+#     `subtype_diff` the test supplies lands in `rngsubdiff`, and nothing fills `rngcanonical`.
+#   * **A composite value quotes only the fields that need it**: `(Paris,Rue)` but
+#     `("New York",Broadway)`. Both the `ROW('Paris','Rue')` constructor and the literal
+#     `'("New York","Broadway")'` are accepted, and they round-trip to the same shape.
+#   * **Field access needs the parentheses**: `(address).city`. And `format_type` of a composite
+#     column is just `full_address` — no `(90)`, no schema qualification.
+#   * **An enum with no labels is legal.** `CREATE TYPE emptyenum AS ENUM ()` succeeds and
+#     `typtype` is `e`. A bad label is `22P02 invalid input value for enum custom_time_format:
+#     "nope"` — `22P02`, the input-syntax class, not `42704`.
+#   * **`enumsortorder` is 1, 2, 3 and is what ordering compares** — `'past' < 'future'` is `t`
+#     because of declaration order, not alphabetical order.
+#   * **`DROP TYPE` with a dependent column is `2BP01`**, DETAIL naming *the column and its table*
+#     (`column address of table postgresql_composites depends on type full_address`), not the table
+#     alone. Duplicate type is `42710`; an unknown subtype is `42704`.
+BEGIN		-
+CREATE TYPE floatrange AS RANGE ( subtype = float8, subtype_diff = float8mi ); CREATE TYPE stringrange AS RANGE ( subtype = varchar );		-
+SELECT 'r', typname, typtype, typcategory, typlen, typarray::regtype::text FROM pg_type WHERE typname IN ('floatrange','stringrange') ORDER BY typname	text,name,"char","char",smallint,text	r|floatrange|r|R|-1|floatrange[] ; r|stringrange|r|R|-1|stringrange[]
+SELECT 'r', rngsubtype::regtype::text, rngsubdiff::regproc::text, rngcanonical::regproc::text FROM pg_range WHERE rngtypid = 'floatrange'::regtype		r|double precision|float8mi|-
+SELECT 'r', floatrange(1.0, 5.0), pg_typeof(floatrange(1.0, 5.0))		r|[1,5)|floatrange
+SAVEPOINT s0		-
+SELECT 'r', floatrange(1.0, 5.0) @> 3.0	!42883 operator does not exist: floatrange @> numeric DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO s0		-
+SELECT 'r', floatrange(1.0, 5.0) @> 3.0::float8, floatrange(1.0, 5.0) @> 9.0::float8, isempty(floatrange(1.0, 1.0))		r|t|f|t
+SELECT 'r', lower(floatrange(1.0, 5.0)), upper(floatrange(1.0, 5.0)), floatrange(1.0,5.0) && floatrange(4.0,6.0)		r|1|5|t
+SELECT 'r', stringrange('a','c'), stringrange('a','c') @> 'b'::varchar		r|[a,c)|t
+CREATE TYPE full_address AS ( city VARCHAR(90), street VARCHAR(90) )		-
+SELECT 'r', typname, typtype, typcategory, typrelid <> 0 FROM pg_type WHERE typname = 'full_address'	text,name,"char","char",boolean	r|full_address|c|C|t
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'full_address') AND a.attnum > 0 ORDER BY a.attnum	text,name,text	r|city|character varying(90) ; r|street|character varying(90)
+CREATE TABLE postgresql_composites (id bigserial primary key, address full_address)		-
+INSERT INTO postgresql_composites (address) VALUES (ROW('Paris','Rue'))		-
+INSERT INTO postgresql_composites (address) VALUES ('("New York","Broadway")')		-
+SELECT 'r', id, address FROM postgresql_composites ORDER BY id		r|1|(Paris,Rue) ; r|2|("New York",Broadway)
+SELECT 'r', id, (address).city, (address).street FROM postgresql_composites ORDER BY id		r|1|Paris|Rue ; r|2|New York|Broadway
+SELECT 'r', format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'postgresql_composites'::regclass AND attname = 'address'		r|full_address
+CREATE TYPE custom_time_format AS ENUM ('past', 'present', 'future')		-
+SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname = 'custom_time_format'	text,name,"char","char"	r|custom_time_format|e|E
+SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = 'custom_time_format'::regtype ORDER BY enumsortorder		r|past|1 ; r|present|2 ; r|future|3
+SELECT 'r', 'past'::custom_time_format, pg_typeof('past'::custom_time_format)		r|past|custom_time_format
+SELECT 'r', 'past'::custom_time_format < 'future'::custom_time_format		r|t
+SELECT 'r', x FROM unnest(enum_range(NULL::custom_time_format)) AS x		r|past ; r|present ; r|future
+SAVEPOINT s1		-
+SELECT 'nope'::custom_time_format	!22P02 invalid input value for enum custom_time_format: "nope"
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE TYPE badrange AS RANGE ( subtype = nosuchtype )	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE TYPE floatrange AS RANGE ( subtype = float8 )	!42710 type "floatrange" already exists
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+CREATE TYPE emptyenum AS ENUM ()		-
+SELECT 'r', typname, typtype FROM pg_type WHERE typname = 'emptyenum'	text,name,"char"	r|emptyenum|e
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+DROP TYPE full_address	!2BP01 cannot drop type full_address because other objects depend on it DETAIL: column address of table postgresql_composites depends on type full_address HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s5		-
+DROP TABLE postgresql_composites		-
+DROP TYPE full_address		-
+SELECT 'r', count(*) FROM pg_type WHERE typname = 'full_address'	text,bigint	r|0
+SAVEPOINT s6		-
+DROP TYPE nosuchtype	!42704 type "nosuchtype" does not exist
+ROLLBACK TO s6		-
+DROP TYPE IF EXISTS nosuchtype		-
+SELECT 'r', pg_typeof(typtype), pg_typeof(typcategory) FROM pg_type WHERE typname = 'floatrange'	text,regtype,regtype	r|"char"|"char"
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('floatrange','stringrange','full_address','custom_time_format','emptyenum')	bigint	0

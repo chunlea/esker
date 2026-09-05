@@ -46,22 +46,27 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(array_agg(i2)) FROM ag",
             "no smallint[] type here: this node has four array types (ADR 0047)",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof(array_agg(d)) FROM ag",
             "no double precision[] type here: this node has four array types (ADR 0047)",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof(array_agg(b)) FROM ag",
             "no boolean[] type here: this node has four array types (ADR 0047)",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof(array_agg(ts)) FROM ag",
             "no timestamptz[] type here: this node has four array types (ADR 0047)",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof(array_agg(u)) FROM ag",
             "no uuid[] type here: this node has four array types (ADR 0047)",
+            "UNMEASURED",
         ),
         // `pg_typeof` reads the **value** here and the static type there, and an aggregate over no
         // rows is NULL — which has no type. The declared type of the column is right either way;
@@ -69,22 +74,26 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag WHERE false",
             "pg_typeof reads the value, and an aggregate over no rows is NULL",
+            "UNMEASURED",
         ),
         // Two functions this node does not have. Named rather than approximated, and neither is
         // about the result type this file is for.
         (
             "SELECT 'r', pg_typeof(array_agg(t || 'x')) FROM ag",
             "the || operator is not implemented",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof(string_agg(t, ',')) FROM ag",
             "string_agg is not implemented",
+            "UNMEASURED",
         ),
         // The standing constant-width divergence, one array deeper: a bare integer constant is
         // `int8` here and `int4` there, so an array of them is `bigint[]`.
         (
             "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
             "a bare integer constant is int8 here and int4 there",
+            "UNMEASURED",
         ),
         // **A bare NULL is still resolved to `text` where PostgreSQL calls it `unknown`.** The
         // entry beside this one — `array_agg(NULL::int4)` — has gone: `Literal::TypedNull` keeps
@@ -100,6 +109,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_typeof(array_agg(NULL)) FROM ag",
             "a bare NULL is text here and unknown there, so this answers where PostgreSQL raises \
              42725; exec::aggregate::is_unknown takes only a quoted string",
+            "UNMEASURED",
         ),
     ],
 };

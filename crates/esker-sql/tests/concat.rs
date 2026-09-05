@@ -26,6 +26,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 1 || 2",
             "an unadorned integer literal is int8 here, so the message names bigint",
+            "pg19_concat.txt:22",
         ),
         // **`||` over arrays is a family of its own and is not built** — `42883 operator does not
         // exist: bigint[] || bigint[]` where a real server appends. A gap, and named as one: the
@@ -34,6 +35,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)",
             "|| over arrays is not built; it refuses rather than answering",
+            "pg19_concat.txt:25",
         ),
         // **`pg_typeof` of the merge**: `jsonb` on both, and it is the one line here whose
         // *column type* still differs — a `regtype` there and `text` here, the standing catalog
@@ -41,6 +43,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)",
             "pg_typeof answers a regtype on a real server and text here; the value is jsonb on both",
+            "pg19_concat.txt:33",
         ),
     ],
 };

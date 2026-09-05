@@ -31,15 +31,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "the per-column form drops parentheses the whole definition keeps: PostgreSQL prints \
              (NOT b IS NULL) for one key part and ((NOT (b IS NULL))) inside the key list, and \
              this node prints the stored text in both",
+            "UNMEASURED",
         ),
         (
             "SELECT pg_get_indexdef('xidx_cast'::regclass)",
             "a cast prints its target type in upper case (a::TEXT) and does not parenthesise its \
              operand, where PostgreSQL's deparser prints (a)::text",
+            "UNMEASURED",
         ),
         (
             "SELECT pg_get_indexdef('xidx_cast'::regclass, 1, true)",
             "the same cast, one key part at a time",
+            "UNMEASURED",
         ),
     ],
 };

@@ -1,0 +1,121 @@
+# `ALTER TABLE … DROP COLUMN`, in the forms `ActiveRecord` sends and with what it leaves behind.
+#
+# **Run 47 ranking: `ALTER TABLE … DROP COLUMN is not supported`, 34 tests over 11 files** —
+# `locking_test.rb` (7), `references_statements_test.rb` (6), `rename_table_test.rb` (6),
+# `columns_test.rb` (4), `compatibility_test.rb` (4), `invertible_migration_test.rb`,
+# `migration_test.rb`, `column_attributes_test.rb`, `belongs_to_associations_test.rb`,
+# `hot_compatibility_test.rb`, `references_foreign_key_test.rb`, `persistence_test.rb`.
+#
+# Things reasoning would get wrong:
+#
+# * **A dropped column does not leave `pg_attribute`.** PostgreSQL keeps the row with
+#   `attisdropped = true`, renames it to `........pg.dropped.N........`, sets `atttypid` to 0, and
+#   **never reuses the `attnum`**. AR's `column_definitions` filters `AND NOT a.attisdropped` for
+#   exactly this reason (`postgresql_adapter.rb:1069`), so an implementation that deletes the row
+#   and then reuses the number answers that query correctly and still breaks: the next added column
+#   must get a *higher* `attnum`, and the rows below show it does.
+# * **`remove_columns` is ONE statement with several clauses**, not several statements:
+#   `ALTER TABLE "x" DROP COLUMN "updated_at", DROP COLUMN "created_at"`
+#   (`abstract/schema_statements.rb:700`), which is what `remove_timestamps` sends. A parser that
+#   takes one `DROP COLUMN` per `ALTER TABLE` refuses half of these files.
+# * **AR never sends `DROP COLUMN IF EXISTS`.** `remove_column(…, if_exists: true)` asks
+#   `column_exists?` first and returns without sending anything (`:719`). The bare form is captured
+#   anyway, because the *server's* answer to a missing column is what a refusal has to match.
+# * **The drop takes dependents with it, and the two kinds differ.** An index over the column and a
+#   `NOT NULL`/`DEFAULT`/`CHECK` on it go silently; a **view** or a foreign key from another table
+#   raises `2BP01` and needs `CASCADE`. The `NOTICE`/`DETAIL` a cascade prints is described here and
+#   not captured, because `sesscap.py` records continuation lines with no prefix in the rows column.
+# * **Dropping the primary key column drops the constraint**, and the table stays — and the
+#   `serial` column's **sequence goes with it**: `dc_id_seq` is gone after `DROP COLUMN "id"`,
+#   because the column owned it. That is not obvious from `DROP COLUMN`'s wording and it is what the
+#   rows below show.
+# * **A table may lose its last column.** PostgreSQL keeps a zero-column table, and its rows: a
+#   `SELECT count(*)` over it still answers. Refusing that is a divergence.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` lines after the `ROLLBACK` prove it left nothing behind. `\gdesc` runs
+# in a second session after that rollback, so statements naming these tables have an **empty**
+# declared-types column; `pg_typeof` lines pin the types instead.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE dc (id serial primary key, name character varying(255), lock_version integer DEFAULT 0 NOT NULL, created_at timestamp(6) without time zone, updated_at timestamp(6) without time zone)		-
+INSERT INTO dc (name) VALUES ('one')		-
+INSERT INTO dc (name) VALUES ('two')		-
+# ---- what the catalog says before ----
+SELECT 'r', a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attisdropped FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|1|id|integer|t|f ; r|2|name|character varying(255)|f|f ; r|3|lock_version|integer|t|f ; r|4|created_at|timestamp(6) without time zone|f|f ; r|5|updated_at|timestamp(6) without time zone|f|f
+# ---- remove_column: the single-clause form, `locking_test.rb`'s lock_version ----
+ALTER TABLE "dc" DROP COLUMN "lock_version"		-
+SELECT 'r', a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attisdropped FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|1|id|integer|f ; r|2|name|character varying(255)|f ; r|3|........pg.dropped.3........|-|t ; r|4|created_at|timestamp(6) without time zone|f ; r|5|updated_at|timestamp(6) without time zone|f
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('dc_id_seq'::regclass)|t ; r|name|character varying(255)|\N|f ; r|created_at|timestamp(6) without time zone|\N|f ; r|updated_at|timestamp(6) without time zone|\N|f
+SELECT 'r', atttypid = 0 AS typid_zeroed, attnotnull, atthasdef FROM pg_attribute WHERE attrelid = '"dc"'::regclass AND attisdropped		r|t|f|f
+SELECT 'r', id, name FROM dc ORDER BY id		r|1|one ; r|2|two
+SELECT 'r', * FROM dc ORDER BY id		r|1|one|\N|\N ; r|2|two|\N|\N
+# ---- the attnum is not reused by the next column ----
+ALTER TABLE "dc" ADD COLUMN "notes" character varying(255)		-
+SELECT 'r', a.attnum, a.attname, a.attisdropped FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 ORDER BY a.attnum		r|1|id|f ; r|2|name|f ; r|3|........pg.dropped.3........|t ; r|4|created_at|f ; r|5|updated_at|f ; r|6|notes|f
+# ---- remove_columns / remove_timestamps: several clauses in ONE statement ----
+ALTER TABLE "dc" DROP COLUMN "updated_at", DROP COLUMN "created_at"		-
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id ; r|name ; r|notes
+SELECT 'r', count(*) FROM pg_attribute WHERE attrelid = '"dc"'::regclass AND attisdropped		r|3
+# ---- ADD and DROP in one statement, which `change_table` can emit ----
+ALTER TABLE "dc" ADD COLUMN "tmp" integer, DROP COLUMN "notes"		-
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id ; r|name ; r|tmp
+ALTER TABLE "dc" DROP COLUMN "tmp"		-
+# ---- a column that is not there ----
+SAVEPOINT d1		-
+ALTER TABLE "dc" DROP COLUMN "nosuchcolumn"	!42703 column "nosuchcolumn" of relation "dc" does not exist
+ROLLBACK TO d1		-
+ALTER TABLE "dc" DROP COLUMN IF EXISTS "nosuchcolumn"		-
+SAVEPOINT d2		-
+ALTER TABLE "nosuchtable" DROP COLUMN "x"	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO d2		-
+# ---- an index over the column goes with it, silently ----
+ALTER TABLE "dc" ADD COLUMN "email" character varying(255)		-
+CREATE INDEX index_dc_on_email ON "dc" ("email")		-
+CREATE INDEX index_dc_on_name_and_email ON "dc" ("name", "email")		-
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dc' ORDER BY indexname	text,name	r|dc_pkey ; r|index_dc_on_email ; r|index_dc_on_name_and_email
+ALTER TABLE "dc" DROP COLUMN "email"		-
+SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dc' ORDER BY indexname	text,name	r|dc_pkey
+# ---- a CHECK constraint on the column goes too ----
+ALTER TABLE "dc" ADD COLUMN "qty" integer		-
+ALTER TABLE "dc" ADD CONSTRAINT dc_qty_check CHECK (qty >= 0)		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '"dc"'::regclass ORDER BY conname		r|dc_id_not_null|n ; r|dc_pkey|p ; r|dc_qty_check|c
+ALTER TABLE "dc" DROP COLUMN "qty"		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '"dc"'::regclass ORDER BY conname		r|dc_id_not_null|n ; r|dc_pkey|p
+# ---- a foreign key FROM another table: 2BP01 without CASCADE (references_foreign_key_test.rb) ----
+CREATE TABLE dcp (id serial primary key)		-
+ALTER TABLE "dc" ADD COLUMN "dcp_id" bigint		-
+ALTER TABLE "dc" ADD CONSTRAINT fk_dc_dcp FOREIGN KEY ("dcp_id") REFERENCES "dcp" ("id")		-
+ALTER TABLE "dc" DROP COLUMN "dcp_id"		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conname = 'fk_dc_dcp'	text,bigint	r|0
+# ---- a view over the column raises, and CASCADE is what removes it ----
+ALTER TABLE "dc" ADD COLUMN "shown" integer		-
+CREATE VIEW dc_view AS SELECT id, shown FROM dc		-
+SAVEPOINT d3		-
+ALTER TABLE "dc" DROP COLUMN "shown"	!2BP01 cannot drop column shown of table dc because other objects depend on it DETAIL: view dc_view depends on column shown of table dc HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO d3		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_view'	text,bigint	r|1
+ALTER TABLE "dc" DROP COLUMN "shown" CASCADE		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_view'	text,bigint	r|0
+# ---- dropping the primary key column drops the constraint and keeps the table ----
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '"dc"'::regclass ORDER BY conname		r|dc_id_not_null|n ; r|dc_pkey|p
+ALTER TABLE "dc" DROP COLUMN "id"		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conrelid = '"dc"'::regclass AND contype = 'p'		r|0
+SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = '"dc"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|name
+SELECT 'r', count(*) FROM dc		r|2
+# ---- the sequence the serial column owned is dropped WITH the column ----
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'dc_id_seq'	text,bigint	r|0
+# ---- the last column of a table can be dropped, and the rows stay ----
+CREATE TABLE dc1 (only_col integer)		-
+INSERT INTO dc1 VALUES (1)		-
+INSERT INTO dc1 VALUES (2)		-
+ALTER TABLE "dc1" DROP COLUMN "only_col"		-
+SELECT 'r', count(*) FROM pg_attribute WHERE attrelid = '"dc1"'::regclass AND attnum > 0 AND NOT attisdropped		r|0
+SELECT 'r', count(*) FROM dc1		r|2
+DROP TABLE dc1		-
+DROP TABLE dc		-
+DROP TABLE dcp		-
+ROLLBACK		-
+# ---- proof the oracle is as it was ----
+SELECT count(*) FROM pg_class WHERE relname IN ('dc','dcp','dc1','dc_view','dc_id_seq')	bigint	0

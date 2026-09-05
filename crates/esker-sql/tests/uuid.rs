@@ -33,6 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT pg_typeof('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid), format_type(2950, -1)",
             "`format_type(2950, -1)` agrees — it is `uuid` on both — and `pg_typeof` is not \
              implemented for any type, so the statement is `0A000` naming the function.",
+            "pg19_uuid.txt:42",
         ),
         (
             "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::char(8)",
@@ -40,6 +41,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              here.** Nothing to do with `uuid` — `::text` and `::varchar` both agree — and the \
              same divergence `tests/time.rs` records for the same reason: it belongs to \
              `bpchar`'s cast path, where an explicit cast and an assignment are the same code.",
+            "pg19_uuid.txt:79",
         ),
         (
             "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid(10)",
@@ -50,11 +52,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              agrees**: `'uuid(10)'::regtype` gives PostgreSQL's own message, because that path \
              resolves the name through `value::type_by_name`. This is the *cast* path, which is \
              `sqlparser`'s grammar and not this node's.",
+            "pg19_uuid.txt:84",
         ),
         (
             "SELECT uuid_cmp('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, \
              '00000000-0000-0000-0000-000000000000'::uuid)",
             FUNCTIONS,
+            "pg19_uuid.txt:87",
         ),
         (
             "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 1",
@@ -62,6 +66,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              because a bare `1` is an `int4` there, and this node says `bigint` because it types \
              an unsuffixed integer literal as `int8`. A divergence of the literal, not of this \
              type — every type's `= 1` says it.",
+            "pg19_uuid.txt:88",
         ),
         // **This line used to be here** and now agrees, deleted under ADR 0031 rule 2. What kept
         // it diverging was `length`'s **declared type** — `text` where a real server says
@@ -70,6 +75,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT uuidv4() IS NOT NULL, uuidv7() IS NOT NULL",
             FUNCTIONS,
+            "pg19_uuid.txt:91",
         ),
     ],
 };

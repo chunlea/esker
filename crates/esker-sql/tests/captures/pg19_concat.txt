@@ -1,0 +1,48 @@
+# `||` — every spelling of the symbol, against PostgreSQL 19beta1 at 127.0.0.1:55432.
+#
+# Captured by b4-types on 2026-09-04 in rolled-back `psql` sessions, filed here because the
+# measurements existed only in a lane scratchpad. They are the seed for the declared-divergence
+# provenance rule (`docs/plans/divergence-provenance.md`): three rows of `pg19_concat.txt`'s
+# corpus are declared divergences whose PostgreSQL answer was measured and never recorded, which
+# from a reader's side is indistinguishable from one written from memory — and one of them WAS
+# written from memory (`json || json`, below) and passed green until it was asked.
+#
+# Format: statement TAB types TAB answer, `-` for a command, `!sqlstate message` for an error.
+# The types column is empty where it was not taken with \gdesc.
+#
+# --- string concatenation: text || anynonarray, anynonarray || text, text || text
+SELECT 'r', 'a' || 'b', 'a' || 1, 1 || 'b', 'a' || 1.5, 'a' || true		r|ab|a1|1b|a1.5|atrue
+SELECT 'r', pg_typeof('a'::text || 'b'::text), pg_typeof('a'::text || 1), pg_typeof(1 || 'b'::text)		r|text|text|text
+SELECT 'r', 'a' || NULL IS NULL AS null_right, NULL || 'a' IS NULL AS null_left		r|t|t
+SELECT 'r', concat('a', NULL, 'b') AS concat_skips_null		r|ab
+SELECT 'r', 'x' || 'y'::varchar, pg_typeof('x'::varchar || 'y'::varchar)		r|xy|text
+SELECT 'r', 'd' || '2024-01-02'::date, 'n' || 3::numeric		r|d2024-01-02|n3
+# **A boolean contributes `true`, not psql's display `t`.**
+# --- and there is no anynonarray || anynonarray
+SELECT 1 || 2	!42883 operator does not exist: integer || integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT true || false	!42883 operator does not exist: boolean || boolean DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+# --- arrays
+SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)		r|{1,2,3}|{1,2,3}|integer[]
+# --- jsonb: both objects merge, otherwise each side reads as an array and they concatenate
+SELECT 'r', '{"a":1,"b":2}'::jsonb || '{"b":3,"c":4}'::jsonb		r|{"a": 1, "b": 3, "c": 4}
+SELECT 'r', '{"a":{"x":1}}'::jsonb || '{"a":{"y":2}}'::jsonb		r|{"a": {"y": 2}}
+SELECT 'r', '[1,2]'::jsonb || '[3]'::jsonb, '[1,2]'::jsonb || '3'::jsonb		r|[1, 2, 3]|[1, 2, 3]
+SELECT 'r', '{"a":1}'::jsonb || '[1]'::jsonb, '"x"'::jsonb || '"y"'::jsonb		r|[{"a": 1}, 1]|["x", "y"]
+SELECT 'r', 'null'::jsonb || 'null'::jsonb, '[]'::jsonb || '[]'::jsonb		r|[null, null]|[]
+SELECT 'r', '1'::jsonb || '{"a":1}'::jsonb, '[1]'::jsonb || '{"a":1}'::jsonb		r|[1, {"a": 1}]|[1, {"a": 1}]
+SELECT 'r', pg_typeof('{"a":1}'::jsonb || '{"b":2}'::jsonb)		r|jsonb
+# --- jsonb beside text is NOT an operator, so both fall back to text || text
+SELECT 'r', body || plain FROM jm		r|{"a": 1}x
+SELECT 'r', plain || body FROM jm		r|x{"a": 1}
+# --- and an unknown literal beside a jsonb is coerced to jsonb, so it must BE one
+SELECT '{"a":1}'::jsonb || 'tail'	!22P02 invalid input syntax for type json DETAIL: Token "tail" is invalid.
+# --- json has no || at all.  THIS IS THE ROW A CORPUS ONCE CLAIMED ANSWERED `{"a":1}{"b":2}`.
+SELECT '{"a":1}'::json || '{"b":2}'::json	!42883 operator does not exist: json || json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+# --- json has no equality either, which is why it is a validated string and jsonb is not
+SELECT '{"a":1}'::json = '{"a":1}'::json	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+# --- jsonb canonicalisation, the three axes: key order, whitespace, duplicate keys
+SELECT 'r', '{"b":1,"a":2}'::jsonb::text, '{ "a" : 1 }'::jsonb::text, '{"a":1,"a":2}'::jsonb::text		r|{"a": 2, "b": 1}|{"a": 1}|{"a": 2}
+SELECT 'r', '{"b":1,"a":2}'::json::text, '{ "a" : 1 }'::json::text, '{"a":1,"a":2}'::json::text		r|{"b":1,"a":2}|{ "a" : 1 }|{"a":1,"a":2}
+SELECT 'r', '{"a":1,"b":2}'::jsonb = '{"b":2,"a":1}'::jsonb, '{"a":1}'::jsonb = '{ "a" : 1 }'::jsonb		r|t|t
+# --- jsonb ORDER BY is type rank, not text: null < string < number < boolean < array < object
+SELECT 'rank', row_number() OVER (ORDER BY v), v::text FROM (VALUES ('{"b":1}'::jsonb),('{"a":2}'::jsonb),('[1]'::jsonb),('1'::jsonb),('"s"'::jsonb),('true'::jsonb),('null'::jsonb)) t(v)		rank|1|null ; rank|2|"s" ; rank|3|1 ; rank|4|true ; rank|5|[1] ; rank|6|{"a": 2} ; rank|7|{"b": 1}

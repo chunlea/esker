@@ -82,11 +82,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              name. Listing PostgreSQL's standard OIDs instead would tell a client this node has \
              `numeric` and `int4`, which is a wrong answer rather than a short one. It closes one \
              type at a time as types arrive.",
+            "pg19_pg_catalog.txt:59",
         ),
         (
             "SELECT typname FROM pg_type WHERE typname = 'numeric'",
             "the same, on its own and in the shape a client actually asks it: one row there, no \
              rows here.",
+            "pg19_pg_catalog.txt:60",
         ),
         (
             "INSERT INTO pg_type (oid, typname) VALUES (99, 'nope')",
@@ -96,6 +98,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              column this node's `pg_type` does not have. There are no roles here and a computed \
              relation has nothing to write to, so the answer is the one a real server gives \
              everyone who is not a superuser. `docs/plans/phase-9-rails.md` §5.",
+            "pg19_pg_catalog.txt:104",
         ),
         (
             "UPDATE pg_type SET typname = 'nope' WHERE typname = 'int8'",
@@ -104,10 +107,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              first time, `int8` left the database, and every later statement answered `XX000 \
              cache lookup failed for type 20`. The three write probes are inside rolled-back \
              blocks for that reason.",
+            "pg19_pg_catalog.txt:107",
         ),
         (
             "DELETE FROM pg_type WHERE typname = 'int8'",
             "the same, and the one that did the damage.",
+            "pg19_pg_catalog.txt:110",
         ),
     ],
 };

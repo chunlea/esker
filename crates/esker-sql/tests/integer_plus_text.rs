@@ -40,6 +40,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
         (
             "SELECT 'r', $1 + $2",
             "an unresolved parameter is text here and unknown there, so 42883 rather than 42725",
+            "UNMEASURED",
         ),
         // **The standing constant-width divergence, in four sentences.** A bare integer constant
         // is `int8` here and `integer` there (`tests/unknown_literal.rs`), so every message that
@@ -56,20 +57,28 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "SELECT 'r', pg_typeof(1 + '2'), pg_typeof('2'), pg_typeof('2'::text)",
             "a bare integer constant is int8 here and int4 there, and an unquoted literal is text \
              here and unknown there",
+            "pg19_integer_plus_text.txt:60",
         ),
         (
             "SELECT 'r', 1 + 'x'",
             "the same constant width, in the input function's message",
+            "pg19_integer_plus_text.txt:62",
         ),
         (
             "SELECT 'r', 1 + '2'::text",
             "the same constant width, and the operands are named typed-side-first",
+            "pg19_integer_plus_text.txt:65",
         ),
-        ("SELECT 'r', '2'::text + 1", "the same constant width"),
+        (
+            "SELECT 'r', '2'::text + 1",
+            "the same constant width",
+            "pg19_integer_plus_text.txt:68",
+        ),
         (
             "SELECT 'r', 1 + NULL IS NULL, pg_typeof(1 + NULL)",
             "the row agrees; a NULL beside a constant is text here and integer there, which is the \
              constant-width divergence with a NULL in it",
+            "pg19_integer_plus_text.txt:76",
         ),
         // **`pg_operator` is not a relation this node has.** The statement is in the capture
         // because it is where "does not exist" is read out of on a real server — there are no `+`
@@ -79,6 +88,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "SELECT 'r', count(*) FROM pg_operator WHERE oprname = '+' AND 'text'::regtype IN \
              (oprleft, oprright)",
             "pg_operator is not built",
+            "pg19_integer_plus_text.txt:79",
         ),
     ],
 };

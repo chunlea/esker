@@ -34,6 +34,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', 'B'::citext < 'a'::citext, 'B' < 'a', 'B'::citext > 'a'::citext",
             "the standing text collation divergence; both citext answers agree",
+            "UNMEASURED",
         ),
         // **Three functions this node does not have**, none of them citext's: `string_agg` and
         // `||` are the pair `tests/aggregate_type.rs` has declared since the array unit, and
@@ -43,15 +44,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', string_agg(v::text, ' ; ' ORDER BY v) FROM (VALUES \
              ('B'::citext),('a'),('C'),('b'),('A')) t(v)",
             "string_agg is not built; the ordering it would show is measured by ORDER BY below",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', length('ABC'::citext)",
             "length is not built, for any type",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_typeof('x'::citext || 'y')",
             "|| is not built over text, so the citext concatenation it would demote to has \
              nothing to demote to",
+            "UNMEASURED",
         ),
         // **The right refusal in the wrong sentence.** Both raise `23505` and neither builds the
         // index; PostgreSQL has a message for a *build* that finds duplicates — `could not create
@@ -62,6 +66,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "CREATE UNIQUE INDEX cit_cival_uidx ON cit (cival)",
             "a unique index that cannot be built reports the insert's sentence, not the build's",
+            "pg19_hstore_citext.txt:108",
         ),
     ],
 };

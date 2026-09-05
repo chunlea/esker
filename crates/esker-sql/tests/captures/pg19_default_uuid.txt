@@ -1,0 +1,98 @@
+# A volatile column DEFAULT — `gen_random_uuid()` and `uuid_generate_v4()` — as a real PostgreSQL
+# 19beta1 answers it.
+#
+# NOT a type. This is **rung 4's stopper at `f84a6a4`** and 4 of the 12 refusals left in
+# `postgresql_specific_schema.rb`:
+#
+#   710  CREATE TABLE "chat_messages" ("id" uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY, …)   ×3
+#   713  … DEFAULT uuid_generate_v4() …                                                              ×1
+#
+# and this node refuses both with `0A000 DEFAULT gen_random_uuid(), which may be volatile is not
+# supported`. `DEFAULT CURRENT_TIMESTAMP` was the same refusal and landed at `0e8680c`; these two
+# were not carried with it.
+#
+# Captured in one session with `scratchpad/sesscap.py`, wrapped in **`BEGIN … ROLLBACK`** — it
+# installs `uuid-ossp` and builds tables, and none of that may outlive the capture. Error probes
+# sit in `SAVEPOINT` / `ROLLBACK TO`. The two `SELECT count(*)` lines at the end prove it left
+# nothing.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# The rollback means `\gdesc` — a second session, afterwards — cannot describe the temporary
+# tables, so those rows have an empty declared-types column.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **PostgreSQL does not refuse a volatile DEFAULT. Volatility is not the criterion at all.**
+#     `gen_random_uuid` and `uuid_generate_v4` are both `provolatile = 'v'` and both are accepted.
+#     What a DEFAULT expression may *not* contain is measured here instead, and it is three things,
+#     each with its own message and all of them `0A000`:
+#       - a **column reference** — `cannot use column reference in DEFAULT expression`;
+#       - a **subquery** — `cannot use subquery in DEFAULT expression`;
+#       - a **set-returning function** — `set-returning functions are not allowed in DEFAULT
+#         expressions`.
+#     A node that refuses on volatility refuses three statements PostgreSQL accepts and still has
+#     to implement these three to refuse the ones it does.
+#   * **`now()` is `provolatile = 's'` — STABLE, not volatile.** So `DEFAULT CURRENT_TIMESTAMP`,
+#     which this node already accepts, was never the volatile case; `gen_random_uuid()` is the
+#     first genuinely volatile default the suite asks for. A refusal message that says
+#     "which may be volatile" is describing a property the accepted case does not have.
+#   * **The values cannot be captured, and the invariant can.** Two inserts produce two *different*
+#     UUIDs, so no row of literal values would replay. What is pinned is `count(*) = 2` with
+#     `count(DISTINCT id) = 2`, a text length of 36, and the version nibble at position 15 being
+#     `4` for both functions — they are both v4 generators, one built in and one from `uuid-ossp`.
+#   * **The stored default is re-printed as written, without a schema qualifier**:
+#     `pg_get_expr(adbin, adrelid)` and `information_schema.columns.column_default` both give
+#     `gen_random_uuid()`, not `pg_catalog.gen_random_uuid()`.
+#   * **An explicit value still overrides it, and the `DEFAULT` keyword still invokes it** — the
+#     same pair `bigserial` has, and the reason a `uuid` primary key can be both generated and
+#     fixture-loaded.
+#   * **A missing or wrong-arity function in a DEFAULT is `42883`, not `0A000`** — and the two
+#     DETAILs differ: `There is no function of that name.` for an unknown name against
+#     `No function of that name accepts the given number of arguments.` for a wrong arity.
+BEGIN		-
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"		-
+SELECT provolatile FROM pg_proc WHERE proname = 'gen_random_uuid'	"char"	v
+SELECT provolatile FROM pg_proc WHERE proname = 'uuid_generate_v4'	"char"	v
+SELECT provolatile FROM pg_proc WHERE proname = 'now'	"char"	s
+SELECT provolatile FROM pg_proc WHERE proname = 'random'	"char"	v ; v ; v ; v ; v ; v ; v
+CREATE TABLE du (id uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY, content text)		-
+CREATE TABLE du2 (id uuid DEFAULT uuid_generate_v4() NOT NULL PRIMARY KEY, content text)		-
+INSERT INTO du (content) VALUES ('a')		-
+INSERT INTO du (content) VALUES ('b')		-
+INSERT INTO du2 (content) VALUES ('a')		-
+INSERT INTO du2 (content) VALUES ('b')		-
+SELECT 'g', count(*), count(DISTINCT id) FROM du		g|2|2
+SELECT 'g', count(*), count(DISTINCT id) FROM du2		g|2|2
+SELECT 'g', length(id::text) FROM du LIMIT 1		g|36
+SELECT 'g', substring(id::text, 15, 1) FROM du LIMIT 1		g|4
+SELECT 'g', substring(id::text, 15, 1) FROM du2 LIMIT 1		g|4
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'du'::regclass ORDER BY a.attname		id|gen_random_uuid()
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'du2'::regclass ORDER BY a.attname		id|uuid_generate_v4()
+SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'du' ORDER BY ordinal_position	name,character varying	id|gen_random_uuid() ; content|\N
+INSERT INTO du (id, content) VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'explicit')		-
+SELECT 'g', content FROM du WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'		g|explicit
+INSERT INTO du (id, content) VALUES (DEFAULT, 'defaulted')		-
+SELECT 'g', count(*), count(DISTINCT id) FROM du		g|4|4
+SAVEPOINT s1		-
+CREATE TABLE dbad (id uuid DEFAULT nosuchuuidfunc())	!42883 function nosuchuuidfunc() does not exist DETAIL: There is no function of that name.
+ROLLBACK TO s1		-
+SAVEPOINT s2		-
+CREATE TABLE dbad2 (a int, b int DEFAULT a)	!0A000 cannot use column reference in DEFAULT expression
+ROLLBACK TO s2		-
+SAVEPOINT s3		-
+CREATE TABLE dbad3 (a int DEFAULT (SELECT 1))	!0A000 cannot use subquery in DEFAULT expression
+ROLLBACK TO s3		-
+SAVEPOINT s4		-
+CREATE TABLE dbad4 (a int DEFAULT generate_series(1, 2))	!0A000 set-returning functions are not allowed in DEFAULT expressions
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+CREATE TABLE dbad5 (a uuid DEFAULT gen_random_uuid(1))	!42883 function gen_random_uuid(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO s5		-
+CREATE TABLE dok (a timestamp DEFAULT now(), b timestamp DEFAULT CURRENT_TIMESTAMP, c float8 DEFAULT random())		-
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'dok'::regclass ORDER BY a.attname		a|now() ; b|CURRENT_TIMESTAMP ; c|random()
+ROLLBACK		-
+SELECT 'g', count(*) FROM pg_class WHERE relname IN ('du','du2','dok')	text,bigint	g|0
+SELECT 'g', count(*) FROM pg_extension WHERE extname = 'uuid-ossp'	text,bigint	g|0

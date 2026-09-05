@@ -43,6 +43,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', o.opcname, o.opcdefault, am.amname, t.typname FROM pg_opclass o JOIN pg_am am ON am.oid = o.opcmethod JOIN pg_type t ON t.oid = o.opcintype WHERE o.opcname IN ('gin_trgm_ops','gist_trgm_ops','text_pattern_ops','varchar_pattern_ops') ORDER BY o.opcname, am.amname",
             "the hash halves are absent because USING hash is refused",
+            "UNMEASURED",
         ),
         // **`position` is a keyword and a real server quotes it.** Pre-existing and declared where
         // it lives (`catalog::pg_index::quote_identifier`): PostgreSQL quotes every non-unreserved
@@ -54,10 +55,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_get_indexdef('trains_position'::regclass)",
             "a keyword column name is quoted there and bare here — quote_identifier's declared gap",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', pg_get_indexdef('trains_np'::regclass)",
             "a keyword column name is quoted there and bare here — quote_identifier's declared gap",
+            "UNMEASURED",
         ),
         // **`indclass` is an `oidvector` and this node has no such type**, so the statement that
         // unnests it needs a `LATERAL … WITH ORDINALITY` FROM item this node does not have either.
@@ -67,6 +70,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', i.indexrelid::regclass::text, o.opcname FROM pg_index i JOIN LATERAL unnest(i.indclass::oid[]) WITH ORDINALITY AS u(cls, n) ON true JOIN pg_opclass o ON o.oid = u.cls WHERE i.indrelid = 'trains'::regclass ORDER BY 1, u.n",
             "an oidvector and a LATERAL WITH ORDINALITY, neither of them the operator class",
+            "UNMEASURED",
         ),
     ],
 };

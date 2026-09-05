@@ -1,0 +1,86 @@
+# `DO $$ … $$` as **`create_enum` really sends it** — the one shape the suite has.
+#
+# **Run 57: `DO is not supported`, 34 tests over 5 files.** Every one of them comes from
+# `create_enum` (`postgresql_adapter.rb:556`), which wraps `CREATE TYPE … AS ENUM` in an anonymous
+# block to make it idempotent. Nothing in those five files writes `DO` itself.
+#
+# **Thirty-six `DO` statements were logged running those five files against PostgreSQL 19, and all
+# thirty-six are this template.** The eleven textual variants differ only in the type name, the
+# label list, whether the `CREATE TYPE` name is schema-qualified, and which of two schema
+# predicates the `WHERE` uses. That is what makes a minimal interpreter the honest answer here
+# rather than a plpgsql engine: there is one shape to run, and everything else is refused by name.
+#
+# `pg19_do_block.txt` (run 45) is the companion capture and holds the general behaviour — the
+# command tag, `RAISE`, `LANGUAGE`, the dollar-quote tag, and the refusals. **It reconstructed the
+# block with `n.nspname = 'public'`, which the suite does not send**; the real predicate is
+# `ANY (current_schemas(false))`. Both are below, because `create_enum` picks between them by
+# whether the caller named a schema.
+#
+# Things reasoning would get wrong:
+#
+#   * **The block is idempotent by construction, not by `CREATE TYPE`.** There is no
+#     `CREATE TYPE IF NOT EXISTS` in PostgreSQL — that is the whole reason the adapter writes a
+#     block — so running it twice must be a success, and running a bare `CREATE TYPE` twice is
+#     `42710`.
+#   * **An empty label list is legal**: `CREATE TYPE "unused" AS ENUM ()`, sent by `schema_test.rb`.
+#   * **The two predicates are not equivalent.** `n.nspname = ANY (current_schemas(false))` finds a
+#     type anywhere on the search path; `n.nspname = 'test_schema'` finds it only there. A block
+#     that tested the wrong one would re-create a type that exists, or skip one that does not.
+#   * **The guard and the `CREATE` can name different schemas.** `create_enum(:test_schema, ...)`
+#     guards on `nspname = 'test_schema'` and creates `"test_schema"."…"`, so the interpreter has
+#     to read the name out of the `CREATE`, not out of the guard.
+#   * **A `DO` block returns no result set at all** — a command tag, not an empty set.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+
+BEGIN;		-
+
+CREATE SCHEMA test_schema;		-
+
+-- ------------------------------------------------- the search-path form, and it is idempotent		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT typname, typtype, typcategory FROM pg_type WHERE typname = 'mood';	name,"char","char"	mood|e|E
+SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;		sad ; ok ; happy
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT count(*) FROM pg_type WHERE typname = 'mood';	bigint	1
+-- the labels of the first run survive: the second did nothing at all		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE TYPE "mood" AS ENUM ('totally', 'different'); END IF; END $$;		-
+SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;		sad ; ok ; happy
+-- and a bare CREATE TYPE of the same name is 42710, which is why the block exists		-
+SAVEPOINT s1;		-
+CREATE TYPE "mood" AS ENUM ('sad');	!42710 type "mood" already exists
+ROLLBACK TO s1;		-
+
+-- ------------------------------------------------- the named-schema form		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'test_enum_in_test_schema' AND n.nspname = 'test_schema' ) THEN CREATE TYPE "test_schema"."test_enum_in_test_schema" AS ENUM ('foo', 'bar'); END IF; END $$;		-
+SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'test_enum_in_test_schema';	name,name	test_schema|test_enum_in_test_schema
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'test_enum_in_test_schema' AND n.nspname = 'test_schema' ) THEN CREATE TYPE "test_schema"."test_enum_in_test_schema" AS ENUM ('foo', 'bar'); END IF; END $$;		-
+SELECT count(*) FROM pg_type WHERE typname = 'test_enum_in_test_schema';	bigint	1
+-- the guard names one schema and the CREATE another: the CREATE is what decides where it lands		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood_in_other_schema' AND n.nspname = 'test_schema' ) THEN CREATE TYPE "test_schema"."mood_in_other_schema" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood_in_other_schema';	name,name	test_schema|mood_in_other_schema
+-- a type in test_schema is NOT on the default search path, so the search-path guard misses it		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'mood_in_other_schema' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE TYPE "mood_in_other_schema" AS ENUM ('sad', 'ok', 'happy'); END IF; END $$;		-
+SELECT count(*) FROM pg_type WHERE typname = 'mood_in_other_schema';	bigint	2
+
+-- ------------------------------------------------- an empty label list, which schema_test.rb sends		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'unused' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE TYPE "unused" AS ENUM (); END IF; END $$;		-
+SELECT typname, typtype FROM pg_type WHERE typname = 'unused';	name,"char"	unused|e
+SELECT count(*) FROM pg_enum WHERE enumtypid = 'unused'::regtype;		0
+
+-- ------------------------------------------------- the quoted-schema guard the run-45 capture used		-
+DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'feeling' AND n.nspname = 'public' ) THEN CREATE TYPE "public"."feeling" AS ENUM ('good', 'bad'); END IF; END $$;		-
+SELECT typname FROM pg_type WHERE typname = 'feeling';	name	feeling
+
+-- ------------------------------------------------- and the type is usable, which is the point		-
+CREATE TABLE do_enum_user (id int, m "mood");		-
+INSERT INTO do_enum_user VALUES (1, 'happy');		-
+SELECT id, m FROM do_enum_user;		1|happy
+SAVEPOINT s2;		-
+INSERT INTO do_enum_user VALUES (2, 'nope');	!22P02 invalid input value for enum mood: "nope"
+ROLLBACK TO s2;		-
+DROP TABLE do_enum_user;		-
+
+ROLLBACK;		-
+SELECT count(*) FROM pg_type WHERE typname IN ('mood','unused','feeling','test_enum_in_test_schema','mood_in_other_schema');	bigint	0

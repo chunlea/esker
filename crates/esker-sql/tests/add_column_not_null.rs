@@ -28,6 +28,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "The reserved block's end against the last value handed out: a session takes a batch \
              and serves from it, so the stored counter runs ahead of what any row has seen. The \
              values `nextval` produces agree, which is what every other line here checks.",
+        "pg19_add_column_not_null.txt:56",
     )],
 };
 

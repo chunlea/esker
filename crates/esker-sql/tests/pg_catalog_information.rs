@@ -52,11 +52,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              there is no name to report and a constant would be a value nobody measured. The same \
              answer `pg_range` gives for `oid`, and it closes the day a unit gives this node \
              databases.",
+            "UNMEASURED",
         ),
         (
             "SELECT constraint_catalog, constraint_schema, table_catalog, table_schema FROM information_schema.key_column_usage WHERE table_name = 'sb'",
             "the same, twice over: `constraint_catalog` and `table_catalog` are both the database \
              name.",
+            "UNMEASURED",
         ),
         (
             "SELECT count(*) FROM information_schema.tables",
@@ -66,6 +68,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              relations in it. The same shape `pg_class` already declares — every other statement \
              in this corpus filters by name for exactly that reason, and this one is here to say \
              what the unfiltered number is.",
+            "UNMEASURED",
         ),
         (
             "DROP TABLE information_schema.tables",
@@ -77,20 +80,24 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              which is one rule rather than two and is the rule `tests/pg_catalog.rs` already \
              declares for `pg_type`. Both refuse, both name the relation, and neither lets the \
              write through — and `DROP TABLE pg_catalog.pg_class` agrees exactly.",
+            "UNMEASURED",
         ),
         (
             "ALTER TABLE information_schema.tables ADD COLUMN a bigint",
             "the same, for `ALTER`.",
+            "UNMEASURED",
         ),
         (
             "CREATE INDEX ixq ON information_schema.tables (table_name)",
             "the same, for `CREATE INDEX`.",
+            "UNMEASURED",
         ),
         (
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'information_schema' AND table_name IN ('tables','columns') ORDER BY table_name",
             "the same fact asked precisely: a real server lists `information_schema`'s own \
              relations in it and this node lists none, because they are computed rather than \
              stored.",
+            "UNMEASURED",
         ),
     ],
 };

@@ -43,6 +43,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '[''1'', ''10'']'::int4range",
             "an int4range's bound is read as an int8 here, so the message names bigint",
+            "pg19_tsrange.txt:106",
         ),
         // **The standing text-collation divergence, seen through a range bound**, and it is the
         // bound *parsing* that makes it visible rather than any new rule: `["a,b", "c,d"]` has
@@ -55,16 +56,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', '[\"a,b\", \"c,d\"]'::stringrange",
             "the bounds compare byte-wise here and under en_US.utf8 there",
+            "pg19_tsrange.txt:118",
         ),
         (
             "SELECT 'r', lower('[\"a,b\", \"c,d\"]'::stringrange), upper('[\"a,b\", \"c,d\"]'::stringrange)",
             "the same collation divergence, one line on",
+            "pg19_tsrange.txt:119",
         ),
         // The same again with no quotes in sight: `[a, f]`'s bounds are `a` and ` f`, and the
         // space is the whole of the difference.
         (
             "SELECT 'r', '[a, f]'::stringrange, '[''a'', ''f'']'::stringrange",
             "a leading space in a bound is ignored by en_US.utf8 and is not by byte order",
+            "pg19_tsrange.txt:120",
         ),
         // **`DateStyle` is not a run-time parameter here.** The text form of a timestamp depends on
         // it on a real server, and this node has one spelling — so the parameter would be a knob
@@ -73,6 +77,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', current_setting('DateStyle'), current_setting('TimeZone')",
             "DateStyle is not a run-time parameter here; this node has one text form",
+            "pg19_tsrange.txt:44",
         ),
         // **`pg_range` is not built**, and this statement is the *evidence* for the unit rather
         // than part of it: `rngcanonical` is `int4range_canonical` for `int4range` and `-` for
@@ -84,6 +89,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              pg_type t ON t.oid = r.rngtypid WHERE t.typname IN ('tsrange','int4range') ORDER BY \
              t.typname",
             "pg_range is not built",
+            "pg19_tsrange.txt:46",
         ),
         // **A second time zone is a knob this node does not have.** It honours `TimeZone` only
         // where it means UTC (`crate::parameter`), so the `SET` itself is `0A000` — and the fact
@@ -93,6 +99,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SET TimeZone = 'Pacific/Auckland'",
             "this node honours TimeZone only where it means UTC",
+            "pg19_assignment_cast_date.txt:68",
         ),
         // **Array containment, which is not a range fact.** `@>` between two arrays is the array
         // operator `tests/array.rs` already declares for every element type — `'{1,2}'::int[] @>
@@ -104,10 +111,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', ARRAY['[1,10]'::int4range] = ARRAY['[1,11)'::int4range], \
              ARRAY['[1,10]'::int4range] @> ARRAY['[1,11)'::int4range]",
             "@> between two arrays is the array operator, unbuilt for every element type",
+            "pg19_tsrange.txt:146",
         ),
         (
             "SELECT 'r', ARRAY['[1,10]'::int4range] @> '[2,3]'::int4range",
             "both refuse — array containment needs two arrays — and only the code differs",
+            "pg19_tsrange.txt:148",
         ),
     ],
 };

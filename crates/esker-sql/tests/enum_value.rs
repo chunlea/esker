@@ -66,6 +66,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', typname, typtype FROM pg_type WHERE typtype IN ('r','e','d') ORDER BY \
              typname",
             "no pg_type rows for the built-in ranges and information_schema's domains",
+            "UNMEASURED",
         ),
         // **A cast *to* a user-defined type is not built**, which is one gap wearing four
         // statements. `'happy'::mood` needs the catalog at a point where a cast is lowered without
@@ -80,6 +81,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', ('happy'::mood)::text || '!'",
             "|| over text is not built for any type",
+            "UNMEASURED",
         ),
         // **A name that is nobody's type is `42704` there and `0A000` here**, and this is the one
         // place the pass cannot do better: after the catalog says no, the name is either a type
@@ -91,6 +93,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', 'happy'::nosuchtype",
             "a name the catalog does not have is either an unbuilt type or no type; 0A000 says \
              which is not known",
+            "UNMEASURED",
         ),
         // **An enum value in a relation that is not a table has no column to carry its type.**
         // ADR 0050 puts the identity on the `ColumnDef` and ADR 0053 keeps the label only where
@@ -104,11 +107,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', min(v), max(v) FROM (VALUES ('sad'::mood), ('happy'::mood), \
              ('ok'::mood)) t(v)",
             "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', v FROM (VALUES ('happy'::mood), ('sad'::mood), ('ok'::mood)) t(v) ORDER \
              BY v",
             "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
+            "UNMEASURED",
         ),
         // **`'mood'::regtype` resolves against this node's own type names and not the catalog.**
         // The lowering answers `42704` for a name `crate::value::named_type` does not have, which
@@ -119,6 +124,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = \
              'mood'::regtype ORDER BY enumsortorder",
             "'x'::regtype does not resolve a user-defined type's name to its oid",
+            "UNMEASURED",
         ),
         // **The standing constant-width divergence, in three sentences that are otherwise
         // identical**: a bare integer constant is `int8` here and `int4` there, so the type this
@@ -128,14 +134,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "INSERT INTO postgresql_enums (current_mood) VALUES (1)",
             "a bare integer constant is int8 here and int4 there",
+            "UNMEASURED",
         ),
         (
             "UPDATE postgresql_enums SET current_mood = 1 WHERE id = 1",
             "a bare integer constant is int8 here and int4 there",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', id FROM postgresql_enums WHERE current_mood = 1",
             "a bare integer constant is int8 here and int4 there",
+            "UNMEASURED",
         ),
         // `DO $$ … $$` was here, refused by name. This entry predicted its own unit would be
         // "a large one — it is a language, not a statement"; the measurement said otherwise.

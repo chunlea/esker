@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "`lower(bigint)` where PostgreSQL says `lower(integer)`: an unsuffixed integer literal is \
          an `int8` here and an `int4` there. The refusal, its DETAIL and its HINT all agree; only \
          the literal's type name differs",
+        "UNMEASURED",
     )],
 };
 

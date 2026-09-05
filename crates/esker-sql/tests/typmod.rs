@@ -28,6 +28,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          function pads to `n`, and a cast to `text` strips back. `SELECT c` is `x  ` and \
          `c || '|'` is `x|` on a real server. That pair stays unpinned here until either operation \
          lands, and this entry is the record that it is owed.",
+        "UNMEASURED",
     )],
 };
 

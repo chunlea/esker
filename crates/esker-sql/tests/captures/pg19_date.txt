@@ -1,0 +1,118 @@
+# `date`, as a real PostgreSQL 19beta1 answers it — tier 2's first type
+# ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap, "Tier 2 — new
+# physical types"). Four bytes, OID 1082, and the first tier-2 type because it is the one
+# `ActiveRecord`'s `t.date` emits and the one with no fractional part to argue about.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A `date` has no fixed text.** `DateStyle` decides it, and all four spellings of one value
+#     are below: ISO `2020-01-02`, SQL `01/02/2020`, German `02.01.2020`, Postgres `01-02-2020`.
+#     An implementation that hard-codes ISO is right only for the default. The *input* half of the
+#     same setting is worse: `'01/02/2020'` is **2 January** under `MDY` and **1 February** under
+#     `DMY` — one literal, two dates, no error either way.
+#   * **`22008` has two messages and they are not interchangeable**, the same trap `int4`'s two
+#     `22003`s set. Past the type's ends is `date out of range: "5874898-01-01"`; an impossible
+#     *field* is `date/time field value out of range: "2020-02-30"`. And only the second kind
+#     sometimes carries `HINT: Perhaps you need a different "DateStyle" setting.` — `2020-13-01`
+#     gets the hint and `2020-02-30` does not, because a 13 could have been a day.
+#   * **`date - date` is an `integer`, not an `interval`**, and **`date + interval` is a
+#     `timestamp`, not a `date`**. Neither arithmetic result has the type of its operands, and
+#     `date + numeric` does not exist at all — `1.5` is a `numeric`, so `d + 1.5` is `42883` where
+#     `d + 1` is a date.
+#   * **`extract` answers `numeric` and `date_part` answers `double precision`** for the same
+#     question. Two functions, one meaning, two declared types.
+#   * **A `date` is not a number.** `'2020-01-01'::date::int` is `42846 cannot cast type date to
+#     integer` and so is the other direction. The Julian day is an implementation detail with no
+#     cast to reach it.
+#   * **There is no year zero.** `0000-01-01` is `22008` while `0001-01-01 BC` is a value, and
+#     `4713-01-01 BC` is the bottom of the range — one year further back is out of range.
+#   * **`infinity` absorbs arithmetic**: `'infinity'::date - 1` is `infinity`, not the day before.
+#   * **`sum` and `avg` over a `date` do not exist** (`42883 function sum(date) does not exist`)
+#     where `min`, `max` and `count` do. The aggregate set is not uniform across types.
+#   * **The clock words are values, not literals to store.** `today`, `tomorrow`, `yesterday` and
+#     `now` resolve at parse time, so no capture can pin them; what is pinned here is the
+#     invariant they satisfy — `'tomorrow'::date - 'today'::date` is 1 on every day.
+DROP TABLE IF EXISTS dt		-
+SELECT oid, typname, typlen, typinput, typelem, typcategory FROM pg_type WHERE typname = 'date'	oid,name,smallint,regproc,oid,"char"	1082|date|4|date_in|0|D
+SELECT pg_typeof('2020-01-01'::date)	regtype	date
+SELECT format_type(1082, -1), format_type(1082, 3)	text,text	date|date(3)
+CREATE TABLE dt (id int8 PRIMARY KEY, d date, e date)		-
+INSERT INTO dt VALUES (1, '2020-01-02', '2020-01-02')		-
+INSERT INTO dt VALUES (2, '4713-01-01 BC', '0001-01-01')		-
+INSERT INTO dt VALUES (3, '5874897-12-31', '0001-01-01 BC')		-
+INSERT INTO dt VALUES (4, 'epoch', '1970-01-01')		-
+INSERT INTO dt VALUES (5, 'infinity', '-infinity')		-
+INSERT INTO dt VALUES (6, NULL, NULL)		-
+SELECT id, d, e FROM dt ORDER BY id	bigint,date,date	1|2020-01-02|2020-01-02 ; 2|4713-01-01 BC|0001-01-01 ; 3|5874897-12-31|0001-01-01 BC ; 4|1970-01-01|1970-01-01 ; 5|infinity|-infinity ; 6|\N|\N
+SELECT id, d FROM dt ORDER BY d	bigint,date	2|4713-01-01 BC ; 4|1970-01-01 ; 1|2020-01-02 ; 3|5874897-12-31 ; 5|infinity ; 6|\N
+SELECT id, d FROM dt ORDER BY d DESC	bigint,date	6|\N ; 5|infinity ; 3|5874897-12-31 ; 1|2020-01-02 ; 4|1970-01-01 ; 2|4713-01-01 BC
+SELECT id FROM dt WHERE d IS NULL	bigint	6
+SELECT id FROM dt WHERE d = '2020-01-02'	bigint	1
+SELECT id FROM dt WHERE d = e	bigint	1 ; 4
+SELECT id FROM dt WHERE d > '2020-01-01' ORDER BY id	bigint	1 ; 3 ; 5
+SELECT id FROM dt WHERE d IN ('2020-01-02', 'epoch') ORDER BY id	bigint	1 ; 4
+SELECT count(*), count(d), min(d), max(d) FROM dt	bigint,bigint,date,date	6|5|4713-01-01 BC|infinity
+SELECT sum(d) FROM dt	!42883 function sum(date) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT avg(d) FROM dt	!42883 function avg(date) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '2020-01-01'::date, '2020-1-1'::date, '20200101'::date, DATE '2020-01-01'	date,date,date,date	2020-01-01|2020-01-01|2020-01-01|2020-01-01
+SELECT '01/02/2020'::date, 'Jan 2, 2020'::date, '2 Jan 2020'::date, '2020-Jan-02'::date, 'January 2, 2020'::date	date,date,date,date,date	2020-01-02|2020-01-02|2020-01-02|2020-01-02|2020-01-02
+SELECT '2020-01-01 12:34:56'::date, '2020-01-01T00:00:00'::date	date,date	2020-01-01|2020-01-01
+SELECT 'epoch'::date, 'infinity'::date, '-infinity'::date	date,date,date	1970-01-01|infinity|-infinity
+SELECT 'tomorrow'::date - 'today'::date, 'today'::date - 'yesterday'::date	integer,integer	1|1
+SELECT '4713-01-01 BC'::date, '5874897-12-31'::date	date,date	4713-01-01 BC|5874897-12-31
+SELECT '0001-01-01'::date, '0001-01-01 BC'::date	date,date	0001-01-01|0001-01-01 BC
+SELECT '5874898-01-01'::date	!22008 date out of range: "5874898-01-01"
+SELECT '4714-01-01 BC'::date	!22008 date out of range: "4714-01-01 BC"
+SELECT '0000-01-01'::date	!22008 date/time field value out of range: "0000-01-01"
+SELECT '2020-02-30'::date	!22008 date/time field value out of range: "2020-02-30"
+SELECT '2020-13-01'::date	!22008 date/time field value out of range: "2020-13-01" HINT: Perhaps you need a different "DateStyle" setting.
+SELECT '2019-02-29'::date	!22008 date/time field value out of range: "2019-02-29"
+SELECT '2020-02-29'::date	date	2020-02-29
+SELECT 'not a date'::date	!22007 invalid input syntax for type date: "not a date"
+SELECT 'allballs'::date	!22007 invalid input syntax for type date: "allballs"
+SELECT ''::date	!22007 invalid input syntax for type date: ""
+SELECT '2020-01-02'::date::text, '2020-01-02'::text::date	text,date	2020-01-02|2020-01-02
+SELECT '2020-01-02'::date::varchar, '2020-01-02'::date::char(4)	character varying,character(4)	2020-01-02|2020
+SELECT 'infinity'::date::text	text	infinity
+SELECT '2020-01-01'::date::timestamp, '2020-01-01'::date::timestamptz	timestamp without time zone,timestamp with time zone	2020-01-01 00:00:00|2020-01-01 00:00:00+00
+SELECT '2020-01-01 12:34:56'::timestamp::date	date	2020-01-01
+SELECT '2020-01-01'::date::int	!42846 cannot cast type date to integer
+SELECT 1::date	!42846 cannot cast type integer to date
+SELECT '2020-06-15'::date::json	!42846 cannot cast type date to json
+SELECT '2020-01-31'::date - '2020-01-01'::date	integer	30
+SELECT '2020-01-01'::date + 30, '2020-01-01'::date - 30	date,date	2020-01-31|2019-12-02
+SELECT '2020-01-01'::date + '1 day'::interval, '2020-01-01'::date - '1 day'::interval	timestamp without time zone,timestamp without time zone	2020-01-02 00:00:00|2019-12-31 00:00:00
+SELECT '2020-06-15'::date - '2020-06-15'::timestamp	interval	00:00:00
+SELECT age('2020-01-01'::date, '2019-01-01'::date)	interval	1 year
+SELECT 'infinity'::date - 1	date	infinity
+SELECT '2020-01-01'::date + 1.5	!42883 operator does not exist: date + numeric DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '2020-01-01'::date + '2020-01-01'::date	!42883 operator does not exist: date + date DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '2020-01-01'::date * 2	!42883 operator does not exist: date * integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT extract(year FROM '2020-06-15'::date), extract(doy FROM '2020-06-15'::date), extract(epoch FROM '2020-06-15'::date)	numeric,numeric,numeric	2020|167|1592179200
+SELECT date_part('month', '2020-06-15'::date)	double precision	6
+SELECT to_char('2020-06-15'::date, 'YYYY-MM-DD'), to_date('2020-06-15', 'YYYY-MM-DD')	text,date	2020-06-15|2020-06-15
+SELECT '2020-01-01'::date = '2020-01-01'::timestamp	boolean	t
+SELECT '2020-01-01'::date < '2020-01-02'::date, '2020-01-01'::date = '2020-01-01'::date	boolean,boolean	t|t
+SELECT 'infinity'::date > '5874897-12-31'::date, '-infinity'::date < '4713-01-01 BC'::date	boolean,boolean	t|t
+SELECT greatest('2020-01-01'::date, '2019-01-01'::date), least('2020-01-01'::date, '2019-01-01'::date)	date,date	2020-01-01|2019-01-01
+SELECT '2020-01-01'::date = 1	!42883 operator does not exist: date = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT NULL::date IS NULL, '2020-01-01'::date = NULL	boolean,boolean	t|\N
+SET DateStyle TO 'ISO, DMY'		-
+SELECT '01/02/2020'::date	date	2020-02-01
+SET DateStyle TO 'SQL, MDY'		-
+SELECT '2020-01-02'::date	date	01/02/2020
+SET DateStyle TO 'German, DMY'		-
+SELECT '2020-01-02'::date	date	02.01.2020
+SET DateStyle TO 'Postgres, MDY'		-
+SELECT '2020-01-02'::date	date	01-02-2020
+RESET DateStyle		-
+SELECT '2020-01-02'::date	date	2020-01-02

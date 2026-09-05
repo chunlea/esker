@@ -58,6 +58,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', last_value, is_called FROM foo_id_seq",
             "a sequence block is reserved 32 at a time (ADR 0072), and last_value reports the reservation",
+            "pg19_serial.txt:71",
         ),
     ],
 };

@@ -1,0 +1,33 @@
+BEGIN		-
+CREATE TABLE mg_books (id serial primary key, name character varying(255))		-
+INSERT INTO mg_books (name) VALUES ('A')		-
+CREATE MATERIALIZED VIEW mg_mat AS SELECT id, name FROM mg_books		-
+CREATE VIEW mg_view AS SELECT id, name FROM mg_books		-
+SAVEPOINT g1		-
+INSERT INTO mg_mat (id, name) VALUES (9, 'X')	!42809 cannot change materialized view "mg_mat"
+ROLLBACK TO g1		-
+SAVEPOINT g2		-
+UPDATE mg_mat SET name = 'Y'	!42809 cannot change materialized view "mg_mat"
+ROLLBACK TO g2		-
+SAVEPOINT g3		-
+DELETE FROM mg_mat	!42809 cannot change materialized view "mg_mat"
+ROLLBACK TO g3		-
+SAVEPOINT g4		-
+DROP TABLE mg_mat	!42809 "mg_mat" is not a table HINT: Use DROP MATERIALIZED VIEW to remove a materialized view.
+ROLLBACK TO g4		-
+SAVEPOINT g5		-
+DROP MATERIALIZED VIEW mg_view	!42809 "mg_view" is not a materialized view HINT: Use DROP VIEW to remove a view.
+ROLLBACK TO g5		-
+SAVEPOINT g6		-
+DROP MATERIALIZED VIEW mg_books	!42809 "mg_books" is not a materialized view HINT: Use DROP TABLE to remove a table.
+ROLLBACK TO g6		-
+SAVEPOINT g7		-
+TRUNCATE mg_mat	!42809 "mg_mat" is not a table
+ROLLBACK TO g7		-
+SAVEPOINT g8		-
+ALTER TABLE mg_mat ADD COLUMN extra integer	!42809 ALTER action ADD COLUMN cannot be performed on relation "mg_mat" DETAIL: This operation is not supported for materialized views.
+ROLLBACK TO g8		-
+SELECT 'r', count(*) AS mat_in_information_schema FROM information_schema.tables WHERE table_name = 'mg_mat'	text,bigint	r|0
+SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name = 'mg_view'	text,name,character varying	r|mg_view|VIEW
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('mg_books','mg_mat','mg_view')	bigint	0

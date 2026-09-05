@@ -39,6 +39,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_typeof(lower(string_range)), pg_typeof(upper(string_range)) FROM fr \
              WHERE id = 109",
             "a varchar bound is a Datum::Text, which reports text",
+            "UNMEASURED",
         ),
         // **The refusal is right and the type name in it is the representation.** A user range
         // column holds `ColumnType::FloatRange`, whose `name()` is `float8range` — deliberately
@@ -49,10 +50,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', float_range = '[0.5,0.7]'::numrange FROM fr WHERE id = 101",
             "the message names the representation, not the declared type",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', min(float_range) FROM fr",
             "the message names the representation, not the declared type",
+            "UNMEASURED",
         ),
         // **A subtype nobody declared.** `42704 type "nosuchtype" does not exist` there and the
         // standing `0A000` here, which is lowering's: a bare type name is not resolved until the
@@ -62,6 +65,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "CREATE TYPE norange AS RANGE (subtype = nosuchtype)",
             "an unresolved type name is 0A000 here and 42704 there",
+            "UNMEASURED",
         ),
         // **A range column cannot be indexed here, and can be there.** Every range has a default
         // btree operator class on a real server; this node has no key encoding for one
@@ -73,6 +77,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "CREATE INDEX fr_range_idx ON fr (float_range)",
             "a range is an index key there and not here; refused rather than built",
+            "UNMEASURED",
         ),
     ],
 };

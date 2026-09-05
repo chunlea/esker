@@ -19,34 +19,42 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 2::numeric ^ 3::numeric",
             "**`^` over two exact values has a scale rule of its own** and it is not division's: `2 ^ 3` is `8.0000000000000000` — sixteen places — while `10 ^ 100` is a bare integer, so the rule is about the *result's* weight rather than the operands'. That is `numeric_power` in `numeric.c`, a different function from the `select_div_scale` this node already implements, and it needs a capture round of its own. Refused by name and counted; `^` over the floats answers (`tests/arithmetic.rs`), which is the form every statement in either schema file uses.",
+            "UNMEASURED",
         ),
         (
             "SELECT 2::numeric ^ 0.5::numeric",
             "**`^` over two exact values has a scale rule of its own** and it is not division's: `2 ^ 3` is `8.0000000000000000` — sixteen places — while `10 ^ 100` is a bare integer, so the rule is about the *result's* weight rather than the operands'. That is `numeric_power` in `numeric.c`, a different function from the `select_div_scale` this node already implements, and it needs a capture round of its own. Refused by name and counted; `^` over the floats answers (`tests/arithmetic.rs`), which is the form every statement in either schema file uses.",
+            "UNMEASURED",
         ),
         (
             "SELECT (10::numeric ^ 100)::text",
             "**`^` over two exact values has a scale rule of its own** and it is not division's: `2 ^ 3` is `8.0000000000000000` — sixteen places — while `10 ^ 100` is a bare integer, so the rule is about the *result's* weight rather than the operands'. That is `numeric_power` in `numeric.c`, a different function from the `select_div_scale` this node already implements, and it needs a capture round of its own. Refused by name and counted; `^` over the floats answers (`tests/arithmetic.rs`), which is the form every statement in either schema file uses.",
+            "pg19_numeric.txt:87",
         ),
         (
             "SELECT (-2)::numeric ^ 0.5::numeric",
             "**`^` over two exact values has a scale rule of its own** and it is not division's: `2 ^ 3` is `8.0000000000000000` — sixteen places — while `10 ^ 100` is a bare integer, so the rule is about the *result's* weight rather than the operands'. That is `numeric_power` in `numeric.c`, a different function from the `select_div_scale` this node already implements, and it needs a capture round of its own. Refused by name and counted; `^` over the floats answers (`tests/arithmetic.rs`), which is the form every statement in either schema file uses.",
+            "UNMEASURED",
         ),
         (
             "SELECT 0::numeric ^ 0::numeric",
             "**`^` over two exact values has a scale rule of its own** and it is not division's: `2 ^ 3` is `8.0000000000000000` — sixteen places — while `10 ^ 100` is a bare integer, so the rule is about the *result's* weight rather than the operands'. That is `numeric_power` in `numeric.c`, a different function from the `select_div_scale` this node already implements, and it needs a capture round of its own. Refused by name and counted; `^` over the floats answers (`tests/arithmetic.rs`), which is the form every statement in either schema file uses.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1.5 + 1.5",
             "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares, and this is the line that shows it costs a value and not only a type: `0.1 + 0.2` is exactly `0.3` in `numeric` and is not in binary floating point. Written with an explicit `::numeric` the same sum agrees (line 8 of this corpus). Closing it means changing what a decimal constant is everywhere, which is a unit of its own and not one arithmetic can do from inside.",
+            "UNMEASURED",
         ),
         (
             "SELECT 1.5 * 2",
             "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares, and this is the line that shows it costs a value and not only a type: `0.1 + 0.2` is exactly `0.3` in `numeric` and is not in binary floating point. Written with an explicit `::numeric` the same sum agrees (line 8 of this corpus). Closing it means changing what a decimal constant is everywhere, which is a unit of its own and not one arithmetic can do from inside.",
+            "UNMEASURED",
         ),
         (
             "SELECT 0.1 + 0.2",
             "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares, and this is the line that shows it costs a value and not only a type: `0.1 + 0.2` is exactly `0.3` in `numeric` and is not in binary floating point. Written with an explicit `::numeric` the same sum agrees (line 8 of this corpus). Closing it means changing what a decimal constant is everywhere, which is a unit of its own and not one arithmetic can do from inside.",
+            "UNMEASURED",
         ),
     ],
 };

@@ -33,10 +33,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', datcollate FROM pg_database WHERE datname = current_database()",
             "no collation support here, so the locale is C rather than the container's en_US.utf8",
+            "pg19_coalesce_current_database.txt:53",
         ),
         (
             "SELECT 'r', datctype FROM pg_database WHERE datname = current_database()",
             "no collation support here, so the locale is C rather than the container's en_US.utf8",
+            "pg19_coalesce_current_database.txt:54",
         ),
         // `pg_typeof` answers a `regtype` there and `text` here, and `current_database()` is a
         // `name` there and `text` here — the same trade `current_schema()` already makes. The
@@ -44,6 +46,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(current_database())",
             "pg_typeof answers text here, and current_database is a name there and text here",
+            "pg19_coalesce_current_database.txt:55",
         ),
         // The two standing constant-width divergences, seen through `COALESCE`'s promotion: a bare
         // integer constant is `int8` here and `int4` there, and a decimal constant is
@@ -55,6 +58,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              pg_typeof(COALESCE(1, 2.5))",
             "a bare integer constant is int8 here and int4 there, and a decimal is double \
              precision here and numeric there",
+            "pg19_coalesce_current_database.txt:59",
         ),
         // Both messages are right in every part except that width: the `22P02` is the unknown
         // literal coerced to the common type, and the `42804` names `COALESCE` and the two types
@@ -62,10 +66,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT COALESCE(1, 'notanumber')",
             "the type named in the message is bigint here and integer there",
+            "pg19_coalesce_current_database.txt:77",
         ),
         (
             "SELECT COALESCE(1, 'x'::text)",
             "the type named in the message is bigint here and integer there",
+            "pg19_coalesce_current_database.txt:80",
         ),
     ],
 };

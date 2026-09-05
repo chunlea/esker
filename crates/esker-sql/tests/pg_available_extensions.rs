@@ -35,6 +35,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE \
              name = 'hstore'",
             "read directly, `installed_version` differs from the two probes above it",
+            "pg19_pg_available_extensions.txt:49",
         ),
         (
             "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = \
@@ -45,6 +46,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              extending the same treatment to the column view would still diverge on content: \
              every column here would report `text` where a real server reports `name` for the \
              first. Nothing reads it; the two methods this view exists for read the view itself.",
+            "pg19_pg_available_extensions.txt:39",
         ),
         (
             "SELECT extname, extversion FROM pg_extension ORDER BY extname",
@@ -55,6 +57,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `ActiveRecord`'s `extension_enabled?` gates the whole suite on it — the two catalogs \
              disagree about `plpgsql`, deliberately, and the disagreement is recorded here rather \
              than resolved by inventing a `pg_extension` row nothing else could honour.",
+            "pg19_pg_available_extensions.txt:50",
         ),
         (
             "SELECT 'g', pg_typeof(name), pg_typeof(default_version), pg_typeof(installed_version) \
@@ -62,6 +65,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`pg_typeof` is not implemented for any type, so this is `0A000` naming the function. \
              It is in the corpus because it is the statement that would *prove* the `name`-vs-\
              `text` divergence declared above.",
+            "pg19_pg_available_extensions.txt:51",
         ),
     ],
 };

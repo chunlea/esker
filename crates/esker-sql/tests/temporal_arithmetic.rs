@@ -22,6 +22,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT '2020-01-01'::date + 1.5",
             "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares. Both raise the same `42883` for the same reason: `date` has no arithmetic with either type. One word of the message differs and nothing else does.",
+            "pg19_date.txt:97",
         ),
         // `SELECT '2020-01-01'::date + NULL::interval` was here — the one place in these three
         // corpora where this node **raised where PostgreSQL returns a row**, because a dropped
@@ -31,6 +32,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT '1 day'::interval * 'Infinity'::float8",
             "**An interval has no infinity in this node.** PostgreSQL 17 gave the type one, so `'1 day' * 'Infinity'::float8` is `infinity` there; here an interval is three finite fields. Scaling by an infinite factor is **refused by name** rather than truncated to `00:00:00`, which is what it would otherwise answer — a wrong value where a refusal is available (ADR 0031).",
+            "UNMEASURED",
         ),
     ],
 };

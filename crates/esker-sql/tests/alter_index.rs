@@ -38,23 +38,27 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`0A000 ALTER INDEX IF EXISTS is not supported`: `sqlparser` has nowhere to put the \
              clause, so the flag cannot reach the executor — where the plain form's `42P01` is \
              already right, and `IF EXISTS` would only soften it to a notice.",
+            "UNMEASURED",
         ),
         (
             "ALTER INDEX \"index_ai_on_name\" ALTER COLUMN 1 SET STATISTICS 100",
             "Both refuse it and both say `0A000`; PostgreSQL's sentence is about the *column* \
              being non-expression and hints at the table's, where this node names the clause it \
              cannot read. The same class, a different sentence.",
+            "UNMEASURED",
         ),
         (
             "ALTER INDEX \"index_ai_on_name\" SET (fillfactor = 70)",
             "A real server accepts it and changes nothing this node can observe — there is no \
              `fillfactor` here and no storage parameter on an index. Named rather than accepted \
              and ignored, which is this node's rule for a setting it will not honour.",
+            "UNMEASURED",
         ),
         (
             "ALTER INDEX \"index_ai_on_name\" SET TABLESPACE pg_default",
             "The same: one tablespace and no way to have another, so moving an index to one is a \
              word this node cannot mean.",
+            "UNMEASURED",
         ),
         // **A real server renames a *table* through `ALTER INDEX`** — the statement is the generic
         // rename wearing another keyword, measured. Refused here rather than quietly doing
@@ -65,6 +69,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              server. This node refuses rather than letting an arm named for indexes rename \
              something else — `ALTER TABLE … RENAME TO` is the statement that does it here, and \
              it works.",
+            "UNMEASURED",
         ),
     ],
 };

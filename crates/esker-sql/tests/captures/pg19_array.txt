@@ -1,0 +1,156 @@
+# Arrays — `integer[]` and `text[]`, and `= ANY(...)` — as a real PostgreSQL 19beta1 answers them.
+# Tier 2 ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)'s roadmap names them
+# last and says why they cannot wait: "`text[]` and `integer[]` columns *and* `= ANY($1)`, which
+# `ActiveRecord` uses for every `IN` with binds — four of its 36 boot statements").
+#
+# `_int4` is OID 1007 and `_text` is 1009; both are `array_in`, `typdelim` `,`, `typcategory` A,
+# and their `typelem` is the element type's OID (23 and 25). An array is not a new scalar — it is
+# a *constructor over* one — which is why `'{2147483648}'::int[]` fails with `int4`'s own message.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own table, dropping whatever a previous run left, so a replay of `cut -f1` is
+# byte-identical. The table is deliberately *not* dropped at the end: `sesscap.py` asks `\gdesc`
+# for the declared types after the session closes, and a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`= ANY` is three-valued and a match beats a NULL.** `1 = ANY('{NULL,1}')` is **`t`**;
+#     `1 = ANY('{NULL,2}')` is **NULL**, not false; `NULL = ANY('{1,2}')` is NULL. So a NULL
+#     element only matters when nothing matched. Over an **empty** array `= ANY` is `f` and
+#     `= ALL` is `t`, and `1 = ANY(NULL::int[])` is NULL — three different empties.
+#     This is the operator Rails puts every `IN (?)` through, so each of these is a row it can hit.
+#   * **An empty array has no dimensions, so its length is NULL and its cardinality is 0.**
+#     `array_length('{}', 1)` is NULL, `array_ndims('{}')` is NULL, `array_dims('{}')` is NULL,
+#     and `cardinality('{}')` is **0**. A length of NULL where a caller expects 0 is the shape
+#     that breaks a `LIMIT` computed from it.
+#   * **An array containing NULL is not a NULL array.** `'{NULL}'::int[] IS NULL` is `f`, and
+#     `array_agg` over one NULL row is `{NULL}` rather than NULL.
+#   * **Subscripts are 1-based and out-of-range is NULL, never an error** — `[0]` and `[4]` on a
+#     three-element array are both NULL. And a **two-dimensional array indexed with one
+#     subscript is NULL**: `('{{1,2},{3,4}}')[1]` is NULL, not `{1,2}`. A slice is what returns
+#     an array.
+#   * **Lower bounds are part of the value and survive the round trip.** `'[0:2]={1,2,3}'::int[]`
+#     prints back as `[0:2]={1,2,3}`, with `array_lower` 0. An implementation that stored only
+#     the elements would print `{1,2,3}` and be wrong about the text.
+#   * **Three shapes of malformed literal, three DETAILs, one SQLSTATE.** `22P02 malformed array
+#     literal` with `Unexpected end of input.`, `Unexpected "," character.`,
+#     `Unexpected "{" character.` and `Multidimensional arrays must have sub-arrays with matching
+#     dimensions.` — but a bad *element* is not a malformed literal at all: `'{1,x}'::int[]` is
+#     `22P02 invalid input syntax for type integer: "x"` and `'{2147483648}'::int[]` is
+#     `22003 value "2147483648" is out of range for type integer`. The element type answers for
+#     its own values.
+#   * **`min` and `max` over an `integer[]` exist and return `integer[]`**, where over `uuid` and
+#     `jsonb` they do not exist at all. `sum(integer[])` does not exist. A fourth per-type
+#     aggregate answer in this corpus, and the fourth reason not to derive the set from the
+#     category.
+#   * **Comparison is element-wise then by length**: `'{2,1}' = '{1,2}'` is `f` — order matters —
+#     and `'{1,2}' < '{1,2,3}'` is `t`. `@>` over an empty right side is `t`; over a NULL array it
+#     is NULL.
+#   * **Unquoted `NULL` inside a literal is a NULL and quoted `"NULL"` is the string**, and
+#     unquoted whitespace around elements is trimmed (`'{ a , b }'` is `{a,b}`) while quoted
+#     whitespace is kept. Output re-quotes only what needs it: `{a,b}` but `{"a b","c,d"}`.
+#   * **Backslash escaping inside a quoted element is the element's, not SQL's**, and the three
+#     lines here pin the whole rule. With `standard_conforming_strings` on, `'{"a\"b"}'` reaches
+#     `array_in` as `{"a\"b"}`: the `\"` is an **escaped quote**, the element is `a"b`, and it
+#     prints back re-escaped as `{"a\"b"}`. `'{"a\\b"}'` is an escaped **backslash** and round
+#     trips the same way. But `'{"a\\"b"}'` — an escaped backslash *then* a quote — closes the
+#     element early and is `22P02 malformed array literal` with a fourth DETAIL,
+#     `Incorrectly quoted array element.` One character apart, and one of them is an error.
+#   * **`ARRAY[]` with no cast is an error**, `42P18 cannot determine type of empty array`, with a
+#     HINT naming the fix. `'{}'::int[]` is fine — the cast is the type, not the contents.
+#   * **Not captured, and measured anyway: the bind form.** `PREPARE p(int[]) AS SELECT ... WHERE
+#     id = ANY($1)` then `EXECUTE p('{1,3}')` returns rows 1 and 3; `EXECUTE p('{}')` and
+#     `EXECUTE p(NULL)` return none. Those are not lines below because `sesscap.py` fills the
+#     declared-types column by asking `\gdesc` in a *second* session, which has no such prepared
+#     statement — an `EXECUTE` can only ever be captured with that column empty. The semantics it
+#     tests are the `= ANY` lines that are here.
+DROP TABLE IF EXISTS ar		-
+SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE typname IN ('_int4','_text') ORDER BY oid	oid,name,smallint,regproc,oid,"char","char"	1007|_int4|-1|array_in|23|,|A ; 1009|_text|-1|array_in|25|,|A
+SELECT pg_typeof('{1,2}'::int[]), pg_typeof(ARRAY[1,2]), format_type(1007, -1), format_type(1009, -1)	regtype,regtype,text,text	integer[]|integer[]|integer[]|text[]
+SELECT 'integer[]'::regtype::oid, 'int4[]'::regtype::oid, '_int4'::regtype::oid, 'text[]'::regtype::oid	oid,oid,oid,oid	1007|1007|1007|1009
+CREATE TABLE ar (id int8 PRIMARY KEY, n int[], t text[])		-
+INSERT INTO ar VALUES (1, '{1,2,3}', '{a,b}')		-
+INSERT INTO ar VALUES (2, '{}', '{}')		-
+INSERT INTO ar VALUES (3, '{1,NULL,3}', '{NULL,"NULL"}')		-
+INSERT INTO ar VALUES (4, '{{1,2},{3,4}}', '{"a b","c,d"}')		-
+INSERT INTO ar VALUES (5, NULL, NULL)		-
+SELECT id, n, t FROM ar ORDER BY id	bigint,integer[],text[]	1|{1,2,3}|{a,b} ; 2|{}|{} ; 3|{1,NULL,3}|{NULL,"NULL"} ; 4|{{1,2},{3,4}}|{"a b","c,d"} ; 5|\N|\N
+SELECT id, n FROM ar ORDER BY n	bigint,integer[]	2|{} ; 1|{1,2,3} ; 4|{{1,2},{3,4}} ; 3|{1,NULL,3} ; 5|\N
+SELECT id, n FROM ar ORDER BY n DESC	bigint,integer[]	5|\N ; 3|{1,NULL,3} ; 4|{{1,2},{3,4}} ; 1|{1,2,3} ; 2|{}
+SELECT id FROM ar WHERE n IS NULL	bigint	5
+SELECT id FROM ar WHERE n = '{1,2,3}'	bigint	1
+SELECT id FROM ar WHERE n @> '{1}' ORDER BY id	bigint	1 ; 3 ; 4
+SELECT id FROM ar WHERE 2 = ANY(n) ORDER BY id	bigint	1 ; 4
+SELECT id FROM ar WHERE id = ANY('{1,3}') ORDER BY id	bigint	1 ; 3
+SELECT id FROM ar WHERE id = ANY(ARRAY[1,3]) ORDER BY id	bigint	1 ; 3
+SELECT id FROM ar WHERE id = ANY('{}')	bigint	-
+SELECT count(*), count(n), array_length(min(n), 1) FROM ar	bigint,bigint,integer	5|4|\N
+SELECT min(n) FROM ar	integer[]	{}
+SELECT max(n) FROM ar	integer[]	{1,NULL,3}
+SELECT sum(n) FROM ar	!42883 function sum(integer[]) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT array_agg(id ORDER BY id) FROM ar	bigint[]	{1,2,3,4,5}
+SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]	integer[],integer[],integer[]	{1,2,3}|{1,2,3}|{1,2,3}
+SELECT '{}'::int[], ARRAY[]::int[]	integer[],integer[]	{}|{}
+SELECT ARRAY[]	!42P18 cannot determine type of empty array HINT: Explicitly cast to the desired type, for example ARRAY[]::integer[].
+SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]	integer[],integer[]	{1,NULL,3}|{1,NULL,3}
+SELECT '{a,b}'::text[], '{"a","b"}'::text[], '{"a b","c,d"}'::text[]	text[],text[],text[]	{a,b}|{a,b}|{"a b","c,d"}
+SELECT '{NULL,"NULL"}'::text[]	text[]	{NULL,"NULL"}
+SELECT '{" "}'::text[], '{""}'::text[]	text[],text[]	{" "}|{""}
+SELECT '{ a , b }'::text[]	text[]	{a,b}
+SELECT '{"a\"b"}'::text[]	text[]	{"a\"b"}
+SELECT '{"a\\"b"}'::text[]	!22P02 malformed array literal: "{"a\\"b"}" DETAIL: Incorrectly quoted array element.
+SELECT '{"a\\\\b"}'::text[]	text[]	{"a\\\\b"}
+SELECT '{"{}"}'::text[]	text[]	{"{}"}
+SELECT '{{1,2},{3,4}}'::int[]	integer[]	{{1,2},{3,4}}
+SELECT '[0:2]={1,2,3}'::int[]	integer[]	[0:2]={1,2,3}
+SELECT array_lower('[0:2]={1,2,3}'::int[], 1), array_upper('[0:2]={1,2,3}'::int[], 1)	integer,integer	0|2
+SELECT '{{1,2},{3}}'::int[]	!22P02 malformed array literal: "{{1,2},{3}}" DETAIL: Multidimensional arrays must have sub-arrays with matching dimensions.
+SELECT '{1,2'::int[]	!22P02 malformed array literal: "{1,2" DETAIL: Unexpected end of input.
+SELECT '{a,,b}'::text[]	!22P02 malformed array literal: "{a,,b}" DETAIL: Unexpected "," character.
+SELECT '{a{b}'::text[]	!22P02 malformed array literal: "{a{b}" DETAIL: Unexpected "{" character.
+SELECT '{1,x}'::int[]	!22P02 invalid input syntax for type integer: "x"
+SELECT '{2147483648}'::int[]	!22003 value "2147483648" is out of range for type integer
+SELECT array_length('{1,2,3}'::int[], 1), array_length('{{1,2},{3,4}}'::int[], 2), array_length('{{1,2},{3,4}}'::int[], 3)	integer,integer,integer	3|2|\N
+SELECT array_length('{}'::int[], 1), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality('{}'::int[])	integer,integer,text,integer	\N|\N|\N|0
+SELECT array_length('{1,2}'::int[], 0), array_length('{1,2}'::int[], -1)	integer,integer	\N|\N
+SELECT array_length(NULL::int[], 1)	integer	\N
+SELECT array_dims('{1,2,3}'::int[]), array_dims('{{1,2},{3,4}}'::int[])	text,text	[1:3]|[1:2][1:2]
+SELECT cardinality('{1,2,3}'::int[]), cardinality('{{1,2},{3,4}}'::int[]), array_ndims('{1,2,3}'::int[])	integer,integer,integer	3|4|1
+SELECT ('{1,2,3}'::int[])[1], ('{1,2,3}'::int[])[0], ('{1,2,3}'::int[])[4]	integer,integer,integer	1|\N|\N
+SELECT ('{1,2,3}'::int[])[1:2]	integer[]	{1,2}
+SELECT ('{{1,2},{3,4}}'::int[])[1][2], ('{{1,2},{3,4}}'::int[])[1]	integer,integer	2|\N
+SELECT unnest('{1,2,3}'::int[])	integer	1 ; 2 ; 3
+SELECT unnest('{1,NULL}'::int[])	integer	1 ; \N
+SELECT unnest('{}'::int[])	integer	-
+SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)	integer[]	{1,2}
+SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)	integer[]	{2,1}
+SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)	integer[]	{NULL}
+SELECT 1 = ANY('{1,2,3}'::int[]), 5 = ANY('{1,2,3}'::int[])	boolean,boolean	t|f
+SELECT 1 = ALL('{1,1}'::int[]), 1 = ALL('{1,2}'::int[])	boolean,boolean	t|f
+SELECT NULL = ANY('{1,2}'::int[])	boolean	\N
+SELECT 1 = ANY('{NULL,2}'::int[])	boolean	\N
+SELECT 1 = ANY('{NULL,1}'::int[])	boolean	t
+SELECT 1 = ANY('{}'::int[]), 1 = ALL('{}'::int[])	boolean,boolean	f|t
+SELECT 1 = ANY(NULL::int[])	boolean	\N
+SELECT 1 = ANY('{1,2}')	boolean	t
+SELECT 'a' = ANY('{a,b}'::text[])	boolean	t
+SELECT '{1,2}'::int[] = '{1,2}'::int[], '{2,1}'::int[] = '{1,2}'::int[]	boolean,boolean	t|f
+SELECT '{1,2}'::int[] = '{1,2,3}'::int[], '{1,2}'::int[] < '{1,2,3}'::int[]	boolean,boolean	f|t
+SELECT '{1,2}'::int[] < '{1,3}'::int[]	boolean	t
+SELECT ARRAY['a','b'] = '{a,b}'::text[]	boolean	t
+SELECT '{1,2}'::int[] @> '{1}'::int[], '{1}'::int[] <@ '{1,2}'::int[], '{1,2}'::int[] && '{2,3}'::int[]	boolean,boolean,boolean	t|t|t
+SELECT '{1,2}'::int[] @> '{}'::int[]	boolean	t
+SELECT NULL::int[] @> '{1}'::int[]	boolean	\N
+SELECT '{1,2}'::int[] || '{3}'::int[], 3 || '{1,2}'::int[], '{1,2}'::int[] || 3	integer[],integer[],integer[]	{1,2,3}|{3,1,2}|{1,2,3}
+SELECT array_position('{a,b,c}'::text[], 'b'), array_remove('{1,2,1}'::int[], 1)	integer,integer[]	2|{2}
+SELECT array_to_string('{1,2,3}'::int[], ','), string_to_array('1,2,3', ',')	text,text[]	1,2,3|{1,2,3}
+SELECT '{1,2,3}'::int[]::text, '{1,2,3}'::text::int[]	text,integer[]	{1,2,3}|{1,2,3}
+SELECT '{1,2,3}'::int[]::text[], '{1,2,3}'::int[]::int8[]	text[],bigint[]	{1,2,3}|{1,2,3}
+SELECT '{1,2}'::int2[], '{1,2}'::numeric[], '{a}'::varchar[]	smallint[],numeric[],character varying[]	{1,2}|{1,2}|{a}
+SELECT min('{1,2}'::int[]), max('{1,2}'::int[]), count('{1,2}'::int[])	integer[],integer[],bigint	{1,2}|{1,2}|1
+SELECT sum('{1,2}'::int[])	!42883 function sum(integer[]) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT NULL::int[] IS NULL, '{NULL}'::int[] IS NULL	boolean,boolean	t|f

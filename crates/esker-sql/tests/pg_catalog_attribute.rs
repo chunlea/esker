@@ -53,10 +53,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              *comparison* `ActiveRecord` writes agree: `a.attcollation <> t.typcollation` is \
              false for every column on both servers, so `collname` is NULL on both. This node has \
              no collation feature at all, so there is no id to report and none to compare.",
+            "UNMEASURED",
         ),
         (
             "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
             "the other half of the same fact, at the type rather than the column.",
+            "UNMEASURED",
         ),
         (
             "SELECT count(*) FROM pg_collation",
@@ -64,6 +66,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `pg_range` makes: a collation is a feature this node does not have, so listing \
              PostgreSQL's would tell a client it could ask for one. What makes the emptiness safe \
              is above — the join that reads it never matches on a real server either.",
+            "UNMEASURED",
         ),
     ],
 };

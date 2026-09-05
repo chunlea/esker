@@ -1,0 +1,65 @@
+# `argument of AND/OR must be type boolean` — run 57's second row, 7 tests, all in `insert_all_test.rb`.
+#
+# **The statement is `upsert_all`'s, and it is one shape**: `postgresql_adapter.rb:675` guards the
+# timestamp touch with a `CASE` over the columns that would change —
+#
+#     updated_at=(CASE WHEN ("bl"."name" IS NOT DISTINCT FROM excluded."name"
+#                        AND "bl"."author_id" IS NOT DISTINCT FROM excluded."author_id")
+#                 THEN "bl".updated_at ELSE CURRENT_TIMESTAMP END)
+#
+# — so `updated_at` moves only when something else did. Both halves are below, with the row read
+# back after each: nothing changed keeps the old timestamp, a changed name takes the new one.
+#
+# Things reasoning would get wrong:
+#
+# * **The refusal names the *type*, not the value.** `argument of AND must be type boolean, not
+#   type character varying` — the word `type` twice, and no value anywhere. A message built from
+#   the datum a row happened to hold would leak a user's data into an error and would differ per
+#   row of the same query.
+# * **`CASE/WHEN` is its own name in the same message.** `argument of CASE/WHEN must be type
+#   boolean, not type character varying`, and the class is `42804` for all three.
+# * **A bare string literal is not refused, it is *coerced*.** `WHERE 'true' AND true` runs, and
+#   `WHERE 'text' AND true` is `22P02 invalid input syntax for type boolean: "text"` — a value
+#   error rather than a type error, because an untyped literal takes the type its context wants and
+#   only then fails to be read as one. A `character varying` **column** cannot: it already has a
+#   type, and that is `42804`.
+#
+# The capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`, and
+# the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+CREATE TABLE bl (id bigint primary key, name character varying(255), author_id integer, updated_at timestamp)		-
+INSERT INTO bl (id, name, author_id, updated_at) VALUES (1, 'one', 10, '2020-01-01 00:00:00')		-
+# ---- the shape `upsert_all` sends: a CASE guarding a timestamp touch (postgresql_adapter.rb:675) ----
+INSERT INTO bl (id, name, author_id, updated_at) VALUES (1, 'one', 10, '2026-06-01 00:00:00') ON CONFLICT ("id") DO UPDATE SET updated_at=(CASE WHEN ("bl"."name" IS NOT DISTINCT FROM excluded."name" AND "bl"."author_id" IS NOT DISTINCT FROM excluded."author_id") THEN "bl".updated_at ELSE excluded.updated_at END), name=excluded.name		-
+SELECT 'r', id, name, updated_at FROM bl ORDER BY id		r|1|one|2020-01-01 00:00:00
+INSERT INTO bl (id, name, author_id, updated_at) VALUES (1, 'changed', 10, '2026-07-01 00:00:00') ON CONFLICT ("id") DO UPDATE SET updated_at=(CASE WHEN ("bl"."name" IS NOT DISTINCT FROM excluded."name" AND "bl"."author_id" IS NOT DISTINCT FROM excluded."author_id") THEN "bl".updated_at ELSE excluded.updated_at END), name=excluded.name		-
+SELECT 'r', id, name, updated_at FROM bl ORDER BY id		r|1|changed|2026-07-01 00:00:00
+# ---- the operands on their own ----
+SELECT 'r', 'a' IS NOT DISTINCT FROM 'a' AS same, 'a' IS NOT DISTINCT FROM 'b' AS different	text,boolean,boolean	r|t|f
+SELECT 'r', (NULL::text IS NOT DISTINCT FROM NULL::text) AND (1 IS NOT DISTINCT FROM 1) AS both	text,boolean	r|t
+SELECT 'r', pg_typeof('a' IS NOT DISTINCT FROM 'a')	text,regtype	r|boolean
+SELECT 'r', CASE WHEN ('a' IS NOT DISTINCT FROM 'a' AND 1 IS NOT DISTINCT FROM 1) THEN 'yes' ELSE 'no' END	text,text	r|yes
+# ---- what PostgreSQL refuses, which is the message this row is named after ----
+SAVEPOINT a1		-
+SELECT 'r', 1 FROM bl WHERE 'text' AND true	!22P02 invalid input syntax for type boolean: "text"
+ROLLBACK TO a1		-
+SAVEPOINT a2		-
+SELECT 'r', 1 FROM bl WHERE name AND true	!42804 argument of AND must be type boolean, not type character varying
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+SELECT 'r', 1 FROM bl WHERE updated_at OR false	!42804 argument of OR must be type boolean, not type timestamp without time zone
+ROLLBACK TO a3		-
+SAVEPOINT a4		-
+SELECT 'r', CASE WHEN name THEN 1 ELSE 2 END FROM bl	!42804 argument of CASE/WHEN must be type boolean, not type character varying
+ROLLBACK TO a4		-
+# ---- and what it accepts: a boolean literal and a boolean column ----
+SELECT 'r', 1 FROM bl WHERE true AND true		r|1
+SELECT 'r', 1 FROM bl WHERE 'true'::boolean AND true		r|1
+SAVEPOINT a5		-
+SELECT 'r', 1 FROM bl WHERE 'true' AND true		r|1
+ROLLBACK TO a5		-
+DROP TABLE bl		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname = 'bl'	bigint	0

@@ -23,11 +23,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              arbiter\u{2019}s `WHERE` is a syntax error before the lowering is reached. The \
              consequence is that a partial index can never be inferred here, which is why the bare \
              target over one is `42P10` on both servers and agrees",
+            "pg19_on_conflict.txt:137",
         ),
         (
             "SELECT \'r\', a, b FROM \"parts\" ORDER BY id",
             "The row the statement above would have updated, one line later: it did not run here, \
              so `b` is still `1`. A follow-on of the parser gap and not a divergence of its own",
+            "pg19_on_conflict.txt:138",
         ),
         // **A third entry stood here and is deleted** (ADR 0031, rule 2): the `upsert_all`
         // template's `IS NOT DISTINCT FROM` was an operator this node did not have, so the

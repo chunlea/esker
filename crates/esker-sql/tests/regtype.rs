@@ -97,45 +97,69 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              than a wrong type — the honest answer under contract C2. It is in the corpus because \
              it is the statement that would *prove* the divergence above: a real server says the \
              expression's type is `regtype`, and this node would say `text`.",
+            "UNMEASURED",
         ),
         (
             "SELECT 'float'::regtype::oid, 'float(24)'::regtype::oid, 'float(25)'::regtype::oid, \
              'float(53)'::regtype::oid",
             FLOAT_PRECISION,
+            "pg19_regtype.txt:75",
         ),
-        ("SELECT 'float(0)'::regtype::oid", FLOAT_PRECISION),
-        ("SELECT 'float(54)'::regtype::oid", FLOAT_PRECISION),
+        (
+            "SELECT 'float(0)'::regtype::oid",
+            FLOAT_PRECISION,
+            "pg19_regtype.txt:76",
+        ),
+        (
+            "SELECT 'float(54)'::regtype::oid",
+            FLOAT_PRECISION,
+            "pg19_regtype.txt:77",
+        ),
         (
             "SELECT pg_typeof(NULL::float), pg_typeof(NULL::float(24)), pg_typeof(NULL::float(25))",
             FLOAT_PRECISION,
+            "pg19_regtype.txt:78",
         ),
         (
             "SELECT 'decimal'::regtype::oid, pg_typeof(NULL::decimal), \
              pg_typeof(NULL::decimal(10,2))",
             PG_TYPEOF,
+            "pg19_regtype.txt:79",
         ),
         (
             "SELECT 'oid'::regtype::oid, 'name'::regtype::oid, 'regtype'::regtype::oid",
             NO_SUCH_TYPE,
+            "pg19_regtype.txt:80",
         ),
         (
             "SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, \
              'time with time zone'::regtype::oid",
             NO_SUCH_TYPE,
+            "pg19_regtype.txt:82",
         ),
         (
             "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \
              'jsonb'::regtype, 'interval'::regtype",
             NO_SUCH_TYPE,
+            "pg19_regtype.txt:117",
         ),
-        ("SELECT 23::regtype, 1043::regtype", REVERSE),
-        ("SELECT 1007::regtype, 1009::regtype", REVERSE),
-        ("SELECT 999999::regtype", REVERSE),
+        (
+            "SELECT 23::regtype, 1043::regtype",
+            REVERSE,
+            "pg19_regtype.txt:119",
+        ),
+        (
+            "SELECT 1007::regtype, 1009::regtype",
+            REVERSE,
+            "pg19_regtype.txt:120",
+        ),
+        ("SELECT 999999::regtype", REVERSE, "pg19_regtype.txt:121"),
         (
             "SELECT '1'::regtype",
             "PostgreSQL reads a bare number in a type name as an **OID**, so `'1'::regtype` is \
              `1` rather than a lookup failure. The same reverse direction as `23::regtype`, \
              reached through the forward spelling.",
+            "pg19_regtype.txt:123",
         ),
         (
             "SELECT 'integer'::regtype = 23",
@@ -143,10 +167,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              Here `'integer'::regtype` is `text` and the comparison is `42883 operator does not \
              exist: text = bigint`. The declared consequence of the `regtype`-is-`text` trade at \
              the top of this file, and the statement that shows what it costs.",
+            "pg19_regtype.txt:124",
         ),
         (
             "SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)",
             PG_TYPEOF,
+            "pg19_regtype.txt:126",
         ),
         (
             "SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN \
@@ -155,6 +181,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              statement is `42703` before any row is built. `date`, `time`, `numeric`, `json` and \
              `jsonb` all have correct rows — `tests/pg_catalog.rs` asserts them in ActiveRecord's \
              own query — and `uuid` and `interval` would be absent in any case.",
+            "pg19_regtype.txt:129",
         ),
     ],
 };

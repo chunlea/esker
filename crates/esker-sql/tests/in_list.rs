@@ -44,6 +44,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`IS TRUE` is `0A000` naming itself here and was before this unit. `IN` composes \
              with everything this node does have — `AND`, `NOT`, a target list — and \
              `tests/in_list.rs` pins those.",
+            "UNMEASURED",
         ),
         // **`SELECT 1 IN (1.0)` stood here and is deleted** (ADR 0031, rule 2). It said an
         // `integer` against a `numeric` was a promotion this node did not do, and pointed at
@@ -56,6 +57,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              *is* being read as an integer because of the `1`, so both servers raise `22P02`. \
              A bare constant is `integer` on a real server and `int8` here, so the message names \
              `bigint`. `tests/unknown_literal.rs` has the eleven statements this costs.",
+            "UNMEASURED",
         ),
     ],
 };

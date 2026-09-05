@@ -1,0 +1,58 @@
+# Which access methods PostgreSQL 19 will actually build an index on a `tsvector` column with.
+#
+# Taken for g1-ddl, who asked for the GIN index-key decision to be capture-backed rather than
+# reasoned. g1's own probe of this container found **all five index creations accepted, btree
+# included**, and `pg_opclass` giving `tsvector_ops` as the default for btree, gin AND gist. The
+# brief this capture tests assumed a `tsvector` under `USING btree` would raise
+# `42704 no default operator class for access method btree`. These rows settle it.
+#
+# Things reasoning would get wrong:
+#
+# * **A default operator class is not the same question as "is this type indexable that way".**
+#   `pg_opclass.opcdefault` is what `CREATE INDEX` consults when no class is named, and a type can
+#   have a default class for an access method whose operators nobody would use in practice. The
+#   `opcdefault` rows below are the authority, not intuition about full text.
+# * **`USING btree` is the default access method**, so `CREATE INDEX … (tsv)` with no `USING` is the
+#   btree case under another name. Both spellings are below so a reader cannot conclude one from the
+#   other by accident.
+# * **`pg_get_indexdef` is the round trip that matters** — it is what a schema dumper reads back, and
+#   it names the access method and the opclass PostgreSQL actually chose, which is the only proof
+#   that the choice was made rather than defaulted silently.
+# * An expression index is a different object from a column index even under the same access method:
+#   its key lives in `indexprs` and its `indkey` reads 0. `captures/pg19_tsvector.txt` records that
+#   pair for the suite's own two indexes; this file adds the access-method dimension.
+#
+# One `BEGIN … ROLLBACK`; the trailing `SELECT count(*)` lines prove nothing persisted.
+BEGIN		-
+# ---- the catalog answer first, because it predicts the five that follow ----
+SELECT 'r', am.amname, oc.opcname, oc.opcdefault FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod JOIN pg_type t ON t.oid = oc.opcintype WHERE t.typname = 'tsvector' ORDER BY am.amname, oc.opcname	text,name,name,boolean	r|btree|tsvector_ops|t ; r|gin|tsvector_ops|t ; r|gist|tsvector_ops|t
+SELECT 'r', amname FROM pg_am WHERE amname IN ('btree','gin','gist','hash','brin') ORDER BY amname	text,name	r|brin ; r|btree ; r|gin ; r|gist ; r|hash
+# ---- g1's seven statements, verbatim ----
+CREATE TABLE gtv (id bigint, name character varying(50), tsv tsvector)		-
+CREATE INDEX gtv_gin_col ON gtv USING gin (tsv)		-
+CREATE INDEX gtv_btree_col ON gtv USING btree (tsv)		-
+CREATE INDEX gtv_gist_col ON gtv USING gist (tsv)		-
+CREATE INDEX gtv_bare ON gtv (tsv)		-
+CREATE INDEX gtv_gin_expr ON gtv USING gin ((to_tsvector('english', coalesce(gtv.name, ''))))		-
+SELECT 'r', c.relname, pg_get_indexdef(c.oid) FROM pg_class c WHERE c.relname LIKE 'gtv_%' ORDER BY c.relname	text,name,text	r|gtv_bare|CREATE INDEX gtv_bare ON public.gtv USING btree (tsv) ; r|gtv_btree_col|CREATE INDEX gtv_btree_col ON public.gtv USING btree (tsv) ; r|gtv_gin_col|CREATE INDEX gtv_gin_col ON public.gtv USING gin (tsv) ; r|gtv_gin_expr|CREATE INDEX gtv_gin_expr ON public.gtv USING gin (to_tsvector('english'::regconfig, (COALESCE(name, ''::character varying))::text)) ; r|gtv_gist_col|CREATE INDEX gtv_gist_col ON public.gtv USING gist (tsv)
+# ---- what each index actually chose: access method, opclass, and whether the key is an expression ----
+SELECT 'r', c.relname, am.amname, i.indexprs IS NOT NULL AS is_expression, i.indkey::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam WHERE c.relname LIKE 'gtv_%' ORDER BY c.relname	text,name,name,boolean,text	r|gtv_bare|btree|f|3 ; r|gtv_btree_col|btree|f|3 ; r|gtv_gin_col|gin|f|3 ; r|gtv_gin_expr|gin|t|0 ; r|gtv_gist_col|gist|f|3
+SELECT 'r', c.relname, oc.opcname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_opclass oc ON oc.oid = i.indclass[0] WHERE c.relname LIKE 'gtv_%' ORDER BY c.relname	text,name,name	r|gtv_bare|tsvector_ops ; r|gtv_btree_col|tsvector_ops ; r|gtv_gin_col|tsvector_ops ; r|gtv_gin_expr|tsvector_ops ; r|gtv_gist_col|tsvector_ops
+# ---- and the access methods that do NOT take a tsvector, for the boundary ----
+SAVEPOINT h1		-
+CREATE INDEX gtv_hash_col ON gtv USING hash (tsv)	!42704 data type tsvector has no default operator class for access method "hash" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+ROLLBACK TO h1		-
+SAVEPOINT b1		-
+CREATE INDEX gtv_brin_col ON gtv USING brin (tsv)	!42704 data type tsvector has no default operator class for access method "brin" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+ROLLBACK TO b1		-
+# ---- tsquery under btree. I put this in expecting it to be the 42704 case and it is NOT: tsquery
+# ---- has a btree default too (tsquery_ops), so it is recorded as the second type that accepts a
+# ---- btree index where intuition says it should not. The 42704 the brief expected is real, but it
+# ---- belongs to hash and brin above, not to btree. ----
+SAVEPOINT x1		-
+CREATE TABLE gtq (q tsquery)		-
+CREATE INDEX gtq_btree ON gtq USING btree (q)		-
+ROLLBACK TO x1		-
+SELECT 'r', am.amname, oc.opcname, oc.opcdefault FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod JOIN pg_type t ON t.oid = oc.opcintype WHERE t.typname = 'tsquery' ORDER BY am.amname	text,name,name,boolean	r|btree|tsquery_ops|t ; r|gist|tsquery_ops|t
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'gtv%' OR relname LIKE 'gtq%'	bigint	0

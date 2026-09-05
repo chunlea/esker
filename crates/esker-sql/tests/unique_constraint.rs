@@ -41,6 +41,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          and until then a constraint can be created over data that breaks it. This entry moves to \
          the divergence table rather than being quietly deleted **because it is a wrong answer \
          and not a missing feature** (ADR 0031 rule 3).",
+        "pg19_unique_constraint.txt:124",
     )],
 };
 

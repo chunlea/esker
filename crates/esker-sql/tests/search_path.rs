@@ -27,6 +27,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          type as a value: `name` and `name[]` there against `text` and `text` here. This node has \
          neither type, and every other line in this file shows the two functions answering the \
          same characters",
+        "pg19_search_path.txt:82",
     )],
 };
 

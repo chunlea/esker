@@ -23,6 +23,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', current_setting('TimeZone')",
             "the one zone this node has is spelled UTC and the container's is Etc/UTC",
+            "pg19_assignment_cast_date.txt:40",
         ),
         // **`pg_cast` is not a relation here.** Three statements, and they are the *evidence* for
         // this unit rather than part of it: `castcontext` is `'a'` for both timestamp types to
@@ -33,16 +34,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', castsource::regtype, casttarget::regtype, castcontext, castmethod FROM \
              pg_cast WHERE casttarget = 'date'::regtype ORDER BY castsource::regtype::text",
             "pg_cast is not built",
+            "pg19_assignment_cast_date.txt:42",
         ),
         (
             "SELECT 'r', castsource::regtype, casttarget::regtype, castcontext FROM pg_cast WHERE \
              castsource = 'date'::regtype ORDER BY casttarget::regtype::text",
             "pg_cast is not built",
+            "pg19_assignment_cast_date.txt:43",
         ),
         (
             "SELECT 'r', count(*) FROM pg_cast WHERE casttarget = 'date'::regtype AND \
              castcontext = 'a'",
             "pg_cast is not built",
+            "pg19_assignment_cast_date.txt:91",
         ),
         // **A per-row cast still has only `text` as a target**, which is the standing debt this
         // lane has carried since the array unit — `'…'::date` on a *constant* folds at plan time
@@ -53,10 +57,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', count(*) FROM bk WHERE updated_on = CURRENT_TIMESTAMP::date",
             "a per-row cast has only text as a target",
+            "pg19_assignment_cast_date.txt:54",
         ),
         (
             "SELECT 'r', CURRENT_DATE = CURRENT_TIMESTAMP::date FROM bk2",
             "a per-row cast has only text as a target",
+            "UNMEASURED",
         ),
         // **The one thing about this cast that is deliberately not reproduced.** `timestamptz` ->
         // `date` asks which calendar day an instant falls on *here*, so the answer depends on the
@@ -70,6 +76,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SET TimeZone = 'Pacific/Auckland'",
             "this node honours TimeZone only where it means UTC, and refuses rather than \
              answering a wrong calendar day",
+            "pg19_assignment_cast_date.txt:68",
         ),
     ],
 };

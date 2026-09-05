@@ -55,6 +55,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              description of the catalog. Closing it would not close this row: five of the \
              twenty-two type names are types this node does not have (`name`, `inet`, `xid` \
              twice), so the answer would still differ, in five cells instead of all of them.",
+            "pg19_relation_resolution.txt:54",
         ),
         (
             "SELECT 'r', pg_typeof(pid), pg_typeof(datname), pg_typeof(state), pg_typeof(query) \
@@ -63,6 +64,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `datname` is a `name` there and a `text` here, and `pg_typeof` reports what the \
              column is. The other three agree, which is what says the divergence is the one string \
              type and not the view.",
+            "pg19_relation_resolution.txt:57",
         ),
         (
             "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN \
@@ -76,6 +78,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              answer `v`. Reporting `r` without the namespace first would put `pg_class` in every \
              schema dump. The two changes are one unit and it is a namespace unit, not a `relkind` \
              one. `pg_stat_activity` is `v` on both sides, which is the row this unit needed.",
+            "pg19_relation_resolution.txt:61",
         ),
     ],
 };

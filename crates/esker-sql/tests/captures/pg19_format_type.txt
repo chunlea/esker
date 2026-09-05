@@ -1,0 +1,73 @@
+# `format_type(oid, typmod)`, as a real PostgreSQL 19beta1 answers it.
+#
+# NOT a type — the function **rung 3 now stops on**. At `e762d64` the join chain landed and rung
+# 3's blocker moved off `more than one JOIN` and onto `the function format_type is not supported`,
+# which is also what boot statement 15 now answers. It is the inverse of `::regtype`: that turns a
+# name into an OID, this turns an OID plus a typmod back into the name a client is shown.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It creates nothing; the one table-driven probe reads `ix`, which `pg19_index_constraint.txt`
+# builds — run that capture first, or that one line will differ.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **It almost never fails.** An OID with no `pg_type` row is not an error — `format_type(999999,
+#     NULL)` is the three characters **`???`** — and `format_type(0, NULL)` is a single **`-`**.
+#     A NULL OID is NULL. The *only* input in this file that raises is a malformed `interval`
+#     typmod, `XX000 invalid INTERVAL typmod: 0x3`, and it raises because the interval typmod is a
+#     bitmask rather than a number (see `pg19_interval.txt`).
+#   * **A typmod on a type that has none is silently ignored**, where the same thing through
+#     `::regtype` is a syntax error: `format_type(23, 4)` is `integer`, but `'integer(4)'::regtype`
+#     is `42601`. The two halves of the round trip do not agree about what is legal.
+#   * **It does not clamp and it does not validate.** `format_type(1114, 7)` is
+#     `timestamp(7) without time zone` — a precision no `CREATE TABLE` will store, since DDL
+#     clamps 7 to 6 with a `WARNING`. `format_type` prints what it is handed.
+#   * **Each family has its own "no typmod" threshold, and it is not simply `-1`.** For `varchar`
+#     the typmod is length + 4, so **0, 1 and 4 all print bare** and `5` is the first real one,
+#     `character varying(1)`. For `timestamp` the typmod is the precision directly, so **`0` is a
+#     real precision** — `timestamp(0) without time zone` — and only a negative is bare. For
+#     `numeric` the typmod is `(p << 16) | s` + 4, so `0` is bare and **`4` is `numeric(0,0)`**,
+#     a precision `numeric` itself refuses on input.
+#   * **Negative scale round-trips**: `format_type(1700, 786434)` is `numeric(11,-2)`.
+#   * **An array carries its element's typmod**: `format_type(1015, 1028)` is
+#     `character varying(1024)[]` — the length goes inside, the brackets outside.
+#   * **The arity is exact.** `format_type(23)` is `42883 function format_type(integer) does not
+#     exist` with `DETAIL: No function of that name accepts the given number of arguments.` — the
+#     *number* of arguments, the same shape `current_schemas()` gives.
+#   * **A capture-format note.** `format_type(0, NULL)` returns the literal string `-`, which is
+#     also this format's marker for "a command with no result set". They are still distinguishable:
+#     the marker form has an **empty** types column (`stmt <tab> <tab> -`) and this row has
+#     `text` in it (`stmt <tab> text <tab> -`). A reader or a replay harness must compare all
+#     three fields, not just the last one.
+SELECT pg_typeof(format_type(23, NULL))	regtype	text
+SELECT format_type(23, NULL), format_type(23, -1), format_type(23, 4)	text,text,text	integer|integer|integer
+SELECT format_type(20, NULL), format_type(21, NULL), format_type(16, NULL), format_type(25, NULL), format_type(17, NULL)	text,text,text,text,text	bigint|smallint|boolean|text|bytea
+SELECT format_type(700, NULL), format_type(701, NULL)	text,text	real|double precision
+SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)	text,text,text	oid|name|regtype
+SELECT format_type(1082, NULL), format_type(2950, NULL), format_type(114, NULL), format_type(3802, NULL)	text,text,text,text	date|uuid|json|jsonb
+SELECT format_type(1043, NULL), format_type(1043, -1)	text,text	character varying|character varying
+SELECT format_type(1043, 0), format_type(1043, 1), format_type(1043, 4), format_type(1043, 5)	text,text,text,text	character varying|character varying|character varying|character varying(1)
+SELECT format_type(1043, 9), format_type(1043, 1028)	text,text	character varying(5)|character varying(1024)
+SELECT format_type(1042, NULL), format_type(1042, 7)	text,text	character|character(3)
+SELECT format_type(1114, NULL), format_type(1114, -2)	text,text	timestamp without time zone|timestamp without time zone
+SELECT format_type(1114, 0), format_type(1114, 3), format_type(1114, 6), format_type(1114, 7)	text,text,text,text	timestamp(0) without time zone|timestamp(3) without time zone|timestamp(6) without time zone|timestamp(7) without time zone
+SELECT format_type(1184, 6), format_type(1083, 3), format_type(1266, 3)	text,text,text	timestamp(6) with time zone|time(3) without time zone|time(3) with time zone
+SELECT format_type(1700, NULL), format_type(1700, 0), format_type(1700, 4)	text,text,text	numeric|numeric|numeric(0,0)
+SELECT format_type(1700, 655366), format_type(1700, 786434)	text,text	numeric(10,2)|numeric(11,-2)
+SELECT format_type(1186, NULL), format_type(1186, 2147418115), format_type(1186, 589823)	text,text,text	interval|interval(3)|interval day
+SELECT format_type(1186, 3)	!XX000 invalid INTERVAL typmod: 0x3
+SELECT format_type(1007, NULL), format_type(1009, NULL), format_type(1007, -1)	text,text,text	integer[]|text[]|integer[]
+SELECT format_type(1015, 1028)	text	character varying(1024)[]
+SELECT format_type(NULL, NULL)	text	\N
+SELECT format_type(NULL, 4)	text	\N
+SELECT format_type(999999, NULL)	text	???
+SELECT format_type(999999, 4)	text	???
+SELECT format_type(0, NULL)	text	-
+SELECT format_type(23)	!42883 function format_type(integer) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT format_type('integer'::regtype, NULL)	text	integer
+SELECT format_type('character varying'::regtype, 1028)	text	character varying(1024)
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ix'::regclass AND attnum > 0 ORDER BY attnum	text	bigint ; integer ; text ; integer ; date

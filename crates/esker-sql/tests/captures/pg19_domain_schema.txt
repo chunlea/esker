@@ -1,0 +1,35 @@
+BEGIN		-
+CREATE SCHEMA ds_s		-
+CREATE DOMAIN ds_s.ds AS integer		-
+CREATE TABLE ds_s.t (v ds_s.ds)		-
+SELECT 'r', format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'ds_s.t'::regclass AND a.attname = 'v'		r|ds_s.ds
+INSERT INTO ds_s.t (v) VALUES (4)		-
+SELECT 'r', v::text FROM ds_s.t		r|4
+SAVEPOINT s1		-
+DROP SCHEMA ds_s	!2BP01 cannot drop schema ds_s because other objects depend on it DETAIL: type ds_s.ds depends on schema ds_s HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s1		-
+CREATE SCHEMA ds_only		-
+CREATE DOMAIN ds_only.lonely AS integer		-
+SAVEPOINT s2		-
+DROP SCHEMA ds_only	!2BP01 cannot drop schema ds_only because other objects depend on it DETAIL: type ds_only.lonely depends on schema ds_only HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s2		-
+DROP SCHEMA ds_only CASCADE		-
+SELECT 'r', count(*) AS lonely_left FROM pg_type WHERE typname = 'lonely'	text,bigint	r|0
+CREATE DOMAIN ds_dep AS integer		-
+CREATE TABLE ds_u (v ds_dep)		-
+SAVEPOINT s3		-
+DROP DOMAIN ds_dep	!2BP01 cannot drop type ds_dep because other objects depend on it DETAIL: column v of table ds_u depends on type ds_dep HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO s3		-
+DROP DOMAIN ds_dep CASCADE		-
+SELECT 'r', count(*) AS dep_left FROM pg_type WHERE typname = 'ds_dep'	text,bigint	r|0
+SELECT 'r', count(*) AS column_left FROM information_schema.columns WHERE table_name = 'ds_u' AND column_name = 'v'	text,bigint	r|0
+CREATE DOMAIN ds_ci AS integer check (value > 0)		-
+CREATE TABLE ds_ci_t (n ds_ci)		-
+INSERT INTO ds_ci_t (n) VALUES (5)		-
+SELECT 'r', n::text AS accepted FROM ds_ci_t		r|5
+SAVEPOINT s4		-
+INSERT INTO ds_ci_t (n) VALUES (-5)	!23514 value for domain ds_ci violates check constraint "ds_ci_check"
+ROLLBACK TO s4		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE contypid = 'ds_ci'::regtype		r|ds_ci_check|c
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('ds','lonely','ds_dep','ds_ci')	bigint	0

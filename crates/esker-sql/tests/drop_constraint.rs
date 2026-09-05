@@ -33,6 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              AND contype = 'n' ORDER BY conname",
             "Reads back what the `SET NOT NULL` above would have restored, so it is one row short \
              here — a consequence of that refusal and not of anything `DROP CONSTRAINT` did.",
+            "pg19_drop_constraint.txt:88",
         ),
     ],
 };

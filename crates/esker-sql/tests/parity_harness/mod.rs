@@ -30,6 +30,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../provenance/mod.rs"]
+mod provenance;
+
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -242,7 +245,7 @@ pub(crate) struct Divergences {
     /// Statements whose rows agree and whose declared types do not.
     pub(crate) types: &'static [&'static str],
     /// Statements answered differently, each with the reason.
-    pub(crate) answers: &'static [(&'static str, &'static str)],
+    pub(crate) answers: &'static [provenance::Divergence],
 }
 
 /// A node with a fixture loaded, which is what a corpus was captured over.
@@ -471,6 +474,9 @@ pub(crate) fn replay_reporting(
     fixture: &[&str],
     divergences: &Divergences,
 ) -> Replay {
+    // **Before anything is replayed.** A corpus whose divergences cannot be traced to a
+    // measurement is not evidence, so there is no point measuring the node against it.
+    provenance::check(divergences.answers);
     let mut node = Node::new(fixture);
     let mut checked = 0;
     let mut mismatched = Vec::new();
@@ -496,7 +502,7 @@ pub(crate) fn replay_reporting(
         let listed = divergences
             .answers
             .iter()
-            .position(|(sql, _)| *sql == statement);
+            .position(|(sql, ..)| *sql == statement);
         let actual = node.answer(&statement);
         checked += 1;
 
@@ -610,7 +616,7 @@ pub(crate) fn replay_reporting(
     );
     // Rule 2, decided per entry: an entry is stale only when **every** occurrence of its statement
     // agreed. One that still covers a second occurrence stays.
-    for (at, (sql, _)) in divergences.answers.iter().enumerate() {
+    for (at, (sql, ..)) in divergences.answers.iter().enumerate() {
         let occurrences = listed_seen.iter().filter(|&&seen| seen == at).count();
         let agreements = listed_agreements
             .iter()

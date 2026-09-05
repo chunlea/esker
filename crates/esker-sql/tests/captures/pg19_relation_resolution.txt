@@ -1,0 +1,123 @@
+# `relation "…" does not exist` — how PostgreSQL resolves a name, and the two catalog relations
+# behind run 51's row.
+#
+# **Run 51 ranking: `relation "…" does not exist` (unqualified), 47 tests over 16 files.** Unlike the
+# rows beside it this is not one gap. The names, from `triage/failures-940aa5a.txt`:
+#
+#     topics (17)  pg_type (8)  companies (5)  comments (5)  people (4)  p_rockets_s (4)
+#     citations (1)  pg_stat_activity (1)  legacy_primary_keys (1)
+#
+#   * `pg_stat_activity` — `migration_test.rb:1108-1114` asks it whether a connection that held an
+#     advisory lock is gone. This node does not have the view at all; the query is below verbatim.
+#   * `pg_type` — `connection_adapters/schema_cache_test.rb`, which never names it: this is AR's own
+#     boot type-map query being re-issued on a reconnect. The node serves that query in `boot36`
+#     (36/36) and in a second database, both checked, so the failure is state-dependent and **is not
+#     pinned to a statement yet** — said plainly rather than guessed at.
+#   * `topics`, `companies`, `comments`, `people`, `citations`, `p_rockets_s`,
+#     `legacy_primary_keys` — suite tables that exist. Not pinned either. One attempt to pin them by
+#     replaying a file's traced statements produced a false positive and is recorded as such in
+#     `results/run-51.md`: the trace contained the schema load's own `DROP TABLE IF EXISTS "topics"`,
+#     and replaying the set in sorted order ran the DROP before the SELECTs.
+#
+# So this file pins the half an oracle can settle: **what PostgreSQL does when a name is looked up**,
+# so an implementation has something to be measured against and the message shapes are right.
+#
+# Things reasoning would get wrong:
+#
+# * **`pg_stat_activity` is cluster-wide, not per-database**, and its `datname` column is how the
+#   test filters to its own — a per-database view would answer that query with the wrong rows.
+# * **`to_regclass` returns NULL where a bare reference raises**, which is the supported way to ask
+#   "is this there" without an error, and is not the same as `EXISTS (SELECT … pg_class)`.
+# * **An unquoted name is folded to lower case and a quoted one is not**, so `TOPICS`, `topics` and
+#   `"Topics"` are two names, not three — and the error text quotes what was *looked up*, folded.
+# * **A temp schema's NAME carries the session's backend id** (`pg_temp_22`), so it is session state
+#   and never belongs in a corpus. The row below asks `nspname LIKE 'pg_temp%'` instead; the first
+#   cut of this file selected the name itself and the replay caught it — which is what the
+#   byte-identical rule is there for.
+# * **A temp table shadows a permanent one of the same name** for the session that made it, because
+#   `pg_temp` comes first in the search path; the permanent one is still there and reachable by
+#   qualifying it.
+# * **The noun in the message is not always `relation`.** A reference in a query says
+#   `relation "x" does not exist`; **`DROP TABLE` says `table "x" does not exist`** — same `42P01`,
+#   different word, chosen by the statement rather than by the object. This file was written
+#   asserting the opposite and the oracle corrected it. A qualified name is quoted **whole**:
+#   `relation "public.nosuchtable" does not exist`, not `"public"."nosuchtable"`.
+#
+# The whole capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`,
+# and the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+BEGIN		-
+# ---- migration_test.rb:1108, verbatim, and what the view is ----
+SELECT 'r', count(*) >= 1 AS has_rows FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle'	text,boolean	r|f
+SELECT 'r', count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle' AND query LIKE '%1234567890%'	text,bigint	r|0
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum	text,name,text	r|datid|oid ; r|datname|name ; r|pid|integer ; r|leader_pid|integer ; r|usesysid|oid ; r|usename|name ; r|application_name|text ; r|client_addr|inet ; r|client_hostname|text ; r|client_port|integer ; r|backend_start|timestamp with time zone ; r|xact_start|timestamp with time zone ; r|query_start|timestamp with time zone ; r|state_change|timestamp with time zone ; r|wait_event_type|text ; r|wait_event|text ; r|state|text ; r|backend_xid|xid ; r|backend_xmin|xid ; r|query_id|bigint ; r|query|text ; r|backend_type|text
+SELECT 'r', relkind FROM pg_class WHERE relname = 'pg_stat_activity'	text,"char"	r|v
+SELECT 'r', count(DISTINCT datname) >= 1 AS is_cluster_wide FROM pg_stat_activity WHERE datname IS NOT NULL	text,boolean	r|t
+SELECT 'r', pg_typeof(pid), pg_typeof(datname), pg_typeof(state), pg_typeof(query) FROM pg_stat_activity LIMIT 1	text,regtype,regtype,regtype,regtype	r|integer|name|text|text
+# ---- AR's boot type-map query, the pg_type half of the row ----
+SELECT 'r', count(*) > 0 AS pg_type_readable FROM pg_type	text,boolean	r|t
+SELECT 'r', t.typname, t.typelem, t.typdelim, t.typtype FROM pg_type as t LEFT JOIN pg_range as r ON t.oid = r.rngtypid WHERE t.typname IN ('int2','int4','int8') ORDER BY t.typname	text,name,oid,"char","char"	r|int2|0|,|b ; r|int4|0|,|b ; r|int8|0|,|b
+SELECT 'r', relkind, relname FROM pg_class WHERE relname IN ('pg_type','pg_range','pg_class') ORDER BY relname	text,"char",name	r|r|pg_class ; r|r|pg_range ; r|r|pg_type
+# ---- what a lookup that fails says, in four contexts ----
+SAVEPOINT n1		-
+SELECT 'r', count(*) FROM nosuchtable	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO n1		-
+SAVEPOINT n2		-
+SELECT 'r', count(*) FROM public.nosuchtable	!42P01 relation "public.nosuchtable" does not exist
+ROLLBACK TO n2		-
+SAVEPOINT n3		-
+SELECT 'r', count(*) FROM (SELECT id FROM nosuchtable) s	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO n3		-
+SAVEPOINT n4		-
+SELECT 'r', count(*) FROM pg_class c JOIN nosuchtable n ON n.id = c.oid	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO n4		-
+SAVEPOINT n5		-
+SELECT 'r', count(*) FROM nosuchschema.sometable	!42P01 relation "nosuchschema.sometable" does not exist
+ROLLBACK TO n5		-
+SAVEPOINT n6		-
+INSERT INTO nosuchtable (id) VALUES (1)	!42P01 relation "nosuchtable" does not exist
+ROLLBACK TO n6		-
+SAVEPOINT n7		-
+DROP TABLE nosuchtable	!42P01 table "nosuchtable" does not exist
+ROLLBACK TO n7		-
+# ---- asking without raising ----
+SELECT 'r', to_regclass('nosuchtable') IS NULL, to_regclass('pg_class')::text, to_regclass('public.nosuchtable') IS NULL	text,boolean,text,boolean	r|t|pg_class|t
+SELECT 'r', count(*) FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'nosuchtable' AND n.nspname = ANY (current_schemas(false))	text,bigint	r|0
+# ---- case folding: two names, not three ----
+CREATE TABLE rr (id serial primary key, title character varying(255))		-
+INSERT INTO rr (title) VALUES ('one')		-
+SELECT 'r', count(*) FROM rr		r|1
+SELECT 'r', count(*) FROM RR		r|1
+SELECT 'r', count(*) FROM "rr"		r|1
+SAVEPOINT n8		-
+SELECT 'r', count(*) FROM "RR"	!42P01 relation "RR" does not exist
+ROLLBACK TO n8		-
+SELECT 'r', relname FROM pg_class WHERE relname IN ('rr','RR')	text,name	r|rr
+# ---- the search path decides, and pg_temp comes first ----
+SELECT 'r', current_schemas(false), current_schemas(true)	text,name[],name[]	r|{public}|{pg_catalog,public}
+CREATE TEMP TABLE rr (id int)		-
+INSERT INTO rr (id) VALUES (99)		-
+SELECT 'r', count(*) FROM rr		r|1
+SELECT 'r', count(*) FROM public.rr		r|1
+SELECT 'r', (n.nspname LIKE 'pg_temp%') AS in_a_temp_schema, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'rr' ORDER BY in_a_temp_schema	text,boolean,name	r|f|rr ; r|t|rr
+DROP TABLE pg_temp.rr		-
+SELECT 'r', count(*) FROM rr		r|1
+# ---- a table created in this transaction is visible to it ----
+CREATE TABLE rr2 (id int)		-
+SELECT 'r', count(*), to_regclass('rr2') IS NOT NULL AS visible FROM rr2		r|0|t
+DROP TABLE rr2		-
+SAVEPOINT n9		-
+SELECT 'r', count(*) FROM rr2	!42P01 relation "rr2" does not exist
+ROLLBACK TO n9		-
+# ---- and one that a savepoint rolled back is not ----
+SAVEPOINT n10		-
+CREATE TABLE rr3 (id int)		-
+ROLLBACK TO n10		-
+SAVEPOINT n11		-
+SELECT 'r', count(*) FROM rr3	!42P01 relation "rr3" does not exist
+ROLLBACK TO n11		-
+SELECT 'r', to_regclass('rr3') IS NULL AS gone_with_the_savepoint	text,boolean	r|t
+DROP TABLE rr		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('rr','rr2','rr3')	bigint	0

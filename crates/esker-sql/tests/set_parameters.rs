@@ -32,6 +32,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SHOW lc_monetary",
             "The boot value differs: `en_US.utf8` on the oracle's container, `C` here. Every \
              other line about this parameter agrees.",
+            "pg19_set_parameters.txt:56",
         ),
         // **A standing refusal, and it predates this unit.** `timestamptz` is printed in UTC and
         // nowhere else, so a zone that is not UTC would be a setting honoured by `SHOW` and
@@ -41,6 +42,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SET TIME ZONE 'America/New_York'",
             "`0A000` naming the zone: this node prints `timestamptz` in UTC only, so it refuses \
              rather than reporting a zone it will not use (`crate::parameter::Parameter::honour`).",
+            "pg19_set_parameters.txt:78",
         ),
     ],
 };

@@ -27,6 +27,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', uuid_generate_v1()::text ~ '^.{24}[0-9a-f][13579bdf]' AS v1_multicast",
             "no MAC address here, so RFC 4122's random multicast node id is used instead",
+            "UNMEASURED",
         ),
         // **`uuid_generate_v3` and `v5` hash**, with MD5 and SHA-1, and this project writes its
         // own primitives rather than linking C — so each is a unit of its own and neither is
@@ -35,14 +36,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', uuid_generate_v3(uuid_ns_dns(), 'www.postgresql.org')",
             "uuid_generate_v3 is MD5 over a namespace and a name; MD5 is a unit of its own",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', uuid_generate_v5(uuid_ns_dns(), 'www.postgresql.org')",
             "uuid_generate_v5 is SHA-1 over a namespace and a name; SHA-1 is a unit of its own",
+            "UNMEASURED",
         ),
         (
             "SELECT 'r', uuid_generate_v3(uuid_ns_dns())",
             "the same gap, reached through the arity error: both refuse and only the code differs",
+            "UNMEASURED",
         ),
     ],
 };

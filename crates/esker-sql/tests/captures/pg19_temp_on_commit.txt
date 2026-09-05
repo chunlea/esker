@@ -1,0 +1,48 @@
+# `ON COMMIT` — the half of a temporary table that needs a commit to be seen (ADR 0053).
+#
+# **This capture is deliberately NOT wrapped in `BEGIN … ROLLBACK`**, which every other capture is,
+# because what it measures *is* the commit: `ON COMMIT DELETE ROWS` empties the table at the end of
+# every transaction, and a capture that never ended one could only record that the clause parses.
+# It is safe to run unwrapped for the reason the feature exists — every object it makes is
+# temporary and dies with the session — and the `SELECT count(*)` at the end proves the oracle is
+# unchanged.
+#
+# The fact that is easiest to get wrong is in the middle: after `COMMIT` the `DELETE ROWS` table is
+# empty, and after a plain autocommitted `INSERT` it is **also** empty, because that statement's own
+# implicit commit fires the same rule. A node that emptied the table only at an explicit `COMMIT`
+# would pass the first probe and answer the second with one row.
+#
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+CREATE TEMPORARY TABLE oc_preserve (id int) ON COMMIT PRESERVE ROWS		-
+CREATE TEMPORARY TABLE oc_delete (id int) ON COMMIT DELETE ROWS		-
+CREATE TEMPORARY TABLE oc_default (id int)		-
+BEGIN		-
+INSERT INTO oc_preserve (id) VALUES (1)		-
+INSERT INTO oc_delete (id) VALUES (1)		-
+INSERT INTO oc_default (id) VALUES (1)		-
+SELECT 'r', count(*) AS delete_rows_inside_the_transaction FROM oc_delete		r|1
+COMMIT		-
+SELECT 'r', count(*) AS preserve_after_commit FROM oc_preserve		r|1
+SELECT 'r', count(*) AS delete_after_commit FROM oc_delete		r|0
+SELECT 'r', count(*) AS default_after_commit FROM oc_default		r|1
+BEGIN		-
+INSERT INTO oc_delete (id) VALUES (2)		-
+ROLLBACK		-
+SELECT 'r', count(*) AS delete_after_rollback FROM oc_delete		r|0
+INSERT INTO oc_delete (id) VALUES (3)		-
+SELECT 'r', count(*) AS delete_after_an_autocommit_insert FROM oc_delete		r|0
+BEGIN		-
+CREATE TEMPORARY TABLE oc_drop (id int) ON COMMIT DROP		-
+INSERT INTO oc_drop (id) VALUES (1)		-
+SELECT 'r', count(*) AS drop_inside_the_transaction FROM oc_drop		r|1
+COMMIT		-
+SELECT 'r', to_regclass('oc_drop') IS NULL AS dropped_at_commit	text,boolean	r|t
+CREATE TEMPORARY TABLE oc_drop2 (id int) ON COMMIT DROP		-
+SELECT 'r', to_regclass('oc_drop2') IS NULL AS dropped_by_its_own_autocommit	text,boolean	r|t
+SAVEPOINT o1	!25P01 SAVEPOINT can only be used in transaction blocks
+CREATE TABLE oc_permanent (id int) ON COMMIT DELETE ROWS	!42P16 ON COMMIT can only be used on temporary tables
+ROLLBACK TO o1	!25P01 ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+DROP TABLE oc_preserve		-
+DROP TABLE oc_delete		-
+DROP TABLE oc_default		-
+SELECT count(*) FROM pg_class WHERE relname IN ('oc_preserve','oc_delete','oc_default','oc_drop','oc_drop2','oc_permanent')	bigint	0

@@ -51,11 +51,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              (`CLAUDE.md`, \"Ask before doing\"). Until then `schema_dumper` writes \
              `t.index …, unique: true` where a real server writes `t.unique_constraint …`, and \
              the schema that round-trips is the same schema.",
+            "UNMEASURED",
         ),
         (
             "SELECT c.conname, c.conindid = i.oid FROM pg_constraint c JOIN pg_class i ON i.oid = c.conindid WHERE c.conrelid = 'kd'::regclass AND c.contype = 'u' ORDER BY c.conname",
             "the same fact through the join `unique_constraints()` writes: two rows there, none \
              here.",
+            "UNMEASURED",
         ),
         (
             "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
@@ -67,11 +69,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              client's use of it is `split(\" \")`. The rule is the client's use, not the type. \
              `information_schema.key_column_usage` answers the same question in a shape this node \
              has, and unit 4 provides it.",
+            "UNMEASURED",
         ),
         (
             "SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint WHERE conrelid = 'kd'::regclass AND contype = 'p'",
             "`pg_typeof` is a function this node does not have. What it would have said is the \
              type divergence declared above.",
+            "UNMEASURED",
         ),
     ],
 };

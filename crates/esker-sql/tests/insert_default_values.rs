@@ -32,6 +32,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          found: ,`. The message on a syntax error is `sqlparser`'s and has never been claimed to \
          be PostgreSQL's (`docs/plans/phase-6a.md` §1); what contract C1 promises is that a \
          statement PostgreSQL *accepts* is never `42601`, and this is one it refuses.",
+        "pg19_insert_default_values.txt:79",
     )],
 };
 

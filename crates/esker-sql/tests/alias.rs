@@ -39,19 +39,23 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "a column alias list renames the columns as well, which is a second feature: after it \
              the table's own names are gone. Refused by name rather than ignored, because \
              ignoring it would answer a query about `c` with a column called `id`.",
+            "UNMEASURED",
         ),
         (
             "SELECT c, d FROM al AS t (c, d) ORDER BY c",
             "a column alias list, as above.",
+            "UNMEASURED",
         ),
         (
             "SELECT t.id FROM al AS t (c)",
             "a column alias list, as above. PostgreSQL's answer here is `42703` — the column is \
              gone, not the feature — which is the clearest statement of what the clause does.",
+            "UNMEASURED",
         ),
         (
             "DELETE FROM al AS t WHERE t.id = 2",
             "an alias on a DELETE, as above.",
+            "UNMEASURED",
         ),
     ],
 };

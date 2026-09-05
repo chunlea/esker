@@ -22,10 +22,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "ALTER TABLE xdsc ADD CONSTRAINT xdsc_uc UNIQUE (a DESC)",
             "PostgreSQL stops at the grammar (42601, a constraint's columns take no direction);              this node stops one step earlier at ALTER TABLE ... ADD CONSTRAINT ... UNIQUE, which              it does not have at all (0A000). The valid form is the gap, not the direction",
+            "UNMEASURED",
         ),
         (
             "CREATE INDEX xdsc_bad2 ON xdsc (a NULLS)",
             "PostgreSQL reads the bare word as an operator class and answers 42704 operator class              \"nulls\" does not exist; sqlparser cannot read it at all, so this node answers              42601. An index operator class is refused by name here either way",
+            "UNMEASURED",
         ),
     ],
 };

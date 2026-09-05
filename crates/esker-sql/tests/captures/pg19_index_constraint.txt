@@ -1,0 +1,136 @@
+# Index and constraint shapes, as a real PostgreSQL 19beta1 answers them.
+#
+# NOT a type. These are items 4, 7 and 8 of `triage/blockers-51390c9.md` — the **tail of the schema
+# gate**: after `json`, `current_schemas`, `date`, `numeric` and `float`, seven statements of
+# `activerecord/test/schema/schema.rb` are still refused and every one of them is an index shape,
+# a foreign key or a volatile default. Captured now so that unit has its oracle before it starts,
+# rather than after.
+#
+# Captured in one session with `scratchpad/sesscap.py` and replayed the same way against one node.
+# It builds its own tables, dropping whatever a previous run left. They are deliberately not
+# dropped at the end: `sesscap.py` asks `\gdesc` for the declared types in a *second* session, and
+# a dropped table makes that column empty.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The stored index definition keeps only what differs from the default, and the default
+#     depends on the direction.** `(a ASC NULLS FIRST)` comes back as **`(a NULLS FIRST)`** — the
+#     `ASC` is dropped because it is the default, and the `NULLS FIRST` is kept because ASC's
+#     default is NULLS **LAST**. `(a DESC NULLS LAST)` keeps **both**, for the mirror reason. So
+#     an implementation cannot round-trip the text it was given; it has to store direction and
+#     null-placement and re-derive the shortest spelling.
+#   * **`NULLS NOT DISTINCT` is a column of `pg_index`, not part of the key.**
+#     `indnullsnotdistinct` is `t` for it and `f` for the default, and the clause prints **after**
+#     the column list: `... USING btree (c) NULLS NOT DISTINCT`. Writing `NULLS DISTINCT`
+#     explicitly stores and prints nothing — it is the default.
+#   * **A partial predicate is re-printed normalised and parenthesised**: `WHERE published_on IS
+#     NOT NULL` comes back `WHERE (published_on IS NOT NULL)`, and an expression index written
+#     `((lower(b)))` comes back `(lower(b))` — one layer of parentheses removed. Two opposite
+#     rewrites in one statement.
+#   * **A bad column in the *predicate* is the same error as a bad column in the key**:
+#     `42703 column "nosuchcol" does not exist` for both. A duplicate index name is `42P07`, the
+#     same code a duplicate table gets.
+#   * **`pg_get_constraintdef` drops `INITIALLY IMMEDIATE` and keeps `DEFERRABLE`**, because
+#     `INITIALLY IMMEDIATE` is the default — so the exact clause `ActiveRecord` writes,
+#     `DEFERRABLE INITIALLY IMMEDIATE`, is *not* what comes back out. `condeferrable` is `t` and
+#     `condeferred` is `f`, which is the pair that says so.
+#   * **PostgreSQL 19 has a `pg_constraint` row for `NOT NULL`**, `contype` `n`, named
+#     `<table>_<column>_not_null` — a row that did not exist in older majors and that a catalog
+#     emulation copied from an older memory would be missing.
+#   * **A foreign key violation is `23503` with two different sentences**: inserting a child says
+#     `insert or update on table "ixc" violates ...` with `Key (p)=(99) is not present`; deleting
+#     the parent says `update or delete on table "ixp" violates ... on table "ixc"` with
+#     `Key (id)=(1) is still referenced`. One code, two messages, and the second names both tables.
+#   * **A volatile default is stored as its own text, unparenthesised, where a computed one is
+#     parenthesised.** `CURRENT_TIMESTAMP` and `CURRENT_DATE` come back exactly as written;
+#     `DEFAULT 1 + 1` comes back `(1 + 1)`. And an unknown function in a default is `42883` with
+#     `DETAIL: There is no function of that name.` — *not* the usual "No function of that name
+#     accepts the given argument types."
+#   * **The `CASE` expression index — captured after all, by normalising the newlines in the
+#     statement.** `pg_get_indexdef` renders a `CASE` over several indented lines and `sesscap.py`
+#     drops output rows beginning with a space, so the raw call cannot be a line here. Wrapping it
+#     in `regexp_replace(…, '\s+', ' ', 'g')` collapses it to one line and makes it capturable —
+#     and the comparison line below proves the normalisation is a **no-op for every other index**
+#     (`= pg_get_indexdef(...)` is `t` for the mixed index and `f` only for the `CASE` one), so the
+#     rewrite hides nothing.
+#
+#     Two facts it turned up that the prose note could not:
+#
+#     **`pg_get_indexdef` materialises the implicit `ELSE`.** Written
+#     `(CASE WHEN rating > 0 THEN lower(name) END)`, it comes back as
+#     `CASE WHEN (rating > 0) THEN lower(name) ELSE NULL::text END` — the omitted branch is filled
+#     in *with its resolved type*, and the condition gains parentheses. So the stored text is not
+#     the written text even after whitespace is normalised.
+#
+#     **An expression index column is `indkey` 0.** Zero means "not a column, see `indexprs`", and
+#     `indnatts` still counts it as one attribute.
+#
+#   * **An expression index column needs its own parentheses.**
+#     `ON cx ((CASE … END))` is accepted and `ON cx (CASE … END)` is
+#     `42601 syntax error at or near "CASE"`. The doubled parenthesis is grammar, not style — and
+#     one layer of it is removed on the way back out: `((lower(name)))` prints as `(lower(name))`.
+DROP TABLE IF EXISTS ix CASCADE		-
+DROP TABLE IF EXISTS ixc CASCADE		-
+DROP TABLE IF EXISTS ixp CASCADE		-
+DROP TABLE IF EXISTS ixd CASCADE		-
+CREATE TABLE ix (id int8 PRIMARY KEY, a int4, b text, c int4, published_on date)		-
+INSERT INTO ix VALUES (1, 10, 'Alpha', 1, '2020-01-01')		-
+INSERT INTO ix VALUES (2, 20, 'beta', 2, NULL)		-
+INSERT INTO ix VALUES (3, NULL, 'Gamma', 3, '2021-01-01')		-
+CREATE INDEX ix_desc ON ix (a DESC, c DESC)		-
+CREATE INDEX ix_desc_nulls ON ix (a DESC NULLS LAST)		-
+CREATE INDEX ix_asc_nulls ON ix (a ASC NULLS FIRST)		-
+CREATE UNIQUE INDEX ix_partial ON ix (b) WHERE published_on IS NOT NULL		-
+CREATE INDEX ix_partial2 ON ix (a, c) WHERE (a > 10)		-
+CREATE UNIQUE INDEX ix_expr ON ix ((lower(b)))		-
+CREATE INDEX ix_expr2 ON ix ((CASE WHEN a > 0 THEN lower(b) END) DESC)		-
+CREATE UNIQUE INDEX ix_nulls_nd ON ix (c) NULLS NOT DISTINCT		-
+CREATE UNIQUE INDEX ix_nulls_d ON ix (a) NULLS DISTINCT		-
+SELECT pg_get_indexdef('ix_desc'::regclass)	text	CREATE INDEX ix_desc ON public.ix USING btree (a DESC, c DESC)
+SELECT pg_get_indexdef('ix_desc_nulls'::regclass)	text	CREATE INDEX ix_desc_nulls ON public.ix USING btree (a DESC NULLS LAST)
+SELECT pg_get_indexdef('ix_asc_nulls'::regclass)	text	CREATE INDEX ix_asc_nulls ON public.ix USING btree (a NULLS FIRST)
+SELECT pg_get_indexdef('ix_partial'::regclass)	text	CREATE UNIQUE INDEX ix_partial ON public.ix USING btree (b) WHERE (published_on IS NOT NULL)
+SELECT pg_get_indexdef('ix_partial2'::regclass)	text	CREATE INDEX ix_partial2 ON public.ix USING btree (a, c) WHERE (a > 10)
+SELECT pg_get_indexdef('ix_expr'::regclass)	text	CREATE UNIQUE INDEX ix_expr ON public.ix USING btree (lower(b))
+SELECT pg_get_indexdef('ix_nulls_nd'::regclass)	text	CREATE UNIQUE INDEX ix_nulls_nd ON public.ix USING btree (c) NULLS NOT DISTINCT
+SELECT pg_get_indexdef('ix_nulls_d'::regclass)	text	CREATE UNIQUE INDEX ix_nulls_d ON public.ix USING btree (a)
+SELECT i.relname, x.indisunique, x.indnullsnotdistinct, pg_get_expr(x.indpred, x.indrelid) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ix'::regclass ORDER BY i.relname	name,boolean,boolean,text	ix_asc_nulls|f|f|\N ; ix_desc|f|f|\N ; ix_desc_nulls|f|f|\N ; ix_expr|t|f|\N ; ix_expr2|f|f|\N ; ix_nulls_d|t|f|\N ; ix_nulls_nd|t|t|\N ; ix_partial|t|f|(published_on IS NOT NULL) ; ix_partial2|f|f|(a > 10) ; ix_pkey|t|f|\N
+CREATE INDEX ix_bad ON ix (nosuchcol)	!42703 column "nosuchcol" does not exist
+CREATE INDEX ix_bad2 ON ix (a DESC) WHERE nosuchcol > 1	!42703 column "nosuchcol" does not exist
+CREATE INDEX ix_desc ON ix (a)	!42P07 relation "ix_desc" already exists
+CREATE TABLE ixp (id int8 PRIMARY KEY, n text)		-
+CREATE TABLE ixc (id int8 PRIMARY KEY, p int8)		-
+ALTER TABLE ixc ADD CONSTRAINT fk_ixc FOREIGN KEY (p) REFERENCES ixp (id) DEFERRABLE INITIALLY IMMEDIATE		-
+ALTER TABLE ixc ADD CONSTRAINT fk_ixc2 FOREIGN KEY (p) REFERENCES ixp (id) ON DELETE CASCADE		-
+ALTER TABLE ixc ADD CONSTRAINT ck_ixc CHECK (p > 0)		-
+SELECT conname, contype, condeferrable, condeferred, confdeltype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ixc'::regclass ORDER BY conname	name,"char",boolean,boolean,"char",text	ck_ixc|c|f|f| |CHECK ((p > 0)) ; fk_ixc|f|t|f|a|FOREIGN KEY (p) REFERENCES ixp(id) DEFERRABLE ; fk_ixc2|f|f|f|c|FOREIGN KEY (p) REFERENCES ixp(id) ON DELETE CASCADE ; ixc_id_not_null|n|f|f| |NOT NULL id ; ixc_pkey|p|f|f| |PRIMARY KEY (id)
+INSERT INTO ixc VALUES (1, 99)	!23503 insert or update on table "ixc" violates foreign key constraint "fk_ixc" DETAIL: Key (p)=(99) is not present in table "ixp".
+INSERT INTO ixp VALUES (1, 'x')		-
+INSERT INTO ixc VALUES (1, 1)		-
+DELETE FROM ixp WHERE id = 1	!23503 update or delete on table "ixp" violates foreign key constraint "fk_ixc" on table "ixc" DETAIL: Key (id)=(1) is still referenced from table "ixc".
+ALTER TABLE ixc ADD CONSTRAINT fk_dup FOREIGN KEY (p) REFERENCES nosuchtable (id)	!42P01 relation "nosuchtable" does not exist
+ALTER TABLE ixc ADD CONSTRAINT fk_ixc DUPLICATE	!42601 syntax error at or near "DUPLICATE"
+CREATE TABLE ixd (id int8 PRIMARY KEY, t timestamp DEFAULT CURRENT_TIMESTAMP, d date DEFAULT CURRENT_DATE, n int4 DEFAULT 1 + 1)		-
+SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'ixd' ORDER BY ordinal_position	name,character varying	id|\N ; t|CURRENT_TIMESTAMP ; d|CURRENT_DATE ; n|(1 + 1)
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid = 'ixd'::regclass ORDER BY d.adnum	text	CURRENT_TIMESTAMP ; CURRENT_DATE ; (1 + 1)
+CREATE TABLE ixe (id int8, t timestamp DEFAULT nosuchfunc())	!42883 function nosuchfunc() does not exist DETAIL: There is no function of that name.
+DROP TABLE IF EXISTS cx CASCADE		-
+CREATE TABLE cx (id int8 PRIMARY KEY, rating int4, name text)		-
+CREATE INDEX cx_case ON cx ((CASE WHEN rating > 0 THEN lower(name) END) DESC)		-
+CREATE INDEX cx_case2 ON cx ((CASE WHEN rating > 0 THEN lower(name) ELSE upper(name) END))		-
+CREATE INDEX cx_expr ON cx ((lower(name)))		-
+CREATE INDEX cx_mixed ON cx (rating, (lower(name)) DESC)		-
+SELECT regexp_replace(pg_get_indexdef('cx_case'::regclass), '\s+', ' ', 'g')	text	CREATE INDEX cx_case ON public.cx USING btree (( CASE WHEN (rating > 0) THEN lower(name) ELSE NULL::text END) DESC)
+SELECT regexp_replace(pg_get_indexdef('cx_case2'::regclass), '\s+', ' ', 'g')	text	CREATE INDEX cx_case2 ON public.cx USING btree (( CASE WHEN (rating > 0) THEN lower(name) ELSE upper(name) END))
+SELECT regexp_replace(pg_get_indexdef('cx_expr'::regclass), '\s+', ' ', 'g')	text	CREATE INDEX cx_expr ON public.cx USING btree (lower(name))
+SELECT regexp_replace(pg_get_indexdef('cx_mixed'::regclass), '\s+', ' ', 'g')	text	CREATE INDEX cx_mixed ON public.cx USING btree (rating, lower(name) DESC)
+SELECT 'g', regexp_replace(pg_get_indexdef('cx_mixed'::regclass), '\s+', ' ', 'g') = pg_get_indexdef('cx_mixed'::regclass)	text,boolean	g|t
+SELECT 'g', regexp_replace(pg_get_indexdef('cx_case'::regclass), '\s+', ' ', 'g') = pg_get_indexdef('cx_case'::regclass)	text,boolean	g|f
+SELECT 'g', i.indisunique, i.indnatts, i.indkey::text FROM pg_index i WHERE i.indexrelid = 'cx_case'::regclass	text,boolean,smallint,text	g|f|1|0
+SELECT 'g', i.indisunique, i.indnatts, i.indkey::text FROM pg_index i WHERE i.indexrelid = 'cx_mixed'::regclass	text,boolean,smallint,text	g|f|2|2 0
+CREATE INDEX cx_bad ON cx ((CASE WHEN nosuchcol > 0 THEN 1 END))	!42703 column "nosuchcol" does not exist
+CREATE INDEX cx_noparen ON cx (CASE WHEN rating > 0 THEN lower(name) END)	!42601 syntax error at or near "CASE"

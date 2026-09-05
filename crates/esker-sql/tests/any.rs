@@ -31,11 +31,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          `RowDescription` could type. Inside an `= ANY` it is a list of names and answers exactly; \
          on its own it would need the stored-array unit that ADR 0033's roadmap puts in tier 2. \
          Refusing by name is the honest half: `ActiveRecord` only ever writes it inside an `ANY`.",
+            "pg19_current_schemas.txt:50",
         ),
         (
             "SELECT current_schemas(true)",
             "The same refusal for the same reason: it is the form that also lists `pg_catalog`, \
              and selecting either returns an array.",
+            "pg19_current_schemas.txt:51",
         ),
     ],
 };

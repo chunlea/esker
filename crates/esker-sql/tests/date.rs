@@ -19,47 +19,62 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT oid, typname, typlen, typinput, typelem, typcategory FROM pg_type WHERE typname = 'date'",
             "`pg_type.typlen` is a column this node's `pg_type` does not have, for every type. Not this unit's: every other column of the row agrees, and the `date` row is there with oid 1082 and `date_in`.",
+            "pg19_date.txt:45",
         ),
         (
             "SELECT pg_typeof('2020-01-01'::date)",
             "`pg_typeof` is `0A000` naming itself, for every type. Not this unit's.",
+            "pg19_date.txt:46",
         ),
         (
             "SELECT format_type(1082, -1), format_type(1082, 3)",
             "`format_type(1082, 3)` prints `date(3)` on a real server: it prints the typmod it is handed whether or not the type takes one. A `date` **has** no typmod — `CREATE TABLE t (d date(3))` is a syntax error there — so no column can reach this and only a hand-written oid can.",
+            "pg19_date.txt:47",
         ),
         (
             "SELECT '2020-01-02'::date::varchar, '2020-01-02'::date::char(4)",
             "`::char(n)` **truncates** on an explicit cast and raises `22001` only on an assignment; this node raises on both. Older than this unit — it is `value::fit_to_typmod`, and it does the same for a `text` source.",
+            "pg19_date.txt:84",
         ),
         (
             "SELECT age('2020-01-01'::date, '2019-01-01'::date)",
             "`age` answers an `interval`, which this node does not have.",
+            "pg19_date.txt:95",
         ),
         (
             "SELECT '2020-01-01'::date + 1.5",
             "Arithmetic. PostgreSQL raises `42883` and this node `0A000`: both refuse, and the reason differs — there the operator is missing for that *pair*, here for every pair.",
+            "pg19_date.txt:97",
         ),
-        ("SELECT '2020-01-01'::date * 2", "Arithmetic; see above."),
+        (
+            "SELECT '2020-01-01'::date * 2",
+            "Arithmetic; see above.",
+            "pg19_date.txt:99",
+        ),
         (
             "SELECT extract(year FROM '2020-06-15'::date), extract(doy FROM '2020-06-15'::date), extract(epoch FROM '2020-06-15'::date)",
             "`extract` is `0A000` naming itself, for every type. Its neighbour is worth keeping in the corpus for what it says: `extract` answers `numeric` and `date_part` answers `double precision` for the same question.",
+            "pg19_date.txt:100",
         ),
         (
             "SELECT date_part('month', '2020-06-15'::date)",
             "`date_part` is `0A000` naming itself.",
+            "pg19_date.txt:101",
         ),
         (
             "SELECT to_char('2020-06-15'::date, 'YYYY-MM-DD'), to_date('2020-06-15', 'YYYY-MM-DD')",
             "`to_char`/`to_date` are `0A000` naming themselves — a whole format-picture language, and nothing `ActiveRecord` sends.",
+            "pg19_date.txt:102",
         ),
         (
             "SELECT greatest('2020-01-01'::date, '2019-01-01'::date), least('2020-01-01'::date, '2019-01-01'::date)",
             "`greatest`/`least` are `0A000` naming themselves, for every type.",
+            "pg19_date.txt:106",
         ),
         (
             "SELECT '2020-01-01'::date = 1",
             "**Both raise `42883`, and the type named in the sentence differs**: `date = bigint` here where a real server says `date = integer`, because a bare integer constant is `int8` in this crate. The declared bare-integer divergence (`tests/unknown_literal.rs`), reached through a new type — and it is here rather than absent because this unit is what made the line raise at all: before it, a `date` compared to an integer answered **`f`**.",
+            "pg19_date.txt:107",
         ),
     ],
 };

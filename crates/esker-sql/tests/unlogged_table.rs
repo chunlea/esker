@@ -43,11 +43,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              because it is temporary`; here the table does not exist, so the answer is `42P01`. \
              The rule cannot be reached without temporary tables, and it is about them rather than \
              about persistence.",
+            "pg19_unlogged_table.txt:91",
         ),
         (
             "SELECT 'r', pg_typeof(relpersistence) FROM pg_class WHERE relname = 'logged_probe'",
             "`\"char\"` there and `text` here — the statement that would *prove* the declared-type \
              divergence above, and it diverges in the same direction.",
+            "pg19_unlogged_table.txt:93",
         ),
     ],
 };

@@ -36,6 +36,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          transaction**, and forty-one statements after it come back `25P02`. The harness counts \
          those as a cascade rather than as divergences of their own, because declaring forty \
          consequences would bury the one cause.",
+        "pg19_trigger_function.txt:80",
     )],
 };
 
