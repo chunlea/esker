@@ -3840,9 +3840,27 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                         escape: None,
                     });
                 }
+                // **`->` means two things** — an hstore's fetch and a JSON document's — and the
+                // values cannot tell them apart, because a `jsonb` is a canonical `Datum::Text`
+                // and so is a string. Told apart the way `||` is: here when a **cast** wrote the
+                // type down, and in the evaluator by `Expr::Ordinal`'s declared type when the
+                // operand is a column.
                 BinaryOperator::Arrow => {
+                    let func = match json_cast_type(left) {
+                        Some(ColumnType::Json) => plan::CatalogFunc::JsonFetch,
+                        Some(_) => plan::CatalogFunc::JsonbFetch,
+                        None => plan::CatalogFunc::HstoreFetch,
+                    };
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
-                        func: plan::CatalogFunc::HstoreFetch,
+                        func,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
+                // **`->>` needs no dispatch**: it is not an hstore operator, so every one of them
+                // is a JSON fetch whatever the operand was declared.
+                BinaryOperator::LongArrow => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::JsonFetchText,
                         args: vec![lower_expr(left)?, lower_expr(right)?],
                     })));
                 }
@@ -5701,6 +5719,23 @@ fn refuse_json_comparison(op: &BinaryOperator) -> SqlError {
 /// Syntactic, and it has to be: after lowering, a `jsonb` is a `Datum::Text` like any other.
 fn either_is_json(left: &Expr, right: &Expr) -> bool {
     is_json_expr(left) || is_json_expr(right)
+}
+
+/// Which of `json` and `jsonb` a cast wrote, for the `->` that has to answer one of them.
+///
+/// The **outermost** cast wins, which is what `'{"a":1}'::json::jsonb -> 'a'` asks for.
+fn json_cast_type(expr: &Expr) -> Option<ColumnType> {
+    match expr {
+        Expr::Nested(inner) => json_cast_type(inner),
+        Expr::Cast {
+            expr, data_type, ..
+        } => match data_type {
+            DataType::JSON => Some(ColumnType::Json),
+            DataType::JSONB => Some(ColumnType::Jsonb),
+            _ => json_cast_type(expr),
+        },
+        _ => None,
+    }
 }
 
 fn is_json_expr(expr: &Expr) -> bool {
