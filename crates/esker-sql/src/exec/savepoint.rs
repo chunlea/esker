@@ -271,6 +271,18 @@ impl Txn for Recording<'_> {
         Ok(taken)
     }
 
+    /// The transaction underneath's view, and **not** the default.
+    ///
+    /// `Txn::locks` has a default, so leaving it out here is not a compile error — it is this
+    /// wrapper quietly answering "nothing is held on this node" for every `pg_locks` read taken
+    /// while a savepoint is open, which is every statement of a Rails nested `transaction do`. The
+    /// one question this view exists to answer is what a stuck session is holding, and that is the
+    /// state it is most likely to be stuck in. `tests/pg_locks.rs` asks it either side of one
+    /// `SAVEPOINT`.
+    fn locks(&self) -> crate::backend::LockView {
+        self.inner.locks()
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.inner.holds(key)
     }
@@ -285,6 +297,10 @@ impl Txn for Recording<'_> {
 
     fn restore_read_set(&mut self, set: crate::backend::ReadSet) {
         self.inner.restore_read_set(set);
+    }
+
+    fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
+        self.inner.changed_since_statement(key)
     }
 
     fn restart_statement(&mut self) -> Result<()> {
@@ -308,10 +324,6 @@ impl Txn for Recording<'_> {
     // `40001`s did not run there either.
     fn validate_reads(&mut self, on: bool) {
         self.inner.validate_reads(on);
-    }
-
-    fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
-        self.inner.changed_since_statement(key)
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {

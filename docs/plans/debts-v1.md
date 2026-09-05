@@ -1,6 +1,6 @@
 # Debts still open at v1
 
-**Status: three of the original eight are still open — #1, #2 and #4.** Everything else has been
+**Status: one of the original eight is still open — #4.** Everything else has been
 closed and moved to §2 with the commit that closed it, and the numbers are quoted across lanes, so
 a closed row leaves a **gap** rather than renumbering the rows after it. Each remaining row names
 its site, a size, and who it belongs to.
@@ -8,9 +8,20 @@ its site, a size, and who it belongs to.
 > **The original claim on this line was that every row had been verified against the tree rather
 > than transcribed. That was true of the sites and not of the symptoms.** #3 and #5 were already
 > fixed in the very commit this file was added at — #3's row even said c6 had verified it as the
-> one item of eight that HEAD still owed — which makes five rows that turned out to be closed when
-> someone looked, not three. Asking "is the site still there" is not asking "is the symptom still
-> there", and a register is only as good as the question put to it.
+> one item of eight that HEAD still owed — and **#2 makes six**: it was fixed by `8126d450` at
+> 09:21 and this file was written at 09:48, twenty-seven minutes later. So six of the eight rows
+> turned out to be closed when someone looked, not three. Asking "is the site still there" is not
+> asking "is the symptom still there", and a register is only as good as the question put to it.
+>
+> **#1 failed the other way, and it is the cheaper failure to fix.** It was genuinely open when
+> written, closed five hours later by `c77619ba` in another lane, and left standing here for a day
+> — while [ADR 0067], written by the lane that closed it, opens with *"closes `debts-v1.md` #1 and
+> #2"*. The closure was recorded; it was recorded somewhere this file does not read. A register
+> that is only written to by the lane that opens a row will always lag the tree, so the rule that
+> follows is the one at the top of §2: **close the row where the row lives, in the commit that
+> closes it.**
+>
+> [ADR 0067]: ../adr/0067-the-check-mutation-and-the-latest-commit-question.md
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -21,13 +32,56 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 
 | # | Debt | Site | Size | Owner |
 |---|---|---|---|---|
-| 1 | **`changed_since_statement` is defaulted on the store path.** The trait's default answers `false` — correct for a backend that takes no locks — and only `MemoryTxn` overrides it. `StoreTxn` does not, so under a real cluster a `READ COMMITTED` re-run proceeds on a value that may be stale, and the check that removed ~100 spurious `40001`s in 1,200 transactions does not run there. | `crates/esker-sql/src/backend/store.rs` (no override); default at `backend/mod.rs:214`; already named in `exec/savepoint.rs:243` | medium — one method, but it needs the store to answer "written since ts" | h1 (txn/locking) |
-| 2 | **`Recording` forwards `changed_since_statement` but the same gap reaches it.** With a savepoint open — which Rails opens for *every* nested `transaction do` — a SERIALIZABLE transaction recorded and validated nothing until this was wired, and the statement re-check does not run on the store path for the same reason as #1. | `crates/esker-sql/src/exec/savepoint.rs:243` | small once #1 lands | h1 |
 | 4 | **Cross-node deadlock detection.** The wait-for graph is node-local, which covers every deadlock two sessions of one `esker-sql` process can make. A cycle *across* nodes needs a graph both can see. Named in the code as a follow-on, and PD's job. | `crates/esker-sql/src/backend/locks.rs:46` | large — needs a PD-held graph | PD / pdha |
 
 ## 2. Reported as open, and closed on inspection
 
-Recorded because the next reader will be handed the same list.
+Recorded because the next reader will be handed the same list. **Close a row here in the commit
+that closes it** — every lag this file has had came from the closure being recorded elsewhere.
+
+### #1 and #2 — **closed, and the harder half was proving a test could tell**
+
+| # | Closed by | Already in the tree this register was written against? |
+|---|---|---|
+| 1 | `c77619ba` *the read set reaches the store, and a loser cleans up after itself* — `StoreTxn::changed_since_statement` asks the store via `latest_commit` ([ADR 0067]) | No — five hours after, and left standing here for a day |
+| 2 | `8126d450` *a savepoint must not turn validation off — two more methods the wrapper swallowed* | **Yes — by twenty-seven minutes** |
+
+Verified by reading the tree, not the record: both sites override the default and the register was
+describing a shape that no longer existed. What was genuinely missing was a **test that could tell
+the difference**, and three were written and thrown away before one could:
+
+| The test | Why it proved nothing |
+|---|---|
+| A savepoint open, two statements, no wait | Passed with `Recording`'s forward removed. READ COMMITTED hands the second statement a fresh snapshot, so it reads the new value whether or not anything was asked. |
+| One writer genuinely blocked behind another | Passed with `StoreTxn`'s override removed. A statement that **waited** restarts unconditionally; the check is consulted only on the branch where the lock was taken at once. |
+| The same contention at 4 × 15 | Passed with the override removed. The window is rarer than 60 increments. |
+
+At 8 × 50 it separates: **1 refusal in 400 without the override, 4/4 runs clean with it**
+(`tests/store_locking.rs`). And the assertion had to change shape as well as size — a lost update
+is not reachable here, because the per-key read stamp (ADR 0057 §4) makes first-committer-wins
+refuse a write computed from a stale value at prewrite. The cost of the missing check is a `40001`
+nobody needed, so **counting refusals is the only assertion that can see it**; the first version
+filtered on `is_ok()` and threw exactly that evidence away.
+
+[ADR 0067]: ../adr/0067-the-check-mutation-and-the-latest-commit-question.md
+
+### The third instance of one shape, and the one that was live
+
+`Txn` has seven defaulted methods, which makes every wrapper of it a silent opt-out — `8126d450`'s
+subject says "two more methods the wrapper swallowed" and it was not the last. Two more were found
+while checking these rows:
+
+* **`Recording::locks` was missing, and that was a wrong answer.** Every `pg_locks` read taken while
+  a savepoint is open returned `LockView::default()` — empty — and Rails opens a savepoint for every
+  nested `transaction do`. The view exists to answer what a stuck session holds; that is the state
+  it is most likely to be stuck in. Fixed in `42344f78`, red-first, asking the same question either
+  side of one `SAVEPOINT`.
+* **`GatedTxn` in `tests/redrive.rs` forwarded fifteen methods and none of the seven with defaults.**
+  So those tests ran with row locking off (`lock`'s default answers `Taken` to everybody), with no
+  per-statement snapshot, and recording nothing for SERIALIZABLE. Latent, not live: `exec::redrive`
+  calls none of the seven and the racing test races on the storage's write-write conflict, as its
+  module doc says. Forwarded anyway in the same commit — the test that should catch whoever adds
+  the first `lock()` to the re-driver was the one that had quietly stopped locking.
 
 | Sighting | What the tree says |
 |---|---|
