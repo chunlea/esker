@@ -25,6 +25,7 @@ use crate::catalog::pg_catalog::CatalogView;
 use crate::plan::{AggregateFunc, Expr, Literal};
 use crate::row::RowSchema;
 use crate::value::PgDatum;
+use crate::value::PgType as _;
 use crate::value::{ColumnType, Datum};
 
 /// Which rows a join keeps when nothing on the right matches.
@@ -1039,6 +1040,9 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         Expr::Literal(literal) => render_literal(literal),
         // As the user wrote it: `EXPLAIN` prints a cast the way SQL spells one.
         Expr::ToText { operand, .. } => format!("{}::text", render(operand, columns)),
+        Expr::Cast { operand, to, .. } => {
+            format!("{}::{}", render(operand, columns), to.name())
+        }
         Expr::Scalar { func, operand } => format!("{}({})", func.name(), render(operand, columns)),
         Expr::Like {
             operand,

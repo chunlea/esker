@@ -202,6 +202,42 @@ pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
 ///
 /// A NULL and a column with no typmod are returned untouched, which is every column this crate
 /// had before version 4 of the catalog record.
+/// [`fit_to_typmod`] for an **explicit cast**, where a string too long is truncated rather than
+/// refused.
+///
+/// **The split this function exists for is measured, not assumed**: `'42'::varchar(1)` is `4` on
+/// 19beta1 and writing `'42'` into a `varchar(1)` column is `22001`. `fit_to_typmod`'s own doc
+/// already names the same split for `bit`, where the cast pads and truncates and the assignment
+/// refuses; the string types are the other half of it, and this is where a cast asks.
+///
+/// Every other type is `fit_to_typmod`'s answer unchanged — a `numeric(10,2)` rounds the same way
+/// whichever side asks, which is what that function's own comment says.
+pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
+    if typmod == NO_TYPMOD {
+        return Ok(value);
+    }
+    let (Datum::Text(text), ColumnType::Varchar | ColumnType::Bpchar) = (&value, ty) else {
+        return fit_to_typmod(value, ty, typmod);
+    };
+    let Some(limit) = length_of_typmod(typmod) else {
+        return Ok(value);
+    };
+    // **Characters, not bytes**, which is what a length means here — the same count
+    // `fit_to_typmod` uses to pad, so the two halves of one rule agree.
+    let limit = limit as usize;
+    let kept: String = text.chars().take(limit).collect();
+    Ok(match ty {
+        // A `char(n)` cast pads as well as truncates: `'abc'::char(5)` is `abc  `, measured.
+        ColumnType::Bpchar => {
+            let short_by = limit - kept.chars().count();
+            let mut padded = kept;
+            padded.extend(std::iter::repeat_n(' ', short_by));
+            Datum::Text(padded)
+        }
+        _ => Datum::Text(kept),
+    })
+}
+
 pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum> {
     if typmod == NO_TYPMOD {
         return Ok(value);

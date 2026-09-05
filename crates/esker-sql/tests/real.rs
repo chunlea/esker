@@ -24,14 +24,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT (1.0/3.0)::real",
-        "a cast is `0A000` naming itself and was before this type. The line is in the corpus \
-         because it is the shortest statement that tells `real`'s text from `double precision`'s \
-         — `0.33333334` against `0.3333333333333333` — and `the_text_is_f32_wide` asserts the \
-         same thing through a column, which is a shape this node can write.",
-        "UNMEASURED",
-    )],
+    answers: &[],
 };
 
 #[test]

@@ -4929,6 +4929,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         ),
         Expr::Scalar { func, operand } => format!("{}({})", func.name(), sub(operand)),
         Expr::ToText { operand, .. } => format!("({})::text", sub(operand)),
+        Expr::Cast { operand, to, .. } => format!("({})::{}", sub(operand), to.name()),
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
         // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
         // `PRETTYFLAG_INDENT`, which puts every keyword of a `CASE` on its own line — and it is

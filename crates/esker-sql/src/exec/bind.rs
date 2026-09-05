@@ -105,6 +105,22 @@ pub(super) fn infer(
     });
 
     let mut found: Vec<Option<ColumnType>> = vec![None; count];
+    // **A cast is how a parameter's type is written down.** `SELECT $1::integer` says the
+    // parameter is an `integer`, and a real server reports it as one — which is what
+    // `connection_test.rb` prepares and then describes. Taken before the walk below so that a
+    // cast wins over anything the statement's shape would otherwise infer, exactly as it does on
+    // a real server: the cast is the client's own declaration.
+    for_each_expr(statement, &mut |expr| {
+        if let Expr::Cast { operand, to, .. } = expr
+            && let Expr::Parameter(number) = operand.as_ref()
+        {
+            let at = (*number as usize).saturating_sub(1);
+            if found.len() <= at {
+                found.resize(at + 1, None);
+            }
+            found[at].get_or_insert(*to);
+        }
+    });
     walk(statement, tables, &mut |number, ty| {
         let at = (number as usize).saturating_sub(1);
         if found.len() <= at {
@@ -920,6 +936,7 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         Expr::Not(operand)
         | Expr::IsNull { operand, .. }
         | Expr::Negate(operand)
+        | Expr::Cast { operand, .. }
         | Expr::ToText { operand, .. }
         | Expr::Scalar { operand, .. } => {
             walk_expr_mut(operand, visit);
@@ -1171,6 +1188,7 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     match expr {
         Expr::Not(operand)
         | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
         | Expr::ToText { operand, .. }
         | Expr::Negate(operand)
         | Expr::Scalar { operand, .. } => descend(operand, visit),

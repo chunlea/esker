@@ -453,6 +453,43 @@ async fn a_schema_change_in_a_transaction_settles_the_sequence_either_way() {
     );
 }
 
+/// **`SELECT $1::integer`**, which is both of run 95's `a cast to INTEGER` tests.
+///
+/// `connection_test.rb`'s `test_statement_key_is_logged` and `test_prepare_false_with_binds` send
+/// exactly this, one prepared and one not. It is a cast of a **bind parameter** — the board's row
+/// names `INTEGER` because the message renders whatever the user wrote, and reading the statement
+/// is what said the row was not about a spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_of_a_bound_parameter_answers() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+
+    for (sql, bound, want) in [
+        ("SELECT $1::integer", "42", "42"),
+        ("SELECT $1::bigint", "42", "42"),
+        // The parameter arrives as text and the cast is what types it, so a value the target
+        // cannot read is the target's own error rather than a silent zero.
+        ("SELECT $1::numeric", "1.5", "1.5"),
+    ] {
+        let reply = wire.send(&extended(sql, &[bound])).await;
+        assert!(
+            !frames(&reply).iter().any(|(tag, _)| *tag == 'E'),
+            "{sql} with {bound:?} was refused: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+        assert_eq!(
+            first_value(&reply).as_deref(),
+            Some(want),
+            "{sql} must answer {want}"
+        );
+    }
+}
+
 /// **The other user types keep their own type across the bind**, which the enum fix took away.
 ///
 /// `ColumnDef::user_type` is set for every `CREATE TYPE`, not only for an enum, so reading "this

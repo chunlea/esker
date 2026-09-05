@@ -5601,7 +5601,25 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                     enum_labels: None,
                 })
             }
-            None => Err(SqlError::unsupported(format!("a cast to {data_type}"))),
+            // **Every other target, per row.** `SELECT $1::integer` is what `connection_test.rb`
+            // sends and `CURRENT_TIMESTAMP::date` is what `assignment_cast_date.rs` has carried as
+            // a declared divergence: neither operand is a constant, so neither folds, and a cast
+            // to anything but `text` had nothing to become.
+            //
+            // **Permission comes from `pg_cast`**, the rows a client can read — a pair with none
+            // is `42846`, which is what `'2020-01-01'::date::int` is on a real server. Reusing the
+            // table rather than writing a second one is what keeps the two answers the same.
+            None => match lower_type(data_type) {
+                Ok((to, typmod)) => {
+                    let operand = lower_expr(expr)?;
+                    Ok(plan::Expr::Cast {
+                        operand: Box::new(operand),
+                        to,
+                        typmod,
+                    })
+                }
+                Err(_) => Err(SqlError::unsupported(format!("a cast to {data_type}"))),
+            },
         };
     };
     match (target, expr) {
