@@ -1170,6 +1170,8 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 matches!(scope, Some(ContextModifier::Local)),
                 format!("SET LOCAL {name}"),
             )?;
+            // Every item, list or not: `$user` is a syntax error wherever it appears unquoted.
+            refuse_placeholders(values)?;
             let [value] = values.as_slice() else {
                 // PostgreSQL takes a list for `search_path`, and one is what `ActiveRecord` sends:
                 // `SET search_path TO "$user", public`. It arrives as two values and is one path.
@@ -1339,6 +1341,23 @@ fn guc_name(name: &ObjectName) -> Option<String> {
 /// A bare identifier that is not `DEFAULT` is a value PostgreSQL would take unquoted; taking it
 /// here keeps `SET esker.read_as_of TO now` from being a syntax-shaped surprise, and the value
 /// grammar refuses it with `22023` a moment later, which is the right condition for it.
+/// Refuses a `SET` value that is a bare `$name`, the way a real server's parser does.
+///
+/// `$` outside a string starts a parameter, so `SET search_path = $user,public` never reaches a
+/// GUC at all on PostgreSQL — it is `syntax error at or near "$"`, and the working spelling is
+/// `'$user'`. `sqlparser` hands it to us as a placeholder instead of refusing it, so this is where
+/// the difference is made. See [`SqlError::SetValueSyntax`] for the capture.
+fn refuse_placeholders(values: &[Expr]) -> Result<()> {
+    for value in values {
+        if let Expr::Value(literal) = value
+            && let Value::Placeholder(_) = &literal.value
+        {
+            return Err(SqlError::SetValueSyntax("$".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn guc_value(value: &Expr) -> Option<String> {
     match value {
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT") => None,

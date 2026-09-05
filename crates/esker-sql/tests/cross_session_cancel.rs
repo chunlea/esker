@@ -141,18 +141,32 @@ fn a_blocked_statement_is_cancelled_by_the_session_holding_its_row() {
     let _ = a_says.send("A holds it");
     let _ = hears_a;
 
-    // The Rails hunt, verbatim — no `state` filter and no `pid <> pg_backend_pid()`.
+    // The Rails hunt, verbatim — no `state` filter and no `pid <> pg_backend_pid()` — and its
+    // **first row**, which is the whole of what this asserts.
+    //
+    // **Waiting until that row is somebody else is not a weakening of it.** A holds the row and
+    // is idle inside its transaction, so its own retained `FOR UPDATE` matches this predicate
+    // too; until B's statement is actually running there is only one row to return and it is A's.
+    // The Rails test spends a `sleep(0.5)` on exactly that window and a gate under load can
+    // outlast it — which is how this failed once at 3,571 tests: the hunt found A, A cancelled
+    // *itself*, its block ended, the row was freed and B simply succeeded (`left: None`). So the
+    // loop waits for the waiter to be visible and then asserts what the ordering decides: that
+    // the first row is the running session and not the idle holder.
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
     let mut pid = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let rows = a.rows("SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'");
-        if let Some(found) = rows.first().and_then(|row| row.first()) {
-            pid = Some(found.clone());
-            break;
+        match rows.first().and_then(|row| row.first()) {
+            Some(found) if *found != a_pid => {
+                pid = Some(found.clone());
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    let pid = pid.expect("the blocked waiter must be visible with its statement");
+    let pid = pid
+        .expect("the hunt's first row must become the blocked waiter rather than the idle holder");
 
     // **One request, which is what the Rails test issues.**
     assert_eq!(
@@ -237,4 +251,72 @@ fn a_committed_session_no_longer_answers_a_hunt_for_its_last_statement() {
             "a block reports how it ended, whichever way it ended"
         );
     }
+}
+
+/// **The hunt with no `ORDER BY` finds the session that is *running* the statement.**
+///
+/// `transaction_test.rb` picks the first row of
+/// `SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'` and cancels it. Both the
+/// holder and the waiter match — the holder because its query text is retained while it sits idle
+/// in its transaction, which is a real server's behaviour and this node's — so which one comes
+/// first decides whether the test cancels the blocked thread it means to or its own.
+///
+/// **PostgreSQL's order here is not reproducible and this does not try to reproduce it.**
+/// `pg_stat_activity` is read out of the `PGPROC` slot array and slots are reused, so its order is
+/// neither pid nor connection order. Measured on PG19, three sessions opened a second apart:
+///
+/// ```text
+/// connected  46822, then 46830, then 46838
+/// returned   46830 | 46822 | 46838
+/// ```
+///
+/// So this asserts the node's own rule — running sessions first — which answers the question the
+/// hunt is actually asking.
+#[test]
+fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
+    let pair = Pair::new(&[
+        "CREATE TABLE samples (id bigint primary key, value bigint)",
+        "INSERT INTO samples VALUES (1, 1)",
+    ]);
+    let (b_pid, hears_b_pid) = channel();
+    let (b_says, hears_b) = channel();
+
+    let sessions = pair.sessions();
+    let victim = std::thread::spawn(move || {
+        let mut node = sessions.session();
+        let _ = b_pid.send(node.rows("SELECT pg_backend_pid()")[0][0].clone());
+        node.run("BEGIN").unwrap();
+        node.run("SET lock_timeout = '20s'").unwrap();
+        reached(&b_says, "B is about to block");
+        let _ = node.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE");
+    });
+
+    // A takes the row first and then sits idle inside its transaction, which is the state that
+    // retains its query text and makes it match the hunt.
+    let mut a = pair.session();
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
+    a.run("BEGIN").unwrap();
+    a.run("SELECT value FROM samples WHERE id = 1 FOR UPDATE")
+        .unwrap();
+    let waiter = hears_b_pid.recv().expect("B says who it is");
+    edge(&hears_b, "B is about to block");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut watcher = pair.session();
+    let hunt = watcher.rows(&format!(
+        "SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE' \
+         AND pid IN ({a_pid}, {waiter})"
+    ));
+    assert_eq!(
+        hunt.len(),
+        2,
+        "both the holder and the waiter match, as they do on a real server: {hunt:?}"
+    );
+    assert_eq!(
+        hunt[0][0], waiter,
+        "the blocked session comes first; the holder {a_pid} is idle in its transaction"
+    );
+
+    a.run("ROLLBACK").unwrap();
+    let _ = victim.join();
 }
