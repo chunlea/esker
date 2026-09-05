@@ -56,5 +56,14 @@ max-threads = 1
 #
 # Serialising them is not hiding the flake — the waits inside them are on events and the bounds
 # have been widened to hold under load. It is refusing to measure a stopwatch in a scrum.
+#
+# **This group is only half the contract, because it only binds `cargo nextest`.** Under plain
+# `cargo test` those eight are threads in one process rather than eight processes, and they raced
+# each other: measured on an idle machine, **two of three runs failed, at 20.00s — a hang, not a
+# near miss**. So the binary also holds a `static CLOCK: Mutex<()>` and every test takes it
+# (`tests/statement_cancellation.rs`, `alone()`). The two halves do not overlap — nextest gives
+# each test its own process, where that mutex is uncontended and free — and the guard is what makes
+# the file honest for whoever runs `cargo test` without reading this file. Five runs green at
+# 0.71s with it.
 filter = 'package(esker-sql) and binary(statement_cancellation)'
 test-group = 'timed'
