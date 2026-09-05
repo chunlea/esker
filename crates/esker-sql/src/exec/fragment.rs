@@ -1436,17 +1436,30 @@ pub(super) fn evaluate(columnar: &mut Columnar, source: &dyn FragmentSource, ts:
     // planner saw, so a region that has split since is refused by the store rather than answered
     // about the half that is left — which is what makes "one fragment per region" cover the whole
     // table or nothing.
-    let shards = columnar.shards.clone();
+    //
+    // A refusal is not the end of it: [`re_routed`] may replace one stale shard with the regions
+    // that now tile its range, and those are walked in the place of the shard they replace. The
+    // list therefore grows while it is being walked, which is why this is an index and not an
+    // iterator.
+    let mut shards = columnar.shards.clone();
+    let mut repairs = 0;
 
     let mut stats = ScanStats::default();
     let mut merged: BTreeMap<GroupKey, Vec<Partial>> = BTreeMap::new();
     let mut answered = 0;
-    for shard in &shards {
+    let mut at = 0;
+    while at < shards.len() {
+        let shard = shards[at].clone();
+        at += 1;
         // `min_apply_index` is zero and that is the whole of what a SQL node can honestly say: the
         // learner's `ReadIndex` round is what makes the answer fresh (ADR 0022 Decision 4, and
         // `docs/plans/phase-10-routing.md` §2).
-        let Ok(answer) = source.evaluate(shard, &bytes, ts, 0) else {
-            return refused(columnar, shards.len(), "a region could not be reached");
+        let Ok(answer) = source.evaluate(&shard, &bytes, ts, 0) else {
+            let Some(fresh) = re_routed(source, &shard, &mut repairs) else {
+                return refused(columnar, shards.len(), "a region could not be reached");
+            };
+            shards.splice(at..at, fresh);
+            continue;
         };
         let (result, cost) = match answer {
             Answer::Answered { result, stats } => (result, stats),
@@ -1483,6 +1496,84 @@ pub(super) fn evaluate(columnar: &mut Columnar, source: &dyn FragmentSource, ts:
         stats,
         rows: Some(finish(columnar, merged)),
     }
+}
+
+/// How many times one query may follow a region that moved under it.
+///
+/// Four, which is what `esker_client`'s scan paths spend on the same problem
+/// (`SCAN_ROUTE_REFRESHES`), for the same reason: a cluster that is splitting really does move a
+/// region between one fragment and the next, and each repair leaves this query aimed better. A
+/// region that moves on *every* attempt is one this statement cannot read at this snapshot, and
+/// the row plan answers it correctly while an unbounded walk would not answer it at all.
+const MAX_ROUTE_REPAIRS: usize = 4;
+
+/// The regions that now cover `shard`'s range, when a failed fragment proved its bounds stale.
+///
+/// `None` means *read the rows*, and it is the answer to everything that is not an exact
+/// re-tiling of the range the fragment was refused for.
+///
+/// # Why exactly, and not merely enough
+///
+/// **A fragment is not a cursor.** `esker-client`'s scan paths repair a route by believing the
+/// bounds the store named and *continuing* from where they stopped, which is safe because a walk
+/// that resumes covers each key once however the boundaries moved. A fragment is an aggregate
+/// over the whole of one region's columnar copy with no key range applied — `esker_columnar`
+/// refuses a `KeyRange`, because a columnar file records none — so what a re-dispatch changes is
+/// not where a walk resumes but **which rows are counted**. A replacement set covering one byte
+/// more than the shard it replaces counts that byte twice, once here and once against whichever
+/// original shard also holds it. That is a wrong number rather than a slow query, so the rule is
+/// equality at both ends with no gap between:
+///
+/// * a **split** re-tiles the range exactly, and is followed;
+/// * a **merge** widens it past the refused end, and is not;
+/// * a **gap** covers less than the range, and is not — for the reason the shard list has to be
+///   complete in the first place ([`the_shards_to_ask`]).
+///
+/// Each of the three is a test in `tests/fragment_route_repair.rs`, and the last two assert the
+/// fallback rather than the answer: the row engine is right, so agreeing with it proves nothing
+/// about which rule produced the agreement.
+fn re_routed(
+    source: &dyn FragmentSource,
+    shard: &Shard,
+    repairs: &mut usize,
+) -> Option<Vec<Shard>> {
+    if *repairs >= MAX_ROUTE_REPAIRS {
+        return None;
+    }
+    // The same question the planner asked, over the one range that turned out to be wrong. What
+    // makes this worth asking twice is underneath it: the client re-resolves against the driver,
+    // and a driver that has not caught up with the split yet is the case that has to be survived
+    // rather than believed (`docs/plans/phase-16-mpp.md` §J12).
+    let fresh = source.shards(&shard.start, &shard.end).ok()?;
+    // **No news is not a repair.** A store that is simply down answers the same shard back, and
+    // spending the budget re-asking it would turn one failed round trip into five.
+    if fresh.len() == 1 && fresh[0].region_id == shard.region_id && fresh[0].epoch == shard.epoch {
+        return None;
+    }
+    if !tiles_exactly(&fresh, shard) {
+        return None;
+    }
+    // A region with no columnar learner cannot answer a fragment, and half an answer is the one
+    // thing this path must never produce.
+    if !fresh.iter().all(Shard::is_columnar) {
+        return None;
+    }
+    *repairs += 1;
+    Some(fresh)
+}
+
+/// Whether `fresh` covers exactly `shard`'s range: no gap, no overlap, and not one byte more.
+///
+/// An empty `end` is the end of the key space, and compares equal only to another empty one,
+/// which is what makes the last region of a table a case this gets right rather than a case it
+/// widens.
+fn tiles_exactly(fresh: &[Shard], shard: &Shard) -> bool {
+    let (Some(first), Some(last)) = (fresh.first(), fresh.last()) else {
+        return false;
+    };
+    first.start == shard.start
+        && last.end == shard.end
+        && fresh.windows(2).all(|pair| pair[0].end == pair[1].start)
 }
 
 /// A run that fell back, with the reason `EXPLAIN` will print.

@@ -290,6 +290,40 @@ impl Cluster {
         }
     }
 
+    /// Waits until every region's learner **answers a fragment**, not merely exists.
+    ///
+    /// **Placement is not readiness.** PD places a learner and the learner then catches up; a
+    /// fragment sent in between is refused `TooFarBehind` and the planner answers from the rows —
+    /// correctly, and silently. A test that started comparing there would be comparing the row
+    /// engine with itself and calling the agreement evidence.
+    ///
+    /// The observable is the plan's own `Fragments: N asked, N answered`, which is the only place
+    /// that distinguishes *asked and refused* from *asked and answered*. `Engine: rows` here is
+    /// not a failure of the query — it is the fragment path not being ready yet, which is why the
+    /// message says `placement never completed` rather than blaming the answer.
+    pub fn wait_until_fragments_answer(&self, probe: &str, seconds: u64) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let plan = self.query_on("auto", &format!("EXPLAIN ANALYZE {probe}"));
+            // **`Engine: columnar` is the readiness condition, and it is the only one that
+            // covers both halves.** A plan that was never routed carries no `Fragments:` line at
+            // all — the planner's own region cache had not yet seen a learner — and one that was
+            // routed and refused carries `N asked, 0 answered`. Waiting on the fragment counts
+            // alone waits for ever in the first case, which is what it did.
+            if plan.contains("Engine: columnar") {
+                eprintln!("harness: the columns are answering");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "placement never completed: no fragment answered within {seconds}s, so \
+                 \"columnar agreed\" could only have meant \"columnar never ran\". \
+                 The last plan was:\n{plan}"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
     /// Waits until every region has a columnar learner.
     ///
     /// A series and not a reading: placement costs one region heartbeat an operator and PD does
