@@ -1,0 +1,25 @@
+crates/esker-cli/tests/pgwire_cluster.rs
+  s_6f7019c05b578b::t_ee4dac82a023e9 46-54,73,76,90
+crates/esker-sql/src/parse/mod.rs
+  s_6f7019c05b578b::t_34ba0ccca75ac5 1264-1274
+crates/esker-sql/tests/psql_smoke.rs
+  s_6f7019c05b578b::t_c054aff8b490f3 60-90,163
+docs/plans/phase-6a.md
+  s_6f7019c05b578b::t_4b5b6e88e274c6 478
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "87f22525ce0966c94ff82199ccead178d94928a5",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
