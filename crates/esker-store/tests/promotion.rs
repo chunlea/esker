@@ -139,6 +139,7 @@ fn key(n: u32) -> Bytes {
 /// than the fix.
 async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let started = Instant::now();
     let mut last: Option<String> = None;
     loop {
         for store in stores {
@@ -171,10 +172,44 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
                 }
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "writing {key:?} never succeeded; the last refusal was: {last:?}"
-        );
+        // **`last: None` means nobody was ever asked, and that is a different failure.** The
+        // three `continue`s above are gates, not refusals: a store is skipped when it holds no
+        // region containing the key, when it holds one but has no peer of it, or when its peer
+        // does not lead. None of that reaches `store.serve`, so `last` stays `None` and the
+        // message used to say only that -- which is the one thing already implied by the panic.
+        //
+        // Seen 2/4 runs at 14 busy threads on 2026-09-04 (`docs/plans/debt-c7.md` section 17):
+        // `writing b"k000659" never succeeded; the last refusal was: None`. Ninety seconds in
+        // which not one of three stores claimed the office for that key, and no way to tell a
+        // leaderless region from a key no store admits to owning. So say which gate each store
+        // stopped at, and who it believes holds the office.
+        if Instant::now() >= deadline {
+            let mut seen = Vec::new();
+            for store in stores {
+                let id = store.store_id();
+                let Some(state) = store.regions().find(&key) else {
+                    seen.push(format!("store {id}: holds no region containing this key"));
+                    continue;
+                };
+                let region_id = state.id();
+                let Some(peer) = store.peer_of(region_id) else {
+                    seen.push(format!(
+                        "store {id}: holds region {region_id} for this key but has no peer of it"
+                    ));
+                    continue;
+                };
+                seen.push(format!(
+                    "store {id}: peer of region {region_id}, is_leader={}, believes leader={:?}",
+                    peer.is_leader(),
+                    peer.leader()
+                ));
+            }
+            panic!(
+                "writing {key:?} never succeeded in {:?}; the last refusal was: {last:?}\n  {}",
+                started.elapsed(),
+                seen.join("\n  ")
+            );
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
