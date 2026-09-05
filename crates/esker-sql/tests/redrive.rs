@@ -355,6 +355,24 @@ impl Txn for GatedTxn {
     fn delete(&mut self, key: &[u8]) {
         self.inner.delete(key);
     }
+    fn buffered(&self, key: &[u8]) -> esker_sql::backend::Buffered {
+        self.inner.buffered(key)
+    }
+    fn restore(&mut self, key: &[u8], prior: esker_sql::backend::Buffered) {
+        self.inner.restore(key, prior);
+    }
+    fn holds(&self, key: &[u8]) -> bool {
+        self.inner.holds(key)
+    }
+    fn unlock(&mut self, key: &[u8]) {
+        self.inner.unlock(key);
+    }
+    fn read_set(&self) -> esker_sql::backend::ReadSet {
+        self.inner.read_set()
+    }
+    fn restore_read_set(&mut self, set: esker_sql::backend::ReadSet) {
+        self.inner.restore_read_set(set);
+    }
     fn start_ts(&self) -> u64 {
         self.inner.start_ts()
     }

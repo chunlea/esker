@@ -2856,6 +2856,15 @@ impl Store {
         let state = self
             .regions
             .route_range(&header, Some(crate::region::txn_request_range(&request)))?;
+        // **Local work, but region-addressed.** `route_range` above has checked the epoch, which
+        // is what invariant 5 asks of every request; the clearing itself needs no leader and no
+        // log entry, and it is disk work — a delete, a flush and a compaction — so it goes to the
+        // blocking pool rather than the driver thread.
+        if matches!(request, TxnKvReq::ReclaimRange { .. }) {
+            let store = Arc::clone(self);
+            return blocking(move || store.handle_txn(&state, request)).await;
+        }
+
         let Some(peer) = state.peer().map(Arc::clone) else {
             let store = Arc::clone(self);
             return blocking(move || store.handle_txn(&state, request)).await;
@@ -2920,6 +2929,11 @@ impl Store {
                 crate::txnkv::latest_commit(&self.db, &key)
             }
             TxnKvReq::GcSafepoint { safepoint } => Ok(self.set_safepoint(safepoint)),
+            TxnKvReq::ReclaimRange {
+                start,
+                end,
+                below_ts,
+            } => self.reclaim_range(&start, &end, below_ts),
             // A write on a store with no peer for this region: no log to put it in, so it is
             // decided and applied here. The decision is the same one apply would make.
             other => {
@@ -2950,6 +2964,73 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Clears one chunk of a dropped database's key range, and says how far it got
+    /// ([ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    ///
+    /// # The record goes down before a byte comes out
+    ///
+    /// A range being reclaimed is written to the `raft` family, synced, **before** anything is
+    /// deleted, and the cursor advances after — so a crash re-clears a chunk that is already
+    /// empty, which is a no-op. The other order would skip a chunk and leave its keys with nothing
+    /// coming back for them, which is the leak
+    /// [ADR 0034](../../docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md) names.
+    ///
+    /// A repeat for a range this store has already finished finds no record and no hosted region
+    /// overlapping it, and answers `finished` after one pass with no writes. That is the
+    /// idempotence a resuming caller needs, and it costs a scan of the `'D'` prefix.
+    fn reclaim_range(
+        &self,
+        start: &Bytes,
+        end: &Bytes,
+        below_ts: u64,
+    ) -> std::result::Result<TxnKvResp, ProtoError> {
+        let safepoint = self.safepoint();
+        let cf_id = self.db.cf_id(cf::RAFT).ok_or_else(|| {
+            ProtoError::internal("the store opened without its `raft` column family")
+        })?;
+        let held = crate::reclaim::load(&self.db)
+            .map_err(|error| ProtoError::internal(format!("reading the reclaim records: {error}")))?
+            .into_iter()
+            .find(|record| record.start == start && record.end == end);
+        let record = if let Some(record) = held {
+            record
+        } else {
+            let fresh = crate::reclaim::Reclaim::new(start.clone(), end.clone(), below_ts);
+            // Synced, and before `advance` deletes anything: this record is the only thing on disk
+            // that says which range a restart has to finish.
+            let mut batch = WriteBatch::new();
+            crate::reclaim::stage(&mut batch, cf_id, &fresh);
+            self.db
+                .write(batch, &WriteOptions::synced())
+                .map_err(|error| crate::error::engine_to_proto(&error))?;
+            fresh
+        };
+        let hosted: Vec<Region> = self
+            .regions
+            .states()
+            .into_iter()
+            .map(|state| state.region().clone())
+            .collect();
+        let progress = crate::reclaim::advance(&self.db, &record, &hosted, safepoint)?;
+        Ok(match progress {
+            crate::reclaim::Progress::Blocked { safepoint, .. } => TxnKvResp::ReclaimRange {
+                cursor: record.cursor,
+                finished: false,
+                safepoint,
+            },
+            crate::reclaim::Progress::Advanced { cursor } => TxnKvResp::ReclaimRange {
+                cursor,
+                finished: false,
+                safepoint,
+            },
+            crate::reclaim::Progress::Finished => TxnKvResp::ReclaimRange {
+                cursor: end.clone(),
+                finished: true,
+                safepoint,
+            },
+        })
     }
 
     /// Raises this store's garbage-collection safepoint, and answers with the one now in force.

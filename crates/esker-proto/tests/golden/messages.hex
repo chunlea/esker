@@ -103,7 +103,8 @@ error pd-not-leader 1300020e3132372e302e302e313a32333830
 error pd-not-leader-blind 13000000
 
 # TxnKv (service 0x02): Get 0x0201, Scan 0x0202, Prewrite 0x0203, Commit 0x0204,
-# Rollback 0x0205, ResolveLock 0x0206, Heartbeat 0x0207, GcSafepoint 0x0208. Every one
+# Rollback 0x0205, ResolveLock 0x0206, Heartbeat 0x0207, GcSafepoint 0x0208,
+# LatestCommit 0x0209, ReclaimRange 0x020A. Every one
 # carries the same region header as a RawKv request. A ResolveLock commit_ts of zero
 # means roll back: no transaction commits at timestamp zero, so the slot is free.
 #
@@ -124,6 +125,7 @@ request txn-resolve-commit 0602010203042a3200
 request txn-resolve-rollback 0602010203042a00010161
 request txn-heartbeat 0702010203042a0170b817
 request txn-gc-safepoint 080201020304808080808040
+request txn-reclaim-range 0a0201020304016400808080808040
 request admin-split 010503016d
 request admin-transfer-leader 02050307
 request admin-regions 0305
@@ -145,6 +147,7 @@ response txn-rollback-committed 05020432
 response txn-resolve-lock 060203
 response txn-heartbeat 0702b817
 response txn-gc-safepoint 0802808080808040
+response txn-reclaim-range 0a02016600808080808040
 response admin-split 0105010161016d010201010a01020161016d010201010a01
 response admin-transfer-leader 0205
 response admin-regions 030501010161016d010201010a010a0180202a

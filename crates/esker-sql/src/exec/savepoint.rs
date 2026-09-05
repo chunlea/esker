@@ -50,6 +50,11 @@ pub(super) const UNDO_LIMIT: usize = 1_000_000;
 struct Mark {
     name: String,
     undo_at: usize,
+    /// How far `locks` had got when the mark was taken. Separate from `undo_at` because a
+    /// `SELECT … FOR UPDATE` locks a row without writing it, so the two logs do not move together.
+    locks_at: usize,
+    /// The recorded read set as it stood, for the same reason the parameters are here.
+    reads: crate::backend::ReadSet,
     parameters: Parameters,
 }
 
@@ -60,12 +65,21 @@ pub(super) type Parameters = std::collections::BTreeMap<&'static str, String>;
 #[derive(Debug, Default)]
 pub(super) struct Savepoints {
     marks: Vec<Mark>,
-    /// Every key written since the oldest open mark, with what it held before, oldest first.
+    /// Every key written since the oldest open mark, with **what the write buffer held for it**
+    /// before, oldest first.
+    ///
+    /// The buffer entry rather than the visible value, and that is the whole of ADR 0057's savepoint
+    /// bug: restoring a *value* leaves the key in the write set, so the commit still prewrites a row
+    /// the transaction has rolled back and a concurrent commit on it refuses everything.
     ///
     /// A key written twice appears twice, and that is required rather than wasteful: replaying
-    /// backwards restores the *earliest* pre-image last, which is the one that was true at the
-    /// mark.
-    undo: Vec<(Vec<u8>, Option<Bytes>)>,
+    /// backwards restores the *earliest* entry last, which is the one that was true at the mark.
+    undo: Vec<(Vec<u8>, crate::backend::Buffered)>,
+    /// Every key **first** locked since the oldest open mark, oldest first.
+    ///
+    /// First only: a key the transaction already held before the mark is not recorded, because
+    /// rolling back must not give away a lock the outer transaction still needs.
+    locks: Vec<Vec<u8>>,
 }
 
 impl Savepoints {
@@ -75,10 +89,17 @@ impl Savepoints {
     }
 
     /// `SAVEPOINT <name>`, with the session parameters it can be rolled back to.
-    pub(super) fn savepoint(&mut self, name: &str, parameters: Parameters) {
+    pub(super) fn savepoint(
+        &mut self,
+        name: &str,
+        reads: crate::backend::ReadSet,
+        parameters: Parameters,
+    ) {
         self.marks.push(Mark {
             name: name.to_owned(),
             undo_at: self.undo.len(),
+            locks_at: self.locks.len(),
+            reads,
             parameters,
         });
     }
@@ -95,6 +116,7 @@ impl Savepoints {
         if self.marks.is_empty() {
             // Nothing left to roll back to, so nothing left to remember.
             self.undo.clear();
+            self.locks.clear();
         }
         Ok(())
     }
@@ -118,11 +140,20 @@ impl Savepoints {
             let Some((key, before)) = self.undo.pop() else {
                 break;
             };
-            match before {
-                Some(value) => txn.put(&key, &value),
-                None => txn.delete(&key),
-            }
+            txn.restore(&key, before);
         }
+        // **And the locks the rolled-back statements took.** PostgreSQL gives back a
+        // subtransaction's row locks when it aborts; keeping them blocks every other session on
+        // those rows for the life of the outer transaction, and leaves this one in a wait-for graph
+        // it has already left — which is the `40P01` Rails sees on the statement *after* its
+        // `rescue` (`transaction_nested_test.rb:187`).
+        let locks_at = self.marks[at].locks_at;
+        while self.locks.len() > locks_at {
+            let Some(key) = self.locks.pop() else { break };
+            txn.unlock(&key);
+        }
+        // And the reads, which are the other half of what a commit is validated against.
+        txn.restore_read_set(self.marks[at].reads.clone());
         self.marks.truncate(at + 1);
         Ok(self.marks[at].parameters.clone())
     }
@@ -131,6 +162,7 @@ impl Savepoints {
     pub(super) fn clear(&mut self) {
         self.marks.clear();
         self.undo.clear();
+        self.locks.clear();
     }
 
     /// The most recent mark of that name, or `3B001`.
@@ -142,7 +174,7 @@ impl Savepoints {
     }
 
     /// Records one key's pre-image, before it is written over.
-    fn record(&mut self, key: &[u8], before: Option<Bytes>) -> Result<()> {
+    fn record(&mut self, key: &[u8], before: crate::backend::Buffered) -> Result<()> {
         if self.undo.len() == UNDO_LIMIT {
             return Err(SqlError::ConfigurationLimitExceeded(format!(
                 "a transaction that has written more than {UNDO_LIMIT} rows since a SAVEPOINT \
@@ -183,19 +215,15 @@ impl<'a> Recording<'a> {
         self.failed.map_or(Ok(()), Err)
     }
 
-    /// The pre-image of a key, as **this transaction** sees it — its own buffered writes merged in,
-    /// which is what makes restoring it correct rather than approximately correct.
-    fn before(&mut self, key: &[u8]) -> Option<Bytes> {
-        match self.inner.get(key) {
-            Ok(before) => before,
-            // A read that failed here is a read the statement is about to fail on anyway, and
-            // recording `None` would make a rollback *delete* a row that is there. Remember the
-            // error and record nothing; `finish` reports it.
-            Err(error) => {
-                self.failed.get_or_insert(error);
-                None
-            }
-        }
+    /// What the write buffer holds for a key right now, which is what a rollback has to put back.
+    ///
+    /// **Not the visible value.** `get` merges the buffer over the store and cannot tell "this
+    /// transaction had already written this key" from "this key's value comes from the store", and
+    /// a rollback that cannot tell those apart re-buffers a write the transaction has abandoned.
+    /// This asks the buffer itself, so an absent entry stays absent. It cannot fail, which also
+    /// retires the read error this used to have to carry.
+    fn before(&mut self, key: &[u8]) -> crate::backend::Buffered {
+        self.inner.buffered(key)
     }
 }
 
@@ -220,7 +248,31 @@ impl Txn for Recording<'_> {
     // *holding* a row never held it and the one waiting never waited. Found by the red test in
     // `tests/read_committed.rs`, which then failed on the wrong side (ADR 0057).
     fn lock(&mut self, key: &[u8]) -> Result<crate::backend::Lock> {
-        self.inner.lock(key)
+        // Recorded **before** the call, while the answer to "did we already hold this?" is still
+        // the honest one: afterwards `Lock::Taken` means "holds it now, or held it already" and
+        // cannot tell a fresh lock from one the outer transaction took.
+        let fresh = !self.inner.holds(key);
+        let taken = self.inner.lock(key)?;
+        if fresh && matches!(taken, crate::backend::Lock::Taken) {
+            self.savepoints.locks.push(key.to_vec());
+        }
+        Ok(taken)
+    }
+
+    fn holds(&self, key: &[u8]) -> bool {
+        self.inner.holds(key)
+    }
+
+    fn unlock(&mut self, key: &[u8]) {
+        self.inner.unlock(key);
+    }
+
+    fn read_set(&self) -> crate::backend::ReadSet {
+        self.inner.read_set()
+    }
+
+    fn restore_read_set(&mut self, set: crate::backend::ReadSet) {
+        self.inner.restore_read_set(set);
     }
 
     fn restart_statement(&mut self) -> Result<()> {
@@ -268,6 +320,16 @@ impl Txn for Recording<'_> {
             }
         }
         self.inner.delete(key);
+    }
+
+    fn buffered(&self, key: &[u8]) -> crate::backend::Buffered {
+        self.inner.buffered(key)
+    }
+
+    /// Straight through, and **deliberately not recorded**: this is the undo being applied, so
+    /// writing it into the undo log would be a rollback that has to be rolled back.
+    fn restore(&mut self, key: &[u8], prior: crate::backend::Buffered) {
+        self.inner.restore(key, prior);
     }
 
     fn start_ts(&self) -> u64 {

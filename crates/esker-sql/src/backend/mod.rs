@@ -274,6 +274,42 @@ pub trait Txn: fmt::Debug + Send {
     /// Buffers a delete, with the same rule.
     fn delete(&mut self, key: &[u8]);
 
+    /// What this transaction has buffered for `key`, in the buffer's three real states.
+    ///
+    /// **No default.** A backend that quietly answered "nothing" would make every savepoint
+    /// rollback on it silently wrong, and a trait default is exactly how this crate's store path
+    /// once opted out of half of ADR 0057 without a single test noticing.
+    fn buffered(&self, key: &[u8]) -> Buffered;
+
+    /// Puts `key`'s buffer entry back to what [`Txn::buffered`] gave earlier, **removing** it when
+    /// that was `None`. Also no default, for the same reason.
+    fn restore(&mut self, key: &[u8], prior: Buffered);
+
+    /// Whether this transaction already holds `key`'s row lock.
+    ///
+    /// [`Lock::Taken`] cannot answer this — it means "holds it now, **or held it already**" — and a
+    /// savepoint rollback has to know the difference, or it gives back a lock the transaction took
+    /// before the mark and still needs.
+    fn holds(&self, key: &[u8]) -> bool;
+
+    /// Gives back one row lock, for a statement the transaction has rolled back.
+    ///
+    /// PostgreSQL releases a subtransaction's row locks when it aborts, and so must this: a lock
+    /// held for a write that no longer exists blocks every other session on that row for the life
+    /// of the outer transaction, and leaves the holder in a wait-for graph it has already left.
+    fn unlock(&mut self, key: &[u8]);
+
+    /// What this transaction has recorded reading so far (ADR 0062).
+    fn read_set(&self) -> ReadSet;
+
+    /// Puts the recorded read set back to a copy taken at a savepoint.
+    ///
+    /// **A read the rollback discarded cannot have influenced what the transaction commits**, so
+    /// validating it would refuse a transaction for a dependency on a statement that no longer
+    /// exists — which is PostgreSQL's answer too: its own `transaction_nested_test.rb` commits the
+    /// outer transaction after a `SerializationFailure` inside a savepoint, and so must we.
+    fn restore_read_set(&mut self, set: ReadSet);
+
     /// The snapshot this transaction reads at.
     ///
     /// What `pg_export_snapshot()` hands out, and it must be **this** transaction's rather than a
@@ -315,6 +351,28 @@ pub trait Txn: fmt::Debug + Send {
 
     /// Abandons the transaction. Buffered writes are discarded and nothing is visible.
     fn rollback(self: Box<Self>) -> Result<()>;
+}
+
+/// What a write buffer holds for one key: `None` for nothing at all, `Some(None)` for a buffered
+/// delete, `Some(Some(value))` for a buffered value.
+///
+/// Three states rather than two, because **"this transaction has no opinion on the key" and "this
+/// transaction is deleting the key" are different**, and a savepoint that undoes an insert by
+/// writing a tombstone has confused them — the rolled-back row stays in the write set and its
+/// commit still conflicts with anyone else who touched it.
+pub type Buffered = Option<Option<Bytes>>;
+
+/// A copy of what a transaction has recorded reading, taken when a savepoint opens.
+///
+/// **A whole copy rather than a delta**, for the reason the savepoint's `Parameters` copy is
+/// (private to `exec::savepoint`, so named here rather than linked):
+/// a savepoint is rare, a read set is small, and a delta is a second thing to get right. The keys
+/// are a set, so there is no insertion order to truncate back to — putting the old copy back is
+/// the only exact undo available.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSet {
+    keys: std::collections::BTreeSet<Vec<u8>>,
+    ranges: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A buffered write.
@@ -829,6 +887,52 @@ impl Txn for MemoryTxn {
         self.remember(key);
         self.stamp(key);
         self.buffer.insert(key.to_vec(), Write::Delete);
+    }
+
+    fn buffered(&self, key: &[u8]) -> Buffered {
+        self.buffer.get(key).map(|write| match write {
+            Write::Put(value) => Some(value.clone()),
+            Write::Delete => None,
+        })
+    }
+
+    fn restore(&mut self, key: &[u8], prior: Buffered) {
+        match prior {
+            Some(Some(value)) => {
+                self.buffer.insert(key.to_vec(), Write::Put(value));
+            }
+            Some(None) => {
+                self.buffer.insert(key.to_vec(), Write::Delete);
+            }
+            None => {
+                // The stamp goes with the write: a later statement writing this key again must
+                // compute from what it reads then, not from the snapshot of a write that was
+                // undone (ADR 0057 §4, and the same rule `restart_statement` follows).
+                self.buffer.remove(key);
+                self.read_ts.remove(key);
+            }
+        }
+    }
+
+    fn holds(&self, key: &[u8]) -> bool {
+        self.held.iter().any(|held| held == key)
+    }
+
+    fn unlock(&mut self, key: &[u8]) {
+        self.held.retain(|held| held != key);
+        self.versions().row_locks.release(self.id, &[key.to_vec()]);
+    }
+
+    fn read_set(&self) -> ReadSet {
+        ReadSet {
+            keys: self.read_keys.borrow().clone(),
+            ranges: self.read_ranges.borrow().clone(),
+        }
+    }
+
+    fn restore_read_set(&mut self, set: ReadSet) {
+        *self.read_keys.borrow_mut() = set.keys;
+        *self.read_ranges.borrow_mut() = set.ranges;
     }
 
     fn is_read_only(&self) -> bool {
