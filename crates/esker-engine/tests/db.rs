@@ -1899,6 +1899,10 @@ fn a_writer_alongside_compact_range_never_makes_it_report_corruption() {
 #[test]
 fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
     const WRITES: u32 = 8_000;
+    // The wall clock half of the cap below. Declared here with the other item, before any
+    // statement: `clippy::items_after_statements` is denied in this workspace, so an item wedged
+    // in beside the code it belongs to fails `--all-targets` while reading perfectly well.
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
     let (_, fs) = memfs();
     let db = Arc::new(open(&fs, small_buffer(2 * 1024), &[cf::DEFAULT]).unwrap());
 
@@ -1943,7 +1947,6 @@ fn a_sustained_writer_and_repeated_compactions_lose_no_key() {
     // work, not on time: on a box where every round is slow, sixty of them is still unbounded from
     // a gate's point of view. Both, so a slow machine ends this test rather than extending it.
     let started = std::time::Instant::now();
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
     while round < 4
         || (!done.load(std::sync::atomic::Ordering::Acquire)
             && round < 60
