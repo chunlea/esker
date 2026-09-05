@@ -1354,8 +1354,10 @@ fn lower_storage_parameters(
             ));
         }
         // `toast.<anything>` is accepted and changes nothing here: this node has no TOAST, so the
-        // parameter has nowhere to land and a real server's answer is the tag either way.
-        return Ok(plan::AlterTableAction::SetColumnarReplicas { replicas: None });
+        // parameter has nowhere to land and a real server's answer is the tag either way. **Not
+        // `SetColumnarReplicas { replicas: None }`** — that one is `RESET`, and it would delete
+        // the table's columnar setting on the way past.
+        return Ok(plan::AlterTableAction::AcceptStorageParameter);
     }
 
     let [SqlOption::KeyValue { key, value }] = options else {

@@ -15,6 +15,15 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
+/// The listing surface, which is the only way to see what a statement did to the setting.
+///
+/// `ALTER TABLE … SET (columnar_replicas = N)` is acted on by the placement driver and nothing in
+/// a `TableDef` changes, so a test that only checks the command tag cannot tell "applied" from
+/// "silently cleared".
+fn listed(node: &mut parity::Node) -> Vec<Vec<String>> {
+    node.rows("SELECT * FROM esker_columnar_replicas()")
+}
+
 /// **A namespaced parameter is valid syntax, and answering `42601` broke contract C1.**
 ///
 /// `sqlparser` 0.62.0 stops at the dot inside `SetOptionsParens` — `Expected: =, found: .` — so
@@ -43,6 +52,31 @@ fn a_namespaced_parameter_is_read_and_answered_by_name() {
         node.answer("ALTER TABLE t SET (esker.columnar_replicas = 1)")
             .to_string(),
         "!22023 unrecognized parameter namespace \"esker\""
+    );
+}
+
+/// **A parameter with nowhere to land must not clear one that landed.**
+///
+/// `toast.*` is accepted and applied to nothing — this node has no TOAST. The first version of
+/// that spelled "nothing" as `SetColumnarReplicas { replicas: None }`, reusing the variant that
+/// was already there. That is not nothing: it is `RESET`, and it *deletes* the table's columnar
+/// setting. So `SET (toast.autovacuum_enabled = …)` silently took a table's columnar copies away
+/// and told the placement driver to act on it.
+///
+/// The command tag is identical either way, which is why this is asserted on the listing.
+#[test]
+fn a_toast_parameter_leaves_the_columnar_setting_alone() {
+    let mut node = parity::Node::new(&["CREATE TABLE t (id int8)"]);
+    node.run("ALTER TABLE t SET (columnar_replicas = 2)")
+        .unwrap();
+    assert_eq!(listed(&mut node), [["t".to_owned(), "2".to_owned()]]);
+
+    node.run("ALTER TABLE t SET (toast.autovacuum_enabled = false)")
+        .unwrap();
+    assert_eq!(
+        listed(&mut node),
+        [["t".to_owned(), "2".to_owned()]],
+        "a parameter this node has nowhere to put must not delete one it has"
     );
 }
 
