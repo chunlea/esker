@@ -436,7 +436,7 @@ rather than fails, sample it before running it again**, and read whether anythin
   through `cargo fmt --all --check | tail -3 && echo OK`, which reports `tail`'s status. The gate's
   first step was red and every lane was calling it green.
 
-## 11. `TxnKv::ReclaimRange`, written out so the commit is mechanical
+## 11. `TxnKv::ReclaimRange` — **applied**; this section is what it was staged as
 
 ADR 0069's one wire message, sketched against the tree at `1228cf11` so that whoever applies it
 after the ruling is transcribing rather than designing. `esker-proto` is the coordinator's to
@@ -555,3 +555,54 @@ The bytes above were **derived from the code and cross-checked**, not remembered
 existing `txn-get` row before the new one was written. `esker-base`'s own test asserts
 `encode(300) == [0xAC, 0x02]`. Mint by running `golden_request_bodies` once — it prints both sides on
 drift, so a derivation error arrives as a diff rather than as a silent pass.
+
+## 12. The reclaim, end to end
+
+`TxnKv::ReclaimRange` is applied at **0x020A**, region-addressed, and `DROP DATABASE`'s rows are
+reclaimed by range under the safepoint gate with a resumable cursor. The staging in §11 was
+transcription: the minted goldens matched the derivation there byte for byte.
+
+### The compiler found the reverse dependents, and there were four
+
+`Method::ALL`, `esker-client`'s `txn_payload_size`, `esker-store`'s `txn_request_range` and
+`txn_command::from_request` — plus the service classification, `name()`, and both enumerating
+tests. None of them is in a crate this change is *about*, which is the argument for building the
+workspace rather than the crate.
+
+Two decisions in that list are reversible and so are stated rather than buried:
+
+* **The span it is checked against is `[start, end)`**, like `Scan`. That is what the epoch guards,
+  and it is why a range spanning regions is refused region by region rather than served wholesale.
+* **It writes and is still not a `Command`.** Clearing storage under a range nothing can route to
+  is housekeeping each replica does to its own copy — ADR 0034's shape. Through the log it would
+  make one replica's compaction schedule the whole group's business and need a replicated format
+  change to say nothing more.
+
+### The end-to-end test, and the two things it found
+
+`tests/reclaim_range.rs`: a store in a **separate process** on a real socket, split into three
+regions so the range spans more than one chunk, `SIGKILL`ed between two of them, and finished by a
+fresh process that has never seen the request. It asserts the kill is *genuinely* mid-reclaim —
+three regions, one chunk per pass, so the first pass must leave work behind — because a crash that
+lands after the work is done proves nothing.
+
+**The safepoint gate is re-applied across the crash, and that is a safety property.** The safepoint
+is PD's to publish and lives in memory, so a restarted store has not learned one and refuses to
+carry on clearing on the strength of a record written before the crash. Worth stating because the
+opposite reading is available and wrong: this is not the reclaim forgetting its progress. It resumes
+from the persisted cursor — the test pins both halves, that the first answer after the restart is
+blocked *and* that its cursor is where the dead process left it.
+
+**And a leadership wait that cost twenty seconds of nothing.** The child waited on `Store::peer`,
+which answers for one region of the three it hosts; on the restart it answered none, and the loop
+spent its whole budget before serving anyway. Asked of `region_statuses` instead: **21.15 s ->
+1.35 s.** The same shape as §5 and §9 — a wait on the wrong observable, paid for in a budget nobody
+was reading.
+
+### The gate, five steps for the first time
+
+`fmt=0 clippy=0 doc=0 deny=0 tests=3378/3378 doctests=0`, each status read from its own command.
+The wave's earlier gates ran three of those five: `cargo deny` and the doctests were missing,
+because a container gate had been built beside `just check` rather than from it (h1's finding), and
+`run.sh` exited 0 regardless until it was fixed. Both are why the fmt line in §10 was green for days
+while it was red.
