@@ -1,0 +1,33 @@
+crates/esker-sql/src/error.rs
+  s_2d916f5f540186::t_f62d783acc2e18 918-925,2430
+crates/esker-sql/src/parse/lower.rs
+  s_2d916f5f540186::t_e187dd3f06231f 94-99
+crates/esker-sql/src/parse/mod.rs
+  s_2d916f5f540186::t_9fda14f0c20f05 527,529-537,540-571,579-616,771-776,787-794,1112-1115,1858-1865
+crates/esker-sql/src/sqlstate.rs
+  s_2d916f5f540186::t_03b43de0759cfa 250-254,340
+crates/esker-sql/tests/do_block.rs
+  s_2d916f5f540186::t_1b848cb53b947b 131-132,195-196,203-270
+docs/acceptance/v1.md
+  s_2d916f5f540186::t_e192e87fc1d629 126
+docs/adr/0058-a-do-block-is-two-templates-not-a-language.md
+  s_2d916f5f540186::t_415a28bbeb9097 60-64,68-75,79-93
+docs/plans/do-blocks.md
+  s_2d916f5f540186::t_27660c2e32f3bc 58-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b5aab19b7805c0533d0ed7c2356808c151df9113",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
