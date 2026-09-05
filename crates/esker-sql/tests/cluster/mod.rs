@@ -57,6 +57,8 @@ pub const TENANT: u64 = 1;
 pub struct Cluster {
     pub backend: Arc<dyn Backend>,
     pub catalog: Arc<Catalog>,
+    /// The node's reserved sequence blocks, shared by every session it serves (ADR 0072).
+    pub sequences: Arc<esker_sql::sequence::Blocks>,
     /// The client the default backend is built over, so a test can build a second backend of its
     /// own — one holding a schema lease, say — against the same three stores.
     pub client: Arc<TxnClient>,
@@ -168,6 +170,7 @@ impl Cluster {
         Cluster {
             backend: Arc::new(StoreBackend::new(Arc::clone(&client), Arc::clone(&oracle))),
             catalog: Arc::new(Catalog::new()),
+            sequences: Arc::new(esker_sql::sequence::Blocks::default()),
             client,
             oracle,
             addresses,
@@ -177,11 +180,14 @@ impl Cluster {
         }
     }
 
-    /// A session on this node. Sessions share the store and the catalog cache, as they do in the
-    /// real binary.
+    /// A session on this node. Sessions share the store, the catalog cache **and the sequence
+    /// allocator**, as they do in the real binary — a block belongs to the node and not to the
+    /// connection (ADR 0072), and a harness that gave each session its own would not be able to
+    /// see the thing that cost `range_test.rb` a test.
     pub fn session(&self) -> Session {
         Session {
-            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT),
+            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT)
+                .sharing_sequence_blocks(Arc::clone(&self.sequences)),
         }
     }
 

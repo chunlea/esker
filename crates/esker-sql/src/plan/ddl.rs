@@ -521,6 +521,10 @@ pub struct IndexKeyPart {
     pub part: KeyPartName,
     /// `DESC` and `NULLS FIRST/LAST`, already resolved against the direction's own default.
     pub order: KeyOrder,
+    /// The **operator class** written after the column, folded to lower case, or `None` for the
+    /// type's default. Carried and checked against the access method when the table is known
+    /// (ADR 0070).
+    pub opclass: Option<String>,
 }
 
 impl IndexKeyPart {
@@ -530,6 +534,8 @@ impl IndexKeyPart {
         IndexKeyPart {
             part: KeyPartName::Column(name.into()),
             order: KeyOrder::ASCENDING,
+            // Only a `CREATE INDEX` can write one; a primary key and a `UNIQUE` take the default.
+            opclass: None,
         }
     }
 }
@@ -876,6 +882,7 @@ mod tests {
                 shape,
             },
             order: KeyOrder::ASCENDING,
+            opclass: None,
         };
         let call = |expr: &str| expression(expr, ExprShape::Call);
         let other = |expr: &str| expression(expr, ExprShape::Operator);
