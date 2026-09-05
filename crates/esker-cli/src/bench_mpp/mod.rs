@@ -204,6 +204,7 @@ fn describe(options: &BenchMppOptions, layout: &Layout) {
     println!("| seed | {} |", options.seed);
     println!("| placement driver | {} |", layout.pd_address());
     println!("| SQL node | {} |", layout.sql_address());
+    println!("| machine | {} |", probe::machine());
     println!("| load average at start | {} |", loadavg());
     println!();
 }

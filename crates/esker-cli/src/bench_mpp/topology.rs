@@ -14,6 +14,7 @@
 //! could not be reaped. A benchmark that leaves a store holding a port is a benchmark whose next
 //! run measures the previous one.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
@@ -269,7 +270,7 @@ impl Cluster {
                 continue;
             }
             let tail = lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n    ");
-            said.push_str(&format!("\n  {what} said:\n    {tail}"));
+            let _ = write!(said, "\n  {what} said:\n    {tail}");
         }
         said
     }

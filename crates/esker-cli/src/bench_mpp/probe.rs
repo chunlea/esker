@@ -125,6 +125,53 @@ pub(crate) fn is_available() -> bool {
     std::path::Path::new("/proc/self/io").exists()
 }
 
+/// The memory and the CPUs this run had, for the record's header.
+///
+/// **Both memory figures, because they disagree and the disagreement is the point.**
+/// `/proc/meminfo` in a container shows the *host's* (or the VM's) memory, while
+/// `/sys/fs/cgroup/memory.max` is what this container may actually use — and a benchmark sized
+/// against the wrong one either fits in a cache it does not have or swaps in a cache it does. A
+/// limit of `max` means uncapped and says so rather than printing a number nobody set.
+pub(crate) fn machine() -> String {
+    let total = meminfo_kib("MemTotal").map_or_else(
+        |why| format!("MemTotal unreadable ({why})"),
+        |kib| format!("MemTotal {}", gibibytes(kib * 1024)),
+    );
+    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max").map_or_else(
+        |_| "no cgroup limit published".to_owned(),
+        |text| match text.trim() {
+            "max" => "cgroup limit max (uncapped)".to_owned(),
+            number => number.parse::<u64>().map_or_else(
+                |_| format!("cgroup limit {number}"),
+                |bytes| format!("cgroup limit {}", gibibytes(bytes)),
+            ),
+        },
+    );
+    let cpus = std::thread::available_parallelism()
+        .map_or_else(|_| "unknown".to_owned(), |count| count.to_string());
+    format!("{total}, {limit}, {cpus} CPUs")
+}
+
+/// The first number on `/proc/meminfo`'s `name` line, in kibibytes.
+fn meminfo_kib(name: &str) -> Result<u64, String> {
+    let text = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("reading /proc/meminfo: {error}"))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .and_then(|rest| rest.split_whitespace().next())
+        .ok_or_else(|| format!("no {name} line"))?
+        .parse::<u64>()
+        .map_err(|error| format!("{name} is not a number: {error}"))
+}
+
+/// A byte count as gibibytes, to one decimal.
+fn gibibytes(bytes: u64) -> String {
+    // A machine with more than 2^53 bytes of memory is not one this runs on.
+    #[allow(clippy::cast_precision_loss)]
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{gib:.1} GiB")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Sample, is_available};
