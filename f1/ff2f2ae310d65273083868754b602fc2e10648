@@ -1,0 +1,18 @@
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 317-325,327,354-358,360-364
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 3085,3089,3352-3368
+crates/esker-sql/tests/check_constraint_pretty.rs
+  h_44076b318daf9c 1-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f1ff2f2ae310d65273083868754b602fc2e10648",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
