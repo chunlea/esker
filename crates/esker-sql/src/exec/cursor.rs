@@ -965,7 +965,9 @@ fn fold(
     let mut rows = Vec::with_capacity(groups.len());
     for (key, accumulators) in groups {
         let mut row = key.0;
-        row.extend(accumulators.iter().map(Accumulator::finish));
+        for accumulator in &accumulators {
+            row.push(accumulator.finish()?);
+        }
         // `HAVING` filters groups, including the one implicit group of an ungrouped aggregate:
         // `SELECT count(*) FROM t HAVING count(*) > 99` returns **no rows** where the same query
         // without the clause returns one row of zero. Measured, and not a shape anybody guesses.

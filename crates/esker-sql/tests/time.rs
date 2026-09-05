@@ -19,12 +19,14 @@ mod parity;
 const CORPUS_FIXTURE: &[&str] = &[];
 
 /// One of `DIVERGENCES`' reasons: the result type does not exist here.
-const INTERVAL: &str = "**`interval` is not a type this node has.** Every arithmetic a `time` \
-     takes part in answers one — `time - time`, `time * 2`, `time + interval`, `sum` and `avg` — \
-     so each is `0A000` naming the construct rather than a number of the wrong type. The type is \
-     ADR 0033's own unit and is not reachable from this one: an `interval` is months, days and \
-     microseconds in three fields, not a count of anything, and nothing below `esker-sql` has a \
-     place to put it.";
+const INTERVAL: &str = "**The two casts between `time` and `interval` are what is left.** This \
+     entry used to say that `interval` was not a type this node had, and covered every arithmetic \
+     a `time` takes part in — `time - time`, `time * 2`, `time + interval`, `sum` and `avg`. The \
+     type arrived, and those came off this list one at a time; `sum(time)` and `avg(time)` were \
+     the last, when they began answering the `interval` a real server answers. \
+     `'12:34:56'::time::interval` and `'1 day 02:00:00'::interval::time` are the two rows that \
+     still disagree, and what they want is a conversion between the two types rather than the \
+     types themselves.";
 
 /// The other absent type.
 const TIMETZ: &str = "**`timetz` is a different type** — OID 1266, twelve bytes, a `time` plus a \
@@ -58,8 +60,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
          ('time','timetz') ORDER BY oid",
         "SELECT pg_typeof('12:34:56'::time)",
-        "SELECT sum(t) FROM tq",
-        "SELECT avg(t) FROM tq",
         "SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)",
         "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
         "SELECT '1 day 02:00:00'::interval::time",
@@ -88,8 +88,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             FUNCTIONS,
             "pg19_time.txt:50",
         ),
-        ("SELECT sum(t) FROM tq", INTERVAL, "pg19_time.txt:66"),
-        ("SELECT avg(t) FROM tq", INTERVAL, "pg19_time.txt:67"),
         (
             "SELECT '12:34:56'::time(-1)",
             "Both refuse with `42601`; the text differs. PostgreSQL's parser stops at the `-` and \

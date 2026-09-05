@@ -660,19 +660,24 @@ fn consider(
         .map(|column| u32::try_from(*column).unwrap_or(u32::MAX))
         .collect();
 
+    let slot_types = slot_types_of(table, &columns)?;
+
     // The aggregates, in the order the output row carries them, and the plan for finishing each.
     let mut asks: Vec<ColAggregate> = Vec::new();
     let mut outputs: Vec<Output> = (0..keys.len()).map(Output::Key).collect();
     for spec in aggregates {
-        outputs.push(Output::Aggregate(push_down(spec, &mut asks, &slot)?));
+        outputs.push(Output::Aggregate(push_down(
+            spec,
+            &mut asks,
+            &slot,
+            &slot_types,
+        )?));
     }
 
     let group_by: Vec<u32> = keys
         .iter()
         .filter_map(|key| ordinal(key).map(&slot))
         .collect();
-
-    let slot_types = slot_types_of(table, &columns)?;
 
     if let (Some(semi), Some(column)) = (semi.as_mut(), outer_column) {
         semi.outer_slot = slot(column);
@@ -728,9 +733,26 @@ fn push_down(
     spec: &AggregateSpec,
     asks: &mut Vec<ColAggregate>,
     slot: &impl Fn(usize) -> u32,
+    types: &[esker_columnar::ColumnType],
 ) -> Routed<Finish> {
     let at = asks.len();
     let arg = spec.arg.as_ref().and_then(ordinal).map(slot);
+    // **A sum a fragment cannot add is a fall back to rows, decided here.** `esker-columnar` adds
+    // an `int8` and a `float8` and refuses every other column type, and that refusal reaches this
+    // node as an error from the region rather than as a routing decision — so `sum(interval)` over
+    // a columnar table would fail where the row engine answers it. `avg` is asked for as a `Sum`
+    // and a `Count`, so it is the same question.
+    if matches!(spec.func, AggregateFunc::Sum | AggregateFunc::Avg)
+        && let Some(column) = arg
+        && !matches!(
+            types.get(column as usize),
+            Some(esker_columnar::ColumnType::Int8 | esker_columnar::ColumnType::Double)
+        )
+    {
+        return Err(Decision::rows(Reason::NotExpressible(
+            "a sum over a column a fragment cannot add",
+        )));
+    }
     Ok(match (spec.func, arg) {
         (AggregateFunc::Count, None) => {
             asks.push(ColAggregate::CountStar);

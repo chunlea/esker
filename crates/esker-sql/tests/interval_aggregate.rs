@@ -6,11 +6,15 @@
 //! and `avg` fell through to a refusal.
 //!
 //! **The division is the interesting half.** An average is its sum divided by its count, this node
-//! already had `interval / n`, and that operator was wrong wherever the division was not exact:
-//! `'1 mon' / 3` answered `9 days 23:59:59.999999` where PostgreSQL answers `10 days`, because
-//! `(1/3) * 30` is `9.999999999999998` in a double and each field was truncated. The corpus rows
-//! that pin the real rule, and the measurement they came from, are in
-//! `tests/captures/pg19_interval_aggregate.txt`.
+//! already had `interval / n`, and that operator was wrong in **fifteen** of the twenty-six cases
+//! this corpus pins — `'1 mon' / 9` answered `3 days 07:59:59.999999` where a real server answers
+//! `3 days 07:59:59.9712`, and `'1 mon -2 days' / 7` answered `4 days` where a real server answers
+//! `4 days -00:00:00.024686`. Nothing tested it: the corpus divided only by exact factors.
+//!
+//! The row **not** to reason from is `'1 mon' / 3`, which the old truncating code got right
+//! because `(1.0/3.0) * 30.0` is exactly `10.0` in a double. It was written up as the example of
+//! the bug before being run. The corpus rows that pin the real rule, and the measurement they came
+//! from, are in `tests/captures/pg19_interval_aggregate.txt`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

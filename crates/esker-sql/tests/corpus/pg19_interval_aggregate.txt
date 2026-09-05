@@ -13,12 +13,13 @@
 #     pairs — twenty values by nine divisors — agree byte for byte, which is also why the
 #     accumulator must keep the exact sum and divide once: the mean of two means is not the mean,
 #     and here it is not even the same rounding.
-#   * **`1 mon / 3` is `10 days`, and only rounding makes it so.** `(1/3) * 30` is
-#     `9.999999999999998` in a double, so scaling each field and truncating answers
-#     `9 days 23:59:59.999999` — wrong in the last microsecond and unrecognisable in print.
 #   * **`1 mon / 9` is `3 days 07:59:59.9712`, not `3 days 08:00:00`.** The month's remainder is
 #     rounded to six decimals **as a number of days** (`0.333333`) before its whole days are split
-#     off; rounding the seconds instead gives the wrong answer here.
+#     off; rounding the seconds instead — the obvious placement — gives the wrong answer here.
+#   * **`1 mon / 3` is `10 days` and a truncating cascade gets it right**, which is the row to
+#     read if you are about to reason about floating point instead of running it: `(1.0/3.0) * 30`
+#     is *exactly* `10.0` in a double. It was written into a commit message as the example of the
+#     bug before it was run, and reverting the rounding is what proved it was not.
 #   * **`100 days / 7` keeps full precision** (`14 days 06:51:25.714286`): the flattening is
 #     confined to the month remainder and does not touch the day remainder.
 #   * **The time field is not normalised into days.** `'1 mon 1 day 23:59:59.999999' / 16` is
@@ -43,8 +44,8 @@ SELECT pg_typeof(min(v)), pg_typeof(max(v)) FROM ia	regtype,regtype	interval|int
 SELECT sum(t), avg(t) FROM ia	interval,interval	26:30:00|08:50:00
 SELECT pg_typeof(sum(t)), pg_typeof(avg(t)) FROM ia	regtype,regtype	interval|interval
 SELECT pg_typeof(min(t)), pg_typeof(max(t)) FROM ia	regtype,regtype	time without time zone|time without time zone
-SELECT sum(ts) FROM ia	!42883 function sum(timestamp without time zone) does not exist
-SELECT avg(ts) FROM ia	!42883 function avg(timestamp without time zone) does not exist
+SELECT sum(ts) FROM ia	!42883 function sum(timestamp without time zone) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT avg(ts) FROM ia	!42883 function avg(timestamp without time zone) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
 SELECT sum(DISTINCT v), avg(DISTINCT v) FROM ia	interval,interval	1 mon 4 days|11 days 08:00:00
 SELECT avg(v) FROM (VALUES ('1 mon'::interval), ('1 day')) t(v)	interval	15 days 12:00:00
 SELECT avg(v) FROM (VALUES ('1 day'::interval), ('2 days')) t(v)	interval	1 day 12:00:00

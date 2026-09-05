@@ -41,18 +41,56 @@
 #     1 mon / 9   ->  3 days 07:59:59.9712         NOT 3 days 08:00:00
 #     100 days / 7 -> 14 days 06:51:25.714286      full precision, no 1e-6 flattening
 #
-# `1 mon / 3` is the sharp one. In double, `(1/3) * 30` is `9.999999999999998`, so a truncating
-# implementation answers `9 days 23:59:59.999999` — a value that is wrong in the last microsecond
-# and prints as a completely different interval. PostgreSQL answers `10 days`.
+# `1 mon / 9` is the sharp one, and it is sharp in a way that took a red proof to establish.
+# PostgreSQL's `3 days 07:59:59.9712` is 28800 microseconds short of `3 days 08:00:00`, and that
+# shortfall is exactly what you get if the *day* remainder is rounded to six decimals — `0.333333`
+# — and only then multiplied by 86400. Rounding the seconds instead, which is the obvious
+# placement, gives `08:00:00` and is wrong.
 #
-# `1 mon / 9` is the one that says the rounding is **not** applied where you would put it. The same
-# reasoning that fixes `/3` by rounding the seconds gives `3 days 08:00:00` here; the measured
-# answer is 28800 microseconds short of that, which is exactly what you get if the *day* remainder
-# is rounded to six decimals — `0.333333` — and only then multiplied by 86400.
+# `100 days / 7` says the flattening is confined to the month remainder: the day remainder keeps
+# its full double precision and prints `.714286`, where a blanket six-decimal round would have
+# given `.6896`.
 #
-# And `100 days / 7` says that flattening is confined to the month remainder: the day remainder
-# keeps its full double precision and prints `.714286`, where a blanket six-decimal round would
-# have given `.6896`.
+# ## `'1 mon' / 3` is the example that does NOT show the bug, and I picked it first
+#
+# The natural way to demonstrate a truncating cascade failing is `'1 mon' / 3`: a third of thirty
+# days is 10 exactly in arithmetic and 9.999… in floating point, so truncation should give
+# `9 days 23:59:59.999999`. **It does not.** `(1.0/3.0) * 30.0` is *exactly* `10.0` in IEEE double
+# — the true product `9.9999999999999994448…` is within half a ULP of 10, and the multiplication
+# rounds up to it — so the old truncating code answered `10 days` and was right.
+#
+# This was written down as fact in a commit message before it was run. What caught it was
+# reverting the rounding and watching which corpus rows reddened: `/3` was not among them. The
+# rule that follows is worth more than the row — **a claim about floating point is a measurement,
+# not a derivation**, and this file is the second time in this lane that reconstructing a double's
+# behaviour from reasoning produced a confident wrong answer.
+#
+# ## What the old cascade actually got wrong: 15 of these 26
+#
+# Each computed step for step through the pre-fix code — `months * (1/n)`, the fraction times 30
+# into days, the fraction times 86400e6 into microseconds, every field truncated:
+#
+#     value                          / n    PostgreSQL                    this node, before
+#     1 mon                          / 3    10 days                       10 days          <- right
+#     1 mon                          / 2    15 days                       15 days          <- right
+#     1 mon                          / 7    4 days 06:51:25.6896          4 days 06:51:25.714285
+#     1 mon                          / 9    3 days 07:59:59.9712          3 days 07:59:59.999999
+#     7 mons                         / 9    23 days 07:59:59.9712         23 days 07:59:59.999999
+#     1 year                         / 7    1 mon 21 days 10:17:08.5344   1 mon 21 days 10:17:08.571428
+#     1 mon 1 day                    / 7    4 days 10:17:08.546743        4 days 10:17:08.571428
+#     1 mon -2 days                  / 7    4 days -00:00:00.024686       4 days
+#     100 days                       / 7    14 days 06:51:25.714286       14 days 06:51:25.714285
+#     1 day -12:00:00                / 7    01:42:51.428572               01:42:51.428571
+#     3 mons 29 days                 / 7    17 days 00:00:00.012343       17 days
+#     1 mon 1 day 23:59:59.999999    / 16   1 day 24:00:00                1 day 23:59:59.999999
+#     -1 mons -1 days -01:00:00      / 7    -4 days -10:25:42.832457      -4 days -10:25:42.857142
+#     0.000003 sec                   / 2    00:00:00.000002               00:00:00.000001
+#     0.000003 sec                   / 4    00:00:00.000001               00:00:00
+#     0.000007 sec                   / 4    00:00:00.000002               00:00:00.000001
+#
+# Three separate defects in one function, which is why fixing one of them would not have been
+# enough: the missing `TSROUND` on the month remainder (rows 3-13), the missing carry when the two
+# remainders reach a day (row 12), and a truncation where PostgreSQL rounds to even (rows 14-16).
 #
 # The rule the whole table fits, with every step measured:
 #

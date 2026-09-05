@@ -168,6 +168,12 @@ impl Aggregation {
                 ColumnType::Int2 | ColumnType::Int4 => Ok(ColumnType::Int8),
                 ColumnType::Int8 | ColumnType::Numeric => Ok(ColumnType::Numeric),
                 ColumnType::Double => Ok(arg),
+                // **A `time` sums to an `interval`, and so does an `interval`.** Measured, and it
+                // is the pair that says the aggregate set is not per type but per (aggregate,
+                // type): `min(time)` is a `time` where `sum(time)` is an `interval`, because
+                // twenty-six and a half hours is not a time of day — `sum(time)` over
+                // `01:00`, `02:00` and `23:30` is `26:30:00`.
+                ColumnType::Interval | ColumnType::Time => Ok(ColumnType::Interval),
                 _ => undefined(),
             },
             // Every type has an ordering here, and `bool` is the one PostgreSQL has no aggregate
@@ -239,6 +245,11 @@ impl Aggregation {
                 ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric => {
                     Ok(ColumnType::Numeric)
                 }
+                // **An interval averages to an interval**, and it is the one average that is not
+                // a division in a number type at all: the sum is kept exactly and divided once,
+                // through `interval / n`, whose cascade rounds twice on the way down. `avg(time)`
+                // comes here too and is an `interval` for the same reason `sum(time)` is.
+                ColumnType::Interval | ColumnType::Time => Ok(ColumnType::Interval),
                 _ => undefined(),
             },
         }
@@ -902,6 +913,15 @@ enum State {
     /// `sum(money)`, which stays a money and therefore **can** overflow — cents in an `i64` with
     /// nothing wider to widen to.
     SumMoney(Option<i64>),
+    /// `sum(interval)` and `sum(time)`, and the running half of the two averages over them.
+    ///
+    /// The three fields are added **independently and exactly** — nothing normalises between them
+    /// and nothing is divided until [`Accumulator::finish`] — because `avg` is its sum divided
+    /// once, not a running mean, and each division rounds.
+    Interval {
+        total: Option<crate::value::interval::Interval>,
+        seen: i64,
+    },
     /// `sum(int8)` and `sum(numeric)`, both of which answer a `numeric`.
     SumNumeric(Option<esker_keys::numeric::Numeric>),
     /// `avg` over any exact type: the running sum as a decimal, and the count to divide it by.
@@ -1024,6 +1044,41 @@ fn add_numeric(
     }
 }
 
+/// One interval added into a running total, or `22008`.
+///
+/// Nothing normalises between the three fields, so this is three independent additions and the sum
+/// of `'1 mon'` and `'30 days'` is `1 mon 30 days` — two values a real server calls *equal* and
+/// prints differently.
+fn fold_interval(
+    total: &mut Option<crate::value::interval::Interval>,
+    seen: &mut i64,
+    months: i32,
+    days: i32,
+    micros: i64,
+) -> Result<()> {
+    let running = total.unwrap_or(crate::value::interval::Interval {
+        months: 0,
+        days: 0,
+        micros: 0,
+    });
+    *total = Some(crate::value::interval::Interval {
+        months: running
+            .months
+            .checked_add(months)
+            .ok_or(SqlError::IntervalOutOfRange)?,
+        days: running
+            .days
+            .checked_add(days)
+            .ok_or(SqlError::IntervalOutOfRange)?,
+        micros: running
+            .micros
+            .checked_add(micros)
+            .ok_or(SqlError::IntervalOutOfRange)?,
+    });
+    *seen += 1;
+    Ok(())
+}
+
 impl Accumulator {
     /// A fresh accumulator for one group.
     pub(super) fn new(spec: &AggregateSpec) -> Self {
@@ -1034,6 +1089,15 @@ impl Accumulator {
             (AggregateFunc::Sum, Some(ColumnType::Int8 | ColumnType::Numeric)) => {
                 State::SumNumeric(None)
             }
+            // One state for both, because a sum and an average over an interval differ only in
+            // whether the count is used at the end.
+            (
+                AggregateFunc::Sum | AggregateFunc::Avg,
+                Some(ColumnType::Interval | ColumnType::Time),
+            ) => State::Interval {
+                total: None,
+                seen: 0,
+            },
             (
                 AggregateFunc::Avg,
                 Some(ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric),
@@ -1102,6 +1166,24 @@ impl Accumulator {
             (State::SumNumeric(total), Datum::Numeric(value)) => {
                 *total = Some(add_numeric(total.as_ref(), value));
             }
+            // **Three fields added independently, and checked**: a real server's
+            // `sum('2147483647 days', '1 day')` is `22008 interval out of range` rather than a
+            // wrapped day count, and a saturating add here would answer a value that looks like
+            // data.
+            (
+                State::Interval { total, seen },
+                Datum::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+            ) => fold_interval(total, seen, *months, *days, *micros)?,
+            // **A `time` folds in as the duration it is being treated as**, which is how
+            // `sum(time)` over `01:00`, `02:00` and `23:30` is `26:30:00` — an interval past a
+            // day, and not a time of day at all.
+            (State::Interval { total, seen }, Datum::Time(micros)) => {
+                fold_interval(total, seen, 0, 0, *micros)?;
+            }
             (State::AvgNumeric { sum, seen }, value) => {
                 let addend = match value {
                     Datum::Int2(value) => crate::value::numeric::of_i64(i64::from(*value)),
@@ -1165,10 +1247,32 @@ impl Accumulator {
     /// The empty case is the one worth reading: `count` is **zero** and everything else is
     /// **NULL**, which is PostgreSQL's rule and the reason a sum over no rows must not be `0` — a
     /// zero there is a wrong answer that looks like data.
-    pub(super) fn finish(&self) -> Datum {
-        match &self.state {
+    ///
+    /// It returns a `Result` for one member: `avg(interval)` divides here, and a division that
+    /// pushes a field out of range is `22008` rather than a wrapped number.
+    pub(super) fn finish(&self) -> Result<Datum> {
+        Ok(match &self.state {
             State::Count(count) => Datum::Int8(*count),
             State::SumWide(total) => total.map_or(Datum::Null, Datum::Int8),
+            State::Interval {
+                total: Some(total), ..
+            } if self.func == AggregateFunc::Sum => Datum::Interval {
+                months: total.months,
+                days: total.days,
+                micros: total.micros,
+            },
+            // **The exact sum, divided once.** Not a running mean: PostgreSQL's average over
+            // intervals is `interval_div(sum, count)` and its cascade rounds twice, so a fold
+            // would round once per row.
+            State::Interval {
+                total: Some(total),
+                seen,
+            } => crate::value::temporal::divide_interval(
+                total.months,
+                total.days,
+                total.micros,
+                *seen,
+            )?,
             State::SumMoney(total) => total.map_or(Datum::Null, Datum::Money),
             State::SumNumeric(total) => total.clone().map_or(Datum::Null, Datum::Numeric),
             // A sum over no rows is NULL, and so is an average over none — the same rule, and
@@ -1183,7 +1287,10 @@ impl Accumulator {
             // as a sum over nothing, and the reason neither divisor is ever zero.
             State::AvgFloat { seen: 0, .. }
             | State::AvgNumeric { seen: 0, .. }
-            | State::AvgNumeric { sum: None, .. } => Datum::Null,
+            | State::AvgNumeric { sum: None, .. }
+            // The interval pair is here for the same rule, and it is why the divisor in the
+            // arm above is never zero: an accumulator that saw nothing has no sum to divide.
+            | State::Interval { total: None, .. } => Datum::Null,
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "the count is the divisor PostgreSQL's own float8 average divides by"
@@ -1220,6 +1327,6 @@ impl Accumulator {
                     )),
                 }
             }
-        }
+        })
     }
 }

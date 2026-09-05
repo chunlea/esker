@@ -287,10 +287,22 @@ fn interval_result(op: ArithOp, left: &Datum, right: &Datum) -> Result<Datum> {
             },
         ) => {
             let sign = if op == ArithOp::Subtract { -1 } else { 1 };
+            // **Checked, not saturating**: `'2147483647 days' + '1 day'` is
+            // `22008 interval out of range` on a real server, and a day field pinned at its
+            // maximum would be a wrong answer that looks like data. Three fields, three
+            // independent ranges — nothing normalises between them, so nothing borrows.
+            let field = |left: i32, right: i32| {
+                right
+                    .checked_mul(sign)
+                    .and_then(|right| left.checked_add(right))
+                    .ok_or(SqlError::IntervalOutOfRange)
+            };
             Ok(interval(
-                lm.saturating_add(rm.saturating_mul(sign)),
-                ld.saturating_add(rd.saturating_mul(sign)),
-                lu.saturating_add(ru.saturating_mul(i64::from(sign))),
+                field(*lm, *rm)?,
+                field(*ld, *rd)?,
+                ru.checked_mul(i64::from(sign))
+                    .and_then(|right| lu.checked_add(right))
+                    .ok_or(SqlError::IntervalOutOfRange)?,
             ))
         }
         // `time - time` and `timestamp - timestamp`: a duration in microseconds alone, because
@@ -322,7 +334,7 @@ fn interval_result(op: ArithOp, left: &Datum, right: &Datum) -> Result<Datum> {
                 }
             };
             let factor = scale_factor(factor)?;
-            let factor = if op == ArithOp::Divide {
+            if op == ArithOp::Divide {
                 if !is_interval_left {
                     return Err(SqlError::Internal(
                         "a number divided by an interval reached the evaluator".to_owned(),
@@ -331,22 +343,30 @@ fn interval_result(op: ArithOp, left: &Datum, right: &Datum) -> Result<Datum> {
                 if factor == 0.0 {
                     return Err(SqlError::DivisionByZero);
                 }
-                1.0 / factor
-            } else {
-                factor
-            };
+                // **An interval has no infinity here**, and on this side that leaves only a NaN:
+                // dividing *by* an infinity is zero and zero is representable, so
+                // `'1 day' / 'Infinity'::float8` is `00:00:00` on a real server and here.
+                if factor.is_nan() {
+                    return Err(SqlError::unsupported(
+                        "an interval scaled by an infinite factor",
+                    ));
+                }
+                // **Divided, not multiplied by the reciprocal.** PostgreSQL's `interval_div`
+                // divides each field by the factor, and the two are not the same double:
+                // `1.0 / 3.0` is not exactly a third, so a reciprocal moves the last bits of
+                // every field before the cascade below rounds them.
+                return scale_interval(*months, *days, *micros, &|value| value / factor);
+            }
             // **An interval has no infinity here.** PostgreSQL 17 gave the type one, so
             // `'1 day' * 'Infinity'::float8` is `infinity` there; this node's interval is three
             // finite fields and scaling by an infinite factor would truncate to `00:00:00`, a
-            // wrong answer where a refusal is available (ADR 0031). The check is **after** the
-            // reciprocal, because dividing *by* an infinity is zero and zero is representable:
-            // `'1 day' / 'Infinity'::float8` is `00:00:00` on a real server too.
+            // wrong answer where a refusal is available (ADR 0031).
             if !factor.is_finite() {
                 return Err(SqlError::unsupported(
                     "an interval scaled by an infinite factor",
                 ));
             }
-            Ok(scale_interval(*months, *days, *micros, factor))
+            scale_interval(*months, *days, *micros, &|value| value * factor)
         }
     }
 }
@@ -370,23 +390,131 @@ fn scale_factor(value: &Datum) -> Result<f64> {
     }
 }
 
+/// Days in the month an interval's month field cascades into, and seconds in its day.
+///
+/// Neither is a fact about the calendar: nothing normalises between an interval's three fields, so
+/// these numbers exist only for the *fraction* left over by a scaling, and only downwards.
+const DAYS_PER_MONTH: f64 = 30.0;
+const SECONDS_PER_DAY: f64 = 86_400.0;
+
 /// Each field scaled, with a month's fraction cascading into days and a day's into microseconds —
-/// the same cascade `interval_in` does for `1.5 months`.
+/// and **rounded twice on the way down**, which is the whole of what makes this hard.
+///
+/// This is PostgreSQL's `interval_mul` and `interval_div`, which are the same function with one
+/// operator different; `scale` is that operator, already closed over its factor. `avg(interval)`
+/// is the divide case with the count as the factor, so all three answers come from here.
+///
+/// # Why the rounding is where it is
+///
+/// A scaling that only truncated would answer `9 days 23:59:59.999999` for `'1 mon' / 3`, because
+/// `(1/3) * 30` is `9.999999999999998` in a double. PostgreSQL answers `10 days`, and it gets
+/// there by rounding the month's remainder **to six decimal places of a day** before taking its
+/// whole days off. Two measured rows say that this is the placement and not merely *a* rounding:
+///
+/// * `'1 mon' / 9` is `3 days 07:59:59.9712`, not `3 days 08:00:00` — the remainder `0.333333` is
+///   short of a third by a millionth of a day, and that shortfall survives into the answer.
+/// * `'100 days' / 7` is `14 days 06:51:25.714286`, at full precision — so the same flattening
+///   must **not** be applied to the day remainder, which would have given `.6896`.
+///
+/// The derivation, with the row that pins each step, is
+/// `tests/captures/pg19_interval_aggregate.txt`.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    reason = "PostgreSQL scales an interval in double and truncates each field, which is what \
-              makes `'1 day' * 2.5` two days and twelve hours rather than a rounded number"
+    reason = "PostgreSQL scales an interval in double, and every truncation here is a field it \
+              truncates too — checked against the type's range first"
 )]
-fn scale_interval(months: i32, days: i32, micros: i64, factor: f64) -> Datum {
-    let months_f = f64::from(months) * factor;
-    let days_f = f64::from(days) * factor + months_f.fract() * 30.0;
-    let micros_f = micros as f64 * factor + days_f.fract() * DAY_MICROS as f64;
-    interval(
-        months_f.trunc() as i32,
-        days_f.trunc() as i32,
-        micros_f.trunc() as i64,
-    )
+fn scale_interval(
+    months: i32,
+    days: i32,
+    micros: i64,
+    scale: &dyn Fn(f64) -> f64,
+) -> Result<Datum> {
+    let scaled_months = fits_in_i32(scale(f64::from(months)))?;
+    let whole_months = scaled_months.trunc();
+    let remainder_days = round_to_millionths((scaled_months - whole_months) * DAYS_PER_MONTH);
+
+    let scaled_days = fits_in_i32(scale(f64::from(days)))?;
+    let mut whole_days = scaled_days.trunc();
+    let mut remainder_seconds = round_to_millionths(
+        (scaled_days - whole_days + remainder_days - remainder_days.trunc()) * SECONDS_PER_DAY,
+    );
+    // **The two remainders together can reach a whole day**, and that day is carried into the day
+    // field: `'11 mons 29 days' / 16` is `22 days 10:30:00`, where the fractions are 0.625 of a
+    // month's days and 0.8125 of a day. The carry is on the *remainder* being cascaded and never
+    // on the result — `'1 mon 1 day 23:59:59.999999' / 16` is `1 day 24:00:00`, twenty-four hours
+    // in the time field beside a day field of one, because nothing normalises a finished interval.
+    if remainder_seconds.abs() >= SECONDS_PER_DAY {
+        let carried = (remainder_seconds / SECONDS_PER_DAY).trunc();
+        whole_days += carried;
+        remainder_seconds -= carried * SECONDS_PER_DAY;
+    }
+    whole_days += remainder_days.trunc();
+    // Ties to even, measured on both halves of the tie: `3 us / 2` is `2 us` (so not truncation)
+    // and `5 us / 2` is `2 us` (so not half-away-from-zero).
+    let scaled_micros = (scale(micros as f64) + remainder_seconds * 1e6).round_ties_even();
+    Ok(interval(
+        // Already in range: a truncation cannot leave one.
+        whole_months as i32,
+        // The day field is the one that can be pushed out of range by the cascade rather than by
+        // the scaling — a month's remainder adds up to thirty days after the check above.
+        // PostgreSQL adds it to a C `int` and lets it wrap; a wrapped day count is a wrong answer
+        // that looks like data, so it is `22008` here.
+        fits_in_i32(whole_days)? as i32,
+        fits_in_i64(scaled_micros)? as i64,
+    ))
+}
+
+/// One interval divided by a count: the arithmetic **`avg(interval)` is**.
+///
+/// An average over intervals is not a fold. PostgreSQL keeps the exact sum and divides it once, at
+/// the end, through the same `interval_div` that `interval / n` uses — twenty values by nine
+/// divisors were put to a real server both ways and all 180 pairs agree byte for byte
+/// (`tests/captures/pg19_interval_aggregate.txt`). Folding would be wrong twice over: the mean of
+/// two means is not the mean, and each fold would round again.
+///
+/// The divisor is a row count, so it is never zero — an average over no rows is NULL and never
+/// reaches here.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the divisor is the count PostgreSQL's own interval average divides by, in a double"
+)]
+pub fn divide_interval(months: i32, days: i32, micros: i64, divisor: i64) -> Result<Datum> {
+    let divisor = divisor as f64;
+    scale_interval(months, days, micros, &|value| value / divisor)
+}
+
+/// `x` rounded to a millionth, ties to even — PostgreSQL's `TSROUND`, which is where an
+/// interval's cascade loses the last bits of a repeating fraction.
+fn round_to_millionths(value: f64) -> f64 {
+    (value * 1e6).round_ties_even() / 1e6
+}
+
+/// The scaled field, or `22008` — the check PostgreSQL makes before every one of these casts.
+///
+/// The upper bound is **exclusive at 2^31**, not inclusive at `i32::MAX`, because what follows is
+/// a truncation: `2147483647.5` days is in range and becomes `2147483647`, which is the answer a
+/// real server gives.
+fn fits_in_i32(value: f64) -> Result<f64> {
+    const LIMIT: f64 = 2_147_483_648.0;
+    if value.is_finite() && (-LIMIT..LIMIT).contains(&value) {
+        Ok(value)
+    } else {
+        Err(SqlError::IntervalOutOfRange)
+    }
+}
+
+/// The same for the microsecond field, whose range is an `i64`.
+///
+/// The bound is written as a power of two rather than as `i64::MAX as f64`, which rounds **up** to
+/// 2^63 and would admit a value the cast cannot hold.
+fn fits_in_i64(value: f64) -> Result<f64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_finite() && (-LIMIT..LIMIT).contains(&value) {
+        Ok(value)
+    } else {
+        Err(SqlError::IntervalOutOfRange)
+    }
 }
 
 /// The time-valued forms: a time shifted by an interval, **wrapping** and ignoring its days.

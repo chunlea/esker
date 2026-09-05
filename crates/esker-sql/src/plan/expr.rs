@@ -1728,14 +1728,22 @@ pub struct SequenceCall {
 pub enum AggregateFunc {
     /// `count(*)` and `count(expr)`, which are different aggregates wearing one name.
     Count,
-    /// `sum`, over `int8` and `float8`.
+    /// `sum`, and the width it goes to is not uniform: `int2` and `int4` widen to `bigint`,
+    /// `int8` and `numeric` to `numeric` — which is why an `int8` sum cannot overflow — `money`
+    /// and `float8` stay themselves, and an `interval` sums to an `interval`. **So does a
+    /// `time`**, which is the pair that says the aggregate set is per (aggregate, type) and not
+    /// per type: `min(time)` is a `time` where `sum(time)` is an `interval`.
     Sum,
     /// `min`, in [`crate::value::PgDatum::pg_cmp`] order.
     Min,
     /// `max`, likewise.
     Max,
-    /// `avg`, over `float8` only — `avg(int8)` is `numeric` on a real server and this node has no
-    /// `numeric` to be right with (`docs/adr/0031-rails-compatibility-is-measured.md`).
+    /// `avg`: `numeric` over every exact number since ADR 0045 gave this node one, `float8` over a
+    /// `float8`, and an `interval` over an `interval` or a `time`.
+    ///
+    /// The interval one is not a division in a number type at all — the exact sum is kept and
+    /// divided **once**, through the same cascade `interval / n` uses, because a running mean
+    /// would round at every row.
     Avg,
     /// `array_agg(expr [ORDER BY …])`: every value of the group, in one array.
     ///
