@@ -41,6 +41,33 @@ filter = """
 """
 test-group = 'cluster'
 
+[[profile.default.overrides]]
+# **The real-process ones run alone against the whole workspace, not just against each other.**
+#
+# The group above serialises this set internally, and that is not enough: each of these starts a
+# placement driver, up to four stores and a SQL node as **operating-system processes**, so while one
+# runs it is competing with the other three thousand tests for the machine — and it is the *other*
+# tests that lose. Three consecutive gates, three different reds, each green alone:
+#
+# ```text
+# esker-cli::cross_region_scan                     FAIL in gate, 2/2 alone
+# esker-cli::multi_region_differential             FAIL in gate, 2/2 alone
+# esker-pd::failover a_membership_report…          FAIL in gate (0.142 s), 3/3 alone
+# ```
+#
+# The last one is the argument: it is an **in-process** test in a crate none of those binaries
+# touch, so the coupling is the machine and nothing narrower. A test that fails for that reason
+# teaches whoever reads the gate to distrust the gate, which costs more than the minutes this
+# saves.
+#
+# `threads-required` set to the run's thread count is nextest's way to say "this one occupies the
+# runner": it takes every slot, so nothing else is scheduled beside it. Not applied to the
+# in-process members of the group above — `joint_gate`, `promotion` and the rest hold Raft groups
+# in threads and cost ticks, not processes, and making them exclusive too would pay a large bill
+# for a smaller share of the problem.
+filter = 'package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential))'
+threads-required = 'num-test-threads'
+
 [test-groups.timed]
 # One at a time, and separate from `cluster` because the cost is different: these start no
 # processes and hold no Raft groups, they **measure**. A cancellation that must be observed within
