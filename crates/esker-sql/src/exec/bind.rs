@@ -247,7 +247,7 @@ fn walk(
                 walk_predicate(filter, &under_own_names(tables), tables, seen);
             }
         }
-        Statement::Explain(inner, _) => walk(inner, tables, seen),
+        Statement::Explain(explain) => walk(&explain.statement, tables, seen),
         // Neither DDL nor a session statement can carry a parameter: there is no expression in
         // either that a `$1` could stand in.
         Statement::CreateTable(_)
@@ -817,7 +817,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
                 walk_expr_mut(filter, visit);
             }
         }
-        Statement::Explain(inner, _) => walk_mut(inner, visit),
+        Statement::Explain(explain) => walk_mut(&mut explain.statement, visit),
         // Neither DDL nor a session statement can carry a parameter: there is no expression in
         // either that a `$1` could stand in.
         Statement::CreateTable(_)
@@ -1050,7 +1050,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
             }
             names
         }
-        Statement::Explain(inner, _) => table_names(inner),
+        Statement::Explain(explain) => table_names(&explain.statement),
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateExtension(_)
@@ -1141,7 +1141,7 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
                 .for_each(&mut each);
         }
         Statement::Delete(delete) => delete.filter.iter().for_each(&mut each),
-        Statement::Explain(inner, _) => for_each_expr(inner, visit),
+        Statement::Explain(explain) => for_each_expr(&explain.statement, visit),
         // Neither DDL nor a session statement can carry a parameter: there is no expression in
         // either that a `$1` could stand in.
         Statement::CreateTable(_)

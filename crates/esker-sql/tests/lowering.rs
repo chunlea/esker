@@ -129,7 +129,6 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
             "EXPLAIN ANALYZE",
         ),
         ("EXPLAIN ANALYZE DELETE FROM t", "EXPLAIN ANALYZE"),
-        ("EXPLAIN (FORMAT JSON) SELECT 1", "EXPLAIN"),
         // Phase 9 unit 1 runs GROUP BY, HAVING, DISTINCT and the five aggregates. What sits next
         // to each of them does not, and each still names the clause rather than the expression it
         // happens to be spelled as -- `GROUP BY ROLLUP` and not "the expression ROLLUP (a)",
@@ -432,10 +431,11 @@ fn an_index_predicate_is_stored_without_its_own_parentheses() {
 /// clause it cannot honour is refused before anything is planned.
 #[test]
 fn explain_wraps_a_lowered_statement() {
-    let Statement::Explain(inner, false) = lower("EXPLAIN CREATE TABLE t (a int8)").unwrap() else {
+    let Statement::Explain(explain) = lower("EXPLAIN CREATE TABLE t (a int8)").unwrap() else {
         panic!("not an EXPLAIN")
     };
-    assert!(matches!(*inner, Statement::CreateTable(_)));
+    assert!(!explain.analyze);
+    assert!(matches!(*explain.statement, Statement::CreateTable(_)));
     // **The refusal inside is still the answer**, which is what this half asserts: `EXPLAIN` does
     // not excuse a clause the lowering will not honour. `CREATE TEMPORARY TABLE` used to be the
     // case here and now lowers (ADR 0054), so the statement that carries the refusal is one that

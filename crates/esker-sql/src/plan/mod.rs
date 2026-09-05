@@ -21,6 +21,7 @@
 pub mod cte;
 mod ddl;
 mod dml;
+pub mod explain;
 mod expr;
 mod query;
 pub mod routing;
@@ -42,6 +43,7 @@ pub use ddl::{
     primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
+pub use explain::{Explain, ExplainFormat, PlanNode};
 pub use expr::{
     AdvisoryCall, AggregateCall, AggregateFunc, ArithOp, BinaryOp, CaseBranch, CatalogFunc,
     CatalogFuncCall, Expr, Literal, ScalarFunc, SequenceCall, SequenceFunc, UuidFunc,
@@ -158,13 +160,11 @@ pub enum Statement {
     Update(Update),
     /// `DELETE`.
     Delete(Delete),
-    /// `EXPLAIN`, and the statement it is about.
+    /// `EXPLAIN`, the statement it is about, and the option list it was given.
     ///
-    /// The flag is `ANALYZE`, which **runs** the statement — that is what the word means on a real
-    /// server, and it is why it stays refused for everything that writes. For a `SELECT` it is
-    /// what puts the `ScanStats` a columnar answer carries into the plan
-    /// (`docs/plans/phase-10-routing.md` U3).
-    Explain(Box<Statement>, bool),
+    /// Boxed because [`Explain`] carries a `Statement` of its own and this variant would otherwise
+    /// set the size of every other one.
+    Explain(Box<Explain>),
     /// `SET`, `SHOW`, `RESET` — the statements that change the session rather than the store.
     /// Run outside any transaction, because one of them replaces the transaction itself.
     Session(SessionStatement),

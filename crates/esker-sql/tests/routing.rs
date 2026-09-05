@@ -141,18 +141,6 @@ const EXPLAIN_DIVERGENCES: &[(&str, &str)] = &[
         "EXPLAIN ANALYZE DELETE FROM t",
         "The same rule, and the same reason.",
     ),
-    (
-        "EXPLAIN VERBOSE SELECT count(*) FROM t",
-        "`VERBOSE` adds output column lists and schema qualification to every node. There is one \
-         schema here and the plan already names its columns, so honouring it would mean printing \
-         the same plan and calling it verbose. Refused by name, as it was before this milestone.",
-    ),
-    (
-        "EXPLAIN (FORMAT JSON) SELECT count(*) FROM t",
-        "A second rendering of a plan text that is already a declared divergence from \
-         PostgreSQL's. Producing JSON with our fields in it would look like PostgreSQL's schema \
-         and not be it, which is the wrong kind of nearly-compatible.",
-    ),
 ];
 
 /// The plan surface, replayed: which `EXPLAIN` spellings both servers accept.

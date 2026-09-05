@@ -22,7 +22,7 @@ use sqlparser::ast::{
     GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
     LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
     SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TimezoneInfo, UnaryOperator, Value,
+    TableObject, TimezoneInfo, UnaryOperator, UtilityOption, Value,
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
@@ -847,12 +847,31 @@ fn lower_statement(
             format,
             options,
         } => {
-            refuse_if(*verbose, "EXPLAIN VERBOSE")?;
             refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
             refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
-            refuse_if(format.is_some(), "EXPLAIN (FORMAT ...)")?;
-            refuse_if(options.is_some(), "EXPLAIN with options")?;
             let _ = describe_alias;
+            // **The two spellings are one vocabulary.** `EXPLAIN ANALYZE VERBOSE` and
+            // `EXPLAIN (ANALYZE, VERBOSE)` mean the same thing on a real server, so the legacy
+            // keywords are folded into the option list rather than handled beside it — and
+            // `FORMAT` outside parentheses is a syntax error there, which is why only the
+            // parenthesised list can carry one (measured, `EXPLAIN FORMAT JSON SELECT 1`).
+            let mut settings = ExplainOptions {
+                analyze: *analyze,
+                verbose: *verbose,
+                ..ExplainOptions::default()
+            };
+            // **`FORMAT` outside the parentheses is a syntax error on a real server**, and
+            // `sqlparser` parses it only for the dialects where it is not. Answering a plan here
+            // would be answering where PostgreSQL raises, which ADR 0031 calls the worst class of
+            // divergence — so it is refused in PostgreSQL's own words. Measured:
+            // `EXPLAIN FORMAT JSON SELECT 1` and `EXPLAIN ANALYZE FORMAT JSON SELECT 1`.
+            if format.is_some() {
+                return Err(SqlError::SyntaxAtOrNear("FORMAT".to_owned()));
+            }
+            for option in options.iter().flatten() {
+                settings.set(option)?;
+            }
+            settings.validate()?;
             // A nested statement carries no storage parameter of its own.
             let inner = lower_statement(statement, None)?;
             // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
@@ -860,10 +879,14 @@ fn lower_statement(
             // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
             // `EXPLAIN ANALYZE INSERT` that ran would be an insert.
             refuse_if(
-                *analyze && !matches!(inner, plan::Statement::Select(_)),
+                settings.analyze && !matches!(inner, plan::Statement::Select(_)),
                 "EXPLAIN ANALYZE of a statement that is not a SELECT",
             )?;
-            Ok(plan::Statement::Explain(Box::new(inner), *analyze))
+            Ok(plan::Statement::Explain(Box::new(plan::Explain {
+                statement: Box::new(inner),
+                analyze: settings.analyze,
+                format: settings.format,
+            })))
         }
         // **A domain lowers into a `CREATE TYPE`**, because that is what it is: a fourth
         // `TypeKind` beside the range, the composite and the enum
@@ -8189,6 +8212,112 @@ fn object_name(name: &ObjectName) -> Result<String> {
             .map(ident)
             .ok_or_else(|| SqlError::unsupported(format!("the name {name}"))),
         _ => Err(SqlError::unsupported(format!("the qualified name {name}"))),
+    }
+}
+
+/// The `EXPLAIN` option list, as it accumulates.
+///
+/// # Why every option is *accepted* and only two of them are honoured
+///
+/// This server has no cost model, no buffer accounting and no per-node timing, so `COSTS`,
+/// `BUFFERS`, `TIMING`, `WAL`, `MEMORY`, `SETTINGS`, `SUMMARY`, `GENERIC_PLAN` and `SERIALIZE`
+/// change nothing about what comes back. Accepting them anyway is the [ADR
+/// 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) call: the plan text here
+/// already differs from a real server's in every line, so a client that asks for buffer counts is
+/// getting a different answer either way — and one of the two answers is a plan and the other is
+/// a `0A000` that stops the statement. What is *not* acceptable is answering where PostgreSQL
+/// raises, which is why the option names, their values and the three "requires `ANALYZE`" checks
+/// are reproduced exactly (`tests/captures/pg19_explain_options.txt`, replayed by
+/// `tests/corpus/pg19_routing_explain.txt`).
+#[derive(Debug, Default)]
+struct ExplainOptions {
+    analyze: bool,
+    verbose: bool,
+    /// The options that are only meaningful about a run, in the order PostgreSQL checks them
+    /// after its own option loop — which is why they are recorded here and validated at the end
+    /// rather than refused where they are read: `EXPLAIN (TIMING, ANALYZE)` is legal.
+    timing: bool,
+    wal: bool,
+    serialize: bool,
+    format: plan::ExplainFormat,
+}
+
+impl ExplainOptions {
+    /// Reads one `name [value]` pair.
+    fn set(&mut self, option: &UtilityOption) -> Result<()> {
+        // PostgreSQL's grammar downcases an unquoted option name before it reaches either the
+        // dispatch or the message that refuses it, so this does too.
+        let name = ident(&option.name).to_ascii_lowercase();
+        let slot = match name.as_str() {
+            "analyze" => &mut self.analyze,
+            "verbose" => &mut self.verbose,
+            "timing" => &mut self.timing,
+            "wal" => &mut self.wal,
+            "serialize" => &mut self.serialize,
+            // Read and discarded: see the type's own note on why these are not refusals.
+            "costs" | "buffers" | "settings" | "summary" | "memory" | "generic_plan" => {
+                option_boolean(&name, option.arg.as_ref())?;
+                return Ok(());
+            }
+            "format" => {
+                let Some(value) = option.arg.as_ref().and_then(option_word) else {
+                    return Err(SqlError::OptionRequiresParameter(name));
+                };
+                let Some(format) = plan::ExplainFormat::parse(&value) else {
+                    return Err(SqlError::UnrecognizedExplainOptionValue {
+                        option: "format",
+                        value: value.to_ascii_lowercase(),
+                    });
+                };
+                self.format = format;
+                return Ok(());
+            }
+            _ => return Err(SqlError::UnrecognizedExplainOption(name)),
+        };
+        *slot = option_boolean(&name, option.arg.as_ref())?;
+        Ok(())
+    }
+
+    /// The three checks PostgreSQL makes *after* reading the whole list, in its order.
+    fn validate(&self) -> Result<()> {
+        for (asked, name) in [
+            (self.wal, "WAL"),
+            (self.timing, "TIMING"),
+            (self.serialize, "SERIALIZE"),
+        ] {
+            if asked && !self.analyze {
+                return Err(SqlError::ExplainOptionRequiresAnalyze(name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An option's value read as a boolean, PostgreSQL's `defGetBoolean` rules: no argument at all is
+/// `true`, and `true`/`false`/`on`/`off`/`1`/`0` are what it will read, quoted or not.
+fn option_boolean(name: &str, arg: Option<&Expr>) -> Result<bool> {
+    let Some(arg) = arg else { return Ok(true) };
+    let word = option_word(arg).ok_or_else(|| SqlError::NonBooleanOption(name.to_owned()))?;
+    match word.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "t" | "y" | "yes" => Ok(true),
+        "false" | "off" | "0" | "f" | "n" | "no" => Ok(false),
+        _ => Err(SqlError::NonBooleanOption(name.to_owned())),
+    }
+}
+
+/// The one word an option's argument is, however it was spelled: a bare identifier, a number, a
+/// quoted string or a boolean literal. Anything else — an expression, a function call — is not an
+/// option value at all and answers `None`.
+fn option_word(arg: &Expr) -> Option<String> {
+    match arg {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::Value(value) => match &value.value {
+            Value::Number(digits, _) => Some(digits.clone()),
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Some(text.clone()),
+            Value::Boolean(flag) => Some(flag.to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

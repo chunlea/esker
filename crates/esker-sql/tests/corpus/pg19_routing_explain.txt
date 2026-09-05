@@ -54,6 +54,12 @@
 #     clock in a plan is a number that changes every run, and nothing here is tuned against one
 #     yet (`docs/bench/`).
 #
+# `VERBOSE` and `FORMAT JSON` were refusals here when this file was written, and both were listed
+# divergences. They are neither now (`tests/explain_options.rs`): the whole option list is accepted
+# and all four formats render. What still diverges is the same four things above -- a structured
+# document simply carries them as absent keys rather than as missing text, which is the honest
+# rendering of "there is no cost model here".
+#
 # The statements themselves are accepted by both servers, which is what these lines pin.
 
 EXPLAIN SELECT count(*) FROM t	ok
@@ -66,3 +72,31 @@ EXPLAIN ANALYZE UPDATE t SET amount = 1	ok
 EXPLAIN ANALYZE DELETE FROM t	ok
 EXPLAIN VERBOSE SELECT count(*) FROM t	ok
 EXPLAIN (FORMAT JSON) SELECT count(*) FROM t	ok
+
+# THE OPTION LIST, captured 2026-09-05 over the same fixture (`b4_t` there, `t` here). Every line
+# below is `psql -f` output against 19beta1 with `VERBOSITY verbose`, each probe in its own
+# `SAVEPOINT`; `tests/captures/pg19_explain_options.txt` holds the session. The refusals are the
+# comparable half and they are compared exactly -- an option list is a closed vocabulary, so a
+# server that accepted `(NOSUCHOPTION)` would be answering where a real one raises.
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM t	ok
+EXPLAIN (ANALYZE) SELECT count(*) FROM t	ok
+EXPLAIN (VERBOSE, ANALYZE, FORMAT JSON) SELECT count(*) FROM t	ok
+EXPLAIN (FORMAT TEXT) SELECT count(*) FROM t	ok
+EXPLAIN (FORMAT XML) SELECT count(*) FROM t	ok
+EXPLAIN (FORMAT YAML) SELECT count(*) FROM t	ok
+EXPLAIN (COSTS FALSE) SELECT count(*) FROM t	ok
+EXPLAIN (BUFFERS) SELECT count(*) FROM t	ok
+EXPLAIN (SETTINGS, SUMMARY, MEMORY, GENERIC_PLAN) SELECT count(*) FROM t	ok
+EXPLAIN (TIMING, ANALYZE) SELECT count(*) FROM t	ok
+EXPLAIN ANALYZE VERBOSE SELECT count(*) FROM t	ok
+EXPLAIN (ANALYZE, ANALYZE) SELECT count(*) FROM t	ok
+EXPLAIN (analyze 1, costs off) SELECT count(*) FROM t	ok
+EXPLAIN (TIMING) SELECT count(*) FROM t	!22023 EXPLAIN option TIMING requires ANALYZE
+EXPLAIN (WAL) SELECT count(*) FROM t	!22023 EXPLAIN option WAL requires ANALYZE
+EXPLAIN (SERIALIZE) SELECT count(*) FROM t	!22023 EXPLAIN option SERIALIZE requires ANALYZE
+EXPLAIN (NOSUCHOPTION) SELECT count(*) FROM t	!42601 unrecognized EXPLAIN option "nosuchoption"
+EXPLAIN (FORMAT NOSUCHFORMAT) SELECT count(*) FROM t	!22023 unrecognized value for EXPLAIN option "format": "nosuchformat"
+EXPLAIN (ANALYZE MAYBE) SELECT count(*) FROM t	!42601 analyze requires a Boolean value
+EXPLAIN (COSTS 2) SELECT count(*) FROM t	!42601 costs requires a Boolean value
+EXPLAIN (FORMAT) SELECT count(*) FROM t	!42601 format requires a parameter
+EXPLAIN FORMAT JSON SELECT count(*) FROM t	!42601 syntax error at or near "FORMAT"

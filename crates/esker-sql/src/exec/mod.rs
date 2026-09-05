@@ -1038,7 +1038,7 @@ impl Executor {
             Statement::Select(select) => self.select(txn, select),
             Statement::Update(update) => dml::update(self, txn, update, written),
             Statement::Delete(delete) => dml::delete(self, txn, delete),
-            Statement::Explain(inner, analyze) => self.explain(txn, inner, *analyze),
+            Statement::Explain(explain) => self.explain(txn, explain),
             Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
             // Handled before a transaction is opened; `execute` never routes one here.
             Statement::Session(_) => Err(SqlError::Internal(
@@ -1944,12 +1944,14 @@ impl Executor {
     }
 
     /// `EXPLAIN`: the plan, as rows, and nothing run.
-    fn explain(&self, txn: &dyn Txn, statement: &Statement, analyze: bool) -> Result<Outcome> {
+    fn explain(&self, txn: &dyn Txn, explain: &crate::plan::Explain) -> Result<Outcome> {
         // A `SELECT`'s plan is the whole point of `EXPLAIN`, and building it needs the catalog.
-        let lines = match statement {
+        let statement = &*explain.statement;
+        let format = explain.format;
+        let subject = match statement {
             Statement::Select(select) => {
                 let mut planned = self.plan_select(txn, select)?;
-                if analyze {
+                if explain.analyze {
                     // **`ANALYZE` runs it**, which is what makes the numbers real. The fragments
                     // go out and the plan is drained: what a routed query costs is a fact about a
                     // run, and a plan that only described one would be reporting an estimate this
@@ -1968,24 +1970,33 @@ impl Executor {
                     let mut cursor = cursor::Cursor::open(txn, self.tenant, &path, &planned.node)?;
                     while cursor.next()?.is_some() {}
                 }
-                planned.node.explain(
-                    &planned.table,
-                    &planned.column_names,
-                    planned.engine.as_ref(),
-                )
+                ExplainSubject::Plan(Box::new(planned))
             }
-            other => explain_lines(other),
+            other => ExplainSubject::Lines(explain_lines(other)),
         };
-        Ok(Self::explain_rows(lines))
+        Ok(Self::explain_rows(&subject, format))
     }
 
-    fn explain_rows(lines: Vec<String>) -> Outcome {
-        Outcome::Rows {
-            fields: vec![FieldDescription::computed("QUERY PLAN", ColumnType::Text)],
-            rows: lines
+    /// The one `QUERY PLAN` column, and the rows that fill it.
+    ///
+    /// **`FORMAT TEXT` is a row per line and every other format is one row**, which is the shape a
+    /// real server sends and not a rendering choice: a JSON document split across rows would not
+    /// parse. Measured, all four (`tests/captures/pg19_explain_options.txt`).
+    fn explain_rows(subject: &ExplainSubject, format: crate::plan::ExplainFormat) -> Outcome {
+        let rows = match subject.tree().render(format) {
+            Some(document) => vec![vec![Some(document.into_bytes())]],
+            None => subject
+                .lines()
                 .into_iter()
                 .map(|line| vec![Some(line.into_bytes())])
                 .collect(),
+        };
+        Outcome::Rows {
+            fields: vec![FieldDescription::computed(
+                "QUERY PLAN",
+                format.column_type(),
+            )],
+            rows,
             tag: "EXPLAIN".to_owned(),
         }
     }
@@ -3406,6 +3417,44 @@ fn fill_sequence_reads_in(
 
 /// The `EXPLAIN` output for a statement. One line per plan node, indented by depth, which is the
 /// shape `psql` renders and users read.
+/// What an `EXPLAIN` is about: a `SELECT`'s plan, or the one line a statement without an access
+/// path prints.
+///
+/// The two are kept apart rather than flattened into lines up front because the structured formats
+/// need the *tree* and the text form needs the *layout*, and only the plan has both to give.
+enum ExplainSubject {
+    /// A `SELECT`, planned. Boxed because a `Planned` is large and this enum is a local.
+    Plan(Box<query::Planned>),
+    /// Everything else, already printed.
+    Lines(Vec<String>),
+}
+
+impl ExplainSubject {
+    /// The indented layout `FORMAT TEXT` sends, one row per line.
+    fn lines(&self) -> Vec<String> {
+        match self {
+            ExplainSubject::Plan(planned) => planned.node.explain(
+                &planned.table,
+                &planned.column_names,
+                planned.engine.as_ref(),
+            ),
+            ExplainSubject::Lines(lines) => lines.clone(),
+        }
+    }
+
+    /// The same plan as named fields, which the other three formats render.
+    fn tree(&self) -> crate::plan::PlanNode {
+        match self {
+            ExplainSubject::Plan(planned) => planned.node.plan_tree(
+                &planned.table,
+                &planned.column_names,
+                planned.engine.as_ref(),
+            ),
+            ExplainSubject::Lines(lines) => crate::plan::PlanNode::from_lines(lines),
+        }
+    }
+}
+
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
         Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
@@ -4032,9 +4081,12 @@ impl Executor {
                         .collect(),
                 )
             }
-            Statement::Explain(..) => Some(vec![FieldDescription::computed(
+            // **The column's type is the format's**, which a `Describe` has to answer before
+            // anything runs: a client that prepared `EXPLAIN (FORMAT JSON)` reads the document
+            // through the OID this sends.
+            Statement::Explain(explain) => Some(vec![FieldDescription::computed(
                 "QUERY PLAN",
-                ColumnType::Text,
+                explain.format.column_type(),
             )]),
             // A `RETURNING` makes a write statement row-returning, and a client that prepares one
             // asks for its shape before it binds. Answering `None` here would tell the client
