@@ -37,7 +37,7 @@ max-threads = 1
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)))
     or (package(esker-store) and (binary(promotion) or binary(balance)))
-    or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan)))
+    or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
 test-group = 'cluster'
 

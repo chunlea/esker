@@ -385,3 +385,77 @@ available parallelism by more than twice on the very first multi-region cluster 
 * **The timing half.** The exchange re-measure and the join before/after need both engines to
   complete; neither is blocked on a quiet window, and scheduling one before the scan fix would
   waste it. §7's single-region numbers stand and remain labelled single-region.
+
+
+## 10. A multi-region columnar query returns N× the right answer — 2026-09-05
+
+The correctness half was re-run on the fixed main with learners placed. It found the failure
+[ADR 0022](../adr/0022-columnar-learner-replica.md) names as the worst this feature can have.
+
+Four regions, a columnar learner on each, **every fragment answered**, `Engine: columnar`:
+
+| query | row engine | columnar |
+|---|---|---|
+| `count(*)` | 20,000 | **80,000** |
+| `count(*), sum(amount) WHERE day < 300` | 16,490 / 8,254,155,880 | **65,960 / 33,016,623,520** |
+| `GROUP BY g32`, every group | 625 | **2,500** |
+| `GROUP BY ghigh`, every group | 40 | **160** |
+| the join | 2,520 | **10,080** |
+
+**The multiplier is the region count**, and the learners were co-located — four on two stores. So a
+fragment reads its store's columnar runs rather than only its own region's, and every row is
+counted once per region. The row engine is correct throughout; the columnar side is silently wrong.
+
+### Why the epoch did not catch it
+
+ADR 0040 foresaw the shape and priced it as harmless:
+
+> Nothing prunes a parent's copy on a split, so a fragment to each half could count a row twice —
+> the epoch pins it: shards carry the epoch the planner saw, a split bumps it, and the store
+> refuses the stale one. **A performance bound, not a wrong answer**, and a split-aware columnar
+> copy is `esker-store`'s.
+
+The reasoning does not hold in the order things now happen. **The splits occur before the learner
+is placed**, so no shard is ever stale: every fragment carries a current epoch, is legitimately
+routed, is answered — and reads too much. The epoch guards against a topology that changed under a
+plan, and this is a topology that was already settled when the plan was made.
+
+**Owner: `esker-store`**, by that same sentence — the columnar copy has to be region-scoped.
+
+### The interim guard
+
+A wrong answer must not stay reachable while the fix is built, so
+`crates/esker-sql/src/exec/fragment.rs` refuses a table in more than one region:
+
+```text
+Engine: rows  (no fragment expresses a table in more than one region:
+               the columnar copy is not region-scoped yet)
+```
+
+Verified on the cluster that produced the table above: every routed statement now names the guard,
+and the two engines agree on all ten. It is **temporary**, and what retires it is
+`multi_region_differential` going green — the test asserting the engines agree across regions with
+`Engine: columnar` on every comparison.
+
+The guard sits **before** the learner check: a multi-region table will not be routed whether or not
+a learner exists, and naming the learner first would send a reader to place one and watch nothing
+change.
+
+### Three notes on how this was nearly missed
+
+* **`routing_differential` cannot see it.** It is single-region, and the differential ADR 0022 asks
+  for by name is exactly the defence this needed. That is the gap
+  `crates/esker-cli/tests/multi_region_guard.rs` and the owed multi-region differential fill.
+* **A stale binary hid it, twice.** `--diagnose` drives `/target/release/esker-sql` and the test
+  harness `/target/debug/esker-sql`; rebuilding one and reading the other produced a run where the
+  row path looked broken after it had been fixed, and a run where the guard looked absent after it
+  had been added. Both times the binary's timestamp was the tell.
+* **"0 disagreements" meant nothing twice**, for opposite reasons: once because no learner was
+  placed so both arms were the row engine, and once because the guard had put them there
+  deliberately. A comparison is worth what its denominator is worth, which is why the guard's test
+  asserts the `Engine` line and not the answer.
+
+### The timing half
+
+Still parked, and now for a second reason: the numbers it would take are wrong by a factor of the
+region count. No quiet window is wanted until the columnar copy is region-scoped.
