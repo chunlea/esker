@@ -184,8 +184,8 @@ impl RawClient {
     /// leaves its region — `RegionMeta::check_range` requires containment, and invariant 5 is why
     /// it is right to. `Transaction::scan` was fixed for that first, because SQL reads through it
     /// and a table past the split threshold made every non-point `SELECT` answer
-    /// `08006 key is not in region 1`; this is the same defect on the RawKV path, found while
-    /// fixing that one and unreachable only because nothing scans large RawKV ranges today.
+    /// `08006 key is not in region 1`; this is the same defect on the `RawKV` path, found while
+    /// fixing that one and unreachable only because nothing scans large `RawKV` ranges today.
     ///
     /// The two directions differ in one way and it is not the clamp. A forward scan can walk
     /// lazily — ask, take the region's end, carry on from it — because the next region is found
