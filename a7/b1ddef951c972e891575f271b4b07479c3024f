@@ -1,0 +1,21 @@
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_d00644ab7aecc7 59
+crates/esker-sql/src/value/stopwords.rs
+  s_2bed4ac2b1c944::t_45ee2c279b0e68 1-232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a7b1ddef951c972e891575f271b4b07479c3024f",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
