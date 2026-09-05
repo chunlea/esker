@@ -821,6 +821,15 @@ pub enum CatalogFunc {
     /// `a || b`: the two hstores merged, **the right winning a shared key** — which is the
     /// opposite of what a repeated key inside one literal does (`crate::value::hstore`).
     HstoreConcat,
+    /// `jsonb || jsonb`: **document merge**, which is a different operator from every other
+    /// spelling of `||` and not a concatenation at all.
+    ///
+    /// Its own variant because the operand cannot decide it: `jsonb` is stored canonicalised as a
+    /// `Datum::Text` (`value::json::canonicalise`), so by the time the evaluator holds two values
+    /// a document and a string are the same bytes. The **lowerer** emits this when a cast says
+    /// `jsonb`, and a jsonb *column* is caught in the evaluator by its `Expr::Ordinal` type —
+    /// the two places the declared type still exists.
+    JsonbConcat,
     /// `akeys(h)` and `avals(h)`: the keys and the values as `text[]`, in canonical order.
     HstoreAkeys,
     /// See [`CatalogFunc::HstoreAkeys`].
@@ -1191,7 +1200,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreHasKey => "?",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
-            CatalogFunc::HstoreConcat => "||",
+            CatalogFunc::HstoreConcat | CatalogFunc::JsonbConcat => "||",
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
@@ -1267,6 +1276,7 @@ impl CatalogFunc {
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
+            | CatalogFunc::JsonbConcat
             | CatalogFunc::HstoreBuild
             | CatalogFunc::TsMatch
             | CatalogFunc::TsRank
@@ -1419,6 +1429,7 @@ impl CatalogFunc {
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
+            CatalogFunc::JsonbConcat => ColumnType::Jsonb,
             CatalogFunc::ToTsVector | CatalogFunc::TsStrip | CatalogFunc::SetWeight => {
                 ColumnType::TsVector
             }

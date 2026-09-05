@@ -30,6 +30,11 @@ CREATE TABLE cc (id int, title text, tag varchar(4))		-
 INSERT INTO cc VALUES (1, 'one', 'ab'), (2, NULL, NULL)		-
 SELECT 'r', id, title || '!', tag || '!' FROM cc ORDER BY id		r|1|one!|ab! ; r|2|\N|\N
 SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)		r|{1,2,3}|{1,2,3}|integer[]
-SELECT 'r', '{"a":1}'::jsonb || '{"b":2}'::jsonb		r|{"a": 1, "b": 2}
-SELECT 'r', '{"a":1}'::json || '{"b":2}'::json		r|{"a":1}{"b":2}
+SELECT 'r', '{"a":1,"b":2}'::jsonb || '{"b":3,"c":4}'::jsonb		r|{"a": 1, "b": 3, "c": 4}
+SELECT 'r', '{"a":{"x":1}}'::jsonb || '{"a":{"y":2}}'::jsonb		r|{"a": {"y": 2}}
+SELECT 'r', '[1,2]'::jsonb || '[3]'::jsonb, '[1,2]'::jsonb || '3'::jsonb		r|[1, 2, 3]|[1, 2, 3]
+SELECT 'r', '{"a":1}'::jsonb || '[1]'::jsonb, '"x"'::jsonb || '"y"'::jsonb		r|[{"a": 1}, 1]|["x", "y"]
+SELECT 'r', 'null'::jsonb || 'null'::jsonb, '[]'::jsonb || '[]'::jsonb		r|[null, null]|[]
+SELECT 'r', pg_typeof('{"a":1}'::jsonb || '{"b":2}'::jsonb)		r|jsonb
+SELECT '{"a":1}'::json || '{"b":2}'::json	!42883 operator does not exist: json || json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
 DROP TABLE cc		-
