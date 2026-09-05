@@ -148,8 +148,8 @@ const SWALLOWING_DEBT: &[&str] = &[
     // `tests/create_schema_elements.rs`
     "CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())",
     "CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one",
-    // `tests/do_block.rs`
-    "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;",
+    // `tests/do_block.rs`'s entry was this one and is **gone**: `enumtypid` is an `oid` now, so
+    // `WHERE enumtypid = 'mood'::regtype` compares instead of being `42883 bigint = regtype`.
     // `tests/drop_extension.rs`
     // **This was `"ltree"` and is one statement later now**: the ltree unit closed that refusal,
     // and the file reaches `postgres_fdw` before it aborts. One fewer statement swallowed, and

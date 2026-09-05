@@ -840,8 +840,13 @@ impl CatalogView {
                 ("seqcache", ColumnType::Int8),
                 ("seqcycle", ColumnType::Bool),
             ],
+            // `enumtypid` is an `oid`, here as on a real server, and for the reason
+            // `pg_cast.castsource` is: it is what a `regtype` is compared against.
+            // `WHERE enumtypid = 'mood'::regtype` is what `ActiveRecord` sends to read an enum's
+            // labels, and an `oid` beside a `regtype` is one representation where a `bigint`
+            // beside one is not (ADR 0077).
             CatalogView::PgEnum => &[
-                ("enumtypid", ColumnType::Int8),
+                ("enumtypid", ColumnType::Oid),
                 ("enumlabel", ColumnType::Text),
                 ("enumsortorder", ColumnType::Real),
             ],
@@ -2184,7 +2189,8 @@ fn pg_enum_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
         let oid = super::pg_relations::as_oid(def.oid);
         for (at, label) in labels.iter().enumerate() {
             rows.push(vec![
-                Datum::Int8(oid),
+                // The declared type, so the rows and the description agree.
+                Datum::Oid(u32::try_from(oid).unwrap_or(0)),
                 Datum::Text(label.clone()),
                 // `at + 1`: a real server's first label is `1`, not `0`.
                 Datum::Real(f32::from(u16::try_from(at + 1).unwrap_or(u16::MAX))),
@@ -2192,7 +2198,7 @@ fn pg_enum_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
         }
     }
     rows.sort_by_key(|row| match (row.first(), row.get(2)) {
-        (Some(Datum::Int8(oid)), Some(Datum::Real(order))) => (*oid, order.to_bits()),
+        (Some(Datum::Oid(oid)), Some(Datum::Real(order))) => (*oid, order.to_bits()),
         _ => (0, 0),
     });
     Ok(rows)
