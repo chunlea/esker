@@ -1000,6 +1000,17 @@ it needs and paying to read and discard it on every fragment. Doing (1) without 
 the correctness of an answer depends on a *build-time* decision, which is the shape that made this
 defect invisible for a whole phase.
 
+### Where this stands on main, 2026-09-05 — and it is not yet safe
+
+**Main carries the scan range (`f0ba6f29`) without the `mpp` lane's guard**, so a multi-region
+columnar query on today's main answers **52 for 200** with nothing stopping it. The range is applied
+over a byte form the reasoning below assumed and the cluster disagrees with; the numbers are in
+§"What the measurement said". Nothing in our own harnesses routes a multi-region query to the
+columnar path, so nothing here is red because of it — which is the reason to write it down rather
+than rely on noticing. The guard batch (`FragmentSource::runs_are_region_scoped`, answering `false`
+until the differential's columnar arm is green) is what closes the window, and
+`ClientFragments::runs_are_region_scoped` must not be flipped to `true` before then.
+
 ### Two things settled while reading, which narrow (2) before it is written
 
 * **The restriction belongs to the store, not to the client.** It is a property of the *region*,
