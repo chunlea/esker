@@ -1225,6 +1225,57 @@ fn strip_virtual_generated(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec
 /// **Only before `TABLE`.** `CREATE UNLOGGED VIEW` is not rewritten: a view has no storage and a
 /// real server refuses it with a sentence of its own, so letting it through here would turn a
 /// `42601` that explains itself into a view that quietly ignored the keyword.
+/// `CREATE USER x` → `CREATE ROLE x LOGIN`, and `DROP USER x` → `DROP ROLE x`.
+///
+/// **`sqlparser` 0.62 routes only `CREATE ROLE`** to its role parser — `CREATE USER` reaches
+/// nothing and was a `0A000` in the refusal table. This is the same mechanism `UNLOGGED` and
+/// `CREATE DATABASE`'s options use: rewrite the source into something the parser reads.
+///
+/// Here the rewrite carries the whole semantic difference rather than losing it, which is why
+/// nothing has to travel beside the tree. On PostgreSQL `CREATE USER` **is** `CREATE ROLE … LOGIN`
+/// — one implies the login attribute and the other does not, and that is the only thing the two
+/// statements disagree about (measured against PG19: `rolcanlogin` is `t` and `f`).
+fn rewrite_user_as_role(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !second.eq_ignore_ascii_case("USER") {
+        return None;
+    }
+    let creating = first.eq_ignore_ascii_case("CREATE");
+    if !creating && !first.eq_ignore_ascii_case("DROP") {
+        return None;
+    }
+    // `CREATE USER MAPPING` is a different statement and keeps its own refusal.
+    if scanned
+        .words
+        .get(2)
+        .is_some_and(|third| third.eq_ignore_ascii_case("MAPPING"))
+    {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let at = upper.find("USER")?;
+    let mut kept = String::with_capacity(sql.len() + " LOGIN".len());
+    kept.push_str(sql.get(..at)?);
+    kept.push_str("ROLE");
+    kept.push_str(sql.get(at + "USER".len()..)?);
+    if creating {
+        // **Before the terminator, not after it.** Appended to the whole string, `CREATE USER bob
+        // SUPERUSER;` became `CREATE ROLE bob SUPERUSER; LOGIN` — a second statement consisting of
+        // one keyword, and a `42601` about correct SQL. The syntax corpus caught it, which is what
+        // that corpus is for: it replays everything PG19 accepts and refuses to let any of it come
+        // back a syntax error.
+        //
+        // The option order is free on a real server, so the end of the statement is a fine place
+        // for it; the end of the *source* is not.
+        let end = kept.trim_end();
+        let insert_at = end.strip_suffix(';').map_or(end.len(), str::len);
+        kept.insert_str(insert_at, " LOGIN");
+    }
+    Some(kept)
+}
+
 fn strip_unlogged(sql: &str, scanned: &Scan<'_>) -> Option<String> {
     let [first, second, third, ..] = scanned.words.as_slice() else {
         return None;
@@ -1836,6 +1887,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     }
 
     let rewritten = rewrite_synonym(sql, &scanned)
+        .or_else(|| rewrite_user_as_role(sql, &scanned))
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
         .or_else(|| strip_unlogged(sql, &scanned))
         .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept))
@@ -2245,7 +2297,6 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("CREATE USER MAPPING", &["CREATE", "USER", "MAPPING"], &[]),
     u("GRANT", &["GRANT"], &[]),
     u("REVOKE", &["REVOKE"], &[]),
-    u("CREATE USER", &["CREATE", "USER"], &[]),
     u("ALTER DEFAULT PRIVILEGES", &["ALTER", "DEFAULT"], &[]),
     u("SECURITY LABEL", &["SECURITY", "LABEL"], &[]),
     u("REASSIGN OWNED", &["REASSIGN"], &[]),
