@@ -1,0 +1,44 @@
+crates/esker-cli/tests/pgwire_cluster.rs
+  h_44076b318daf9c 1-251
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 3182-3255
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 200-203,263,286-287,330-331,424-428,445-449,717-735,891-892,1030-1031,1514-1546
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 196-202,1063-1121
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 317-321,1483-1490,2531-2532
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 218-219,759-760,980-981,1073-1074
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 3136-3144,3702-3748
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 927-928,3128-3129
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 455-468,485-494,497-498,664-674
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 1228-1278,1890
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 116,208,221-236,270-283,569,720
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 275-281,286-309
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 36,38-40,110-111,131-132,241-242,308-309
+crates/esker-sql/tests/psql_smoke.rs
+  h_44076b318daf9c 60-90,158,163,181,245,269
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 855,929
+docs/plans/phase-6a.md
+  h_44076b318daf9c 478
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "959fe9bdb263a6a9d60560aaae35775687257c57",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
