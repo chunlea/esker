@@ -1,0 +1,70 @@
+# **Vendored from r1-harness** (ADR 0075), who measured it against both nodes and found it. Kept
+# byte-for-byte below this line; `tests/wire_serial.rs`'s
+# `an_arrow_over_a_column_describes_the_document_type` is what holds it.
+#
+# PG19 capture: the wire type of `->` over a json/jsonb COLUMN
+#
+# For b4-types. Found in run 98 (main 5e053a35), where 85dad1bd made `->` and `->>` work but
+# json_test.rb went 0F 2E -> 2F 0E: the refusal became a wrong answer, so the file's totals did
+# not move at all.
+#
+# WRAP EVERY ROW YOU EXPECT THE NODE TO REFUSE IN A SAVEPOINT. Nothing here is expected to be
+# refused, so this file has none -- but a replay that adds rows should keep the rule.
+#
+# The divergence is in the RowDescription type OID, NOT in the value and NOT in pg_typeof. Both
+# nodes return the same bytes; only the declared type differs, so psql renders them identically
+# and `pg_typeof` answers correctly on both. It is invisible to any probe that does not read
+# ftype() off the wire. Mine did not, which is why my pre-pass provenance recorded this commit as
+# LANDED.
+#
+# MEASURED, one session per node, BEGIN ... ROLLBACK, proof line at the end.
+
+BEGIN;
+CREATE TABLE r98_j_json  (id serial primary key, payload json);
+CREATE TABLE r98_j_jsonb (id serial primary key, payload jsonb);
+INSERT INTO r98_j_json  (payload) VALUES ('{"a":{},"b":"b"}');
+INSERT INTO r98_j_jsonb (payload) VALUES ('{"a":{},"b":"b"}');
+
+SELECT payload->'a', payload->>'b' FROM r98_j_json;
+SELECT payload->'a', payload->>'b' FROM r98_j_jsonb;
+
+ROLLBACK;
+SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'r98_j_%';   -- proof: 0
+
+# ============================ RESULT, read off the wire ============================
+#
+#                          PG19 (oracle, 55432)        esker 5e053a35 (55442)
+#   json  column  -> 'a'   OID  114  value "{}"        OID   25  value "{}"     <-- text
+#   jsonb column  -> 'a'   OID 3802  value "{}"        OID   25  value "{}"     <-- text
+#   json  column ->> 'b'   OID   25  value "b"         OID   25  value "b"      correct
+#
+#   tables left after ROLLBACK: 0 on both.
+#
+# `->>` is right on both. `->` should return json (114) / jsonb (3802) and the node returns
+# text (25) for both.
+#
+# ============================ THE LITERAL PATH IS CORRECT ==========================
+#
+# This is the part that made it hide. Over a literal cast, the node types `->` correctly:
+#
+#   SELECT '{"a":{}}'::json  -> 'a';    node OID  114   correct
+#   SELECT '{"a":{}}'::jsonb -> 'a';    node OID 3802   correct
+#   SELECT pg_typeof('{"a":{}}'::json -> 'a');   node answers `json`   correct
+#
+# So: literal path types correctly, COLUMN path degrades to text. A probe built on literals --
+# which is what my provenance used -- reports the commit as landed.
+#
+# ============================ WHAT RAILS SEES ======================================
+#
+#   json_test.rb:44   klass.pluck(Arel.sql("payload->'a', payload->>'b'"))
+#
+#     Expected: [[{}, "b"]]        a decoded Hash
+#     Actual:   [["{}", "b"]]      a String
+#
+# AR decodes by the RowDescription OID. Told 25, it hands back the raw string and never parses it.
+# Both PostgresqlJSONTest and PostgresqlJSONBTest fail this way.
+#
+# Worth saying plainly: as a scoreboard line this is neutral (2E -> 2F, net 0), but a refusal that
+# becomes a silently wrong type is worse than the refusal was. The error was visible; a text OID
+# where json belongs is not, and anything that reads the value without checking its type will take
+# the string.

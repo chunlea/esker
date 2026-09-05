@@ -147,6 +147,84 @@ fn frames(bytes: &[u8]) -> Vec<(char, Vec<u8>)> {
     out
 }
 
+/// Every column's **type oid** from a reply's `RowDescription`, which is the only place a wrong
+/// declared type is visible.
+///
+/// A `RowDescription` field is: name (NUL-terminated), table oid (4), column attnum (2), **type
+/// oid (4)**, type size (2), typmod (4), format (2).
+fn described_oids(reply: &[u8]) -> Vec<u32> {
+    let Some((_, body)) = frames(reply).into_iter().find(|(tag, _)| *tag == 'T') else {
+        return Vec::new();
+    };
+    let count = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut oids = Vec::with_capacity(count);
+    let mut at = 2;
+    for _ in 0..count {
+        let end = body[at..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|n| at + n);
+        let Some(end) = end else { break };
+        // Past the name's NUL, the table oid and the attnum.
+        let oid_at = end + 1 + 4 + 2;
+        if oid_at + 4 > body.len() {
+            break;
+        }
+        oids.push(u32::from_be_bytes([
+            body[oid_at],
+            body[oid_at + 1],
+            body[oid_at + 2],
+            body[oid_at + 3],
+        ]));
+        at = oid_at + 4 + 2 + 4 + 2;
+    }
+    oids
+}
+
+/// **`->` over a column must describe itself as the document type it returns.**
+///
+/// Measured in `captures/pg19_json_arrow_oid.txt`, vendored from r1-harness who found it.
+///
+/// r1-harness, against 19beta1: `json col -> 'a'` is oid **114** and `jsonb col -> 'a'` is
+/// **3802**; both were **25** here, so `json_test.rb` went `0F 2E -> 2F 0E` — the refusal became a
+/// wrong answer, which ADR 0031 ranks the worse of the two. `ActiveRecord` decodes by this oid, so
+/// told `text` it never parses and hands back `"{}"` where the test wants a Hash.
+///
+/// **It has to be asserted here and cannot be asserted anywhere else.** The value is right either
+/// way and `text` and `json` render identically, so no corpus row can see it; `pg_typeof` folds
+/// off the *resolved* call and was right all along, so the one I wrote passed. Only the wire says
+/// so — and only through a **column**, because the literal path types correctly.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_arrow_over_a_column_describes_the_document_type() {
+    let node = Arc::new(Node {
+        backend: Arc::new(esker_sql::backend::MemoryBackend::new()),
+        catalog: Arc::new(esker_sql::catalog::Catalog::new()),
+        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
+        share: true,
+    });
+    let mut wire = Wire::open(Arc::clone(&node)).await;
+    wire.run("CREATE TABLE j (payload jsonb, doc json)").await;
+    wire.run(r#"INSERT INTO j VALUES ('{"a":{},"b":"b"}', '{"a":{},"b":"b"}')"#)
+        .await;
+
+    // `json_test.rb:44`'s own projection, and one of each arrow over each column type.
+    for (sql, want) in [
+        ("SELECT payload->'a', payload->>'b' FROM j", vec![3802, 25]),
+        ("SELECT doc->'a', doc->>'b' FROM j", vec![114, 25]),
+        // The literal path, which was right and must stay right.
+        (r#"SELECT '{"a":{}}'::jsonb->'a'"#, vec![3802]),
+        (r#"SELECT '{"a":{}}'::json->'a'"#, vec![114]),
+    ] {
+        let reply = wire.run(sql).await;
+        assert_eq!(
+            described_oids(&reply),
+            want,
+            "{sql} described the wrong types: {}",
+            String::from_utf8_lossy(&reply).replace('\0', "|")
+        );
+    }
+}
+
 /// The first column of the first `DataRow` in a reply, as text.
 fn first_value(reply: &[u8]) -> Option<String> {
     let (_, body) = frames(reply).into_iter().find(|(tag, _)| *tag == 'D')?;

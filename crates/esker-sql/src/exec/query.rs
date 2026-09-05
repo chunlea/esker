@@ -26,7 +26,9 @@ use crate::catalog::pg_catalog;
 use crate::catalog::{ColumnDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::aggregate;
-use crate::plan::{BinaryOp, Expr, Literal, LockWait, Node, Select, SelectItem, SortKey};
+use crate::plan::{
+    BinaryOp, CatalogFunc, Expr, Literal, LockWait, Node, Select, SelectItem, SortKey,
+};
 use crate::row::{self, RowSchema};
 use crate::value::PgType;
 use crate::value::{ColumnType, Datum};
@@ -2648,12 +2650,8 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // declared type follows from the same decision: `pg_typeof(payload->'b')` is
                 // `jsonb` and `pg_typeof(doc->'a')` is `json`, measured, and an evaluator-only
                 // dispatch answered `text` for both.
-                (crate::plan::CatalogFunc::HstoreFetch, Some(operand)) => {
-                    let func = match expr_type(operand, scope) {
-                        Ok(ColumnType::Jsonb) => crate::plan::CatalogFunc::JsonbFetch,
-                        Ok(ColumnType::Json) => crate::plan::CatalogFunc::JsonFetch,
-                        _ => call.func,
-                    };
+                (crate::plan::CatalogFunc::HstoreFetch, Some(_)) => {
+                    let func = arrow_fetch(call.func, &args, scope);
                     Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall { func, args }))
                 }
                 _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
@@ -4019,6 +4017,30 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
     }
 }
 
+/// Which fetch a `->` is, from the **declared type of its operand**.
+///
+/// `->` means an hstore's fetch and a document's, and a `jsonb` is a canonical `Datum::Text` here
+/// — so nothing about the values decides it and the plan's own types have to. Asked in two places
+/// that must not disagree: `resolve`, which rewrites the call so the evaluator does the right
+/// fetch, and `expr_type`, which is what a client is **told**.
+///
+/// **Both, because the second was missing and the first alone is a wrong answer.** With only the
+/// rewrite, `payload->'a'` over a column returned the right `{}` and described it as `text`
+/// (oid 25) where a real server says `jsonb` (3802) — and `ActiveRecord` decodes by that oid, so
+/// it handed back the string `"{}"` instead of a Hash. `pg_typeof` could not see it (it folds at
+/// resolution, off the rewritten call) and neither could a rendered value, because `text` and
+/// `json` print identically. Only `ftype()` off the wire can, which is what the test asserts.
+fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFunc {
+    if func != CatalogFunc::HstoreFetch {
+        return func;
+    }
+    match args.first().map(|operand| expr_type(operand, scope)) {
+        Some(Ok(ColumnType::Jsonb)) => CatalogFunc::JsonbFetch,
+        Some(Ok(ColumnType::Json)) => CatalogFunc::JsonFetch,
+        _ => func,
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // The type the cast named. Settled at lowering, where the permission was checked too.
@@ -4072,6 +4094,13 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             } else {
                 ColumnType::Text
             }
+        }
+        // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
+        // the operand — and it needs the same arm here for the same reason that one gives: the
+        // rows were already right and it was the *declared* type that said `text`, which a client
+        // binds against.
+        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::HstoreFetch => {
+            arrow_fetch(call.func, &call.args, scope).result_type()
         }
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
