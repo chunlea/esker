@@ -1,0 +1,23 @@
+crates/esker-sql/tests/prepared_serial.rs
+  s_2bed4ac2b1c944::t_974cbb3ae63dcb 1-101
+crates/esker-sql/tests/real_backend.rs
+  s_2bed4ac2b1c944::t_988289ef84d345 807-854
+crates/esker-sql/tests/wire_serial.rs
+  s_2bed4ac2b1c944::t_7974d8740581f4 1-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5ef93450a5861111f25f4c205ef30e7429ae33bb",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
