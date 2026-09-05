@@ -103,3 +103,74 @@ fn a_lock_taken_inside_a_rolled_back_savepoint_is_released() {
         "row 3 is B's; A's rolled-back insert left neither a lock nor a tombstone"
     );
 }
+
+/// **`SELECT … FOR UPDATE` inside a savepoint is released too** — the shape Rails' deadlock test
+/// actually sends, and a different route into the lock table from the one above.
+///
+/// `s1.lock!` is a `SELECT … FOR UPDATE`, which the planner reaches through `lock_targets` rather
+/// than through a write. The test above locks by writing, so on its own it says nothing about this
+/// road: if `FOR UPDATE` took its lock somewhere the savepoint's recorder does not see, the undo
+/// would record nothing and Rails' `40P01` after the `rescue` would still be there with every unit
+/// test green.
+#[test]
+fn a_for_update_lock_taken_inside_a_rolled_back_savepoint_is_released() {
+    let pair = Pair::new(&[
+        "CREATE TABLE t (id bigint primary key, v bigint)",
+        "INSERT INTO t VALUES (1, 0), (2, 0)",
+    ]);
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+    a.run("SAVEPOINT s1").unwrap();
+    assert_eq!(
+        a.rows("SELECT v FROM t WHERE id = 2 FOR UPDATE"),
+        [["0".to_owned()]]
+    );
+    a.run("ROLLBACK TO SAVEPOINT s1").unwrap();
+
+    // Row 2 was locked only by the statement that has been rolled back.
+    let mut b = pair.session();
+    b.run("SET lock_timeout = '2s'").unwrap();
+    b.run("UPDATE t SET v = 9 WHERE id = 2")
+        .expect("the FOR UPDATE that took row 2 was rolled back with the savepoint");
+
+    a.run("COMMIT").expect("A writes row 1 only");
+}
+
+/// **And a lock the transaction took _before_ the mark is not given away.**
+///
+/// The undo records only a *first* lock, because `Lock::Taken` means "holds it now, or held it
+/// already". Without that distinction a savepoint would hand back a row the outer transaction is
+/// still relying on, and the failure would be a lost update rather than a stuck session — quieter
+/// and worse than the bug being fixed.
+#[test]
+fn a_lock_taken_before_the_mark_survives_the_rollback() {
+    let pair = Pair::new(&[
+        "CREATE TABLE t (id bigint primary key, v bigint)",
+        "INSERT INTO t VALUES (1, 0)",
+    ]);
+
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    assert_eq!(
+        a.rows("SELECT v FROM t WHERE id = 1 FOR UPDATE"),
+        [["0".to_owned()]]
+    );
+    a.run("SAVEPOINT s1").unwrap();
+    // Locks the same row again, inside the mark: recorded as *not* fresh, so not released.
+    assert_eq!(
+        a.rows("SELECT v FROM t WHERE id = 1 FOR UPDATE"),
+        [["0".to_owned()]]
+    );
+    a.run("ROLLBACK TO SAVEPOINT s1").unwrap();
+
+    let mut b = pair.session();
+    b.run("SET lock_timeout = '300ms'").unwrap();
+    let blocked = b
+        .run("UPDATE t SET v = 9 WHERE id = 1")
+        .expect_err("A still holds row 1 from before the savepoint");
+    assert_eq!(blocked.sqlstate(), "55P03", "{blocked}");
+
+    a.run("COMMIT").unwrap();
+}
