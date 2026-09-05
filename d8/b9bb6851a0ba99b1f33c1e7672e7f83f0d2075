@@ -1,0 +1,23 @@
+crates/esker-keys/src/row.rs
+  s_3f615600dbce74::t_ca10cfd308869f 1117-1121,1180,1346-1355
+crates/esker-sql/tests/row_order.rs
+  s_3f615600dbce74::t_0e6541c199c44c 135-144
+docs/adr/0066-a-tsvector-is-its-canonical-text.md
+  s_3f615600dbce74::t_2a2bfc11fa3f13 49-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d8b9bb6851a0ba99b1f33c1e7672e7f83f0d2075",
+  "prompts": {},
+  "sessions": {
+    "s_3f615600dbce74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "763171d7-06a5-4af8-a3be-00a4e647dd9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
