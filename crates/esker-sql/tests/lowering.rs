@@ -359,6 +359,7 @@ fn an_index_key_is_a_column_or_an_expression() {
             shape,
         },
         order: KeyOrder::ASCENDING,
+        opclass: None,
     };
     assert_eq!(
         keys("CREATE INDEX ON t ((lower(b)))"),

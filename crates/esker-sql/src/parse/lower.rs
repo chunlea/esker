@@ -7181,6 +7181,12 @@ fn index_keys(columns: &[IndexColumn]) -> Result<Vec<plan::IndexKeyPart>> {
             Ok(plan::IndexKeyPart {
                 part,
                 order: index_key_order(column),
+                // **`sqlparser` already parses it**, so the parser needed nothing: an operator
+                // class is a name after the column, folded like every other unquoted identifier.
+                opclass: column
+                    .operator_class
+                    .as_ref()
+                    .map(|name| name.to_string().to_ascii_lowercase()),
             })
         })
         .collect()

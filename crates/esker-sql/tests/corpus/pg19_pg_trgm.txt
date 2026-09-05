@@ -1,0 +1,47 @@
+# `pg_trgm` and the **operator class** surface — against PostgreSQL 19beta1.
+#
+# Run 70's extension row, and `schema_test.rb`'s two opclass tests. **The suite uses none of
+# `pg_trgm`'s functions**: what it needs is `CREATE INDEX … USING gin(position gin_trgm_ops)`
+# accepted and the class readable back by the schema dumper, and `text_pattern_ops` — the sibling
+# test one method up — needs the same machinery *without* the extension.
+#
+# [ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md):
+# the access method and the class are **recorded**, the index underneath is the ordinary ordered
+# one, and nothing claims a trigram search is accelerated.
+CREATE EXTENSION IF NOT EXISTS pg_trgm		-
+SELECT 'r', extname, extversion FROM pg_extension WHERE extname = 'pg_trgm'	text,name,text	r|pg_trgm|1.6
+SELECT 'r', name, default_version FROM pg_available_extensions WHERE name = 'pg_trgm'	text,name,text	r|pg_trgm|1.6
+SELECT 'r', o.opcname, o.opcdefault, am.amname, t.typname FROM pg_opclass o JOIN pg_am am ON am.oid = o.opcmethod JOIN pg_type t ON t.oid = o.opcintype WHERE o.opcname IN ('gin_trgm_ops','gist_trgm_ops','text_pattern_ops','varchar_pattern_ops') ORDER BY o.opcname, am.amname	text,name,boolean,name,name	r|gin_trgm_ops|f|gin|text ; r|gist_trgm_ops|f|gist|text ; r|text_pattern_ops|f|btree|text ; r|text_pattern_ops|f|hash|text ; r|varchar_pattern_ops|f|btree|text ; r|varchar_pattern_ops|f|hash|text
+SELECT 'r', amname, amtype FROM pg_am WHERE amname IN ('btree','gin','gist') ORDER BY amname	text,name,"char"	r|btree|i ; r|gin|i ; r|gist|i
+BEGIN		-
+CREATE TABLE trains (id bigserial primary key, name character varying, description text, position character varying)		-
+CREATE INDEX trains_position ON trains USING gin(position gin_trgm_ops)		-
+CREATE INDEX trains_desc ON trains USING btree(description text_pattern_ops)		-
+CREATE INDEX trains_np ON trains USING btree(name, position text_pattern_ops)		-
+CREATE INDEX trains_gist ON trains USING gist(description gist_trgm_ops)		-
+CREATE INDEX trains_plain ON trains (name)		-
+SELECT 'r', pg_get_indexdef('trains_position'::regclass)		r|CREATE INDEX trains_position ON public.trains USING gin ("position" gin_trgm_ops)
+SELECT 'r', pg_get_indexdef('trains_desc'::regclass)		r|CREATE INDEX trains_desc ON public.trains USING btree (description text_pattern_ops)
+SELECT 'r', pg_get_indexdef('trains_np'::regclass)		r|CREATE INDEX trains_np ON public.trains USING btree (name, "position" text_pattern_ops)
+SELECT 'r', pg_get_indexdef('trains_gist'::regclass)		r|CREATE INDEX trains_gist ON public.trains USING gist (description gist_trgm_ops)
+SELECT 'r', pg_get_indexdef('trains_plain'::regclass)		r|CREATE INDEX trains_plain ON public.trains USING btree (name)
+SELECT 'r', c.relname, am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname LIKE 'trains_%' ORDER BY 1	text,name,name	r|trains_desc|btree ; r|trains_gist|gist ; r|trains_np|btree ; r|trains_pkey|btree ; r|trains_plain|btree ; r|trains_position|gin
+SELECT 'r', i.indexrelid::regclass::text, o.opcname FROM pg_index i JOIN LATERAL unnest(i.indclass::oid[]) WITH ORDINALITY AS u(cls, n) ON true JOIN pg_opclass o ON o.oid = u.cls WHERE i.indrelid = 'trains'::regclass ORDER BY 1, u.n		r|trains_np|text_ops ; r|trains_position|gin_trgm_ops ; r|trains_desc|text_pattern_ops ; r|trains_pkey|int8_ops ; r|trains_plain|text_ops ; r|trains_gist|gist_trgm_ops ; r|trains_np|text_pattern_ops
+INSERT INTO trains (name, description, position) VALUES ('a', 'bee', 'front'), ('b', 'sea', 'rear')		-
+SELECT 'r', count(*) FROM trains WHERE position LIKE '%ron%'		r|1
+SELECT 'r', name FROM trains WHERE description = 'sea'		r|b
+SAVEPOINT t1		-
+CREATE INDEX trains_bad ON trains USING gin(name)	!42704 data type character varying has no default operator class for access method "gin" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+ROLLBACK TO SAVEPOINT t1		-
+SAVEPOINT t2		-
+CREATE INDEX trains_bad2 ON trains USING btree(name gin_trgm_ops)	!42704 operator class "gin_trgm_ops" does not exist for access method "btree"
+ROLLBACK TO SAVEPOINT t2		-
+SAVEPOINT t3		-
+CREATE INDEX trains_bad3 ON trains USING btree(id text_pattern_ops)	!42804 operator class "text_pattern_ops" does not accept data type bigint
+ROLLBACK TO SAVEPOINT t3		-
+SAVEPOINT t4		-
+CREATE INDEX trains_bad4 ON trains USING btree(name nosuchopclass)	!42704 operator class "nosuchopclass" does not exist for access method "btree"
+ROLLBACK TO SAVEPOINT t4		-
+DROP TABLE trains		-
+COMMIT		-
+SELECT 'r', count(*) FROM pg_class WHERE relname LIKE 'trains%'	text,bigint	r|0
