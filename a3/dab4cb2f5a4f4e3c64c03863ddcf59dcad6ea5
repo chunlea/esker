@@ -1,0 +1,16 @@
+crates/esker-cli/src/bench_mpp/mod.rs
+  h_44076b318daf9c 303-315,317-319,406-417,455,525,556-567
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 50-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a3dab4cb2f5a4f4e3c64c03863ddcf59dcad6ea5",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
