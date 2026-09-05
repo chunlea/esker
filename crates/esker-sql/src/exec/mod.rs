@@ -2333,9 +2333,23 @@ impl Executor {
         let mut out: Vec<String> = Vec::new();
         for entry in written.split(',') {
             let entry = entry.trim().trim_matches('"');
-            // `$user` names a schema after the connected role, and there are no roles here — so it
-            // resolves to nothing and is dropped, exactly as a missing schema is.
-            if entry.is_empty() || entry == "$user" || out.iter().any(|held| held == entry) {
+            // **`$user` is the session's role**, which is what makes a per-user schema reachable
+            // without naming it — the whole subject of `schema_authorization_test.rb`. It used to
+            // be dropped unconditionally, with a comment saying "there are no roles here": true
+            // when it was written, and a lie from the moment roles landed. The same shape as the
+            // `SET SESSION AUTHORIZATION` refusal, in the same week.
+            //
+            // **A role with no schema of its own still resolves to nothing**, and nothing extra is
+            // needed for that: the `schema_exists` check below already drops an entry naming a
+            // schema that is not there, which is PostgreSQL's rule for *every* entry and the
+            // reason the boot default `"$user", public` still answers `{public}` on a node where
+            // nobody has made one.
+            let entry = if entry == "$user" {
+                self.authorization.as_deref().unwrap_or(&self.user)
+            } else {
+                entry
+            };
+            if entry.is_empty() || out.iter().any(|held| held == entry) {
                 continue;
             }
             if crate::catalog::schema_exists(txn, self.tenant, entry)? {
