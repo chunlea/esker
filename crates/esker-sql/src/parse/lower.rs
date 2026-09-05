@@ -1170,6 +1170,8 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
                 matches!(scope, Some(ContextModifier::Local)),
                 format!("SET LOCAL {name}"),
             )?;
+            // Every item, list or not: `$user` is a syntax error wherever it appears unquoted.
+            refuse_placeholders(values)?;
             let [value] = values.as_slice() else {
                 // PostgreSQL takes a list for `search_path`, and one is what `ActiveRecord` sends:
                 // `SET search_path TO "$user", public`. It arrives as two values and is one path.
@@ -1339,6 +1341,23 @@ fn guc_name(name: &ObjectName) -> Option<String> {
 /// A bare identifier that is not `DEFAULT` is a value PostgreSQL would take unquoted; taking it
 /// here keeps `SET esker.read_as_of TO now` from being a syntax-shaped surprise, and the value
 /// grammar refuses it with `22023` a moment later, which is the right condition for it.
+/// Refuses a `SET` value that is a bare `$name`, the way a real server's parser does.
+///
+/// `$` outside a string starts a parameter, so `SET search_path = $user,public` never reaches a
+/// GUC at all on PostgreSQL — it is `syntax error at or near "$"`, and the working spelling is
+/// `'$user'`. `sqlparser` hands it to us as a placeholder instead of refusing it, so this is where
+/// the difference is made. See [`SqlError::SetValueSyntax`] for the capture.
+fn refuse_placeholders(values: &[Expr]) -> Result<()> {
+    for value in values {
+        if let Expr::Value(literal) = value
+            && let Value::Placeholder(_) = &literal.value
+        {
+            return Err(SqlError::SetValueSyntax("$".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn guc_value(value: &Expr) -> Option<String> {
     match value {
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT") => None,
@@ -3522,6 +3541,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             // real server gives.
             [table, column] => Ok(plan::Expr::Column {
                 table: Some(ident(table)),
+                name: ident(column),
+            }),
+            // `s.t.c`. **The qualifier goes through `relation_name`**, which is the one place
+            // this crate decides what `schema.relation` means — `public` dropped because a public
+            // table's stored name is bare, `pg_temp` and `pg_catalog` kept as lookup prefixes.
+            // Comparing the text instead would refuse `public.t.c` over a bare `FROM t`, which a
+            // real server answers, and there would be a second parser of a grammar that already
+            // has one.
+            [schema, table, column] => Ok(plan::Expr::Column {
+                table: Some(relation_name(&ObjectName(vec![
+                    sqlparser::ast::ObjectNamePart::Identifier(schema.clone()),
+                    sqlparser::ast::ObjectNamePart::Identifier(table.clone()),
+                ]))?),
                 name: ident(column),
             }),
             _ => Err(SqlError::unsupported(format!(
@@ -5960,7 +5992,16 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
                 refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
                 match kind {
                     SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
+                        // `s.t.*` reaches the same rules a `FROM s.t` does, for the reason
+                        // above: one grammar, one parser. `object_name` refuses qualification by
+                        // design and is right to — it names extensions, schemas and databases,
+                        // which have no schema of their own.
+                        Ok(plan::SelectItem::QualifiedWildcard(
+                            match name.0.as_slice() {
+                                [_] => object_name(name)?,
+                                _ => relation_name(name)?,
+                            },
+                        ))
                     }
                     // `STRUCT('x').*` and friends: an expression, not a table.
                     SelectItemQualifiedWildcardKind::Expr(_) => {

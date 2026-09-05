@@ -81,7 +81,8 @@ fn the_bare_name_is_only_unambiguous_when_it_is() {
             .to_string(),
         "!42712 table name \"things\" specified more than once"
     );
-    // An alias is the way through, and it is the only one here — see below.
+    // An alias is one way through; naming the schema is the other, and it is the one a real
+    // server's own users reach for (`a_three_part_reference_resolves_the_ambiguity`).
     assert_eq!(
         node.rows("SELECT a.name FROM s1.things a, s2.things b")
             .len(),
@@ -89,28 +90,33 @@ fn the_bare_name_is_only_unambiguous_when_it_is() {
     );
 }
 
-/// **A three-part column reference is still a gap**, and PostgreSQL's answers for the two shapes
-/// it would settle are recorded here so the boundary is a decision rather than an omission.
+/// **A three-part reference is the ambiguity's escape hatch, and it works now.**
 ///
-/// `s1.things.name` is what a real server accepts — it is also its escape hatch from the ambiguity
-/// above, which is why aliasing is the only way through here. Nothing in the capture needs it:
-/// part 3 writes `things.name` over a single qualified `FROM` item.
+/// This test used to record `s1.things.name` as a gap, and said in its own words that it "is also
+/// its escape hatch from the ambiguity above, which is why aliasing is the only way through here".
+/// The three-part unit closed it (`tests/three_part_name.rs`), so aliasing is no longer the only
+/// way through — which is the sentence that would otherwise have gone quietly out of date.
 #[test]
-fn a_three_part_reference_is_named_rather_than_answered() {
+fn a_three_part_reference_resolves_the_ambiguity() {
     let mut node = parity::Node::new(FIXTURE);
-    // PostgreSQL answers the row; this node names the construct (contract C2).
+    // Two relations of one bare name: the bare qualifier is `42P09`, and naming the schema settles
+    // it — which is exactly what PostgreSQL offers a user in that position.
     assert_eq!(
-        node.answer("SELECT s1.things.name FROM s1.things")
+        node.answer("SELECT things.name FROM s1.things, s2.things")
             .to_string(),
-        "!0A000 the qualified column s1.things.name is not supported"
+        "!42P09 table reference \"things\" is ambiguous"
     );
-    // PostgreSQL: `42P01 invalid reference to FROM-clause entry for table "things"`, with a
-    // DETAIL. The construct is refused before the reference can be judged, so this node gives the
-    // same sentence as above rather than that one.
+    // `s2.things` needs a row of its own, or the cross join is empty whatever the qualifier
+    // resolves to — which would make this pass for the wrong reason.
+    node.run("INSERT INTO s2.things VALUES (9, 'z')").unwrap();
     assert_eq!(
-        node.answer("SELECT s2.things.name FROM s1.things")
-            .to_string(),
-        "!0A000 the qualified column s2.things.name is not supported"
+        node.rows("SELECT s1.things.name FROM s1.things, s2.things"),
+        [["a".to_owned()]]
+    );
+    assert_eq!(
+        node.rows("SELECT s2.things.name FROM s1.things, s2.things"),
+        [["z".to_owned()]],
+        "and the other schema names the other relation"
     );
 }
 

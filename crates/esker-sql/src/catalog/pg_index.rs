@@ -355,16 +355,28 @@ impl Key<'_> {
     /// and this does not — the one cell where PostgreSQL's two forms disagree
     /// ([`crate::catalog::ExprShape`]).
     fn per_column(&self, table: &TableDef) -> Vec<String> {
+        let column_name = |at: usize| {
+            table
+                .columns
+                .get(at)
+                .map(|column| quote_identifier(&column.name))
+                .unwrap_or_default()
+        };
         self.keys
             .iter()
             .map(|key| match &key.part {
-                KeyPart::Column(at) => table
-                    .columns
-                    .get(*at)
-                    .map(|column| quote_identifier(&column.name))
-                    .unwrap_or_default(),
+                KeyPart::Column(at) => column_name(*at),
                 KeyPart::Expression { expr, shape, .. } => shape.per_column(expr),
             })
+            // **The payload answers too**, and it is the same chain [`Key::indkey`] makes — these
+            // two have to agree position for position or the column at subscript *n* is not the
+            // one `pg_get_indexdef(index, n, true)` names.
+            //
+            // `ActiveRecord`'s `indexes` asks for one call per subscript of `indkey`, payload
+            // included, and then drops the payload **by name** against the `INCLUDE (…)` clause.
+            // Answering `""` here left two empty strings in its column list that matched nothing
+            // and survived the filter, so a two-column index dumped as four.
+            .chain(self.include.iter().map(|&at| column_name(at)))
             .collect()
     }
 

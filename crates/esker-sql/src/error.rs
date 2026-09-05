@@ -115,6 +115,31 @@ pub enum SqlError {
     #[error("{0} is not supported")]
     FeatureNotSupported(String),
 
+    /// A `SET` whose value is a bare `$name` — `SET search_path = $user,public`.
+    ///
+    /// **`$user` only means anything inside quotes.** PostgreSQL's `search_path` has a magic
+    /// entry spelled `"$user"`, and a `$` outside a string is the start of a parameter, so the
+    /// unquoted form is a *syntax* error rather than an unknown schema:
+    ///
+    /// ```text
+    /// esker=# SET search_path = $user,public;
+    /// ERROR:  syntax error at or near "$"
+    /// LINE 1: SET search_path = $user,public
+    ///                           ^
+    /// esker=# SET search_path = '$user',public;
+    /// SET
+    /// ```
+    ///
+    /// Measured on 19beta1, both. `schema_test.rb`'s `test_raise_on_unquoted_schema_name` asserts
+    /// exactly this difference, and this node used to accept the unquoted form and set a path with
+    /// a schema nobody has — a wrong answer dressed as a success, which is the shape ADR 0031
+    /// ranks below a refusal.
+    ///
+    /// Carries what the parser stopped at, so the sentence is PostgreSQL's own with no prefix —
+    /// [`SqlError::Syntax`] writes `syntax error: …` and a real server writes no colon here.
+    #[error("syntax error at or near \"{0}\"")]
+    SetValueSyntax(String),
+
     /// The statement is not valid SQL. Contract C1 says this must never be the answer to
     /// something PostgreSQL 19 accepts; when it is, the statement belongs in the gap register.
     #[error("syntax error: {message}")]
@@ -2483,7 +2508,8 @@ impl SqlError {
             // **A syntax error and not a `22P02`**, which is `ltree`'s own choice on a real
             // server: the input function reports where the path stopped being a path.
             | SqlError::LtreeSyntax(_)
-            | SqlError::LQuerySyntax(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::LQuerySyntax(_)
+            | SqlError::SetValueSyntax(_) => sqlstate::SYNTAX_ERROR,
             // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
             // the one place PostgreSQL spends that class on something it will never implement
             // rather than on something it has not implemented yet.
