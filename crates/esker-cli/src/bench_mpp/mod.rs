@@ -296,8 +296,17 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     }
 
     let mut runs: Vec<Run> = Vec::new();
-    for _ in 0..options.repeats {
+    for repeat in 0..options.repeats {
         for query in &queries {
+            // **The join runs once, however many repeats the aggregates get.** It is the most
+            // expensive statement here by an order of magnitude — tens of seconds where the
+            // aggregates are tens of milliseconds — and it is the one query that cannot reach
+            // the columnar path at all (ADR 0040 Decision 4), so its repeats buy context rather
+            // than evidence. Spending them would cost the aggregates their repeats, and the
+            // aggregates are what the verdict turns on.
+            if query.kind == Kind::Join && repeat > 0 {
+                continue;
+            }
             for arm in [Arm::Columnar, Arm::Row] {
                 runs.push(one(&mut pg, cluster, query, arm)?);
             }
@@ -513,9 +522,9 @@ fn report(runs: &[Run], queries: &[Query]) {
     println!();
     println!(
         "| query | engine | fragments | rows out | wall median | wall min–max | SQL-node CPU | \
-         stores' CPU | SQL-node CPU share | cluster loopback bytes | SQL-node peak RSS |"
+         stores' CPU | SQL-node CPU share | cluster loopback bytes | SQL-node peak RSS | runs |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for query in queries {
         for arm in [Arm::Columnar, Arm::Row] {
             let mine: Vec<&Run> = runs
@@ -530,7 +539,7 @@ fn report(runs: &[Run], queries: &[Query]) {
             let peak = median(mine.iter().map(|run| as_float(run.sql_peak_rss)));
             println!(
                 "| {} | {} | {} of {} | {} | {:.3} s | {:.3}–{:.3} s | {sql_cpu:.2} s | \
-                 {store_cpu:.2} s | {:.0}% | {} | {} |",
+                 {store_cpu:.2} s | {:.0}% | {} | {} | {} |",
                 query.name,
                 engine_text(&first.engine),
                 first.fragments_answered,
@@ -542,6 +551,7 @@ fn report(runs: &[Run], queries: &[Query]) {
                 100.0 * sql_cpu / walls.1.max(1e-9),
                 bytes_text(bytes),
                 bytes_text(peak),
+                mine.len(),
             );
         }
     }
