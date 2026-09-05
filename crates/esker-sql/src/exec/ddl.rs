@@ -3732,7 +3732,7 @@ pub(super) fn create_role(
         });
         return Ok(Outcome::done("CREATE ROLE"));
     }
-    catalog::create_role(txn, &create.name, create.login)?;
+    catalog::create_role(txn, &create.name, create.flags)?;
     Ok(Outcome::done("CREATE ROLE"))
 }
 
@@ -4801,6 +4801,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
         Expr::CurrentDatabase => "current_database()".to_owned(),
+        Expr::CurrentUser => "CURRENT_USER".to_owned(),
         Expr::CurrentSchema {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),
