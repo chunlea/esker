@@ -169,13 +169,13 @@ impl Check {
                     return Ok(());
                 }
                 Err(SqlError::ForeignKeyViolation {
-                    relation: table.name.clone(),
+                    relation: super::foreign_key::message_name(&table.name).to_owned(),
                     constraint: key.name.clone(),
                     detail: format!(
                         "Key ({})=({}) is not present in table \"{}\".",
                         super::foreign_key::column_names(table, &key.columns),
                         super::index::render_values(values),
-                        parent.name
+                        super::foreign_key::message_name(&parent.name)
                     ),
                 })
             }

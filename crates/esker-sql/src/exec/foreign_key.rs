@@ -28,7 +28,7 @@ use crate::catalog::{self, ForeignKeyDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::row;
-use crate::value::Datum;
+use crate::value::{Datum, PgDatum};
 
 /// How deep a `CASCADE` may follow itself before this crate calls it a cycle.
 ///
@@ -87,13 +87,13 @@ pub(super) fn check_references(
         }
         if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
-                relation: table.name.clone(),
+                relation: message_name(&table.name).to_owned(),
                 constraint: key.name.clone(),
                 detail: format!(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
                     super::index::render_values(&values),
-                    parent.name
+                    message_name(&parent.name)
                 ),
             });
         }
@@ -130,13 +130,13 @@ pub(super) fn validate(
     for values in pending {
         if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
-                relation: table.name.clone(),
+                relation: message_name(&table.name).to_owned(),
                 constraint: key.name.clone(),
                 detail: format!(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
                     super::index::render_values(&values),
-                    parent.name
+                    message_name(&parent.name)
                 ),
             });
         }
@@ -222,8 +222,13 @@ pub(super) fn cascade_update(
         };
         for old_child in referencing_rows(executor, txn, &child, &key, &before)? {
             let mut new_child = old_child.clone();
+            // **Into the child's type, not the parent's.** `CASCADE` carries the parent's new
+            // key across, and a `bigserial` parent with an `integer` child — Rails' default
+            // pairing — hands an `Int8` to an `Int4` column. This is the assignment cast every
+            // written value gets, applied here because the row is assembled here; without it the
+            // write was refused outright as `column N is Int4 and was given Int8`.
             for (at, value) in key.columns.iter().zip(after.iter()) {
-                new_child[*at] = value.clone();
+                new_child[*at] = super::dml::assign_default(value.clone(), child.columns[*at].ty)?;
             }
             super::dml::rewrite_row(executor, txn, &child, &old_child, &new_child, written)?;
         }
@@ -336,6 +341,26 @@ fn written_by(
     .transpose()
 }
 
+/// The name a `23503` prints for a relation: **bare**, whatever schema it lives in.
+///
+/// PostgreSQL builds both of these messages from the relation's own name and never the qualified
+/// one — measured on 19beta1 with the child in one schema and the parent in another:
+///
+/// ```text
+/// insert or update on table "wagons" violates foreign key constraint "fk_x"
+///   DETAIL:  Key (train_id)=(99) is not present in table "trains".
+/// ```
+///
+/// where those are `sb.wagons` and `sa.trains`. The same holds for the parent-side message, for a
+/// deferred check at `COMMIT`, and for the scan `ADD CONSTRAINT` runs.
+///
+/// **This is not the rule for every message**: `42P01` quotes the qualifier back inside the
+/// quotes, which is what [`crate::catalog::display_name`] is for. Here the stored name would put
+/// its NUL separator inside them instead.
+pub(super) fn message_name(stored: &str) -> &str {
+    catalog::split_qualified(stored).1
+}
+
 /// `23503` from the parent's side, which names **both** tables — the one difference between the
 /// two messages a real server sends for this SQLSTATE.
 fn still_referenced(
@@ -345,14 +370,14 @@ fn still_referenced(
     values: &[Datum],
 ) -> SqlError {
     SqlError::ForeignKeyStillReferenced {
-        relation: parent.name.clone(),
+        relation: message_name(&parent.name).to_owned(),
         constraint: key.name.clone(),
-        child: child.name.clone(),
+        child: message_name(&child.name).to_owned(),
         detail: format!(
             "Key ({})=({}) is still referenced from table \"{}\".",
             column_names(parent, &key.parent_columns),
             super::index::render_values(values),
-            child.name
+            message_name(&child.name)
         ),
     }
 }
@@ -394,6 +419,26 @@ pub(super) fn children_of(
 /// (`crate::exec::query::access_path` narrows only on a whole pinned unique key), so the scan is
 /// what makes it correct. `TODO(post-v1)`: read the child's index when there is one, which is a
 /// planner change and not a change to this rule.
+/// Whether a child's key **is** a parent's, by PostgreSQL's equality rather than the enum's.
+///
+/// `Datum::Int4(1)` and `Datum::Int8(1)` are different values and the same key. That is not an
+/// edge case here: `t.integer :train_id` referencing a `bigserial` primary key is what
+/// `ActiveRecord` writes by default, so it is the ordinary shape of a Rails foreign key.
+///
+/// The child's side of the constraint has always agreed, because it asks by building the parent's
+/// row key and the memcomparable codec widens both to the same bytes — which is why an `INSERT`
+/// into such a child is checked correctly. Only this direction compared `Vec<Datum>` with `==`,
+/// so `DELETE` from the parent found no referencing row, **returned success, and left the child
+/// pointing at nothing**. `ON DELETE CASCADE`, `SET NULL` and the `ON UPDATE` pair went through
+/// the same function and did nothing at all.
+///
+/// [`crate::value::PgDatum::pg_cmp`] is the rule `=` and `GROUP BY` use, and the one the two
+/// directions now share. A NULL never arrives: `referencing_values` returns `None` for a key with
+/// one, which is `MATCH SIMPLE`.
+fn references(child: &[Datum], parent: &[Datum]) -> bool {
+    child.len() == parent.len() && std::iter::zip(child, parent).all(|(a, b)| a.pg_cmp(b).is_eq())
+}
+
 fn referencing_rows(
     executor: &Executor,
     txn: &dyn Txn,
@@ -409,7 +454,7 @@ fn referencing_rows(
         let Some(referencing) = referencing_values(key, &row) else {
             continue;
         };
-        if referencing == values {
+        if references(&referencing, values) {
             rows.push(row);
         }
     }
