@@ -585,11 +585,15 @@ impl CatalogView {
             // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
             // `opcdefault` a boolean; the three oids are `oid` there and this node's own types
             // here, the trade every `pg_catalog` column makes.
-            // `castsource` and `casttarget` are `oid` on a real server and `castcontext` and
-            // `castmethod` are `"char"` — all `text`/`bigint` here, the standing catalog trade.
+            // **`castsource` and `casttarget` are `oid`, here as on a real server** — this pair
+            // steps out of the standing `bigint` trade because they are what a `regtype` is
+            // compared against: `castsource = 'character varying'::regtype` is the join
+            // `ActiveRecord`'s case-insensitivity probe makes, and an `oid` beside a `regtype` is
+            // one representation where a `bigint` beside one is not (ADR 0077). `castcontext` and
+            // `castmethod` are `"char"` there and `text` here, which is the trade unchanged.
             CatalogView::PgCast => &[
-                ("castsource", ColumnType::Int8),
-                ("casttarget", ColumnType::Int8),
+                ("castsource", ColumnType::Oid),
+                ("casttarget", ColumnType::Oid),
                 ("castcontext", ColumnType::Text),
                 ("castmethod", ColumnType::Text),
             ],
@@ -1989,8 +1993,10 @@ fn pg_cast_rows() -> Vec<Vec<Datum>> {
         .iter()
         .map(|(source, target, context, method)| {
             vec![
-                Datum::Int8(*source),
-                Datum::Int8(*target),
+                // The declared type, so the rows and the description agree: an `oid` renders the
+                // same digits a `bigint` did, and now compares with a `regtype` as well.
+                Datum::Oid(u32::try_from(*source).unwrap_or(0)),
+                Datum::Oid(u32::try_from(*target).unwrap_or(0)),
                 Datum::Text((*context).to_owned()),
                 Datum::Text((*method).to_owned()),
             ]
@@ -2572,6 +2578,8 @@ fn partitioned_relkind(
 /// is declared `int8` and named `bigint` in an error. Measured against 19beta1, all six.
 pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
+        ColumnType::RegType => "regtype",
+        ColumnType::RegTypeArray => "_regtype",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
         // client matching on it expects.
@@ -2702,6 +2710,9 @@ fn typtype(ty: ColumnType) -> &'static str {
 /// a type added here has to answer instead of inheriting somebody else's letter.
 pub(super) fn typcategory(ty: ColumnType) -> &'static str {
     match ty {
+        // A `regtype` sits in the `N` group below beside the `oid` it is, and its array in `A`
+        // with every other array — which is the point of the model (ADR 0077) rather than an
+        // exception to it.
         ColumnType::Int8
         | ColumnType::Int4
         | ColumnType::Int2
@@ -2710,6 +2721,7 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::Numeric
         // A number, and PostgreSQL groups it with them despite being an identifier.
         | ColumnType::Oid
+        | ColumnType::RegType
         // **And a money**, which a real server puts here too — not in `U` with the extension
         // types and not in a category of its own. Measured.
         | ColumnType::Money => "N",
@@ -2758,7 +2770,7 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`, all seven.
@@ -2803,6 +2815,8 @@ fn typdelim(ty: ColumnType) -> &'static str {
 
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
+        // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
+        ColumnType::RegType => "regtypein",
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
         // catalog: `ActiveRecord` decides that a column is an array by comparing this string, and
         // a column it does not know to be an array is what makes it hand a Ruby `Array` to
@@ -2837,6 +2851,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::JsonArray
         | ColumnType::JsonbArray
         | ColumnType::OidArray
+        | ColumnType::RegTypeArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray

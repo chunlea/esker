@@ -42,12 +42,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg_cast is not built",
             "pg19_assignment_cast_date.txt:43",
         ),
-        (
-            "SELECT 'r', count(*) FROM pg_cast WHERE casttarget = 'date'::regtype AND \
-             castcontext = 'a'",
-            "pg_cast is not built",
-            "pg19_assignment_cast_date.txt:91",
-        ),
         // **A per-row cast still has only `text` as a target**, which is the standing debt this
         // lane has carried since the array unit — `'…'::date` on a *constant* folds at plan time
         // and works, and `CURRENT_TIMESTAMP::date` cannot, because the value is not known until

@@ -142,6 +142,12 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::TsQuery
                 | ColumnType::TsVectorArray
                 | ColumnType::TsQueryArray
+                // A `regtype` is not an index column either, and for a reason of its own: its
+                // value is an oid and its name is only how it prints, so a key over one would have
+                // to choose between the order the comparison uses and the one a reader expects
+                // ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+                | ColumnType::RegType
+                | ColumnType::RegTypeArray
         ) {
             assert!(
                 !types_seen.contains(&ty),
