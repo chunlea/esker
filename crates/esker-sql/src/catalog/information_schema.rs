@@ -503,7 +503,11 @@ fn numeric_scale(ty: ColumnType) -> Datum {
 /// fractional digits a `timestamp` stores, so a column with no modifier still has a precision.
 fn datetime_precision(column: &ColumnDef) -> Datum {
     match column.ty {
-        ColumnType::Timestamp | ColumnType::TimestampTz => {
+        // **`interval` is here too, and its default is six as well** — measured, a plain
+        // `interval` column reports `6` where this answered NULL. The type keeps six fractional
+        // digits whether or not anybody wrote a number, which is the same argument as `timestamp`'s
+        // above; only the typmod's *encoding* differs, and `ColumnDef::precision` absorbs that.
+        ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Interval => {
             Datum::Int4(i32::try_from(column.precision().unwrap_or(6)).unwrap_or(6))
         }
         _ => Datum::Null,
