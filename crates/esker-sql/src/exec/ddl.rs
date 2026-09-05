@@ -3133,6 +3133,15 @@ pub(super) fn create_schema(
     if create.name.starts_with("pg_") {
         return Err(SqlError::ReservedSchemaName(create.name.clone()));
     }
+    // **`AUTHORIZATION u` requires `u` to be a role**, which is the half of ownership a client can
+    // tell apart: the statement fails on a name that is not there. What is *not* recorded is who
+    // owns the schema afterwards — `pg_namespace` has no owner column and nothing here enforces
+    // one (`docs/plans/roles-and-user-schemas.md`).
+    if let Some(owner) = &create.owner
+        && catalog::role_by_name(&*txn, owner)?.is_none()
+    {
+        return Err(SqlError::UndefinedRole(owner.clone()));
+    }
     if catalog::schema_exists(&*txn, executor.tenant, &create.name)? {
         // **`IF NOT EXISTS` is a notice and a success**, which is what a real server answers; the
         // notice itself is on stderr in `psql` and is not a row.
@@ -3688,6 +3697,53 @@ pub(super) fn drop_view(
         }
     }
     Ok(Outcome::done("DROP VIEW"))
+}
+
+/// `CREATE ROLE name` / `CREATE USER name`.
+///
+/// Cluster-wide: a role made here is visible from every database, which is what a real server does
+/// and why `catalog::create_role` takes no tenant.
+///
+/// **No privileges are attached and none are enforced** — a declared divergence
+/// (`docs/plans/roles-and-user-schemas.md`). The six tests this unit exists for need a role to
+/// *exist*, own a schema and be assumable; a catalog that recorded grants nobody honoured would be
+/// a security-shaped feature that is not one.
+pub(super) fn create_role(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    create: &plan::CreateRole,
+) -> Result<Outcome> {
+    if create.if_not_exists && catalog::role_by_name(&*txn, &create.name)?.is_some() {
+        executor.notice(SqlError::DoesNotExistSkipping {
+            kind: "role",
+            name: create.name.clone(),
+        });
+        return Ok(Outcome::done("CREATE ROLE"));
+    }
+    catalog::create_role(txn, &create.name, create.login)?;
+    Ok(Outcome::done("CREATE ROLE"))
+}
+
+/// `DROP ROLE [IF EXISTS] name` / `DROP USER …`.
+pub(super) fn drop_role(
+    executor: &mut Executor,
+    txn: &mut dyn Txn,
+    drop: &plan::DropRole,
+) -> Result<Outcome> {
+    for name in &drop.names {
+        if catalog::role_by_name(&*txn, name)?.is_none() {
+            if drop.if_exists {
+                executor.notice(SqlError::DoesNotExistSkipping {
+                    kind: "role",
+                    name: name.clone(),
+                });
+                continue;
+            }
+            return Err(SqlError::UndefinedRole(name.clone()));
+        }
+        catalog::drop_role(txn, name)?;
+    }
+    Ok(Outcome::done("DROP ROLE"))
 }
 
 /// `DROP SCHEMA [IF EXISTS] name [CASCADE]`.

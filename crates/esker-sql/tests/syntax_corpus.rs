@@ -155,7 +155,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
         "REVOKE GRANT OPTION FOR SELECT ON t FROM alice CASCADE;",
         "G24",
     ),
-    ("CREATE USER bob SUPERUSER CREATEDB CREATEROLE;", "G24"),
     (
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO alice;",
         "G24",
