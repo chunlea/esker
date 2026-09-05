@@ -127,3 +127,25 @@ fn a_view_that_is_not_auto_updatable_is_refused_the_way_a_real_server_refuses_it
         assert_eq!(refused.to_string(), message, "{sql}");
     }
 }
+
+/// `UPDATE printed SET name = $1 WHERE printed.id = $2` — the statement `test_update_record`
+/// really sends, **qualified with the view's own name**.
+///
+/// The rewrite onto the table underneath replaced the target relation and renamed the columns, but
+/// left every qualifier pointing at the view, so the rewritten statement referred to a relation its
+/// own `FROM` no longer had: `42P01 missing FROM-clause entry for table "printed"`. My first tests
+/// for writing through a view wrote `WHERE id = 1` — unqualified, and with a literal — which is
+/// exactly the shape that passes while the client's own statement does not.
+#[test]
+fn a_view_qualified_column_is_rewritten_onto_the_table_underneath() {
+    let mut node = node();
+    assert_eq!(
+        node.answer("UPDATE printed SET name = 'AWDwR' WHERE printed.id = 1"),
+        node.answer("UPDATE books SET name = 'AWDwR' WHERE books.id = 1"),
+        "the view's own name is a legal qualifier for its own columns"
+    );
+    assert_eq!(
+        node.rows("SELECT name FROM books WHERE id = 1"),
+        vec![vec!["AWDwR".to_owned()]]
+    );
+}

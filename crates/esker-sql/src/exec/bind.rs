@@ -370,7 +370,7 @@ fn under_own_names(tables: &[std::sync::Arc<TableDef>]) -> Vec<Named<'_>> {
 /// name *bare*, so a dot-splitting version of this strips nothing and still compares equal there.
 /// It is every other schema that breaks, which is why this surfaced only under
 /// `SET SESSION AUTHORIZATION`.
-fn bare(name: &str) -> &str {
+pub(super) fn bare(name: &str) -> &str {
     name.rsplit(crate::catalog::SCHEMA_SEPARATOR)
         .next()
         .unwrap_or(name)

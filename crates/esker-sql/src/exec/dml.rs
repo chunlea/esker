@@ -466,15 +466,26 @@ fn updatable(
 fn rename_columns(
     expr: &mut crate::plan::Expr,
     renames: &std::collections::BTreeMap<String, String>,
+    through: &str,
+    onto: &str,
 ) {
-    if renames.is_empty() {
-        return;
-    }
     crate::exec::bind::walk_expr_mut(expr, &mut |expr| {
-        if let crate::plan::Expr::Column { name, .. } = expr
-            && let Some(base) = renames.get(name)
-        {
-            name.clone_from(base);
+        if let crate::plan::Expr::Column { table, name } = expr {
+            // **A column may be qualified with the view's own name**, and the rewrite moves the
+            // relation out from under it. `UPDATE printed_books SET … WHERE printed_books.id = $1`
+            // is what `view_test.rb` sends, and renaming only the *column* left the qualifier
+            // naming a relation the rewritten statement's `FROM` no longer had:
+            // `42P01 missing FROM-clause entry for table "printed_books"` — for a statement whose
+            // every part was valid. An alias is left alone: `UPDATE v AS p … WHERE p.id` keeps the
+            // alias, and the alias goes on the table underneath.
+            if let Some(qualifier) = table
+                && crate::exec::bind::bare(qualifier) == crate::exec::bind::bare(through)
+            {
+                onto.clone_into(qualifier);
+            }
+            if let Some(base) = renames.get(name) {
+                name.clone_from(base);
+            }
         }
     });
 }
@@ -482,12 +493,12 @@ fn rename_columns(
 /// The `UPDATE` a view's write becomes, against the table underneath.
 fn update_onto(update: &Update, view: Updatable) -> Update {
     let mut rewritten = update.clone();
-    rewritten.table = view.table;
+    let through = std::mem::replace(&mut rewritten.table, view.table.clone());
     rewritten.assignments = rewritten
         .assignments
         .into_iter()
         .map(|(column, mut value)| {
-            rename_columns(&mut value, &view.renames);
+            rename_columns(&mut value, &view.renames, &through, &view.table);
             match view.renames.get(&column) {
                 Some(base) => (base.clone(), value),
                 None => (column, value),
@@ -495,7 +506,7 @@ fn update_onto(update: &Update, view: Updatable) -> Update {
         })
         .collect();
     if let Some(filter) = &mut rewritten.filter {
-        rename_columns(filter, &view.renames);
+        rename_columns(filter, &view.renames, &through, &view.table);
     }
     // **The view's own `WHERE` bounds the write**, which is the whole of what makes
     // `UPDATE p SET …` touch one row rather than every row of the table.
@@ -1179,9 +1190,9 @@ pub(super) fn delete(
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
     if let Some(view) = updatable(executor, txn, &delete.table, Verb::Delete)? {
         let mut rewritten = delete.clone();
-        rewritten.table = view.table;
+        let through = std::mem::replace(&mut rewritten.table, view.table.clone());
         if let Some(filter) = &mut rewritten.filter {
-            rename_columns(filter, &view.renames);
+            rename_columns(filter, &view.renames, &through, &view.table);
         }
         // A `DELETE` with no `WHERE` deletes what the **view** shows, not the table.
         rewritten.filter = both(rewritten.filter, view.filter);

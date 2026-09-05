@@ -220,6 +220,67 @@ fn a_bind_parameter_is_typed_from_a_column_in_the_session_s_own_schema() {
     assert_eq!(stream, "1tT2DCZ", "the whole exchange: {stream}");
 }
 
+/// **A parameter compared with a view's column is typed by that column**, and `Describe` and
+/// `Execute` say the same thing about it.
+///
+/// The gap this file could not see, because it prepared no statement naming a view.
+/// Both halves had it, by different routes: the execute path resolved a statement's
+/// relations through `View::table`, which does not answer for a view, and `described_in` expanded
+/// the view into a derived table *before* typing — and a derived table is what the typer skips. So
+/// `Describe` and `Execute` agreed, and both answered
+/// `42883 operator does not exist: bigint = text` for a plain read of a view.
+///
+/// It is asserted as one exchange because the two halves fail at different points: the parameter
+/// description is where the type is claimed, and the `Execute` is where a wrong one is felt.
+#[test]
+fn a_bind_parameter_is_typed_from_a_view_s_column() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE books (id bigserial primary key, name text, format text)",
+        "INSERT INTO books (name, format) VALUES ('a', 'paperback')",
+        "CREATE VIEW printed AS SELECT id, name, format FROM books WHERE format = 'paperback'",
+    ]);
+    let mut session = Session::new();
+    let mut out = Vec::new();
+    for message in [
+        Frontend::Parse {
+            statement: "v1".to_owned(),
+            sql: "SELECT name FROM printed WHERE id = $1".to_owned(),
+            param_types: Vec::new(),
+        },
+        Frontend::Describe {
+            target: Target::Statement,
+            name: "v1".to_owned(),
+        },
+        Frontend::Bind {
+            portal: String::new(),
+            statement: "v1".to_owned(),
+            param_formats: Vec::new(),
+            params: vec![Some(b"1".to_vec())],
+            result_formats: Vec::new(),
+        },
+        Frontend::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+        Frontend::Sync,
+    ] {
+        session.handle(&message, &mut node.executor, &mut out);
+    }
+
+    let stream = tags(&out);
+    assert!(
+        !stream.contains('E'),
+        "reading a view with a bound predicate must not fail: {stream}"
+    );
+    assert_no_data_before_description(&stream, "a view with a bound predicate");
+    assert_eq!(stream, "1tT2DCZ", "the whole exchange: {stream}");
+    assert_eq!(
+        parameter_oids(&out),
+        vec![20],
+        "the view publishes `id` as bigint, so $1 is bigint (oid 20) and not the text fallback"
+    );
+}
+
 /// **A three-part column name types the parameter beside it.**
 ///
 /// `schema_test.rb`'s `test_habtm_table_name_with_schema`, whose models carry a schema in
