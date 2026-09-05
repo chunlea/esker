@@ -1,0 +1,29 @@
+crates/esker-sql/src/error.rs
+  s_2d916f5f540186::t_80e8d9d3e23e0b 273-281,2436
+crates/esker-sql/src/exec/cancel.rs
+  s_2d916f5f540186::t_1884b4fa3389b0 15-17,25-31,48-70,76-81,87-140
+crates/esker-sql/src/exec/mod.rs
+  s_2d916f5f540186::t_f922a85d78448c 30
+crates/esker-sql/src/pgwire/backends.rs
+  s_2d916f5f540186::t_1e2152a8177caf 1-169
+crates/esker-sql/src/pgwire/mod.rs
+  s_2d916f5f540186::t_06d9bed4b15e70 23
+crates/esker-sql/src/pgwire/server.rs
+  s_2d916f5f540186::t_c48951798e97dc 13,112-124,147-152,166-171,192,219,283-286,327-334,395-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5b470e6a34fff541aece8b72c8130c09c54772ff",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
