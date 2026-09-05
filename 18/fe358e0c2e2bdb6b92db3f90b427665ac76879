@@ -1,0 +1,21 @@
+crates/esker-cli/Cargo.toml
+  s_2bed4ac2b1c944::t_311a0e8dac7178 34-37
+crates/esker-cli/src/bench_mpp/workload.rs
+  s_2bed4ac2b1c944::t_c1169abfc46331 71-95,166,260-267,269-279,312,315-319,353,395,406-442
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "18fe358e0c2e2bdb6b92db3f90b427665ac76879",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
