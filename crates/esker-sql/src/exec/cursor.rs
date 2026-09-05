@@ -2963,8 +2963,6 @@ fn catalog_function(
             oid_argument(args.first())?,
             column_argument(args.get(1))?,
         ),
-        // The `pretty` flag changes nothing this node prints: it re-wraps a long `CHECK`
-        // expression on a real server, and there are no `CHECK` constraints here.
         // **The inverse of `'x'::regclass`, and per row.** An oid that names nothing is not an
         // error: it prints the number back, and oid 0 prints `-`, PostgreSQL's rendering of
         // `InvalidOid`. Measured, both — raising here would break a `LEFT JOIN` that legitimately
@@ -3084,9 +3082,11 @@ fn catalog_function(
                 None => Datum::Null,
             }
         }
+        CatalogFunc::PgGetConstraintdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
         CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
             env.relations()?,
             oid_argument(args.first())?,
+            pretty_argument(args.get(1))?,
         ),
         // **Nothing found is NULL and never an error** — an uncommented object, an attnum out of
         // range, a negative one, an oid that names nothing, an unknown catalog name and a NULL
@@ -3344,6 +3344,23 @@ fn column_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "a column number is an integer, not {other:?}"
+            )));
+        }
+    })
+}
+
+/// `pg_get_constraintdef`'s optional `pretty` flag.
+///
+/// **Absent is `false`**, measured: the one-argument form and `pretty => false` are the same
+/// string for every contype. A NULL is answered before this is called, the function being strict
+/// in both arguments.
+fn pretty_argument(arg: Option<&Datum>) -> Result<bool> {
+    Ok(match arg {
+        None | Some(Datum::Null) => false,
+        Some(Datum::Bool(pretty)) => *pretty,
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "a pretty flag is a boolean, not {other:?}"
             )));
         }
     })

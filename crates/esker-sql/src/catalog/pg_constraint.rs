@@ -314,10 +314,17 @@ fn domain_constraint_rows(relations: &Relations, schemas: &[(String, u64)]) -> V
 /// NULL for an oid that names no constraint, measured — the same rule `pg_get_indexdef` follows,
 /// and for the same reason: a client calls it over a column of oids it has not filtered.
 ///
-/// The `pretty` flag changes nothing this node prints. On a real server it re-wraps a long `CHECK`
-/// expression, and there are no `CHECK` constraints here.
+/// **The `pretty` flag reaches a `CHECK` and nothing else.** Measured on 19beta1 over all six
+/// contypes: for `p`, `u`, `f`, `x` and `n` the two forms are byte-identical, and for a `c` the
+/// pretty form drops one pair of parentheses — `CHECK (quantity > 0)` against
+/// `CHECK ((quantity > 0))`. The one-argument form is the **non**-pretty one, so
+/// `unique_constraints` and `foreign_keys`, which send it, see nothing move.
+///
+/// It does not re-wrap. That was the earlier belief here and it is why the flag was ignored;
+/// measured, `strpos(pg_get_constraintdef(oid, true), chr(10))` is `0` for predicates of 42, 153
+/// and 223 characters. `PRETTYFLAG_INDENT` reaches `pg_get_indexdef`'s column lists, not this.
 #[must_use]
-pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
+pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bool) -> Datum {
     let Some(oid) = oid else {
         return Datum::Null;
     };
@@ -344,11 +351,17 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>) -> Datum {
         && let Some(check) = table.checks.get(at)
     {
         // `CHECK ((p > 0))` — the doubled parentheses are PostgreSQL's, which wraps the whole
-        // predicate and then prints it parenthesised. Measured, and so is the suffix: an unvalidated
-        // one prints `CHECK ((quantity > 0)) NOT VALID`, which is what the schema dumper reads to
-        // write `validate: false` back out.
+        // predicate and then prints it parenthesised; `pretty` is the spelling that keeps one
+        // pair. Measured, and so is the suffix: an unvalidated one prints
+        // `CHECK ((quantity > 0)) NOT VALID` and `CHECK (quantity > 0) NOT VALID`, always
+        // **outside** the parentheses, which is what lets `ActiveRecord`'s greedy
+        // `/CHECK \((.+)\)/` stop before it.
         let suffix = if check.validated { "" } else { " NOT VALID" };
-        return Datum::Text(format!("CHECK (({})){suffix}", check.expr));
+        return Datum::Text(if pretty {
+            format!("CHECK ({}){suffix}", check.expr)
+        } else {
+            format!("CHECK (({})){suffix}", check.expr)
+        });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.
     if let Some((table_id, at)) = foreign_key_of(oid)
