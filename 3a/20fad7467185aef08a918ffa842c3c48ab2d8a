@@ -1,0 +1,66 @@
+.config/nextest.toml
+  h_44076b318daf9c 40
+crates/esker-cli/src/args.rs
+  h_44076b318daf9c 266-269,1294
+crates/esker-cli/src/bench_mpp/mod.rs
+  h_44076b318daf9c 44,76-81,112,166-172,267-269,383-548
+crates/esker-cli/src/bench_mpp/workload.rs
+  h_44076b318daf9c 244-312
+crates/esker-cli/tests/cluster_harness/mod.rs
+  h_44076b318daf9c 1-410
+crates/esker-cli/tests/cross_region_scan.rs
+  h_44076b318daf9c 1-172
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 139-169,811,816-818,820,822-823,839-917
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 259-358
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 118-142,2069-2075,2531-2532,2760
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 617-654,5350-5354,5470,5515-5525,5587-5636
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 3092-3116,3601,3637,3659,3677,3682,3732
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 269-285
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 1252-1253,1423-1439,2761,2828-2833,2853-2855,2857,2869,3069-3078,3680-3692,6129-6138
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 1210-1211,1215-1221,1410-1420
+crates/esker-sql/src/session.rs
+  h_44076b318daf9c 176-200
+crates/esker-sql/tests/add_column_primary_key.rs
+  h_44076b318daf9c 1-160
+crates/esker-sql/tests/bare_relation_name.rs
+  h_44076b318daf9c 84-85,93,95-98,100,102-103,105,107,109-111,113-119
+crates/esker-sql/tests/cancel_over_a_socket.rs
+  h_44076b318daf9c 1-201
+crates/esker-sql/tests/captures/pg19_add_column_primary_key.txt
+  h_44076b318daf9c 1-52
+crates/esker-sql/tests/cross_session_cancel.rs
+  h_44076b318daf9c 1-322
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 67-75,211-212,222-228,230,474,487
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 104-106
+crates/esker-sql/tests/three_part_name.rs
+  h_44076b318daf9c 1-120
+crates/esker-sql/tests/unique_over_existing_rows.rs
+  h_44076b318daf9c 20-25
+crates/esker-sql/tests/unquoted_user_in_search_path.rs
+  h_44076b318daf9c 1-70
+docs/bench/mpp-baseline.md
+  h_44076b318daf9c 288-387
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 398-406,411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3a20fad7467185aef08a918ffa842c3c48ab2d8a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
