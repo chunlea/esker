@@ -74,6 +74,7 @@ impl Cluster {
                             Arc::clone(&backend) as Arc<dyn Backend>,
                             Arc::clone(&catalog),
                             TENANT,
+                            esker_sql::session::register(),
                         ),
                         in_block: false,
                         failed: false,
@@ -770,7 +771,11 @@ struct OneIdler {
 }
 
 impl esker_sql::pgwire::server::Executors for OneIdler {
-    fn for_session(&self, _database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        _database: &str,
+        _identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         Ok(Box::new(Idling {
             limit: self.limit,
             rolled_back: Arc::clone(&self.rolled_back),

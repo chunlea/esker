@@ -137,7 +137,12 @@ pub(crate) fn run_file(name: &str, body: &str) -> usize {
 /// The whole corpus, unchanged, is the point: a file that had to be written differently for the
 /// real store would be testing the file rather than the store.
 pub(crate) fn run_file_on(name: &str, body: &str, backend: Arc<dyn Backend>) -> usize {
-    let mut executor = Executor::new(backend, Arc::new(Catalog::new()), 1);
+    let mut executor = Executor::new(
+        backend,
+        Arc::new(Catalog::new()),
+        1,
+        esker_sql::session::register(),
+    );
     let mut directives = 0;
 
     for directive in parse_file(name, body) {

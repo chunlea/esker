@@ -43,6 +43,7 @@ impl Node {
             Arc::clone(&self.backend) as Arc<dyn Backend>,
             Arc::clone(&self.catalog),
             1,
+            esker_sql::session::register(),
         )
     }
 }

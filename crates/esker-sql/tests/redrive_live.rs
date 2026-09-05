@@ -68,7 +68,12 @@ impl Node {
 
     fn session(&self) -> Session {
         Session {
-            executor: Executor::new(Arc::clone(&self.backend), Arc::clone(&self.catalog), TENANT),
+            executor: Executor::new(
+                Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                TENANT,
+                esker_sql::session::register(),
+            ),
         }
     }
 

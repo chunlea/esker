@@ -1459,14 +1459,28 @@ fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<
         .into_iter()
         .find(|(_, id)| *id == tenant)
         .map(|(name, _)| name);
-    Ok(vec![vec![
+    // **One row per live session, from the one registry every session is in** — a connection, a
+    // `Pair` and a `Cluster` alike (`crate::session`). It used to be a single row whose pid was
+    // `std::process::id()`, the same number for every session and therefore useless to the one
+    // thing a client wants it for: `SELECT pid FROM pg_stat_activity WHERE query LIKE …`, which is
+    // how `pg_cancel_backend` is aimed.
+    Ok(crate::session::snapshot()
+        .into_iter()
+        .map(|(pid, activity)| stat_activity_row(tenant, datname.clone(), pid, &activity))
+        .collect())
+}
+
+/// One `pg_stat_activity` row.
+fn stat_activity_row(
+    tenant: u64,
+    datname: Option<String>,
+    pid: u32,
+    activity: &crate::session::Activity,
+) -> Vec<Datum> {
+    vec![
         Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX)),
         datname.map_or(Datum::Null, Datum::Text),
-        // **A pid, because the column is an `integer` and a client filters on it.** This node has
-        // no backend processes to number, so the number is the one thing about the session that is
-        // already true and already unique: nothing else in `pg_stat_activity` is derived from a
-        // fact this node invented.
-        Datum::Int4(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
+        Datum::Int4(i32::try_from(pid).unwrap_or(i32::MAX)),
         // Not a parallel worker: there are none, so no backend here has a leader.
         Datum::Null,
         Datum::Null,
@@ -1483,15 +1497,24 @@ fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<
         // ADR 0031's permanent caveat and is why both wait columns are NULL rather than empty.
         Datum::Null,
         Datum::Null,
-        Datum::Text("active".to_owned()),
+        // **`active` only while something is running**, which is the distinction a client reads:
+        // a session between statements is `idle` on a real server and was `active` here always.
+        Datum::Text(
+            if activity.query.is_some() {
+                "active"
+            } else {
+                "idle"
+            }
+            .to_owned(),
+        ),
         Datum::Null,
         Datum::Null,
         Datum::Null,
-        // The statement text is session state and `rows_of` is given a transaction and a tenant,
-        // not a session. NULL is what a real server sends when it will not show the query.
-        Datum::Null,
+        // The statement this session is running, which is what `WHERE query LIKE …` needs. NULL
+        // while it runs nothing, as a real server sends for a session with no current query.
+        activity.query.clone().map_or(Datum::Null, Datum::Text),
         Datum::Text("client backend".to_owned()),
-    ]])
+    ]
 }
 
 /// Every `pg_matviews` row: one per materialized view, and no ordinary table.

@@ -34,7 +34,11 @@ const GSSENC_REQUEST: u32 = 80_877_104;
 struct Sessions;
 
 impl Executors for Sessions {
-    fn for_session(&self, _database: &str) -> esker_sql::Result<Box<dyn Execute + Send>> {
+    fn for_session(
+        &self,
+        _database: &str,
+        _identity: esker_sql::session::Backend,
+    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
         Ok(Box::new(NotYetExecuting))
     }
 }
