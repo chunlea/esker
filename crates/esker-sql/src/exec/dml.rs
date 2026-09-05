@@ -1134,6 +1134,32 @@ fn render_key(table: &TableDef, ordinals: &[usize], values: &[Datum]) -> String 
 /// further along the scan and updated twice. That is the Halloween problem, and materialising the
 /// matching rows first is the cheap way out of it: what the statement writes can no longer change
 /// what it is about to read.
+/// An `UPDATE`'s `RETURNING`, resolved against the target and everything its `FROM` chain adds.
+///
+/// Split out of [`update`] because that function is at the line limit and this is the part of it
+/// that is about one clause rather than about the statement.
+fn update_returning(
+    executor: &Executor,
+    update: &Update,
+    named: &TableDef,
+    target_name: &str,
+    chain: &[crate::plan::Join],
+    sources: &[std::sync::Arc<TableDef>],
+) -> Result<Option<Returned>> {
+    let target_ref = crate::plan::TableRef {
+        alias: update.alias.clone(),
+        ..crate::plan::TableRef::bare(named.name.clone())
+    };
+    let entries = scope_entries(named, target_name, chain, sources);
+    Returned::open_over(
+        update.returning.as_ref(),
+        target_ref,
+        chain,
+        &query::Scope::chain(&entries),
+        executor.interval_style(),
+    )
+}
+
 pub(super) fn update(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -1163,20 +1189,7 @@ pub(super) fn update(
             .collect::<Result<Vec<_>>>()?
     };
     let target_name = target_name(update, &named);
-    let target_ref = crate::plan::TableRef {
-        alias: update.alias.clone(),
-        ..crate::plan::TableRef::bare(named.name.clone())
-    };
-    let mut returned = {
-        let entries = scope_entries(&named, &target_name, &chain, &sources);
-        Returned::open_over(
-            update.returning.as_ref(),
-            target_ref,
-            &chain,
-            &query::Scope::chain(&entries),
-            executor.interval_style(),
-        )?
-    };
+    let mut returned = update_returning(executor, update, &named, &target_name, &chain, &sources)?;
     let targets = inheritance_targets(executor, txn, &named)?;
     let mut count = 0;
 
