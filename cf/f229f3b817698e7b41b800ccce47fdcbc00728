@@ -1,0 +1,19 @@
+crates/esker-sql/tests/uuid_primary_key_pk_lookup.rs
+  s_2d916f5f540186::t_b3dc1e73a58c7d 1-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cff229f3b817698e7b41b800ccce47fdcbc00728",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
