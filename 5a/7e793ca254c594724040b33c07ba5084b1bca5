@@ -1,0 +1,21 @@
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_a8f258d8df7cce 1351-1353,1611
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_ae73124ee52ec2 1609-1610
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5a7e793ca254c594724040b33c07ba5084b1bca5",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
