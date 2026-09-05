@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use esker_proto::{
-    Epoch, Operator, PeerRole, RawKvReq, RawKvResp, Region, RequestHeader, Server, ServerHandle,
-    Service, TransportConfig, TxnKvReq, TxnKvResp, TxnMutation,
+    Epoch, Operator, PeerRole, RawKvReq, RawKvResp, Region, Reply, Request, RequestHeader,
+    Response, Server, ServerHandle, Service, TransportConfig, TxnKvReq, TxnKvResp, TxnMutation,
 };
 use esker_store::pd::{FakePd, PdClient};
 use esker_store::server::RaftOptions;
@@ -498,6 +498,27 @@ async fn commit_one(
     start_ts: u64,
     commit_ts: u64,
 ) {
+    commit_value(
+        store,
+        region,
+        key,
+        Bytes::from_static(value),
+        start_ts,
+        commit_ts,
+    )
+    .await;
+}
+
+/// [`commit_one`] for a value that is built rather than named: a catalog record, or a row encoded
+/// by `esker-keys`. The same two entries through the same path; only the value's lifetime differs.
+async fn commit_value(
+    store: &Arc<Store>,
+    region: &Region,
+    key: Bytes,
+    value: Bytes,
+    start_ts: u64,
+    commit_ts: u64,
+) {
     let requests = [
         TxnKvReq::Prewrite {
             start_ts,
@@ -505,7 +526,7 @@ async fn commit_one(
             ttl_ms: 3_000,
             mutations: vec![TxnMutation::Put {
                 key: key.clone(),
-                value: Bytes::from_static(value),
+                value: value.clone(),
                 read_ts: None,
             }],
         },
@@ -1132,24 +1153,7 @@ async fn a_placed_columnar_learner_holds_what_the_leader_holds() {
     )
     .await;
 
-    let epoch = first.store.regions().regions()[0].epoch;
-    pd.issue(Operator::AddLearner {
-        region_id: 1,
-        epoch,
-        store_id: 2,
-        peer_id: 2,
-    });
-    wait_for("the columnar learner in the membership", || {
-        first.store.regions().regions()[0]
-            .peers
-            .iter()
-            .any(|peer| peer.role == PeerRole::ColumnarLearner)
-    })
-    .await;
-    wait_for("the region to arrive on the second store", || {
-        second.store.regions().get(1).is_some()
-    })
-    .await;
+    place_a_columnar_learner(&pd, &first, &second).await;
 
     // One more commit after the placement, so "caught up" means the stream as well as the
     // transfer — a learner that received nothing and then followed the log perfectly would pass
@@ -1543,13 +1547,11 @@ async fn snapshot_refusal(
     peer_id: u64,
 ) -> Option<String> {
     match connection
-        .call_stream(esker_proto::Request::Snapshot(
-            esker_proto::SnapshotRequest {
-                region_id,
-                index: 1,
-                peer_id,
-            },
-        ))
+        .call_stream(Request::Snapshot(esker_proto::SnapshotRequest {
+            region_id,
+            index: 1,
+            peer_id,
+        }))
         .await
     {
         Err(error) => Some(error.to_string()),
@@ -1599,13 +1601,11 @@ async fn a_store_outside_the_region_is_refused_a_copy() {
 
     // The member itself is served, and the first chunk is a header naming the region.
     let mut stream = connection
-        .call_stream(esker_proto::Request::Snapshot(
-            esker_proto::SnapshotRequest {
-                region_id: 1,
-                index: 1,
-                peer_id: 1,
-            },
-        ))
+        .call_stream(Request::Snapshot(esker_proto::SnapshotRequest {
+            region_id: 1,
+            index: 1,
+            peer_id: 1,
+        }))
         .await
         .expect("a member is served");
     let first = stream.next_chunk().await.unwrap().unwrap();
@@ -1905,4 +1905,275 @@ async fn what_is_streamed_is_the_region_and_nothing_else() {
         panic!("not a scan");
     };
     assert_eq!(pairs.len(), 20);
+}
+
+// -- the copy a placed columnar learner answers from ----------------------------------------
+
+/// `id int8, name text`, which is what [`table_row`] encodes and what the record below publishes.
+const COLUMNAR_TENANT: u64 = 1;
+const COLUMNAR_TABLE: u64 = 1;
+
+/// The catalog record an `ALTER TABLE ... SET (columnar_replicas = 1)` commits.
+fn columnar_record() -> Bytes {
+    Bytes::from(
+        esker_keys::columnar::encode(
+            1,
+            Some(&esker_keys::columnar::Published {
+                schema_version: 1,
+                columns: vec![
+                    (esker_keys::value::ColumnType::Int8, None),
+                    (esker_keys::value::ColumnType::Text, None),
+                ],
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+fn table_row_key(id: i64) -> Bytes {
+    Bytes::from(
+        esker_keys::row::row_key(
+            COLUMNAR_TENANT,
+            COLUMNAR_TABLE,
+            &[esker_keys::value::Datum::Int8(id)],
+        )
+        .unwrap(),
+    )
+}
+
+fn table_row(id: i64, name: &str) -> Bytes {
+    Bytes::from(
+        esker_keys::row::encode_row(
+            &[
+                esker_keys::value::ColumnType::Int8,
+                esker_keys::value::ColumnType::Text,
+            ],
+            &[
+                esker_keys::value::Datum::Int8(id),
+                esker_keys::value::Datum::Text(name.into()),
+            ],
+        )
+        .unwrap(),
+    )
+}
+
+/// The `id`s a scan fragment answers with, asked of `node` the way the SQL layer asks.
+///
+/// In process rather than over the socket: the same [`Service`] the server dispatches through, so
+/// the whole of `Store::serve_fragment` runs — the epoch check, the role check and the catch-up —
+/// with nothing between the assertion and the code under test.
+async fn fragment_ids(node: &Node, region_id: u64, min_apply_index: u64) -> Vec<i64> {
+    let epoch = node
+        .store
+        .regions()
+        .get(region_id)
+        .expect("the learner holds the region")
+        .region()
+        .epoch;
+    let fragment = esker_columnar::Fragment::scan(
+        esker_columnar::TableRef {
+            tenant: COLUMNAR_TENANT,
+            table_id: COLUMNAR_TABLE,
+        },
+        vec![0, 1],
+    );
+    let reply = StoreService::new(Arc::clone(&node.store))
+        .call(Request::Fragment {
+            header: RequestHeader::new(region_id, epoch, 0),
+            request: esker_proto::fragment::FragmentReq {
+                fragment: esker_columnar::fragment::encode(&fragment).into(),
+                // Every version this test commits, which is what makes the answer about the
+                // copy's completeness rather than about visibility.
+                ts: u64::MAX,
+                min_apply_index,
+            },
+        })
+        .await
+        .expect("a fragment is answered, never an error frame");
+    let Reply::Unary(Response::Fragment(answer)) = reply else {
+        panic!("a fragment request was answered with {reply:?}");
+    };
+    let esker_proto::fragment::FragmentResp::Result { result, .. } = answer else {
+        panic!("the learner refused the fragment: {answer:?}");
+    };
+    let esker_proto::fragment::result::Body::Rows { rows, .. } =
+        esker_proto::fragment::result::decode(&result).unwrap()
+    else {
+        panic!("a scan fragment came back as groups");
+    };
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(esker_proto::fragment::result::Value::Int8(id)) => *id,
+            other => panic!("the first column of a row came back as {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The catalog record that asks for a copy, and the four rows that predate the learner.
+///
+/// The record first, as the `ALTER` commits it: without it the region knows of no table wanting a
+/// copy and one is correctly never built.
+async fn commit_the_history(store: &Arc<Store>, region: &Region) {
+    commit_value(
+        store,
+        region,
+        Bytes::from(esker_keys::columnar::key(COLUMNAR_TENANT, COLUMNAR_TABLE)),
+        columnar_record(),
+        8,
+        9,
+    )
+    .await;
+    for (offset, name) in ["ada", "grace", "edsger", "barbara"].iter().enumerate() {
+        let id = i64::try_from(offset).unwrap() + 1;
+        let at = 10 + u64::try_from(offset).unwrap() * 2;
+        commit_value(
+            store,
+            region,
+            table_row_key(id),
+            table_row(id, name),
+            at,
+            at + 1,
+        )
+        .await;
+    }
+}
+
+/// Places `second` on region 1 as a columnar learner and waits for both halves of it: the
+/// membership the leader proposes, and the region arriving where it was sent.
+///
+/// Shared by the two placement tests below, which differ only in what they then ask of the
+/// learner — its row column families, or its columnar copy.
+async fn place_a_columnar_learner(pd: &Arc<FakePd>, first: &Node, second: &Node) {
+    let epoch = first.store.regions().regions()[0].epoch;
+    pd.issue(Operator::AddLearner {
+        region_id: 1,
+        epoch,
+        store_id: 2,
+        peer_id: 2,
+    });
+    wait_for("the columnar learner in the membership", || {
+        first.store.regions().regions()[0]
+            .peers
+            .iter()
+            .any(|peer| peer.role == PeerRole::ColumnarLearner)
+    })
+    .await;
+    wait_for("the region to arrive on the second store", || {
+        second.store.regions().get(1).is_some()
+    })
+    .await;
+}
+
+/// **The twin of [`a_placed_columnar_learner_holds_what_the_leader_holds`], asked of the copy.**
+///
+/// That test proves the learner's **row** column families hold what the leader's do, and stops
+/// there — deliberately, because when it was written the fragment service was the thing it was
+/// standing in for. This asks the fragment service itself, which is a different claim about a
+/// different structure: a columnar copy is fed by `RaftPeer::tee_columnar` during apply and built
+/// from history by `columnar::region::ColumnarSlot`, and *applied is not copied*.
+///
+/// The shape is the failing one, reduced. Four rows are committed **before** the learner exists,
+/// so the copy can only have them by converting the region's history; one is committed after, so
+/// it has a stream to follow as well. `esker-sql`'s `joint_gate` differential caught a learner
+/// answering with the second set and not the first — the fragment returned four rows where the
+/// row scan returned five, and the row missing was the only one whose entire existence predated
+/// the placement (`docs/plans/phase-16-mpp.md` §J13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_columnar_learner_answers_for_the_rows_that_predate_it() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // **History**, committed before the second store exists, let alone holds the region.
+    let region = first.store.regions().regions()[0].clone();
+    commit_the_history(&first.store, &region).await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+
+    place_a_columnar_learner(&pd, &first, &second).await;
+
+    // **The stream.** One row after the placement, so a copy fed only by the tee would answer
+    // this one and none of the four above — which is exactly the wrong answer being reproduced.
+    let region = first.store.regions().regions()[0].clone();
+    let leader = first.store.peer_of(1).unwrap();
+    commit_value(
+        &first.store,
+        &region,
+        table_row_key(5),
+        table_row(5, "katherine"),
+        30,
+        31,
+    )
+    .await;
+
+    // The bar from the driver and not from what the peer publishes, for the reason the twin test
+    // states at length: `Published::applied` is refreshed at the end of a batch, so it can name
+    // the entry before the one whose data is on disk.
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for(
+        "the learner to reach the index the leader acknowledged",
+        || {
+            second
+                .store
+                .peer_of(1)
+                .is_some_and(|peer| peer.applied_index() >= bar)
+        },
+    )
+    .await;
+
+    // The row store first, so a failure below cannot be a replication failure wearing a columnar
+    // costume: this is the claim the twin test makes, restated as a precondition.
+    let rows: Vec<(i64, u64)> = (1..=5i64)
+        .map(|id| (id, second.store.write_records(&table_row_key(id)).unwrap()))
+        .collect();
+    assert!(
+        rows.iter().all(|(_, versions)| *versions == 1),
+        "the learner's row store is short before the copy is even asked: (id, versions) = {rows:?}"
+    );
+
+    let answered = fragment_ids(&second, 1, bar).await;
+    assert_eq!(
+        answered,
+        vec![1, 2, 3, 4, 5],
+        "the copy answered for the rows that arrived after the placement and not for the ones it \
+         had to convert; the learner's row store holds all five (id, versions) = {rows:?}, and \
+         the bar it caught up to was {bar}",
+    );
+
+    first.stop().await;
+    second.stop().await;
 }
