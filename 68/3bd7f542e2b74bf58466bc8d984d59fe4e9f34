@@ -1,0 +1,23 @@
+crates/esker-sql/src/pd.rs
+  s_2d916f5f540186::t_e90bd64f5130f9 270-275,277-290,404-432,466,468-471,475-477,479-489,495,497-544,546-569,572,575-577,579,581-599,601-605,607-608
+crates/esker-sql/tests/pd_wiring.rs
+  s_2d916f5f540186::t_47d7ee053b93f0 300-416
+docs/plans/phase-16-mpp.md
+  s_2d916f5f540186::t_253666c809305a 995-1102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "683bd7f542e2b74bf58466bc8d984d59fe4e9f34",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
