@@ -128,6 +128,28 @@ mod tests {
         );
     }
 
+    /// **The pid is readable while a session is installed and gone afterwards**, which is what
+    /// `pg_backend_pid()` reads and what makes a nested statement report the outer session rather
+    /// than leaking the inner one's.
+    #[test]
+    fn the_installed_session_is_the_one_the_pid_reports() {
+        assert_eq!(current_pid(), None, "no session on this thread yet");
+        {
+            let _outer = with_session(11, Arc::new(AtomicBool::new(false)));
+            assert_eq!(current_pid(), Some(11));
+            {
+                let _inner = with_session(22, Arc::new(AtomicBool::new(false)));
+                assert_eq!(current_pid(), Some(22));
+            }
+            assert_eq!(
+                current_pid(),
+                Some(11),
+                "the inner statement put the outer session back"
+            );
+        }
+        assert_eq!(current_pid(), None, "and the thread is clean again");
+    }
+
     /// The deadline still answers `57014` with the timeout's own sentence, and the two do not
     /// shadow each other.
     #[test]
