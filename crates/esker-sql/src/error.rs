@@ -930,6 +930,14 @@ pub enum SqlError {
     ///
     /// Its severity is the level that was written, which is the whole of what a client sees —
 
+    /// `ALTER TABLE t SET (esker.x = 1)` — a storage-parameter namespace PostgreSQL does not have.
+    ///
+    /// **`22023`, and semantic rather than syntactic.** A namespaced parameter name is valid
+    /// syntax; PostgreSQL proves it by accepting `toast.` and refusing `esker.` with *this*
+    /// sentence rather than a parse error. Answering `42601` here would break contract C1.
+    #[error("unrecognized parameter namespace \"{0}\"")]
+    UnrecognizedParameterNamespace(String),
+
     /// `DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$` — the raised text is the whole message.
     ///
     /// **An error and not a notice**, which is the distinction ADR 0058 refused to blur: routing
@@ -2713,7 +2721,8 @@ impl SqlError {
             // **`22023`, not the `42704` the identical sentence takes for `CREATE DATABASE … OWNER`.**
             // PostgreSQL reads an authorization name as a *parameter value* and an owner as an
             // object reference. Measured, both.
-            | SqlError::UndefinedRoleForAuthorization(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::UndefinedRoleForAuthorization(_)
+            | SqlError::UnrecognizedParameterNamespace(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
