@@ -2737,6 +2737,73 @@ fn drop_column(
 /// already stored are not checked here for the same reason `CREATE UNIQUE INDEX` does not: an index
 /// that is `Public` from the start is this node's declared trade
 /// (`crate::catalog::SchemaState`), and a duplicate surfaces at the next write.
+/// `ADD CONSTRAINT [name] UNIQUE USING INDEX <index>` — promote an index that already exists.
+///
+/// **Nothing is built and nothing is backfilled.** A unique constraint here *is* an [`IndexDef`]
+/// with its `constraint` field set, so this sets that field on the index the statement names. The
+/// index is already there and already filled, which is the whole reason a client writes this
+/// spelling: `add_index … unique: true` then `add_unique_constraint … using_index:` is
+/// `ActiveRecord`'s way of promoting an index it built earlier without paying for a second one.
+///
+/// Measured on 19beta1, and the second line is the one an implementation would not guess:
+///
+/// ```text
+/// the constraint takes the columns of the named index
+/// the INDEX IS RENAMED to the constraint's name, and the server says so:
+///     NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "unique_index"
+///              to "unique_constraint"
+/// and when the two names are already equal there is no rename and no notice
+/// ```
+fn promote_index_to_constraint(
+    executor: &Executor,
+    updated: &mut TableDef,
+    promote: &plan::UniqueUsingIndex,
+) -> Result<()> {
+    let name = promote
+        .name
+        .clone()
+        .unwrap_or_else(|| promote.index.clone());
+    // The name has to be free unless it is the index's own — promoting `ui` to a constraint called
+    // `ui` is a rename to where it already is.
+    if name != promote.index
+        && (updated.indexes.iter().any(|index| index.name == name)
+            || updated.checks.iter().any(|check| check.name == name)
+            || updated.foreign_keys.iter().any(|key| key.name == name))
+    {
+        return Err(SqlError::DuplicateConstraint {
+            constraint: name,
+            relation: updated.name.clone(),
+        });
+    }
+    let kind = match (promote.deferrable, promote.deferred) {
+        (_, true) => catalog::UniqueKind::Deferred,
+        (true, false) => catalog::UniqueKind::Deferrable,
+        (false, false) => catalog::UniqueKind::Immediate,
+    };
+    let Some(index) = updated
+        .indexes
+        .iter_mut()
+        .find(|index| index.name == promote.index)
+    else {
+        return Err(SqlError::UndefinedIndex(promote.index.clone()));
+    };
+    if !index.unique {
+        return Err(SqlError::IndexNotUnique(promote.index.clone()));
+    }
+    if index.name != name {
+        executor.notice(SqlError::Raised {
+            message: format!(
+                "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"{}\" to \"{name}\"",
+                index.name
+            ),
+            severity: crate::error::Severity::Notice,
+        });
+        index.name = name;
+    }
+    index.constraint = Some(kind);
+    Ok(())
+}
+
 fn add_unique_constraint(
     txn: &mut dyn Txn,
     executor: &Executor,
@@ -5589,6 +5656,11 @@ pub(super) fn alter_table(
         }
         if let AlterTableAction::AddUnique(constraint) = action {
             add_unique_constraint(txn, executor, &mut updated, constraint)?;
+            changed = true;
+            continue;
+        }
+        if let AlterTableAction::AddUniqueUsingIndex(promote) = action {
+            promote_index_to_constraint(executor, &mut updated, promote)?;
             changed = true;
             continue;
         }

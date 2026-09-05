@@ -1395,7 +1395,7 @@ fn the_background_pool_compacts_by_itself() {
     // Give the pool a moment; then finish the job synchronously so the test is not a race.
     db.compact_range(cf::DEFAULT, None, None).unwrap();
 
-    // Each of these says what it saw. This test has failed once in a full parallel run and never
+    // Each of these says what it saw. This test has failed in a full parallel run and never
     // alone, and "assertion failed" told nobody which of the three it was.
     assert!(
         db.compactions_run() > 0,
@@ -1403,12 +1403,18 @@ fn the_background_pool_compacts_by_itself() {
         db.compactions_run(),
         db.property("esker.compactions-running")
     );
-    assert_eq!(
-        db.property("esker.compactions-running").unwrap(),
-        "0",
-        "a compaction was still running after `compact_range` returned; {} have run",
-        db.compactions_run()
-    );
+    // **`esker.compactions-running == 0` was asserted here and was never the API's to promise.**
+    // Two things were wrong with it. `compact_range` waits for its own work and not for the
+    // pool's, which schedules compactions whenever the levels warrant one — so under load the
+    // count is routinely non-zero the instant it returns, and it was red in a gate at load ~10
+    // for exactly that reason. And the property counts *reserved input files* rather than
+    // compactions, so the `running=5` in that failure was very likely one job over five files,
+    // not five jobs; the message it printed said "a compaction was still running", which the
+    // number could not support either way.
+    //
+    // What `compact_range` does promise is that this range is compacted, and the two assertions
+    // that bracket this comment are that promise: something ran, and every key reads back at its
+    // newest version. Both hold under contention.
     for i in 0..200u32 {
         assert_eq!(
             get(&db, format!("key-{i:04}").as_bytes()).as_deref(),

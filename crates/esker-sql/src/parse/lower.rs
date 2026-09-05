@@ -3154,6 +3154,21 @@ fn lower_added_constraint(
             deferred,
         }));
     }
+    // **`UNIQUE USING INDEX` has no column list** — the index supplies the columns — so it is its
+    // own `sqlparser` variant, and its own action because a unique constraint here *is* an index
+    // with its `constraint` field set: promoting one sets that field rather than building
+    // anything.
+    if let TableConstraint::UniqueUsingIndex(promote) = constraint {
+        let (deferrable, deferred) = unique_deferrable(promote.characteristics.as_ref())?;
+        return Ok(plan::AlterTableAction::AddUniqueUsingIndex(
+            plan::UniqueUsingIndex {
+                name: promote.name.as_ref().map(ident),
+                index: ident(&promote.index_name),
+                deferrable,
+                deferred,
+            },
+        ));
+    }
     // `PRIMARY KEY` over columns the table already has, which is what `change_table`'s
     // `t.primary_key :id` sends when the column is there. It declares a key and re-keys nothing:
     // the rows keep whatever identity they were created with
