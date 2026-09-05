@@ -35,23 +35,28 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)",
             "|| over arrays is not built; it refuses rather than answering",
         ),
-        // **`jsonb || jsonb` concatenates as text here, and that is a wrong answer, not a gap.**
-        // It is worth writing down precisely because of that. `jsonb` has **no `Datum` of its
-        // own** — it is a `Datum::Text`, where `hstore`, `ltree`, `citext` and `tsvector` each
-        // have a variant — so at the value layer this operator cannot tell a jsonb from a string
-        // and concatenates the two documents instead of merging them. Before `||` over text
-        // existed the same call was refused, so this replaces a gap with a wrong answer in one
-        // narrow case, which
-        // [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) ranks the other way
-        // round.
+        // **`jsonb || jsonb` is refused, not answered.** PostgreSQL merges the two documents;
+        // this node has no `Datum` for a `jsonb` — it is a `Datum::Text`, where `hstore`, `ltree`,
+        // `citext` and `tsvector` each have a variant — so by the time `||` has two values in
+        // hand a document and a string are the same thing, and concatenating them would produce a
+        // string that is not a document. That is a **wrong answer** where refusing is a gap, and
+        // [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) ranks a wrong
+        // answer worse, so the operator gives back the `0A000` it gave before `||` over text
+        // existed. `tests/concat_refuses_json.rs` pins the refusal itself.
         //
-        // The fix is not in this operator: it is
-        // [ADR 0042](../../../docs/adr/0042-a-type-shares-a-representation-only-if-it-shares-a-comparison.md)'s
-        // rule applied to `jsonb`, which needs a representation that is not `text`. Owed, and
-        // named in the handover — `jsonb` merge semantics are a unit of their own.
+        // `json` is refused beside it and is **not the same type**: it keeps key order,
+        // whitespace and duplicate keys, so `'{"a":1}'::json || '{"b":2}'::json` really is the
+        // two documents' text run together on a real server. Refusing it too is the conservative
+        // half — telling the two apart is part of the unit that gives `jsonb` a representation,
+        // `docs/plans/jsonb-representation.md`, and guessing which of them this node's
+        // `Datum::Text` is standing for is exactly what got the operator into this.
         (
             "SELECT 'r', '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb",
-            "jsonb is a Datum::Text here, so || concatenates the documents instead of merging them",
+            "jsonb has no representation of its own here, so || refuses rather than concatenating",
+        ),
+        (
+            "SELECT 'r', '{\"a\":1}'::json || '{\"b\":2}'::json",
+            "json is refused beside jsonb until the two have representations that tell them apart",
         ),
     ],
 };

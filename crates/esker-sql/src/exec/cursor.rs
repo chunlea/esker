@@ -1130,6 +1130,33 @@ impl Env<'_> {
 ///
 /// Split out of [`catalog_function`] for the reason [`range_function`] is: one family, and that
 /// function is long enough already.
+/// Whether a `||` operand is **declared** `json` or `jsonb`, which is a question the values cannot
+/// answer.
+///
+/// `jsonb` has no `Datum` of its own — it is a `Datum::Text`, where `hstore`, `ltree`, `citext`
+/// and `tsvector` each have a variant — so by the time this operator has two values in hand a
+/// document and a string are the same thing. Concatenating them is a **wrong answer** where
+/// refusing is a gap, and [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md)
+/// ranks a wrong answer worse, so the declared type is read from the plan instead and the operator
+/// gives back the `0A000` it gave before `||` over text existed.
+///
+/// A column is an [`Expr::Ordinal`], which carries its type for exactly this kind of question —
+/// the same reason it carries `typmod` so a `character(3)` can be told from a `text`. A *literal*
+/// cast is folded away before the executor sees it, so `'{"a":1}'::jsonb` is caught one layer up,
+/// in `parse::lower`, where the `::jsonb` is still written down.
+///
+/// The real fix is `docs/plans/jsonb-representation.md`: `jsonb` gets a `Datum` and `||` becomes
+/// document merge.
+fn is_json_typed(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ordinal {
+            ty: ColumnType::Json | ColumnType::Jsonb,
+            ..
+        }
+    )
+}
+
 /// `text || anynonarray`, `anynonarray || text` and `text || text` — PostgreSQL's string
 /// concatenation, and the plainest meaning of the symbol.
 ///
@@ -2783,7 +2810,7 @@ fn catalog_function(
                     value,
                     Datum::Hstore(_) | Datum::Ltree(_) | Datum::TsVector(_)
                 )
-            }) =>
+            }) && !call.args.iter().any(is_json_typed) =>
         {
             text_concat(args.first(), args.get(1))?
         }

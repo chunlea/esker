@@ -31,4 +31,5 @@ INSERT INTO cc VALUES (1, 'one', 'ab'), (2, NULL, NULL)		-
 SELECT 'r', id, title || '!', tag || '!' FROM cc ORDER BY id		r|1|one!|ab! ; r|2|\N|\N
 SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)		r|{1,2,3}|{1,2,3}|integer[]
 SELECT 'r', '{"a":1}'::jsonb || '{"b":2}'::jsonb		r|{"a": 1, "b": 2}
+SELECT 'r', '{"a":1}'::json || '{"b":2}'::json		r|{"a":1}{"b":2}
 DROP TABLE cc		-
