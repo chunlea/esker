@@ -94,8 +94,20 @@ impl Returned {
         let values = self
             .exprs
             .iter()
-            .map(|expr| {
-                cursor::evaluate(expr, row).map(|value| value.to_text().map(String::into_bytes))
+            .enumerate()
+            .map(|(at, expr)| {
+                cursor::evaluate(expr, row).map(|value| {
+                    // **An enum leaves as its label here too.** The ordinal is what is stored
+                    // (ADR 0050) and the label is what a client is told, and this path rendered
+                    // the `Datum::Int2` straight out — so `INSERT … RETURNING current_mood`
+                    // answered `3` where `SELECT current_mood` answered `happy`. One renderer,
+                    // two output paths, and only the `SELECT` one used it.
+                    match self.columns.get(at).and_then(|c| c.user_type.as_ref()) {
+                        Some(def) => super::assign::from_enum(&value, def).to_text(),
+                        None => value.to_text(),
+                    }
+                    .map(String::into_bytes)
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         self.rows.push(values);

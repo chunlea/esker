@@ -419,7 +419,7 @@ async fn psql_runs_real_sql_against_the_real_executor() {
         eprintln!("skipping: no psql on this machine");
         return;
     }
-    let sessions = Arc::new(RealSessions::new());
+    let sessions = Arc::new(real_sessions());
     psql_smoke(sessions).await;
 }
 
@@ -438,7 +438,7 @@ async fn psql_runs_real_sql_against_a_real_cluster() {
         return;
     }
     let cluster = cluster::Cluster::start_on_this_runtime().await;
-    let sessions = Arc::new(RealSessions::on(Arc::clone(&cluster.backend)));
+    let sessions = Arc::new(sessions_on(Arc::clone(&cluster.backend)));
     psql_smoke(sessions).await;
     // Held until the script is done: dropping it closes the stores out from under the node.
     drop(cluster);
@@ -456,7 +456,7 @@ async fn psql_runs_real_sql_against_a_real_cluster() {
 /// an assertion about missing rows.
 const BLOCKING_GUARD: &str = "BlockingTransport::call was used inside an async runtime";
 
-async fn psql_smoke(sessions: Arc<RealSessions>) {
+async fn psql_smoke(sessions: Arc<esker_sql::node::Sessions>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -576,38 +576,16 @@ fn check_smoke_output(output: &std::process::Output) {
 }
 
 /// Hands every session an executor over one shared store, the way the binary does.
-struct RealSessions {
-    backend: Arc<dyn esker_sql::backend::Backend>,
-    catalog: Arc<esker_sql::catalog::Catalog>,
+/// The node the binary runs, not a double of it.
+///
+/// This was a hand-built `Executors` that never called `sharing_sequence_blocks`, so the **only**
+/// harness speaking the wire protocol ran with ADR 0072 switched off — the inverse of the usual
+/// drift, where the double has a feature the product lacks. `esker_sql::node::Sessions` moved out
+/// of `bin/esker-sql.rs` so that a test constructs the same thing the binary serves.
+fn real_sessions() -> esker_sql::node::Sessions {
+    sessions_on(Arc::new(esker_sql::backend::MemoryBackend::new()))
 }
 
-impl RealSessions {
-    fn new() -> Self {
-        RealSessions::on(Arc::new(esker_sql::backend::MemoryBackend::new()))
-    }
-
-    fn on(backend: Arc<dyn esker_sql::backend::Backend>) -> Self {
-        RealSessions {
-            backend,
-            catalog: Arc::new(esker_sql::catalog::Catalog::new()),
-        }
-    }
-}
-
-impl Executors for RealSessions {
-    fn for_session(
-        &self,
-        database: &str,
-        identity: esker_sql::session::Backend,
-    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
-        Ok(Box::new(
-            esker_sql::exec::Executor::new(
-                Arc::clone(&self.backend),
-                Arc::clone(&self.catalog),
-                1,
-                identity,
-            )
-            .serving_database(database),
-        ))
-    }
+fn sessions_on(backend: Arc<dyn esker_sql::backend::Backend>) -> esker_sql::node::Sessions {
+    esker_sql::node::Sessions::new(backend, Arc::new(esker_sql::catalog::Catalog::new()))
 }
