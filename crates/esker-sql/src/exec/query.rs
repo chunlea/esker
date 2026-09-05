@@ -3942,6 +3942,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // spelling is `text` too, because this node has no array *value* to type.
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
+        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,

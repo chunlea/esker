@@ -579,6 +579,7 @@ fn push_filter(
         Expr::Parameter(_) => return Err(refused("a parameter inside a pushed-down filter")),
         Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
+        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. } => {
             return Err(refused("current_schema inside a pushed-down filter"));
@@ -959,6 +960,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         | Expr::Parameter(_)
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
+        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         // Folded to a literal before a fragment is ever built, and its arguments are constants by
         // then, so it names no column either.

@@ -2088,6 +2088,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // row would be reading a session this evaluator cannot see.
         Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
+        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. } => {
             return Err(SqlError::Internal(

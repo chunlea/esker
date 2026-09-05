@@ -396,6 +396,16 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   `apply_index`** — so a crash has both or neither. The child's log starts at index 0 and its group elects
   from scratch; its `conf_state` is the split-time membership, which for a log beginning at index 0 is
   exactly what `InitialState::conf_state` means. Merge is post-v1.
+  - **What "the region's data" is, for both the size and the boundary.** A region owns a range of
+    the *user* key space, and each user key reaches the engine as `'r' ++ key` or as
+    `'x' ++ enc(key) ++ !ts` — so a region is one engine range **per physical namespace**, in every
+    family that holds data. The size sums `default` and `write` over both; the boundary scan reads
+    exactly the same ranges and yields user keys, a key's versions counting once. `lock` is not
+    counted (an in-flight claim is not data) and `raft` is not (this store's log, keyed by region
+    id). The mapping is `esker-store/src/keyspace.rs`, shared with the snapshot stream and the
+    reclaim. Reading `default` under `'r'` alone is why a SQL table occupied exactly one region
+    whatever its size, at every threshold
+    ([ADR 0073](adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
   - **A write the split overtook is refused at apply, not at propose.** A command ordered after the
     `Split` entry is checked against the parent's *narrowed* range and answered `EpochNotMatch` — the
     proposer routed correctly and the region moved under it, so the refusal is retryable and its hint is

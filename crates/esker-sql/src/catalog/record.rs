@@ -1101,22 +1101,65 @@ pub(super) fn next_role_key() -> Vec<u8> {
 /// **One flag byte rather than seven booleans**, because six of the seven are `false` for every
 /// role this node can make and the seventh — `rolcanlogin` — is the only one `CREATE USER` and
 /// `CREATE ROLE` differ on. A bit per flag leaves room for the rest without another version.
-pub(super) fn encode_role(oid: u64, can_login: bool) -> Vec<u8> {
+pub(super) fn encode_role(oid: u64, flags: RoleFlags) -> Vec<u8> {
     let mut out = vec![CATALOG_FORMAT_VERSION];
     // Little-endian in a body, as every other record here writes an id — a key is sorted and a
     // body is not.
     out.extend_from_slice(&oid.to_le_bytes());
-    out.push(u8::from(can_login));
+    out.push(flags.bits());
     out
 }
 
 /// Reads one back.
-pub(super) fn decode_role(bytes: &[u8]) -> Result<(u64, bool)> {
+pub(super) fn decode_role(bytes: &[u8]) -> Result<(u64, RoleFlags)> {
     let mut reader = Reader::new(bytes)?;
     let oid = reader.u64_le()?;
-    let flags = reader.byte()?;
+    let flags = RoleFlags::from_bits(reader.byte()?);
     reader.finish()?;
-    Ok((oid, flags & 1 == 1))
+    Ok((oid, flags))
+}
+
+/// A role's attributes, one bit each.
+///
+/// **No version bump for the three that joined `LOGIN`.** Every bit added here defaults to `false`
+/// and a record written before them has zeroes in those positions, which is the right answer for
+/// all three — a role created without `SUPERUSER` is not a superuser. `rolinherit` is deliberately
+/// *not* here: its default is `true`, so a zero bit would read as the wrong answer for every role
+/// written before it, and it is `true` for every role this node can make.
+// **Four bools on purpose.** `struct_excessive_bools` is aimed at a struct whose flags are really
+// a state machine wearing booleans; these are not. They are four independent attributes that
+// PostgreSQL itself keeps as four independent columns — `rolsuper`, `rolcreatedb`, `rolcreaterole`,
+// `rolcanlogin` — and any role may have any combination. Folding them into an enum would claim they
+// are mutually exclusive, which would be a worse description than the lint is objecting to.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleFlags {
+    /// `LOGIN` — the one attribute that distinguishes `CREATE USER` from `CREATE ROLE`.
+    pub login: bool,
+    /// `SUPERUSER`, recorded and not enforced.
+    pub superuser: bool,
+    /// `CREATEDB`, likewise.
+    pub create_db: bool,
+    /// `CREATEROLE`, likewise.
+    pub create_role: bool,
+}
+
+impl RoleFlags {
+    fn bits(self) -> u8 {
+        u8::from(self.login)
+            | u8::from(self.superuser) << 1
+            | u8::from(self.create_db) << 2
+            | u8::from(self.create_role) << 3
+    }
+
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            login: bits & 1 == 1,
+            superuser: bits & 2 == 2,
+            create_db: bits & 4 == 4,
+            create_role: bits & 8 == 8,
+        }
+    }
 }
 
 /// A database record: the version byte and the tenant id it is.

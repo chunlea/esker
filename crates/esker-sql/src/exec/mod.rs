@@ -99,6 +99,13 @@ pub struct Executor {
     /// block: PostgreSQL keeps it across `COMMIT` and `ROLLBACK`, and only `RESET` or a new
     /// connection undoes it.
     authorization: Option<String>,
+    /// What `authorization` owes the session when the block ends, if a `SET LOCAL` changed it.
+    ///
+    /// **A named type rather than `Option<Option<String>>`**, which is what this was and what
+    /// clippy objected to — rightly: the outer layer means "is a restore owed" and the inner means
+    /// "to what", and two `Option`s spell both as `None`. Recorded once per block, so a second
+    /// `SET LOCAL` restores the session's value and not the first statement's.
+    authorization_before_block: LocalAuthorization,
 
     pub(crate) tenant: u64,
     /// The database this session is connected to, which is the tenant above under its name.
@@ -366,6 +373,19 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
             }
         }
     }
+}
+
+/// What a `SET LOCAL SESSION AUTHORIZATION` owes the session when its block ends.
+///
+/// The two states are *"nothing was set locally"* and *"put it back to this"*, and the second
+/// carries an `Option` of its own because having no authorization is a real thing to go back to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum LocalAuthorization {
+    /// No `SET LOCAL` in this block; the session's authorization stands.
+    #[default]
+    Unchanged,
+    /// A `SET LOCAL` changed it; this is what it was before.
+    Restore(Option<String>),
 }
 
 /// Which parameter bounded a wait, because the two answer **different SQLSTATEs** for the same
@@ -662,6 +682,7 @@ impl Executor {
             database: crate::parse::DATABASE_NAME.to_owned(),
             user: crate::parse::DATABASE_NAME.to_owned(),
             authorization: None,
+            authorization_before_block: LocalAuthorization::Unchanged,
             open: None,
             written: Written::default(),
             constraints: std::cell::RefCell::default(),
@@ -1013,17 +1034,8 @@ impl Executor {
             // is `22023` — a *parameter value* that is wrong, which is the code PostgreSQL uses
             // for this and not the `42704` an undefined object gets. `DEFAULT` puts the session
             // back to the role it connected as.
-            SessionStatement::SetSessionAuthorization(name) => {
-                if let Some(role) = name {
-                    let txn = self.backend.begin()?;
-                    let known = crate::catalog::role_by_name(&*txn, role)?.is_some();
-                    let _ = txn.rollback();
-                    if !known {
-                        return Err(SqlError::UndefinedRoleForAuthorization(role.clone()));
-                    }
-                }
-                self.authorization.clone_from(name);
-                Ok(Outcome::done("SET"))
+            SessionStatement::SetSessionAuthorization { name, local } => {
+                self.set_session_authorization(name.as_deref(), *local)
             }
             SessionStatement::SetReadAsOf { value, local } => {
                 self.set_read_as_of(value.as_deref(), *local)?;
@@ -1223,6 +1235,39 @@ impl Executor {
     }
 
     /// `SET esker.read_as_of = '...'`, resolved once and checked against the window.
+    /// `SET [LOCAL] SESSION AUTHORIZATION <name>` and its `DEFAULT`.
+    ///
+    /// Its own method because `session_statement` was one line over the limit with it inline, and
+    /// because this is where the catalog is asked — the lowering used to refuse every name without
+    /// asking anything, which is run 87's first item.
+    fn set_session_authorization(&mut self, name: Option<&str>, local: bool) -> Result<Outcome> {
+        if let Some(role) = name {
+            let txn = self.backend.begin()?;
+            let known = crate::catalog::role_by_name(&*txn, role)?.is_some();
+            let _ = txn.rollback();
+            if !known {
+                return Err(SqlError::UndefinedRoleForAuthorization(role.to_owned()));
+            }
+        }
+        // **`SET LOCAL` outside a block does nothing and warns**, which is what a real
+        // server does — there is no transaction for it to be local to.
+        if local && self.open.is_none() {
+            self.notice(SqlError::OutsideTransactionBlock("SET LOCAL"));
+            return Ok(Outcome::done("SET"));
+        }
+        if local {
+            // What to put back when the transaction ends, remembered once: a second
+            // `SET LOCAL` in the same block must not overwrite the session's own value
+            // with the first one's.
+            if self.authorization_before_block == LocalAuthorization::Unchanged {
+                self.authorization_before_block =
+                    LocalAuthorization::Restore(self.authorization.clone());
+            }
+        }
+        self.authorization = name.map(str::to_owned);
+        Ok(Outcome::done("SET"))
+    }
+
     fn set_read_as_of(&mut self, value: Option<&str>, local: bool) -> Result<()> {
         let Some(text) = value else {
             return self.move_to(None);
@@ -1406,6 +1451,14 @@ impl Executor {
         );
         if self.read_as_of.as_ref().is_some_and(|as_of| as_of.local) {
             self.read_as_of = None;
+        }
+        // **A `SET LOCAL SESSION AUTHORIZATION` never outlives its transaction.** Carried on the
+        // restore `esker.read_as_of` already uses rather than on a new mechanism: one more field
+        // put back here, and one more on the savepoint mark so a `ROLLBACK TO` undoes it too.
+        if let LocalAuthorization::Restore(before) =
+            std::mem::take(&mut self.authorization_before_block)
+        {
+            self.authorization = before;
         }
     }
 
@@ -2104,6 +2157,7 @@ impl Executor {
         }
         self.resolve_current_schema(txn, &mut statement)?;
         self.resolve_current_database(&mut statement);
+        self.resolve_current_user(&mut statement);
         self.resolve_current_setting(&mut statement)?;
         self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
@@ -2154,6 +2208,28 @@ impl Executor {
         let mut resolve = |expr: &mut Expr| {
             if matches!(expr, Expr::CurrentDatabase) {
                 *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(self.database.clone()))));
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+    }
+
+    /// Folds `current_user` / `session_user` / `user` to the role this session is running as.
+    ///
+    /// The same shape as [`Executor::resolve_current_database`] and for the same reason: the answer
+    /// is the session's, and a `SET SESSION AUTHORIZATION` moves it mid-connection.
+    fn resolve_current_user(&self, statement: &mut Statement) {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| matches!(expr, Expr::CurrentUser)) {
+            return;
+        }
+        let who = self
+            .authorization
+            .clone()
+            .unwrap_or_else(|| self.user.clone());
+        let mut resolve = |expr: &mut Expr| {
+            if matches!(expr, Expr::CurrentUser) {
+                *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(who.clone()))));
             }
         };
         bind::walk_mut(statement, &mut resolve);
@@ -3462,8 +3538,12 @@ impl Execute for Executor {
             .as_ref()
             .map(|txn| txn.read_set())
             .unwrap_or_default();
-        self.savepoints
-            .savepoint(name, reads, self.parameters.clone());
+        self.savepoints.savepoint(
+            name,
+            reads,
+            self.authorization.clone(),
+            self.parameters.clone(),
+        );
         Ok(())
     }
 
@@ -3479,8 +3559,11 @@ impl Execute for Executor {
         self.open = Some(txn);
         // The parameters go back with the writes: a `SET` inside the savepoint is undone too.
         // Only on success — a `3B001` rolled nothing back and must change nothing.
-        let parameters = result?;
+        let (parameters, authorization) = result?;
         self.parameters = parameters;
+        // The session authorization goes back with them: a `SET LOCAL SESSION AUTHORIZATION`
+        // inside the mark is undone by a `ROLLBACK TO`, as every other `SET` in there is.
+        self.authorization = authorization;
         Ok(())
     }
 

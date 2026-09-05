@@ -55,6 +55,9 @@ struct Mark {
     locks_at: usize,
     /// The recorded read set as it stood, for the same reason the parameters are here.
     reads: crate::backend::ReadSet,
+    /// The session authorization as it stood, so a `SET LOCAL SESSION AUTHORIZATION` inside the
+    /// mark is undone by a `ROLLBACK TO` as well as by the transaction ending.
+    authorization: Option<String>,
     parameters: Parameters,
 }
 
@@ -93,6 +96,7 @@ impl Savepoints {
         &mut self,
         name: &str,
         reads: crate::backend::ReadSet,
+        authorization: Option<String>,
         parameters: Parameters,
     ) {
         self.marks.push(Mark {
@@ -100,6 +104,7 @@ impl Savepoints {
             undo_at: self.undo.len(),
             locks_at: self.locks.len(),
             reads,
+            authorization,
             parameters,
         });
     }
@@ -129,7 +134,11 @@ impl Savepoints {
     /// never be reached.
     /// Answers with the session parameters as they stood at the mark, which the caller puts back:
     /// a `SET` inside the savepoint is undone with the writes, exactly as a real server does it.
-    pub(super) fn rollback_to(&mut self, name: &str, txn: &mut dyn Txn) -> Result<Parameters> {
+    pub(super) fn rollback_to(
+        &mut self,
+        name: &str,
+        txn: &mut dyn Txn,
+    ) -> Result<(Parameters, Option<String>)> {
         let at = self.find(name)?;
         let undo_at = self.marks[at].undo_at;
         // Backwards, so that a key written more than once lands on the value it had at the mark
@@ -155,7 +164,10 @@ impl Savepoints {
         // And the reads, which are the other half of what a commit is validated against.
         txn.restore_read_set(self.marks[at].reads.clone());
         self.marks.truncate(at + 1);
-        Ok(self.marks[at].parameters.clone())
+        Ok((
+            self.marks[at].parameters.clone(),
+            self.marks[at].authorization.clone(),
+        ))
     }
 
     /// The block is over: every mark and every pre-image with it.

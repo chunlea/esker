@@ -239,6 +239,18 @@ pub enum Expr {
     /// lowering has no session — so a constant here would report the *default* database's name to
     /// a client connected to another one, which is a wrong answer rather than a missing feature.
     CurrentDatabase,
+    /// `current_user`, `session_user` and the bare `user` — the role **this session** is running
+    /// as.
+    ///
+    /// Folded in `crate::exec::Executor::bound`, for the reason [`Expr::CurrentDatabase`] is: the
+    /// answer is a property of the session and a lowering has none, so a constant here would
+    /// report whoever the node booted as to a client that had said `SET SESSION AUTHORIZATION`.
+    ///
+    /// **The two spellings are the same value here**, and that is a declared divergence rather
+    /// than an oversight: PostgreSQL separates them at `SET ROLE`, which changes `current_user`
+    /// and leaves `session_user` alone. This node has no `SET ROLE`, so nothing can make them
+    /// differ — and inventing a difference would be a distinction a client could not produce.
+    CurrentUser,
     /// `current_setting(name)` and `current_setting(name, missing_ok)`.
     ///
     /// Folded to a literal in `crate::exec::Executor::bound`, the way [`Expr::CurrentSchema`] is
@@ -2236,6 +2248,7 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::CurrentSchema { .. } => "current_schemas",
         Expr::Advisory { call, .. } => call.name(),
         Expr::CurrentDatabase => "current_database",
+        Expr::CurrentUser => "current_user",
         Expr::Like {
             case_insensitive: false,
             ..
