@@ -882,42 +882,8 @@ impl CatalogView {
             // `amtype` `i` — an index method, which is what both of these are. A real server's
             // `pg_am` also holds table methods (`amtype` `t`, `heap`); this node has one storage
             // engine and no `USING` on a table, so there is nothing to name.
-            // **One row per class this node accepts**, with `opcdefault` `f` for every one —
-            // measured, and it is why none of them is what a column gets when no class is
-            // written. The oid is this node's own, in the extension range for the same reason
-            // hstore's is: a real server allocates an extension's classes at `CREATE EXTENSION`
-            // time and a client reads them by `opcname`.
-            CatalogView::PgOpclass => Ok(super::OPERATOR_CLASSES
-                .iter()
-                .enumerate()
-                .map(|(at, (name, method, ty))| {
-                    use crate::value::PgType as _;
-                    vec![
-                        Datum::Int8(OPCLASS_OID_BASE + i64::try_from(at).unwrap_or(0)),
-                        Datum::Text((*name).to_owned()),
-                        Datum::Int8(access_method_by_name(method)),
-                        Datum::Int8(i64::from(ty.oid())),
-                        Datum::Bool(false),
-                    ]
-                })
-                .collect()),
-            CatalogView::PgAm => Ok(vec![
-                vec![
-                    Datum::Int8(BTREE_AM_OID),
-                    Datum::Text("btree".to_owned()),
-                    Datum::Text("i".to_owned()),
-                ],
-                vec![
-                    Datum::Int8(GIN_AM_OID),
-                    Datum::Text("gin".to_owned()),
-                    Datum::Text("i".to_owned()),
-                ],
-                vec![
-                    Datum::Int8(GIST_AM_OID),
-                    Datum::Text("gist".to_owned()),
-                    Datum::Text("i".to_owned()),
-                ],
-            ]),
+            CatalogView::PgOpclass => Ok(pg_opclass_rows()),
+            CatalogView::PgAm => Ok(pg_am_rows()),
             CatalogView::PgTsConfig => Ok(pg_ts_config_rows()),
             // **One row per schema**, `public` included — and `public` is not a record: it is a
             // property of the build, the way the available extensions are, so a tenant that has
@@ -1710,23 +1676,112 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 /// **`last_value` is not here.** It is state, it lives in the sequence relation, and the two reads
 /// are what `reset_pk_sequence!` uses in its two branches: `seqmin` when the table is empty and
 /// `MAX(pk)` when it is not.
+/// One `pg_opclass` row per operator class this node accepts.
+/// **One row per class this node accepts**, with `opcdefault` `f` for every one —
+/// measured, and it is why none of them is what a column gets when no class is
+/// written. The oid is this node's own, in the extension range for the same reason
+/// hstore's is: a real server allocates an extension's classes at `CREATE EXTENSION`
+/// time and a client reads them by `opcname`.
+fn pg_opclass_rows() -> Vec<Vec<Datum>> {
+    super::OPERATOR_CLASSES
+        .iter()
+        .enumerate()
+        .map(|(at, (name, method, ty))| {
+            use crate::value::PgType as _;
+            vec![
+                Datum::Int8(OPCLASS_OID_BASE + i64::try_from(at).unwrap_or(0)),
+                Datum::Text((*name).to_owned()),
+                Datum::Int8(access_method_by_name(method)),
+                Datum::Int8(i64::from(ty.oid())),
+                Datum::Bool(false),
+            ]
+        })
+        .collect()
+}
+
+/// One row per index access method a `CREATE INDEX` here may name: `btree`, `gin` and `gist`.
+///
+/// All three are `amtype` `i`, which is what an *index* method is; a real server also has `t` for
+/// a table method and six methods in total. The three missing ones — `hash`, `spgist` and `brin` —
+/// are refused by `USING`, so a row for one would be a claim rather than a report (ADR 0070).
+fn pg_am_rows() -> Vec<Vec<Datum>> {
+    [
+        (BTREE_AM_OID, "btree"),
+        (GIN_AM_OID, "gin"),
+        (GIST_AM_OID, "gist"),
+    ]
+    .into_iter()
+    .map(|(oid, name)| {
+        vec![
+            Datum::Int8(oid),
+            Datum::Text(name.to_owned()),
+            Datum::Text("i".to_owned()),
+        ]
+    })
+    .collect()
+}
+
 fn pg_sequence_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let relations = super::pg_relations::Relations::read(txn, tenant)?;
-    let mut rows = Vec::new();
-    for table in relations.tables() {
-        for sequence in &table.sequences {
-            rows.push(vec![
-                Datum::Int8(super::pg_relations::as_oid(sequence.id)),
-                // `bigint`, which is what every sequence this node makes counts in.
-                Datum::Int8(i64::from(ColumnType::Int8.oid())),
-                Datum::Int8(1),
-                Datum::Int8(1),
-                Datum::Int8(i64::MAX),
-                Datum::Int8(1),
-                Datum::Int8(1),
-                Datum::Bool(false),
-            ]);
+    // **A sequence no column owns is filed under `STANDALONE_SEQUENCE_OWNER`, which has no
+    // `TableDef`**, so walking the tables finds every `bigserial`'s sequence and none of the ones
+    // `CREATE SEQUENCE` made. `pg_class` lists them — it reads the name records — and this view
+    // did not, which is why `SELECT … FROM pg_sequence WHERE seqrelid = 's1'::regclass` came back
+    // empty for a sequence that plainly exists. Read straight from the record, the way
+    // `catalog::sequence_by_id` exists to allow.
+    let mut standalone = Vec::new();
+    for row in relations.of_kind(super::pg_relations::RelKind::Sequence) {
+        if row.table_id != super::STANDALONE_SEQUENCE_OWNER {
+            continue;
         }
+        let id = u64::try_from(row.oid).unwrap_or(0);
+        if let Some(sequence) = super::sequence_by_id(txn, tenant, row.table_id, id)? {
+            standalone.push(sequence);
+        }
+    }
+    let mut rows = Vec::new();
+    for (table, sequence) in relations
+        .tables()
+        .flat_map(|table| table.sequences.iter().map(move |s| (Some(table), s)))
+        .chain(standalone.iter().map(|s| (None, s)))
+    {
+        // **A serial's sequence counts in the column's type, not always in `bigint`** — a
+        // `serial` gets an `integer` sequence whose ceiling is `2147483647`, and a
+        // `smallserial` a `smallint` one. Measured on 19beta1, `pg_sequence` for
+        // `foo_bar_baz_id_seq` beside the `bigserial` next to it. Nothing new is stored for
+        // it: the column the sequence fills is already recorded, and its type is the answer.
+        // A standalone `CREATE SEQUENCE` owns no column and is `bigint`, which is what a real
+        // server defaults one to.
+        let ty = table
+            .and_then(|table| sequence.column.and_then(|at| table.columns.get(at)))
+            .map_or(ColumnType::Int8, |column| column.ty);
+        let (floor, ceiling) = match ty {
+            ColumnType::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX)),
+            ColumnType::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+            _ => (i64::MIN, i64::MAX),
+        };
+        // **A descending sequence runs from the type's floor to `-1`**, not from `1` to the
+        // ceiling — measured for all three widths, `INCREMENT BY -1` giving
+        // `seqmax` `-1` and `seqmin` the type's own minimum. An ascending one bottoms out at
+        // `1` whatever the type is, which is the half a `serial` uses.
+        let (min, max) = if sequence.increment < 0 {
+            (floor, -1)
+        } else {
+            (1, ceiling)
+        };
+        rows.push(vec![
+            Datum::Int8(super::pg_relations::as_oid(sequence.id)),
+            Datum::Int8(i64::from(ty.oid())),
+            Datum::Int8(sequence.start),
+            Datum::Int8(sequence.increment),
+            Datum::Int8(max),
+            Datum::Int8(min),
+            // `CACHE 1`: a block is reserved by the node and not by the sequence
+            // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-the-connection.md)),
+            // so nothing here caches and a client reading this is told so.
+            Datum::Int8(1),
+            Datum::Bool(false),
+        ]);
     }
     rows.sort_by_key(|row| match row.first() {
         Some(Datum::Int8(oid)) => *oid,

@@ -1,0 +1,63 @@
+# How PostgreSQL 19 **names a serial column's sequence** — the two `serial_test.rb` tests that are
+# about the name rather than the value.
+#
+# * **`CollidedSequenceNameTest`** builds `foo_bar (baz_id serial)` and then
+#   `foo (bar_baz_id bigserial)`. The naive `<table>_<column>_seq` derives `foo_bar_baz_id_seq` for
+#   both, and PostgreSQL does not let the second overwrite the first. The rows below record what it
+#   does instead; an implementation that concatenates and hopes hands back the wrong sequence for
+#   one of the two columns.
+# * **`LongerSequenceNameDetectionTest`** uses a table name of exactly `NAMEDATALEN - 1`
+#   characters. `<table>_<column>_seq` cannot fit, so something has to give — and what gives is the
+#   **table**, never the `_seq`. All three sequences below come out at exactly 63 bytes with a
+#   different amount of table left in each, which a join-then-truncate cannot produce.
+#
+# Two rules that reasoning gets wrong, both measured:
+#
+# * **`serial?` is not "the default mentions nextval".** The first table declares `seq serial` and
+#   `serials_id integer DEFAULT nextval('postgresql_serials_id_seq')` and both defaults read
+#   `nextval(...)`; the suite asserts the first is serial and the second is not. What separates
+#   them is **ownership**, and `pg_get_serial_sequence` is where it shows: `\N` for the
+#   hand-written one. The two `count(*)` lines put the discriminator beside the thing it is not —
+#   three columns default from a sequence, two own one.
+# * **The counter that resolves a collision joins the *label*, not the finished name.** For a short
+#   name the two are the same string, which is why `foo_bar_id_seq1` proves nothing; the probe that
+#   separates them is in `plan::ddl::choose_relation_name`'s doc, measured against 19beta1 on a
+#   56-character table whose plain sequence name was already taken. It answered `<55>_id_seq1` —
+#   the table half gave up a character to make room for the `1`.
+#
+# Captured by r1 in one `BEGIN … ROLLBACK`. The tables live and die inside it, so `\gdesc` — which
+# runs in a second session after the rollback — cannot see them, and statements naming these tables
+# carry rows and an empty types column. The two counts after the `ROLLBACK` prove nothing persisted.
+BEGIN		-
+CREATE TABLE postgresql_serials (id serial primary key, seq serial, serials_id integer DEFAULT nextval('postgresql_serials_id_seq'))		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) AS default_text FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('postgresql_serials_id_seq'::regclass) ; r|seq|integer|nextval('postgresql_serials_seq_seq'::regclass) ; r|serials_id|integer|nextval('postgresql_serials_id_seq'::regclass)
+SELECT 'r', a.attname, pg_get_serial_sequence('postgresql_serials', a.attname) AS owned_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|public.postgresql_serials_id_seq ; r|seq|public.postgresql_serials_seq_seq ; r|serials_id|\N
+SELECT 'r', count(*) AS columns_whose_default_mentions_nextval FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'postgresql_serials'::regclass AND pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'		r|3
+SELECT 'r', count(*) AS columns_that_OWN_a_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND pg_get_serial_sequence('postgresql_serials', a.attname) IS NOT NULL		r|2
+SELECT 'r', c.relname, c.relkind FROM pg_class c WHERE c.relname LIKE 'postgresql_serials%' ORDER BY c.relname	text,name,"char"	r|postgresql_serials|r ; r|postgresql_serials_id_seq|S ; r|postgresql_serials_pkey|i ; r|postgresql_serials_seq_seq|S
+CREATE TABLE foo_bar (id serial primary key, baz_id serial)		-
+CREATE TABLE foo (id serial primary key, bar_id serial, bar_baz_id bigserial)		-
+SELECT 'r', 'foo_bar.baz_id' AS column, pg_get_serial_sequence('foo_bar', 'baz_id') AS sequence	text,text,text	r|foo_bar.baz_id|public.foo_bar_baz_id_seq
+SELECT 'r', 'foo.bar_id' AS column, pg_get_serial_sequence('foo', 'bar_id') AS sequence	text,text,text	r|foo.bar_id|public.foo_bar_id_seq1
+SELECT 'r', 'foo.bar_baz_id' AS column, pg_get_serial_sequence('foo', 'bar_baz_id') AS sequence	text,text,text	r|foo.bar_baz_id|public.foo_bar_baz_id_seq1
+SELECT 'r', c.relname FROM pg_class c WHERE c.relkind = 'S' AND (c.relname LIKE 'foo%') ORDER BY c.relname	text,name	r|foo_bar_baz_id_seq ; r|foo_bar_baz_id_seq1 ; r|foo_bar_id_seq ; r|foo_bar_id_seq1 ; r|foo_id_seq
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'foo'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('foo_id_seq'::regclass) ; r|bar_id|integer|nextval('foo_bar_id_seq1'::regclass) ; r|bar_baz_id|bigint|nextval('foo_bar_baz_id_seq1'::regclass)
+SELECT 'r', pg_get_serial_sequence('foo_bar', 'baz_id') = 'public.foo_bar_baz_id_seq' AS first_keeps_the_plain_name	text,boolean	r|t
+SELECT 'r', pg_get_serial_sequence('foo', 'bar_baz_id') = 'public.foo_bar_baz_id_seq' AS second_took_the_same_name	text,boolean	r|f
+SELECT 'r', length('long_table_name_to_test_sequence_name_detection_for_serial_cols') AS table_name_length	text,integer	r|63
+SELECT 'r', current_setting('max_identifier_length') AS namedatalen_minus_one	text,text	r|63
+CREATE TABLE long_table_name_to_test_sequence_name_detection_for_serial_cols (id serial primary key, seq serial, bigseq bigserial)		-
+SELECT 'r', a.attname, pg_get_serial_sequence('long_table_name_to_test_sequence_name_detection_for_serial_cols', a.attname) FROM pg_attribute a WHERE a.attrelid = 'long_table_name_to_test_sequence_name_detection_for_serial_cols'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|public.long_table_name_to_test_sequence_name_detection_for_seri_id_seq ; r|seq|public.long_table_name_to_test_sequence_name_detection_for_ser_seq_seq ; r|bigseq|public.long_table_name_to_test_sequence_name_detection_for__bigseq_seq
+SELECT 'r', c.relname, length(c.relname) AS name_length FROM pg_class c WHERE c.relkind = 'S' AND c.relname LIKE 'long_table_name%' ORDER BY c.relname	text,name,integer	r|long_table_name_to_test_sequence_name_detection_for__bigseq_seq|63 ; r|long_table_name_to_test_sequence_name_detection_for_ser_seq_seq|63 ; r|long_table_name_to_test_sequence_name_detection_for_seri_id_seq|63
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'long_table_name_to_test_sequence_name_detection_for_serial_cols'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('long_table_name_to_test_sequence_name_detection_for_seri_id_seq'::regclass) ; r|seq|integer|nextval('long_table_name_to_test_sequence_name_detection_for_ser_seq_seq'::regclass) ; r|bigseq|bigint|nextval('long_table_name_to_test_sequence_name_detection_for__bigseq_seq'::regclass)
+SELECT 'r', seqtypid::regtype, seqstart, seqincrement, seqmax FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'foo_bar_baz_id_seq'	text,regtype,bigint,bigint,bigint	r|integer|1|1|2147483647
+SELECT 'r', seqtypid::regtype, seqstart, seqmax FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid WHERE c.relname LIKE 'foo_bar_baz_id_seq%' ORDER BY c.relname	text,regtype,bigint,bigint	r|integer|1|2147483647 ; r|bigint|1|9223372036854775807
+INSERT INTO foo (bar_id, bar_baz_id) VALUES (DEFAULT, DEFAULT) RETURNING id		1
+INSERT INTO foo (bar_id, bar_baz_id) VALUES (DEFAULT, DEFAULT) RETURNING id		2
+SELECT 'r', id, bar_id, bar_baz_id FROM foo ORDER BY id		r|1|1|1 ; r|2|2|2
+SELECT 'r', last_value, is_called FROM foo_id_seq		r|2|t
+DROP TABLE foo		-
+SELECT 'r', count(*) AS foo_sequences_left FROM pg_class WHERE relkind = 'S' AND relname LIKE 'foo\_%'	text,bigint	r|2
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('postgresql_serials','foo','foo_bar','long_table_name_to_test_sequence_name_detection_for_serial_cols')	bigint	0
+SELECT count(*) FROM pg_class WHERE relkind = 'S' AND (relname LIKE 'foo%' OR relname LIKE 'postgresql_serials%' OR relname LIKE 'long_table_name%')	bigint	0

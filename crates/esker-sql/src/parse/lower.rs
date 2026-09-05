@@ -1464,6 +1464,29 @@ pub(super) fn column_default(
     {
         return Err(error);
     }
+    // **`nextval('s')` is stored as `nextval('s'::regclass)`**, which is not the text that was
+    // written. PostgreSQL does not keep the text at all — it keeps a parsed node, and `nextval`
+    // takes a `regclass`, so the `unknown` literal is coerced and the coercion is what
+    // `pg_get_expr` deparses. Measured: a column declared
+    // `DEFAULT nextval('postgresql_serials_id_seq')` reads back with the cast.
+    //
+    // It matters because it is what a *hand-written* default looks like to a schema dumper.
+    // `serial_test.rb`'s `test_schema_dump_with_not_serial` matches on the `::regclass` form to
+    // decide the column is not a serial, and a dumper handed back the text as typed does not
+    // recognise it. A **serial's** own default already prints this way
+    // (`catalog::pg_attribute`), from the sequence rather than from any stored text — this is the
+    // other half, and now both spellings agree.
+    //
+    // Normalised here rather than at every reader: the matcher is `sequence_literal_name`, the
+    // one `lower_set_default` uses, so there is still one reader of this grammar.
+    if let Expr::Function(function) = expr
+        && let Ok(name) = unqualified_function_name(function)
+        && name.eq_ignore_ascii_case("nextval")
+        && let Ok([argument]) = <[&Expr; 1]>::try_from(function_arguments(function, "nextval")?)
+        && let Some(sequence) = sequence_literal_name(argument)
+    {
+        return Ok((None, Some(format!("nextval('{sequence}'::regclass)"))));
+    }
     Ok((None, Some(expr.to_string())))
 }
 
@@ -1687,7 +1710,10 @@ fn sequence_literal_name(argument: &Expr) -> Option<String> {
     };
     match inner {
         Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) => Some(sequence_reference(text)),
+            Value::SingleQuotedString(text)
+            | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
+                Some(sequence_reference(text))
+            }
             _ => None,
         },
         _ => None,
@@ -4243,21 +4269,17 @@ fn lower_sequence_function(
         )));
     }
 
+    // **`nextval('s'::regclass)` names the same sequence as `nextval('s')`**, and it is the
+    // spelling a real server hands back: `pg_get_expr` deparses the coercion `nextval(regclass)`
+    // forces on the literal, so a client that reads a default and sends it on writes the cast.
+    // This refused it until the third reader of this grammar became a caller of the first —
+    // `sequence_literal_name`, which `lower_set_default` and `column_default` already use.
     let named = |expr: &Expr| -> Result<String> {
-        match expr {
-            Expr::Value(value) => match &value.value {
-                Value::SingleQuotedString(text)
-                | Value::DollarQuotedString(DollarQuotedString { value: text, .. }) => {
-                    Ok(sequence_reference(text))
-                }
-                other => Err(SqlError::unsupported(format!(
-                    "the sequence name {other}, which is not a string literal"
-                ))),
-            },
-            other => Err(SqlError::unsupported(format!(
-                "the sequence name {other}, which is not a string literal"
-            ))),
-        }
+        sequence_literal_name(expr).ok_or_else(|| {
+            SqlError::unsupported(format!(
+                "the sequence name {expr}, which is not a string literal"
+            ))
+        })
     };
 
     let call = match (func, plain.as_slice()) {

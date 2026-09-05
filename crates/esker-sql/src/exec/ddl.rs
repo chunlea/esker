@@ -159,7 +159,9 @@ pub(super) fn create_table(
         // ordinary migration.
         let name = match &create.primary_key_name {
             Some(given) => given.clone(),
-            None => free_derived_name(txn, executor, &plan::primary_key_name(&create.name))?,
+            // A primary key is the one derived name with **no column part** — `makeObjectName`
+            // takes a null second name for it, so `pkey` and its separator are the whole overhead.
+            None => free_derived_name(txn, executor, &create.name, None, "pkey")?,
         };
         (columns, primary_key, name)
     };
@@ -248,6 +250,11 @@ pub(super) fn create_table(
 /// One sequence per `bigserial` or identity column, named the way a real server names it and
 /// taking that name in the same namespace tables and indexes share — `CREATE TABLE t_id_seq` after
 /// a `bigserial` is `42P07` on both servers.
+///
+/// The name is **derived**, so one already taken is numbered rather than refused, and it is
+/// derived with the byte budget `makeObjectName` uses rather than by joining and clipping: a
+/// 63-byte table still gets a sequence whose name ends in `_seq`. Both are
+/// `adapters/postgresql/serial_test.rb`, one test each.
 /// The table's columns, as the catalog holds them, refusing a name written twice.
 fn declared_columns(
     txn: &dyn Txn,
@@ -2607,23 +2614,25 @@ fn add_unique_constraint(
     backfill(executor, txn, updated, &index)
 }
 
-/// The derived name, or the first `<name><n>` that nothing answers to.
+/// The derived name, or the first one with a numbered label that nothing answers to.
 ///
 /// **Only for names this node derives.** PostgreSQL uniquifies a name it made up and refuses one
 /// the user gave, and the difference matters: a migration that renames a table and recreates the
 /// old name expects the second key to be numbered, while a `CONSTRAINT c` that collides is a
 /// mistake worth reporting. Measured: after a rename, a new table's key is `<table>_pkey1`.
-fn free_derived_name(txn: &dyn Txn, executor: &Executor, derived: &str) -> Result<String> {
-    if !catalog::name_exists(txn, executor.tenant, derived)? {
-        return Ok(derived.to_owned());
-    }
-    for suffix in 1..u32::MAX {
-        let candidate = format!("{derived}{suffix}");
-        if !catalog::name_exists(txn, executor.tenant, &candidate)? {
-            return Ok(candidate);
-        }
-    }
-    Err(SqlError::DuplicateTable(derived.to_owned()))
+///
+/// The parts are passed **unjoined** because the counter goes on the label and the name is then
+/// rebuilt from them — see [`plan::choose_relation_name`], which is where that is measured.
+fn free_derived_name(
+    txn: &dyn Txn,
+    executor: &Executor,
+    name1: &str,
+    name2: Option<&str>,
+    label: &str,
+) -> Result<String> {
+    plan::choose_relation_name(name1, name2, label, |candidate| {
+        catalog::name_exists(txn, executor.tenant, candidate)
+    })
 }
 
 /// `ALTER INDEX <name> RENAME TO <name>`.
@@ -3026,12 +3035,29 @@ fn sequences_for(
     create: &CreateTable,
     table_id: u64,
 ) -> Result<Vec<catalog::SequenceDef>> {
-    let mut sequences = Vec::new();
+    let mut sequences: Vec<catalog::SequenceDef> = Vec::new();
     for (ordinal, column) in create.columns.iter().enumerate() {
         if let Some(identity) = column.sequence {
+            // **A derived sequence name that is taken is numbered, not refused** — this is
+            // `CollidedSequenceNameTest`, where `foo_bar (baz_id serial)` and
+            // `foo (bar_baz_id bigserial)` both derive `foo_bar_baz_id_seq` and the second gets
+            // `foo_bar_baz_id_seq1`. The first column keeps the plain name, which the test
+            // asserts directly.
+            //
+            // The names chosen earlier in *this* statement count as taken: `foo` derives
+            // `foo_bar_id_seq` for one column and `foo_bar_baz_id_seq` for another, and neither
+            // is in the catalog yet. A real server creates the sequences one at a time before the
+            // table, which is the order this loop runs in.
+            let name =
+                plan::choose_relation_name(&create.name, Some(&column.name), "seq", |candidate| {
+                    if sequences.iter().any(|chosen| chosen.name == candidate) {
+                        return Ok(true);
+                    }
+                    catalog::name_exists(&*txn, executor.tenant, candidate)
+                })?;
             sequences.push(catalog::SequenceDef {
                 id: catalog::allocate_id(txn, executor.tenant)?,
-                name: plan::sequence_name(&create.name, &column.name),
+                name,
                 table_id,
                 // A `bigserial` both fills and owns the column: it *is* the default, and it goes
                 // when the column does. `CREATE SEQUENCE … OWNED BY` sets only the second.
@@ -4422,14 +4448,13 @@ pub(super) fn create_index(
         // `t_a_idx` and `t_a_idx1`, not an error. Measured against a real server, which produced
         // `..._idx`, `..._idx1` and `..._idx2` for three. The user named nothing, so there is
         // nothing of theirs to collide with.
-        let derived = plan::index_name(&create.table, &create.keys);
-        let mut name = derived.clone();
-        let mut suffix = 0u32;
-        while existing_relation(executor, txn, &name)?.is_some() {
-            suffix += 1;
-            name = format!("{derived}{suffix}");
-        }
-        name
+        //
+        // The counter joins the **label**, so a long name is rebuilt rather than lengthened —
+        // `plan::choose_relation_name` carries the measurement.
+        let addition = plan::index_name_addition(&create.keys);
+        plan::choose_relation_name(&create.table, Some(&addition), "idx", |candidate| {
+            Ok::<_, SqlError>(existing_relation(executor, txn, candidate)?.is_some())
+        })?
     };
 
     let keys = create
