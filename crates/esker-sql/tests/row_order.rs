@@ -132,6 +132,16 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // **A pattern has no comparison at all**, which is `json`'s reason: `lquery`
                 // exists to be matched with `~` and never to be stored, ordered or indexed.
                 | ColumnType::LQuery
+                // **A tsvector's order is not its printed form's.** Measured on 19beta1 over ten
+                // values: `'b'` sorts before `'ab'` and `'a':1A` before `'a':1`, where plain bytes
+                // give the reverse of both, and a two-lexeme vector lands between two one-lexeme
+                // ones. PostgreSQL orders by lexeme length, then bytes, then positions. Equality
+                // *is* the text's, so the type is stored, compared and grouped here — it is only
+                // the **order** it cannot offer, so it is not an index column and has no fixture.
+                | ColumnType::TsVector
+                | ColumnType::TsQuery
+                | ColumnType::TsVectorArray
+                | ColumnType::TsQueryArray
         ) {
             assert!(
                 !types_seen.contains(&ty),

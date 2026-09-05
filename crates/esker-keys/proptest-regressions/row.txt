@@ -10,3 +10,5 @@ cc eff54e186a6763aade4f78e4f2a1212e81bb716cb9907df5727ec2c49d901d97 # shrinks to
 cc 9e043a3e3f02b194ca6bfc0fe9cbc3cf008033860a09a56e659e7cb1a14bd49d # shrinks to (types, rows) = ([Ltree], [[Ltree("a.b")]]), added = [Int8, Int8, TimestampTz]
 cc a210041632fad8ef466223ddacbfc47f81c4cfae9e929305678dd023d0389650 # shrinks to (types, rows) = ([Ltree], [[Ltree("a.b")]]), added = [Int8, Int8, Int8, Text]
 cc a4f47776f119d2c8c81f41a5eb88119c54e13bc30cdb2e69c8da683b6c837aaf # shrinks to (types, rows) = ([LtreeArray], [[Array(ArrayValue { element: Ltree, lower: 0, dims: [1], values: [Some(Ltree("a.b"))] })]])
+cc 745f641e7d38dd2d6225f16fc8ac8c7b7f372fbe25b9b990c57b75070ec72d72 # shrinks to (types, rows) = ([TsQueryArray], [[Array(ArrayValue { element: Text, lower: 0, dims: [], values: [] })]]), added = [Bool, Text, Int8]
+cc bc2eda969f7893ae57370cadb3afb02edb91859b55c3131c3f5482b54667e049 # shrinks to (types, rows) = ([TsQueryArray], [[Array(ArrayValue { element: Text, lower: 0, dims: [], values: [] })]])

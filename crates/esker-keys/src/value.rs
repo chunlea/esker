@@ -151,6 +151,27 @@ pub enum ColumnType {
     /// why nothing may hard-code it — a fixed one on this side is invisible to a client that
     /// reads it the way the adapter does.
     Hstore,
+    /// PostgreSQL's `tsvector`: a sorted, deduplicated set of lexemes, each optionally carrying a
+    /// list of positions, stored as **the canonical text it prints as**
+    /// ([ADR 0066](../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)).
+    ///
+    /// The road `hstore` takes and for the same reason: the canonical form is a function of the
+    /// content, so two tsvectors are equal exactly when their texts are, and equality, ordering,
+    /// grouping and an index over the column are the text machinery's. **It is a key**, unlike
+    /// `jsonb`, because there is no number inside it to print two ways.
+    ///
+    /// The canonicalisation is not free and is the whole of the risk: `'a fat cat'::tsvector` is
+    /// `'a' 'cat' 'fat'` — sorted and quoted — so a node that stored the user's characters
+    /// unchanged would round-trip `full_text_test.rb` and disagree with a real server the first
+    /// time a value arrived unsorted. `esker_sql::value::tsvector` is what canonicalises one.
+    TsVector,
+    /// PostgreSQL's `tsquery`: lexemes joined by `&`, `|`, `!` and `<->`, stored as its canonical
+    /// text.
+    ///
+    /// **A different grammar from [`ColumnType::TsVector`], not a different spelling of it**:
+    /// `'a b'` is a two-lexeme tsvector and a *syntax error* as a tsquery, which is measured in
+    /// `captures/pg19_tsvector.txt`.
+    TsQuery,
     /// PostgreSQL's `tsrange`: a range of `timestamp without time zone`.
     ///
     /// Stored as the canonical text `crate::value::range` renders, the road `hstore` takes and for
@@ -326,6 +347,13 @@ pub enum ColumnType {
     Citext,
     /// `hstore[]`, which `hstore_test.rb` declares as `t.hstore "payload", array: true`.
     HstoreArray,
+    /// `tsvector[]`. The capture builds one — `ARRAY['a b'::tsvector, 'c'::tsvector]` prints
+    /// `{"'a' 'b'",'c'}` — so the element is quoted exactly when the array codec's own rules say
+    /// so, which is what makes this a flat variant rather than a special case.
+    TsVectorArray,
+    /// `tsquery[]`, for the symmetry [ADR 0047](../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)
+    /// asks of every element type. Nothing in the suite builds one.
+    TsQueryArray,
     /// Two-valued, with no third state but NULL.
     Bool,
     /// Variable-length byte string.
@@ -454,7 +482,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 81] = [
+    pub const ALL: [ColumnType; 85] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -470,6 +498,10 @@ impl ColumnType {
         ColumnType::Int4Range,
         ColumnType::TsRangeArray,
         ColumnType::HstoreArray,
+        ColumnType::TsVector,
+        ColumnType::TsQuery,
+        ColumnType::TsVectorArray,
+        ColumnType::TsQueryArray,
         ColumnType::Bool,
         ColumnType::Bytea,
         ColumnType::TimestampTz,
@@ -583,6 +615,15 @@ pub enum Datum {
     /// `text` and `||` could not tell which concatenation it was. Its **comparison is `text`'s**,
     /// unlike citext's, because the canonical form is a function of the content.
     Hstore(String),
+    /// [`ColumnType::TsVector`]: the lexeme set, as its canonical text.
+    ///
+    /// A variant of its own for exactly the reason [`Datum::Hstore`] is one, and the capture names
+    /// the operator that proves it: `||` over two tsvectors **concatenates and renumbers**, which
+    /// is not what `||` over two strings does. A folded `'…'::tsvector` that came out as a `Text`
+    /// would have lost the only thing saying which concatenation to run.
+    TsVector(String),
+    /// [`ColumnType::TsQuery`]: the query, as its canonical text.
+    TsQuery(String),
     /// [`ColumnType::TsRange`] and its siblings: the range, as its canonical text.
     ///
     /// The subtype rides along because a folded constant would otherwise lose it — the lesson
@@ -831,7 +872,9 @@ impl PartialEq for Datum {
             // arrived without this line and was never equal to itself either; the same property
             // test caught it, one type later.
             | (Datum::Ltree(a), Datum::Ltree(b))
-            | (Datum::Hstore(a), Datum::Hstore(b)) => a == b,
+            | (Datum::Hstore(a), Datum::Hstore(b))
+            | (Datum::TsVector(a), Datum::TsVector(b))
+            | (Datum::TsQuery(a), Datum::TsQuery(b)) => a == b,
             // The canonical text and the subtype together: two ranges are one row when they print
             // the same *and* are the same type.
             (
@@ -876,6 +919,8 @@ impl Datum {
             Datum::Bit { varying: true, .. } => ColumnType::VarBit,
             Datum::Bit { .. } => ColumnType::Bit,
             Datum::Hstore(_) => ColumnType::Hstore,
+            Datum::TsVector(_) => ColumnType::TsVector,
+            Datum::TsQuery(_) => ColumnType::TsQuery,
             // **The inverse of `crate::row::range_subtype`, and it is not total.** `int4range`
             // and `int8range` are both ranges *of* an `int8` here — an `int4` is read as one
             // everywhere in this crate — so a value carrying that subtype could be either, and

@@ -1254,6 +1254,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::NumericArray
         | ColumnType::TextArray
         | ColumnType::HstoreArray
+        | ColumnType::TsVectorArray
+        | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray
         | ColumnType::TstzRangeArray
         | ColumnType::Int4RangeArray
@@ -1298,6 +1300,8 @@ fn placeholder(ty: ColumnType) -> Datum {
             Datum::Text(String::new())
         }
         ColumnType::Citext => Datum::Citext(String::new()),
+        ColumnType::TsVector => Datum::TsVector(String::new()),
+        ColumnType::TsQuery => Datum::TsQuery(String::new()),
         // The empty range, which is a real value and not a NULL.
         ColumnType::TsRange
         | ColumnType::TstzRange

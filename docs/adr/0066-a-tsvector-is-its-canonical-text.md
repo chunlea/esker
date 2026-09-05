@@ -46,9 +46,34 @@ printed in PostgreSQL's order. A column of either type is a string column with a
 
 Three things follow, and they are the reason:
 
-1. **The comparison is the text's**, which is what [ADR 0042](0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)
-   requires of two types sharing a representation. A `tsvector`'s ordering on a real server is over
-   its canonical form; two values that print the same are the same value.
+1. **The equality is the text's** — two values that print the same are the same value — which is
+   what [ADR 0042](0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md) requires of
+   two types sharing a representation.
+
+   > **Corrected on measurement.** This point first said *the comparison* is the text's, and that
+   > a tsvector's ordering on a real server is over its canonical form. **The ordering is not.**
+   > Measured on 19beta1 over ten values, ascending:
+   >
+   > ```text
+   > (empty)  'A'  'a'  'b'  'ab'  'a b'  'a':1A  'a':1  'a' 'b'  'a':1,2
+   > ```
+   >
+   > `'b'` sorts **before** `'ab'` and `'a':1A` **before** `'a':1`, where plain bytes give the
+   > reverse of both, and a two-lexeme vector lands between two one-lexeme ones. PostgreSQL orders
+   > by lexeme **length**, then bytes, then positions — not by the printed form.
+   >
+   > So a `tsvector` column is stored, compared, grouped and round-tripped by its canonical text,
+   > and it is **not an index key here**: `esker_keys::row` refuses one beside `hstore`, and
+   > `tests/row_order.rs` records why it has no ordering fixture. This is the inverse of `jsonb`,
+   > which cannot be a key because values that are *equal* differ in bytes; a tsvector cannot
+   > because values that are *ordered* differ in order. `tsvector_ops` being a real btree operator
+   > class on a real server is what makes this a declared divergence rather than a gap — the
+   > server can index one and this node cannot.
+   >
+   > The guard that caught it is
+   > `tests/row_order.rs::encoded_keys_sort_the_way_postgresql_sorts_the_values`, whose message is
+   > the whole argument: *a type whose key order is unchecked is a type whose range scans are
+   > unchecked*. It was written for exactly this and it fired on the first type that needed it.
 2. **The round-trip is the feature** for the file that owns it. A parsed structure would have to
    reproduce the printed form exactly anyway, so the printed form is the shorter path to the same
    answer — and the only one whose correctness the suite can currently check.
