@@ -414,6 +414,18 @@ Named so the next person can check them rather than re-derive them:
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
    parallel dispatch, not before.**
 
+### The interim guard, and what retires it
+
+A multi-region columnar query returns **N times** the right answer — measured 2026-09-05,
+`docs/bench/mpp-baseline.md` §10 — so `exec::fragment` refuses a table in more than one region and
+`EXPLAIN` names the rule. The guard is **temporary**. It is retired by
+`crates/esker-cli/tests/multi_region_differential.rs` going green: the test that asserts the two
+engines agree across regions with `Engine: columnar` on every comparison, which cannot pass until
+the columnar copy is region-scoped (`esker-store`'s, by ADR 0040's own sentence).
+
+Until then **every number in this file is single-region**, and the exchange re-measure is blocked
+on correctness rather than on a quiet machine.
+
 ### What this measurement cannot say
 
 It has **one fragment**, so it says nothing about how the finish scales with fragment count — the
