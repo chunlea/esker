@@ -4875,6 +4875,21 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             && let Expr::Value(value) = strip_nesting(inner)
             && let Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) = &value.value
         {
+            // **A `regtype` over a name the value layer does not know belongs to the catalog**,
+            // not to this fold: `ARRAY['example_type'::regtype]` is what `postgresql_adapter_test`
+            // sends about a `CREATE DOMAIN`, and folding it here read the name with
+            // `value::named_type`, which only knows the built-ins, and answered `42704` for a type
+            // that exists. The runtime constructor lowers each element through `lower_expr`, where
+            // the regtype cast already has its catalog seam.
+            if cast_to == ColumnType::RegType && value::named_type(text)?.is_none() {
+                return Ok(plan::Expr::Array {
+                    elements: elements
+                        .iter()
+                        .map(lower_expr)
+                        .collect::<Result<Vec<_>>>()?,
+                    element: None,
+                });
+            }
             element = Some(cast_to);
             texts.push(Some(text.clone()));
             continue;
