@@ -343,6 +343,30 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
             padded.extend(std::iter::repeat_n(' ', short_by));
             Datum::Text(padded)
         }
+        // **`interval(p)` rounds its time-of-day part**, and only that part: `1 mon 2 days
+        // 00:00:59.9999` at `interval(0)` is `1 mon 2 days 00:01:00` — the carry reaches minutes
+        // and stops at days, because an interval's three fields never carry into one another.
+        // Half away from zero and symmetric: `0.0005` at `interval(3)` is `0.001` and the negative
+        // is `-0.001`. All measured.
+        //
+        // The precision comes out of a **packed** typmod — an interval's is
+        // `(range_mask << 16) | precision`, so a bare number is not a valid one — which is why
+        // this asks `interval_precision_of_typmod` and not `precision_of_typmod`.
+        (
+            Datum::Interval {
+                months,
+                days,
+                micros,
+            },
+            ColumnType::Interval,
+        ) => match interval_precision_of_typmod(typmod) {
+            Some(precision) => Datum::Interval {
+                months: *months,
+                days: *days,
+                micros: timestamp::round_to_precision(*micros, precision),
+            },
+            None => value,
+        },
         (Datum::Timestamp(micros), ColumnType::Timestamp) => match precision_of_typmod(typmod) {
             Some(precision) => Datum::Timestamp(timestamp::round_to_precision(*micros, precision)),
             None => value,
