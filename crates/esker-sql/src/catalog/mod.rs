@@ -58,6 +58,9 @@ use crate::value::{self, ColumnType, Datum};
 /// (`CLAUDE.md` invariant 2).
 pub const CATALOG_FORMAT_VERSION: u8 = record::CATALOG_FORMAT_VERSION;
 
+/// A role's attributes, as `CREATE ROLE` asked for them.
+pub use record::RoleFlags;
+
 /// How long old MVCC versions are kept when nothing says otherwise: **one hour**.
 ///
 /// This number is two things at once and they pull in opposite directions
@@ -3101,9 +3104,9 @@ pub struct RoleDef {
     pub name: String,
     /// Its oid, which `pg_namespace.nspowner` joins to.
     pub oid: u64,
-    /// **`CREATE USER` implies this and `CREATE ROLE` does not**, which is the only thing the two
-    /// statements disagree about. Measured against PG19.
-    pub can_login: bool,
+    /// Its attributes. **`CREATE USER` implies `LOGIN` and `CREATE ROLE` does not**, which is the
+    /// only thing the two statements disagree about; the rest are recorded and not enforced.
+    pub flags: RoleFlags,
 }
 
 /// Every role in the cluster, by name.
@@ -3114,11 +3117,11 @@ pub fn roles(txn: &dyn Txn) -> Result<Vec<RoleDef>> {
     let (start, end) = record::role_range();
     let mut out = Vec::new();
     for (key, value) in txn.scan(&start, &end, u32::MAX)? {
-        let (oid, can_login) = record::decode_role(&value)?;
+        let (oid, flags) = record::decode_role(&value)?;
         out.push(RoleDef {
             name: record::role_name_of(&key)?,
             oid,
-            can_login,
+            flags,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3130,16 +3133,16 @@ pub fn role_by_name(txn: &dyn Txn, name: &str) -> Result<Option<RoleDef>> {
     let Some(value) = txn.get(&record::role_key(name))? else {
         return Ok(None);
     };
-    let (oid, can_login) = record::decode_role(&value)?;
+    let (oid, flags) = record::decode_role(&value)?;
     Ok(Some(RoleDef {
         name: name.to_owned(),
         oid,
-        can_login,
+        flags,
     }))
 }
 
 /// Records a new role. `42710` if the name is taken.
-pub fn create_role(txn: &mut dyn Txn, name: &str, can_login: bool) -> Result<()> {
+pub fn create_role(txn: &mut dyn Txn, name: &str, flags: record::RoleFlags) -> Result<()> {
     if txn.get(&record::role_key(name))?.is_some() {
         return Err(SqlError::RoleAlreadyExists(name.to_owned()));
     }
@@ -3150,10 +3153,7 @@ pub fn create_role(txn: &mut dyn Txn, name: &str, can_login: bool) -> Result<()>
         None => FIRST_ROLE_OID,
     };
     txn.put(&record::next_role_key(), &record::encode_schema(next + 1));
-    txn.put(
-        &record::role_key(name),
-        &record::encode_role(next, can_login),
-    );
+    txn.put(&record::role_key(name), &record::encode_role(next, flags));
     bump_version(txn)
 }
 

@@ -292,6 +292,14 @@ pub struct CreateRole {
     pub name: String,
     /// `LOGIN` — implied by `CREATE USER`, absent from a bare `CREATE ROLE`.
     pub login: bool,
+    /// `SUPERUSER`. **Recorded and not honoured**: nothing here checks a privilege, so this is
+    /// what `pg_roles.rolsuper` reports and nothing more. It was accepted and dropped before,
+    /// which is worse — a client that asked for it was told yes and then shown `f`.
+    pub superuser: bool,
+    /// `CREATEDB`, on the same terms.
+    pub create_db: bool,
+    /// `CREATEROLE`, on the same terms.
+    pub create_role: bool,
     /// `IF NOT EXISTS`.
     pub if_not_exists: bool,
 }

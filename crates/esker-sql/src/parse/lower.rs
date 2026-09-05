@@ -472,6 +472,9 @@ fn lower_statement(
                 // so `Some(true)` here is that rewrite arriving — and a bare `CREATE ROLE` is
                 // `None`, which is `NOLOGIN`, which is what a real server does.
                 login: create.login.unwrap_or(false),
+                superuser: create.superuser.unwrap_or(false),
+                create_db: create.create_db.unwrap_or(false),
+                create_role: create.create_role.unwrap_or(false),
                 if_not_exists: create.if_not_exists,
             }))
         }
@@ -3896,6 +3899,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     if name.eq_ignore_ascii_case("current_database") {
         refuse_wrong_arity(function, "current_database", 0)?;
         return Ok(plan::Expr::CurrentDatabase);
+    }
+    // `current_user`, `session_user` and `user`, which PostgreSQL spells without parentheses and
+    // `sqlparser` hands over as a zero-argument call. The same three names, one value: this node
+    // has no `SET ROLE`, which is the only thing that makes the first two differ on a real server.
+    if name.eq_ignore_ascii_case("current_user")
+        || name.eq_ignore_ascii_case("session_user")
+        || name.eq_ignore_ascii_case("user")
+    {
+        refuse_wrong_arity(function, "current_user", 0)?;
+        return Ok(plan::Expr::CurrentUser);
     }
     // The advisory-lock functions this node answers. The **blocking** forms are not here and are
     // refused by name: they wait, and nothing here has anything to wait on. `ActiveRecord` sends

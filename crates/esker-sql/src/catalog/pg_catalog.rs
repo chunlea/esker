@@ -1501,16 +1501,20 @@ fn role_rows(txn: &dyn crate::backend::Txn, _authid: bool) -> Result<Vec<Vec<Dat
             vec![
                 Datum::Int8(i64::try_from(role.oid).unwrap_or(i64::MAX)),
                 Datum::Text(role.name),
-                // Six attributes this node does not grant and does not enforce, false for every
-                // role it can make. `rolinherit` is the exception and is `true`, which is what
-                // `CREATE ROLE` defaults to on a real server (measured).
-                Datum::Bool(false),
+                // **Recorded, not enforced** — every one of these is what the statement asked
+                // for and what `pg_roles` reports, and nothing in this node consults any of them.
+                // Reporting `f` for a role created `SUPERUSER` was worse than either: the client
+                // was told yes and then shown no.
+                Datum::Bool(role.flags.superuser),
+                // `rolinherit` is `true` for every role here, which is `CREATE ROLE`'s own default
+                // on a real server (measured) — so it is a constant rather than a stored bit, and
+                // a stored bit would have read `false` for every role written before it existed.
                 Datum::Bool(true),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                // **The one attribute that is real**: `CREATE USER` implies it, `CREATE ROLE` does
-                // not, and nothing else about the two statements differs.
-                Datum::Bool(role.can_login),
+                Datum::Bool(role.flags.create_role),
+                Datum::Bool(role.flags.create_db),
+                // **The one attribute that changes behaviour**: `CREATE USER` implies it, `CREATE
+                // ROLE` does not, and nothing else about the two statements differs.
+                Datum::Bool(role.flags.login),
                 Datum::Bool(false),
                 Datum::Bool(false),
                 // No connection limit, which is `-1` rather than NULL.

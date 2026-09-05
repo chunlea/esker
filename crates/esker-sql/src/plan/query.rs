@@ -1033,6 +1033,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
         Expr::CurrentDatabase | Expr::Advisory { .. } => "current_database()".to_owned(),
+        Expr::CurrentUser => "CURRENT_USER".to_owned(),
         Expr::CurrentSchema {
             all: Some(implicit),
         } => format!("current_schemas({implicit})"),

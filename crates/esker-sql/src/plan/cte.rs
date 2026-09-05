@@ -229,6 +229,7 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
         | Expr::Parameter(_)
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
+        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
         | Expr::Column { .. }

@@ -2082,6 +2082,7 @@ impl Executor {
         }
         self.resolve_current_schema(txn, &mut statement)?;
         self.resolve_current_database(&mut statement);
+        self.resolve_current_user(&mut statement);
         self.resolve_current_setting(&mut statement)?;
         self.resolve_advisory(&mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
@@ -2132,6 +2133,28 @@ impl Executor {
         let mut resolve = |expr: &mut Expr| {
             if matches!(expr, Expr::CurrentDatabase) {
                 *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(self.database.clone()))));
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+    }
+
+    /// Folds `current_user` / `session_user` / `user` to the role this session is running as.
+    ///
+    /// The same shape as [`Executor::resolve_current_database`] and for the same reason: the answer
+    /// is the session's, and a `SET SESSION AUTHORIZATION` moves it mid-connection.
+    fn resolve_current_user(&self, statement: &mut Statement) {
+        use crate::plan::{Expr, Literal};
+
+        if !bind::any(statement, |expr| matches!(expr, Expr::CurrentUser)) {
+            return;
+        }
+        let who = self
+            .authorization
+            .clone()
+            .unwrap_or_else(|| self.user.clone());
+        let mut resolve = |expr: &mut Expr| {
+            if matches!(expr, Expr::CurrentUser) {
+                *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(who.clone()))));
             }
         };
         bind::walk_mut(statement, &mut resolve);
