@@ -155,13 +155,25 @@ fn one_session_finds_another_in_pg_stat_activity_and_cancels_it() {
     }
     let pid = pid.expect("the sleeping session must appear in pg_stat_activity with its statement");
 
-    assert_eq!(
-        hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
-        [["t".to_owned()]],
-        "the pid was found, so there was a session to ask"
-    );
-
+    // **Asked until it lands, not once — and that is the semantics, not a workaround.**
+    // `pg_cancel_backend` is best-effort on a real server too: it *requests* a cancellation, and
+    // PostgreSQL's own documentation says so. A test that requires one request to be observed is
+    // asserting something no server promises, and this one did: it went red under a loaded gate
+    // with the sleep running its full ten seconds.
+    //
+    // The bound is what keeps it a test. Each round re-asks and gives the victim a moment; if the
+    // statement is still running after five seconds the loop stops asking and the assertion below
+    // fails on a completed sleep, which is a report rather than a hang.
     let started = Instant::now();
+    while !sleeping.is_finished() && started.elapsed() < Duration::from_secs(5) {
+        assert_eq!(
+            hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
+            [["t".to_owned()]],
+            "the pid was found, so there is a session to ask"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     let stopped = sleeping
         .join()
         .unwrap()
@@ -208,4 +220,74 @@ fn cancelling_a_pid_that_is_not_here_is_false() {
         session.rows("SELECT pg_cancel_backend(999999)"),
         [["f".to_owned()]]
     );
+}
+
+/// **A statement blocked in a row-lock wait is cancellable too** — run 86's survivor.
+///
+/// `pg_sleep` polls `exec::cancel` between its steps, so a sleep stops. The row wait had its own
+/// loop that watched only its deadline, so a cancel from another session set a flag nothing on that
+/// path ever read: `pg_cancel_backend` answered `true` and the waiter went on waiting. That is what
+/// `transaction_test.rb`'s last failure is —
+/// `ActiveRecord::QueryCanceled expected but nothing was raised` — and it is the shape a real
+/// application actually cancels: a statement stuck behind somebody else's lock.
+#[test]
+fn a_statement_waiting_for_a_row_lock_is_cancellable() {
+    let pair = Pair::new(&[
+        "CREATE TABLE t (id bigint primary key, v bigint)",
+        "INSERT INTO t VALUES (1, 0)",
+    ]);
+
+    // The holder keeps the row for the whole test.
+    let mut holder = pair.session();
+    holder.run("BEGIN").unwrap();
+    holder.run("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+
+    let mut waiter = pair.session();
+    let blocked = std::thread::spawn(move || {
+        // **A `lock_timeout` far past the cancellation, so a failure is a failure.** Written
+        // without one this test did not fail when the cancel was ignored — it *hung*, for 295
+        // seconds, until nextest killed it. A bound turns "the cancel never landed" into a
+        // `55P03` the assertion below can name, which is the difference between a test that
+        // reports and a test that stops the suite.
+        waiter.run("SET lock_timeout = '20s'").unwrap();
+        waiter.run("UPDATE t SET v = 2 WHERE id = 1")
+    });
+
+    let mut hunter = pair.session();
+    let mut pid = None;
+    for _ in 0..300 {
+        let rows = hunter.rows(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE query LIKE '%SET v = 2%' AND pid <> pg_backend_pid()",
+        );
+        if let Some(found) = rows.first().and_then(|row| row.first()) {
+            pid = Some(found.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = pid.expect("the blocked writer must be visible with its statement");
+
+    assert_eq!(
+        hunter.rows(&format!("SELECT pg_cancel_backend({pid})")),
+        [["t".to_owned()]]
+    );
+
+    let started = Instant::now();
+    let stopped = blocked
+        .join()
+        .unwrap()
+        .expect_err("the wait was cancelled, so the statement is an error");
+    assert_eq!(
+        stopped.sqlstate(),
+        "57014",
+        "a 55P03 here means the lock timeout ended the wait and the cancellation never did: \
+         {stopped}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it ended only when the holder did, which is not a cancellation"
+    );
+
+    holder.run("ROLLBACK").unwrap();
 }
