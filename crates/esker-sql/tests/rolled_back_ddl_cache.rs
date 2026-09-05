@@ -71,14 +71,20 @@ fn a_rolled_back_ddl_transaction_does_not_change_the_next_one() {
     }
 }
 
-/// The rolled-back statements need not touch the table that then breaks.
+/// **The bug is table-scoped, and this is the test that says so.**
 ///
-/// **A guard, not a reproducer**: it is green before the fix as well as after, because the cache
-/// is filled per relation on demand and lining up a *second* table's entry with the version the
-/// next transaction asks for needs more than this. It is here so that the shape has a test at all
-/// — the harness saw it fire against a real node, and in-process it does not.
+/// It is green before the fix as well as after, and that is the finding rather than a weakness:
+/// the cache is filled per relation on demand, so only the table the doomed transaction *touched*
+/// is sitting there under its version. A second table is untouched and its lookup goes to the
+/// store.
+///
+/// Worth the lines because the first report of this bug said the opposite — "it fires even when
+/// the two statements target a different table, so it is session state, not table state". That
+/// came from a contaminated batch and `r1-harness` withdrew it after re-testing on an isolated
+/// node: cross-table 4/4 clean, same-table 4/4 red, one rig. The claim was believed for a while by
+/// both of us, so the shape gets an assertion rather than a memory.
 #[test]
-fn the_rolled_back_statements_need_not_touch_the_same_table() {
+fn the_bug_does_not_reach_a_table_the_doomed_transaction_never_touched() {
     let mut node = parity::Node::new(&[
         "CREATE TABLE t (id serial primary key)",
         "CREATE TABLE other (id serial primary key)",

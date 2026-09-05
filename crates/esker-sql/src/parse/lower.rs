@@ -7469,6 +7469,24 @@ fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
         DataType::Varchar(Some(length)) | DataType::CharacterVarying(Some(length)) => {
             Ok((ColumnType::Varchar, string_typmod(length, "varchar")?))
         }
+        // **`interval(p)` carries a typmod; `interval <fields>` still does not.** The precision is
+        // a width and this node keeps it; the field mask says which fields a value *keeps*, which
+        // is semantics, and stays the declared divergence `tests/interval.rs` records.
+        //
+        // A precision past six is **reduced rather than refused** — measured, `interval(7)` is
+        // `WARNING: INTERVAL(7) precision reduced to maximum allowed, 6` and the column is created
+        // as `interval(6)`. The clamp lives in `value::interval_typmod_of_precision`; the warning
+        // itself is not emitted here, because lowering has no notice channel, and that gap is
+        // named in `tests/interval_precision.rs`.
+        DataType::Interval {
+            fields: None,
+            precision: Some(precision),
+        } => Ok((
+            ColumnType::Interval,
+            value::interval_typmod_of_precision(
+                u32::try_from(*precision).unwrap_or(value::MAX_TIME_PRECISION),
+            ),
+        )),
         // `numeric` and `decimal` are one type under two spellings, which is PostgreSQL's own
         // model: `'decimal(3,2)'::regtype` is `numeric(3,2)` there. A **bare precision means
         // scale zero**, not "no scale" — `numeric(10)` is `numeric(10,0)` and rounds — which is

@@ -34,8 +34,27 @@ max-threads = 1
 # `esker-cli`'s are, and they are the heaviest of all: they start the cluster as **real
 # processes**, so a store there costs an operating-system process rather than a task, and their
 # deadlines are wall-clock budgets rather than assertions about a state.
+#
+# **Four more `esker-sql` binaries, measured rather than guessed.** They share
+# `tests/cluster/mod.rs` — three stores, three regions, real sockets, all in process — with
+# `joint_gate` and `routing_differential`, which were already here, and they were in no group at
+# all. Five tests across them failed together in one full-workspace run and every one passed
+# alone; the wall clocks are the argument, not the pass:
+#
+# ```text
+# esker-sql::redrive_live          106.9 s in the run    1.4 s alone
+# esker-sql::routing_differential   63.6 s               0.8 s
+# esker-sql::real_backend           24.4 s               0.4 s
+# esker-sql::real_corpus            19.5 s               4.1 s
+# ```
+#
+# `redrive_live` at 76x is worse than any of the real-process binaries below, and it starts no
+# process — which is what says this group, and not the exclusivity override, is the right home:
+# the cost is Raft ticks competing with each other, and one at a time is the whole fix. They are
+# **deliberately not** given `threads-required` for the reason the next override states.
 filter = """
-    (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)))
+    (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)
+        or binary(real_backend) or binary(real_corpus) or binary(redrive_live)))
     or (package(esker-store) and (binary(promotion) or binary(balance)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
