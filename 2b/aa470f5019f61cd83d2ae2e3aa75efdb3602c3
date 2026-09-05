@@ -1,0 +1,19 @@
+crates/esker-sql/tests/wire_serial.rs
+  s_2bed4ac2b1c944::t_19102c09fe64a3 88-133,203-208,283-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2baa470f5019f61cd83d2ae2e3aa75efdb3602c3",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
