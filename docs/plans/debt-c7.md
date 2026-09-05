@@ -808,3 +808,75 @@ state only because their write loop ran long enough for PD to promote the learne
 
 Three of the eight sightings in this wave now have the same shape: **a test whose premise is
 established once and then assumed to hold.** Still nothing fixed by changing a budget.
+
+## 17. The arm that was worth running, and a verification of mine that was not
+
+One arm, 14 threads, GNU `timeout` proved against a fast success (rc=0) **and** a real hang
+(rc=124) before it was trusted. Aborted early — see the last part of this section.
+
+### promotion, with a budget above its own deadlines
+
+§15 said the 300 s cap could not tell "failed" from "needed longer". At 600 s the test's own
+assertion fires, and it is reproducible: **2 of 4 runs failed at 14 threads** (158 s, 204 s; the
+passes took 107 s and 338 s).
+
+```
+promotion.rs:174: writing b"k000659" never succeeded; the last refusal was: None
+```
+
+`the last refusal was: None` is the whole finding. `last` is only assigned after `store.serve`
+returns an error, so `None` means **no store was ever asked** — for ninety seconds, not one of the
+three passed all three gates in the loop:
+
+```rust
+let Some(state) = store.regions().find(&key) else { continue };  // holds no region for this key
+let Some(peer)  = store.peer_of(state.id())   else { continue };  // holds it, but has no peer
+if !peer.is_leader() { continue }                                 // has a peer that does not lead
+```
+
+Three very different states, one silent `continue`, and a message that reports only the absence of
+a refusal. So the message now names which gate each store stopped at and who it believes holds the
+office. A leaderless region and a key no store admits to owning are not the same finding, and the
+next occurrence will say which it is. **The measurement is not repeated here** — this is the
+instrument being fixed, not the defect.
+
+### The retire test's third face: the other half of the same guard
+
+§16 fixed the office half of `!peer.is_leader() && peer.applied_index() < index` and this lane's
+own crate run then lost the test again, at the same 60 s retire wait — with the §16 assert *not*
+firing, which proves the receiver was not the leader. That leaves the applied-index half.
+
+It closes on its own. The gap is measured, then the announcement is built and delivered, and in
+that window the learner applies more of the log — `leader.status().await` sits **between** the
+measurement and the send, which is an await in exactly the wrong place. Under load the learner
+reaches the index that was chosen, `receive_raft` skips the branch, and a single-shot wait spends
+its whole deadline.
+
+The announcement is therefore retried rather than sent once: each round re-measures, names an index
+the learner has not reached at the moment of sending, and watches briefly before announcing again.
+The term is read once above the loop, so no await separates the measurement from the send. Losing a
+round now costs one more announcement instead of the deadline, and the failure reports the rounds,
+the announcements, both applied indices and the gap between them.
+
+Four gates, three faces, one guard. §14 and §16 each removed a face and promoted the next.
+
+### A verification of mine that was not a verification
+
+The arm was stopped early: load average reached **196**, far outside the ≤14 rule. Killing the
+spinners and checking them found two faults that both read as success:
+
+* **zsh does not word-split an unquoted `$PIDS`.** `for p in $PIDS` runs the body *once* with the
+  whole string, so `kill -9` fails `illegal pid: 49786 49787 …` and `kill -0` fails identically —
+  and a `still-alive=0` counter built on that reports "all dead" while fourteen loops spin at 100%.
+* **`kill -0` is not a liveness check.** It returns non-zero for permission denied as well as for
+  no-such-process, so a failure never proves absence.
+
+`ps -p <pid>` is the check that works, and it is what confirmed all fourteen were gone. The
+previous arm's cleanup was sound — its script was bash with a real `PIDS=()` array, and it was
+independently confirmed by a `ps` sweep — but **"verified per PID with `kill -0`" is what I reported
+to the coordinator, and that sentence describes a check that cannot fail-closed.** It is now
+corrected in the standing lane guidance.
+
+The load itself was not the spinners alone: with all fourteen gone the average was still 196, and
+macOS `StorageManagementService` and `ApplicationsStorageExtension` were burning 58% and 65%. Disk
+is healthy (72% used, 1.0 TiB free).
