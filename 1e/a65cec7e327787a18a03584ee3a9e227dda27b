@@ -1,0 +1,23 @@
+crates/esker-sql/src/fragment.rs
+  s_2bed4ac2b1c944::t_7e954ba36fc663 97
+crates/esker-store/src/server.rs
+  s_2bed4ac2b1c944::t_c50ac5a24827f8 3434-3464,3529-3530,4312-4346
+docs/plans/phase-8-learner.md
+  s_2bed4ac2b1c944::t_ee06ceb93ba3c1 1003-1037,1047-1048
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1ea65cec7e327787a18a03584ee3a9e227dda27b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
