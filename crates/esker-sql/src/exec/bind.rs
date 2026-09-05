@@ -73,11 +73,20 @@ use crate::value::{PgDatum, PgType};
 /// `ActiveRecord` write to an enum column, because `ActiveRecord` prepares. A **label** is what a
 /// client sends, so the parameter is read as text and `assign::into_enum` maps it to the ordinal
 /// on the way into the row, exactly as it does for a literal.
-fn parameter_type(column: &crate::catalog::ColumnDef) -> ColumnType {
-    if column.user_type.is_some() {
-        ColumnType::Text
-    } else {
-        column.ty
+///
+/// **The kind, not the presence.** This first asked only whether the column had a user type at
+/// all, and every `CREATE TYPE` sets that: a **domain** and a **user-defined range** took `text`
+/// too, and then the assignment refused them with `42804 column "price" is of type numeric but
+/// expression is of type text`. Two `range_test.rb` tests and one in `domain_test.rb` went red on
+/// it while every enum test stayed green, because an enum is the one kind whose storage type is
+/// not what a client sends. So the question is which kind it is, and only `Enum` answers `text`.
+fn parameter_type(table: &TableDef, at: usize) -> ColumnType {
+    let column = &table.columns[at];
+    match column.user_type.and_then(|oid| table.enums.get(&oid)) {
+        Some(def) if matches!(def.kind, crate::catalog::TypeKind::Enum { .. }) => ColumnType::Text,
+        // A domain is its base type and a range is its own; a user type the table did not hydrate
+        // is the column's own type too, which is what this answered before enums were special.
+        _ => column.ty,
     }
 }
 
@@ -185,7 +194,7 @@ fn walk(
             for row in &insert.rows {
                 for (target, expr) in targets.iter().zip(row) {
                     if let Expr::Parameter(number) = expr {
-                        seen(*number, parameter_type(&table.columns[*target]));
+                        seen(*number, parameter_type(table, *target));
                     }
                 }
             }
@@ -197,7 +206,7 @@ fn walk(
                     match (table.column(name), value) {
                         // `SET c = $1`: the column's own type, which is the whole of it.
                         (Some(at), Expr::Parameter(number)) => {
-                            seen(*number, parameter_type(&table.columns[at]));
+                            seen(*number, parameter_type(table, at));
                         }
                         // **`SET c = <expression holding $1>`**, which is what a counter cache
                         // sends and what the `$1`-is-`text` bug was: the value is an arithmetic
@@ -500,7 +509,7 @@ fn walk_predicate(
                                 found = None;
                                 break;
                             }
-                            found = Some(parameter_type(&candidate.columns[at]));
+                            found = Some(parameter_type(candidate, at));
                         }
                     }
                     if let Some(ty) = found {
@@ -630,7 +639,7 @@ fn column_type(named: &[Named<'_>], qualifier: Option<&str>, name: &str) -> Opti
             if found.is_some() {
                 return None;
             }
-            found = Some(parameter_type(&candidate.columns[at]));
+            found = Some(parameter_type(candidate, at));
         }
     }
     found

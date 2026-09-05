@@ -1,0 +1,88 @@
+# `COLLATE` — what PostgreSQL 19beta1 answers, and what this node answers instead.
+#
+# **Run 89: `COLLATE "C" is not supported`, 6 tests over 2 files** — `collation_test.rb` (5) and
+# `unsafe_raw_sql_test.rb` (1). The five are a `string` and a `text` column declared with one and
+# read back through `columns()`, `add_column … collation:`, `change_column … collation:`, and the
+# schema dump; the sixth is `ORDER BY author_id, title COLLATE "C" DESC`.
+#
+# The decision is ADR 0076: `C` and `POSIX` are byte order under two names, a memcomparable key is
+# already in byte order, and every other name is `42704` rather than accepted and sorted by bytes
+# anyway.
+#
+# Things reasoning would get wrong:
+#
+#   * **PostgreSQL's default collation is a locale; `C` is byte order.** `q8` is `a,A,b,B` there
+#     and `A,B,a,b` here. So `C` is not the collation this node lacks — it is the one it has, and
+#     the *default* is the one it does not.
+#   * **Two sqlstates, and the name is checked first.** `a integer COLLATE "nope"` is `42704`, the
+#     name's error, though `integer` could not have taken `C` either; a name the server *has* on a
+#     non-collatable type is `42804`.
+#   * **An array is collatable where its element is** — `_text.typcollation` is `100` and
+#     `text[] COLLATE "C"` is accepted. `char` is not (`0`), though `bpchar` is; and `name`'s own
+#     collation is `950`, which is `C`.
+#   * **`ALTER COLUMN … TYPE` with no `COLLATE` clears the one the column had** (`q11` to `q12`):
+#     the column takes its new type's collation, so it is assigned and not merged.
+#   * **`attcollation <> typcollation` is what makes a plain column read back NULL**, so the `100`
+#     on the *type* matters as much as the `950` on the column: with `typcollation` left at `0`,
+#     every `text` column reports the collation `default`.
+#   * `name`, `char` and `ucs_basic` are in the capture and not in this corpus: the first two
+#     are types this node does not have, and `collprovider` is a column of `pg_collation` that
+#     nothing reads. Their measurements are `captures/pg19_collation.txt:18` and `:19`.
+#   * `SELECT 'x' COLLATE "C"` is accepted — an `unknown` literal takes the type it is used with,
+#     so there is nothing to refuse.
+#
+# Error probes sit in a `SAVEPOINT` taken before them, and `q17` after the `ROLLBACK` proves the
+# session left nothing behind. The sqlstates were read with `VERBOSITY verbose` rather than
+# assumed from the class.
+
+BEGIN;		-
+CREATE TABLE co (id bigserial primary key, plain text, c_col varchar COLLATE "C", p_col text COLLATE "POSIX", n integer);		-
+INSERT INTO co (plain, c_col, p_col, n) VALUES ('b','b','b',1),('A','A','A',2),('a','a','a',3),('B','B','B',4);		-
+-- ------------------------------------------------- the three collations, and which types have one		-
+SELECT 'q1', oid, collname FROM pg_collation WHERE collname IN ('C','POSIX','default') ORDER BY oid;		q1|100|default ; q1|950|C ; q1|951|POSIX
+SELECT 'q2', typname, typcollation FROM pg_type WHERE typname IN ('text','varchar','bpchar','int4','_text','uuid') ORDER BY typname;		q2|_text|100 ; q2|bpchar|100 ; q2|int4|0 ; q2|text|100 ; q2|uuid|0 ; q2|varchar|100
+-- ------------------------------------------------- what a column stores, and what a client reads		-
+SELECT 'q4', a.attname, a.attcollation FROM pg_attribute a WHERE a.attrelid='co'::regclass AND a.attnum>0 ORDER BY a.attnum;		q4|id|0 ; q4|plain|100 ; q4|c_col|950 ; q4|p_col|951 ; q4|n|0
+SELECT 'q5', a.attname, c.collname FROM pg_attribute a LEFT JOIN pg_type t ON a.atttypid=t.oid LEFT JOIN pg_collation c ON a.attcollation=c.oid AND a.attcollation<>t.typcollation WHERE a.attrelid='co'::regclass AND a.attnum>0 ORDER BY a.attnum;		q5|id|\N ; q5|plain|\N ; q5|c_col|C ; q5|p_col|POSIX ; q5|n|\N
+-- ------------------------------------------------- the ordering the clause asks for -- and the one the default gives, which is not it		-
+SELECT 'q6', plain FROM co ORDER BY plain COLLATE "C";		q6|A ; q6|B ; q6|a ; q6|b
+SELECT 'q7', plain FROM co ORDER BY plain COLLATE "POSIX" DESC;		q7|b ; q7|a ; q7|B ; q7|A
+SELECT 'q8', plain FROM co ORDER BY plain;		q8|a ; q8|A ; q8|b ; q8|B
+SELECT 'q9', count(*) FROM co WHERE c_col COLLATE "C" = 'a';		q9|1
+SELECT 'q10', 'x' COLLATE "C";		q10|x
+-- ------------------------------------------------- ALTER carries it, and dropping the clause clears it		-
+ALTER TABLE co ADD COLUMN added varchar COLLATE "POSIX";		-
+ALTER TABLE co ALTER COLUMN plain TYPE varchar COLLATE "C";		-
+SELECT 'q11', a.attname, c.collname FROM pg_attribute a LEFT JOIN pg_type t ON a.atttypid=t.oid LEFT JOIN pg_collation c ON a.attcollation=c.oid AND a.attcollation<>t.typcollation WHERE a.attrelid='co'::regclass AND a.attnum>0 ORDER BY a.attnum;		q11|id|\N ; q11|plain|C ; q11|c_col|C ; q11|p_col|POSIX ; q11|n|\N ; q11|added|POSIX
+ALTER TABLE co ALTER COLUMN plain TYPE text;		-
+SELECT 'q12', a.attname, c.collname FROM pg_attribute a LEFT JOIN pg_type t ON a.atttypid=t.oid LEFT JOIN pg_collation c ON a.attcollation=c.oid AND a.attcollation<>t.typcollation WHERE a.attrelid='co'::regclass AND a.attname='plain';		q12|plain|\N
+-- ------------------------------------------------- an array is collatable where its element is		-
+SAVEPOINT s0;		-
+CREATE TABLE arr (a text[] COLLATE "C");		-
+SELECT 'q13', attname, attcollation FROM pg_attribute WHERE attrelid='arr'::regclass AND attnum>0;		q13|a|950
+ROLLBACK TO s0;		-
+-- ------------------------------------------------- the two refusals, and which one wins		-
+SAVEPOINT s1;		-
+CREATE TABLE bad (a text COLLATE "en_US.UTF-8");	!42704 collation "en_US.UTF-8" for encoding "UTF8" does not exist
+ROLLBACK TO s1;		-
+SAVEPOINT s2;		-
+CREATE TABLE bad (a integer COLLATE "C");	!42804 collations are not supported by type integer
+ROLLBACK TO s2;		-
+SAVEPOINT s3;		-
+CREATE TABLE bad (a uuid COLLATE "C");	!42804 collations are not supported by type uuid
+ROLLBACK TO s3;		-
+SAVEPOINT s4;		-
+CREATE TABLE bad (a integer COLLATE "nope");	!42704 collation "nope" for encoding "UTF8" does not exist
+ROLLBACK TO s4;		-
+SAVEPOINT s5;		-
+SELECT 1 COLLATE "C";	!42804 collations are not supported by type integer
+ROLLBACK TO s5;		-
+SAVEPOINT s6;		-
+SELECT 'q14', n COLLATE "C" FROM co;	!42804 collations are not supported by type integer
+ROLLBACK TO s6;		-
+SAVEPOINT s7;		-
+SELECT 'q15', plain FROM co ORDER BY plain COLLATE "en_US.UTF-8";	!42704 collation "en_US.UTF-8" for encoding "UTF8" does not exist
+ROLLBACK TO s7;		-
+SELECT 'q16', count(*) FROM co;		q16|4
+ROLLBACK;		-
+SELECT 'q17', count(*) FROM pg_class WHERE relname IN ('co','bad','arr');		q17|0

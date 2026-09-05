@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 34;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 35;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -2071,6 +2071,16 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
         }
     }
 
+    // Version 35. Each column's **collation**, eighteenth section and on the end for the reason
+    // every other one is: a column written before 35 reads back with none, which is what every
+    // column a version 34 catalog could hold had — the word was refused
+    // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). An
+    // empty string is "the type's own", and no collation name is empty, so the two cannot be
+    // confused.
+    for column in &table.columns {
+        put_str(column.collation.as_deref().unwrap_or(""), &mut out);
+    }
+
     Ok(out)
 }
 
@@ -2085,6 +2095,22 @@ fn read_check_validated(reader: &mut Reader<'_>, checks: &mut [CheckDef]) -> Res
     }
     for check in checks {
         check.validated = reader.flag()?;
+    }
+    Ok(())
+}
+
+/// The version 35 tail: one collation per column, in column order.
+///
+/// Read **last**, after version 34's operator classes, because the sections come off in the order
+/// they went on. A column written before 35 answers `None` — the type's own ordering, which is
+/// what every column had while `COLLATE` was refused (ADR 0076).
+fn read_column_collations(reader: &mut Reader<'_>, columns: &mut [ColumnDef]) -> Result<()> {
+    if reader.version < 35 {
+        return Ok(());
+    }
+    for column in columns.iter_mut() {
+        let collation = reader.string()?;
+        column.collation = (!collation.is_empty()).then_some(collation);
     }
     Ok(())
 }
@@ -2645,6 +2671,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
             None
         };
         columns.push(ColumnDef {
+            collation: None,
             name,
             ty,
             typmod,
@@ -2753,6 +2780,7 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
     read_check_validated(&mut reader, &mut checks)?;
     let matview = read_matview(&mut reader)?;
     read_index_opclasses(&mut reader, &mut indexes)?;
+    read_column_collations(&mut reader, &mut columns)?;
     reader.finish()?;
 
     Ok(TableDef {

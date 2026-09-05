@@ -1020,6 +1020,14 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // Its own parentheses, as the comparison operators print theirs — `EXPLAIN` shows the
         // grouping the parser chose rather than the one the user typed.
         Expr::Negate(operand) => format!("(- {})", render(operand, columns)),
+        Expr::Array { elements, .. } => format!(
+            "ARRAY[{}]",
+            elements
+                .iter()
+                .map(|element| render(element, columns))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Arithmetic {
             op, left, right, ..
         } => format!(

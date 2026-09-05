@@ -792,6 +792,9 @@ fn push_filter(
         Expr::Ordinal { at, .. } => ColExpr::Column(slot(*at)),
         // A cast is not expressible in the fragment language, so the filter stays on the row side.
         Expr::ToText { .. } => return Err(refused("a cast to text")),
+        // The fragment language has no array value to build, so a constructor keeps its filter on
+        // the row side rather than being half-pushed.
+        Expr::Array { .. } => return Err(refused("an ARRAY constructor")),
         // Neither is arithmetic: the fragment language compares and combines, and every operator
         // brings an overflow rule the scan would have to reproduce exactly to be worth pushing.
         Expr::Arithmetic { .. } | Expr::Negate(_) => return Err(refused("arithmetic")),
@@ -1193,6 +1196,11 @@ fn ordinal(expr: &Expr) -> Option<usize> {
 fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
     match expr {
         Expr::Ordinal { at, .. } => into.push(*at),
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                collect_columns(element, into);
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             collect_columns(left, into);
             collect_columns(right, into);

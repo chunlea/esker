@@ -208,6 +208,7 @@ pub(super) fn table_function_def(
         id: crate::catalog::DERIVED_TABLE_ID,
         name: name.clone(),
         columns: vec![crate::catalog::ColumnDef {
+            collation: None,
             name,
             ty,
             typmod: crate::value::NO_TYPMOD,
@@ -315,6 +316,7 @@ fn plan_derived(
         .iter()
         .enumerate()
         .map(|(at, output)| crate::catalog::ColumnDef {
+            collation: None,
             // The alias replaces the name outright: after `AS t(a, b)`, `t.id` is `42703`.
             name: derived
                 .columns
@@ -683,8 +685,16 @@ fn substitute_outer(node: &mut Node, outer: &[Datum], depth: usize) {
     for_each_node_expr_mut(node, &mut |expr| substitute_in_expr(expr, outer, depth));
 }
 
+/// [`substitute_in_expr`] over a list, which is what an `ARRAY[…]`'s elements are.
+fn substitute_in_each(elements: &mut [Expr], outer: &[Datum], depth: usize) {
+    for element in elements {
+        substitute_in_expr(element, outer, depth);
+    }
+}
+
 fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
     match expr {
+        Expr::Array { elements, .. } => substitute_in_each(elements, outer, depth),
         Expr::Outer { level, at, .. } if *level == depth => {
             *expr = Expr::Literal(match outer.get(*at) {
                 // A NULL has no type to carry and needs none: every comparison with one is NULL.
@@ -1183,6 +1193,11 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
 pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                walk(element, visit);
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk(left, visit);
             walk(right, visit);
@@ -1278,6 +1293,11 @@ pub(super) fn walk_mut(
     visit: &mut impl FnMut(&mut Expr) -> Result<()>,
 ) -> Result<()> {
     match expr {
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                walk_mut(element, visit)?;
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             walk_mut(left, visit)?;
             walk_mut(right, visit)?;
