@@ -1,0 +1,19 @@
+docs/bench/mpp-baseline.md
+  s_609bbbdbf3c419::t_00c00a2ad1ec98 460-581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b2a8d4aa8f899ef5be5e19d9372427829512f136",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
