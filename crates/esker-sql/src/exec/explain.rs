@@ -75,6 +75,21 @@ pub(crate) fn describe(columnar: &Columnar, columns: &[String]) -> (String, Stri
             let _ = write!(extra, "\nAggregates: {}", calls.join(", "));
         }
     }
+    // **The join the fragment absorbed**, named with the table its keys came from. Without this
+    // a reader sees a plan with no `Nested Loop` in it and no account of where the join went
+    // (`docs/plans/phase-16-mpp.md` §J6).
+    if let Some(semi) = &columnar.semi_join {
+        let keys = match &columnar.fragment.filter {
+            Some(filter) => in_list_len(filter),
+            None => 0,
+        };
+        let _ = write!(
+            extra,
+            "\nSemi Join Filter: {} in {}  ({keys} keys)",
+            name(&names, semi.outer_slot),
+            semi.inner_table
+        );
+    }
     if columnar.fragment.filter.is_some() {
         // The pushed-down predicate, named by the columns it reads rather than re-rendered from
         // the fragment's own tree: what a reader wants to know is *that* the filter went down and
@@ -154,5 +169,20 @@ fn render(finish: Finish, asks: &[ColAggregate], names: &[String]) -> String {
         Finish::Min(at) => format!("min({})", of(at)),
         Finish::Max(at) => format!("max({})", of(at)),
         Finish::Avg { sum, .. } => format!("avg({})", of(sum)),
+    }
+}
+
+/// How many values the `IN` list in a filter carries, for the `EXPLAIN` line.
+///
+/// Zero when there is none — which is what a plan that was built but never run looks like, since
+/// the keys are read at resolve time and not while planning.
+fn in_list_len(filter: &esker_columnar::Expr) -> usize {
+    match filter {
+        esker_columnar::Expr::In { values, .. } => values.len(),
+        esker_columnar::Expr::And(left, right) | esker_columnar::Expr::Or(left, right) => {
+            in_list_len(left).max(in_list_len(right))
+        }
+        esker_columnar::Expr::Not(inner) => in_list_len(inner),
+        _ => 0,
     }
 }

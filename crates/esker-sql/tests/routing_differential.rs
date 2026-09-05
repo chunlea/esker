@@ -187,6 +187,65 @@ async fn explain_names_an_engine_for_a_join() {
     gate.stop().await;
 }
 
+/// **The join is visibly a semi-join, not just fast.** `EXPLAIN ANALYZE` names the table the keys
+/// came from and how many there were.
+///
+/// A plan that absorbed a join has no `Nested Loop` in it any more, so without this line a reader
+/// sees an aggregate over one table and no account of where the join went
+/// (`docs/plans/phase-16-mpp.md` §J6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_shows_the_join_it_absorbed() {
+    let gate = Gate::start().await;
+    gate.fill_join().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(&mut session, "SET esker.engine = 'auto'");
+        let plan = explain(
+            &mut session,
+            "EXPLAIN ANALYZE SELECT count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1",
+        );
+        assert!(
+            plan.contains("Engine: columnar"),
+            "the join did not run on the columns:\n{plan}"
+        );
+        assert!(
+            plan.contains("Semi Join Filter: dk in d"),
+            "the absorbed join is not named:\n{plan}"
+        );
+        // `d` holds k = 1..=4 and `bucket = k % 2`, so `bucket = 1` selects k = 1 and 3.
+        assert!(
+            plan.contains("(2 keys)"),
+            "the key count is wrong; d.bucket = 1 selects two of four:\n{plan}"
+        );
+    });
+
+    gate.stop().await;
+}
+
+/// An inner side that matches nothing must answer nothing — and must not be expressed as an empty
+/// `IN` list, which the fragment format refuses (ADR 0074).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_whose_inner_side_is_empty_answers_zero_on_both_engines() {
+    let gate = Gate::start().await;
+    gate.fill_join().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        assert!(
+            compare(
+                &gate,
+                &mut session,
+                "SELECT count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 99",
+                " (empty inner side)"
+            ),
+            "an empty inner side was not answered by the columns"
+        );
+    });
+
+    gate.stop().await;
+}
+
 /// The other half: a join the rewrite must not take, and does not.
 ///
 /// Green today and green afterwards, which is the point — it is the guard that says the join
