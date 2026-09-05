@@ -1366,6 +1366,12 @@ pub enum AlterTableAction {
         /// the same as forgetting it to every reader.
         replicas: Option<u8>,
     },
+    /// `ADD CONSTRAINT … EXCLUDE (…)` on a table that already exists.
+    ///
+    /// The same [`crate::catalog::ExcludeDef`] a `CREATE TABLE` builds, from the same clause
+    /// parser — what differs is only that the rows are already there, so the executor validates
+    /// them before the constraint is recorded.
+    AddExclude(crate::catalog::ExcludeDef),
     /// A storage parameter a real server takes and this node has nowhere to put: every name in a
     /// `RESET` but `columnar_replicas`, and anything in the `toast` namespace.
     ///

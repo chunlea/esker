@@ -311,6 +311,9 @@ pub struct Parsed {
     /// was — **the parsed tree is a placeholder**, the third and last of that exception
     /// ([`read_alter_table_reset`]).
     alter_table_reset: Option<AlterTableReset>,
+    /// The `EXCLUDE` clause of an `ALTER TABLE … ADD CONSTRAINT … EXCLUDE (…)`, which the parser
+    /// saw as a `CHECK (true)` placeholder ([`rewrite_alter_add_exclude`]).
+    alter_exclude: Option<String>,
 }
 
 /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`, read out of the source.
@@ -440,6 +443,12 @@ impl Parsed {
         self.alter_table_reset.as_ref()
     }
 
+    /// The `EXCLUDE` clause an `ALTER TABLE … ADD CONSTRAINT` carried, if it carried one.
+    #[must_use]
+    pub fn alter_exclude(&self) -> Option<&str> {
+        self.alter_exclude.as_deref()
+    }
+
     /// Whether this `BEGIN` asked for a **read-only** transaction.
     ///
     /// PostgreSQL's `BEGIN READ ONLY` refuses every write in the block with `25006`, and this node
@@ -545,6 +554,12 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = virtual_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
+    // An `ALTER TABLE … ADD CONSTRAINT … EXCLUDE` becomes a `CHECK (true)` the parser can read,
+    // and the clause travels on `Parsed` to be built where the table's name is known.
+    let alter_exclude = rewrite_alter_add_exclude(sql, &scanned);
+    let sql = alter_exclude
+        .as_ref()
+        .map_or(sql, |(text, _)| text.as_str());
     // `CREATE EXTENSION … SCHEMA` needs a `WITH` this parser insists on and PostgreSQL does not.
     let extension_with = insert_extension_with(sql, &scanned);
     let sql = extension_with.as_deref().unwrap_or(sql);
@@ -599,6 +614,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 with_data: with_data_rewrite.as_ref().map(|(_, data)| *data),
                 refresh: refresh.clone(),
                 alter_table_reset: reset.clone(),
+                alter_exclude: alter_exclude.as_ref().map(|(_, clause)| clause.clone()),
             }
         })
         .collect())
@@ -1723,6 +1739,48 @@ fn option_value(text: &str, at: usize) -> Option<(String, usize)> {
 /// **Parenthesis-balanced rather than comma-split**, because the clause is full of commas:
 /// `EXCLUDE USING gist (daterange(start_date, end_date) WITH &&)` has three, and a split on the
 /// first would cut the constraint in half.
+/// Turns an `ALTER TABLE … ADD CONSTRAINT … EXCLUDE (…)` into one `sqlparser` can read, and hands
+/// the clause back.
+///
+/// The same `EXCLUDE` written into a `CREATE TABLE` has worked since the exclude unit — the
+/// expression key, `USING gist`, the operator and the deferrability are all built and all shared.
+/// What `sqlparser` 0.62.0 cannot read is the `ALTER` spelling, so the statement reached the
+/// refusal table and `exclusion_constraint_test.rb` stopped on all eight of its calls.
+///
+/// The clause is replaced by `CHECK (true)` rather than cut, because unlike a table's column list
+/// an `ADD` with nothing after it is not a statement. The lowering sees the placeholder and the
+/// clause together and builds the exclusion instead — the same "parsed and thrown away" trade
+/// `Parsed::raise` and `Parsed::refresh` make, narrowed to one action.
+fn rewrite_alter_add_exclude(sql: &str, scanned: &Scan<'_>) -> Option<(String, String)> {
+    if !starts_with_words(&scanned.words, &["ALTER", "TABLE"]) {
+        return None;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let (start, end) = find_exclude_clause(&upper, sql.as_bytes(), 0)?;
+    let clause = sql.get(start..end)?.trim().to_owned();
+    // The name is kept where it was written, so the placeholder carries it and the lowering does
+    // not have to put it back: `CONSTRAINT c1 CHECK (true)`.
+    let named = clause
+        .to_ascii_uppercase()
+        .starts_with("CONSTRAINT")
+        .then(|| {
+            clause.get(
+                .."CONSTRAINT".len()
+                    + clause.to_ascii_uppercase()["CONSTRAINT".len()..].find("EXCLUDE")?,
+            )
+        })
+        .flatten()
+        .unwrap_or("");
+    Some((
+        format!(
+            "{}{named} CHECK (true){}",
+            sql.get(..start)?,
+            sql.get(end..)?
+        ),
+        clause,
+    ))
+}
+
 fn strip_exclude_constraints(sql: &str, scanned: &Scan<'_>) -> Option<(String, Vec<String>)> {
     let [first, second, ..] = scanned.words.as_slice() else {
         return None;
@@ -2157,7 +2215,8 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         // **Here as well**, for the reason the two above it are: this function is an entry point
         // of its own, and a statement that only parses through the other door is a statement whose
         // answer depends on which door it came in.
-        .or_else(|| insert_extension_with(sql, &scanned));
+        .or_else(|| insert_extension_with(sql, &scanned))
+        .or_else(|| rewrite_alter_add_exclude(sql, &scanned).map(|(text, _)| text));
     // **A recognised `REFRESH` parses as a placeholder here too.** `sqlparser` has no `REFRESH`
     // statement at all, so without this the same statement parsed through `parse_statements` and
     // was a bare `42601` through this door — and `42601` about valid PostgreSQL is the one answer
