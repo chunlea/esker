@@ -1,0 +1,16 @@
+docs/DESIGN.md
+  h_44076b318daf9c 399-408
+docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md
+  h_44076b318daf9c 1-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fa238b73baf04083afb8c0d9014120ec30a2a077",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
