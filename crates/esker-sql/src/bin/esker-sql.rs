@@ -16,73 +16,14 @@ use std::sync::Arc;
 
 use esker_sql::backend::{Backend, MemoryBackend, StoreBackend};
 use esker_sql::catalog::Catalog;
-use esker_sql::exec::Executor;
 use esker_sql::exec::redrive::ReDriver;
 use esker_sql::fragment::{ClientFragments, FragmentSource};
 use esker_sql::pd::{ColumnarReport, LeaseRefresher, PdConn, PdLease};
-use esker_sql::pgwire::server::{Auth, Config, Executors, serve};
-use esker_sql::pgwire::session::Execute;
+use esker_sql::pgwire::server::{Auth, Config, serve};
 use esker_sql::pgwire::tls::TlsConfig;
 
 /// The tenant every connection is served as, until there is a way to say otherwise.
 const TENANT: u64 = 1;
-
-/// The store and the catalog cache, shared; one [`Executor`] per session over them.
-struct Sessions {
-    backend: Arc<dyn Backend>,
-    catalog: Arc<Catalog>,
-    /// This node's advisory locks, shared by every session it serves.
-    ///
-    /// Beside the catalog cache because it has the same lifetime and the same scope: node-wide,
-    /// in memory, gone when the process is. A session that took one and never released it loses it
-    /// when its connection closes, which is what a real server does too (`esker_sql::advisory`).
-    locks: Arc<esker_sql::advisory::Locks>,
-    /// The node's reserved sequence blocks, shared by every session it serves (ADR 0072).
-    sequences: Arc<esker_sql::sequence::Blocks>,
-    /// Where an `ALTER ... SET (columnar_replicas = N)` reports to, on a node that has a PD.
-    columnar: Option<Arc<dyn ColumnarReport>>,
-    /// Where a plan fragment goes, on a node that can send one (ADR 0022 milestone 4).
-    ///
-    /// `None` without `--pd`, and that is not a degraded node: routing needs to know which peer of
-    /// a region is the columnar learner, and only the placement driver can say. A node without one
-    /// plans every query on rows and `EXPLAIN` says why.
-    fragments: Option<Arc<dyn FragmentSource>>,
-}
-
-impl Executors for Sessions {
-    fn for_session(
-        &self,
-        database: &str,
-        identity: esker_sql::session::Backend,
-    ) -> esker_sql::Result<Box<dyn Execute + Send>> {
-        // **The directory decides the tenant**, and it is read once per connection rather than
-        // per statement: the answer cannot change under a session, because dropping the database
-        // it is serving is `55006` (ADR 0052).
-        let txn = self.backend.begin()?;
-        let tenant = esker_sql::catalog::database_id(&*txn, database)?
-            .ok_or_else(|| esker_sql::SqlError::UndefinedDatabase(database.to_owned()))?;
-        let _ = txn.rollback();
-        let mut executor = Executor::new(
-            Arc::clone(&self.backend),
-            Arc::clone(&self.catalog),
-            tenant,
-            identity,
-        )
-        .serving_database(database)
-        .sharing_advisory_locks(Arc::clone(&self.locks))
-        // **The node's, not this connection's** — a pooled client is the normal client,
-        // and a block per connection is what made five inserts answer 1, 33, 65, 97, 129
-        // (ADR 0072).
-        .sharing_sequence_blocks(Arc::clone(&self.sequences));
-        if let Some(report) = &self.columnar {
-            executor = executor.reporting_columnar_to(Arc::clone(report));
-        }
-        if let Some(source) = &self.fragments {
-            executor = executor.asking_fragments_of(Arc::clone(source));
-        }
-        Ok(Box::new(executor))
-    }
-}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -203,14 +144,13 @@ async fn main() -> std::io::Result<()> {
         tracing::info!("columnar routing is available: fragments go to the learners PD placed");
     }
 
-    let sessions = Sessions {
-        backend,
-        catalog,
-        locks: Arc::new(esker_sql::advisory::Locks::new()),
-        sequences: Arc::new(esker_sql::sequence::Blocks::default()),
-        columnar,
-        fragments,
-    };
+    let mut sessions = esker_sql::node::Sessions::new(backend, catalog);
+    if let Some(report) = columnar {
+        sessions = sessions.reporting_columnar_to(report);
+    }
+    if let Some(source) = fragments {
+        sessions = sessions.asking_fragments_of(source);
+    }
     serve(config, Arc::new(sessions)).await
 }
 
