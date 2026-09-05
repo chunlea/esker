@@ -232,9 +232,19 @@ pub(crate) struct Query {
     pub(crate) expected_rows: u64,
     /// Whether this shape can reach the columnar path at all.
     ///
-    /// `false` for the join: [ADR 0040](../../../../docs/adr/0040-the-engine-a-query-runs-on.md)
+    /// It read `false` for the join, on the grounds that [ADR 0040](../../../../docs/adr/0040-the-engine-a-query-runs-on.md)
     /// Decision 4 substitutes exactly one plan shape, `Aggregate { [Filter] { SeqScan } }`, so a
-    /// join has no fragment to be pushed into and runs on rows whatever the session says.
+    /// join had no fragment to be pushed into. That stopped being true when the semi-join
+    /// push-down landed, and the stale `false` was worse than a wrong comment: it made the
+    /// assertion in `mod.rs` *require* the join to be on rows, so the join arm measured the row
+    /// engine twice and the run stayed green while doing it.
+    ///
+    /// Measured 2026-09-05: the join reaches the columnar path when its inner side fits in a
+    /// fragment. At the default `--groups-high`, it does not — `dim` holds one row per
+    /// high-cardinality group, so `bucket = 3` selects far more keys than
+    /// `esker_columnar::fragment::MAX_IN_VALUES` (4,096) and the planner refuses with *"a join
+    /// whose inner side has more keys than a fragment carries"*. That is the bound working, not a
+    /// fault, and it is why the join is measured with `--groups-high` below the cap.
     pub(crate) columnar_is_possible: bool,
 }
 
@@ -270,7 +280,7 @@ pub(crate) fn queries(shape: Shape) -> Vec<Query> {
                  WHERE {DIM}.bucket = 3"
             ),
             expected_rows: 1,
-            columnar_is_possible: false,
+            columnar_is_possible: true,
         },
     ]
 }
