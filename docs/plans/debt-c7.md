@@ -1140,3 +1140,53 @@ the file now runs in 12 s rather than about 3. Bounded, and paid in the case the
 a measurement and its use. This is the third of the same family: **a mechanism whose documented
 contract and whose actual behaviour disagreed, with the comment right and the code wrong.** Reading
 the comment against the number was the whole diagnosis; no arm, no reproduction, no message needed.
+
+## 23. Sweeping for the shape that came back six times, and what the wave found
+
+No-load work while the machine was held for another lane's benchmark. Two passes over what this
+lane has written.
+
+### The citations hold
+
+Sections 0–22 cite 7 file paths, 12 commit hashes and a run of cross-references. Checked
+mechanically rather than remembered: every path exists, every hash resolves to a commit, and every
+`§N` names a section that exists. Worth doing because a facts-only document written from memory has
+been wrong here before.
+
+### The sweep: no seventh instance
+
+One shape accounts for six of this wave's findings — **a handle or a fact captured before the office
+can move, then used as though it still holds** (§16 the retire helper's leader, §17 its term across
+an `await`, §18's guard test, §20's ambiguous results, §21's two `peer` bindings, and §22's constant
+that had displaced its own budgets). Searching the tests this lane owns for a seventh:
+
+| searched | result |
+|---|---|
+| every `RequestHeader::new` built from a captured epoch | **clean** — all four re-read `regions().get(id)` each time round the loop |
+| every peer/leader handle bound, then an office-moving call, then reused | 27 candidates, **all false positives**: an `epoch` used inside the very `pd.issue` that "moved" it, or a region descriptor used for assertions, or a handle used before the test's closing `stop()` |
+| every one-store `put` group | `retire.rs` and `sim_sweep.rs` **already carry the §14 audit in prose** — "store 1 is the sole voter and cannot lose an election, so the single store is safe by construction. Widening it would say otherwise" |
+
+A negative worth recording because it is a *stated* negative: the epoch path re-reads everywhere,
+and the two files that could have had §14's defect had already reasoned their way out of it in
+writing. The shape is not endemic; it clustered in the two helpers that were doing the most.
+
+### The tally
+
+Eleven sightings reached this lane. What they were:
+
+| | count |
+|---|---|
+| product defects | **2** (`cluster_start`'s readiness probe, §1 — and its own constant, §22) |
+| test defects | **7** (`sim_sweep` ×3 and its clock §18, `promotion`, `cluster_chaos`, `snapshot`'s three faces §14/16/17, `cluster.rs` ×2 §21, `txn_crash_boundaries` §20) |
+| already closed by another lane | **1** (`crash_through_the_client`) |
+| handed to the core, not this lane's to fix | **1** (the leaderless region, §19) |
+
+Two of those "test defects" were committed **by this lane, during this wave**, while writing up the
+very rule they broke (§18's guard test, and §21 inheriting a helper that had learned the lesson at
+one of its three sites). That is the honest shape of the count, and the reason the sweep above was
+worth running rather than assumed.
+
+**The rule held to the end: not one of the eleven was fixed by raising a budget that decides a
+verdict.** §18 replaced a stopwatch on an event with a wait on the event and left the negative
+proof's clock untouched; §22 moved a *bound* that had displaced the two budgets documented as
+owning the decision, and neither of those moved. Both are number changes and both say so.
