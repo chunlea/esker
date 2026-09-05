@@ -1,11 +1,16 @@
 # Debts still open at v1
 
-**Status: draft. Every row was verified against the tree at this commit**, not transcribed from a
-list — three items that were reported as open turned out to be closed, and two that were not on the
-list are open (#5 and #8). Two more were opened and closed within a wave and are gone from this
-table, and **#7 has since been diagnosed and closed out of it**; §2 records all three. The numbers
-are quoted across lanes, so a closed row leaves a gap rather than renumbering the rows after it.
-Each row names its site, a size, and who it belongs to.
+**Status: three of the original eight are still open — #1, #2 and #4.** Everything else has been
+closed and moved to §2 with the commit that closed it, and the numbers are quoted across lanes, so
+a closed row leaves a **gap** rather than renumbering the rows after it. Each remaining row names
+its site, a size, and who it belongs to.
+
+> **The original claim on this line was that every row had been verified against the tree rather
+> than transcribed. That was true of the sites and not of the symptoms.** #3 and #5 were already
+> fixed in the very commit this file was added at — #3's row even said c6 had verified it as the
+> one item of eight that HEAD still owed — which makes five rows that turned out to be closed when
+> someone looked, not three. Asking "is the site still there" is not asking "is the symptom still
+> there", and a register is only as good as the question put to it.
 
 Sources: the c6 wave's verification record (`debt-c6.md`), the coordinator's sightings, and the
 code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what is left.
@@ -18,11 +23,7 @@ code itself. `docs/acceptance/v1.md` carries the numbers; this file carries what
 |---|---|---|---|---|
 | 1 | **`changed_since_statement` is defaulted on the store path.** The trait's default answers `false` — correct for a backend that takes no locks — and only `MemoryTxn` overrides it. `StoreTxn` does not, so under a real cluster a `READ COMMITTED` re-run proceeds on a value that may be stale, and the check that removed ~100 spurious `40001`s in 1,200 transactions does not run there. | `crates/esker-sql/src/backend/store.rs` (no override); default at `backend/mod.rs:214`; already named in `exec/savepoint.rs:243` | medium — one method, but it needs the store to answer "written since ts" | h1 (txn/locking) |
 | 2 | **`Recording` forwards `changed_since_statement` but the same gap reaches it.** With a savepoint open — which Rails opens for *every* nested `transaction do` — a SERIALIZABLE transaction recorded and validated nothing until this was wired, and the statement re-check does not run on the store path for the same reason as #1. | `crates/esker-sql/src/exec/savepoint.rs:243` | small once #1 lands | h1 |
-| 3 | **`Db::ingest` refuses any overlap, tombstones included.** `DbInner::place` refuses three ways: against another file in the same ingest, the memtable, and any level of the current version. c6 verified this as the one item of eight that HEAD still owes. | `crates/esker-engine/src/db/ingest.rs:353` (`DbInner::place`; c6's record says `:126`, and the file has moved since) | medium | c6 / engine |
 | 4 | **Cross-node deadlock detection.** The wait-for graph is node-local, which covers every deadlock two sessions of one `esker-sql` process can make. A cycle *across* nodes needs a graph both can see. Named in the code as a follow-on, and PD's job. | `crates/esker-sql/src/backend/locks.rs:46` | large — needs a PD-held graph | PD / pdha |
-| 5 | **`crash_through_the_client` starves under load.** Fails 6 runs in 10 under 24 spinning threads **in one container**, so it is not the network-namespace contention the harness fix addressed. It is **not a durability failure**: the round's own guard `acked > 0` fires, and the durability assertion at `:311` fired in none of the six. The child is killed on a **wall clock** while the writes it should interrupt are CPU-bound. | `crates/esker-client/tests/crash_through_the_client.rs:331` (c6's record says `:305`; the file has moved) | small — measure the kill point in acknowledged writes, or retry a round that acked none | client |
-| 6 | **`esker-cli::cluster_start a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster`.** Passed in an exclusive run after failing on a 60 s timeout in both contended ones; c6 carries it as a standing flake with an owner and treats the exclusive pass as evidence it is the same contention rather than a defect of its own. | `crates/esker-cli/tests/cluster_start.rs` | small, and may be closed by the per-container network namespaces | cli |
-| 8 | **The Miri gate needs `-Zmiri-disable-isolation`, which the code could make unnecessary.** proptest's default `FileFailurePersistence` calls `std::env::current_dir` to place a `.proptest-regressions` file, and Miri refuses `getcwd` under isolation, so the run aborts with 22 tests unrun. Setting `failure_persistence: None` under `cfg(miri)` in the memtable's `ProptestConfig` would make the plain documented command true — and matters because the failure looks like the gate *failing* rather than the gate *not running*. Not urgent: `docs/bench/skiplist.md` §3 and `docs/acceptance/v1.md` §0 now both state the flag. | `crates/esker-engine/src/memtable/differential.rs:316` (`ProptestConfig::with_cases`) | ~3 lines | engine |
 
 ## 2. Reported as open, and closed on inspection
 
@@ -55,6 +56,34 @@ keystroke — an alias — changes the answer, which is what makes an enum the s
 Only a projection whose derived name is not its own column's is substituted, which is the whole of
 what differs and leaves every aggregated query on the path it was already taking.
 `tests/order_by_output_column.rs`.
+
+### #3, #5, #6 and #8 — **closed, and two of them were closed before the register named them**
+
+Verified by **ancestry**, not by commit date: `git merge-base --is-ancestor <fix> c6641c25`, where
+`c6641c25` is the commit that added this file.
+
+| # | Closed by | Already in the tree this register was written against? |
+|---|---|---|
+| 3 | `616954e8` *an ingest is refused for a shared key, not for a shared range* (ADR 0068), with `40a42384` making the disjoint case one seek | **Yes** |
+| 5 | `46166886` *the crash loop kills after acknowledged writes, not after milliseconds*, on top of `d8a7b252` | **Yes** |
+| 6 | `58ed28af` *a port that answers is not a driver that answers* and `2a82232e` *a cluster is announced when its stores answer, not when none has died yet* | No — closed after |
+| 8 | `189d4117` *the Miri gate stops needing a flag to run at all* | No — closed after |
+
+**#3 and #5 were already fixed in the very tree this file was written against.** #3's row went
+further and said c6 had "verified this as the one item of eight that HEAD still owes"; the fix was
+nine hours old and reachable from the same commit. So §2 above, which records three sightings that
+were closed on inspection, was itself two rows short — a debt register verified against a tree is
+still only as good as the question asked of it, and "is the site still there" is not the same
+question as "is the symptom still there".
+
+**#6 was two defects, not one flake.** A readiness check that connected to a port rather than
+proving *which* process answered, and a cluster announced before its stores could answer. Both are
+the shape a timeout hides: the test was recorded as a standing flake with an owner.
+
+**#8's fix is three lines**, which is what the row estimated, and its value is not the three lines:
+`config.failure_persistence = None` under `cfg(miri)` means the documented Miri command runs the
+module instead of aborting 22 tests in. `docs/acceptance/v1.md` §0 now dates the flag rather than
+requiring it.
 
 ### #7 `join_cost` — **closed by c7's diagnosis and a change to the test's shape**
 

@@ -12,14 +12,42 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    // `name` and `"char"` there, `text` here — the standing choice, and these two rows only
+    // became visible when the `tsvector` refusal above stopped aborting the transaction.
+    types: &[
+        "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_multi' ORDER BY c.relname",
+        "SELECT 'r', pg_typeof(current_schema()), pg_typeof(nspname) FROM pg_namespace LIMIT 1",
+        "SELECT 'r', nspname FROM pg_namespace WHERE nspname = 'test_schema'",
+        "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' ORDER BY c.relname",
+        "SELECT 'r', current_schema()",
+        "SELECT 'r', n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' ORDER BY n.nspname",
+        "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_idx' ORDER BY c.relname",
+        "SELECT 'r', n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_semi' ORDER BY c.relname",
+    ],
     answers: &[
+        // **These three were never checked before this revision.** The declared `tsvector`
+        // refusal above raised, a raise aborts the transaction, and every later statement in the
+        // file answered `25P02` and was counted as swallowed rather than as disagreeing. Giving
+        // the node `tsvector` closed that refusal and made them visible for the first time; none
+        // of them is a regression and none is new.
         (
-            "CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())",
-            "**Not the schema form**: `tsvector` is a type this node does not have, and the column \
-             is `schema_test.rb`\u{2019}s full-text one. The split itself worked — the refusal is the \
-             type, reached *inside* the element, which is what a named refusal for the right thing \
-             looks like",
+            "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_multi' ORDER BY c.relname",
+            "empty, and it follows from the `CREATE VIEW` element below: the statement that would \
+             have built `a`, `b` and `v` is the one this node answers `42601` to, so the schema \
+             has no relations to report",
+        ),
+        (
+            "CREATE SCHEMA se_bad CREATE TABLE t (i nosuchtype)",
+            "`0A000 the type nosuchtype is not supported` where a real server says `42704 type \
+             \"nosuchtype\" does not exist`. Both refuse and neither creates the schema, so the \
+             atomicity the corpus is testing holds; the *code* differs because the element path \
+             reaches the unknown name through lowering rather than through the catalog. A gap in \
+             the message, recorded rather than papered over",
+        ),
+        (
+            "SELECT 'r', pg_typeof(current_schema()), pg_typeof(nspname) FROM pg_namespace LIMIT 1",
+            "`text` where a real server says `name`: this node has no `name` type, which is the \
+             standing choice every catalog column here makes",
         ),
         (
             "CREATE SCHEMA se_multi CREATE TABLE a (i int) CREATE TABLE b (j int) CREATE VIEW v AS SELECT 1 AS one",

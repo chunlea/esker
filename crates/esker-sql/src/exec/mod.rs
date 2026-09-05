@@ -2452,7 +2452,7 @@ impl Executor {
                 let crate::plan::SelectItem::Expr { expr, .. } = item else {
                     continue;
                 };
-                match self.user_cast(&mut types, txn, expr, true) {
+                match Self::user_cast(self.tenant, &mut types, txn, expr, true) {
                     Ok(Some(resolved)) => *expr = resolved,
                     Ok(None) => {}
                     Err(error) => {
@@ -2461,18 +2461,61 @@ impl Executor {
                 }
             }
         }
-        let mut resolve = |expr: &mut Expr| match self.user_cast(&mut types, txn, expr, false) {
-            Ok(Some(resolved)) => *expr = resolved,
-            Ok(None) => {}
-            Err(error) => {
-                failure.get_or_insert(error);
-            }
-        };
+        let mut resolve =
+            |expr: &mut Expr| match Self::user_cast(self.tenant, &mut types, txn, expr, false) {
+                Ok(Some(resolved)) => *expr = resolved,
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            };
         bind::walk_mut(statement, &mut resolve);
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// A user-defined type by the name a statement wrote, **schema and all**.
+    ///
+    /// One lookup for the three places that ask — a column type, an expression cast and a
+    /// `regtype` — because they were three and disagreed: `CREATE TABLE d (v schema_1.text)`
+    /// resolved, `'x'::schema_1.text` was `0A000 the type schema_1.text is not supported`, and
+    /// `'schema_1.text'::regtype` was `3F000`. `value::split_type_name` made the *parser* one;
+    /// this is the other half.
+    ///
+    /// A stored name is `schema ++ NUL ++ name`, and `public` stores none
+    /// ([`crate::catalog::qualify`]), so an unqualified spelling finds a type in `public` and a
+    /// qualified one finds the schema it names.
+    fn qualified_user_type<'known>(
+        known: &'known [crate::catalog::TypeDef],
+        spelled: &str,
+    ) -> Option<&'known crate::catalog::TypeDef> {
+        let (schema, bare) = crate::value::split_type_name(spelled);
+        let stored = match &schema {
+            Some(schema) => crate::catalog::qualify(schema, &bare),
+            None => bare,
+        };
+        known.iter().find(|def| def.name == stored)
+    }
+
+    /// Which of the two things is missing when a type name does not resolve.
+    ///
+    /// **A schema nobody declared is `3F000` and a type nobody declared is `42704`** — measured,
+    /// `'nosuchschema.mood'::regtype` against `'public.nosuchtype'::regtype` — and this is the only
+    /// place that can tell them apart, because it is the only one with the catalog. The
+    /// qualification stays inside the quotes of the `42704`, which is also measured.
+    fn no_such_type(txn: &dyn Txn, tenant: u64, spelled: &str) -> Result<SqlError> {
+        let (schema, bare) = crate::value::split_type_name(spelled);
+        if let Some(schema) = &schema
+            && !crate::catalog::schema_exists(txn, tenant, schema)?
+        {
+            return Ok(SqlError::UndefinedSchema(schema.clone()));
+        }
+        Ok(SqlError::UndefinedType(match &schema {
+            Some(schema) => format!("{schema}.{bare}"),
+            None => bare,
+        }))
     }
 
     /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
@@ -2482,8 +2525,13 @@ impl Executor {
                   over one, and a `regtype` — resolved against one catalog read; splitting them \
                   would put a shape somewhere other than beside the read it shares"
     )]
-    fn user_cast(
-        &self,
+    /// **An associated function and not a method**, because the *default* path needs it: a
+    /// stored `DEFAULT 'x'::schema_1.text` is parsed per row by
+    /// `exec::dml::column_default_value`, which never runs the statement pass and so met the cast
+    /// unresolved — the same shape, one function over, that the `UserFunc` inlining beside it
+    /// already had to answer. Everything it wants from a session is the tenant.
+    pub(super) fn user_cast(
+        tenant: u64,
         types: &mut Option<Vec<crate::catalog::TypeDef>>,
         txn: &dyn Txn,
         expr: &crate::plan::Expr,
@@ -2499,7 +2547,7 @@ impl Executor {
             && matches!(&**operand, Expr::CatalogFunc(inner)
                 if inner.func == crate::plan::CatalogFunc::UserCast)
         {
-            return self.user_cast(types, txn, operand, true);
+            return Self::user_cast(tenant, types, txn, operand, true);
         }
         let Expr::CatalogFunc(call) = expr else {
             return Ok(None);
@@ -2518,7 +2566,7 @@ impl Executor {
             let Some(Expr::Literal(Literal::String(name))) = inner.args.first().cloned() else {
                 return Ok(None);
             };
-            self.user_cast(types, txn, &call.args[0].clone(), true)?;
+            Self::user_cast(tenant, types, txn, &call.args[0].clone(), true)?;
             return Ok(Some(Expr::Literal(Literal::String(name))));
         }
         // **`'<name>'::regtype` over a type the catalog made**, resolved in this pass because it
@@ -2535,21 +2583,11 @@ impl Executor {
             };
             let known = match types {
                 Some(known) => known,
-                None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
+                None => types.insert(crate::catalog::user_types(txn, tenant)?),
             };
-            // **The same splitter the built-ins use** — one grammar, one parser. A user type is
-            // in `public`, so `'public.mood'::regtype` is `mood` and `'"public.mood"'` is one
-            // quoted identifier holding a dot and resolves to nothing.
-            let (schema, bare) = crate::value::split_type_name(name);
-            let Some(def) = known.iter().find(|def| def.name == bare) else {
-                // The same sentence a real server gives, and the same class: a name that is not a
-                // type is `42704`, not the `0A000` a *feature* this node lacks would get. The
-                // **qualification stays in the message** when one was written, measured:
-                // `'public.nosuchtype'::regtype` quotes `public.nosuchtype` and not `nosuchtype`.
-                return Err(SqlError::UndefinedType(match &schema {
-                    Some(schema) => format!("{schema}.{bare}"),
-                    None => bare,
-                }));
+            // **One grammar, one parser — and now one lookup behind it.**
+            let Some(def) = Self::qualified_user_type(known, name) else {
+                return Err(Self::no_such_type(txn, tenant, name)?);
             };
             // **The name unless the `::oid` was written**, which is the half `ActiveRecord`
             // asks for and the half this node can answer without a `regtype` type of its own.
@@ -2563,7 +2601,7 @@ impl Executor {
                     u32::try_from(def.oid).unwrap_or(u32::MAX),
                 ))))
             } else {
-                Expr::Literal(Literal::String(def.name.clone()))
+                Expr::Literal(Literal::String(crate::catalog::display_name(&def.name)))
             }));
         }
         if call.func != crate::plan::CatalogFunc::UserCast {
@@ -2578,9 +2616,11 @@ impl Executor {
         };
         let known = match types {
             Some(known) => known,
-            None => types.insert(crate::catalog::user_types(txn, self.tenant)?),
+            None => types.insert(crate::catalog::user_types(txn, tenant)?),
         };
-        let Some(def) = known.iter().find(|def| &def.name == name) else {
+        // The third of the three lookups, and the same one: a cast to `schema_1.text` resolves
+        // where a column of it already did.
+        let Some(def) = Self::qualified_user_type(known, name) else {
             // **Not a type anybody declared**, which is where lowering's own refusal has been
             // waiting for a catalog to confirm it: the same `0A000` naming the type that
             // `lower_type` gave before this pass existed, and the same one a column of it gets.
@@ -2608,6 +2648,23 @@ impl Executor {
             }
             _ => return Err(SqlError::unsupported(format!("the type {name}"))),
         };
+        // **A cast to a domain is a cast to its base type**, which is the whole of what a domain
+        // is: a name over a representation (ADR 0065). `schema_test.rb` writes
+        // `'some text'::schema_1.text` in a `SET DEFAULT`, and the value it stores is a `text`.
+        // The domain's own constraints are checked where a column of it is written, not here —
+        // a cast is not an assignment, and a real server agrees: `'x'::a_domain` is `x` whatever
+        // the domain's `CHECK` says about it, until something stores it.
+        if let crate::catalog::TypeKind::Domain { base, typmod, .. } = def.kind {
+            let value = <Datum as PgDatum>::from_text(base, &text)?;
+            let value = crate::value::fit_to_typmod(value, base, typmod)?;
+            return Ok(Some(if printed {
+                Expr::Literal(Literal::String(
+                    PgDatum::to_text(&value).unwrap_or_default(),
+                ))
+            } else {
+                Expr::Literal(Literal::Typed(Box::new(value)))
+            }));
+        }
         // **A range's value is the range**, where an enum's is an ordinal — the two halves of
         // ADR 0053's rule, and this is where they part. `range_test.rb` writes
         // `'[0.5,0.7]'::floatrange` in a `WHERE`, so the cast has to fold to something the

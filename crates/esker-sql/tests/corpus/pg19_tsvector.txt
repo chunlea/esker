@@ -1,0 +1,131 @@
+# What PostgreSQL 19 answers to every full-text statement the ActiveRecord suite sends.
+#
+# **Run 79 ranking: `the type TSVECTOR is not supported`, 52 tests over 2 files — the head of the
+# board since run 60, and now more than four times the next row.** The two files want quite
+# different things and only one of them is about full text:
+#
+# * `adapters/postgresql/full_text_test.rb` (3 tests) declares `t.tsvector "text_vector"`, writes
+#   the literal `'text' 'vector'`, reads it back, updates it to `'new' 'text' 'vector'`, and dumps
+#   the schema expecting `t.tsvector "text_vector"`. No operators, no functions, no index.
+# * `adapters/postgresql/schema_test.rb` (48 tests, none of them about full text) dies in a shared
+#   setup that builds two schemas each holding `things` with a `name_vector tsvector` column, then
+#   **two GIN indexes**: one over the plain column and one over the expression
+#   `(to_tsvector('english', coalesce(things.name, '')))`. One unsupported column type is costing 48
+#   tests that never mention full text.
+#
+# So the corpus below is in three parts: the declaration and round-trip path, the index path, and
+# the operator/function surface a `tsvector` implementation has to answer for even though these two
+# files do not reach all of it.
+#
+# Things reasoning would get wrong:
+#
+# * **`tsvector` is not a string, and its normalised form is not the input.** `'text' 'vector'` is
+#   already lexeme form and round-trips unchanged, which is what `full_text_test` asserts; but
+#   `to_tsvector('english', 'The Fat Cats')` normalises, stems and drops stop words, and the output
+#   ordering is by lexeme, not by input position. A round-trip test that writes lexeme form and one
+#   that writes prose are testing different things.
+# * **Position and weight are part of the value.** `to_tsvector` records positions (`'cat':3`), and
+#   `setweight` attaches A-D; `strip()` removes both. Two tsvectors that print differently can hold
+#   the same lexemes, so equality is over the whole value including positions.
+# * **`@@` is not symmetric in type.** `tsvector @@ tsquery` and `tsquery @@ tsvector` both exist,
+#   and `text @@ text` exists too via implicit `to_tsvector`/`to_tsquery` — with the *default* text
+#   search configuration, not `english`. The rows below pin `default_text_search_config` so the
+#   difference is visible rather than assumed.
+# * **`||` over tsvector concatenates and renumbers.** Positions in the right operand are shifted by
+#   the maximum position of the left, so `a || b` is not `b || a`.
+# * **A GIN index over an expression is not the same object as one over a column**, and
+#   `pg_index.indexprs` is where the expression lives — `indkey` reads 0 for it. The suite's
+#   `schema_test` builds both kinds on the same table, so an implementation that supports only the
+#   column form still fails the file.
+# * **`tsquery` rejects what `tsvector` accepts.** A bare word is a valid tsvector and a valid
+#   tsquery; `'a b'` is a two-lexeme tsvector but a **syntax error** as a tsquery.
+#
+# The whole capture is one `BEGIN … ROLLBACK`. Its tables live and die inside that block, so the
+# `\gdesc` pass — which runs in a SECOND session after the rollback — cannot see them: queries that
+# name `tsv` or `things` carry rows but an empty types column, exactly as `pg19_tsrange.txt` does.
+# The expression and catalog rows carry both. Savepoints wrap every probe expected to raise, so one
+# error cannot abort the block and turn every later answer into `25P02`. The `SELECT count(*)` lines
+# after the `ROLLBACK` prove nothing persisted.
+BEGIN		-
+# ---- what the server is configured to do before anything is asked of it ----
+SELECT 'r', current_setting('default_text_search_config')	text,text	r|pg_catalog.english
+SELECT 'r', cfgname, nspname FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace ORDER BY cfgname	text,name,name	r|arabic|pg_catalog ; r|armenian|pg_catalog ; r|basque|pg_catalog ; r|catalan|pg_catalog ; r|danish|pg_catalog ; r|dutch|pg_catalog ; r|english|pg_catalog ; r|esperanto|pg_catalog ; r|estonian|pg_catalog ; r|finnish|pg_catalog ; r|french|pg_catalog ; r|german|pg_catalog ; r|greek|pg_catalog ; r|hindi|pg_catalog ; r|hungarian|pg_catalog ; r|indonesian|pg_catalog ; r|irish|pg_catalog ; r|italian|pg_catalog ; r|lithuanian|pg_catalog ; r|nepali|pg_catalog ; r|norwegian|pg_catalog ; r|polish|pg_catalog ; r|portuguese|pg_catalog ; r|romanian|pg_catalog ; r|russian|pg_catalog ; r|serbian|pg_catalog ; r|simple|pg_catalog ; r|spanish|pg_catalog ; r|swedish|pg_catalog ; r|tamil|pg_catalog ; r|turkish|pg_catalog ; r|yiddish|pg_catalog
+SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname	text,name,"char","char","char",smallint	r|_tsvector|b|A|,|-1 ; r|regconfig|b|N|,|4 ; r|tsquery|b|U|,|-1 ; r|tsvector|b|U|,|-1
+SELECT 'r', a.typname AS array_of_tsvector FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'tsvector'	text,name	r|_tsvector
+# ---- part 1: full_text_test.rb -- declaration, round trip, schema dump ----
+CREATE TABLE tsv (id serial primary key, text_vector tsvector)		-
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_attribute a WHERE a.attrelid = '"tsv"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|t ; r|text_vector|tsvector|f
+INSERT INTO tsv (id, text_vector) VALUES (1, 'text vector')		-
+INSERT INTO tsv (id, text_vector) VALUES (2, '''text'' ''vector''')		-
+SELECT 'r', id, text_vector FROM tsv ORDER BY id		r|1|'text' 'vector' ; r|2|'text' 'vector'
+UPDATE tsv SET text_vector = '''new'' ''text'' ''vector''' WHERE id = 2		-
+SELECT 'r', id, text_vector FROM tsv ORDER BY id		r|1|'text' 'vector' ; r|2|'new' 'text' 'vector'
+SELECT 'r', text_vector = '''text'' ''vector'''::tsvector AS round_trips FROM tsv WHERE id = 1		r|t
+INSERT INTO tsv (id, text_vector) VALUES (3, NULL)		-
+SELECT 'r', id, text_vector IS NULL FROM tsv WHERE id = 3		r|3|t
+# ---- what a schema dump has to read back out of the catalog ----
+SELECT 'r', c.relname, a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'tsv' AND a.attnum > 0 ORDER BY a.attnum	text,name,name,text	r|tsv|id|integer ; r|tsv|text_vector|tsvector
+# ---- part 2: the values themselves, as expressions -- these DO carry \gdesc types ----
+SELECT 'r', to_tsvector('english', 'The Fat Cats ate a rat')	text,tsvector	r|'ate':4 'cat':3 'fat':2 'rat':6
+SELECT 'r', to_tsvector('simple', 'The Fat Cats ate a rat')	text,tsvector	r|'a':5 'ate':4 'cats':3 'fat':2 'rat':6 'the':1
+SELECT 'r', to_tsvector('english', '')	text,tsvector	r|
+SELECT 'r', to_tsvector('english', 'running runs ran')	text,tsvector	r|'ran':3 'run':1,2
+SELECT 'r', 'a fat cat'::tsvector	text,tsvector	r|'a' 'cat' 'fat'
+SELECT 'r', '''text'' ''vector'''::tsvector	text,tsvector	r|'text' 'vector'
+SELECT 'r', length(to_tsvector('english', 'The Fat Cats ate a rat'))	text,integer	r|4
+SELECT 'r', strip(to_tsvector('english', 'The Fat Cats ate a rat'))	text,tsvector	r|'ate' 'cat' 'fat' 'rat'
+SELECT 'r', setweight(to_tsvector('english', 'fat cat'), 'A')	text,tsvector	r|'cat':2A 'fat':1A
+SELECT 'r', setweight(to_tsvector('english', 'fat cat'), 'A') || setweight(to_tsvector('english', 'thin dog'), 'B')	text,tsvector	r|'cat':2A 'dog':4B 'fat':1A 'thin':3B
+SELECT 'r', to_tsvector('english', 'fat cat') || to_tsvector('english', 'thin dog')	text,tsvector	r|'cat':2 'dog':4 'fat':1 'thin':3
+SELECT 'r', to_tsvector('english', 'thin dog') || to_tsvector('english', 'fat cat')	text,tsvector	r|'cat':4 'dog':2 'fat':3 'thin':1
+SELECT 'r', numnode(to_tsquery('english', 'fat & cat'))	text,integer	r|3
+# ---- tsquery, and the @@ match operator in both argument orders ----
+SELECT 'r', to_tsquery('english', 'fat & cat')	text,tsquery	r|'fat' & 'cat'
+SELECT 'r', to_tsquery('english', 'fat | cat')	text,tsquery	r|'fat' | 'cat'
+SELECT 'r', to_tsquery('english', '!fat')	text,tsquery	r|!'fat'
+SELECT 'r', plainto_tsquery('english', 'fat cats')	text,tsquery	r|'fat' & 'cat'
+SELECT 'r', phraseto_tsquery('english', 'fat cats')	text,tsquery	r|'fat' <-> 'cat'
+SELECT 'r', websearch_to_tsquery('english', '"fat cat" -dog')	text,tsquery	r|'fat' <-> 'cat' & !'dog'
+SELECT 'r', to_tsvector('english', 'The Fat Cats ate a rat') @@ to_tsquery('english', 'cat')	text,boolean	r|t
+SELECT 'r', to_tsquery('english', 'cat') @@ to_tsvector('english', 'The Fat Cats ate a rat')	text,boolean	r|t
+SELECT 'r', to_tsvector('english', 'The Fat Cats ate a rat') @@ to_tsquery('english', 'dog')	text,boolean	r|f
+SELECT 'r', to_tsvector('english', 'The Fat Cats ate a rat') @@ to_tsquery('english', 'fat & cat')	text,boolean	r|t
+SELECT 'r', to_tsvector('english', 'The Fat Cats ate a rat') @@ to_tsquery('english', 'fat & dog')	text,boolean	r|f
+SELECT 'r', 'fat cat'::tsvector @@ 'cat'::tsquery	text,boolean	r|t
+SELECT 'r', ts_rank(to_tsvector('english', 'The Fat Cats ate a rat'), to_tsquery('english', 'cat')) > 0	text,boolean	r|t
+SELECT 'r', ts_headline('english', 'The Fat Cats ate a rat', to_tsquery('english', 'cat'))	text,text	r|The Fat <b>Cats</b> ate a rat
+# ---- what tsquery refuses that tsvector accepts ----
+SAVEPOINT q1		-
+SELECT 'r', 'a b'::tsquery	!42601 syntax error in tsquery: "a b"
+ROLLBACK TO q1		-
+SELECT 'r', 'a b'::tsvector	text,tsvector	r|'a' 'b'
+SAVEPOINT q2		-
+SELECT 'r', to_tsquery('english', 'fat &')	!42601 no operand in tsquery: "fat &"
+ROLLBACK TO q2		-
+SAVEPOINT q3		-
+SELECT 'r', to_tsvector('nosuchconfig', 'a')	!42704 text search configuration "nosuchconfig" does not exist
+ROLLBACK TO q3		-
+# ---- part 3: schema_test.rb -- the two schemas, the tsvector column, the two GIN indexes ----
+CREATE SCHEMA test_schema CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())		-
+CREATE SCHEMA test_schema2 CREATE TABLE things (id integer,name character varying(50),email character varying(50),description character varying(100),name_vector tsvector,moment timestamp without time zone default now())		-
+CREATE INDEX c_index_full_text_search ON test_schema.things  USING gin ((to_tsvector('english', coalesce(things.name, ''))))		-
+CREATE INDEX c_index_full_text_search ON test_schema2.things  USING gin ((to_tsvector('english', coalesce(things.name, ''))))		-
+CREATE INDEX e_index_things_on_name_vector ON test_schema.things  USING gin (name_vector)		-
+CREATE INDEX e_index_things_on_name_vector ON test_schema2.things  USING gin (name_vector)		-
+# ---- what the catalog says about those two indexes, which is what the file reads back ----
+SELECT 'r', n.nspname, c.relname AS index_name, am.amname, i.indnatts, i.indkey::text, i.indexprs IS NOT NULL AS is_expression FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE c.relname IN ('c_index_full_text_search','e_index_things_on_name_vector') ORDER BY n.nspname, c.relname	text,name,name,name,smallint,text,boolean	r|test_schema|c_index_full_text_search|gin|1|0|t ; r|test_schema|e_index_things_on_name_vector|gin|1|5|f ; r|test_schema2|c_index_full_text_search|gin|1|0|t ; r|test_schema2|e_index_things_on_name_vector|gin|1|5|f
+SELECT 'r', c.relname, pg_get_indexdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('c_index_full_text_search','e_index_things_on_name_vector') AND n.nspname = 'test_schema' ORDER BY c.relname	text,name,text	r|c_index_full_text_search|CREATE INDEX c_index_full_text_search ON test_schema.things USING gin (to_tsvector('english'::regconfig, (COALESCE(name, ''::character varying))::text)) ; r|e_index_things_on_name_vector|CREATE INDEX e_index_things_on_name_vector ON test_schema.things USING gin (name_vector)
+SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'test_schema.things'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer ; r|name|character varying(50) ; r|email|character varying(50) ; r|description|character varying(100) ; r|name_vector|tsvector ; r|moment|timestamp without time zone
+# ---- and that the index is usable, which is the point of building it ----
+INSERT INTO test_schema.things (id, name, name_vector) VALUES (1, 'The Fat Cat', to_tsvector('english', 'The Fat Cat'))		-
+INSERT INTO test_schema.things (id, name, name_vector) VALUES (2, 'A Thin Dog', to_tsvector('english', 'A Thin Dog'))		-
+SELECT 'r', id, name_vector FROM test_schema.things ORDER BY id		r|1|'cat':3 'fat':2 ; r|2|'dog':3 'thin':2
+SELECT 'r', id FROM test_schema.things WHERE name_vector @@ to_tsquery('english', 'cat') ORDER BY id		r|1
+SELECT 'r', id FROM test_schema.things WHERE to_tsvector('english', coalesce(things.name, '')) @@ to_tsquery('english', 'dog') ORDER BY id		r|2
+SELECT 'r', count(*) FROM test_schema.things WHERE name_vector @@ to_tsquery('english', 'rat')		r|0
+# ---- a tsvector array, because the type map has to know one exists ----
+SELECT 'r', ARRAY['a b'::tsvector, 'c'::tsvector]	text,tsvector[]	r|{"'a' 'b'",'c'}
+SELECT 'r', array_length(ARRAY['a b'::tsvector, 'c'::tsvector], 1)	text,integer	r|2
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('tsv','things','c_index_full_text_search','e_index_things_on_name_vector')	bigint	0
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('test_schema','test_schema2')	bigint	0
