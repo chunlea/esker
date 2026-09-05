@@ -371,16 +371,121 @@ mod tests {
     /// | `'running runs ran'` → `'ran' 'run':1,2` | `running`/`runs` → `run`, and `ran` unchanged |
     /// | `'thin dog'` → `'dog' 'thin'` | two more that do not move |
     const GOLDEN: &[(&str, &str)] = &[
+        // The nine the tsvector capture pins directly, in its own lexemes.
         ("cats", "cat"),
         ("ate", "ate"),
         ("fat", "fat"),
         ("rat", "rat"),
         ("running", "run"),
         ("runs", "run"),
-        // Irregular, and Porter2 leaves it: the capture says `'ran'`, so anything cleverer is wrong.
+        // Irregular, and Porter2 leaves it: the capture says `'ran'`.
         ("ran", "ran"),
         ("thin", "thin"),
         ("dog", "dog"),
+        ("abilities", "abil"),
+        ("ability", "abil"),
+        ("activate", "activ"),
+        ("adjustable", "adjust"),
+        ("adjustment", "adjust"),
+        ("adoption", "adopt"),
+        ("agreed", "agre"),
+        ("agreement", "agreement"),
+        ("agrees", "agre"),
+        ("airliner", "airlin"),
+        ("allowance", "allow"),
+        ("analogously", "analog"),
+        ("andes", "andes"),
+        ("angularity", "angular"),
+        ("arsenal", "arsenal"),
+        ("arsenic", "arsenic"),
+        ("atlas", "atlas"),
+        ("bias", "bias"),
+        ("bled", "bled"),
+        ("bowdlerize", "bowdler"),
+        ("caress", "caress"),
+        ("caresses", "caress"),
+        ("cats", "cat"),
+        ("cease", "ceas"),
+        ("communism", "communism"),
+        ("communities", "communiti"),
+        ("community", "communiti"),
+        ("conflated", "conflat"),
+        ("conformably", "conform"),
+        ("consign", "consign"),
+        ("consigned", "consign"),
+        ("consigning", "consign"),
+        ("consignment", "consign"),
+        ("controlling", "control"),
+        ("cosmos", "cosmos"),
+        ("creation", "creation"),
+        ("cries", "cri"),
+        ("defensible", "defens"),
+        ("dependent", "depend"),
+        ("dies", "die"),
+        ("differently", "differ"),
+        ("digitizer", "digit"),
+        ("dying", "die"),
+        ("effective", "effect"),
+        ("electrical", "electr"),
+        ("electricity", "electr"),
+        ("failing", "fail"),
+        ("falling", "fall"),
+        ("feed", "feed"),
+        ("feeds", "feed"),
+        ("filing", "file"),
+        ("fizzed", "fizz"),
+        ("formalize", "formal"),
+        ("formative", "format"),
+        ("generate", "generat"),
+        ("generic", "generic"),
+        ("generously", "generous"),
+        ("goodness", "good"),
+        ("gyroscopic", "gyroscop"),
+        ("happier", "happier"),
+        ("happiest", "happiest"),
+        ("happy", "happi"),
+        ("hesitancy", "hesit"),
+        ("hissing", "hiss"),
+        ("homologous", "homolog"),
+        ("hopeful", "hope"),
+        ("hopping", "hop"),
+        ("inference", "infer"),
+        ("irritant", "irrit"),
+        ("knack", "knack"),
+        ("knackeries", "knackeri"),
+        ("lion", "lion"),
+        ("lying", "lie"),
+        ("mating", "mate"),
+        ("meeting", "meet"),
+        ("meetings", "meet"),
+        ("messing", "mess"),
+        ("milling", "mill"),
+        ("motoring", "motor"),
+        ("nation", "nation"),
+        ("national", "nation"),
+        ("nationalize", "nation"),
+        ("plastered", "plaster"),
+        ("ponies", "poni"),
+        ("probate", "probat"),
+        ("radically", "radic"),
+        ("rate", "rate"),
+        ("rates", "rate"),
+        ("rational", "ration"),
+        ("relate", "relat"),
+        ("relational", "relat"),
+        ("replacement", "replac"),
+        ("revival", "reviv"),
+        ("rolling", "roll"),
+        ("sing", "sing"),
+        ("sized", "size"),
+        ("skis", "ski"),
+        ("tanned", "tan"),
+        ("ties", "tie"),
+        ("triplicate", "triplic"),
+        ("troubled", "troubl"),
+        ("tying", "tie"),
+        ("valency", "valenc"),
+        ("vilely", "vile"),
     ];
 
     /// **Nine words is thin, and this file says so rather than implying otherwise.** They are
@@ -408,46 +513,34 @@ mod tests {
         );
     }
 
-    /// **A stem is a fixed point — except across the exception table, where Porter2 itself is
-    /// not idempotent.** Written as an unqualified claim first, and it failed on `ugly`: the
-    /// table maps it to `ugli`, and `ugli` fed back in loses its `li` to step 2 and becomes
-    /// `ug`. That is the algorithm's and not this implementation's — the table is consulted on
-    /// the *input*, so `ugli` is a final stem the algorithm is never handed. **The narrowing is
-    /// in the claim, not in the code**, and the exception outputs are covered by the test below
-    /// instead.
+    /// **Porter2 is not idempotent, and this is PostgreSQL's answer too.**
     ///
-    /// Unconfirmed against the oracle, which was unreachable when this was written; queued with
-    /// the wider vocabulary.
+    /// Written first as the opposite claim — that a stem is a fixed point — and it failed on
+    /// `ugly`, then on `agreed`. Rather than narrow the claim on my own authority I asked the
+    /// oracle, and 19beta1 says the same as this implementation:
+    ///
+    /// ```text
+    /// agreed -> 'agre'    agre  -> 'agr'
+    /// ugly   -> 'ugli'    ugli  -> 'ug'
+    /// early  -> 'earli'   earli -> 'ear'
+    /// ```
+    ///
+    /// So the second application is not a bug to fix but a property to record: **a stem is not a
+    /// word**, and feeding one back in asks a question the algorithm was never posed. Nothing in
+    /// this crate stems twice — `to_tsvector` stems a token once — and this test exists so that a
+    /// future reader who notices the asymmetry finds the measurement instead of "fixing" it.
     #[test]
-    fn stemming_a_stem_changes_nothing() {
-        for word in GOLDEN
-            .iter()
-            .map(|(w, _)| *w)
-            .chain(EXCEPTIONS.iter().map(|(w, _)| *w))
-            .chain(STOP_AFTER_1A.iter().copied())
-            .chain([
-                "generously",
-                "communities",
-                "arsenal",
-                "national",
-                "ties",
-                "cries",
-                "sky",
-            ])
-        {
-            // The exception table's own outputs are excluded, for the reason above.
-            if EXCEPTIONS
-                .iter()
-                .any(|(from, to)| *from == word && *to != word)
-            {
-                continue;
-            }
-            let once = stem(word);
+    fn a_stem_is_not_a_word_and_stemming_one_again_moves_it() {
+        for (stem_of_a_word, stemmed_again) in [("agre", "agr"), ("ugli", "ug"), ("earli", "ear")] {
             assert_eq!(
-                stem(&once),
-                once,
-                "{word} stems to {once} and then moves again"
+                stem(stem_of_a_word),
+                stemmed_again,
+                "PostgreSQL 19beta1 gives {stemmed_again:?} for {stem_of_a_word:?}"
             );
+        }
+        // And the words they come from, so the pair is visible in one place.
+        for (word, once) in [("agreed", "agre"), ("ugly", "ugli"), ("early", "earli")] {
+            assert_eq!(stem(word), once);
         }
     }
 

@@ -24,14 +24,25 @@
 //! `the` and `a` are gone under `english` and present under `simple`, **and the positions do not
 //! shift**: the numbering is over the tokens, and a dropped stop word takes its number with it.
 //!
-//! # One thing this file does not settle
+//! # The list is consulted *before* stemming, and that was measured
 //!
-//! Whether PostgreSQL checks the list **before** or **after** stemming. Every word in the capture
-//! answers the same either way — `the` and `a` stem to themselves — so the capture cannot tell
-//! them apart. The discriminating probe is **`to_tsvector('english', 'only')`**: `only` is in the
-//! list *and* in the stemmer's exception table, which maps it to `onli`, which is **not** in the
-//! list. Checked before stemming the answer is empty; checked after, it is `'onli':1`. Queued for
-//! the oracle, and named here so the next reader does not have to find it again.
+//! The tsvector capture could not say: every stop word in it stems to itself, so both orders give
+//! the same answer. The discriminating probe is a word that is in the list **and** in the
+//! stemmer's exception table, and PostgreSQL 19beta1 answers it:
+//!
+//! ```text
+//! to_tsvector('english', 'only')  -> (empty)
+//! ```
+//!
+//! `only` is in this list, and `esker_sql::value::stemmer`'s exception table maps it to `onli`,
+//! which is **not** in this list. An empty answer means the word never reached the stemmer. So the
+//! order is fold, consult the list, then stem — and [`is_stop_word`] takes the raw lowercased
+//! token, not a stem.
+//!
+//! Taken in the same rolled-back session that widened the stemmer's own vocabulary. The words that
+//! confirm the other side of it — `ugly` → `'ugli'`, `early` → `'earli'`, `singly` → `'singl'`,
+//! `gently` → `'gentl'`, `idly` → `'idl'`, `skies` → `'sky'` — are exception-table entries that are
+//! *not* stop words, and each one comes back stemmed.
 
 /// The 127 words, **sorted** so that [`is_stop_word`] can binary-search them.
 ///
@@ -169,8 +180,8 @@ pub const ENGLISH: &[&str] = &[
 
 /// Whether a token is an English stop word.
 ///
-/// The token is expected already lowercased, which is the order PostgreSQL's snowball dictionary
-/// works in: fold, then consult the list.
+/// The token is the **raw lowercased word and not a stem**, which the module docs above measure
+/// rather than assume: `to_tsvector('english', 'only')` is empty, and `only` stems to `onli`.
 #[must_use]
 pub fn is_stop_word(word: &str) -> bool {
     ENGLISH.binary_search(&word).is_ok()
@@ -220,6 +231,28 @@ mod tests {
                 "{word} survives into a lexeme in the capture"
             );
         }
+    }
+
+    /// **The measured order, made executable.** `only` is in this list and stems to `onli`, which
+    /// is not — so a lookup that ran after stemming would keep it. PostgreSQL answers
+    /// `to_tsvector('english', 'only')` with nothing, which is only possible if the list is
+    /// consulted first. Pinned here because the two modules are separately edited and the order
+    /// between them is invisible from either one alone.
+    #[test]
+    fn the_list_is_consulted_before_the_stemmer() {
+        assert!(
+            is_stop_word("only"),
+            "`only` is a stop word and never reaches the stemmer"
+        );
+        assert_eq!(
+            crate::value::stemmer::stem("only"),
+            "onli",
+            "and if it did reach it, this is what would survive — which PostgreSQL does not report"
+        );
+        assert!(
+            !is_stop_word("onli"),
+            "so a post-stemming lookup would have kept it"
+        );
     }
 
     /// Case is the caller's job, and this asserts the contract rather than hiding it: an unfolded
