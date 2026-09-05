@@ -145,6 +145,7 @@ fn columnar(apply: &ColumnarApply, at: u64) -> BTreeMap<i64, String> {
         &fragment,
         &ScanOptions {
             prune: true,
+            range: None,
             widening: None,
             visibility: Some(Visibility {
                 key_columns: vec![2],
@@ -376,6 +377,7 @@ fn count_at(apply: &ColumnarApply, at: u64) -> u64 {
         &fragment,
         &ScanOptions {
             prune: true,
+            range: None,
             widening: None,
             visibility: Some(Visibility {
                 key_columns: vec![2],
@@ -558,6 +560,7 @@ fn a_column_added_mid_workload_reads_its_default_for_the_rows_that_predate_it() 
         &fragment,
         &ScanOptions {
             prune: true,
+            range: None,
             widening: Some(widening),
             visibility: Some(Visibility {
                 key_columns: vec![key_slot],

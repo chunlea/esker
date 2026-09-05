@@ -2576,7 +2576,13 @@ impl Store {
             }
         };
 
-        match evaluate(slot.fs().as_ref(), &runs, &fragment, request.ts) {
+        match evaluate(
+            slot.fs().as_ref(),
+            &runs,
+            &fragment,
+            request.ts,
+            state.region(),
+        ) {
             Ok(answer) => Ok(answer),
             Err(error) => Ok(refused(
                 RefusalReason::Unsupported,
@@ -3430,6 +3436,7 @@ fn evaluate(
     runs: &crate::columnar::region::TableRuns,
     fragment: &esker_columnar::Fragment,
     ts: u64,
+    region: &Region,
 ) -> std::result::Result<esker_proto::fragment::FragmentResp, esker_columnar::Error> {
     use esker_columnar::scan::visible::Visibility;
     use esker_columnar::{Reader, ScanOptions};
@@ -3476,6 +3483,20 @@ fn evaluate(
             widening: Some(esker_columnar::Widening {
                 schema: runs.schema.clone(),
                 missing: runs.missing.clone(),
+            }),
+            // **This region's own key range**, so an answer covers the shard the caller was
+            // routed to and nothing else. Not `fragment.range` — that is the client's field and
+            // is still refused; which rows a copy may answer for is a property of the *region*,
+            // so it is applied here where the region record is, and a caller cannot get it wrong.
+            //
+            // Scoping the *build* (`columnar::region::convert`) stops a copy being written with
+            // another region's rows; this makes the answer right whatever a run already holds —
+            // a parent's runs after a split, which nothing prunes (ADR 0040). The two cover
+            // different halves and `docs/plans/phase-8-learner.md` §store unit 4 says why neither
+            // is sufficient alone.
+            range: Some(esker_columnar::KeyRange {
+                start: region.start_key.to_vec(),
+                end: region.end_key.to_vec(),
             }),
             // MVCC at **read** time (ADR 0022 Decision 4): the runs hold every version as
             // committed, and which of them a caller may see is a property of when it is reading.
