@@ -451,9 +451,12 @@ fn resolve_user_type(
         // for one reports `numeric field overflow` naming precision 8 scale 2, the **base type's**
         // error and not the domain's.
         catalog::TypeKind::Domain { base, .. } => Ok((base, Some(def.oid))),
-        catalog::TypeKind::Composite { .. } => Err(SqlError::unsupported(format!(
-            "a column of the composite type {name}"
-        ))),
+        // **A composite's value is its canonical record text**, the way `jsonb`'s is its canonical
+        // document text — ADR 0042 permits sharing `text`'s representation when the comparison
+        // comes with it, and it does: composite equality is field by field, and two field-equal
+        // composites render identically (`value::composite`). The oid rides along so `format_type`
+        // and `pg_typeof` answer the type's own name, exactly as they do for a domain above.
+        catalog::TypeKind::Composite { .. } => Ok((ColumnType::Text, Some(def.oid))),
     }
 }
 
@@ -480,6 +483,11 @@ fn fold_user_default(
     Ok(Some(match (&def.kind, value) {
         (catalog::TypeKind::Enum { .. }, _) => {
             super::assign::into_enum(value.clone(), column, def)?
+        }
+        // A composite `DEFAULT` is canonicalised like any other value of one, so the column's
+        // default and a row written by hand are the same string.
+        (catalog::TypeKind::Composite { fields }, Datum::Text(text)) => {
+            Datum::Text(crate::value::composite::canonicalise(text, fields.len())?)
         }
         (catalog::TypeKind::Range { .. }, Datum::Text(text)) => {
             <Datum as crate::value::PgDatum>::from_text(ty, text)?
@@ -570,6 +578,21 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef, method: &str) -> Res
             | ColumnType::Xml
     ) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
+    }
+    // **A composite is stored as `text` and must not be indexed as one.** `is_index_key` sees the
+    // storage type and cannot tell it apart, so the question is asked here, where the column's
+    // declared type is known. PostgreSQL orders a record **field by field**; this node's key would
+    // be the canonical text, and the two part company as soon as a field needs quoting — `"a b"`
+    // sorts by its opening quote. An index that returns rows in an order a real server does not is
+    // ADR 0031's worst class, so it is refused by name until a composite has a key encoding of its
+    // own (`docs/plans/composite-type.md`).
+    if let Some(def) = super::assign::user_type_of(table, column)
+        && matches!(def.kind, catalog::TypeKind::Composite { .. })
+    {
+        return Err(SqlError::unsupported(format!(
+            "an index over the composite type {}",
+            def.name
+        )));
     }
     if !esker_keys::row::is_index_key(ty) {
         let declared = super::assign::user_type_of(table, column)

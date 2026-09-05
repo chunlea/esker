@@ -633,7 +633,7 @@ fn value_for_column(
     // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
     // `mood` is a label the same way `'2020-01-01'` in a `date` column is a date — one rule, one
     // place, and the same one an `UPDATE` uses (ADR 0050).
-    if let Some(def) = super::assign::enum_of(table, column) {
+    if let Some(def) = super::assign::rewriting_type_of(table, column) {
         let value = match expr {
             crate::plan::Expr::Literal(literal) => super::assign::enum_literal(literal),
             other => {
@@ -641,7 +641,9 @@ fn value_for_column(
                 cursor::evaluate_in_txn(&resolved, &[], txn)?
             }
         };
-        return super::assign::into_enum(value, column, def);
+        // Through `into_column` rather than straight to `into_enum`: the kind is decided in one
+        // place, so a composite is canonicalised here exactly as an enum is mapped.
+        return super::assign::into_column(value, column, Some(def));
     }
     match expr {
         crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
@@ -662,7 +664,7 @@ fn value_for_column(
             super::assign::into_column(
                 cursor::evaluate_in_txn(&resolved, &[], txn)?,
                 column,
-                super::assign::enum_of(table, column),
+                super::assign::rewriting_type_of(table, column),
             )
         }
     }
@@ -703,7 +705,7 @@ fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<
         // An enum column takes a label, so the literal keeps its own type here and `into_column`
         // reads it against the enum rather than against the `int2` the row holds.
         crate::plan::Expr::Literal(literal)
-            if super::assign::enum_of(at.table, at.column).is_some() =>
+            if super::assign::rewriting_type_of(at.table, at.column).is_some() =>
         {
             Ok(super::assign::enum_literal(literal))
         }
@@ -978,7 +980,7 @@ pub(super) fn update(
                 new[*ordinal] = super::assign::into_column(
                     evaluated,
                     column,
-                    super::assign::enum_of(&table, column),
+                    super::assign::rewriting_type_of(&table, column),
                 )?;
             }
             fit_typmods(&table, &mut new)?;
@@ -1304,8 +1306,11 @@ fn apply_conflict_update(
                 cursor::evaluate_in_txn(&resolved, &both, txn)?
             }
         };
-        updated[ordinal] =
-            super::assign::into_column(evaluated, column, super::assign::enum_of(table, column))?;
+        updated[ordinal] = super::assign::into_column(
+            evaluated,
+            column,
+            super::assign::rewriting_type_of(table, column),
+        )?;
     }
     fit_typmods(table, &mut updated)?;
     fill_generated(table, &mut updated)?;

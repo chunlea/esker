@@ -38,7 +38,7 @@ INSERT INTO pc VALUES (1, ROW('Paris', 'Champs-Élysées'));		-
 INSERT INTO pc VALUES (2, ROW('a,b', 'c"d'));		-
 INSERT INTO pc VALUES (3, ROW(NULL, 'x'));		-
 INSERT INTO pc VALUES (4, ROW('', ' '));		-
-INSERT INTO pc VALUES (5, ROW('a(b)c', 'd\\e'));		-
+INSERT INTO pc VALUES (5, ROW('a(b)c', 'd\e'));		-
 INSERT INTO pc VALUES (6, ROW('  lead', 'trail  '));		-
 SELECT 'o1', id, address FROM pc ORDER BY id;		o1|1|(Paris,Champs-Élysées) ; o1|2|("a,b","c""d") ; o1|3|(,x) ; o1|4|(""," ") ; o1|5|("a(b)c","d\\e") ; o1|6|("  lead","trail  ")
 
