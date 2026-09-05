@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crate::clock::Clock;
 use crate::error::{Error, Result};
 use crate::region_cache::{RegionCache, RegionResolver};
-use crate::router::{Router, clamp_end, owns};
+use crate::router::{Router, clamp_end, repair_route};
 use crate::transport::StoreTransport;
 use crate::wire::{Body, DEFAULT_SCAN_LIMIT, Method, RawKvReq, RawKvResp};
 
@@ -217,7 +217,15 @@ impl RawClient {
         let mut pieces = Vec::new();
         let mut cursor = Bytes::copy_from_slice(start);
         for _ in 0..crate::txn::MAX_SCAN_REGIONS {
-            let boundary = self.router.route(&cursor)?.region.end_key;
+            // **The enumeration needs the repair too.** `Router::route` answers its own
+            // `KeyNotInRegion` with `region_id == 0` when the driver says no region covers the key
+            // — which under load is a fact about the driver being a heartbeat behind, not about the
+            // cluster. That is the `08006 … key is not in region 0` a loaded gate produced while
+            // the same test passed alone.
+            let boundary = match self.router.route(&cursor) {
+                Ok(route) => route.region.end_key,
+                Err(refusal) => repair_route(&self.router, &cursor, &refusal)?,
+            };
             let piece_end = clamp_end(end, &boundary);
             pieces.push((cursor.clone(), piece_end));
             if boundary.is_empty()
@@ -259,15 +267,15 @@ impl RawClient {
             match self.call(&request) {
                 Ok(RawKvResp::Scan { pairs }) => return Ok(pairs),
                 Ok(other) => return Err(unexpected(Method::RawScan, &other)),
-                Err(Error::Store(crate::wire::ProtoError::KeyNotInRegion {
-                    start_key,
-                    end_key,
-                    ..
-                })) if refreshes < crate::txn::SCAN_ROUTE_REFRESHES
-                    && owns(&start_key, &end_key, from) =>
+                Err(Error::Store(refusal))
+                    if matches!(refusal, crate::wire::ProtoError::KeyNotInRegion { .. })
+                        && refreshes < crate::txn::SCAN_ROUTE_REFRESHES =>
                 {
                     refreshes += 1;
-                    to = clamp_end(&to, &end_key);
+                    // The same repair the transactional scan uses, and the same one the fragment
+                    // dispatch must: one place, so the ordering of "believe the store" against
+                    // "ask the driver" cannot differ between them.
+                    to = clamp_end(&to, &repair_route(&self.router, from, &refusal)?);
                 }
                 Err(other) => return Err(other),
             }

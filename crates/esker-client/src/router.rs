@@ -426,6 +426,71 @@ impl Router {
     }
 }
 
+/// Where the region holding `key` ends, after a store refused a request for it.
+///
+/// **One repair, in one place.** A scan learns a boundary has moved from the refusal it causes,
+/// and so does a fragment dispatch — [ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md)'s
+/// path has the same problem for the same reason. Two copies of this would be two chances to get
+/// the ordering of "believe the store" and "ask the driver" the wrong way round, and only one of
+/// them would be under test.
+///
+/// # The two cases, and why the order between them matters
+///
+/// * **The refusal's own bounds contain `key`.** Then the store has just told us the truth about
+///   itself and it is *newer than the driver*: a store knows about its own split the instant it
+///   happens and the placement driver learns at the next heartbeat. Believe it, and return.
+/// * **They do not.** Then this is stale *routing* rather than a stale *boundary* — the request
+///   went to a store that never held the key — and only the authority can fix it.
+///
+/// Getting that order wrong is not academic: asking the driver first returns the same too-wide
+/// boundary inside the heartbeat window, and the retries burn out in microseconds
+/// (`Transaction::scan_region`, measured 2026-09-05).
+///
+/// # Why the driver is asked in a loop
+///
+/// Under load the driver stays behind for longer than one round trip, and a `GetRegion` that
+/// answers "no region covers this key" — `region_id == 0`, the resolver's own refusal — is *not*
+/// a fact about the cluster, it is a fact about the driver's knowledge at that instant. That is
+/// what surfaced as `08006 … key is not in region 0` in a loaded gate while passing alone. So it
+/// waits the driver out on the router's own jittered schedule, and gives up with the refusal it
+/// was handed rather than one it invented.
+pub(crate) fn repair_route(
+    router: &Router,
+    key: &Bytes,
+    refusal: &ProtoError,
+) -> std::result::Result<Bytes, Error> {
+    if let ProtoError::KeyNotInRegion {
+        start_key, end_key, ..
+    } = refusal
+        && owns(start_key, end_key, key)
+    {
+        return Ok(end_key.clone());
+    }
+    let policy = RetryPolicy::default();
+    for attempt in 0..ROUTE_REPAIR_ATTEMPTS {
+        match router.locate(key) {
+            // The authority knows the key, and its answer replaces whatever the cache held.
+            Ok(Some(route)) if owns(&route.region.start_key, &route.region.end_key, key) => {
+                return Ok(route.region.end_key);
+            }
+            // It answered, and still does not cover the key: it is behind, not authoritative.
+            Ok(_) => {}
+            // It could not answer at all, which is the same kind of "not yet".
+            Err(_) => {}
+        }
+        router
+            .clock()
+            .sleep(router.jitter().apply(policy.backoff(attempt)));
+    }
+    Err(terminal(refusal.clone(), Method::PdGetRegion))
+}
+
+/// How many times the driver is asked before a refusal is believed as final.
+///
+/// Small and fixed rather than a deadline: each attempt is a round trip to the authority and the
+/// thing being waited for is one heartbeat, not an unbounded queue.
+const ROUTE_REPAIR_ATTEMPTS: u32 = 5;
+
 /// Whether `[start_key, end_key)` — a region, as the store named it — contains `key`.
 ///
 /// Beside the router rather than beside either scan, because **both** scans need it and a second

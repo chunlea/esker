@@ -65,7 +65,7 @@ use bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::region_cache::RegionResolver;
 use crate::retry::backoff_ms;
-use crate::router::{ClientOptions, Router, clamp_end, fan_out, owns};
+use crate::router::{ClientOptions, Router, clamp_end, fan_out, owns, repair_route};
 use crate::transport::StoreTransport;
 use crate::wire::{
     Body, DEFAULT_SCAN_LIMIT, LockInfo, Method, ProtoError, Response, TxnKvReq, TxnKvResp,
@@ -854,38 +854,25 @@ impl Transaction {
         end: &[u8],
         limit: u32,
     ) -> Result<(Vec<(Bytes, Bytes)>, Bytes)> {
-        let mut boundary = self.router.route(cursor)?.region.end_key;
+        // The first lookup is repaired too: `Router::route` raises its own `KeyNotInRegion` with
+        // `region_id == 0` when the driver does not yet know the key, and under load that is the
+        // driver being behind rather than an answer about the cluster.
+        let mut boundary = match self.router.route(cursor) {
+            Ok(route) => route.region.end_key,
+            Err(refusal) => repair_route(&self.router, cursor, &refusal)?,
+        };
         let mut refreshes = 0;
         loop {
             match self.scan_page(cursor, &clamp_end(end, &boundary), limit) {
                 Ok(pairs) => return Ok((pairs, boundary)),
-                Err(Error::Store(ProtoError::KeyNotInRegion {
-                    start_key, end_key, ..
-                })) if refreshes < SCAN_ROUTE_REFRESHES => {
+                Err(Error::Store(refusal))
+                    if matches!(refusal, ProtoError::KeyNotInRegion { .. })
+                        && refreshes < SCAN_ROUTE_REFRESHES =>
+                {
                     refreshes += 1;
-                    boundary = if owns(&start_key, &end_key, cursor) {
-                        // **The store just named the range it actually owns, so believe it.**
-                        // Asking the placement driver instead is what the first version did, and
-                        // it did not work: the store knows about its own split the instant it
-                        // happens and the driver learns at the next heartbeat, so a refresh
-                        // during that window hands back the same too-wide boundary and the
-                        // retries burn out in microseconds. The refusal is the newer fact.
-                        end_key
-                    } else {
-                        // The cursor is not in that region at all, so this is stale *routing*
-                        // rather than a stale boundary, and the authority is what fixes it.
-                        self.router
-                            .locate(cursor)?
-                            .map(|route| route.region.end_key)
-                            .ok_or_else(|| {
-                                Error::Store(ProtoError::KeyNotInRegion {
-                                    key: cursor.clone(),
-                                    region_id: 0,
-                                    start_key: Bytes::new(),
-                                    end_key: Bytes::new(),
-                                })
-                            })?
-                    };
+                    // **The shared repair**, not a copy of it: the fragment dispatch meets the same
+                    // stale routing and must resolve it the same way (`router::repair_route`).
+                    boundary = repair_route(&self.router, cursor, &refusal)?;
                 }
                 Err(other) => return Err(other),
             }
