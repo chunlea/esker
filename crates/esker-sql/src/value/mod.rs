@@ -55,6 +55,7 @@ pub mod random;
 pub mod range;
 pub mod regex;
 /// Arithmetic over the date and time types: which pairs have an operator, and what it yields.
+pub mod stemmer;
 pub mod temporal;
 pub mod time;
 mod timestamp;
