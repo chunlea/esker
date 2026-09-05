@@ -1,0 +1,16 @@
+docs/adr/0074-a-fragment-expression-node-is-added-by-tag-not-by-version.md
+  h_44076b318daf9c 1
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 348-363,395-397,547-551,631-655
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "02129a48231106b7d20ed3bec957d7ac68872b99",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
