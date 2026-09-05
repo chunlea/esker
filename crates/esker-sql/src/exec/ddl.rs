@@ -5133,6 +5133,12 @@ pub(super) fn alter_table(
             set_columnar_replicas(txn, executor, &updated, *replicas)?;
             continue;
         }
+        // Accepted and applied to nothing, which is the whole of it: no catalog write, and **no
+        // `columnar_changed`** — telling the placement driver to re-read for a parameter that
+        // touched nothing is work it does not need.
+        if matches!(action, AlterTableAction::AcceptStorageParameter) {
+            continue;
+        }
         // **One field on the table and nothing else.** Every relation reads its persistence from
         // the table it belongs to, so the indexes and the owned sequence move with it in this same
         // statement and there is no second place to keep in step.

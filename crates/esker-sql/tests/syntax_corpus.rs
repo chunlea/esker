@@ -226,8 +226,9 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ("ALTER TABLE t CLUSTER ON i;", "G36"),
     ("ALTER TABLE t SET WITHOUT CLUSTER;", "G36"),
     ("ALTER TABLE t SET WITHOUT OIDS;", "G36"),
-    // G37 -- resetting storage parameters, and a multi-action list whose first action is itself a gap
-    ("ALTER TABLE t RESET (fillfactor);", "G37"),
+    // G37 -- a multi-action list whose first action is itself a gap. `ALTER TABLE t RESET (…)`
+    // was the other half and is no longer one: it is read out of the source and accepted for every
+    // name, which is what a real server does (`tests/storage_parameters.rs`).
     ("ALTER TABLE t SET LOGGED, SET (fillfactor = 50);", "G37"),
     // G38 -- table inheritance
     ("ALTER TABLE t INHERIT u;", "G38"),
