@@ -1,0 +1,30 @@
+.config/nextest.toml
+  h_44076b318daf9c 56-86,105-108
+crates/esker-sql/src/exec/assign.rs
+  h_44076b318daf9c 16-21,24-25,65-76,87,103,106-116,119,121-134,158
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 3037-3058,3062
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 274-277,279
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 2253-2257,2282-2293
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 306-517
+crates/esker-sql/tests/assignment_casts.rs
+  h_44076b318daf9c 1-343
+crates/esker-sql/tests/rename_in_schema.rs
+  h_44076b318daf9c 1-154
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1700-1707
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2a32346adfd2a62332cdd4632b3570a203a26e26",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
