@@ -127,6 +127,24 @@ pub struct ScanOptions {
     /// filter, and why it **turns pruning off**.
     pub visibility: Option<visible::Visibility>,
 
+    /// Keep only rows whose key falls in this half-open byte range.
+    ///
+    /// **A region's own bounds, applied by the store that holds the copy** — not
+    /// [`crate::Fragment::range`], which a client sends and this build still refuses. The
+    /// distinction is the whole design: which rows a copy may answer for is a property of the
+    /// *region*, not of the query, so a caller cannot get it wrong and no wire field carries it.
+    ///
+    /// It exists because a run can hold rows the region no longer owns: a parent's runs after a
+    /// split, which nothing prunes ([ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md)).
+    /// Scoping the *build* stops a copy being written wrong; this makes the answer right whatever
+    /// a run already contains, and the two cover different halves of the same defect
+    /// (`docs/plans/phase-8-learner.md` §store unit 4).
+    ///
+    /// Compared against the **first** key column, which for a store's copy is the whole row key.
+    /// Requires [`ScanOptions::visibility`], because that is what names the key columns; a range
+    /// without it is a refusal rather than a range nothing applies.
+    pub range: Option<crate::fragment::KeyRange>,
+
     /// Whether to skip stripes whose statistics rule them out.
     ///
     /// A switch rather than a constant, for the reason ADR 0022 gives for the session GUC it
@@ -144,6 +162,7 @@ impl Default for ScanOptions {
             prune: true,
             widening: None,
             visibility: None,
+            range: None,
         }
     }
 }
@@ -337,7 +356,12 @@ pub fn evaluate_with(
             }
             stats.rows_scanned += 1;
             if let Some(visibility) = &options.visibility
-                && !next_is_visible(visibility, &mut visibility_cursors, &mut resolver)
+                && !next_is_visible(
+                    visibility,
+                    options.range.as_ref(),
+                    &mut visibility_cursors,
+                    &mut resolver,
+                )
             {
                 continue;
             }
@@ -404,6 +428,7 @@ pub fn evaluate_merged(
 /// independent, and a fragment need not project a single column this reads.
 fn next_is_visible(
     visibility: &visible::Visibility,
+    range: Option<&crate::fragment::KeyRange>,
     cursors: &mut [crate::column::ColumnIter<'_>],
     resolver: &mut visible::Resolver,
 ) -> bool {
@@ -420,7 +445,30 @@ fn next_is_visible(
         _ => i64::MIN,
     };
     let deleted = matches!(seen.get(keys + 1), Some(ValueRef::Bool(true)));
+    // **Before the resolver, and it must be**: a key the region does not own is not a version to
+    // settle, it is a row that belongs to somebody else. Letting it settle would make the next,
+    // in-range version of a *different* key look already-decided.
+    if !in_range(range, &seen[..keys]) {
+        return false;
+    }
     resolver.visible(&seen[..keys], commit_ts, deleted, visibility.ts)
+}
+
+/// Whether `key` is inside `range`, comparing its **first** column as bytes.
+///
+/// An empty bound is unbounded on that side, and the two sides mean it in opposite directions —
+/// an empty `start` is the beginning of the key space, an empty `end` is the end of it. A key
+/// whose first column is not bytes cannot be compared with a byte bound and is kept: the range is
+/// a region's, and a copy whose key is not a row key is not one a region bounds.
+pub(crate) fn in_range(range: Option<&crate::fragment::KeyRange>, key: &[ValueRef<'_>]) -> bool {
+    let Some(range) = range else {
+        return true;
+    };
+    let Some(ValueRef::Bytes(first)) = key.first() else {
+        return true;
+    };
+    (range.start.is_empty() || *first >= range.start.as_slice())
+        && (range.end.is_empty() || *first < range.end.as_slice())
 }
 
 /// Decodes the chunks this fragment names, and only those.

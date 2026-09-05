@@ -2682,6 +2682,89 @@ fn catalog_function(
         // **An empty `from` is a no-op**, which is the one rule `str::replace` does not share:
         // it matches between every character and answers `XaXbXcX` where PostgreSQL answers
         // `abc`. Everything else — left to right, non-overlapping, case-sensitive — is the same.
+        // `split_part(text, sep, n)`. Measured on 19beta1, and the edges are the specification:
+        // past the end is `''` and not NULL, a negative `n` counts from the end, an empty
+        // separator gives the whole string back, and `n = 0` is an error rather than an answer.
+        CatalogFunc::SplitPart => match (args.first(), args.get(1), args.get(2)) {
+            (Some(Datum::Text(text)), Some(Datum::Text(sep)), Some(position)) => {
+                let Some(n) = whole_number(Some(position)) else {
+                    return Ok(Datum::Null);
+                };
+                if n == 0 {
+                    return Err(SqlError::InvalidFunctionArgument(
+                        "field position must not be zero",
+                    ));
+                }
+                if sep.is_empty() {
+                    return Ok(Datum::Text(text.clone()));
+                }
+                let fields: Vec<&str> = text.split(sep.as_str()).collect();
+                let at = if n > 0 {
+                    usize::try_from(n - 1).ok()
+                } else {
+                    // `-1` is the last field, `-len` the first, and anything further is past the
+                    // start — which answers the empty string, the same as past the end.
+                    usize::try_from(n.checked_neg().unwrap_or(i64::MAX))
+                        .ok()
+                        .and_then(|back| fields.len().checked_sub(back))
+                };
+                Datum::Text(
+                    at.and_then(|at| fields.get(at))
+                        .map_or_else(String::new, |field| (*field).to_owned()),
+                )
+            }
+            _ => Datum::Null,
+        },
+        // `strpos(haystack, needle)`: 1-based, `0` for absent, and `1` for an empty needle —
+        // measured, it matches at the start rather than nowhere. Counted in **characters**, which
+        // is what makes it agree with `substr`.
+        CatalogFunc::StrPos => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(haystack)), Some(Datum::Text(needle))) => {
+                Datum::Int4(haystack.find(needle.as_str()).map_or(0, |byte| {
+                    i32::try_from(haystack[..byte].chars().count() + 1).unwrap_or(i32::MAX)
+                }))
+            }
+            _ => Datum::Null,
+        },
+        // `substr(text, from[, count])`, 1-based and **clamped at both ends**: the characters at
+        // positions `max(from, 1) ..= from + count - 1`, so `substr('hello', -1, 3)` is `h` —
+        // positions -1, 0 and 1, of which only 1 exists. Getting that wrong by clamping `from`
+        // before applying `count` gives `hel`, which is the plausible answer and not the measured
+        // one.
+        CatalogFunc::Substr | CatalogFunc::Substring => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(text)), Some(from)) => {
+                let Some(from) = whole_number(Some(from)) else {
+                    return Ok(Datum::Null);
+                };
+                let end = match args.get(2) {
+                    None => None,
+                    Some(Datum::Null) => return Ok(Datum::Null),
+                    Some(count) => match whole_number(Some(count)) {
+                        None => return Ok(Datum::Null),
+                        Some(count) => {
+                            if count < 0 {
+                                return Err(SqlError::InvalidFunctionArgument(
+                                    "negative substring length not allowed",
+                                ));
+                            }
+                            Some(from.saturating_add(count))
+                        }
+                    },
+                };
+                let first = from.max(1);
+                let taken: String = text
+                    .chars()
+                    .enumerate()
+                    .filter_map(|(at, ch)| {
+                        let position = i64::try_from(at).unwrap_or(i64::MAX).saturating_add(1);
+                        let within = position >= first && end.is_none_or(|end| position < end);
+                        within.then_some(ch)
+                    })
+                    .collect();
+                Datum::Text(taken)
+            }
+            _ => Datum::Null,
+        },
         CatalogFunc::Replace => match (args.first(), args.get(1), args.get(2)) {
             (Some(Datum::Text(text)), Some(Datum::Text(from)), Some(Datum::Text(to))) => {
                 if from.is_empty() {
@@ -3088,6 +3171,19 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
 
 /// `pg_get_indexdef`'s optional column number. `None` is the one-argument form, which is a
 /// different answer from column `0` — that one prints the definition unqualified.
+/// An integer function argument as an `i64`, or `None` for anything that is not one.
+///
+/// The three string functions are **strict**: a NULL argument is a NULL answer, and a non-integer
+/// one has no meaning to give, so both come back `None` and the caller answers NULL.
+fn whole_number(arg: Option<&Datum>) -> Option<i64> {
+    match arg? {
+        Datum::Int8(n) => Some(*n),
+        Datum::Int4(n) => Some(i64::from(*n)),
+        Datum::Int2(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
 fn column_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
     Ok(match arg {
         // A NULL is answered above, before this is called: the function is strict in this

@@ -4130,6 +4130,37 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     .map(Box::new),
             })
         }
+        // **`SUBSTR` is a node, not a call.** `sqlparser` reads `substr(x, 2)` and
+        // `substring(x FROM 2 FOR 3)` into the same `Expr::Substring`, so a `CatalogFunc` alone
+        // never sees it — which is why `substr` stayed `0A000` while `split_part` beside it
+        // worked. The two spellings mean the same thing and both arrive here.
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            shorthand,
+            ..
+        } => {
+            let mut args = vec![lower_expr(expr)?];
+            let Some(from) = substring_from else {
+                // `SUBSTRING(x FOR n)` with no `FROM` is `SUBSTRING(x FROM 1 FOR n)` on a real
+                // server; nothing sends it, so it is named rather than assumed.
+                return Err(SqlError::unsupported("SUBSTRING with no FROM"));
+            };
+            args.push(lower_expr(from)?);
+            if let Some(count) = substring_for {
+                args.push(lower_expr(count)?);
+            }
+            // The spelling decides the output column's name and nothing else — measured.
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: if *shorthand {
+                    plan::CatalogFunc::Substr
+                } else {
+                    plan::CatalogFunc::Substring
+                },
+                args,
+            })))
+        }
         other => Err(SqlError::unsupported(format!("the expression {other}"))),
     }
 }
