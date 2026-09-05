@@ -2894,6 +2894,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // the case PostgreSQL refuses.
     fn family(ty: ColumnType) -> u8 {
         match ty {
+            // **A `regtype` is in the numbers' family**, with `oid`: measured,
+            // `'text'::regtype = 25` is true against an uncast integer, so the two compare and a
+            // family of its own would make that `42883`. Its array is its own, like every array.
+            ColumnType::RegType => family(ColumnType::Oid),
+            ColumnType::RegTypeArray => 200,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.

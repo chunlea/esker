@@ -313,6 +313,13 @@ const TAG_TSVECTOR: u8 = 84;
 const TAG_TSQUERY: u8 = 85;
 const TAG_TSVECTOR_ARRAY: u8 = 86;
 const TAG_TSQUERY_ARRAY: u8 = 87;
+/// `regtype` and its array ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+///
+/// **This file's own next free numbers**, which are one below `esker_keys::columnar`'s for the same
+/// two types — that offset is not new, it has held since `citext` (28 here, 29 there), and each
+/// space is append-only within itself.
+const TAG_REGTYPE: u8 = 88;
+const TAG_REGTYPE_ARRAY: u8 = 89;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -446,6 +453,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Uuid => TAG_UUID,
         ColumnType::Interval => TAG_INTERVAL,
         ColumnType::Oid => TAG_OID,
+        ColumnType::RegType => TAG_REGTYPE,
+        ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
         ColumnType::Int2Array => TAG_INT2_ARRAY,
@@ -581,6 +590,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_UUID => ColumnType::Uuid,
         TAG_INTERVAL => ColumnType::Interval,
         TAG_OID => ColumnType::Oid,
+        TAG_REGTYPE => ColumnType::RegType,
+        TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,
         TAG_INT2_ARRAY => ColumnType::Int2Array,

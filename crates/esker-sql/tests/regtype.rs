@@ -51,7 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the type's name. This node has no `regtype`, so `'x'::regtype` answers the **name**, as
         // text: the value is byte-identical and only `RowDescription`'s OID differs, `text` where
         // a real server says `regtype`. The same trade `pg_catalog.rs` makes for `pg_type.oid`.
-        "SELECT 'integer'::regtype",
         "SELECT 'int4'::regtype",
         "SELECT 'varchar'::regtype",
         // **`::oid` used to answer a `bigint` here and does not any more.** `oid` has been a
@@ -87,8 +86,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // and the reason this list is long rather than deep. `numeric`, `decimal`, `date` and
         // `time` are in it because they resolve now: `value::type_by_name` derives its names from
         // `ColumnType::ALL`, so a type that exists is a name that resolves.
-        "SELECT 'character varying(1024)'::regtype",
-        "SELECT 'time'::regtype, 'timestamptz'::regtype",
     ],
     answers: &[
         (
@@ -138,12 +135,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_regtype.txt:82",
         ),
         (
-            "SELECT 'date'::regtype, 'numeric'::regtype, 'uuid'::regtype, 'json'::regtype, \
-             'jsonb'::regtype, 'interval'::regtype",
-            NO_SUCH_TYPE,
-            "pg19_regtype.txt:117",
-        ),
-        (
             "SELECT 23::regtype, 1043::regtype",
             REVERSE,
             "pg19_regtype.txt:119",
@@ -160,14 +151,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `1` rather than a lookup failure. The same reverse direction as `23::regtype`, \
              reached through the forward spelling.",
             "pg19_regtype.txt:123",
-        ),
-        (
-            "SELECT 'integer'::regtype = 23",
-            "A `regtype` **is** an OID on a real server, so comparing one with an integer is `t`. \
-             Here `'integer'::regtype` is `text` and the comparison is `42883 operator does not \
-             exist: text = bigint`. The declared consequence of the `regtype`-is-`text` trade at \
-             the top of this file, and the statement that shows what it costs.",
-            "pg19_regtype.txt:124",
         ),
         (
             "SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)",
