@@ -180,6 +180,19 @@ const PROBE_ROUNDS: usize = 50;
 /// by [`open`]. This is what turns the beats PD received into a count of the rounds that ran.
 const ROUNDS_PER_BEAT: usize = 4;
 
+/// How long a case that requires a reclamation waits for it to **finish**.
+///
+/// A budget for an event, not a sample: the reclaim is a decision followed by a range delete, and
+/// the delete is not instantaneous under load. Reaching this deadline means the reclaim stalled
+/// rather than that it was declined, and [`Half::ReclaimUnfinished`] says which.
+const RECLAIM_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a case that requires the region be **kept** watches before calling nothing a decision.
+///
+/// Unchanged, and it cannot be shortened: proving a negative costs real time, and the round guard
+/// below checks that the throttle actually got its 50 leaderless rounds inside it.
+const NOTHING_HAPPENS_WINDOW: Duration = Duration::from_secs(3);
+
 /// Writes one key, retrying while the answer is one the caller is told to retry.
 ///
 /// **One store, deliberately.** See `retire.rs`'s note: a hint-ignoring retry livelocks against a
@@ -411,6 +424,72 @@ fn place_and_verify(pd: &Arc<FakePd>, case: &Case, hosted: &Region) {
     );
 }
 
+/// Watches until the case's verdict is a decision rather than a sample.
+///
+/// Split out of [`observe`] so each budget can be read next to the thing it is a budget for, and
+/// because the two are not the same kind of wait -- see the comment inside.
+async fn watch_for_the_verdict(case: &Case, pd: &Arc<FakePd>, store: &Arc<Store>) {
+    // **Waiting for an event is not the same as proving a negative, and they had the same clock.**
+    //
+    // A case that requires `Reclaim` waits for something to *happen* -- the region gone and its
+    // keys with it -- so its budget only has to be long enough that reaching the end means the
+    // reclaim stalled. A case that requires `Keep` is proving that nothing happens, and the only
+    // way to do that is to spend the window and then check the throttle really ran.
+    //
+    // Both were given the same three seconds. So a reclaim still in flight when the clock ran out
+    // was reported as a refusal to reclaim: `still_hosted: false, keys_left: 6, keys_before: 6`
+    // in a gate on 2026-09-04 -- the decision taken correctly, the bytes not yet gone. Reading
+    // that sample as a decision is the same mistake this wave has found six times over
+    // (`docs/plans/debt-c7.md` section 18).
+    //
+    // The negative window stays exactly as long as it was; only the positive one now waits for
+    // its event. A reclaim that never finishes still fails, at `RECLAIM_DEADLINE`, and now says
+    // which half is outstanding.
+    let beats_before = pd.store_beats().len();
+    let watch_until = Instant::now()
+        + if case.expected() == Expected::Reclaim {
+            RECLAIM_DEADLINE
+        } else {
+            NOTHING_HAPPENS_WINDOW
+        };
+    let mut reclaimed_inside_the_window = false;
+    while Instant::now() < watch_until {
+        if store.regions().get(1).is_none() && keys_held(store) == 0 {
+            // The reclamation has finished. Every other case runs the full window, because
+            // "nothing happened" is only a decision once the throttle has had time to fire.
+            reclaimed_inside_the_window = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // **The window's own precondition, asserted rather than asserted in prose.**
+    //
+    // Every "nothing happened" answer below rests on the throttle having had room to fire, and
+    // the comment above says so — but the budget is spent in *wall clock* while the throttle
+    // counts *rounds*, and the heartbeat interval is `MissedTickBehavior::Skip`, so a skipped
+    // tick is a round that never happens rather than one that happens late. Nothing connected
+    // the two, so a tighter tick, a larger `ORPHAN_PROBE_ROUNDS` or a slow enough box would
+    // shorten the window in rounds while it still looked like three seconds — and the failure
+    // would arrive as `still_hosted: true`, which this test reads as a *decision*.
+    //
+    // A store beat is emitted every `store_heartbeat / tick` rounds (20 ms / 5 ms = 4), so the
+    // beats PD received are a count of the rounds that really ran. Measured at 520-600 rounds
+    // against the 50 the throttle needs — quiet and under forty-eight spinning threads alike, so
+    // the margin is real and this assertion is not a flake waiting to happen. It exists to make
+    // the erosion loud if it ever starts.
+    if !reclaimed_inside_the_window {
+        let rounds = (pd.store_beats().len() - beats_before) * ROUNDS_PER_BEAT;
+        assert!(
+            rounds >= PROBE_ROUNDS * 2,
+            "case {:?}: the window ran {rounds} heartbeat rounds, and the orphan probe needs \
+             {PROBE_ROUNDS} before it asks PD anything — so \"nothing happened\" is this test \
+             running out of clock, not the store deciding",
+            case.name
+        );
+    }
+}
+
 /// Runs one case end to end and reports what the store did.
 ///
 /// The stores are real, the transport is real, and everything the case varies is the placement
@@ -501,46 +580,8 @@ async fn observe(case: &Case) -> Observed {
     let case = &rebase(case, hosted.epoch.conf_ver);
     place_and_verify(&pd, case, &hosted);
 
-    // Long enough for the throttle (50 leaderless rounds at a 5 ms tick) several times over, so a
-    // "nothing happened" answer is a decision and not a race.
-    let beats_before = pd.store_beats().len();
-    let watch_until = Instant::now() + Duration::from_secs(3);
-    let mut reclaimed_inside_the_window = false;
-    while Instant::now() < watch_until {
-        if second.store.regions().get(1).is_none() && keys_held(&second.store) == 0 {
-            // The reclamation has finished. Every other case runs the full window, because
-            // "nothing happened" is only a decision once the throttle has had time to fire.
-            reclaimed_inside_the_window = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    watch_for_the_verdict(case, &pd, &second.store).await;
 
-    // **The window's own precondition, asserted rather than asserted in prose.**
-    //
-    // Every "nothing happened" answer below rests on the throttle having had room to fire, and
-    // the comment above says so — but the budget is spent in *wall clock* while the throttle
-    // counts *rounds*, and the heartbeat interval is `MissedTickBehavior::Skip`, so a skipped
-    // tick is a round that never happens rather than one that happens late. Nothing connected
-    // the two, so a tighter tick, a larger `ORPHAN_PROBE_ROUNDS` or a slow enough box would
-    // shorten the window in rounds while it still looked like three seconds — and the failure
-    // would arrive as `still_hosted: true`, which this test reads as a *decision*.
-    //
-    // A store beat is emitted every `store_heartbeat / tick` rounds (20 ms / 5 ms = 4), so the
-    // beats PD received are a count of the rounds that really ran. Measured at 520-600 rounds
-    // against the 50 the throttle needs — quiet and under forty-eight spinning threads alike, so
-    // the margin is real and this assertion is not a flake waiting to happen. It exists to make
-    // the erosion loud if it ever starts.
-    if !reclaimed_inside_the_window {
-        let rounds = (pd.store_beats().len() - beats_before) * ROUNDS_PER_BEAT;
-        assert!(
-            rounds >= PROBE_ROUNDS * 2,
-            "case {:?}: the window ran {rounds} heartbeat rounds, and the orphan probe needs \
-             {PROBE_ROUNDS} before it asks PD anything — so \"nothing happened\" is this test \
-             running out of clock, not the store deciding",
-            case.name
-        );
-    }
     let observed = Observed {
         still_hosted: second.store.regions().get(1).is_some(),
         keys_left: keys_held(&second.store),
