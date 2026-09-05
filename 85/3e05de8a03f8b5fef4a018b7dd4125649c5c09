@@ -1,0 +1,51 @@
+crates/esker-sql/tests/captures/pg19_collation.txt
+  s_e5c0c6e78b5662::t_9262aa1b5c6533 1-64
+crates/esker-sql/tests/collation_parity.rs
+  s_e5c0c6e78b5662::t_c89bc4586c4384 1-58
+crates/esker-sql/tests/corpus/pg19_collation.txt
+  s_e5c0c6e78b5662::t_ed32b5bc2e27d2 1-88
+crates/esker-sql/src/catalog/mod.rs
+  s_e5c0c6e78b5662::t_8cdeb847640428 87-96,905,4116,4131,4199,4292,4374,4483-4487,4942,4957,4972,5650,5709
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_e5c0c6e78b5662::t_22d5ae3468eea8 79-86,247,291,399,403-447
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_f67b092b245aaf 951,1052,1054,1115,2001-2019,2236-2247
+crates/esker-sql/src/catalog/record.rs
+  s_e5c0c6e78b5662::t_44f6c8c85954e5 106,2074-2083,2102-2117,2674,2783
+crates/esker-sql/src/error.rs
+  s_e5c0c6e78b5662::t_c4eab0ae10e3b8 1836-1855,2528,2586-2589
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_8acc803985bfdd 129,283-285,1217,1278-1281,3660,3694,5344,5347-5356,5485,5503
+crates/esker-sql/src/exec/subquery.rs
+  s_e5c0c6e78b5662::t_571fa879885cc0 211,319
+crates/esker-sql/src/exec/values.rs
+  s_e5c0c6e78b5662::t_375ba9987a317c 43
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_a92b6425f089f4 199-211,216-279,381-382,384,2369,2437-2453,2462,2645-2647,2741,2812-2818,2837,3473-3496
+crates/esker-sql/src/parse/mod.rs
+  s_e5c0c6e78b5662::t_3831ac9f02af2e 295-297,431-437,580-584,629-631,830-866,2270
+crates/esker-sql/src/plan/ddl.rs
+  s_e5c0c6e78b5662::t_c1ae09b258d5bd 109-115,1255-1260
+crates/esker-sql/tests/collation.rs
+  s_e5c0c6e78b5662::t_23b87b830de9d6 1-219
+crates/esker-sql/tests/lowering.rs
+  s_e5c0c6e78b5662::t_4c0556614de2cf 71-75
+docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md
+  s_e5c0c6e78b5662::t_eb0ec8471f1ce5 1-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "853e05de8a03f8b5fef4a018b7dd4125649c5c09",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
