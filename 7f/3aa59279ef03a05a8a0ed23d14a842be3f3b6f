@@ -1,0 +1,25 @@
+crates/esker-cli/tests/pgwire_cluster.rs
+  s_2d916f5f540186::t_3b70e46886bda0 1-222
+crates/esker-sql/src/pgwire/server.rs
+  s_2d916f5f540186::t_3eeb679e23abe5 116,208,221-236,270-283,569,720
+crates/esker-sql/tests/psql_smoke.rs
+  s_2d916f5f540186::t_8e7e7c5a21e5a8 127,150,214,238
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_2d916f5f540186::t_697ccffe14133b 855,929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7f3aa59279ef03a05a8a0ed23d14a842be3f3b6f",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
