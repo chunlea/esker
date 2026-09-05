@@ -579,3 +579,105 @@ One reporting weakness found here and worth fixing: the header counts **cluster*
 fragment line counts the **table's**, so `regions | 2` beside `1 of 1 fragments` reads like a query
 answered from half a table. It was not — the second region held `dim`, which never asked for a
 columnar copy — but a reader should not have to run a second experiment to learn that.
+
+## 12. The multi-region timings, at last — 2026-09-05, second quiet window
+
+| field | value |
+|---|---|
+| commit | `0c0cbfe0`, containing main `138618e6` |
+| cluster | 4, 8 and 6 stores; 20,000 rows; 4 MiB split; `--groups-high 4000` |
+| load average | **1.7 – 2.3**, a machine held clear by the coordinator |
+| duration | 08:00 to 08:03 — three points in three minutes |
+
+The window survived its operator: the Claude Code process died in a version restart at ~08:02 and
+the container did not, so N=8 and N=6 ran unattended and their reports were read afterwards from
+the target volume. Nothing here is reconstructed; the files are verbatim.
+
+### 12a. A load survives a split — the control
+
+**N=4 at 4 MiB and 20,000 rows returned `rc=0` in 33 seconds.** That is the exact configuration
+§11a records failing three times, with `deadline passed after 14 attempts` and `gave up after 10
+attempts: peer is not the leader of region 34`. N=8 and N=6 loaded clean too.
+
+`esker-client`'s `Router::route` now waits out the driver's own "no region yet" instead of
+surfacing it, which is the fourth call site §11a named. **The write path was the gate and it is
+open.**
+
+This is also the first genuine multi-region columnar query in the project: the fact table spans
+**2 regions**, both carry a columnar learner, and every routed statement reports `2 of 2`
+fragments.
+
+### 12b. Fan-out by distinct stores
+
+| stores | fact-table regions | with a learner | distinct stores | which |
+|---|---|---|---|---|
+| 4 | 2 | 2 | **1** | store 4 |
+| 6 | 2 | 2 | **2** | stores 3, 4 |
+| 8 | 2 | 2 | **2** | stores 5, 6 |
+
+At four stores both learners land on the **same** store, and that is placement working as
+specified rather than a fault: a region has three voters, PD places a learner on a store holding no
+peer of that region, and on a four-store cluster that leaves exactly one candidate per region —
+which can be, and here was, the same store for both.
+
+From six stores on they separate, and the ceiling stops being the store count: **2 learners on 2
+stores is the limit the *region count* sets.** Adding a seventh and eighth store changes nothing,
+because there is no third region to place a third learner for.
+
+### 12c. The exchange verdict
+
+N=4 and N=6 are a controlled A/B that nobody designed: the same rows, the same 2 regions, the same
+`2 of 2` fragments, the same work. The only difference is how many machines the two fragments run
+on — **one at N=4, two at N=6.**
+
+| query | N=4 (1 store) | N=6 (2 stores) | N=8 (2 stores) | rows |
+|---|---|---|---|---|
+| control-scan | 0.004 s | 0.004 s | 0.004 s | 0.065–0.068 s |
+| group-low | 0.005 s | 0.005 s | 0.005 s | 0.066–0.069 s |
+| group-high | 0.010 s | 0.011 s | 0.010 s | 0.070–0.072 s |
+| join | 0.013 s | 0.012 s | 0.014 s | 3.576–3.710 s |
+
+**Spreading the same two fragments from one machine onto two changed nothing measurable.**
+
+That is the answer ADR 0022 milestone 5 asks for, at this scale, and it is a negative one. An
+exchange distributes a merge across the nodes holding the data; here the merge is not the
+bottleneck, so there is nothing for it to save. A fragment answers in 4–11 ms against a row engine
+taking 65–72 ms, and that saving comes from *not reading columns nobody projected* — it is banked
+before any shuffle exists.
+
+**What it does not say, stated so nobody reads it as more than it is.** Two regions is a small
+fan-out and 20,000 rows a small table. Nothing here speaks to a table in twenty regions, where the
+per-fragment work is large enough for parallelism to show and the single SQL node's merge could
+become the funnel. That measurement is *possible for the first time* — loads survive splits now —
+and it is the one that should actually decide milestone 5. It needs a table big enough to split
+many ways, so it needs a window measured in tens of minutes, most of it spent loading.
+
+### 12d. Speedups, with the caveat attached rather than filed separately
+
+| query | columnar | rows | ratio |
+|---|---|---|---|
+| control-scan | 0.004 s | 0.068 s | **17×** |
+| group-low | 0.005 s | 0.069 s | **14×** |
+| group-high | 0.010 s | 0.071 s | **7×** |
+| join | 0.013 s | 3.659 s | **281×** |
+
+The ratio falls as the answer grows — 17× for one row out, 7× for four thousand — because what the
+columns save is fixed while the result is not.
+
+The join figure is at `--groups-high 4000`, which keeps the semi-join's inner side at 500 keys,
+under the 4,096 a fragment carries. At the shipped default it is 12,500 keys and the same join
+correctly refuses. **It is a routable join, not a representative one**, and the number means
+nothing without that sentence next to it.
+
+### 12e. The field that was wrong in both spellings
+
+§11d records `columnar_is_possible: false` making the join arm assert the row engine. Flipping it
+to `true` only moved the trap: every run at the shipped `--groups-high` then *aborted*, because the
+inner side is 12,500 keys and the assertion had become a demand for the columnar path.
+
+A constant is right for one configuration and wrong for the other, so it was the wrong shape.
+`workload::join_inner_keys` now computes the inner side from the data the loader actually writes,
+and compares it against `esker_columnar::fragment::MAX_IN_VALUES` — imported rather than copied, so
+the bound and the expectation cannot drift. The test asserts both directions **and the boundary
+from both sides**, because a test that only ran the small case would have passed against the `true`
+that broke the default.

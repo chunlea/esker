@@ -478,6 +478,21 @@ fn lower_statement(
 ) -> Result<plan::Statement> {
     match statement {
         Statement::CreateTable(create) => {
+            // **`CREATE TABLE … AS <query>` is a different statement, not a clause.** It has no
+            // column declarations to lower — its shape is the query's — so it branches here
+            // rather than inside `lower_create_table`, which is entirely about declarations.
+            if let Some(query) = &create.query {
+                refuse_create_table_clauses(create)?;
+                refuse_if(create.like.is_some(), "CREATE TABLE ... AS with LIKE")?;
+                return Ok(plan::Statement::CreateTableAs(plan::CreateTableAs {
+                    name: relation_name(&create.name)?,
+                    columns: create.columns.iter().map(|c| ident(&c.name)).collect(),
+                    // Rendered back through the parser, for the reason the matview's is
+                    // (`lower_create_view`): text this node re-reads must be text it can parse.
+                    definition: query.to_string(),
+                    if_not_exists: create.if_not_exists,
+                }));
+            }
             Ok(plan::Statement::CreateTable(lower_create_table(create)?))
         }
         // The time machine's verbs are function calls, which is the only spelling PostgreSQL 19
@@ -2440,7 +2455,6 @@ fn refuse_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(
     refuse_if(create.transient, "CREATE TRANSIENT TABLE")?;
     refuse_if(create.volatile, "CREATE VOLATILE TABLE")?;
     refuse_if(create.iceberg, "CREATE ICEBERG TABLE")?;
-    refuse_if(create.query.is_some(), "CREATE TABLE ... AS")?;
     refuse_if(create.like.is_some(), "CREATE TABLE ... LIKE")?;
     refuse_if(create.clone.is_some(), "CREATE TABLE ... CLONE")?;
 

@@ -334,13 +334,23 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     );
 
     let regions = cluster.regions()?;
-    let (with_a_learner, on_stores) = topology::columnar_spread(&regions);
-    println!();
-    println!(
-        "| regions | {} | with a columnar learner | {with_a_learner} | on distinct stores | {on_stores} |",
-        regions.len()
+    let (with_a_learner, _) = topology::columnar_spread(&regions);
+    let stores = topology::learner_stores(&regions);
+    // The fact table's own span, which the cluster's region count is not. `EXPLAIN ANALYZE`
+    // rather than `EXPLAIN`: `asked` is what the dispatch actually sent, and a plan that was
+    // only planned carries no fragment line at all.
+    let spans = fragments_of(
+        &pg.query(&format!("EXPLAIN ANALYZE {}", probe_query.sql))?
+            .text(),
+    )
+    .0;
+    fan_out(
+        regions.len(),
+        spans,
+        with_a_learner,
+        &stores,
+        options.stores,
     );
-    println!();
 
     // One untimed pass so the first measured repeat is not paying for a cold page cache on either
     // engine. Discarded rather than reported: a warm-up in the medians would be a slow first run
@@ -443,6 +453,76 @@ fn the_three_questions(pg: &mut Pg, shape: Shape) {
 fn answer_on(pg: &mut Pg, engine: &str, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
     pg.run(&format!("SET esker.engine = '{engine}'"))?;
     pg.query(sql).map(|answer| answer.rows)
+}
+
+/// How much of the cluster a routed query can actually use.
+///
+/// # Two counts that were one line
+///
+/// This printed `regions | N | with a columnar learner | M | on distinct stores | K`, where `N`
+/// counted **every region in the cluster** while the fragment line beside it counted **the fact
+/// table's**. On 2026-09-05 that produced `regions | 2` next to `1 of 1 fragments`, which reads
+/// like a query answered from half a table — the one failure ADR 0022 says this feature must not
+/// have. It was not: the second region held the dimension table, which never asked for a columnar
+/// copy. Establishing that took a whole second experiment, which is the thing a report exists to
+/// make unnecessary (`docs/bench/mpp-baseline.md` §11e).
+///
+/// # The verdict line
+///
+/// The last row is what the MPP question turns on. An exchange distributes a merge across the
+/// nodes that hold the data, so **the count of distinct stores holding a columnar copy is the
+/// ceiling on what any exchange could ever parallelise** — not the region count, which is what a
+/// reader instinctively looks at. A five-region table whose learners sit on two stores is a
+/// two-way query however it is planned, and no shuffle protocol changes that.
+fn fan_out(
+    cluster_regions: usize,
+    spans: u64,
+    with_a_learner: usize,
+    stores: &[u64],
+    cluster_stores: u64,
+) {
+    let spans = if spans == 0 {
+        "— (the probe was not routed)".to_owned()
+    } else {
+        spans.to_string()
+    };
+    let named = if stores.is_empty() {
+        "none".to_owned()
+    } else {
+        stores
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!();
+    println!("| fan-out | count |");
+    println!("|---|---|");
+    println!("| regions in the cluster | {cluster_regions} |");
+    println!("| regions the fact table spans | {spans} |");
+    println!("| of those, carrying a columnar learner | {with_a_learner} |");
+    println!(
+        "| distinct stores those learners sit on | {} (store {named}) |",
+        stores.len()
+    );
+    println!("| stores in the cluster | {cluster_stores} |");
+    println!();
+    let ceiling = stores.len() as u64;
+    if ceiling >= cluster_stores {
+        println!(
+            "> A fragment can run on **{ceiling} of {cluster_stores} stores** — the learners are \
+             spread across the whole cluster, so an exchange would have the whole cluster to \
+             distribute a merge over."
+        );
+    } else {
+        println!(
+            "> A fragment can run on **{ceiling} of {cluster_stores} stores**, so that is the most \
+             parallelism any exchange could distribute — whatever the region count. The ceiling \
+             here is **placement, not the plan**: an exchange cannot spread work onto a store that \
+             holds no columnar copy."
+        );
+    }
+    println!();
 }
 
 /// `N of M` from a plan's fragment line, or `—` for a plan that asked none.
