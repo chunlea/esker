@@ -1,0 +1,16 @@
+crates/esker-cli/src/cluster.rs
+  h_44076b318daf9c 400-413
+docs/plans/debt-c7.md
+  h_44076b318daf9c 1101-1142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4322adb44d61bfa5d9c43d4a4860f4647486a6cb",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
