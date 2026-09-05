@@ -1,0 +1,19 @@
+crates/esker-sql/tests/store_locking.rs
+  s_2bed4ac2b1c944::t_8a93e4b6c27d74 410-512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a3767c5eb234832dab1d0c857bc4eb0c4e77f5d4",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
