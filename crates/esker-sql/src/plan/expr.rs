@@ -1348,7 +1348,9 @@ impl CatalogFunc {
             CatalogFunc::RangeLowerInf => "lower_inf",
             CatalogFunc::RangeUpperInf => "upper_inf",
             CatalogFunc::RangeBuild => "tsrange",
-            CatalogFunc::HstoreFetch => "->",
+            // One symbol, two fetches — an hstore's and a document's — told apart by the cast at
+            // lowering and by the operand's declared type at resolution, never by the values.
+            CatalogFunc::HstoreFetch | CatalogFunc::JsonFetch | CatalogFunc::JsonbFetch => "->",
             CatalogFunc::HstoreHasKey => "?",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
@@ -1376,7 +1378,6 @@ impl CatalogFunc {
             // the other reads a name and answers its oid.
             CatalogFunc::RegTypeName | CatalogFunc::UserRegType => "regtype",
             CatalogFunc::OidVector => "oidvector",
-            CatalogFunc::JsonFetch | CatalogFunc::JsonbFetch => "->",
             CatalogFunc::JsonFetchText => "->>",
             // What a `42883` would call it, and nothing reaches one: the pass either
             // resolves it or raises about the type by name.
@@ -1605,10 +1606,9 @@ impl CatalogFunc {
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
-            CatalogFunc::JsonbConcat => ColumnType::Jsonb,
             // `->` keeps the document type and `->>` is text — measured,
             // `pg_typeof(payload->'b')` is `jsonb` and `pg_typeof(payload->>'b')` is `text`.
-            CatalogFunc::JsonbFetch => ColumnType::Jsonb,
+            CatalogFunc::JsonbConcat | CatalogFunc::JsonbFetch => ColumnType::Jsonb,
             CatalogFunc::JsonFetch => ColumnType::Json,
             CatalogFunc::ToTsVector | CatalogFunc::TsStrip | CatalogFunc::SetWeight => {
                 ColumnType::TsVector
