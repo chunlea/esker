@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
-use esker_proto::{AdminReq, AdminResp, PeerRole, Region, Request, Response, TransportConfig};
+use esker_proto::{
+    AdminReq, AdminResp, PeerRole, Region, RegionStatus, Request, Response, TransportConfig,
+};
 
 use super::pg::Pg;
 use super::probe::Sample;
@@ -195,7 +197,21 @@ impl Cluster {
                 .arg("--store-id")
                 .arg(id.to_string())
                 .arg("--pd")
-                .arg(&pd_address)
+                .arg(&pd_address);
+            // **`--peer` as well as `--pd`, which is what the working reference does.**
+            // `crate::cluster` builds its peer list unconditionally and passes it whether or not
+            // there is a placement driver, and leaving it out is what wedged this benchmark's
+            // first cluster: PD issued `AddPeer` 32 ms after bootstrap, the leader could not
+            // reach a peer whose address nothing had told it, and the operator timed out at
+            // PD's 300 s ceiling and was reissued to the next store for ever. The region stayed
+            // at one voter, so `repair_for` held its only operator slot and `columnar_for` --
+            // which `esker_pd::pd::repair` reaches only after repair -- never got a turn.
+            for peer in 1..=layout.stores {
+                store
+                    .arg("--peer")
+                    .arg(format!("{peer}@{}", layout.store_address(peer)));
+            }
+            store
                 .arg("--region-split-size")
                 .arg(layout.region_split_size.to_string())
                 .arg("--region-heartbeat-ms")
@@ -237,19 +253,29 @@ impl Cluster {
 
     /// Spawns a child, keeping it for teardown, and answers with its pid.
     ///
-    /// **Each child gets its own stderr file**, under the data directory and named after it.
+    /// **Each child gets its own log file**, under the data directory and named after it, with
+    /// stdout and stderr both going into it so their order is preserved.
+    ///
     /// Inheriting this process's would be simpler and is what `esker cluster start` does — and
     /// `docs/bench/columnar-learner.md` records what that cost: nine processes writing one pipe,
     /// two of the failures interleaving mid-line, and no way to say which store said what. A
     /// benchmark whose diagnosis is "one of these ten processes panicked" has no diagnosis.
-    /// Their stdout is dropped; a SQL node's is noise this report should not be mixed with.
+    ///
+    /// **Both streams, because the interesting half is on stdout.** This first captured only
+    /// stderr, on the reasoning that a store which refuses to start says why there. It does — a
+    /// *panic* does. `tracing_subscriber::fmt()` writes to **stdout**, so every `INFO` and `WARN`
+    /// any of these processes emitted went to `/dev/null`, and a schema lease expiring mid-load
+    /// read as an empty file.
     fn spawn(&mut self, what: &str, mut process: Process) -> Result<u32, String> {
-        let log = self.log_dir.join(format!("{}.stderr", slug(what)));
-        let file = std::fs::File::create(&log)
+        let log = self.log_dir.join(format!("{}.log", slug(what)));
+        let out = std::fs::File::create(&log)
             .map_err(|error| format!("creating {}: {error}", log.display()))?;
+        let err = out
+            .try_clone()
+            .map_err(|error| format!("duplicating {}: {error}", log.display()))?;
         let child = process
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(file))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
             .spawn()
             .map_err(|error| format!("starting {what}: {error}"))?;
         let pid = child.id();
@@ -257,11 +283,11 @@ impl Cluster {
         Ok(pid)
     }
 
-    /// The tail of every child's stderr, for an error that needs to name which process failed.
+    /// The tail of every child's log, for an error that needs to name which process failed.
     pub(crate) fn logs(&self) -> String {
         let mut said = String::new();
         for (what, _) in &self.children {
-            let path = self.log_dir.join(format!("{}.stderr", slug(what)));
+            let path = self.log_dir.join(format!("{}.log", slug(what)));
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -322,22 +348,32 @@ impl Cluster {
         Ok((sql, stores))
     }
 
-    /// Every region every store hosts, asked of the stores themselves.
+    /// Every region, **as its own leader describes it**.
     ///
     /// One entry per region, with the peers and their roles, so the report can say how many
     /// fragments a query has and how many *distinct stores* answer them — which is not the same
     /// number and is the one a reader will assume.
+    ///
+    /// # Why the leader's view and not the first answer
+    ///
+    /// Taking whichever store answered first made this benchmark report *"every region reached 3
+    /// voters in 1.8ms"*, which is not a thing that can happen: a store started with `--peer` has
+    /// the whole peer list in hand before any conf change is committed, so it can describe a
+    /// membership that is only configured. The leader is the one peer that cannot say that — a
+    /// region's committed membership is exactly what its leader has applied. A region no store
+    /// claims to lead is left out rather than guessed at, so a check over this list is waiting for
+    /// a leader too.
     pub(crate) fn regions(&self) -> Result<Vec<Region>, String> {
-        let mut seen: Vec<Region> = Vec::new();
+        let mut led: Vec<Region> = Vec::new();
         for store in &self.stores {
             for status in regions_of(&store.address)? {
-                if !seen.iter().any(|region| region.id == status.id) {
-                    seen.push(status);
+                if status.is_leader && !led.iter().any(|region| region.id == status.region.id) {
+                    led.push(status.region);
                 }
             }
         }
-        seen.sort_by_key(|region| region.id);
-        Ok(seen)
+        led.sort_by_key(|region| region.id);
+        Ok(led)
     }
 
     /// Stops every child and waits for it, naming any that would not go.
@@ -422,8 +458,8 @@ fn ask_a_store(address: &str) -> Result<(), String> {
     regions_of(address).map(|_| ())
 }
 
-/// What `address` says it hosts.
-fn regions_of(address: &str) -> Result<Vec<Region>, String> {
+/// What `address` says it hosts, leader flag included.
+fn regions_of(address: &str) -> Result<Vec<RegionStatus>, String> {
     let socket: SocketAddr = address
         .parse()
         .map_err(|error| format!("`{address}` is not an address: {error}"))?;
@@ -437,9 +473,7 @@ fn regions_of(address: &str) -> Result<Vec<Region>, String> {
         Request::Admin(AdminReq::Regions),
         Instant::now() + PROBE_TIMEOUT,
     ) {
-        Ok(Response::Admin(AdminResp::Regions { regions })) => {
-            Ok(regions.into_iter().map(|status| status.region).collect())
-        }
+        Ok(Response::Admin(AdminResp::Regions { regions })) => Ok(regions),
         Ok(other) => Err(format!(
             "{address} answered a store's question with {other:?}"
         )),

@@ -252,6 +252,11 @@ Bench-mpp options:
                         32 MiB). This is what chooses the number of fragments: one
                         per region
       --repeats N       Timed repeats of the whole interleaved set (default 3)
+      --region-heartbeat-ms N, --heartbeat-tick-ms N
+                        How often a region's leader reports to PD, and the tick that
+                        interval is counted in (default 2000 / 250; the shipped
+                        defaults are 60000 / 1000). This decides how fast placement
+                        happens and how often PD acts on a region
       --batch N         Rows per INSERT during the load (default 500)
       --base-port P     The lowest port the cluster uses (default 24160); the driver
                         sits above the stores and the SQL node above that
@@ -1250,6 +1255,12 @@ fn parse_bench_mpp(arguments: &[String]) -> Result<Command, ParseError> {
                 options.region_split_size = positive("--region-split-size", &mut index)?;
             }
             "--repeats" => options.repeats = positive("--repeats", &mut index)?,
+            "--region-heartbeat-ms" => {
+                options.region_heartbeat_ms = positive("--region-heartbeat-ms", &mut index)?;
+            }
+            "--heartbeat-tick-ms" => {
+                options.heartbeat_tick_ms = positive("--heartbeat-tick-ms", &mut index)?;
+            }
             "--batch" => options.batch = positive("--batch", &mut index)?,
             "--seed" => {
                 let raw = take_value(arguments, &mut index, inline, "--seed")?;

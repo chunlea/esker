@@ -120,6 +120,42 @@ fn counter(pid: u32, file: &str, name: &str) -> Result<u64, String> {
         .map_err(|error| format!("{path}'s {name} is not a number: {error}"))
 }
 
+/// Bytes this network namespace's loopback interface has carried, from `/proc/net/dev`.
+///
+/// # Why not the process's own counter
+///
+/// `/proc/<pid>/io`'s `rchar` looks like the right number and is not: it counts bytes returned by
+/// **VFS** reads, and a socket read through `recv`/`recvmsg` — which is what `tokio` does — never
+/// increments it. This benchmark printed a column of `0 B` for a join moving megabytes until a
+/// `cat` of a 64 MiB file (a VFS read, duly counted) proved the counter worked and the socket
+/// traffic was simply invisible to it. There is no per-process socket byte counter in `/proc`.
+///
+/// What there is, is per **network namespace**, and inside this container that namespace holds
+/// exactly this cluster: the placement driver, the stores and the SQL node, talking over
+/// loopback. So the delta across one statement is *the traffic that statement caused between the
+/// processes of this cluster*, which is the quantity milestone 5 is about — with two honest
+/// caveats, both stated wherever the number is:
+///
+/// * it is the **whole cluster's** traffic, so region and store heartbeats are in it. They are
+///   small and periodic, and the control query measures them;
+/// * loopback counts each packet once received and once transmitted, so `rx` and `tx` agree and
+///   one of them, not their sum, is "bytes moved".
+pub(crate) fn loopback_bytes() -> Result<u64, String> {
+    let text = std::fs::read_to_string("/proc/net/dev")
+        .map_err(|error| format!("reading /proc/net/dev: {error}"))?;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("lo:"))
+        .ok_or("no loopback line in /proc/net/dev")?;
+    // `lo: <rx bytes> <rx packets> ...` — the first number after the colon.
+    line.split_whitespace()
+        .nth(1)
+        .ok_or("a loopback line with no byte count")?
+        .parse::<u64>()
+        .map_err(|error| format!("the loopback byte count is not a number: {error}"))
+}
+
 /// Whether this kernel publishes what [`Sample`] reads, named once so a run refuses early.
 pub(crate) fn is_available() -> bool {
     std::path::Path::new("/proc/self/io").exists()

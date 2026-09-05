@@ -72,6 +72,15 @@ pub(crate) struct BenchMppOptions {
     pub(crate) seed: u64,
     /// Keep the data directory after the run.
     pub(crate) keep: bool,
+    /// How often a region's leader reports it to PD, in milliseconds.
+    ///
+    /// A flag rather than a constant because it is the knob that decides how fast placement
+    /// happens *and* how often PD acts on a region, and those are not the same thing: the
+    /// reference (`esker cluster start`) leaves it at the shipped 60 s, and a benchmark that
+    /// shortens it is asking PD to make thirty times as many decisions per minute.
+    pub(crate) region_heartbeat_ms: u64,
+    /// The tick the heartbeat intervals are counted in, in milliseconds.
+    pub(crate) heartbeat_tick_ms: u64,
 }
 
 impl Default for BenchMppOptions {
@@ -87,6 +96,13 @@ impl Default for BenchMppOptions {
             base_port: 24_160,
             seed: 20_260_904,
             keep: false,
+            // **The shipped defaults, which is what the working reference uses.** A 2 s region
+            // heartbeat places a columnar learner in seconds instead of fifty, and it also asks
+            // PD to act on every region thirty times as often; runs at 2 s lost the SQL node's
+            // schema lease mid-load twice, and runs at 60 s completed. Setup is slower and the
+            // measured statements are unaffected, which is the right way round.
+            region_heartbeat_ms: 60_000,
+            heartbeat_tick_ms: 1_000,
         }
     }
 }
@@ -117,7 +133,8 @@ struct Run {
     wall: Duration,
     sql_cpu: Duration,
     store_cpu: Duration,
-    sql_read_bytes: u64,
+    loopback_bytes: u64,
+    sql_peak_rss: u64,
     rows: u64,
     engine: String,
     fragments_asked: u64,
@@ -126,6 +143,12 @@ struct Run {
 
 /// How long a columnar copy has to appear and catch up before the run gives up.
 const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the cluster has to reach its replica target before the run gives up.
+///
+/// Short on purpose. With the heartbeat intervals this benchmark sets, a healthy cluster is at
+/// three voters in seconds; a minute of it not happening is a wedge, not slowness.
+const REPLICA_TARGET_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Runs the whole measurement and prints the record.
 pub(crate) fn run(options: &BenchMppOptions) -> Result<(), String> {
@@ -154,12 +177,8 @@ pub(crate) fn run(options: &BenchMppOptions) -> Result<(), String> {
         stores: options.stores,
         base_port: options.base_port,
         region_split_size: options.region_split_size,
-        // Every placement operator costs one region heartbeat and this run waits for several, so
-        // the default 60 s would be four minutes of nothing. Two seconds is the same code and a
-        // different clock — the in-process gate already runs the same sequence at 20 ms
-        // (`docs/bench/columnar-learner.md`, "How long it takes, and why").
-        region_heartbeat_ms: 2_000,
-        heartbeat_tick_ms: 250,
+        region_heartbeat_ms: options.region_heartbeat_ms,
+        heartbeat_tick_ms: options.heartbeat_tick_ms,
     };
     let shape = Shape {
         rows: options.rows,
@@ -211,6 +230,17 @@ fn describe(options: &BenchMppOptions, layout: &Layout) {
 
 /// Everything between a started cluster and a printed report.
 fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result<(), String> {
+    // **Before a single row is loaded, prove the cluster reached its replica target.** A
+    // benchmark whose regions have one voter is not measuring this system, and the failure is
+    // silent: the SQL node answers, the load succeeds, and only the columnar wait -- five minutes
+    // later, after the load -- says anything is wrong. It was wrong here for exactly that reason,
+    // and this is the check that turns it into fifteen seconds and a topology.
+    let voters = wait_for_the_replica_target(cluster)?;
+    println!(
+        "every region reached {} voters in {voters:.1?}",
+        esker_pd::schedule::TARGET_REPLICAS
+    );
+
     let mut pg = Pg::connect(&cluster.sql_address, "esker", "esker")?;
 
     let started = Instant::now();
@@ -275,6 +305,48 @@ fn measure(cluster: &Cluster, options: &BenchMppOptions, shape: Shape) -> Result
     Ok(())
 }
 
+/// Waits until every region has the cluster's replica target in voters.
+///
+/// PD reaches a store only by answering its region heartbeat, and it gives a region one operator
+/// at a time, so a region short of voters holds the slot that a columnar learner would need
+/// (`esker_pd::pd::repair`). Waiting here rather than discovering it later is the difference
+/// between a named failure and a benchmark that quietly measured a single-replica cluster.
+fn wait_for_the_replica_target(cluster: &Cluster) -> Result<Duration, String> {
+    let started = Instant::now();
+    loop {
+        let regions = cluster.regions()?;
+        let short: Vec<String> = regions
+            .iter()
+            .filter_map(|region| {
+                let voters = region
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.role == esker_proto::PeerRole::Voter)
+                    .count();
+                (voters < esker_pd::schedule::TARGET_REPLICAS)
+                    .then(|| format!("region {} has {voters}", region.id))
+            })
+            .collect();
+        if short.is_empty() && !regions.is_empty() {
+            return Ok(started.elapsed());
+        }
+        if started.elapsed() >= REPLICA_TARGET_TIMEOUT {
+            return Err(format!(
+                "the cluster did not reach {} voters a region within {REPLICA_TARGET_TIMEOUT:?}: \
+                 {}. PD places a columnar learner only after a region has its voters, so nothing \
+                 would ever have been measured",
+                esker_pd::schedule::TARGET_REPLICAS,
+                if short.is_empty() {
+                    "no regions at all".to_owned()
+                } else {
+                    short.join(", ")
+                }
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Waits until the planner answers `query` from the columns, or says what it kept saying instead.
 fn wait_for_the_columns(pg: &mut Pg, query: &Query) -> Result<Duration, String> {
     let started = Instant::now();
@@ -324,7 +396,9 @@ fn one(pg: &mut Pg, cluster: &Cluster, query: &Query, arm: Arm) -> Result<Run, S
     let (asked, answered) = fragments_of(&plan);
 
     let (sql_before, stores_before) = cluster.sample()?;
+    let net_before = probe::loopback_bytes()?;
     let (wall, rows) = pg.timed(&query.sql)?;
+    let net_after = probe::loopback_bytes()?;
     let (sql_after, stores_after) = cluster.sample()?;
 
     let returned = u64::try_from(rows.rows.len()).unwrap_or(u64::MAX);
@@ -350,7 +424,8 @@ fn one(pg: &mut Pg, cluster: &Cluster, query: &Query, arm: Arm) -> Result<Run, S
         wall,
         sql_cpu: sql.cpu,
         store_cpu,
-        sql_read_bytes: sql.read_bytes,
+        loopback_bytes: net_after.saturating_sub(net_before),
+        sql_peak_rss: sql.peak_rss_bytes,
         rows: returned,
         engine,
         fragments_asked: asked,
@@ -434,9 +509,9 @@ fn report(runs: &[Run], queries: &[Query]) {
     println!();
     println!(
         "| query | engine | fragments | rows out | wall median | wall min–max | SQL-node CPU | \
-         stores' CPU | SQL-node CPU share | bytes into the SQL node |"
+         stores' CPU | SQL-node CPU share | cluster loopback bytes | SQL-node peak RSS |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
     for query in queries {
         for arm in [Arm::Columnar, Arm::Row] {
             let mine: Vec<&Run> = runs
@@ -447,10 +522,11 @@ fn report(runs: &[Run], queries: &[Query]) {
             let walls = medianed(mine.iter().map(|run| run.wall.as_secs_f64()));
             let sql_cpu = median(mine.iter().map(|run| run.sql_cpu.as_secs_f64()));
             let store_cpu = median(mine.iter().map(|run| run.store_cpu.as_secs_f64()));
-            let bytes = median(mine.iter().map(|run| as_float(run.sql_read_bytes)));
+            let bytes = median(mine.iter().map(|run| as_float(run.loopback_bytes)));
+            let peak = median(mine.iter().map(|run| as_float(run.sql_peak_rss)));
             println!(
                 "| {} | {} | {} of {} | {} | {:.3} s | {:.3}–{:.3} s | {sql_cpu:.2} s | \
-                 {store_cpu:.2} s | {:.0}% | {} |",
+                 {store_cpu:.2} s | {:.0}% | {} | {} |",
                 query.name,
                 engine_text(&first.engine),
                 first.fragments_answered,
@@ -461,12 +537,15 @@ fn report(runs: &[Run], queries: &[Query]) {
                 walls.2,
                 100.0 * sql_cpu / walls.1.max(1e-9),
                 bytes_text(bytes),
+                bytes_text(peak),
             );
         }
     }
     println!();
     println!(
-        "Read every share beside the seconds it came from. The SQL-node CPU share is that \
+        "Loopback bytes are this container's whole network namespace — the driver, the stores \
+         and the SQL node — so heartbeats are in them, and the control query is what says how \
+         much of that is background. Read every share beside the seconds it came from. The SQL-node CPU share is that \
          process's own `utime + stime` over the statement's wall time, so it is what one node did \
          while the query ran — the quantity an exchange moves elsewhere — and it is not a \
          speed-up, a ratio between engines, or a claim about any other workload."
@@ -511,10 +590,13 @@ fn as_float(count: u64) -> f64 {
 }
 
 fn bytes_text(bytes: f64) -> String {
+    // **The exact count in brackets, always.** A byte column that rounds to `0 B` reads the same
+    // whether the quantity is genuinely tiny or the instrument is broken, and this benchmark
+    // printed a column of `0 B` for a join moving megabytes before the raw number said which.
     if bytes >= 1024.0 * 1024.0 {
-        format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
+        format!("{:.1} MiB ({bytes:.0})", bytes / (1024.0 * 1024.0))
     } else if bytes >= 1024.0 {
-        format!("{:.1} KiB", bytes / 1024.0)
+        format!("{:.1} KiB ({bytes:.0})", bytes / 1024.0)
     } else {
         format!("{bytes:.0} B")
     }
