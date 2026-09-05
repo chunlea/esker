@@ -3524,6 +3524,19 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 table: Some(ident(table)),
                 name: ident(column),
             }),
+            // `s.t.c`. **The qualifier goes through `relation_name`**, which is the one place
+            // this crate decides what `schema.relation` means — `public` dropped because a public
+            // table's stored name is bare, `pg_temp` and `pg_catalog` kept as lookup prefixes.
+            // Comparing the text instead would refuse `public.t.c` over a bare `FROM t`, which a
+            // real server answers, and there would be a second parser of a grammar that already
+            // has one.
+            [schema, table, column] => Ok(plan::Expr::Column {
+                table: Some(relation_name(&ObjectName(vec![
+                    sqlparser::ast::ObjectNamePart::Identifier(schema.clone()),
+                    sqlparser::ast::ObjectNamePart::Identifier(table.clone()),
+                ]))?),
+                name: ident(column),
+            }),
             _ => Err(SqlError::unsupported(format!(
                 "the qualified column {}",
                 parts
@@ -5960,7 +5973,16 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
                 refuse_if(options.opt_rename.is_some(), "SELECT * RENAME")?;
                 match kind {
                     SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        Ok(plan::SelectItem::QualifiedWildcard(object_name(name)?))
+                        // `s.t.*` reaches the same rules a `FROM s.t` does, for the reason
+                        // above: one grammar, one parser. `object_name` refuses qualification by
+                        // design and is right to — it names extensions, schemas and databases,
+                        // which have no schema of their own.
+                        Ok(plan::SelectItem::QualifiedWildcard(
+                            match name.0.as_slice() {
+                                [_] => object_name(name)?,
+                                _ => relation_name(name)?,
+                            },
+                        ))
                     }
                     // `STRUCT('x').*` and friends: an expression, not a table.
                     SelectItemQualifiedWildcardKind::Expr(_) => {
