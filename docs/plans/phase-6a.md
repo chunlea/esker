@@ -444,13 +444,19 @@ merely refused well.
 Thirty-seven features, ninety-five statements. G13 (`TABLE t`) and `ABORT` from G22 are closed:
 both are documented synonyms and are now rewritten rather than refused.
 
-> **Those two numbers are stale and the table below does not agree with them either.** Counted on
-> 2026-09-04: `KNOWN_GAPS` in `tests/syntax_corpus.rs` holds **85 statements across 36 features**,
-> the table below has **37 rows summing to 90**, and this sentence says 37 and 95. Closures have
-> been landing in the code and in individual rows without the totals being re-derived. Nothing
+> **Those two numbers are stale, and the table below does not agree with them either.** Counted on
+> 2026-09-04: `KNOWN_GAPS` in `tests/syntax_corpus.rs` holds **84 statements across 36 features**,
+> the table below has **37 rows summing to 89**, and this sentence says 37 and 95. Closures have
+> been landing in the code and in individual rows without the totals being re-derived, and nothing
 > reads the totals — `the_register_still_describes_what_the_parser_does` compares the *statements*,
-> which is why the drift survived — so this is a note rather than a correction: re-deriving all
-> three needs the row-by-row audit that would say which five the table has and the code does not.
+> which is why the drift survived.
+>
+> **The durable number is the difference, not either total.** The table has counted five statements
+> the code does not for as long as both have been moving: it was 90 against 85 before the two
+> closures that landed on 2026-09-04, and 89 against 84 after them. Whatever those five are, they
+> are not what has been closing. Re-deriving all three needs the row-by-row audit that would name
+> them, which is a unit of its own; this is a note so that the next reader does not trust the
+> sentence above it.
 
 G32 to G39 came from one sweep of the `ALTER TABLE` grammar while `ADD COLUMN` was being built
 (§11, the ALTER continuation). The corpus had fifteen `ALTER TABLE` lines and the grammar has some
