@@ -2001,16 +2001,14 @@ impl Executor {
         txn: &dyn Txn,
         select: &crate::plan::Select,
     ) -> Result<query::Planned> {
-        // The set's own clauses are not the first arm's; they are applied over the result, and
-        // until they are, a statement that writes one is refused by name rather than ignored.
-        if !select.order_by.is_empty() {
-            return Err(SqlError::unsupported("ORDER BY over a set operation"));
-        }
-        if select.limit.is_some() || select.offset.is_some() {
-            return Err(SqlError::unsupported("LIMIT over a set operation"));
-        }
+        // **The set's clauses come off the first arm**, or they are applied twice: once by the
+        // arm's own plan and again over the result. The first arm is the set's select with the
+        // arms and the set's clauses taken away.
         let first = crate::plan::Select {
             set_arms: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
             ..select.clone()
         };
         let mut planned = vec![(None, self.plan_select(txn, &first)?)];
@@ -2018,7 +2016,7 @@ impl Executor {
             set_arm_supported(arm)?;
             planned.push((Some((arm.op, arm.all)), self.plan_select(txn, &arm.select)?));
         }
-        query::append(planned)
+        query::append(select, planned)
     }
 
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {

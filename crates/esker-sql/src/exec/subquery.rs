@@ -400,14 +400,12 @@ fn plan_set_of(
     tables: &dyn Tables,
     outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<crate::exec::query::Planned> {
-    if !select.order_by.is_empty() {
-        return Err(SqlError::unsupported("ORDER BY over a set operation"));
-    }
-    if select.limit.is_some() || select.offset.is_some() {
-        return Err(SqlError::unsupported("LIMIT over a set operation"));
-    }
+    // The set's clauses are the set's; see the executor's twin for why taking them off matters.
     let first = Select {
         set_arms: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
         ..select.clone()
     };
     let mut planned = vec![(None, plan_select_of(&first, tenant, tables, outer)?)];
@@ -418,7 +416,7 @@ fn plan_set_of(
             plan_select_of(&arm.select, tenant, tables, outer)?,
         ));
     }
-    crate::exec::query::append(planned)
+    crate::exec::query::append(select, planned)
 }
 
 fn plan_select_of(

@@ -644,7 +644,10 @@ pub(super) fn matching_rows_as(
 /// * and an **unknown literal** is neither: it takes the other arm's type and then fails to parse
 ///   as it, which is why `SELECT 1 UNION ALL SELECT 'abc'` is `22P02 invalid input syntax for type
 ///   integer` — decided in the lowering, where a literal still is one.
-pub(super) fn append(arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>) -> Result<Planned> {
+pub(super) fn append(
+    select: &Select,
+    arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>,
+) -> Result<Planned> {
     let ops: Vec<Option<(crate::plan::SetOp, bool)>> = arms.iter().map(|(op, _)| *op).collect();
     let mut arms = arms.into_iter().map(|(_, planned)| planned);
     let first = arms
@@ -682,7 +685,27 @@ pub(super) fn append(arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>) -
         .zip(arm_types)
         .map(|(node, types)| coerce_arm(node, &types, &columns))
         .collect();
-    let node = combine(nodes, &ops);
+    let mut node = combine(nodes, &ops);
+    // **The set's own clauses, over the set's own row.** An `ORDER BY` after the last arm sorts
+    // the whole result on a real server, and what it may name is measured: the output name or the
+    // ordinal, never the underlying column — `SELECT i AS c … UNION ALL … ORDER BY i` is
+    // `column "i" does not exist` there, because by then the column is called `c`.
+    let keys = set_order_keys(select, &columns)?;
+    if !keys.is_empty() {
+        node = Node::Sort {
+            input: Box::new(node),
+            keys,
+        };
+    }
+    let offset = count(select.offset.as_ref(), "OFFSET")?.unwrap_or(0);
+    let limit = count(select.limit.as_ref(), "LIMIT")?;
+    if select.limit.is_some() || select.offset.is_some() {
+        node = Node::Limit {
+            input: Box::new(node),
+            offset,
+            limit,
+        };
+    }
     // **No routing, no locks, no junk.** A set operation is not routed to a columnar replica —
     // the arms may name different relations — and a locking clause over one is a syntax error on a
     // real server, so neither field can carry anything a caller would then have to undo.
@@ -696,6 +719,55 @@ pub(super) fn append(arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>) -
         junk: 0,
         limit: None,
     })
+}
+
+/// An `ORDER BY` written after the last arm, resolved against the set's output columns.
+///
+/// **Two spellings and no third**, measured: the ordinal, and the name the *first arm* gave the
+/// column. Anything else is `column "…" does not exist`, which is what a real server answers for
+/// the underlying column of a renamed one — by the time the set exists, that name is gone.
+///
+/// A separate resolver from `order_keys` rather than a reuse of it, because the two resolve
+/// against different things: that one has a scope with the tables in it, and a set operation has
+/// no table — its row is the arms' agreement and nothing else.
+fn set_order_keys(select: &Select, columns: &[OutputColumn]) -> Result<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for item in &select.order_by {
+        let at = match &item.expr {
+            Expr::Literal(Literal::Integer(position)) => usize::try_from(*position)
+                .ok()
+                .filter(|at| (1..=columns.len()).contains(at))
+                .map(|at| at - 1)
+                .ok_or_else(|| {
+                    SqlError::InvalidColumnReference(format!(
+                        "ORDER BY position {position} is not in select list"
+                    ))
+                })?,
+            Expr::Column { name, .. } => columns
+                .iter()
+                .position(|column| column.name == *name)
+                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?,
+            // An expression over a set's row is legal on a real server and needs the row's own
+            // scope to resolve; refused by name rather than answered against the first arm's,
+            // which would be a different column of the same spelling.
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "ORDER BY {other:?} over a set operation"
+                )));
+            }
+        };
+        keys.push(SortKey {
+            expr: Expr::Ordinal {
+                at,
+                ty: columns[at].ty,
+                typmod: columns[at].typmod,
+            },
+            descending: item.descending,
+            // The same default as everywhere else: NULLs last ascending, first descending.
+            nulls_first: item.nulls_first.unwrap_or(item.descending),
+        });
+    }
+    Ok(keys)
 }
 
 /// The arms folded into one node, left to right, which is the associativity SQL has.

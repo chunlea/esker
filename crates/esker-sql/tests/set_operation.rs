@@ -145,15 +145,48 @@ fn union_without_all_deduplicates() {
     );
 }
 
+/// **`ORDER BY` after the last arm sorts the whole set**, and may name two things and no third.
+#[test]
+fn the_set_takes_an_order_by_a_limit_and_an_offset() {
+    let mut node = parity::Node::new(FIXTURE);
+
+    // The ordinal.
+    assert_eq!(
+        node.rows("SELECT 1 UNION ALL SELECT 2 ORDER BY 1 DESC"),
+        vec![vec!["2"], vec!["1"]]
+    );
+    // The **output** name, which is the first arm's.
+    assert_eq!(
+        node.rows("SELECT i AS c FROM so UNION ALL SELECT 9 ORDER BY c DESC"),
+        vec![vec!["9"], vec!["2"], vec!["1"]]
+    );
+    // `LIMIT` and `OFFSET` over the result, not over an arm.
+    assert_eq!(
+        node.rows("SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1"),
+        vec![vec!["2"]]
+    );
+    // And the two together, which is the shape a paginated set has.
+    assert_eq!(
+        node.rows("SELECT i FROM so UNION ALL SELECT 9 ORDER BY 1 DESC LIMIT 2"),
+        vec![vec!["9"], vec!["2"]]
+    );
+}
+
+/// **The underlying column is not visible**: by the time the set exists it is called what the
+/// first arm called it.
+#[test]
+fn an_order_by_cannot_name_the_column_the_first_arm_renamed() {
+    let mut node = parity::Node::new(FIXTURE);
+    let error = node
+        .run("SELECT i AS c FROM so UNION ALL SELECT 9 ORDER BY i")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
+}
+
 #[test]
 fn what_this_commit_does_not_do_is_named() {
     let mut node = parity::Node::new(FIXTURE);
-    for statement in [
-        "SELECT 1 INTERSECT SELECT 2",
-        "SELECT 1 EXCEPT SELECT 2",
-        "SELECT 1 UNION ALL SELECT 2 ORDER BY 1",
-        "SELECT 1 UNION ALL SELECT 2 LIMIT 1",
-    ] {
+    for statement in ["SELECT 1 INTERSECT SELECT 2", "SELECT 1 EXCEPT SELECT 2"] {
         let error = node.run(statement).unwrap_err();
         assert_eq!(
             error.sqlstate(),
