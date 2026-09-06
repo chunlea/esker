@@ -1,0 +1,37 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_609bbbdbf3c419::t_780f7768613a13 226-240,285,312,358,421,485-489,790-804,958,981,1141,1692-1736
+crates/esker-sql/src/exec/cursor.rs
+  s_609bbbdbf3c419::t_bc4e1adc03ea30 59-63,72,319,378
+crates/esker-sql/src/exec/mod.rs
+  s_609bbbdbf3c419::t_2e2f7855b84a45 94-101,714,1263,1267,3674-3677
+crates/esker-sql/src/pgwire/server.rs
+  s_609bbbdbf3c419::t_48c45960b26bb4 786-788
+crates/esker-sql/src/pgwire/session.rs
+  s_609bbbdbf3c419::t_011c8164442fe7 138-151,256-268,324,340-342,348-350,468,668-672,729-744,765-767,861-935,1016-1021,1047-1050
+crates/esker-sql/src/session.rs
+  s_609bbbdbf3c419::t_2b7ae00d9064e0 63-94
+crates/esker-sql/tests/discard_all.rs
+  s_609bbbdbf3c419::t_ddc288ed95689a 31-39,45-48,113-119
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_609bbbdbf3c419::t_4de3cb52790a0b 43,262-269,296,389-391
+crates/esker-sql/tests/pg_prepared_statements.rs
+  s_609bbbdbf3c419::t_e704720bf3ff62 1-268
+crates/esker-sql/tests/transaction_timeouts.rs
+  s_609bbbdbf3c419::t_d2f1111c108661 752-754
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "efbb1204eac610d5d3b9a04d622d44b810db5040",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
