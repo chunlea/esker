@@ -332,3 +332,104 @@ fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
     a.run("ROLLBACK").unwrap();
     let _ = victim.join();
 }
+
+/// **The cancel lands, and then the lock frees — and the statement must still die.**
+///
+/// This is the sequence the Rails test actually produces, and the one neither test above reaches.
+/// r1 tapped both servers on the same seed (`triage/querycanceled-divergence.md`):
+///
+/// ```text
+/// [869] SELECT … FOR UPDATE      B blocks behind A
+/// [870] SELECT pid FROM pg_stat_activity WHERE query LIKE '% FOR UPDATE'
+/// [871] SELECT pg_cancel_backend(50)
+/// [872] COMMIT                   A releases the row
+///  node [869] -> [513.3 ms] 1 row(s)          pg19 [869] -> [513.2 ms] ERROR 57014
+/// ```
+///
+/// Identical SQL, identical binds, **513.3 ms against 513.2 ms** — so the node was not failing to
+/// receive the cancel and was not ignoring it: both servers stop waiting at the same instant,
+/// which is A's `COMMIT`. What differed is what happens next. The wait loop asked `cancel::check`
+/// only in the arm it takes **while the lock is still held**; when the lock came free it took the
+/// other arm, restarted the statement, and the restart ran to completion with the flag still set.
+///
+/// So the outcome depended on which of two things B saw first when it woke, two milliseconds
+/// apart — and the cancel and the commit arrive microseconds apart, so it lost nearly every time.
+/// The sweeps read 12, 11 and 10 FAIL of 12 across three builds, which is what a race that is
+/// almost always lost looks like from the outside.
+#[test]
+fn a_cancel_survives_the_lock_coming_free_underneath_it() {
+    let pair = Pair::new(&[
+        "CREATE TABLE samples (id bigint primary key, value bigint)",
+        "INSERT INTO samples VALUES (1, 1)",
+    ]);
+    let (b_says, hears_b) = channel();
+    let (b_pid_says, hears_b_pid) = channel();
+    let (a_says, hears_a) = channel();
+
+    let sessions = pair.sessions();
+    let victim = std::thread::spawn(move || {
+        let hears_a = hears_a;
+        let mut node = sessions.session();
+        let mut session = Session::new();
+        simple(&mut session, &mut node, "BEGIN");
+        // Far past anything this test does, so a missed cancel is a `55P03` with a name rather
+        // than a hang the runner has to kill.
+        simple(&mut session, &mut node, "SET lock_timeout = '20s'");
+        b_pid_says
+            .send(node.rows("SELECT pg_backend_pid()")[0][0].clone())
+            .unwrap();
+        edge(&hears_a, "A holds the row");
+        reached(&b_says, "B is about to block");
+        let out = extended(
+            &mut session,
+            &mut node,
+            "SELECT value FROM samples WHERE id = $1 FOR UPDATE",
+            vec![Some(b"1".to_vec())],
+        );
+        sqlstate(&out)
+    });
+
+    let mut a = pair.session();
+    let mut a_session = Session::new();
+    simple(&mut a_session, &mut a, "BEGIN");
+    extended(
+        &mut a_session,
+        &mut a,
+        "SELECT value FROM samples WHERE id = $1 FOR UPDATE",
+        vec![Some(b"1".to_vec())],
+    );
+    // **B's own pid, over a channel, rather than the Rails hunt.** The hunt is what the test above
+    // asserts; here it would only be a second way for this test to be about something else.
+    let waiter = hears_b_pid.recv().expect("B says who it is");
+    reached(&a_says, "A holds the row");
+    edge(&hears_b, "B is about to block");
+    // B is *about* to block; wait until it actually is, by asking the view that can see it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut watcher = pair.session();
+    while Instant::now() < deadline {
+        // **Not filtered by pid**: `pg_locks.pid` is `std::process::id()` for every row here,
+        // the same number for every session, so it cannot name one — unlike
+        // `pg_stat_activity.pid`, which is the session's. (A real server's are the same number;
+        // this node's are not, which is its own divergence and not this test's subject.) One
+        // waiter exists in this test, so an ungranted row is that one.
+        let waiting = watcher.rows("SELECT count(*) FROM pg_locks WHERE granted = false");
+        if waiting[0][0] != "0" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The two statements the Rails test issues, in its order and with nothing between them: the
+    // cancel, and then the commit that frees the row the victim is waiting for.
+    assert_eq!(
+        a.rows(&format!("SELECT pg_cancel_backend({waiter})")),
+        [["t".to_owned()]]
+    );
+    simple(&mut a_session, &mut a, "COMMIT");
+
+    assert_eq!(
+        victim.join().unwrap().as_deref(),
+        Some("57014"),
+        "the cancelled statement must not go on to answer because the lock came free"
+    );
+}

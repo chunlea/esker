@@ -31,6 +31,7 @@ pub(crate) mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
+mod declared_cursor;
 mod deferred;
 mod dml;
 pub(crate) mod explain;
@@ -91,6 +92,21 @@ pub struct Executor {
     /// view would need a second code path for the ones it cannot — which is the thing this change
     /// exists to remove.
     identity: crate::session::Backend,
+    /// The cursors this transaction has declared, by name.
+    ///
+    /// **Emptied by `commit` and by `rollback`**, which is the whole of a cursor's lifetime here:
+    /// one without `WITH HOLD` does not outlive its transaction, and `WITH HOLD` is refused by
+    /// name. Both ends are the executor's, so there is one place that forgets them rather than a
+    /// rule every caller follows (`crate::exec::declared_cursor`).
+    cursors: std::collections::BTreeMap<String, declared_cursor::Open>,
+    /// What this session has prepared, for `pg_prepared_statements` to report.
+    ///
+    /// **Handed in rather than kept**: the statements live in the protocol's session
+    /// ([`crate::pgwire::session::Session`]), which rebuilds this list immediately before every
+    /// statement runs ([`crate::pgwire::session::Execute::remember_prepared`]). An executor with
+    /// no protocol above it — a `Pair`, a corpus replay — has an empty one, and a session that
+    /// has prepared nothing has an empty one too, which is the same answer for the same reason.
+    prepared: Vec<crate::session::PreparedStatement>,
     /// Blocks of sequences this transaction dropped, to forget **if** it commits.
     forget_on_commit: Vec<u64>,
     /// The role this session authenticated as, which `serving_user` sets.
@@ -306,6 +322,21 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     let began = std::time::Instant::now();
     let mut waited = 0_u64;
     loop {
+        // **At the top, not in the arm that waits.** A cancelled statement must stop whatever it
+        // finds here, and what it finds is the whole difference: the check used to live in the
+        // `Held` arm below, so it fired only while the lock was *still* held. When the holder
+        // committed, this loop took the `Taken` arm instead, restarted the statement, and the
+        // restart ran to completion with the flag still set — the statement answered rows to a
+        // client that had cancelled it.
+        //
+        // r1 tapped both servers on one seed for `transaction_test.rb`'s
+        // `raises QueryCanceled when canceling statement due to user request`: identical SQL,
+        // identical binds, **513.3 ms here against 513.2 ms on PostgreSQL 19**, one row against
+        // `57014`. The wait ended at the same instant on both — the holder's `COMMIT` — so the
+        // cancel was never missed; only the raise was. The cancel and that commit arrive
+        // microseconds apart and this loop sleeps two milliseconds, which is why the sweeps read
+        // 12, 11 and 10 failures of 12 rather than a clean split.
+        cancel::check()?;
         match txn.lock(key)? {
             // **A lock taken at once is not proof that nothing moved.** The writer in front may
             // have committed and released between this statement's read and this lock, in which
@@ -358,8 +389,9 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 // its own deadline, so a `pg_cancel_backend` from another session set a flag
                 // nothing on this path read — the function answered `true` and the waiter waited
                 // on. It is the shape an application actually cancels: a statement stuck behind
-                // somebody else's lock, which is `transaction_test.rb`'s last failure.
-                cancel::check()?;
+                // somebody else's lock, which is `transaction_test.rb`'s last failure. The check
+                // that does it is now at the top of the loop, where it also catches the waiter
+                // whose lock came free.
                 if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
@@ -703,6 +735,8 @@ impl Executor {
             locks,
             session,
             identity,
+            cursors: std::collections::BTreeMap::new(),
+            prepared: Vec::new(),
             forget_on_commit: Vec::new(),
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
@@ -884,6 +918,12 @@ impl Executor {
                         // back to what it was before this statement, which is what a re-read needs
                         // and what a savepoint's value-restore would have shadowed.
                         Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                            // **A cancelled statement is not re-run.** The restart is this node's
+                            // own machinery — nobody asked for it — so retrying one that has been
+                            // told to stop is a cancel that never lands, however many times the
+                            // flag is set. The wait loop's own check catches this too when the
+                            // restart reaches a lock; this catches the restart that does not.
+                            cancel::check()?;
                         }
                         other => return other,
                     }
@@ -1041,6 +1081,7 @@ impl Executor {
             Statement::Delete(delete) => dml::delete(self, txn, delete),
             Statement::Explain(explain) => self.explain(txn, explain),
             Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
+            Statement::Cursor(cursor) => declared_cursor::run(self, txn, cursor),
             // Handled before a transaction is opened; `execute` never routes one here.
             Statement::Session(_) => Err(SqlError::Internal(
                 "a session statement reached the transaction path".into(),
@@ -1068,6 +1109,24 @@ impl Executor {
                 self.set_read_as_of(value.as_deref(), *local)?;
                 Ok(Outcome::done("SET"))
             }
+            // **Read off the executor, not out of the parameter map**: `SET SESSION
+            // AUTHORIZATION` writes the field, and a session that has not used it is acting as
+            // the role it connected as. Measured on PostgreSQL 19: the column is
+            // `session_authorization` and the value is the role, for both spellings.
+            SessionStatement::ShowSessionAuthorization => Ok(Outcome::Rows {
+                fields: vec![FieldDescription::computed(
+                    "session_authorization",
+                    ColumnType::Text,
+                )],
+                rows: vec![vec![Some(
+                    self.authorization
+                        .as_deref()
+                        .unwrap_or(&self.user)
+                        .to_owned()
+                        .into_bytes(),
+                )]],
+                tag: "SHOW".to_owned(),
+            }),
             SessionStatement::ShowReadAsOf => Ok(Outcome::Rows {
                 fields: vec![FieldDescription::computed(
                     time_machine::READ_AS_OF,
@@ -1262,10 +1321,11 @@ impl Executor {
     ///
     /// The path is resolved by the caller because resolving it reads the catalog and needs a
     /// transaction; everything else here is session state and is read from the parameters.
-    fn settings<'a>(&self, search_path: &'a [String]) -> cursor::Settings<'a> {
+    fn settings<'a>(&'a self, search_path: &'a [String]) -> cursor::Settings<'a> {
         cursor::Settings {
             search_path,
             rendering: self.rendering(),
+            prepared: &self.prepared,
         }
     }
 
@@ -1501,6 +1561,11 @@ impl Executor {
     /// block takes. An imported snapshot is local by the same rule: it was imported into *this*
     /// transaction.
     fn end_of_block(&mut self) {
+        // **Both ends of a cursor's life are here**, which is the whole reason the cursors live on
+        // the executor: `commit` and `rollback` are the only two callers of this, so a cursor
+        // cannot survive its transaction by anybody forgetting a line. `WITH HOLD` — the one form
+        // that would survive — is refused by name at lowering.
+        self.cursors.clear();
         self.open_used = false;
         self.block_parameters = None;
         self.block_read_only = false;
@@ -3546,6 +3611,7 @@ impl ExplainSubject {
 
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
+        Statement::Cursor(cursor) => vec![cursor.tag().to_owned()],
         Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
         Statement::Truncate(truncate) => vec![format!("Truncate on {}", truncate.names.join(", "))],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
@@ -3689,6 +3755,10 @@ fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
 }
 
 impl Execute for Executor {
+    fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
+        self.prepared = statements;
+    }
+
     fn terminated(&self) -> bool {
         self.identity
             .terminate
@@ -3738,6 +3808,14 @@ impl Execute for Executor {
         let statement = parsed.lower()?;
         if let Statement::Session(session) = &statement {
             return self.session_statement(session);
+        }
+        // The mirror of the check below, and it has the same trap for the same reason: a cursor
+        // is transaction-scoped, so a `DECLARE` outside a block could never be read back, and
+        // `self.open` is the only place that still knows whether there is one.
+        if self.open.is_none()
+            && let Some(named) = statement.requires_a_transaction_block()
+        {
+            return Err(SqlError::OutsideTransactionBlock(named));
         }
         // PostgreSQL's `25001`, captured: a concurrent change is *many* transactions, so it cannot
         // be part of one, and a block that could roll it back would be a block that could roll back

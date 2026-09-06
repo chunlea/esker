@@ -215,6 +215,15 @@ fn walk(
                 }
             }
         }
+        // **A `DECLARE`'s query is a query.** A `$1` inside one is typed and bound exactly as it
+        // would be in the bare `SELECT`, which is what delegating here buys — and the alternative,
+        // an empty arm, is a parameter that reaches execution unbound.
+        Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
+            walk_select(query, tables, seen);
+        }
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
+        Statement::Cursor(_) => {}
+
         Statement::Select(select) => walk_select(select, tables, seen),
         Statement::Update(update) => {
             if let Some(table) = tables.first() {
@@ -854,6 +863,12 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
                 }
             }
         }
+        Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
+            walk_select_mut(query, visit);
+        }
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
+        Statement::Cursor(_) => {}
+
         Statement::Select(select) => walk_select_mut(select, visit),
         Statement::Update(update) => {
             for (_, value) in &mut update.assignments {
@@ -1073,6 +1088,13 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
     match statement {
         Statement::Insert(insert) => vec![insert.table.as_str()],
         // A join's two tables, outer first, which is the order their columns appear in a row.
+        Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
+            let mut names = Vec::new();
+            collect_table_names(query, &mut names);
+            names
+        }
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and no table.
+        Statement::Cursor(_) => Vec::new(),
         Statement::Select(select) => {
             let mut names = Vec::new();
             collect_table_names(select, &mut names);
@@ -1163,6 +1185,22 @@ pub(crate) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool
     found
 }
 
+/// How many parameters a statement declares — the **highest** `$n` in it, not how many distinct
+/// ones appear.
+///
+/// `SELECT $2` declares two on a real server, and `EXECUTE` supplying one is
+/// `wrong number of parameters`. Counting the distinct placeholders would make that statement take
+/// one argument and put it in the wrong position.
+pub(crate) fn parameter_count(statement: &Statement) -> usize {
+    let mut highest = 0;
+    for_each_expr(statement, &mut |expr| {
+        if let Expr::Parameter(number) = expr {
+            highest = highest.max(*number as usize);
+        }
+    });
+    highest
+}
+
 pub(super) fn has_parameters(statement: &Statement) -> bool {
     let mut found = false;
     for_each_expr(statement, &mut |expr| {
@@ -1189,6 +1227,12 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
                 }
             }
         }
+        Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
+            for_each_in_select(query, &mut each);
+        }
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
+        Statement::Cursor(_) => {}
+
         Statement::Select(select) => for_each_in_select(select, &mut each),
         Statement::Update(update) => {
             for (_, value) in &update.assignments {

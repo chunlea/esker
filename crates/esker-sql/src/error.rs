@@ -199,6 +199,19 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SetValueSyntax(String),
 
+    /// A clause written on both sides of a parenthesised query body.
+    ///
+    /// `(SELECT … ORDER BY id) ORDER BY id DESC` is `42601 multiple ORDER BY clauses not allowed`
+    /// on PostgreSQL 19 — measured, and so are the `OFFSET`, `LIMIT` and `WITH` sentences.
+    /// Parentheses around a query are grouping and the clauses merge (`gram.y`'s
+    /// `insertSelectOptions`); these four are what happens when the merge collides.
+    ///
+    /// **Its own variant rather than [`SqlError::Syntax`]**, for the reason
+    /// [`SqlError::SetValueSyntax`] is one: `Syntax` writes `syntax error: …` and a real server
+    /// writes no prefix on these. The words are the whole message.
+    #[error("multiple {0} clauses not allowed")]
+    DoubledClause(&'static str),
+
     /// The statement is not valid SQL. Contract C1 says this must never be the answer to
     /// something PostgreSQL 19 accepts; when it is, the statement belongs in the gap register.
     #[error("syntax error: {message}")]
@@ -2593,6 +2606,57 @@ pub enum SqlError {
     #[error("prepared statement \"{0}\" does not exist")]
     InvalidSqlStatementName(String),
 
+    /// `DECLARE` naming a cursor this transaction already has: `42P03`, measured on 19.
+    #[error("cursor \"{0}\" already exists")]
+    DuplicateCursor(String),
+
+    /// `FETCH`, `MOVE` or `CLOSE` naming a cursor that is not open: `34000`, measured — and the
+    /// same answer after the transaction that declared one has ended, because a cursor without
+    /// `WITH HOLD` does not outlive it.
+    ///
+    /// **Not [`SqlError::InvalidCursorName`]**, which shares the SQLSTATE and says *portal*. That
+    /// one is the extended protocol's; PostgreSQL spells the two differently because they are
+    /// named by different statements, and a client reading the sentence can tell which it asked
+    /// for.
+    #[error("cursor \"{0}\" does not exist")]
+    UndefinedCursor(String),
+
+    /// `PREPARE` naming a statement this session already has.
+    ///
+    /// Measured on 19beta1: `42P05: prepared statement "h1_notypes" already exists`. The protocol's
+    /// `Parse` is *not* this — an unnamed re-`Parse` replaces silently, which is what a client
+    /// pooling one name relies on — so only the SQL-level statement raises it.
+    #[error("prepared statement \"{0}\" already exists")]
+    DuplicatePreparedStatement(String),
+
+    /// A prepared statement whose result row type changed under it.
+    ///
+    /// Measured on PostgreSQL 19: `0A000: cached plan must not change result type`, with no DETAIL
+    /// and no HINT. `ActiveRecord` maps the sentence to `PreparedStatementCacheExpired`,
+    /// deallocates the statement and retries — so the words are load-bearing and not a paraphrase.
+    ///
+    /// **Not `FeatureNotSupported`, though it shares the SQLSTATE.** That variant carries contract
+    /// C2 — a statement this node can parse and will not run — and this is a statement it ran
+    /// happily a moment ago and must now refuse. Filing it there would enter it in the refusal
+    /// register as a feature nobody is missing.
+    #[error("cached plan must not change result type")]
+    CachedPlanMustNotChangeResultType,
+
+    /// `EXECUTE` supplying the wrong number of arguments.
+    ///
+    /// Measured on 19beta1: `42601: wrong number of parameters for prepared statement "h1_types"`
+    /// with `DETAIL: Expected 1 parameters but got 2.` — and the same sentence, not a different
+    /// one, when too few are supplied.
+    #[error("wrong number of parameters for prepared statement \"{name}\"")]
+    WrongParameterCount {
+        /// The statement's name.
+        name: String,
+        /// How many it declared.
+        expected: usize,
+        /// How many `EXECUTE` supplied.
+        got: usize,
+    },
+
     /// A portal name that does not exist.
     #[error("portal \"{0}\" does not exist")]
     InvalidCursorName(String),
@@ -2647,7 +2711,8 @@ impl SqlError {
             // `0A000` on something it will never implement rather than on something it has not
             // implemented yet.
             | SqlError::LockingNotAllowedWith { .. }
-            | SqlError::LockingNullableSide(_) => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::LockingNullableSide(_)
+            | SqlError::CachedPlanMustNotChangeResultType => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
@@ -2656,6 +2721,7 @@ impl SqlError {
             }
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
+            | SqlError::DoubledClause(_)
             // PostgreSQL's type-name grammar, refusing in the same class as its statement
             // grammar: `'timestamp(-1)'::regtype` and `''::regtype` are both `42601`.
             | SqlError::TypeNameSyntax(_)
@@ -2680,7 +2746,8 @@ impl SqlError {
             | SqlError::SyntaxAtOrNear(_)
             | SqlError::UnrecognizedExplainOption(_)
             | SqlError::NonBooleanOption(_)
-            | SqlError::OptionRequiresParameter(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::OptionRequiresParameter(_)
+            | SqlError::WrongParameterCount { .. } => sqlstate::SYNTAX_ERROR,
             // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
             // the one place PostgreSQL spends that class on something it will never implement
             // rather than on something it has not implemented yet.
@@ -2981,6 +3048,7 @@ impl SqlError {
             }
             SqlError::LockNotHeld(_) => sqlstate::WARNING,
             SqlError::IdleInTransactionTimeout => sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+            SqlError::DuplicatePreparedStatement(_) => sqlstate::DUPLICATE_PREPARED_STATEMENT,
             SqlError::TerminatedByAdministrator => sqlstate::ADMIN_SHUTDOWN,
             SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
@@ -2990,7 +3058,10 @@ impl SqlError {
                 sqlstate::PROTOCOL_VIOLATION
             }
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
-            SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
+            SqlError::InvalidCursorName(_) | SqlError::UndefinedCursor(_) => {
+                sqlstate::INVALID_CURSOR_NAME
+            }
+            SqlError::DuplicateCursor(_) => sqlstate::DUPLICATE_CURSOR,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
             SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
             // `StatementMustRestart` is a signal, not an answer — it reaches a client only if
@@ -3040,6 +3111,11 @@ impl SqlError {
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
             }
+            // Measured on 19beta1, and the plural is PostgreSQL's own however many there are:
+            // `Expected 1 parameters but got 2.`
+            SqlError::WrongParameterCount {
+                expected, got, ..
+            } => Some(format!("Expected {expected} parameters but got {got}.")),
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
             }

@@ -88,6 +88,11 @@ impl Parsed {
                 actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
             }));
         }
+        // The same arrangement: `crate::parse::read_cursor` read the statement and the tree is a
+        // placeholder, because `sqlparser` cannot read three of the four.
+        if let Some(cursor) = &self.cursor {
+            return lower_cursor(cursor);
+        }
         // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
         // statement it is a disguised form of, so the whole lowering is this.
         if let Some((message, severity)) = self.raised() {
@@ -1428,6 +1433,12 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
 /// A `SHOW` of an unknown parameter is *not* contract C2's `0A000`: the statement is one this node
 /// executes, and what is missing is the parameter, which is the condition PostgreSQL reports.
 fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
+    // **The names PostgreSQL spells with spaces come first**, because after the join below they
+    // are indistinguishable from a namespaced one: `SHOW TIME ZONE` and `SHOW esker.read_as_of`
+    // are both two idents and the AST does not record which separator was written.
+    if let Some(statement) = lower_multi_word_show(variable) {
+        return Ok(statement);
+    }
     // `SHOW esker.read_as_of` arrives as two idents, because the parser splits on the dot.
     let name = variable
         .iter()
@@ -1448,6 +1459,103 @@ fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
         ));
     }
     Err(SqlError::UnrecognizedParameter(name))
+}
+
+/// A cursor statement, from what [`crate::parse::read_cursor`] read out of the source.
+///
+/// The `DECLARE`'s query travels as **text** and is parsed here, through the one parser every
+/// other query goes through — the same arrangement `PREPARE`'s body uses, and for the same
+/// reason: the hand-written reader knows the statement's shape and nothing about expressions.
+fn lower_cursor(read: &crate::parse::CursorRead) -> Result<plan::Statement> {
+    use crate::parse::CursorRead;
+
+    let cursor = match read {
+        CursorRead::Declare {
+            name,
+            quoted,
+            hold,
+            query,
+        } => {
+            // **Refused by name.** A holdable cursor outlives the transaction that made it, which
+            // means keeping its snapshot alive past the commit — there is nothing here that does
+            // that, and answering with a cursor that quietly saw newer rows would be worse than
+            // saying so.
+            if *hold {
+                return Err(SqlError::unsupported("DECLARE ... WITH HOLD"));
+            }
+            let mut statements = crate::parse::parse_statements(query)?;
+            let [_] = statements.as_slice() else {
+                return Err(SqlError::unsupported(
+                    "DECLARE CURSOR FOR more than one statement",
+                ));
+            };
+            let plan::Statement::Select(select) = statements.remove(0).lower()? else {
+                return Err(SqlError::unsupported(
+                    "DECLARE CURSOR FOR a statement that is not a query",
+                ));
+            };
+            plan::CursorStatement::Declare {
+                name: fold_identifier(name, *quoted).0,
+                query: select,
+            }
+        }
+        CursorRead::Fetch {
+            name,
+            quoted,
+            direction,
+            only_move,
+        } => plan::CursorStatement::Fetch {
+            name: fold_identifier(name, *quoted).0,
+            direction: *direction,
+            only_move: *only_move,
+        },
+        CursorRead::Close(named) => plan::CursorStatement::Close(
+            named
+                .as_ref()
+                .map(|(name, quoted)| fold_identifier(name, *quoted).0),
+        ),
+    };
+    Ok(plan::Statement::Cursor(cursor))
+}
+
+/// The three parameter names PostgreSQL's grammar spells with spaces, and no others.
+///
+/// **A closed set copied from the grammar, not a rule inferred from a shape.** Measured on
+/// PostgreSQL 19: `SHOW TIME ZONE`, `SHOW TRANSACTION ISOLATION LEVEL` and
+/// `SHOW SESSION AUTHORIZATION` are three productions of their own, while `SHOW TRANSACTION READ
+/// ONLY` and `SHOW NOSUCH THING` are `42601` — so "two words means spaces" is not a rule a real
+/// server has, and reading one into the parser would accept statements PostgreSQL refuses.
+///
+/// Each answers under PostgreSQL's own spelling of the parameter rather than the user's, which is
+/// what makes `SHOW TIME ZONE` and `SHOW timezone` name the same column.
+fn lower_multi_word_show(variable: &[Ident]) -> Option<plan::Statement> {
+    let words: Vec<String> = variable
+        .iter()
+        .map(|ident| ident.value.to_ascii_uppercase())
+        .collect();
+    let name = match words
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["TIME", "ZONE"] => "timezone",
+        ["TRANSACTION", "ISOLATION", "LEVEL"] => "transaction_isolation",
+        // **`sqlparser` eats the `SESSION` keyword and drops it**, so this arrives as the single
+        // ident `AUTHORIZATION` and is indistinguishable from a bare `SHOW AUTHORIZATION`. That
+        // one is `42601` on a real server, so taking the word accepts a statement PostgreSQL
+        // refuses — an over-acceptance, which is the direction contract C1 leaves open, and the
+        // alternative is refusing the form the suite actually sends.
+        ["AUTHORIZATION"] | ["SESSION_AUTHORIZATION"] => {
+            return Some(plan::Statement::Session(
+                plan::SessionStatement::ShowSessionAuthorization,
+            ));
+        }
+        _ => return None,
+    };
+    Some(plan::Statement::Session(
+        plan::SessionStatement::ShowParameter(name.to_owned()),
+    ))
 }
 
 /// `RESET <parameter>` — `SET <parameter> = DEFAULT` by another name, and PostgreSQL treats them
@@ -6656,6 +6764,97 @@ fn refuse_unlockable_shape(select: &plan::Select) -> Result<()> {
     Ok(())
 }
 
+/// A query written in parentheses, with whatever was written outside them merged in.
+///
+/// **PostgreSQL merges rather than nests**, and refuses only when both levels write the same
+/// clause — measured, each sentence its own:
+///
+/// ```text
+/// (SELECT id FROM ex) ORDER BY id DESC LIMIT 1                -> the outer clauses apply
+/// WITH w AS (…) (SELECT n FROM w)                             -> so does an outer WITH
+/// (SELECT id FROM ex FOR UPDATE) FOR UPDATE                   -> locks merge, silently
+/// ((SELECT … ORDER BY id LIMIT 2)) ORDER BY id DESC           42601: multiple ORDER BY clauses not allowed
+/// (SELECT … ORDER BY id LIMIT 2) LIMIT 1                      42601: multiple LIMIT clauses not allowed
+/// (SELECT … OFFSET 0) OFFSET 0                                42601: multiple OFFSET clauses not allowed
+/// WITH a AS (…) (WITH b AS (…) SELECT n FROM b)               42601: multiple WITH clauses not allowed
+/// ```
+///
+/// The refusals are the half that makes this more than unwrapping a parenthesis: a fix that
+/// simply took the inner query would answer four statements a real server rejects, and would
+/// silently drop one of each doubled pair to do it.
+///
+/// Checked in `insertSelectOptions`'s order — `ORDER BY`, `OFFSET`, `LIMIT`, `WITH` — which is the
+/// order the sentences come out in when a statement doubles more than one. Recursion is bounded by
+/// `sqlparser`'s own parser depth limit, so `(((…)))` cannot be made deep enough to overflow here.
+fn lower_parenthesised(outer: &Query, inner: &Query) -> Result<plan::Select> {
+    let (outer_limit, outer_offset) = limit_halves(outer.limit_clause.as_ref());
+    let (inner_limit, inner_offset) = limit_halves(inner.limit_clause.as_ref());
+    if outer.order_by.is_some() && inner.order_by.is_some() {
+        return Err(SqlError::DoubledClause("ORDER BY"));
+    }
+    if outer_offset && inner_offset {
+        return Err(SqlError::DoubledClause("OFFSET"));
+    }
+    if outer_limit && inner_limit {
+        return Err(SqlError::DoubledClause("LIMIT"));
+    }
+    if outer.with.is_some() && inner.with.is_some() {
+        return Err(SqlError::DoubledClause("WITH"));
+    }
+    let mut merged = inner.clone();
+    if outer.with.is_some() {
+        merged.with = outer.with.clone();
+    }
+    if outer.order_by.is_some() {
+        merged.order_by = outer.order_by.clone();
+    }
+    merged.limit_clause = merge_limits(inner.limit_clause.clone(), outer.limit_clause.clone());
+    // **Concatenated rather than chosen**: two `FOR UPDATE`s are legal and merge on a real server,
+    // which is the one clause here that does not collide.
+    merged.locks = [inner.locks.clone(), outer.locks.clone()].concat();
+    lower_query(&merged)
+}
+
+/// Which halves of a `LIMIT`/`OFFSET` are written, `sqlparser` carrying both in one field.
+fn limit_halves(clause: Option<&LimitClause>) -> (bool, bool) {
+    match clause {
+        None => (false, false),
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.is_some(), offset.is_some()),
+        // `LIMIT a, b` is MySQL's spelling of both halves at once.
+        Some(LimitClause::OffsetCommaLimit { .. }) => (true, true),
+    }
+}
+
+/// The two levels' `LIMIT`/`OFFSET` in one clause. Each half is written by at most one of them:
+/// a doubled half is refused before this runs.
+fn merge_limits(inner: Option<LimitClause>, outer: Option<LimitClause>) -> Option<LimitClause> {
+    match (inner, outer) {
+        (None, clause) | (clause, None) => clause,
+        (
+            Some(LimitClause::LimitOffset {
+                limit: inner_limit,
+                offset: inner_offset,
+                limit_by: inner_by,
+            }),
+            Some(LimitClause::LimitOffset {
+                limit: outer_limit,
+                offset: outer_offset,
+                limit_by: outer_by,
+            }),
+        ) => Some(LimitClause::LimitOffset {
+            limit: inner_limit.or(outer_limit),
+            offset: inner_offset.or(outer_offset),
+            limit_by: if inner_by.is_empty() {
+                outer_by
+            } else {
+                inner_by
+            },
+        }),
+        // `LIMIT a, b` carries both halves, so anything beside it has already been refused.
+        (_, outer) => outer,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
@@ -6668,6 +6867,13 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(!query.pipe_operators.is_empty(), "a pipe operator")?;
 
     let SetExpr::Select(select) = query.body.as_ref() else {
+        // **Parentheses around a query are grouping, and the grammar sees through them.**
+        // `gram.y`'s `insertSelectOptions` merges what is written outside the parentheses into the
+        // query inside; there is no nesting to lower. `postgresql_adapter_prevent_writes_test.rb`
+        // sends `/*action:index*/((SELECT …))`, and this arm is why it is a `SELECT` again.
+        if let SetExpr::Query(inner) = query.body.as_ref() {
+            return lower_parenthesised(query, inner);
+        }
         // **`VALUES …` on its own is a query**, so it takes the clauses a query takes: its rows
         // are a relation with no name, and the `ORDER BY`, `LIMIT` and `OFFSET` above it are the
         // ordinary ones over the columns it names itself.

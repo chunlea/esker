@@ -783,6 +783,9 @@ impl Execute for NotYetExecuting {
         false
     }
 
+    /// Discarded: there is no catalog behind this, so nothing can read the view they would fill.
+    fn remember_prepared(&mut self, _statements: Vec<crate::session::PreparedStatement>) {}
+
     fn execute(
         &mut self,
         parsed: &crate::parse::Parsed,

@@ -395,6 +395,12 @@ impl<'a> Reader<'a> {
         Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    /// An unsigned 16-bit field, which is what every *count* on this wire is.
+    fn u16(&mut self, what: &str) -> Result<u16> {
+        let bytes = self.take(2, what)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
     fn u32(&mut self, what: &str) -> Result<u32> {
         let bytes = self.take(4, what)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -432,10 +438,16 @@ impl<'a> Reader<'a> {
     /// This is the check that matters most in this file. `Bind` carries a parameter count, and
     /// without this a twelve-byte message claiming 2^31 parameters would have us reserve capacity
     /// for two billion of them before reading the first.
+    /// A count of things that follow.
+    ///
+    /// **Unsigned, and it is the difference between 32767 and 32768 working.** The protocol
+    /// documents every one of these as `Int16` and PostgreSQL reads them with `pq_getmsgint`,
+    /// which widens a `uint16` — so the range is `0..=65535` and there is no such thing as a
+    /// negative count. Reading one signed made `ActiveRecord`'s `where(id: […])` over 32768
+    /// elements a `ProtocolViolation` and a closed connection, where PG19 answers the identical
+    /// bytes; r1 pinned the boundary at exactly `i16::MAX + 1`.
     fn count(&mut self, what: &str, bytes_each: usize) -> Result<usize> {
-        let count = self.i16(what)?;
-        let count = usize::try_from(count)
-            .map_err(|_| SqlError::ProtocolViolation(format!("negative {what}")))?;
+        let count = usize::from(self.u16(what)?);
         if count.saturating_mul(bytes_each) > self.remaining() {
             return Err(SqlError::ProtocolViolation(format!(
                 "{what} claims {count} entries, more than the message can hold"
@@ -643,7 +655,7 @@ impl Backend<'_> {
             }),
             Backend::ReadyForQuery(status) => framed(out, b'Z', |o| o.push(status.as_byte())),
             Backend::RowDescription(fields) => framed(out, b'T', |o| {
-                let count = i16::try_from(fields.len()).unwrap_or(i16::MAX);
+                let count = u16::try_from(fields.len()).unwrap_or(u16::MAX);
                 o.extend_from_slice(&count.to_be_bytes());
                 for field in *fields {
                     cstring(o, &field.name);
@@ -656,7 +668,7 @@ impl Backend<'_> {
                 }
             }),
             Backend::DataRow(values) => framed(out, b'D', |o| {
-                let count = i16::try_from(values.len()).unwrap_or(i16::MAX);
+                let count = u16::try_from(values.len()).unwrap_or(u16::MAX);
                 o.extend_from_slice(&count.to_be_bytes());
                 for value in *values {
                     match value {
@@ -677,8 +689,12 @@ impl Backend<'_> {
             Backend::BindComplete => framed(out, b'2', |_| {}),
             Backend::CloseComplete => framed(out, b'3', |_| {}),
             Backend::NoData => framed(out, b'n', |_| {}),
+            // **Unsigned, the same as the reader.** This one truncated in practice rather than in
+            // theory: a statement with 32768 parameters announced 32767 of them and left the client
+            // reading the next message from the middle of this one — quieter than the closed
+            // connection the reader caused, and worse.
             Backend::ParameterDescription(types) => framed(out, b't', |o| {
-                let count = i16::try_from(types.len()).unwrap_or(i16::MAX);
+                let count = u16::try_from(types.len()).unwrap_or(u16::MAX);
                 o.extend_from_slice(&count.to_be_bytes());
                 for oid in *types {
                     o.extend_from_slice(&oid.to_be_bytes());

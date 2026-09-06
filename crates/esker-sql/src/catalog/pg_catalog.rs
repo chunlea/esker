@@ -223,6 +223,21 @@ pub enum CatalogView {
     /// shows a `transactionid` row with `granted = false`** naming the transaction it waits for.
     /// That pair is the whole diagnostic, and it is the shape reproduced here.
     PgLocks,
+    /// **What this session has prepared** — SQL `PREPARE`s and the protocol's named statements,
+    /// which are one store on a real server and are one store here.
+    ///
+    /// Eight columns, measured from `\d pg_prepared_statements` on PostgreSQL 19. Two of them are
+    /// answered the way every other view here answers a thing this node does not keep:
+    /// `prepare_time` is NULL, because no wall clock is read for anything a client can order by
+    /// (the same reason `pg_stat_activity.backend_start` and `pg_locks.waitstart` are NULL), and
+    /// `generic_plans`/`custom_plans` are `0`, which is not a placeholder — there is no plan cache
+    /// here, so no generic plan has ever been used, and `0` is what a real server reports for a
+    /// statement that has not been run either.
+    ///
+    /// **The rows come from the session, not the store**, which is why this is the first view
+    /// whose input is neither the transaction nor the tenant: the protocol hands its statements
+    /// down before each one runs (`crate::pgwire::session::Execute::remember_prepared`).
+    PgPreparedStatements,
     /// The databases this server has, which is **one**.
     ///
     /// `ActiveRecord`'s adapter reads it three times while connecting — the encoding, the collation
@@ -267,7 +282,7 @@ pub enum CatalogView {
 
 impl CatalogView {
     /// Every view, for the tests that must not silently skip one.
-    pub const ALL: [CatalogView; 38] = [
+    pub const ALL: [CatalogView; 39] = [
         CatalogView::PgType,
         CatalogView::PgRange,
         CatalogView::PgClass,
@@ -294,6 +309,7 @@ impl CatalogView {
         CatalogView::PgRoles,
         CatalogView::PgAuthid,
         CatalogView::PgLocks,
+        CatalogView::PgPreparedStatements,
         CatalogView::PgDatabase,
         CatalogView::PgDepend,
         CatalogView::PgSequence,
@@ -339,6 +355,7 @@ impl CatalogView {
             CatalogView::PgRoles => "pg_roles",
             CatalogView::PgAuthid => "pg_authid",
             CatalogView::PgLocks => "pg_locks",
+            CatalogView::PgPreparedStatements => "pg_prepared_statements",
             CatalogView::PgDatabase => "pg_database",
             CatalogView::PgDepend => "pg_depend",
             CatalogView::PgSequence => "pg_sequence",
@@ -401,6 +418,7 @@ impl CatalogView {
             | CatalogView::PgViews
             | CatalogView::PgStatActivity
             | CatalogView::PgLocks
+            | CatalogView::PgPreparedStatements
             | CatalogView::PgAvailableExtensions
             | CatalogView::InformationSchemaTables
             | CatalogView::InformationSchemaViews
@@ -464,6 +482,11 @@ impl CatalogView {
                 // `information_schema.domains` answered no rows — which is the third time this
                 // file has recorded that failure.
                 CatalogView::PgLocks => 31,
+                // **38, claimed out loud at `c7a1ff57`**, which is the next free id and was free
+                // on every branch when this was written (`ddl-trio`, `mpp`, `values`, `main`).
+                // Whoever commits second renumbers: two views sharing an id resolve to each
+                // other, which is what the notes above are scars from.
+                CatalogView::PgPreparedStatements => 38,
                 CatalogView::PgDatabase => 26,
                 CatalogView::PgDepend => 24,
                 CatalogView::PgSequence => 25,
@@ -767,6 +790,21 @@ impl CatalogView {
                 ("rolpassword", ColumnType::Text),
                 ("rolvaliduntil", ColumnType::TimestampTz),
             ],
+            // Eight columns in PostgreSQL 19's order, from `\d pg_prepared_statements`.
+            // `parameter_types` and `result_types` are `regtype[]` there and here, and they spell
+            // "nothing" differently on purpose: a statement that takes no parameters has `{}` and
+            // one that returns no rows has **NULL** — measured side by side on an `INSERT` with no
+            // `RETURNING`, whose `parameter_types` is `{integer}` and whose `result_types` is NULL.
+            CatalogView::PgPreparedStatements => &[
+                ("name", ColumnType::Text),
+                ("statement", ColumnType::Text),
+                ("prepare_time", ColumnType::TimestampTz),
+                ("parameter_types", ColumnType::RegTypeArray),
+                ("result_types", ColumnType::RegTypeArray),
+                ("from_sql", ColumnType::Bool),
+                ("generic_plans", ColumnType::Int8),
+                ("custom_plans", ColumnType::Int8),
+            ],
             CatalogView::PgStatActivity => &[
                 ("datid", ColumnType::Oid),
                 ("datname", ColumnType::Text),
@@ -920,6 +958,7 @@ impl CatalogView {
         txn: &dyn crate::backend::Txn,
         tenant: u64,
         rendering: crate::value::Rendering,
+        prepared: &[crate::session::PreparedStatement],
     ) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
@@ -942,6 +981,7 @@ impl CatalogView {
             CatalogView::PgRoles => role_rows(txn, false),
             CatalogView::PgAuthid => role_rows(txn, true),
             CatalogView::PgLocks => Ok(locks_rows(txn, tenant)),
+            CatalogView::PgPreparedStatements => Ok(prepared_statement_rows(prepared)),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             // **The standard's views delegate as a group**, in their own function: they are six
             // arms that all call one module, and keeping them here is what pushed `rows_of` past
@@ -1101,6 +1141,7 @@ impl CatalogView {
             | CatalogView::PgViews
             | CatalogView::PgStatActivity
             | CatalogView::PgLocks
+            | CatalogView::PgPreparedStatements
             | CatalogView::PgEnum
             | CatalogView::PgClass
             | CatalogView::PgNamespace
@@ -1649,6 +1690,51 @@ fn role_rows(txn: &dyn crate::backend::Txn, _authid: bool) -> Result<Vec<Vec<Dat
             ]
         })
         .collect())
+}
+
+/// Every `pg_prepared_statements` row: what **this** session has named, in name order.
+///
+/// **This session's and no other's**, which is where it parts company with `pg_stat_activity`
+/// beside it: that view is cluster-wide on a real server and this one is per-backend, so the list
+/// arrives from the session that is asking rather than from the process-wide registry. A second
+/// connection's prepared statements are invisible here, exactly as they are on PostgreSQL.
+///
+/// Name order rather than PostgreSQL's hash order. Neither server promises one, and a corpus that
+/// replays two `PREPARE`s needs the answer not to depend on a hash seed.
+fn prepared_statement_rows(prepared: &[crate::session::PreparedStatement]) -> Vec<Vec<Datum>> {
+    prepared
+        .iter()
+        .map(|statement| {
+            vec![
+                Datum::Text(statement.name.clone()),
+                Datum::Text(statement.statement.clone()),
+                // No wall clock is read here (`pg_locks.waitstart` and every timestamp in
+                // `pg_stat_activity` are NULL for the same reason).
+                Datum::Null,
+                regtype_array(&statement.parameters),
+                statement
+                    .results
+                    .as_deref()
+                    .map_or(Datum::Null, regtype_array),
+                Datum::Bool(statement.from_sql),
+                // No plan cache, so no plan of either kind has been reused. `0` is what a real
+                // server reports for a statement nobody has executed yet.
+                Datum::Int8(0),
+                Datum::Int8(0),
+            ]
+        })
+        .collect()
+}
+
+/// A `regtype[]` of these OIDs, which is how both type columns of `pg_prepared_statements` print.
+fn regtype_array(oids: &[u32]) -> Datum {
+    Datum::Array(ArrayValue::one_dimensional(
+        ColumnType::RegType,
+        1,
+        oids.iter()
+            .map(|oid| Some(crate::value::regtype_of_oid(*oid)))
+            .collect(),
+    ))
 }
 
 fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {

@@ -86,6 +86,88 @@ pub enum SessionStatement {
     },
     /// `SHOW <parameter>`, for one of the same.
     ShowParameter(String),
+    /// `SHOW SESSION AUTHORIZATION`, or the one-word GUC spelling of it.
+    ///
+    /// **Not a [`SessionStatement::ShowParameter`], deliberately.** The value lives on the
+    /// executor (`SET SESSION AUTHORIZATION` writes it) and not in the parameter map, and adding
+    /// it to that map would open a second door — a generic `SET session_authorization = 'bob'`
+    /// writing the map while the field it is supposed to be kept nothing. One state, one door.
+    ShowSessionAuthorization,
+}
+
+/// `DECLARE`, `FETCH`, `MOVE` and `CLOSE` — a cursor over a result, and a position in it.
+///
+/// **Transaction-scoped**, which is why they live on the executor rather than the protocol
+/// session: a cursor without `WITH HOLD` dies with the transaction that declared it, and the
+/// executor is what owns the transaction. Both callers of a statement — a connection and the
+/// corpus harness — reach these the same way, through `execute`, so there is no dispatch to
+/// mirror.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CursorStatement {
+    /// `DECLARE <name> CURSOR FOR <query>`, whose rows are read when it runs.
+    Declare {
+        /// The cursor's name, folded.
+        name: String,
+        /// The query it stands for.
+        query: Box<super::Select>,
+    },
+    /// `FETCH`, and `MOVE`, which is `FETCH` that keeps the rows to itself.
+    Fetch {
+        /// The cursor's name, folded.
+        name: String,
+        /// Where it leaves the cursor, normalised from PostgreSQL's spellings.
+        direction: CursorDirection,
+        /// `MOVE`: report the count and return no rows.
+        only_move: bool,
+    },
+    /// `CLOSE <name>`, or `CLOSE ALL` as `None`.
+    Close(Option<String>),
+}
+
+/// Where a `FETCH` or `MOVE` leaves the cursor.
+///
+/// PostgreSQL writes this thirteen ways — `NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`,
+/// `RELATIVE n`, a bare count, `ALL`, and `FORWARD`/`BACKWARD` with a count, `ALL` or nothing —
+/// and they are three movements. Normalising at the parser is what keeps the executor from
+/// carrying the spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorDirection {
+    /// Step this many rows from where the cursor is; negative goes backwards.
+    ///
+    /// **Zero is not "do nothing"**: `FETCH FORWARD 0` re-reads the row the cursor is on and
+    /// reports a count of one, and so does `MOVE 0` — measured. A model that treated the count as
+    /// a number of rows to step over gets every other spelling right and that one wrong.
+    Relative(i64),
+    /// Go to a row by number, 1-based. Negative counts from the end, so `-1` is `LAST`; `0` is
+    /// before the first row and returns nothing.
+    Absolute(i64),
+    /// Everything from here to the end (`true`) or back to the start (`false`).
+    All(bool),
+}
+
+impl CursorStatement {
+    /// The command tag, which counts rows for `FETCH` and `MOVE` and names the verb otherwise.
+    ///
+    /// Measured through the `pg` gem rather than `psql`, which prints a result set for `FETCH` and
+    /// so never shows its tag: `DECLARE CURSOR`, `FETCH n`, `MOVE n`, `CLOSE CURSOR`, and
+    /// `CLOSE CURSOR ALL` for the one that names no cursor.
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            CursorStatement::Declare { .. } => "DECLARE CURSOR",
+            // The count is added where it is known; this is the tag for a statement that did not
+            // run, which is what `plan::Statement::tag` is for.
+            CursorStatement::Fetch { only_move, .. } => {
+                if *only_move {
+                    "MOVE"
+                } else {
+                    "FETCH"
+                }
+            }
+            CursorStatement::Close(None) => "CLOSE CURSOR ALL",
+            CursorStatement::Close(Some(_)) => "CLOSE CURSOR",
+        }
+    }
 }
 
 impl SessionStatement {
@@ -113,7 +195,9 @@ impl SessionStatement {
                 DiscardTarget::Sequences => "DISCARD SEQUENCES",
                 DiscardTarget::Temp => "DISCARD TEMP",
             },
-            SessionStatement::ShowReadAsOf | SessionStatement::ShowParameter(_) => "SHOW",
+            SessionStatement::ShowReadAsOf
+            | SessionStatement::ShowParameter(_)
+            | SessionStatement::ShowSessionAuthorization => "SHOW",
         }
     }
 }

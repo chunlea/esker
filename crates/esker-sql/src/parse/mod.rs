@@ -155,6 +155,35 @@ pub enum StatementClass {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `PREPARE name [(types)] AS stmt` — the **SQL-level** prepared statement.
+    ///
+    /// Not the protocol's `Parse`, though they share one store: `DISCARD ALL` clears both because
+    /// both are session state, and `pg_prepared_statements` reports both with `from_sql` telling
+    /// them apart. `PREPARE TRANSACTION` is a different statement entirely — two-phase commit —
+    /// and is refused before this by the `UNSUPPORTED` word table, which is where the guard has to
+    /// be: by the time `sqlparser` has an AST the two are unrelated variants and a leading-keyword
+    /// test here would be a second, weaker copy of that rule.
+    Prepare {
+        /// The name it is stored under.
+        name: String,
+        /// The statement it prepares, rendered back to SQL.
+        ///
+        /// **Text rather than the parsed body**, because `sqlparser` is named nowhere outside this
+        /// module (`tests/containment.rs`) and the session is where a prepared statement is stored.
+        /// The session re-parses it, which is not a detour: it is how a `PREPARE` whose body this
+        /// node cannot run refuses at the `PREPARE` rather than at the first `EXECUTE`.
+        body: String,
+    },
+    /// `EXECUTE name [(args)]`.
+    Execute {
+        /// Which prepared statement.
+        name: String,
+        /// The literal arguments as text, `None` for a `NULL` — and the whole field `None` when an
+        /// argument is not a literal, which the session refuses by name.
+        args: Option<Vec<Option<String>>>,
+    },
+    /// `DEALLOCATE name` and `DEALLOCATE ALL` — `None` for `ALL`.
+    Deallocate(Option<String>),
     /// `SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }`.
     ///
     /// **`sqlparser` 0.62.0 cannot read it** — it takes `SET` and then wants `=` or `TO` — which
@@ -236,7 +265,29 @@ pub struct Parsed {
     /// The **whole** input rather than this statement's slice of it, which is what a real server
     /// reports: one `Query` message carrying three statements shows all three in `query` while any
     /// of them is running.
+    ///
+    /// **The client's text, not the parser's.** Several statements are rewritten before
+    /// `sqlparser` sees them — a `DO … RAISE` block, `REFRESH MATERIALIZED VIEW`,
+    /// `ALTER TABLE … RESET` and every cursor statement all become `SELECT 1` — and this used to
+    /// hold the rewrite, so `pg_stat_activity` reported `SELECT 1` for a session running
+    /// something else. A view whose whole job is to say what a session is doing.
     source: String,
+    /// This statement's own slice of `source`, with its semicolon.
+    ///
+    /// **A second answer to "what was sent", because the two views want different ones.** Measured
+    /// on PostgreSQL 19: `PREPARE h1_a AS SELECT 1; PREPARE h1_b AS SELECT 2;` in one query string
+    /// puts `PREPARE h1_a AS SELECT 1;` in `pg_prepared_statements.statement` for the first and
+    /// `PREPARE h1_b AS SELECT 2;` for the second, each with its own semicolon — while
+    /// `pg_stat_activity.query` shows the whole string for both.
+    ///
+    /// Falls back to the whole input when the slices and the parsed statements do not come out
+    /// one for one, which is the only honest answer when the split and the parser disagree.
+    text: String,
+    /// The cursor statement this is, read by [`read_cursor`] because `sqlparser` cannot.
+    ///
+    /// When it is `Some`, the tree above is a placeholder — the source handed to the parser was
+    /// replaced by `SELECT 1`, the same arrangement `refresh` and `raise` use.
+    cursor: Option<CursorRead>,
     /// `CONCURRENTLY` on a `DROP INDEX`, which the parser cannot carry.
     ///
     /// `sqlparser` 0.62.0's `Statement::Drop` has no field for it, so the statement does not parse
@@ -369,6 +420,12 @@ impl Parsed {
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// This statement's own text, which is what `pg_prepared_statements.statement` reports.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// What kind of statement this is.
@@ -539,6 +596,10 @@ impl Parsed {
 /// A simple-query message may carry several statements in one string, which is why this returns a
 /// list and why the session runs them in order and stops at the first failure.
 pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
+    // **Held before anything rewrites it.** `sql` is shadowed a dozen times below by the rewrites
+    // that make a statement `sqlparser` can read; what the client actually sent is this, and it is
+    // what both views report.
+    let original = sql;
     // `parse` does the rewriting; this only has to *notice*, because the keyword it removes is a
     // fact about the statement that the parsed tree cannot carry.
     let scanned = scan(sql);
@@ -591,6 +652,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
     let namespaced = strip_parameter_namespace(sql, &scanned);
     let sql = namespaced.as_ref().map_or(sql, |(text, _)| text.as_str());
+    // A cursor statement is read whole here; the tree `sqlparser` returns for the placeholder
+    // below is thrown away.
+    let cursor = read_cursor(sql, &scanned);
     let refresh = read_refresh(sql);
     let reset = read_alter_table_reset(sql, &scanned);
     let sql = match (&guarded, &raise, &refresh, &reset) {
@@ -605,16 +669,28 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         }
         (None, None, None, None) => sql,
     };
-    Ok(parse(sql)?
+    let sql = if cursor.is_some() { "SELECT 1" } else { sql };
+    let parsed = parse(sql)?;
+    // One slice per statement, or none at all: a rewrite that changed how many statements there
+    // are would make the pairing a guess, and the whole input is the honest answer to that.
+    let texts = statement_texts(original);
+    let texts = (texts.len() == parsed.len()).then_some(texts);
+    Ok(parsed
         .into_iter()
-        .map(|statement| {
+        .enumerate()
+        .map(|(at, statement)| {
             // The rewritten source parses as something harmless; what the user wrote is this.
             let class = constraints.clone().unwrap_or_else(|| classify(&statement));
             Parsed {
                 statement,
                 class,
-                source: sql.to_owned(),
+                source: original.to_owned(),
+                text: texts
+                    .as_ref()
+                    .and_then(|texts| texts.get(at))
+                    .map_or_else(|| original.to_owned(), |text| (*text).to_owned()),
                 parameter_namespace: namespaced.as_ref().map(|(_, ns)| ns.clone()),
+                cursor: cursor.clone(),
                 concurrently,
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
@@ -636,6 +712,238 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
             }
         })
         .collect())
+}
+
+/// A cursor statement, read here because `sqlparser` can read only one of the four.
+///
+/// **One reader for one grammar.** `MOVE` is not even a keyword in `sqlparser` 0.62; its `FETCH`
+/// demands a direction and then a `FROM` or `IN`, so the `FETCH c` and `FETCH 2 c` a real server
+/// takes are parse errors; `DECLARE` and `CLOSE` it does read. Rewriting the source into the
+/// subset it accepts would mean reading the direction words *here* and then again *there*, which
+/// is the shape that cost this project 4,873 tests once. So the whole statement is read here and
+/// the tree `sqlparser` returns is thrown away, exactly as [`read_refresh`] does for a statement
+/// it cannot read at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CursorRead {
+    /// `DECLARE <name> [options] CURSOR [{WITH|WITHOUT} HOLD] FOR <query>`.
+    Declare {
+        /// The name as written, and whether it was quoted — folded when it is lowered.
+        name: String,
+        /// Whether the name was quoted.
+        quoted: bool,
+        /// `WITH HOLD`, which this node refuses by name: such a cursor outlives its transaction
+        /// and there is nothing here to keep its snapshot alive.
+        hold: bool,
+        /// The query text, parsed where every other query is.
+        query: String,
+    },
+    /// `FETCH …` and `MOVE …`, one grammar with two verbs.
+    Fetch {
+        /// The cursor's name as written.
+        name: String,
+        /// Whether it was quoted.
+        quoted: bool,
+        /// Normalised from PostgreSQL's thirteen spellings.
+        direction: crate::plan::CursorDirection,
+        /// `MOVE`: the same movement, reporting the count and keeping the rows.
+        only_move: bool,
+    },
+    /// `CLOSE <name>`, or `CLOSE ALL` as `None`.
+    Close(Option<(String, bool)>),
+}
+
+/// Reads a whole cursor statement, or `None` when this is not one.
+fn read_cursor(sql: &str, scanned: &Scan<'_>) -> Option<CursorRead> {
+    let [first, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    // From the first *word*, so a leading comment cannot hide the verb — which is exactly what
+    // `/*action:index*/` does to a naive `trim_start`.
+    let body = sql.get(scanned.first_word.clone()?.start..)?;
+    let body = body.trim().trim_end_matches(';').trim_end();
+    if first.eq_ignore_ascii_case("CLOSE") {
+        let rest = strip_leading_word(body, "CLOSE")?;
+        if let Some(tail) = strip_leading_word(rest, "ALL")
+            && tail.trim().is_empty()
+        {
+            return Some(CursorRead::Close(None));
+        }
+        let (name, quoted, tail) = read_identifier(rest)?;
+        return tail
+            .trim()
+            .is_empty()
+            .then_some(CursorRead::Close(Some((name, quoted))));
+    }
+    if first.eq_ignore_ascii_case("DECLARE") {
+        let rest = strip_leading_word(body, "DECLARE")?;
+        let (name, quoted, mut rest) = read_identifier(rest)?;
+        // `BINARY`, `INSENSITIVE`/`ASENSITIVE` and `[NO] SCROLL` in any order, and all of them
+        // accepted and ignored: this node's cursors are read into memory, so every one of them is
+        // scrollable and insensitive whatever was asked for. `NO SCROLL` is therefore an
+        // over-acceptance — a backward `FETCH` works here and is an error on a real server — which
+        // is the direction contract C1 leaves open.
+        loop {
+            let stepped = ["BINARY", "INSENSITIVE", "ASENSITIVE", "SCROLL"]
+                .iter()
+                .find_map(|word| strip_leading_word(rest, word))
+                .or_else(|| {
+                    strip_leading_word(rest, "NO").and_then(|no| strip_leading_word(no, "SCROLL"))
+                });
+            match stepped {
+                Some(tail) => rest = tail,
+                None => break,
+            }
+        }
+        let rest = strip_leading_word(rest, "CURSOR")?;
+        let (hold, rest) = match strip_leading_word(rest, "WITH") {
+            Some(after) => (true, strip_leading_word(after, "HOLD")?),
+            None => match strip_leading_word(rest, "WITHOUT") {
+                Some(after) => (false, strip_leading_word(after, "HOLD")?),
+                None => (false, rest),
+            },
+        };
+        let query = strip_leading_word(rest, "FOR")?.trim();
+        return (!query.is_empty()).then(|| CursorRead::Declare {
+            name,
+            quoted,
+            hold,
+            query: query.to_owned(),
+        });
+    }
+    let only_move = first.eq_ignore_ascii_case("MOVE");
+    if !only_move && !first.eq_ignore_ascii_case("FETCH") {
+        return None;
+    }
+    let rest = strip_leading_word(body, if only_move { "MOVE" } else { "FETCH" })?;
+    let (direction, rest) = read_cursor_direction(rest);
+    // `FROM` and `IN` are noise here: PostgreSQL takes either, or neither.
+    let rest = strip_leading_word(rest, "FROM")
+        .or_else(|| strip_leading_word(rest, "IN"))
+        .unwrap_or(rest);
+    let (name, quoted, tail) = read_identifier(rest)?;
+    tail.trim().is_empty().then_some(CursorRead::Fetch {
+        name,
+        quoted,
+        direction,
+        only_move,
+    })
+}
+
+/// The direction words of a `FETCH` or `MOVE`, and what is left after them.
+///
+/// Thirteen spellings and three movements. No direction at all is `NEXT`, which is why the
+/// fallthrough is `Relative(1)` and not an error: `FETCH c` is the commonest form there is.
+fn read_cursor_direction(rest: &str) -> (crate::plan::CursorDirection, &str) {
+    use crate::plan::CursorDirection;
+
+    for (word, direction) in [
+        ("NEXT", CursorDirection::Relative(1)),
+        ("PRIOR", CursorDirection::Relative(-1)),
+        ("FIRST", CursorDirection::Absolute(1)),
+        // `LAST` is `ABSOLUTE -1`, which is what makes one arm serve both.
+        ("LAST", CursorDirection::Absolute(-1)),
+    ] {
+        if let Some(tail) = strip_leading_word(rest, word) {
+            return (direction, tail);
+        }
+    }
+    for (word, absolute) in [("ABSOLUTE", true), ("RELATIVE", false)] {
+        if let Some(tail) = strip_leading_word(rest, word)
+            && let Some((count, tail)) = read_signed_number(tail)
+        {
+            let direction = if absolute {
+                CursorDirection::Absolute(count)
+            } else {
+                CursorDirection::Relative(count)
+            };
+            return (direction, tail);
+        }
+    }
+    for (word, forward) in [("FORWARD", true), ("BACKWARD", false)] {
+        if let Some(tail) = strip_leading_word(rest, word) {
+            if let Some(after) = strip_leading_word(tail, "ALL") {
+                return (CursorDirection::All(forward), after);
+            }
+            if let Some((count, after)) = read_signed_number(tail) {
+                let step = if forward { count } else { -count };
+                return (CursorDirection::Relative(step), after);
+            }
+            return (
+                CursorDirection::Relative(if forward { 1 } else { -1 }),
+                tail,
+            );
+        }
+    }
+    if let Some(tail) = strip_leading_word(rest, "ALL") {
+        return (CursorDirection::All(true), tail);
+    }
+    if let Some((count, tail)) = read_signed_number(rest) {
+        return (CursorDirection::Relative(count), tail);
+    }
+    (CursorDirection::Relative(1), rest)
+}
+
+/// A signed integer at the front of `text`, and what follows it.
+fn read_signed_number(text: &str) -> Option<(i64, &str)> {
+    let text = text.trim_start();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1, rest.trim_start()),
+        None => (1, text.strip_prefix('+').map_or(text, str::trim_start)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let value: i64 = digits.get(..end)?.parse().ok()?;
+    Some((sign * value, digits.get(end..)?))
+}
+
+/// Each statement's own source text, in order, semicolon included.
+///
+/// **A walk and not a `split(';')`**, for the reason every other reader in this module is one: a
+/// semicolon inside a string, a quoted identifier, a dollar-quoted body or a comment is not a
+/// statement boundary, and the same five helpers that let [`scan`] skip those let this skip them.
+///
+/// Leading whitespace between statements is dropped and the terminator is kept, which is what
+/// PostgreSQL records: the second of two `PREPARE`s reports `PREPARE h1_b AS SELECT 2;` and not
+/// ` PREPARE h1_b AS SELECT 2`.
+fn statement_texts(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut texts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'-' if bytes.get(index + 1) == Some(&b'-') => index = line_comment_end(bytes, index),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => index = block_comment_end(bytes, index),
+            b'\'' => index = single_quote_end(bytes, index),
+            b'"' => index = double_quote_end(bytes, index),
+            // `None` is a `$` that opens nothing — `$1`, or a `$` inside an identifier.
+            b'$' => index = dollar_quote(bytes, index).unwrap_or(index + 1),
+            b';' => {
+                if let Some(text) = sql.get(start..=index) {
+                    let text = text.trim();
+                    if text.len() > 1 {
+                        texts.push(text);
+                    }
+                }
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    // The last statement, when the client wrote no closing semicolon — which is the common case
+    // over the wire, where the terminator is the message length.
+    if let Some(tail) = sql.get(start..) {
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            texts.push(tail);
+        }
+    }
+    texts
 }
 
 /// The language a `DO` block names, when this node does not run it.
@@ -2393,11 +2701,74 @@ pub fn classify(statement: &Statement) -> StatementClass {
         Statement::Discard {
             object_type: sqlparser::ast::DiscardObject::ALL,
         } => StatementClass::DiscardAll,
+        Statement::Prepare {
+            name, statement, ..
+        } => StatementClass::Prepare {
+            name: crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
+            body: statement.to_string(),
+        },
+        // A bare `EXECUTE` with no name is `sqlparser` accepting another dialect's spelling; it has
+        // no name to look up here and falls through to the refusal every other statement gets.
+        Statement::Execute {
+            name: Some(name),
+            parameters,
+            ..
+        } => StatementClass::Execute {
+            name: crate::catalog::fold_identifier(
+                &name.0.last().map(ToString::to_string).unwrap_or_default(),
+                false,
+            )
+            .0,
+            args: parameters.iter().map(argument_text).collect(),
+        },
+        // **`ALL` is a keyword here and a name when it is quoted.** `DEALLOCATE ALL` drops
+        // everything; `DEALLOCATE "ALL"` drops the statement called `ALL`, which PostgreSQL allows
+        // and which a case-insensitive match on the folded text alone would silently turn into the
+        // first.
+        Statement::Deallocate { name, .. } => StatementClass::Deallocate(
+            (name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("ALL")).then(|| {
+                crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0
+            }),
+        ),
         Statement::ReleaseSavepoint { name } => StatementClass::Release(
             crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
         ),
         Statement::Explain { .. } | Statement::ExplainTable { .. } => StatementClass::Explain,
         other => StatementClass::Other(feature_name(other)),
+    }
+}
+
+/// One `EXECUTE` argument as the text a `Bind` would have carried, or `None` for the whole list if
+/// it is not a literal.
+///
+/// **A negative number is a literal**, and `sqlparser` reads `-2` as a unary minus over `2`: a
+/// match on `Expr::Value` alone refuses `EXECUTE cc(-2, 1)`, which is in the corpus twice. The
+/// outer `Option` is the list's — `collect` over `Option` turns one unreadable argument into no
+/// list at all, and the session refuses by name rather than running with a hole in it.
+fn argument_text(expr: &sqlparser::ast::Expr) -> Option<Option<String>> {
+    use sqlparser::ast::{Expr as Ast, UnaryOperator, Value};
+    let (negated, value) = match expr {
+        Ast::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        other => (false, other),
+    };
+    let Ast::Value(value) = value else {
+        return None;
+    };
+    match &value.value {
+        Value::Number(digits, _) => Some(Some(if negated {
+            format!("-{digits}")
+        } else {
+            digits.clone()
+        })),
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+            Some(Some(text.clone()))
+        }
+        Value::Boolean(yes) => Some(Some(if *yes { "true" } else { "false" }.to_owned())),
+        Value::Null => Some(None),
+        _ => None,
     }
 }
 

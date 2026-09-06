@@ -166,6 +166,12 @@ pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 /// `FATAL: 57P01: terminating connection due to administrator command`.
 pub const ADMIN_SHUTDOWN: &str = "57P01";
 
+/// `PREPARE` naming a statement the session already has. Measured on 19beta1.
+pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
+
+/// `DECLARE` naming a cursor the transaction already has. Measured on 19.
+pub const DUPLICATE_CURSOR: &str = "42P03";
+
 // --- Class 26 — Invalid SQL Statement Name ---
 
 /// `Bind`/`Describe`/`Execute` naming a prepared statement that was never parsed.
@@ -419,6 +425,7 @@ mod tests {
             super::INVALID_AUTHORIZATION_SPECIFICATION,
         ),
         ("INVALID_CURSOR_NAME", super::INVALID_CURSOR_NAME),
+        ("DUPLICATE_CURSOR", super::DUPLICATE_CURSOR),
         (
             "DEPENDENT_OBJECTS_STILL_EXIST",
             super::DEPENDENT_OBJECTS_STILL_EXIST,

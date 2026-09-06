@@ -40,7 +40,7 @@ use esker_sql::backend::{Backend, MemoryBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::parse::{StatementClass, parse_statements};
-use esker_sql::pgwire::session::{Execute, Outcome, Params};
+use esker_sql::pgwire::session::{Execute, Outcome, Session};
 use esker_sql::value::PgType;
 
 /// How long a test waits for the other session to reach its edge before calling it wedged. Long
@@ -262,6 +262,14 @@ pub(crate) struct Node {
     /// (see [`Node::run`]).
     in_block: bool,
     failed: bool,
+    /// **The real session's statement store**, which is not mirrored and cannot be.
+    ///
+    /// `PREPARE`, `EXECUTE`, `DEALLOCATE` and the half of `DISCARD ALL` that clears them all act
+    /// on state the protocol owns, so a harness that only had an `Executor` answered `0A000` for
+    /// statements this node runs. It is the same `Session` a connection has, driven through
+    /// [`Session::run_statement`] — one implementation, two callers, rather than a third copy of
+    /// the dispatch below.
+    session: Session,
 }
 
 impl Node {
@@ -288,6 +296,7 @@ impl Node {
                 .serving_database(database),
             in_block: false,
             failed: false,
+            session: Session::new(),
         };
         for statement in fixture {
             node.run(statement)
@@ -380,7 +389,9 @@ impl Node {
                         ))
                     }
                 }
-                _ => self.executor.execute(&parsed, &Params::NONE),
+                // **Not `executor.execute`**: the statements whose whole effect is on the
+                // session's own store go through the session, which is where a client's go.
+                _ => self.session.run_statement(&parsed, &mut self.executor),
             };
             match outcome {
                 Ok(outcome) => last = outcome,
