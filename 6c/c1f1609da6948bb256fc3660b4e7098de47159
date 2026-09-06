@@ -1,0 +1,35 @@
+crates/esker-sql/src/backend/locks.rs
+  s_2d916f5f540186::t_9c1d553ea7b801 38-45,66-70,80-82,87,92-99,110-113,153-156,202-203,206-211,214-219,235-236
+crates/esker-sql/src/backend/mod.rs
+  s_2d916f5f540186::t_751585ecd67eff 209-217,556,581,636-638,760-764,893-896
+crates/esker-sql/src/backend/store.rs
+  s_2d916f5f540186::t_d00a545643c6eb 103,190-191,271-275,327
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2d916f5f540186::t_7924026528f4dc 1586-1590,1596,1617,1626,1647
+crates/esker-sql/src/exec/mod.rs
+  s_2d916f5f540186::t_14ddc278e25e26 279,867-879,882,1209,1371,1498,1531,1540,1553,1938,1965,2159,2190,2281
+crates/esker-sql/src/exec/savepoint.rs
+  s_2d916f5f540186::t_77cd5bbf5a4960 243-248
+crates/esker-sql/tests/cross_session_cancel.rs
+  s_2d916f5f540186::t_b835d07325d243 410-415
+crates/esker-sql/tests/pg_locks.rs
+  s_2d916f5f540186::t_b2c13f15087191 237-337
+crates/esker-sql/tests/redrive.rs
+  s_2d916f5f540186::t_94bc597d3167f5 347-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6cc1f1609da6948bb256fc3660b4e7098de47159",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
