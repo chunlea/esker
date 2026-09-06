@@ -7152,12 +7152,42 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
 /// is simply a name nothing substituted — and the relation lookup that follows it is the `42P01`
 /// with the `DETAIL` and `HINT` PostgreSQL sends. That ordering is also what makes a
 /// self-reference an error rather than a loop.
+/// Whether a `WITH` item's body names the item itself — the thing that makes it recursive.
+///
+/// The parser's own text is the cheapest total answer here and the safest: walking the AST for a
+/// table factor would have to know every place a relation can be named, and a shape it had not
+/// been taught would read as "not recursive" and then inline forever. A word match over the
+/// rendered body can only err the other way — calling something recursive that is not — and that
+/// error is a refusal rather than a loop.
+fn references(body: &Query, name: &str) -> bool {
+    let text = body.to_string();
+    let lowered = text.to_ascii_lowercase();
+    let wanted = name.to_ascii_lowercase();
+    lowered
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word == wanted)
+}
+
 fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> Result<()> {
     let Some(with) = with else { return Ok(()) };
-    // A second evaluation model -- a working table iterated to a fixed point, with its own
-    // termination and its own memory bound. It is a phase, not a unit
-    // (`docs/plans/phase-12-subquery.md` §4).
-    refuse_if(with.recursive, "WITH RECURSIVE")?;
+    // **`RECURSIVE` is a keyword about the *bodies*, not about the list.** A `WITH RECURSIVE`
+    // whose body does not reference itself is an ordinary `WITH` on a real server and answers —
+    // measured, `WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t` is `1` — so the keyword
+    // alone is not the refusal. What this node cannot do is the fixpoint: a CTE here is *inlined*
+    // (`crate::plan::cte`), and a body that names itself cannot be, because substituting it would
+    // never terminate. That needs a working table iterated to a fixed point, with its own
+    // termination rule and its own memory bound, and it is refused by name below — per body, so
+    // the non-recursive ones in the same list still run.
+    if with.recursive {
+        for cte in &with.cte_tables {
+            let name = ident(&cte.alias.name);
+            if references(&cte.query, &name) {
+                return Err(SqlError::unsupported(format!(
+                    "WITH RECURSIVE over {name}, whose body names itself"
+                )));
+            }
+        }
+    }
 
     // Every name up front, because deciding whether a reference is a *forward* one needs the list
     // the body being lowered is not yet part of.

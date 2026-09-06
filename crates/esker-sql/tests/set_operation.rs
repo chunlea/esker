@@ -183,6 +183,64 @@ fn an_order_by_cannot_name_the_column_the_first_arm_renamed() {
     assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_COLUMN);
 }
 
+/// **A `UNION ALL` inside a `WITH`**, which is the statement `with_test.rb` sends.
+#[test]
+fn a_cte_body_may_be_a_set_operation() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows("WITH t AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM t"),
+        vec![vec!["1"], vec!["2"]]
+    );
+    // Three arms with a parenthesised one in the middle: `with_test.rb`'s own shape.
+    assert_eq!(
+        node.rows(
+            "WITH t AS (SELECT i FROM so UNION ALL (SELECT i FROM so) UNION ALL SELECT 9) \
+             SELECT * FROM t"
+        )
+        .len(),
+        5
+    );
+}
+
+/// **`RECURSIVE` is a keyword about the bodies, not about the list.**
+///
+/// A `WITH RECURSIVE` whose body does not name itself is an ordinary `WITH` on a real server and
+/// answers — measured — so the keyword alone is not a refusal here either.
+#[test]
+fn with_recursive_over_a_body_that_is_not_recursive_answers() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows("WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        node.rows("WITH RECURSIVE t AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM t"),
+        vec![vec!["1"], vec!["2"]]
+    );
+}
+
+/// A body that **does** name itself is refused by name, and the name is the CTE's.
+///
+/// The fixpoint is a second evaluation model, not a variation on this one: a CTE here is inlined
+/// (`plan::cte`), and a body that names itself cannot be — substituting it would never terminate.
+/// What it needs is a working table iterated to a fixed point with its own termination rule and
+/// its own memory bound.
+#[test]
+fn a_body_that_names_itself_is_refused_by_name() {
+    let mut node = parity::Node::new(FIXTURE);
+    let error = node
+        .run(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) \
+              SELECT n FROM t",
+        )
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert!(
+        error.to_string().contains("whose body names itself"),
+        "the refusal did not say why: {error}"
+    );
+}
+
 #[test]
 fn what_this_commit_does_not_do_is_named() {
     let mut node = parity::Node::new(FIXTURE);

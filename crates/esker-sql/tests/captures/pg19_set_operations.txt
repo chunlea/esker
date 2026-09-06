@@ -76,3 +76,34 @@
 #     SELECT NULL::int UNION SELECT NULL::int        ->  one row   NULL is equal to NULL here
 #     SELECT 1 INTERSECT SELECT 1                    ->  1
 #     SELECT 1 EXCEPT SELECT 2                       ->  1
+#
+# ## `WITH RECURSIVE`, measured for the commit that does not build it
+#
+#     WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t                  ->  1
+#
+# **The keyword is about the bodies, not the list**: a `WITH RECURSIVE` whose body does not name
+# itself is an ordinary `WITH` and answers. So the keyword alone is not a refusal.
+#
+#     WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5) SELECT n FROM t
+#         ->  1, 2, 3, 4, 5
+#     WITH RECURSIVE t AS (
+#       SELECT id, firm_id FROM co WHERE firm_id IS NULL
+#       UNION ALL
+#       SELECT c.id, c.firm_id FROM co c JOIN t ON c.firm_id = t.id
+#     ) SELECT id FROM t ORDER BY id                                       ->  1, 2, 3, 4
+#
+# — the second is `with_test.rb`'s own statement, one table smaller.
+#
+#     WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT 1 FROM t) SELECT n FROM t   ->  1
+#
+# **The dedup is what terminates that one**: with `UNION` the second iteration produces a row the
+# working table already has, so there is nothing to carry forward. With `UNION ALL` it would not
+# terminate at all — and PostgreSQL answers it anyway when a `LIMIT` bounds the reading:
+#
+#     WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t) SELECT n FROM t LIMIT 3
+#         ->  1, 1, 1
+#
+# That last row is the one a bounded implementation cannot reproduce. A fixpoint that materialises
+# hits its iteration cap and must **raise** rather than loop; PostgreSQL streams the working table
+# and the `LIMIT` stops it. Whichever cap is chosen, that statement is a declared divergence and
+# not a bug in the cap.
