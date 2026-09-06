@@ -2504,9 +2504,6 @@ const UNSUPPORTED: &[Unsupported] = &[
         &["NULLS", "NOT", "DISTINCT"],
     ),
     u("BETWEEN SYMMETRIC", &[], &["BETWEEN", "SYMMETRIC"]),
-    u("TRIM(BOTH ...)", &[], &["TRIM", "BOTH"]),
-    u("TRIM(LEADING ...)", &[], &["TRIM", "LEADING"]),
-    u("TRIM(TRAILING ...)", &[], &["TRIM", "TRAILING"]),
     u(
         "a window frame EXCLUDE clause",
         &[],

@@ -4043,6 +4043,34 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
 /// one is `text || text` on a real server, because no `jsonb || text` operator exists. That
 /// quantifier is what the evaluator uses, and the two must agree or the rows and the declared
 /// type part company. They had: `a || b` over two jsonb columns merged correctly and said `text`.
+/// The type `greatest`/`least` answer: the arguments' common type.
+///
+/// **Folded through the arithmetic promotion rather than written a second time.** A rule here that
+/// disagreed with `value::arith::result_type` would be a column whose declared type is not the
+/// type of its values, which that module's own header calls worse than either being wrong alone.
+/// Every measurement agrees with it: `int2` beside `int8` is `bigint`, an integer beside a decimal
+/// is `numeric`, and one beside a `float8` is `double precision`
+/// (`tests/captures/pg19_greatest_trim.txt`).
+///
+/// Arguments that share a type keep it — which is how `greatest('a', 'b')` is `text` — and a pair
+/// the promotion has no rule for keeps the first argument's, because the *rows* are still that
+/// type and a refusal here would be this node raising where a real server answers.
+fn greatest_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
+    let mut found: Option<ColumnType> = None;
+    for arg in args {
+        let Ok(ty) = expr_type(arg, scope) else {
+            continue;
+        };
+        found = Some(match found {
+            None => ty,
+            Some(sofar) if sofar == ty => sofar,
+            Some(sofar) => crate::value::arith::result_type(crate::plan::ArithOp::Add, sofar, ty)
+                .unwrap_or(sofar),
+        });
+    }
+    found.unwrap_or(ColumnType::Text)
+}
+
 fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
     // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
     // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
@@ -4175,6 +4203,16 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // binds against.
         Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreFetch => {
             arrow_fetch(call.func, &call.args, scope).result_type()
+        }
+        // **The common type of the arguments**, which is what a real server resolves and what
+        // `CatalogFunc::result_type` cannot answer without them. Measured: `int2` beside `int8`
+        // is `bigint`, an integer beside a decimal is `numeric`, and one beside a `float8` is
+        // `double precision` — the same promotion arithmetic makes, so it is folded through that
+        // rule rather than written a second time.
+        Expr::CatalogFunc(call)
+            if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) =>
+        {
+            greatest_type(&call.args, scope)
         }
         Expr::CatalogFunc(call) => call.func.result_type(),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,

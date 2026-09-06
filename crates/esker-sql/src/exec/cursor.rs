@@ -2912,6 +2912,55 @@ fn catalog_function(
             // Strict: any NULL argument is a NULL answer, and a non-text one has no `replace`.
             _ => Datum::Null,
         },
+        // **The characters are a set, not a prefix**: `TRIM(BOTH 'ab' FROM 'abcba')` is `c`,
+        // measured. One argument trims whitespace, which is what a bare `TRIM(x)` means.
+        CatalogFunc::Btrim | CatalogFunc::Ltrim | CatalogFunc::Rtrim => {
+            match (args.first(), args.get(1)) {
+                (Some(Datum::Null), _) | (_, Some(Datum::Null)) => Datum::Null,
+                (Some(value), set) => {
+                    let Some(text) = value.to_text() else {
+                        return Ok(Datum::Null);
+                    };
+                    let set: Vec<char> = match set {
+                        None => vec![' ', '\t', '\n', '\r', '\x0b', '\x0c'],
+                        Some(chars) => chars.to_text().unwrap_or_default().chars().collect(),
+                    };
+                    let cut = |text: &str| -> String {
+                        let trimmed = match call.func {
+                            CatalogFunc::Ltrim => text.trim_start_matches(|c| set.contains(&c)),
+                            CatalogFunc::Rtrim => text.trim_end_matches(|c| set.contains(&c)),
+                            _ => text.trim_matches(|c| set.contains(&c)),
+                        };
+                        trimmed.to_owned()
+                    };
+                    Datum::Text(cut(&text))
+                }
+                (None, _) => Datum::Null,
+            }
+        }
+        // **Not strict**: a NULL argument is skipped, and the answer is NULL only when every one
+        // of them is. Measured — `GREATEST(1, NULL, 3)` is `3`, where almost everything else in
+        // this evaluator propagates a NULL.
+        CatalogFunc::Greatest | CatalogFunc::Least => {
+            let mut best: Option<&Datum> = None;
+            for arg in &args {
+                if matches!(arg, Datum::Null) {
+                    continue;
+                }
+                best = Some(match best {
+                    None => arg,
+                    Some(sofar) => {
+                        let take = if call.func == CatalogFunc::Greatest {
+                            arg.pg_cmp(sofar) == Ordering::Greater
+                        } else {
+                            arg.pg_cmp(sofar) == Ordering::Less
+                        };
+                        if take { arg } else { sofar }
+                    }
+                });
+            }
+            best.cloned().unwrap_or(Datum::Null)
+        }
         CatalogFunc::Concat => Datum::Text(
             args.iter()
                 .filter(|arg| !matches!(arg, Datum::Null))

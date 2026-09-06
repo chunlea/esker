@@ -782,6 +782,11 @@ impl CatalogFuncCall {
             // family rather than assumed, since `concat` next door is `STABLE`.
             | CatalogFunc::SplitPart
             | CatalogFunc::StrPos
+            | CatalogFunc::Btrim
+            | CatalogFunc::Ltrim
+            | CatalogFunc::Rtrim
+            | CatalogFunc::Greatest
+            | CatalogFunc::Least
             | CatalogFunc::Substr
             | CatalogFunc::Substring => true,
             _ => false,
@@ -1193,6 +1198,27 @@ pub enum CatalogFunc {
     ///
     /// An empty needle is `1`, measured — it matches at the start rather than nowhere.
     StrPos,
+    /// `btrim(text)` and `btrim(text, characters)` — and the three `TRIM` spellings that lower
+    /// here, with [`CatalogFunc::Ltrim`] and [`CatalogFunc::Rtrim`].
+    ///
+    /// **The second argument is a *set* of characters, not a prefix.** Measured:
+    /// `TRIM(BOTH 'ab' FROM 'abcba')` is `c`, not `cba` — every leading and trailing character
+    /// that is in the set goes, in any order and any number. One argument trims whitespace.
+    Btrim,
+    /// `ltrim`, and `TRIM(LEADING …)`.
+    Ltrim,
+    /// `rtrim`, and `TRIM(TRAILING …)`.
+    Rtrim,
+    /// `greatest(...)` and [`CatalogFunc::Least`]: variadic, and **not strict**.
+    ///
+    /// They *skip* NULLs where almost everything else propagates them — measured,
+    /// `GREATEST(1, NULL, 3)` is `3` and `LEAST(NULL, 2)` is `2` — and answer NULL only when
+    /// every argument is one. One argument is legal and answers itself; **zero is a syntax
+    /// error**, `42601 syntax error at or near ")"`, because the grammar requires an argument
+    /// rather than the function refusing an empty list.
+    Greatest,
+    /// `least(...)`, which is [`CatalogFunc::Greatest`] with the comparison turned round.
+    Least,
     /// `substr(text, from[, count])`: the substring, 1-based and clamped.
     ///
     /// **`from` may be zero or negative**, and the clamp is what makes those work: the result is
@@ -1316,6 +1342,11 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
             () if name.eq_ignore_ascii_case("split_part") => Some(CatalogFunc::SplitPart),
             () if name.eq_ignore_ascii_case("strpos") => Some(CatalogFunc::StrPos),
+            () if name.eq_ignore_ascii_case("btrim") => Some(CatalogFunc::Btrim),
+            () if name.eq_ignore_ascii_case("ltrim") => Some(CatalogFunc::Ltrim),
+            () if name.eq_ignore_ascii_case("rtrim") => Some(CatalogFunc::Rtrim),
+            () if name.eq_ignore_ascii_case("greatest") => Some(CatalogFunc::Greatest),
+            () if name.eq_ignore_ascii_case("least") => Some(CatalogFunc::Least),
             () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
             () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
             () if name.eq_ignore_ascii_case("replace") => Some(CatalogFunc::Replace),
@@ -1437,6 +1468,11 @@ impl CatalogFunc {
             CatalogFunc::Concat => "concat",
             CatalogFunc::SplitPart => "split_part",
             CatalogFunc::StrPos => "strpos",
+            CatalogFunc::Btrim => "btrim",
+            CatalogFunc::Ltrim => "ltrim",
+            CatalogFunc::Rtrim => "rtrim",
+            CatalogFunc::Greatest => "greatest",
+            CatalogFunc::Least => "least",
             CatalogFunc::Substr => "substr",
             CatalogFunc::Substring => "substring",
             CatalogFunc::Replace => "replace",
@@ -1481,6 +1517,10 @@ impl CatalogFunc {
             | CatalogFunc::TsRank
             | CatalogFunc::SetWeight
             | CatalogFunc::StrPos => &[2],
+            // One argument trims whitespace, two trim a set of characters.
+            CatalogFunc::Btrim | CatalogFunc::Ltrim | CatalogFunc::Rtrim => &[1, 2],
+            // Variadic like `concat`, and one argument is legal: `GREATEST(1)` is `1`.
+            CatalogFunc::Greatest | CatalogFunc::Least => &CONCAT_ARITIES,
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
@@ -1561,7 +1601,17 @@ impl CatalogFunc {
             // **`UserFunc` is never evaluated and never typed** — it is replaced by the body's
             // expression before anything asks — so it joins the text-returning group rather than
             // claiming an answer of its own.
-            CatalogFunc::UserFunc
+            // **`greatest` and `least` answer their arguments' common type**, which this
+            // function cannot say: it takes no arguments. `exec::query::expr_type` has an arm
+            // above the one that calls this, the way `hstore`'s `->` does, and it is the answer
+            // a client is told; `text` here is only what a caller that skipped that arm would
+            // see, and there is no such caller.
+            CatalogFunc::Greatest
+            | CatalogFunc::Least
+            | CatalogFunc::Btrim
+            | CatalogFunc::Ltrim
+            | CatalogFunc::Rtrim
+            | CatalogFunc::UserFunc
             | CatalogFunc::FormatType
             | CatalogFunc::PgGetExpr
             | CatalogFunc::PgGetIndexdef

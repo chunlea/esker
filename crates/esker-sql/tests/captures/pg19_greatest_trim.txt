@@ -1,0 +1,69 @@
+# **`GREATEST`/`LEAST` and `TRIM`'s three forms** — PostgreSQL 19beta1, 2026-09-05.
+#
+# `insert_all_test.rb` needs the first — `ON CONFLICT ("id") DO UPDATE SET status =
+# GREATEST(books.status, 1)` was `0A000 the function GREATEST is not supported` — and two errors
+# elsewhere need `TRIM(title)`. One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe.
+#
+# ## GREATEST and LEAST
+#
+#     GREATEST(1, 2, 3)                       3          pg_typeof  integer
+#     LEAST(1, 2, 3)                          1
+#     GREATEST(1)                             1          one argument is legal
+#     GREATEST()                              42601 syntax error at or near ")"
+#     greatest(1, 2)                          2          the name folds
+#
+# **They are not strict, and that is the rule reasoning gets wrong**: a NULL argument is *skipped*
+# where almost every other function propagates it.
+#
+#     GREATEST(1, NULL, 3)                    3
+#     LEAST(NULL, 2)                          2
+#     GREATEST(NULL::int, NULL::int)          NULL       every argument NULL, and only then
+#
+# The type is the arguments' common type, and it is PostgreSQL's ordinary promotion:
+#
+#     GREATEST(1::int2, 2::int8)              bigint
+#     GREATEST(1, 2.5)                        numeric
+#     GREATEST(1::int4, 2.5::float8)          double precision
+#     GREATEST(1::int4, 2.5::numeric)         2.5
+#     GREATEST('a', 'b')                      b          text
+#     GREATEST('2020-01-01'::date, '2021-01-01'::date)   2021-01-01
+#
+# An argument that cannot be read as the resolved type fails **as that type**, not as a function
+# resolution error:
+#
+#     GREATEST(1, 'a')     22P02 invalid input syntax for type integer: "a"
+#
+# ## TRIM
+#
+#     TRIM('  x  ')                    x        BOTH is the default
+#     TRIM(BOTH FROM '  x  ')          x
+#     TRIM(LEADING FROM '  x  ')       'x  '
+#     TRIM(TRAILING FROM '  x  ')      '  x'
+#
+#     TRIM(BOTH 'x' FROM 'xxhixx')     hi
+#     TRIM(LEADING 'x' FROM 'xxhixx')  hixx
+#     TRIM(TRAILING 'x' FROM 'xxhixx') xxhi
+#     TRIM('x' FROM 'xxhixx')          hi       no keyword, same as BOTH
+#
+# **The characters are a SET, not a prefix**, and this is the row a reader would get wrong:
+#
+#     TRIM(BOTH 'ab' FROM 'abcba')     c
+#
+# — not `cba`. Every leading and trailing character that is *in* the set is removed, in any order
+# and any number, until one that is not.
+#
+# The function spellings are the same three:
+#
+#     btrim('  x  ')      x       btrim('xxhixx', 'x')   hi
+#     ltrim('xxhi', 'x')  hi      rtrim('hixx', 'x')     hi
+#
+# **`sqlparser` 0.62 will not parse `TRIM(<side> FROM x)`** — the side written out with no
+# characters — and reports `Expected: ), found: …`. PostgreSQL answers `x`. The lowering here
+# already handles it (`trim_what` is an `Option`), so it closes the day the parser produces it;
+# nothing in the suite writes that form. Recorded rather than worked around, because rewriting the
+# text before parsing is how a keyword ends up in a refusal table taking the blame for a gap
+# somewhere else.
+#
+#     pg_typeof(TRIM('  x  '))        text
+#     pg_typeof(TRIM('x'::varchar))   text      a varchar in, a text out
+#     TRIM(NULL)                      NULL

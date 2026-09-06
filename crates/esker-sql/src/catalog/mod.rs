@@ -1070,7 +1070,7 @@ impl TypeKind {
         match self {
             TypeKind::Range { .. } | TypeKind::Composite { .. } => -1,
             TypeKind::Enum { .. } => 4,
-            TypeKind::Domain { base, .. } => crate::value::PgType::type_len(*base),
+            TypeKind::Domain { base, .. } => value::PgType::type_len(*base),
         }
     }
 }

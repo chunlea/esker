@@ -22,7 +22,7 @@ use sqlparser::ast::{
     GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
     LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
     SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TimezoneInfo, UnaryOperator, UtilityOption, Value,
+    TableObject, TimezoneInfo, TrimWhereField, UnaryOperator, UtilityOption, Value,
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
@@ -4157,6 +4157,38 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::Cast {
             expr, data_type, ..
         } => lower_cast(expr, data_type),
+        // **`TRIM`'s three forms are three functions**, which is what a real server's own
+        // `pg_get_expr` says when it deparses one: `TRIM(BOTH …)` is `btrim`, `LEADING` is
+        // `ltrim`, `TRAILING` is `rtrim`, and no keyword at all is `BOTH`. The characters are a
+        // **set** and not a prefix — `TRIM(BOTH 'ab' FROM 'abcba')` is `c` — so the second
+        // argument goes through unchanged and the evaluator does the work
+        // (`tests/captures/pg19_greatest_trim.txt`).
+        Expr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => {
+            let func = match trim_where {
+                Some(TrimWhereField::Leading) => plan::CatalogFunc::Ltrim,
+                Some(TrimWhereField::Trailing) => plan::CatalogFunc::Rtrim,
+                Some(TrimWhereField::Both) | None => plan::CatalogFunc::Btrim,
+            };
+            let mut args = vec![lower_expr(expr)?];
+            // Two spellings of the same second argument: `TRIM(BOTH 'x' FROM y)` puts it in
+            // `trim_what`, and PostgreSQL's `trim(y, 'x')` in `trim_characters`.
+            if let Some(what) = trim_what {
+                args.push(lower_expr(what)?);
+            } else if let Some(chars) = trim_characters {
+                for one in chars {
+                    args.push(lower_expr(one)?);
+                }
+            }
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func,
+                args,
+            })))
+        }
         // `DATE '2020-01-01'` and `TIMESTAMP '…'`: SQL's typed-literal spelling, which is the
         // **same thing** as the cast written the other way round — a real server records no
         // difference between `DATE 'x'` and `'x'::date`, so neither does this.
