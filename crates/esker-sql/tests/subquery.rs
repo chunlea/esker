@@ -301,9 +301,15 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
     let mut node = parity::Node::new(FIXTURE);
 
     for (statement, named) in [
+        // **The recursive body, not the keyword.** This entry used to be
+        // `WITH RECURSIVE t AS (SELECT 1 AS n)`, which is an ordinary `WITH` on a real server
+        // and answers `1` — measured — and this node now answers it too. What is still refused
+        // is a body that *names itself*, which the inlining a CTE uses here cannot do
+        // (`tests/set_operation.rs`).
         (
-            "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t",
-            "WITH",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) \
+             SELECT n FROM t",
+            "WITH RECURSIVE",
         ),
         // The boundary with the type lane's arrays is decided by the **right-hand side** and not
         // by the quantifier: `= ANY (array)` is `IN (list)` and runs, any other operator over an

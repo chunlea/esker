@@ -6855,10 +6855,6 @@ fn merge_limits(inner: Option<LimitClause>, outer: Option<LimitClause>) -> Optio
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
-)]
 /// One arm of a set operation, lowered.
 ///
 /// A **parenthesised** arm is a query and may carry its own `ORDER BY` or `LIMIT` — measured, and
@@ -6871,7 +6867,7 @@ fn lower_set_arm(template: &Query, body: &SetExpr) -> Result<plan::Select> {
         return lower_query(inner);
     }
     let mut arm = template.clone();
-    arm.body = Box::new(body.clone());
+    *arm.body = body.clone();
     // The set's, not the arm's — every one of them measured on the oracle.
     arm.with = None;
     arm.order_by = None;
@@ -6879,6 +6875,10 @@ fn lower_set_arm(template: &Query, body: &SetExpr) -> Result<plan::Select> {
     lower_query(&arm)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
+)]
 fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(query.fetch.is_some(), "FETCH FIRST")?;
     refuse_if(query.for_clause.is_some(), "FOR XML/JSON")?;

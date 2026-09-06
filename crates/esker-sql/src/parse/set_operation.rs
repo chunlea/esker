@@ -72,8 +72,9 @@ fn operator(op: SetOperator) -> Result<plan::SetOp> {
         SetOperator::Intersect => plan::SetOp::Intersect,
         SetOperator::Except => plan::SetOp::Except,
         // `MINUS` is Oracle's spelling of `EXCEPT` and PostgreSQL does not have it, so it is
-        // refused by its own name rather than answered as something it is not.
-        other => return Err(SqlError::unsupported(format!("{other}"))),
+        // refused by its own name rather than answered as something it is not. Named rather than
+        // matched by a wildcard, so that a fourth operator is a compile error here.
+        SetOperator::Minus => return Err(SqlError::unsupported("MINUS")),
     })
 }
 
