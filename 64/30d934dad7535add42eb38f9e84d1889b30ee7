@@ -1,0 +1,68 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 226-240,285,312,358,421,485-489,793-807,961,984,1144,1695-1739
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 202-214,2609-2659,2714-2715,2724,2749-2750,3051,3061-3064,3114-3118
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 218-226,866-871,1091-1097,1188-1203,1230-1235
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 59-63,72,319,377-380
+crates/esker-sql/src/exec/declared_cursor.rs
+  h_44076b318daf9c 1-167
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 34,95-109,325-339,392-394,738-739,921-926,1084,1112-1129,1324,1328,1564-1568,3614,3758-3761,3812-3819
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 91-95,1436-1441,1464-1560,6767-6857,6870-6876
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 158-186,268-273,275-290,425-430,599-602,655-657,672-678,680-681,687-691,693,717-948,2704-2732,2741-2774
+crates/esker-sql/src/pgwire/message.rs
+  h_44076b318daf9c 398-403,441-448,450,658,671,692-695,697
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 786-788
+crates/esker-sql/src/pgwire/session.rs
+  h_44076b318daf9c 138-151,256-268,310-423,471,671-675,732-747,768-770,796,798-812,872-946,984-1043,1087-1092,1118-1121
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 57,173-174,218-219,314-333,388
+crates/esker-sql/src/plan/session.rs
+  h_44076b318daf9c 89-170,198-200
+crates/esker-sql/src/session.rs
+  h_44076b318daf9c 63-94
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 169-174,428
+crates/esker-sql/tests/cached_plan_result_type.rs
+  h_44076b318daf9c 1-282
+crates/esker-sql/tests/cross_session_cancel.rs
+  h_44076b318daf9c 335-435
+crates/esker-sql/tests/cursors.rs
+  h_44076b318daf9c 1-264
+crates/esker-sql/tests/discard_all.rs
+  h_44076b318daf9c 31-39,45-48,106-112
+crates/esker-sql/tests/many_parameters.rs
+  h_44076b318daf9c 1-149
+crates/esker-sql/tests/parenthesised_query_body.rs
+  h_44076b318daf9c 1-138
+crates/esker-sql/tests/parity_harness/mod.rs
+  h_44076b318daf9c 43,265-272,299,392-394
+crates/esker-sql/tests/pg_prepared_statements.rs
+  h_44076b318daf9c 1-268
+crates/esker-sql/tests/prepared_sql.rs
+  h_44076b318daf9c 1-267
+crates/esker-sql/tests/show_multi_word_names.rs
+  h_44076b318daf9c 1-105
+crates/esker-sql/tests/statement_text.rs
+  h_44076b318daf9c 1-100
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 752-754
+docs/plans/phase-6a.md
+  h_44076b318daf9c 494
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6430d934dad7535add42eb38f9e84d1889b30ee7",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
