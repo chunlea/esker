@@ -1,0 +1,21 @@
+crates/esker-client/tests/prewrite_ordering.rs
+  s_2bed4ac2b1c944::t_017e75d1b6f93f 1-217
+docs/plans/cross-node-deadlock.md
+  s_2bed4ac2b1c944::t_7af6fef0920583 85-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "758e7223298f4dbcdbf862778c6f63c6f71d852e",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
