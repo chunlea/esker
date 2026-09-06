@@ -324,6 +324,10 @@ const TAG_REGTYPE_ARRAY: u8 = 89;
 /// which keeps the one-below offset the comment above records. Append-only, as that space is:
 /// a tag is a byte on disk and an old reader must refuse a new one rather than guess.
 const TAG_REGCLASS: u8 = 90;
+/// `int2vector` and `oidvector`, which share `text`'s representation and need a tag of their own
+/// only so that a stored column can say which it is.
+const TAG_INT2VECTOR: u8 = 91;
+const TAG_OIDVECTOR: u8 = 92;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -459,6 +463,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Oid => TAG_OID,
         ColumnType::RegType => TAG_REGTYPE,
         ColumnType::RegClass => TAG_REGCLASS,
+        ColumnType::Int2Vector => TAG_INT2VECTOR,
+        ColumnType::OidVector => TAG_OIDVECTOR,
         ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
@@ -597,6 +603,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_OID => ColumnType::Oid,
         TAG_REGTYPE => ColumnType::RegType,
         TAG_REGCLASS => ColumnType::RegClass,
+        TAG_INT2VECTOR => ColumnType::Int2Vector,
+        TAG_OIDVECTOR => ColumnType::OidVector,
         TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,

@@ -11,19 +11,20 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing `pg_catalog` trade, and one addition to it that is this unit's own: `attname`
-    // and `relname` are `name` on a real server, and **`indkey` is an `int2vector`** where it is
-    // `text` here. That is the representation this unit chose deliberately and the reason is in
-    // `crate::value::vector` — an array is a value the operators read out of its own text form,
-    // because a `Datum` variant would be a row-codec type for something that can never be stored
-    // and a `ColumnType` would put an array row in `pg_type` advertising a column this node
-    // refuses to create.
+    // The standing `pg_catalog` trade: `attname` and `relname` are `name` on a real server and
+    // `text` here.
     //
-    // **Every row agrees**, on all seventeen statements, `2 3` included: `int2vectorout` is what
-    // this column already held, and `ActiveRecord` reads it with `String#split(" ")`.
+    // **`indkey` is no longer part of it.** This list used to carry it too, on the argument that a
+    // `ColumnType` "would put an array row in `pg_type` advertising a column this node refuses to
+    // create" — and the answer to that turned out to be that `int2vector` is not an array: it is a
+    // scalar type on a real server, in `pg_type` with oid 22, and `CREATE TABLE t (v int2vector)`
+    // works there. So it is a `ColumnType` now, sharing text's representation the way `json` and
+    // `jsonb` do, and the entry whose only difference was `indkey` has come off under rule 2.
+    //
+    // **Every row still agrees**: `int2vectorout` is the space-separated numbers this column
+    // already held, and `ActiveRecord` reads it with `String#split(" ")`.
     types: &[
         "SELECT i.relname, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ak'::regclass ORDER BY i.relname",
-        "SELECT x.indkey, x.indkey::text FROM pg_index x WHERE x.indexrelid = 'ak_c'::regclass",
         "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
         "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak2'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
         "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indexrelid = 'ak_ab'::regclass ORDER BY array_position(i.indkey, a.attnum)",

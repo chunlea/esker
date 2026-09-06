@@ -50,6 +50,15 @@ mod tests {
                 .boxed(),
             // The same for a `regclass`, whose name may carry a schema: what resolved it decides
             // whether it is qualified, so the codec carries the string it was handed.
+            // Space-separated numbers, which is all a vector holds.
+            ColumnType::Int2Vector | ColumnType::OidVector => {
+                proptest::sample::select(vec![
+                    Datum::Text(String::new()),
+                    Datum::Text("1".to_owned()),
+                    Datum::Text("1 2 3".to_owned()),
+                ])
+                .boxed()
+            }
             ColumnType::RegClass => (any::<i64>(), "[a-z. ]{0,12}")
                 .prop_map(|(oid, name)| Datum::RegClass {
                     oid,

@@ -1,0 +1,48 @@
+# **`int2vector` and `oidvector`: what `pg_index` and `pg_proc` really declare** — PostgreSQL
+# 19beta1, 2026-09-05.
+#
+# The queue called this "`pg_index.indkey` as **oidvector** (22)". The name and the number belong
+# to two different types, and one command settled it:
+#
+#     attname       format_type
+#     indkey        int2vector      oid 22
+#     indoption     int2vector      oid 22
+#     indclass      oidvector       oid 30
+#     indcollation  oidvector       oid 30
+#     pg_proc.proargtypes  oidvector  oid 30
+#
+# So `indkey` is an **`int2vector`** — the oid in the brief was right and the name belonged to the
+# column next to it. Two types, not one.
+#
+# ## What they hold, and how they print
+#
+#     CREATE TABLE ivx_b4 (a int4, b text, c int8);
+#     CREATE INDEX ivx_b4_ab ON ivx_b4 (a, b);
+#
+#     indkey      1 2          the attnums, space separated
+#     indclass    1978 3126    the opclass oids, the same way
+#     indoption   0 0          one per key column, 0 for ASC NULLS LAST
+#     proargtypes 25 25        `btrim(text, text)`
+#
+# ## The catalog rows
+#
+#     typname     oid  typlen  typtype  typcategory  typelem  typinput       typalign  typstorage
+#     int2vector  22   -1      b        A            21       int2vectorin   i         p
+#     oidvector   30   -1      b        A            26       oidvectorin    i         p
+#
+# **`typcategory` is `A`** for both, which is the array category — and neither is an array type:
+# `typtype` is `b`, a base type, and there is no `_int2vector` behind them. That pair of facts is
+# what says a `ColumnType` of its own is right and an array is not: `CREATE TABLE t (v int2vector)`
+# is accepted on a real server, so a `pg_type` row for it advertises something real.
+#
+# ## They subscript from **zero**
+#
+#     indkey[0], indkey[1]   ->  1, 2
+#
+# — where a SQL array subscripts from one. Not reproduced here and not needed by anything: the
+# columns are read whole, and `ActiveRecord` splits the text on spaces.
+#
+#     1 = ANY(indkey)   ->  t        9 = ANY(indkey)  ->  f
+#
+# `ANY` over one already worked here, because the value is the text it prints as and the operators
+# read it out of that.

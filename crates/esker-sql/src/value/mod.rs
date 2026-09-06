@@ -1152,6 +1152,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // No `_regclass` here: an array of a regclass is not a type this node offers, so the
         // link is a zero rather than a pointer at a `pg_type` row that is not there.
         ColumnType::RegClass => 0,
+        // Neither vector has an array type on a real server either.
+        ColumnType::Int2Vector | ColumnType::OidVector => 0,
         // There is no array of an array: an array type is a constructor over a *scalar* here, so
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
         // `typarray` holds for a type that has no array.
@@ -1401,7 +1403,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -1509,6 +1511,8 @@ impl PgType for ColumnType {
             // PostgreSQL's own, measured: `'regtype'::regtype::oid` is 2206.
             ColumnType::RegType => 2206,
             ColumnType::RegClass => 2205,
+            ColumnType::Int2Vector => 22,
+            ColumnType::OidVector => 30,
             ColumnType::Int2 => 21,
             ColumnType::Int4 => 23,
             ColumnType::Text => 25,
@@ -1709,6 +1713,8 @@ impl PgType for ColumnType {
             ColumnType::Oid => "oid",
             ColumnType::RegType => "regtype",
             ColumnType::RegClass => "regclass",
+            ColumnType::Int2Vector => "int2vector",
+            ColumnType::OidVector => "oidvector",
         }
     }
 
@@ -1762,7 +1768,7 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -1932,6 +1938,8 @@ impl PgDatum for Datum {
             // from them, which is the round trip `999999::regclass` makes. A *name* is resolved at
             // the seam that has a catalog — `CatalogFunc::RegClass`, where every `::regclass` cast
             // is lowered — so reaching here with one means a path that bypassed it.
+            // Text's representation: the numbers space separated, read back as written.
+            ColumnType::Int2Vector | ColumnType::OidVector => Datum::Text(text.to_owned()),
             ColumnType::RegClass => {
                 return text.parse::<i64>().map(regclass_of_oid).map_err(|_| {
                     SqlError::unsupported("a relation name read as a regclass without a catalog")
@@ -2204,6 +2212,15 @@ impl PgDatum for Datum {
                 regtype_of_oid(u32::from_be_bytes(head.try_into().unwrap_or([0; 4])))
             }
             // The same four bytes; the name a resolvable oid prints is put on at the catalog seam.
+            // **Refused, not guessed.** `int2vectorsend` writes an array header and shorts, not
+            // the space-separated text; nothing here has ever sent one, so a client that does is
+            // told so rather than handed a value built from a guess — the call `json` two arms
+            // below makes for the same reason.
+            ColumnType::Int2Vector | ColumnType::OidVector => {
+                return Err(SqlError::unsupported(
+                    "an int2vector or oidvector parameter in the binary format",
+                ));
+            }
             ColumnType::RegClass => {
                 let head = fixed(4)?;
                 regclass_of_oid(i64::from(u32::from_be_bytes(
@@ -3035,7 +3052,7 @@ mod tests {
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::Bytea

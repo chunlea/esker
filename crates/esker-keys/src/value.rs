@@ -453,6 +453,19 @@ pub enum ColumnType {
     /// `'x'::regclass` as a `bigint` — an oid it knows — so three of its tests watched nothing
     /// happen (`tests/captures/pg19_unknown_oid.txt`).
     RegClass,
+    /// `int2vector` and `oidvector`: `pg_index.indkey` and `pg_proc.proargtypes`.
+    ///
+    /// **Text's representation, like `json` and `jsonb`** — the value is the numbers space
+    /// separated and this node has no vector of its own — and a `ColumnType` of its own because
+    /// the *declared* type is what a client reads: `indkey` is an `int2vector` (oid 22) on a real
+    /// server and `indclass` an `oidvector` (oid 30), and this node called both `text`.
+    ///
+    /// Measured (`tests/captures/pg19_indkey.txt`): `indkey` of a two-column index is `1 2`,
+    /// `indclass` is `1978 3126`, both `typlen` -1, both `typcategory` `A`, and both subscript
+    /// **from zero** where a SQL array subscripts from one.
+    Int2Vector,
+    /// `oidvector`, `int2vector`'s sibling — see it for the shape they share.
+    OidVector,
     /// `boolean[]`. **The sixteen below are not sixteen features.** Every base type on a real
     /// server has an array type, and `pg_type.typarray` points at it; a `typarray` naming a row
     /// that is not there is worse than a zero, because a client walks the link in both directions
@@ -507,7 +520,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 88] = [
+    pub const ALL: [ColumnType; 90] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -541,6 +554,8 @@ impl ColumnType {
         ColumnType::Oid,
         ColumnType::RegType,
         ColumnType::RegClass,
+        ColumnType::Int2Vector,
+        ColumnType::OidVector,
         ColumnType::Int8Array,
         ColumnType::Int4Array,
         ColumnType::Int2Array,

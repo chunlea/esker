@@ -1360,6 +1360,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         // only its type is.
         ColumnType::RegType => crate::value::regtype_of_oid(0),
         ColumnType::RegClass => crate::value::regclass_of_oid(0),
+        // Text's representation: an empty vector is an empty string.
+        ColumnType::Int2Vector | ColumnType::OidVector => Datum::Text(String::new()),
         ColumnType::RegTypeArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             ColumnType::RegType,
             1,

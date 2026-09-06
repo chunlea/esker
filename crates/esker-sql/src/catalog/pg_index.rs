@@ -495,12 +495,16 @@ pub const INDEX_COLUMNS: &[(&str, ColumnType)] = &[
     ("indnullsnotdistinct", ColumnType::Bool),
     ("indisprimary", ColumnType::Bool),
     ("indisvalid", ColumnType::Bool),
-    ("indkey", ColumnType::Text),
+    // **`int2vector`, not `text`** — measured, and the two columns beside it are `oidvector`.
+    // The value is the same space-separated numbers either way; what a client reads is the
+    // declared type (`tests/captures/pg19_indkey.txt`).
+    ("indkey", ColumnType::Int2Vector),
     // Like `indkey` an `int2vector` on a real server, and text here for the same reason: the way
     // a client uses it is text-shaped. `ActiveRecord` reads the ordering out of
     // `pg_get_indexdef`'s string rather than from here, so this is the honest record of a fact
     // rather than a column anything depends on.
-    ("indoption", ColumnType::Text),
+    // `indoption` is an `int2vector` too, and `0 0` for an index with no DESC or NULLS FIRST.
+    ("indoption", ColumnType::Int2Vector),
     ("indexprs", ColumnType::Text),
     ("indpred", ColumnType::Text),
     // **Last**, see the row it fills.

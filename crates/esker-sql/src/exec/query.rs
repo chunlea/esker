@@ -2949,6 +2949,9 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // `WHERE attrelid = 'iv'::regclass` compare at all: measured,
             // `'pg_class'::regclass = 1259` is true against an uncast integer.
             ColumnType::RegType | ColumnType::RegClass => family(ColumnType::Oid),
+            // **Text's family, because text is what they are here.** They compare as the
+            // strings they print as, which is what `attnum = ANY(indkey)` already relies on.
+            ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
             ColumnType::RegTypeArray => 200,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two

@@ -1013,7 +1013,9 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // **Not a columnar type.** A `regtype` cannot be a stored column here (ADR 0077), so the
         // scan never sees one; `None` keeps the filter on the row side rather than inventing a
         // representation for a value the columnar format has no tag for.
-        Row::RegType | Row::RegTypeArray | Row::RegClass => return None,
+        Row::RegType | Row::RegTypeArray | Row::RegClass | Row::Int2Vector | Row::OidVector => {
+            return None;
+        }
         Row::Int8 => Col::Int8,
         Row::Time => Col::Time,
         Row::Uuid => Col::Uuid,

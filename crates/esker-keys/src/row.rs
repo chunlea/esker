@@ -547,6 +547,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Varchar
         | ColumnType::Bpchar
         | ColumnType::Json
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector
         | ColumnType::Jsonb
         | ColumnType::Xml
         | ColumnType::Ltree
@@ -953,6 +955,8 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         | ColumnType::Varchar
         | ColumnType::Bpchar
         | ColumnType::Json
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector
         | ColumnType::Jsonb
         // A pattern is a validated string, which is `json`'s shape.
         | ColumnType::LQuery
@@ -1216,7 +1220,11 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     Ok(match ty {
         // Refused by `is_index_key` above, and refused again here: a type missing from either list
         // is still refused by the other, which is the direction a disagreement has to fail in.
-        ColumnType::RegType | ColumnType::RegTypeArray | ColumnType::RegClass => {
+        ColumnType::RegType
+        | ColumnType::RegTypeArray
+        | ColumnType::RegClass
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector => {
             return Err(not_a_key());
         }
         ColumnType::Int8Array
@@ -2280,6 +2288,13 @@ mod tests {
                 "",
             ])
             .prop_map(|text: &str| Datum::Text(text.to_owned()))
+            .boxed(),
+            // Space-separated numbers, which is what the two vectors hold and all they hold.
+            ColumnType::Int2Vector | ColumnType::OidVector => proptest::sample::select(vec![
+                Datum::Text(String::new()),
+                Datum::Text("1".to_owned()),
+                Datum::Text("1 2 3".to_owned()),
+            ])
             .boxed(),
             ColumnType::Json | ColumnType::Jsonb => proptest::sample::select(vec![
                 "null",

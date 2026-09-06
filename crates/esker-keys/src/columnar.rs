@@ -58,6 +58,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         // written keeps the number it had ([ADR 0077](../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
         ColumnType::RegType => 89,
         ColumnType::RegClass => 91,
+        ColumnType::Int2Vector => 92,
+        ColumnType::OidVector => 93,
         ColumnType::RegTypeArray => 90,
         ColumnType::Int8 => 1,
         ColumnType::Text => 2,

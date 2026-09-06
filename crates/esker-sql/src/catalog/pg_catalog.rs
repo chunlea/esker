@@ -671,7 +671,10 @@ impl CatalogView {
                 // where it reads best put it in `prolang`'s slot, and the misalignment surfaced as
                 // `pg_proc JOIN pg_language` returning nothing for a user's function — a column
                 // order is a contract with the row builder, not a matter of taste.
-                ("proargtypes", ColumnType::Text),
+                // **`oidvector`** — the type the `::oidvector` cast beside it already names,
+                // and the one `ActiveRecord` compares against in
+                // `can_perform_case_insensitive_comparison_for?` (ADR 0077).
+                ("proargtypes", ColumnType::OidVector),
             ],
             // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
             // DDL used.
@@ -2660,6 +2663,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::RegType => "regtype",
         ColumnType::RegClass => "regclass",
+        ColumnType::Int2Vector => "int2vector",
+        ColumnType::OidVector => "oidvector",
         ColumnType::RegTypeArray => "_regtype",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
@@ -2852,7 +2857,11 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray => "A",
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
+        // PostgreSQL's array category despite not being array types.
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
         // `S` a string does. Measured off `pg_type.typcategory`, all seven.
@@ -2900,6 +2909,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
         ColumnType::RegType => "regtypein",
         ColumnType::RegClass => "regclassin",
+        ColumnType::Int2Vector => "int2vectorin",
+        ColumnType::OidVector => "oidvectorin",
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
         // catalog: `ActiveRecord` decides that a column is an array by comparing this string, and
         // a column it does not know to be an array is what makes it hand a Ruby `Array` to
