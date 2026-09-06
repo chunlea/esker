@@ -1,0 +1,19 @@
+crates/esker-sql/tests/captures/pg19_date_trunc.txt
+  s_2d916f5f540186::t_f4197c01a5eaf6 1-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a3581e2f09d660a338b28c938bb0c2fa5eee653b",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
