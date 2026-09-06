@@ -206,6 +206,15 @@ pub trait Txn: fmt::Debug + Send {
     /// defaulted.
     fn lock(&mut self, key: &[u8]) -> Result<Lock>;
 
+    /// Tells this transaction which session opened it, for `pg_locks.pid` to report.
+    ///
+    /// **Required rather than defaulted**, for the reason every required method on these traits
+    /// is: a default that dropped the pid would make every lock this transaction takes report
+    /// `0`, and `0` is indistinguishable from a transaction nobody claimed. It is set once, by
+    /// `Executor::begin_txn`, immediately after the transaction is opened — a session's pid never
+    /// changes, so there is nothing to keep in step afterwards.
+    fn owned_by_session(&mut self, pid: u32);
+
     /// Every row lock **this node** holds, and every session waiting for one, for `pg_locks`.
     ///
     /// On the trait rather than on the backend because a catalog view is handed a transaction and
@@ -544,6 +553,7 @@ impl Backend for MemoryBackend {
             (versions.clock, id)
         };
         Ok(Box::new(MemoryTxn {
+            session: 0,
             versions: Arc::clone(&self.versions),
             start_ts,
             buffer: BTreeMap::new(),
@@ -568,6 +578,7 @@ impl Backend for MemoryBackend {
     /// the whole feature, and the whole `.slt` corpus, be exercised before the client half lands.
     fn begin_at(&self, start_ts: u64) -> Result<Box<dyn Txn>> {
         Ok(Box::new(MemoryTxn {
+            session: 0,
             versions: Arc::clone(&self.versions),
             start_ts,
             buffer: BTreeMap::new(),
@@ -622,6 +633,9 @@ struct MemoryTxn {
     held: Vec<Vec<u8>>,
     /// This transaction's identity, which `start_ts` is not: see [`Versions::locks`].
     id: u64,
+    /// The backend pid of the session that opened it, which `pg_locks.pid` reports. `0` until
+    /// somebody says, which is what an internal transaction with no session behind it stays.
+    session: u32,
     /// Each key the **current statement** has written, with the buffer entry it replaced.
     ///
     /// **The undo a restart needs, and it is not a savepoint's.** `ROLLBACK TO` restores the
@@ -743,6 +757,11 @@ impl Drop for MemoryTxn {
 }
 
 impl Txn for MemoryTxn {
+    /// See [`Txn::owned_by_session`]: set once, right after the transaction is opened.
+    fn owned_by_session(&mut self, pid: u32) {
+        self.session = pid;
+    }
+
     fn start_ts(&self) -> u64 {
         self.start_ts
     }
@@ -871,7 +890,10 @@ impl Txn for MemoryTxn {
             // lock a live writer would then wait behind.
             return Ok(Lock::Taken);
         }
-        let taken = self.versions().row_locks.take(key, self.id, self.start_ts);
+        let taken = self
+            .versions()
+            .row_locks
+            .take(key, self.id, self.start_ts, self.session);
         if matches!(taken, Lock::Taken) && !self.held.iter().any(|held| held == key) {
             self.held.push(key.to_vec());
         }

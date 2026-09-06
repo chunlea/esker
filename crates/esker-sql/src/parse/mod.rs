@@ -745,7 +745,7 @@ pub(crate) enum CursorRead {
         /// Whether it was quoted.
         quoted: bool,
         /// Normalised from PostgreSQL's thirteen spellings.
-        direction: crate::plan::CursorDirection,
+        direction: plan::CursorDirection,
         /// `MOVE`: the same movement, reporting the count and keeping the rows.
         only_move: bool,
     },
@@ -834,8 +834,8 @@ fn read_cursor(sql: &str, scanned: &Scan<'_>) -> Option<CursorRead> {
 ///
 /// Thirteen spellings and three movements. No direction at all is `NEXT`, which is why the
 /// fallthrough is `Relative(1)` and not an error: `FETCH c` is the commonest form there is.
-fn read_cursor_direction(rest: &str) -> (crate::plan::CursorDirection, &str) {
-    use crate::plan::CursorDirection;
+fn read_cursor_direction(rest: &str) -> (plan::CursorDirection, &str) {
+    use plan::CursorDirection;
 
     for (word, direction) in [
         ("NEXT", CursorDirection::Relative(1)),
@@ -2720,7 +2720,13 @@ pub fn classify(statement: &Statement) -> StatementClass {
                 false,
             )
             .0,
-            args: parameters.iter().map(argument_text).collect(),
+            // `collect` over `Option` turns one unreadable argument into no list at all, and
+            // the session refuses by name rather than running with a hole in it.
+            args: parameters
+                .iter()
+                .map(argument_text)
+                .collect::<Option<Vec<_>>>()
+                .map(|args| args.into_iter().map(Argument::into_bind).collect()),
         },
         // **`ALL` is a keyword here and a name when it is quoted.** `DEALLOCATE ALL` drops
         // everything; `DEALLOCATE "ALL"` drops the statement called `ALL`, which PostgreSQL allows
@@ -2739,6 +2745,30 @@ pub fn classify(statement: &Statement) -> StatementClass {
     }
 }
 
+/// One `EXECUTE` argument the client wrote.
+///
+/// **A named type rather than `Option<Option<String>>`**, which is what this was and what clippy
+/// objected to — rightly, and for the reason [`crate::exec::LocalAuthorization`] is one too: the
+/// outer layer means "could this be read at all" and the inner means "and was it NULL", and two
+/// `Option`s spell both as `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Argument {
+    /// A value, as the text a `Bind` would have carried.
+    Text(String),
+    /// `NULL`, which a `Bind` spells as a length of -1 and which is not the empty string.
+    Null,
+}
+
+impl Argument {
+    /// The `Bind` parameter it stands for: `None` is the wire's NULL.
+    fn into_bind(self) -> Option<String> {
+        match self {
+            Argument::Text(text) => Some(text),
+            Argument::Null => None,
+        }
+    }
+}
+
 /// One `EXECUTE` argument as the text a `Bind` would have carried, or `None` for the whole list if
 /// it is not a literal.
 ///
@@ -2746,7 +2776,7 @@ pub fn classify(statement: &Statement) -> StatementClass {
 /// match on `Expr::Value` alone refuses `EXECUTE cc(-2, 1)`, which is in the corpus twice. The
 /// outer `Option` is the list's — `collect` over `Option` turns one unreadable argument into no
 /// list at all, and the session refuses by name rather than running with a hole in it.
-fn argument_text(expr: &sqlparser::ast::Expr) -> Option<Option<String>> {
+fn argument_text(expr: &sqlparser::ast::Expr) -> Option<Argument> {
     use sqlparser::ast::{Expr as Ast, UnaryOperator, Value};
     let (negated, value) = match expr {
         Ast::UnaryOp {
@@ -2759,16 +2789,18 @@ fn argument_text(expr: &sqlparser::ast::Expr) -> Option<Option<String>> {
         return None;
     };
     match &value.value {
-        Value::Number(digits, _) => Some(Some(if negated {
+        Value::Number(digits, _) => Some(Argument::Text(if negated {
             format!("-{digits}")
         } else {
             digits.clone()
         })),
         Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-            Some(Some(text.clone()))
+            Some(Argument::Text(text.clone()))
         }
-        Value::Boolean(yes) => Some(Some(if *yes { "true" } else { "false" }.to_owned())),
-        Value::Null => Some(None),
+        Value::Boolean(yes) => Some(Argument::Text(
+            if *yes { "true" } else { "false" }.to_owned(),
+        )),
+        Value::Null => Some(Argument::Null),
         _ => None,
     }
 }

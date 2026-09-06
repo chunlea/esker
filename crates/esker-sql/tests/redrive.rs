@@ -344,6 +344,11 @@ struct GatedTxn {
 }
 
 impl Txn for GatedTxn {
+    /// Forwarded: the gate is a lens on one transaction, not a transaction of its own.
+    fn owned_by_session(&mut self, pid: u32) {
+        self.inner.owned_by_session(pid);
+    }
+
     // **Every defaulted method is forwarded, including the ones this test never calls.**
     //
     // A wrapper only has to forget one to opt its whole test out of a mechanism, and the compiler

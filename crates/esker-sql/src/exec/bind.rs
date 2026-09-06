@@ -221,8 +221,6 @@ fn walk(
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             walk_select(query, tables, seen);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => walk_select(select, tables, seen),
         Statement::Update(update) => {
@@ -293,6 +291,9 @@ fn walk(
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }
@@ -393,7 +394,13 @@ fn named_relations<'a>(
 /// * the projection is a single `*` or `q.*` — anything computed or renamed publishes a column that
 ///   is not the relation's, and `SELECT a AS b` would otherwise type `b` from `a`;
 /// * no column alias list (`WITH t (x, y) AS …`), which renames every column at once;
-/// * exactly one relation underneath, so there is no ambiguity about which one a name came from.
+/// * and one relation to pass the columns *from*, which is where the two spellings of the
+///   wildcard part company. A bare `*` over a join publishes both relations' columns
+///   concatenated, and "the table underneath" is not a thing — so it needs exactly one relation.
+///   A qualified `a.*` **names** the one it publishes, so a join underneath is no ambiguity at
+///   all. That is `bind_parameter_test.rb`'s statement: `SELECT authors.* FROM authors INNER JOIN
+///   posts …` inside a derived table, whose `authors.id` PostgreSQL types as `bigint` and this
+///   node typed as `text` — measured, `{text,text,bigint}` against `pg_prepared_statements`.
 ///
 /// **It recurses**, because the statement that found this is three deep: `posts_with_tags` over
 /// `posts`, `posts_with_tags_and_truthy` over that, and the `$1` in the third one.
@@ -407,14 +414,17 @@ fn passes_columns_through<'a>(
     let [only] = &derived.select.projection[..] else {
         return None;
     };
-    if !matches!(
-        only,
-        crate::plan::SelectItem::Wildcard | crate::plan::SelectItem::QualifiedWildcard(_)
-    ) {
-        return None;
-    }
-    match named_relations(&derived.select, tables).as_slice() {
-        [(_, def)] => Some(def),
+    let relations = named_relations(&derived.select, tables);
+    match only {
+        crate::plan::SelectItem::Wildcard => match relations.as_slice() {
+            [(_, def)] => Some(*def),
+            _ => None,
+        },
+        crate::plan::SelectItem::QualifiedWildcard(qualifier) => relations
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(qualifier))
+            .map(|(_, def)| def),
+        // Anything computed or renamed publishes a column that is not the relation's.
         _ => None,
     }
 }
@@ -866,8 +876,6 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             walk_select_mut(query, visit);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => walk_select_mut(select, visit),
         Statement::Update(update) => {
@@ -928,6 +936,9 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }
@@ -1093,8 +1104,6 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
             collect_table_names(query, &mut names);
             names
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and no table.
-        Statement::Cursor(_) => Vec::new(),
         Statement::Select(select) => {
             let mut names = Vec::new();
             collect_table_names(select, &mut names);
@@ -1172,6 +1181,9 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         // to resolve names against: the checkpoint verbs take a name that is their own, and a
         // `DIFF`'s table is resolved where it is scanned, in its own snapshot.
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => Vec::new(),
     }
 }
@@ -1230,8 +1242,6 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             for_each_in_select(query, &mut each);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => for_each_in_select(select, &mut each),
         Statement::Update(update) => {
@@ -1283,6 +1293,9 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }

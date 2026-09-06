@@ -1586,13 +1586,17 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
 /// anyway.
 fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
     let view = txn.locks();
-    let pid = Datum::Int4(i32::try_from(std::process::id()).unwrap_or(i32::MAX));
+    // **A pid per row, from the lock table.** This was `std::process::id()` — the same number on
+    // every row, so the column could not tell two holders apart and a join to
+    // `pg_stat_activity.pid` matched nothing. On a real server `pg_locks.pid` *is* the backend pid:
+    // the number `pg_backend_pid()` returns and the one `pg_cancel_backend` takes.
+    let backend = |pid: u32| Datum::Int4(i32::try_from(pid).unwrap_or(i32::MAX));
     let database = Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX));
     let mut rows = Vec::with_capacity(view.held.len() + view.waiting.len());
     // `holder id -> start_ts`, so a waiter's row can name the transaction it waits for the way a
     // real server does: by the transaction, not by the key.
     let mut start_of: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    for (key, holder, start_ts) in &view.held {
+    for (key, holder, start_ts, session) in &view.held {
         start_of.insert(*holder, *start_ts);
         let Some((owner, table_id)) = esker_keys::prefix::row_key_table(key) else {
             // Not a row key: an index entry or a metadata key, which this node does not row-lock.
@@ -1613,7 +1617,7 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
             Datum::Null,
             Datum::Null,
             Datum::Text(format!("0/{holder}")),
-            pid.clone(),
+            backend(*session),
             // `FOR SHARE` is served as `FOR UPDATE` (ADR 0057 §5), so every row lock here is
             // exclusive and reporting anything else would describe a mode this node cannot take.
             Datum::Text("ExclusiveLock".to_owned()),
@@ -1622,7 +1626,7 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
             Datum::Null,
         ]);
     }
-    for (waiter, holder) in &view.waiting {
+    for (waiter, holder, session) in &view.waiting {
         rows.push(vec![
             Datum::Text("transactionid".to_owned()),
             database.clone(),
@@ -1643,7 +1647,7 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
             Datum::Null,
             Datum::Null,
             Datum::Text(format!("0/{waiter}")),
-            pid.clone(),
+            backend(*session),
             // What a waiter asks for on the holder's transaction id, measured.
             Datum::Text("ShareLock".to_owned()),
             Datum::Bool(false),

@@ -48,9 +48,9 @@ pub(super) fn run(
                 // `plan::Statement::Select` always produces rows; a command tag here would mean
                 // the lowering had handed us something that is not a query.
                 Outcome::Done { tag } => {
-                    return Err(SqlError::Internal(
-                        format!("DECLARE CURSOR ran a statement that answered {tag}").into(),
-                    ));
+                    return Err(SqlError::Internal(format!(
+                        "DECLARE CURSOR ran a statement that answered {tag}"
+                    )));
                 }
             };
             executor.cursors.insert(
