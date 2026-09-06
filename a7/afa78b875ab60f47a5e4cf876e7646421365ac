@@ -1,0 +1,21 @@
+crates/esker-sql/tests/user_decided_divergences.rs
+  s_609bbbdbf3c419::t_6ecf4439686c13 1-104
+docs/plans/phase-9-rails.md
+  s_609bbbdbf3c419::t_05f4f9c57b323e 1618-1673
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a7afa78b875ab60f47a5e4cf876e7646421365ac",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
