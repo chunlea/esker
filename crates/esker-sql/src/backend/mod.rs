@@ -395,17 +395,29 @@ enum Write {
 struct Versions {
     /// `key -> [(commit_ts, value)]`, ascending by timestamp. `None` is a tombstone.
     keys: BTreeMap<Vec<u8>, Vec<(u64, Option<Bytes>)>>,
-    /// Stands in for the timestamp oracle. Monotone, and the only source of timestamps here, which
-    /// is `CLAUDE.md` invariant 6 kept true even in a fake.
+    /// The last timestamp this oracle handed out. Monotone, and the only source of timestamps
+    /// here, which is `CLAUDE.md` invariant 6 kept true even in a fake.
     ///
-    /// **Shaped like a real one**: `ts = physical_ms << 18 | logical` (`esker_pd::tso`), starting
-    /// at a plausible instant rather than at zero, and advancing the *logical* half per commit.
-    /// The shape is not decoration — it is what a time machine is asked about. A counter starting
-    /// at zero puts every version inside the same millisecond of 1970, so an instant a user could
-    /// name would not distinguish two of them, and a test written against it would prove the
-    /// feature works on data no cluster produces. Tests that want two versions in different
-    /// milliseconds ask for that with [`MemoryBackend::advance_ms`].
+    /// **Shaped like a real one and now paced like one**: `ts = physical_ms << 18 | logical`
+    /// (`esker_pd::tso`), with the physical half following the wall clock and the logical half
+    /// advancing per commit within a millisecond. [`Versions::mark`] is `esker_pd::tso`'s own
+    /// restart rule — the greater of the last timestamp and the clock — which is what keeps the
+    /// sequence monotone across a jump in either direction.
+    ///
+    /// It used to start at a hardcoded instant and advance *only* the logical half, so every
+    /// timestamp a process ever handed out named the same millisecond. That is invisible to a test
+    /// that compares two versions to each other, and wrong for every client that compares one to
+    /// its own clock: the scoreboard node runs this backend, so `now()` and `CURRENT_TIMESTAMP`
+    /// were `2026-08-30 14:00:00 UTC` forever, and `fixtures_test#test_insert_with_default_function`
+    /// measured a default six days stale — a frozen oracle, not a folded `DEFAULT`.
     clock: u64,
+    /// Milliseconds the tests have pushed the clock **forward by**, and it stays pushed.
+    ///
+    /// An offset rather than a one-shot bump ([`MemoryBackend::advance_ms`]) because the physical
+    /// half is the wall clock now: a bump added to `clock` alone would be swallowed the moment the
+    /// clock caught up, and a test that asked for two versions in different milliseconds would get
+    /// them only when it ran slowly enough.
+    skew_ms: u64,
     /// The row locks this node holds ([`crate::backend::locks::RowLocks`]).
     row_locks: locks::RowLocks,
 }
@@ -414,23 +426,44 @@ impl Default for Versions {
     fn default() -> Self {
         Versions {
             keys: BTreeMap::new(),
-            clock: esker_client::ts_at_ms(FAKE_START_MS),
+            clock: 0,
+            skew_ms: 0,
             row_locks: locks::RowLocks::default(),
         }
     }
 }
 
-/// Where a [`MemoryBackend`]'s clock starts: 2026-08-30 14:00:00 UTC, in Unix milliseconds.
+/// The wall clock, in Unix milliseconds — read **here and nowhere else in this crate**.
 ///
-/// Checked against the value rather than asserted in a comment: `a_plausible_instant` below is
-/// the test, because a constant whose comment says one date and whose bits say another is a
-/// trap for whoever reads the next failing assertion.
-///
-/// Any plausible instant would do. What matters is that it is not zero, so that the physical half
-/// of every timestamp the fake hands out is a real date a test can write down.
-const FAKE_START_MS: u64 = 1_788_098_400_000;
+/// `CLAUDE.md` invariant 6 is that no node uses its wall clock for ordering, and this does not
+/// break it: [`Versions`] is the timestamp oracle's stand-in, and reading the clock is what an
+/// oracle is for (`esker_pd::tso` does exactly this, and guards it with the same mark). Every
+/// *other* part of this crate takes its instant from a transaction's `start_ts`.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 impl Versions {
+    /// The oracle's mark: **the greater of the last timestamp handed out and the wall clock**,
+    /// which is `esker_pd::tso`'s restart rule written for one process.
+    ///
+    /// It is what makes the sequence survive a clock that stands still (the logical half carries
+    /// on inside the millisecond), a clock that jumps backwards (the mark wins), and a test that
+    /// pushes the clock forward ([`Self::skew_ms`], which is added to the reading rather than to
+    /// the mark, so it cannot be overtaken).
+    ///
+    /// Reading it does **not** consume a timestamp: `begin` and `now` want the current instant and
+    /// two transactions starting in the same millisecond share one, exactly as they did when the
+    /// clock only moved at commit. Only a commit allocates, and it allocates above this.
+    fn mark(&self) -> u64 {
+        let wall = esker_client::ts_at_ms(unix_now_ms().saturating_add(self.skew_ms));
+        self.clock.max(wall)
+    }
+
     /// The value visible at `ts`: the newest version committed at or before it.
     fn visible(&self, key: &[u8], ts: u64) -> Option<Bytes> {
         self.keys
@@ -505,18 +538,22 @@ impl MemoryBackend {
         self
     }
 
-    /// Moves the clock's **physical** half on by `millis`, the way time passing does.
+    /// Moves the clock's **physical** half on by `millis`, the way time passing does, and leaves
+    /// it moved.
     ///
-    /// A commit advances the logical half only, so without this every version a test writes lands
-    /// in one millisecond — which is what a busy cluster looks like, and which is why the default
-    /// is that way. A test about reading *as of an instant* needs its versions in different
-    /// milliseconds, because an instant a user can name has millisecond resolution
-    /// (`crate::time_machine`), and this is how it says so.
+    /// Several commits can land in one millisecond — which is what a busy cluster looks like — and
+    /// a test about reading *as of an instant* needs its versions in different ones, because an
+    /// instant a user can name has millisecond resolution (`crate::time_machine`). This is how it
+    /// says so.
+    ///
+    /// **A persistent offset, not a bump.** The physical half follows the wall clock
+    /// (`Versions::mark`), so adding milliseconds to the mark would buy nothing the moment the
+    /// clock caught up: two calls a millisecond apart would collapse into one instant and the test
+    /// would pass or fail on how fast the machine was. Added to the *reading*, every later
+    /// timestamp carries it and each call moves the clock strictly forward.
     pub fn advance_ms(&self, millis: u64) {
         let mut versions = self.lock();
-        versions.clock = versions
-            .clock
-            .saturating_add(millis << esker_client::TSO_LOGICAL_BITS);
+        versions.skew_ms = versions.skew_ms.saturating_add(millis);
     }
 
     /// The value visible at the newest committed timestamp, for assertions in tests.
@@ -541,7 +578,7 @@ impl Backend for MemoryBackend {
         let (start_ts, id) = {
             let mut versions = self.lock();
             let id = versions.row_locks.next_id();
-            (versions.clock, id)
+            (versions.mark(), id)
         };
         Ok(Box::new(MemoryTxn {
             versions: Arc::clone(&self.versions),
@@ -586,7 +623,7 @@ impl Backend for MemoryBackend {
     }
 
     fn now(&self) -> Result<u64> {
-        Ok(self.lock().clock)
+        Ok(self.lock().mark())
     }
 }
 
@@ -1012,8 +1049,11 @@ impl Txn for MemoryTxn {
             }
         }
 
-        versions.clock += 1;
-        let commit_ts = versions.clock;
+        // **Above the mark, never merely above the last commit**: the physical half is the wall
+        // clock, so this is `esker_pd::tso`'s allocation — take the greater of the two and add one
+        // in the logical bits.
+        let commit_ts = versions.mark().saturating_add(1);
+        versions.clock = commit_ts;
         for (key, write) in &self.buffer {
             let value = match write {
                 Write::Put(value) => Some(value.clone()),
@@ -1139,10 +1179,15 @@ mod tests {
 
         let mut writer = backend.begin().unwrap();
         writer.put(b"k", b"v");
-        // A commit takes the next timestamp, which is the one after the snapshot every open
-        // transaction holds. Written as a *relation* to `before` rather than as a literal,
-        // because the clock starts at a plausible instant rather than at zero.
-        assert_eq!(writer.commit().unwrap(), Some(before + 1));
+        // A commit takes a timestamp **after** the snapshot every open transaction holds. Written
+        // as a relation and not as `before + 1`: the oracle follows the wall clock, so a
+        // millisecond passing between the two calls moves the commit further on and an equality
+        // here would be a clock race rather than an assertion.
+        let commit_ts = writer
+            .commit()
+            .unwrap()
+            .expect("a write commits at a timestamp");
+        assert!(commit_ts > before, "{commit_ts} is not after {before}");
 
         // The transaction that started first still sees its own snapshot.
         assert_eq!(older.get(b"k").unwrap(), None);
