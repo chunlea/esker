@@ -199,6 +199,19 @@ pub enum SqlError {
     #[error("syntax error at or near \"{0}\"")]
     SetValueSyntax(String),
 
+    /// A clause written on both sides of a parenthesised query body.
+    ///
+    /// `(SELECT … ORDER BY id) ORDER BY id DESC` is `42601 multiple ORDER BY clauses not allowed`
+    /// on PostgreSQL 19 — measured, and so are the `OFFSET`, `LIMIT` and `WITH` sentences.
+    /// Parentheses around a query are grouping and the clauses merge (`gram.y`'s
+    /// `insertSelectOptions`); these four are what happens when the merge collides.
+    ///
+    /// **Its own variant rather than [`SqlError::Syntax`]**, for the reason
+    /// [`SqlError::SetValueSyntax`] is one: `Syntax` writes `syntax error: …` and a real server
+    /// writes no prefix on these. The words are the whole message.
+    #[error("multiple {0} clauses not allowed")]
+    DoubledClause(&'static str),
+
     /// The statement is not valid SQL. Contract C1 says this must never be the answer to
     /// something PostgreSQL 19 accepts; when it is, the statement belongs in the gap register.
     #[error("syntax error: {message}")]
@@ -2693,6 +2706,7 @@ impl SqlError {
             }
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
+            | SqlError::DoubledClause(_)
             // PostgreSQL's type-name grammar, refusing in the same class as its statement
             // grammar: `'timestamp(-1)'::regtype` and `''::regtype` are both `42601`.
             | SqlError::TypeNameSyntax(_)

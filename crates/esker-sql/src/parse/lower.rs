@@ -6661,6 +6661,97 @@ fn refuse_unlockable_shape(select: &plan::Select) -> Result<()> {
     Ok(())
 }
 
+/// A query written in parentheses, with whatever was written outside them merged in.
+///
+/// **PostgreSQL merges rather than nests**, and refuses only when both levels write the same
+/// clause — measured, each sentence its own:
+///
+/// ```text
+/// (SELECT id FROM ex) ORDER BY id DESC LIMIT 1                -> the outer clauses apply
+/// WITH w AS (…) (SELECT n FROM w)                             -> so does an outer WITH
+/// (SELECT id FROM ex FOR UPDATE) FOR UPDATE                   -> locks merge, silently
+/// ((SELECT … ORDER BY id LIMIT 2)) ORDER BY id DESC           42601: multiple ORDER BY clauses not allowed
+/// (SELECT … ORDER BY id LIMIT 2) LIMIT 1                      42601: multiple LIMIT clauses not allowed
+/// (SELECT … OFFSET 0) OFFSET 0                                42601: multiple OFFSET clauses not allowed
+/// WITH a AS (…) (WITH b AS (…) SELECT n FROM b)               42601: multiple WITH clauses not allowed
+/// ```
+///
+/// The refusals are the half that makes this more than unwrapping a parenthesis: a fix that
+/// simply took the inner query would answer four statements a real server rejects, and would
+/// silently drop one of each doubled pair to do it.
+///
+/// Checked in `insertSelectOptions`'s order — `ORDER BY`, `OFFSET`, `LIMIT`, `WITH` — which is the
+/// order the sentences come out in when a statement doubles more than one. Recursion is bounded by
+/// `sqlparser`'s own parser depth limit, so `(((…)))` cannot be made deep enough to overflow here.
+fn lower_parenthesised(outer: &Query, inner: &Query) -> Result<plan::Select> {
+    let (outer_limit, outer_offset) = limit_halves(outer.limit_clause.as_ref());
+    let (inner_limit, inner_offset) = limit_halves(inner.limit_clause.as_ref());
+    if outer.order_by.is_some() && inner.order_by.is_some() {
+        return Err(SqlError::DoubledClause("ORDER BY"));
+    }
+    if outer_offset && inner_offset {
+        return Err(SqlError::DoubledClause("OFFSET"));
+    }
+    if outer_limit && inner_limit {
+        return Err(SqlError::DoubledClause("LIMIT"));
+    }
+    if outer.with.is_some() && inner.with.is_some() {
+        return Err(SqlError::DoubledClause("WITH"));
+    }
+    let mut merged = inner.clone();
+    if outer.with.is_some() {
+        merged.with = outer.with.clone();
+    }
+    if outer.order_by.is_some() {
+        merged.order_by = outer.order_by.clone();
+    }
+    merged.limit_clause = merge_limits(inner.limit_clause.clone(), outer.limit_clause.clone());
+    // **Concatenated rather than chosen**: two `FOR UPDATE`s are legal and merge on a real server,
+    // which is the one clause here that does not collide.
+    merged.locks = [inner.locks.clone(), outer.locks.clone()].concat();
+    lower_query(&merged)
+}
+
+/// Which halves of a `LIMIT`/`OFFSET` are written, `sqlparser` carrying both in one field.
+fn limit_halves(clause: Option<&LimitClause>) -> (bool, bool) {
+    match clause {
+        None => (false, false),
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.is_some(), offset.is_some()),
+        // `LIMIT a, b` is MySQL's spelling of both halves at once.
+        Some(LimitClause::OffsetCommaLimit { .. }) => (true, true),
+    }
+}
+
+/// The two levels' `LIMIT`/`OFFSET` in one clause. Each half is written by at most one of them:
+/// a doubled half is refused before this runs.
+fn merge_limits(inner: Option<LimitClause>, outer: Option<LimitClause>) -> Option<LimitClause> {
+    match (inner, outer) {
+        (None, clause) | (clause, None) => clause,
+        (
+            Some(LimitClause::LimitOffset {
+                limit: inner_limit,
+                offset: inner_offset,
+                limit_by: inner_by,
+            }),
+            Some(LimitClause::LimitOffset {
+                limit: outer_limit,
+                offset: outer_offset,
+                limit_by: outer_by,
+            }),
+        ) => Some(LimitClause::LimitOffset {
+            limit: inner_limit.or(outer_limit),
+            offset: inner_offset.or(outer_offset),
+            limit_by: if inner_by.is_empty() {
+                outer_by
+            } else {
+                inner_by
+            },
+        }),
+        // `LIMIT a, b` carries both halves, so anything beside it has already been refused.
+        (_, outer) => outer,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
@@ -6673,6 +6764,13 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(!query.pipe_operators.is_empty(), "a pipe operator")?;
 
     let SetExpr::Select(select) = query.body.as_ref() else {
+        // **Parentheses around a query are grouping, and the grammar sees through them.**
+        // `gram.y`'s `insertSelectOptions` merges what is written outside the parentheses into the
+        // query inside; there is no nesting to lower. `postgresql_adapter_prevent_writes_test.rb`
+        // sends `/*action:index*/((SELECT …))`, and this arm is why it is a `SELECT` again.
+        if let SetExpr::Query(inner) = query.body.as_ref() {
+            return lower_parenthesised(query, inner);
+        }
         // **`VALUES …` on its own is a query**, so it takes the clauses a query takes: its rows
         // are a relation with no name, and the `ORDER BY`, `LIMIT` and `OFFSET` above it are the
         // ordinary ones over the columns it names itself.
