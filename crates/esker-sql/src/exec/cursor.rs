@@ -2974,7 +2974,14 @@ fn catalog_function(
                 .and_then(|oid| env.relations().ok()?.view_definition(oid))
                 .map_or(Datum::Null, |text| Datum::Text(text.to_owned())),
         },
-        CatalogFunc::PgGetIndexdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
+        // **`pg_get_constraintdef` shares this guard**, being strict in its `pretty` flag the same
+        // way: `pg_get_constraintdef(oid, NULL)` is NULL and `pg_get_constraintdef(oid)` is the
+        // definition. Measured on both.
+        CatalogFunc::PgGetIndexdef | CatalogFunc::PgGetConstraintdef
+            if matches!(args.get(1), Some(Datum::Null)) =>
+        {
+            Datum::Null
+        }
         CatalogFunc::PgGetIndexdef => crate::catalog::pg_index::index_definition(
             env.relations()?,
             oid_argument(args.first())?,
@@ -3099,7 +3106,6 @@ fn catalog_function(
                 None => Datum::Null,
             }
         }
-        CatalogFunc::PgGetConstraintdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
         CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
             env.relations()?,
             oid_argument(args.first())?,

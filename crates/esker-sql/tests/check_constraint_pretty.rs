@@ -144,18 +144,18 @@ fn a_null_flag_is_a_null_answer() {
     assert_eq!(def(&mut node, "quantity_check", ", NULL"), "\\N");
 }
 
+/// `row["constraintdef"][/CHECK \((.+)\)/m, 1]`, the Ruby half of `check_constraints` — greedy,
+/// so it ends at the **last** `)`, which is what leaves `NOT VALID` outside the capture.
+fn expression(definition: &str) -> String {
+    let rest = &definition[definition.find("CHECK (").expect("no CHECK (") + "CHECK (".len()..];
+    rest[..rest.rfind(')').expect("no closing parenthesis")].to_owned()
+}
+
 /// **`ActiveRecord#check_constraints`, both halves**: the query verbatim and the Ruby regex that
 /// reduces its answer. This is the assertion the five Rails tests make.
 #[test]
 fn activerecord_check_constraints_reads_the_expression_without_the_extra_parentheses() {
     let mut node = parity::Node::new(FIXTURE);
-    // `row["constraintdef"][/CHECK \((.+)\)/m, 1]` — greedy, so it ends at the **last** `)`,
-    // which is what leaves `NOT VALID` outside the capture.
-    fn expression(definition: &str) -> String {
-        let rest = &definition[definition.find("CHECK (").expect("no CHECK (") + "CHECK (".len()..];
-        rest[..rest.rfind(')').expect("no closing parenthesis")].to_owned()
-    }
-
     let rows = node.rows(
         "SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, \
          c.convalidated AS valid FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid \
