@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_da6ed9bc8eabdc 325-339,392-394,921-926
+crates/esker-sql/tests/cross_session_cancel.rs
+  s_2bed4ac2b1c944::t_8d259430ad2016 335-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ddc8b8919457accfebb034f958f02e3433259386",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
