@@ -391,7 +391,11 @@ enum Write {
 }
 
 /// Every committed version of every key, newest last, plus the clock that stamps them.
-#[derive(Debug)]
+///
+/// **Derived `Default`, and the clock starts at zero on purpose**: zero is below every wall-clock
+/// reading, so [`Versions::mark`] lifts the first timestamp to the present without a starting
+/// instant having to be chosen — which is what the hardcoded one used to be for.
+#[derive(Debug, Default)]
 struct Versions {
     /// `key -> [(commit_ts, value)]`, ascending by timestamp. `None` is a tombstone.
     keys: BTreeMap<Vec<u8>, Vec<(u64, Option<Bytes>)>>,
@@ -420,17 +424,6 @@ struct Versions {
     skew_ms: u64,
     /// The row locks this node holds ([`crate::backend::locks::RowLocks`]).
     row_locks: locks::RowLocks,
-}
-
-impl Default for Versions {
-    fn default() -> Self {
-        Versions {
-            keys: BTreeMap::new(),
-            clock: 0,
-            skew_ms: 0,
-            row_locks: locks::RowLocks::default(),
-        }
-    }
 }
 
 /// The wall clock, in Unix milliseconds — read **here and nowhere else in this crate**.

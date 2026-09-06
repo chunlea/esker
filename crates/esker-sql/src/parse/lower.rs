@@ -77,6 +77,28 @@ impl Parsed {
         })
     }
 
+    /// Puts back what `sqlparser` could not hold in an `ON CONFLICT` clause: the index predicate,
+    /// and the expression each target placeholder stands for
+    /// (`crate::parse::strip_on_conflict_target`).
+    fn apply_conflict_shim(&self, lowered: &mut plan::Statement) {
+        let plan::Statement::Insert(insert) = lowered else {
+            return;
+        };
+        let Some(on_conflict) = insert.on_conflict.as_mut() else {
+            return;
+        };
+        if let Some(predicate) = self.conflict_predicate() {
+            on_conflict.predicate = Some(predicate.to_owned());
+        }
+        for key in &mut on_conflict.target {
+            if let plan::ConflictKey::Column(name) = key
+                && let Some(expression) = self.conflict_expression(name)
+            {
+                *key = plan::ConflictKey::Expression(expression.to_owned());
+            }
+        }
+    }
+
     fn lower_inline(&self) -> Result<plan::Statement> {
         // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
         // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
@@ -193,22 +215,7 @@ impl Parsed {
                 *not_null = self.domain_not_null();
             }
         }
-        // `ON CONFLICT (…) WHERE …`: the predicate the parser could not hold
-        // (`crate::parse::strip_on_conflict_predicate`).
-        if let plan::Statement::Insert(insert) = &mut lowered
-            && let Some(on_conflict) = insert.on_conflict.as_mut()
-        {
-            if let Some(predicate) = self.conflict_predicate() {
-                on_conflict.predicate = Some(predicate.to_owned());
-            }
-            for key in &mut on_conflict.target {
-                if let plan::ConflictKey::Column(name) = key
-                    && let Some(expression) = self.conflict_expression(name)
-                {
-                    *key = plan::ConflictKey::Expression(expression.to_owned());
-                }
-            }
-        }
+        self.apply_conflict_shim(&mut lowered);
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }

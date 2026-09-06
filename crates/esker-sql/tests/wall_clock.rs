@@ -151,6 +151,6 @@ fn every_commit_takes_a_timestamp_above_the_last() {
         );
     }
     for pair in seen.windows(2) {
-        assert!(pair[1] > pair[0], "{:?} does not ascend", seen);
+        assert!(pair[1] > pair[0], "{seen:?} does not ascend");
     }
 }
