@@ -30,6 +30,11 @@ const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 const DEPTH: &str = "ESKER_LOWER_DEPTH";
 /// Which walk the probe should make: `lower` stops at the plan, `execute` runs the statement.
 const MODE: &str = "ESKER_LOWER_MODE";
+/// Which pathological shape to build. Depth is not one thing: `or` and `parens` are deep in the
+/// source, while `in` and `row` are **flat** there and only become deep — if they do — inside
+/// lowering. A guard that counts brackets sees the first pair and not the second, which is the
+/// defect this file was opened for.
+const SHAPE: &str = "ESKER_LOWER_SHAPE";
 
 /// `a = 0 OR a = 1 OR …`, which is `depth` terms and **one** bracket.
 fn or_chain(depth: usize) -> String {
@@ -43,6 +48,55 @@ fn or_chain(depth: usize) -> String {
     sql
 }
 
+/// `SELECT ((((… 1 …))))`: deep in the source, and every level a bracket.
+fn parens(depth: usize) -> String {
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&"(".repeat(depth));
+    sql.push('1');
+    sql.push_str(&")".repeat(depth));
+    sql
+}
+
+/// `a IN (0, 1, …)`: one bracket and `depth` elements, flat in the source.
+fn in_list(depth: usize) -> String {
+    let mut sql = String::from("SELECT * FROM t WHERE a IN (");
+    for value in 0..depth {
+        if value > 0 {
+            sql.push(',');
+        }
+        let _ = write!(sql, "{value}");
+    }
+    sql.push(')');
+    sql
+}
+
+/// `(a, a, …) = (0, 1, …)`: two brackets and `depth` columns, flat in the source — and a row
+/// comparison is *defined* as a conjunction over its columns, so lowering is where the depth
+/// would appear if it appears anywhere.
+fn row_value(depth: usize) -> String {
+    let mut left = String::new();
+    let mut right = String::new();
+    for column in 0..depth {
+        if column > 0 {
+            left.push(',');
+            right.push(',');
+        }
+        left.push('a');
+        let _ = write!(right, "{column}");
+    }
+    format!("SELECT * FROM t WHERE ({left}) = ({right})")
+}
+
+/// The statement this probe should build, by shape.
+fn statement(depth: usize) -> String {
+    match std::env::var(SHAPE).as_deref() {
+        Ok("parens") => parens(depth),
+        Ok("in") => in_list(depth),
+        Ok("row") => row_value(depth),
+        _ => or_chain(depth),
+    }
+}
+
 /// The probe: lower an `OR` chain of `depth` terms on a worker-sized stack.
 ///
 /// Prints what happened and exits 0 either way — a refusal is a correct outcome, and the only
@@ -52,7 +106,7 @@ fn probe(depth: usize) -> ! {
     let handle = std::thread::Builder::new()
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
-            let sql = or_chain(depth);
+            let sql = statement(depth);
             // **The whole client path, not just the plan.** Lowering was where the node died, but
             // a plan the lowering guard admits is then walked by the resolver, the type pass and
             // the evaluator — each recursive, each on this same worker stack. If any of them
@@ -102,9 +156,16 @@ fn run_probe(depth: usize) -> Option<String> {
 }
 
 fn run_probe_in(depth: usize, mode: Option<&str>) -> Option<String> {
+    run_probe_shaped(depth, mode, None)
+}
+
+fn run_probe_shaped(depth: usize, mode: Option<&str>, shape: Option<&str>) -> Option<String> {
     let mut command = Command::new(std::env::current_exe().expect("this test binary"));
     if let Some(mode) = mode {
         command.env(MODE, mode);
+    }
+    if let Some(shape) = shape {
+        command.env(SHAPE, shape);
     }
     let output = command
         .env(DEPTH, depth.to_string())
@@ -200,5 +261,72 @@ fn a_plan_deeper_than_the_bound_is_refused_rather_than_fatal() {
             "the child died executing a {depth}-term OR chain: invariant 9"
         );
         assert_eq!(answer.as_deref(), Some("REFUSED 54001"), "at depth {depth}");
+    }
+}
+
+/// **Four pathological shapes, ten thousand deep, none of them a crash.**
+///
+/// Invariant 9 says never panic on user input, and a stack overflow is a panic that takes the
+/// process with it. The shapes differ in *where* their depth lives, which is the whole reason to
+/// test more than one:
+///
+/// * `parens` and `or` are deep **in the source**. The parser's own bracket count sees the first;
+///   the second has one bracket and an N-deep tree, which is the miss this file was opened for.
+/// * `in` and `row` are **flat** in the source. A guard counting brackets sees nothing at all, so
+///   whether they are safe depends on what lowering does with them — and a row comparison is
+///   defined as a conjunction over its columns, so it is the one shape whose depth is *created*
+///   after the parser has finished counting.
+///
+/// The assertion is deliberately not "54001": a shape this node does not implement may answer
+/// `0A000` instead, and that is equally not a crash. What is asserted is that the child **reached
+/// the end of the probe and printed an outcome**, because the only failure this test can have is
+/// the child dying — `None` here is `SIGABRT`.
+///
+/// What the four answered when this was written, which is worth recording because two of them are
+/// not what a reader would guess:
+///
+/// | shape | at ten thousand |
+/// |---|---|
+/// | `parens` | `PARSE 54001` — the parser's bracket count |
+/// | `or` | `PARSE 54001` — deep enough that the parser catches it before lowering does |
+/// | `in` | **`LOWERED`, then `EXECUTED`** — refused by nothing, because it is flat at every layer |
+/// | `row` | **`REFUSED 0A000`** — row comparisons are not implemented, so this shape is turned
+///   away before any depth guard sees it |
+///
+/// So `row` proves nothing about depth *yet*, and that is the point of leaving it here: a row
+/// comparison is defined as a conjunction over its columns, so the day it is implemented this
+/// shape stops being flat and starts being ten thousand deep — after the parser has finished
+/// counting brackets. This test will be waiting for it.
+#[test]
+fn every_pathological_shape_at_ten_thousand_is_an_answer_and_not_a_crash() {
+    const DEEP: usize = 10_000;
+
+    for shape in ["parens", "or", "in", "row"] {
+        let outcome = run_probe_shaped(DEEP, None, Some(shape));
+        let text = outcome.unwrap_or_else(|| {
+            panic!(
+                "the `{shape}` probe at {DEEP} did not survive: the child died rather than \
+                 answering, which is a stack overflow and invariant 9 forbids it"
+            )
+        });
+        assert!(
+            !text.is_empty(),
+            "the `{shape}` probe printed nothing, so it is not known which phase it reached"
+        );
+        println!("{shape} at {DEEP}: {text}");
+
+        // **A shape that lowers is not a shape that is safe.** `in` is refused by nothing — it is
+        // flat in the source and stays flat through lowering — so the plan it produces is then
+        // walked by the resolver, the type pass and the evaluator, each recursive and each on the
+        // worker's own 2 MiB. Stopping at `LOWERED` would be checking the one phase that had
+        // already answered.
+        if text.starts_with("LOWERED") {
+            let executed = run_probe_shaped(DEEP, Some("execute"), Some(shape)).unwrap_or_else(|| {
+                panic!(
+                    "the `{shape}` probe lowered at {DEEP} and then died executing: the guard is                      in the wrong place if a plan it admits cannot be walked"
+                )
+            });
+            println!("{shape} at {DEEP}, executed: {executed}");
+        }
     }
 }
