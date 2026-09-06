@@ -1,0 +1,137 @@
+# **`date_trunc`: three argument types, one session zone, and two error classes** — PostgreSQL
+# 19beta1, 2026-09-06. One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe; the field-spelling walk is
+# one statement per spelling, because a refusal inside an `unnest` hides every row after it.
+#
+# `PostgresqlTimestampFixtureTest#test_group_by_date` sends
+# `Topic.group("date_trunc('month', created_at)").count`, and asserts on the *keys*:
+#
+#     keys.each { |k| assert_kind_of Time, k }
+#
+# so the **declared type decides the test**, not only the value. A `text` answer would be a String
+# in Ruby and fail on a row whose value is right.
+#
+#     SELECT COUNT(*) AS count_all, date_trunc('month', created_at) AS date_trunc_month_created_at
+#       FROM topics GROUP BY date_trunc('month', created_at)
+#
+#         count_all                    bigint
+#         date_trunc_month_created_at  timestamp without time zone
+#
+# The unaliased output name is `date_trunc`.
+#
+# ## The result type is the argument's, and a date is not the type it looks like
+#
+#     date_trunc(text, timestamp)              timestamp without time zone
+#     date_trunc(text, timestamptz)            timestamp with time zone
+#     date_trunc(text, interval)               interval
+#     date_trunc(text, date)                   timestamp WITH time zone      <- not timestamp
+#     date_trunc(text, timestamp, text)        timestamp with time zone      <- and not either
+#     date_trunc(text, timestamptz, text)      timestamp with time zone
+#
+# **A `date` resolves to the `timestamptz` overload**, not the unzoned one: `date_trunc('day',
+# DATE '2026-09-05')` is `2026-09-05 00:00:00+00`. And the three-argument form takes a `timestamp`
+# by casting it to `timestamptz` first, so *its* answer is zoned too.
+#
+# ## The session `TimeZone` decides where a `timestamptz` is cut
+#
+# This is the whole reason the zone reader (ADR 0080) is load-bearing here.
+#
+#     SET TimeZone='UTC';                date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00')
+#                                            2026-09-05 00:00:00+00
+#     SET TimeZone='Australia/Sydney';   same statement
+#                                            2026-09-06 00:00:00+10   (= 2026-09-05 14:00 UTC)
+#     SET TimeZone='America/New_York';   date_trunc('month', TIMESTAMPTZ '2026-09-01 02:00:00+00')
+#                                            2026-08-01 00:00:00-04   <- the *month* changes
+#
+# An unzoned `timestamp` is cut where it is written and `TimeZone` does not touch it.
+#
+# ## Every field, on 2026-09-05 14:37:59.123456 (a Saturday)
+#
+#     microseconds  2026-09-05 14:37:59.123456      week          2026-08-31 00:00:00  (Monday)
+#     milliseconds  2026-09-05 14:37:59.123         month         2026-09-01 00:00:00
+#     second        2026-09-05 14:37:59             quarter       2026-07-01 00:00:00
+#     minute        2026-09-05 14:37:00             year          2026-01-01 00:00:00
+#     hour          2026-09-05 14:00:00             decade        2020-01-01 00:00:00
+#     day           2026-09-05 00:00:00             century       2001-01-01 00:00:00
+#                                                   millennium    2001-01-01 00:00:00
+#
+#     date_trunc('century',    TIMESTAMP '2000-06-01')   1901-01-01 00:00:00
+#     date_trunc('century',    TIMESTAMP '2001-06-01')   2001-01-01 00:00:00
+#     date_trunc('millennium', TIMESTAMP '2000-06-01')   1001-01-01 00:00:00
+#
+# **A century starts in year 1**, so 2000 belongs to the one beginning 1901 and 2001 opens its own.
+#
+# ## The field is a synonym table, and it is not regular
+#
+# Measured one statement per spelling. Every one of these truncates:
+#
+#     microseconds  microsecond  usec  usecs  us
+#     milliseconds  millisecond  msec  ms
+#     second        seconds      sec   secs   s
+#     minute        minutes      min   mins   m          <- `m` is the MINUTE, not the month
+#     hour          hours        hr    hrs    h
+#     day           days         d
+#     week          weeks        w
+#     month         months       mon   mons
+#     quarter                                            <- and nothing else
+#     year          years        yr    yrs    y
+#     decade        decades      dec
+#     century       centuries    cent  c
+#     millennium    millenniums  millennia  mil
+#
+# **`quarter` has no plural and no abbreviation**: `quarters` and `q` are both refused, while every
+# other unit here takes at least one alias. `millisec`, `microsecs` and `millisecs` are refused
+# although `msec` and `usec` are not. The field is case-insensitive (`MONTH`, `MoNtH`) and is not
+# trimmed: `' month'` with a leading space is a refusal.
+#
+# ## Two error classes, and which is which matters
+#
+#     22023 unit "fortnight" not recognized for type timestamp without time zone
+#     22023 unit "fortnight" not recognized for type timestamp with time zone
+#     22023 unit "fortnight" not recognized for type interval
+#     22023 unit " month" not recognized for type timestamp without time zone
+#     22023 unit "quarters" not recognized for type timestamp without time zone
+#     22023 unit "epoch" not recognized for type timestamp without time zone
+#     22023 unit "dow" / "doy" / "isoyear" / "isodow" / "julian" not recognized …
+#
+#     0A000 unit "timezone" not supported for type timestamp without time zone
+#     0A000 unit "timezone_hour" not supported …
+#     0A000 unit "timezone_minute" not supported …
+#     0A000 unit "week" not supported for type interval
+#           DETAIL: Months usually have fractional weeks.
+#
+# A unit the table does not hold is **`22023 not recognized`**; a unit it holds that this function
+# cannot apply is **`0A000 not supported`**. `epoch` and `dow` are `EXTRACT` fields and land in the
+# first class, which reasoning would have put in the second.
+#
+# ## An interval truncates its own fields, and loses the ones below
+#
+#     date_trunc(f, INTERVAL '3 years 4 mons 5 days 06:07:08.9')
+#
+#     microseconds  3 years 4 mons 5 days 06:07:08.9    month       3 years 4 mons
+#     milliseconds  3 years 4 mons 5 days 06:07:08.9    quarter     3 years 3 mons
+#     second        3 years 4 mons 5 days 06:07:08      year        3 years
+#     minute        3 years 4 mons 5 days 06:07:00      decade      00:00:00
+#     hour          3 years 4 mons 5 days 06:00:00      century     00:00:00
+#     day           3 years 4 mons 5 days               millennium  00:00:00
+#
+# **A decade truncation of 3 years is zero**, printed `00:00:00` and not the empty string —
+# an interval has no smaller unit to keep. `week` is the one field an interval refuses.
+#
+# ## Arity and NULLs
+#
+#     SELECT date_trunc('day', 42)
+#         42883 function date_trunc(unknown, integer) does not exist
+#         DETAIL: No function of that name accepts the given argument types.
+#         HINT:  You might need to add explicit type casts.
+#     SELECT date_trunc('day')
+#         42883 function date_trunc(unknown) does not exist
+#         DETAIL: No function of that name accepts the given number of arguments.
+#     SELECT date_trunc('day', TIMESTAMPTZ '…', 'Mars/Olympus')
+#         22023 time zone "Mars/Olympus" not recognized
+#
+#     date_trunc(NULL, TIMESTAMP '…')      NULL
+#     date_trunc('day', NULL::timestamp)   NULL
+#
+# Statements below are the corpus rows; the field walk and the synonym table are asserted in
+# `tests/date_trunc.rs` against this file rather than re-listed as rows.
+
