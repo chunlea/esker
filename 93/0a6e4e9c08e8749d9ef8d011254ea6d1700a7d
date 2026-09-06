@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_2d916f5f540186::t_6f99f6907bd7ae 2977-2984
+crates/esker-sql/tests/check_constraint_pretty.rs
+  s_2d916f5f540186::t_aae052c3d75a10 147-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "930a6e4e9c08e8749d9ef8d011254ea6d1700a7d",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
