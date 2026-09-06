@@ -322,6 +322,21 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     let began = std::time::Instant::now();
     let mut waited = 0_u64;
     loop {
+        // **At the top, not in the arm that waits.** A cancelled statement must stop whatever it
+        // finds here, and what it finds is the whole difference: the check used to live in the
+        // `Held` arm below, so it fired only while the lock was *still* held. When the holder
+        // committed, this loop took the `Taken` arm instead, restarted the statement, and the
+        // restart ran to completion with the flag still set — the statement answered rows to a
+        // client that had cancelled it.
+        //
+        // r1 tapped both servers on one seed for `transaction_test.rb`'s
+        // `raises QueryCanceled when canceling statement due to user request`: identical SQL,
+        // identical binds, **513.3 ms here against 513.2 ms on PostgreSQL 19**, one row against
+        // `57014`. The wait ended at the same instant on both — the holder's `COMMIT` — so the
+        // cancel was never missed; only the raise was. The cancel and that commit arrive
+        // microseconds apart and this loop sleeps two milliseconds, which is why the sweeps read
+        // 12, 11 and 10 failures of 12 rather than a clean split.
+        cancel::check()?;
         match txn.lock(key)? {
             // **A lock taken at once is not proof that nothing moved.** The writer in front may
             // have committed and released between this statement's read and this lock, in which
@@ -374,8 +389,9 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
                 // its own deadline, so a `pg_cancel_backend` from another session set a flag
                 // nothing on this path read — the function answered `true` and the waiter waited
                 // on. It is the shape an application actually cancels: a statement stuck behind
-                // somebody else's lock, which is `transaction_test.rb`'s last failure.
-                cancel::check()?;
+                // somebody else's lock, which is `transaction_test.rb`'s last failure. The check
+                // that does it is now at the top of the loop, where it also catches the waiter
+                // whose lock came free.
                 if let Some((limit, which)) = deadline
                     && waited >= limit
                 {
@@ -902,6 +918,12 @@ impl Executor {
                         // back to what it was before this statement, which is what a re-read needs
                         // and what a savepoint's value-restore would have shadowed.
                         Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                            // **A cancelled statement is not re-run.** The restart is this node's
+                            // own machinery — nobody asked for it — so retrying one that has been
+                            // told to stop is a cancel that never lands, however many times the
+                            // flag is set. The wait loop's own check catches this too when the
+                            // restart reaches a lock; this catches the restart that does not.
+                            cancel::check()?;
                         }
                         other => return other,
                     }
