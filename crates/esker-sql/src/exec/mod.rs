@@ -3672,6 +3672,12 @@ fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
 }
 
 impl Execute for Executor {
+    fn terminated(&self) -> bool {
+        self.identity
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Everything this session holds, released — what the end of a connection owes the node.
     ///
     /// A session's locks die with it on a real server and nothing else releases them: they survive

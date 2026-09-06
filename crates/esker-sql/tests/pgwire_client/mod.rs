@@ -56,6 +56,48 @@ impl Client {
         self.read_until_ready().await
     }
 
+    /// One statement through the **extended** protocol, the way `PG::Connection#exec_params` sends
+    /// it: `Parse` (unnamed, no declared types), `Bind`, `Describe(portal)`, `Execute`, `Sync`.
+    ///
+    /// Here because a simple `Query` cannot carry a parameter, and a parameter is the whole subject
+    /// of the tests that use this: the pg gem never sends `Describe(statement)` for `exec_params`,
+    /// so a node that types its parameters only on that path answers a real client differently from
+    /// this file's `query`.
+    pub async fn exec_params(&mut self, sql: &str, values: &[Option<&str>]) -> Answer {
+        let mut packet = Vec::new();
+        // Parse: unnamed statement, the SQL, and zero declared parameter types.
+        let mut body = vec![0u8];
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        frame(&mut packet, b'P', &body);
+
+        // Bind: unnamed portal, unnamed statement, no format codes, the values as text.
+        let mut body = vec![0u8, 0u8];
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&u16::try_from(values.len()).unwrap().to_be_bytes());
+        for value in values {
+            match value {
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(text) => {
+                    body.extend_from_slice(&i32::try_from(text.len()).unwrap().to_be_bytes());
+                    body.extend_from_slice(text.as_bytes());
+                }
+            }
+        }
+        body.extend_from_slice(&0u16.to_be_bytes());
+        frame(&mut packet, b'B', &body);
+
+        frame(&mut packet, b'D', &[b'P', 0]);
+        let mut body = vec![0u8];
+        body.extend_from_slice(&0u32.to_be_bytes());
+        frame(&mut packet, b'E', &body);
+        frame(&mut packet, b'S', &[]);
+
+        self.0.write_all(&packet).await.unwrap();
+        self.read_until_ready().await
+    }
+
     /// **Bounded**: a cancellation that never lands must be a report, not a hung suite.
     pub async fn read_until_ready(&mut self) -> Answer {
         let mut answer = Answer::default();
@@ -132,4 +174,11 @@ pub async fn listen(
         .await;
     });
     address
+}
+
+/// One protocol message: tag, length including itself, body.
+fn frame(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    out.push(tag);
+    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+    out.extend_from_slice(body);
 }

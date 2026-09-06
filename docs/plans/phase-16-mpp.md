@@ -992,3 +992,111 @@ opens and not only at the next entry. The gate on `catch_up` that was originally
 `ColumnarApply::applied_index()` against `min_apply_index` — was withdrawn once the durable-seal
 reading above was shown; if it is ever wanted as a safety net against *other* ways a copy can lag,
 it needs `complete_index` and it needs to run after a seal.
+
+## J14. The first write on a fresh connection was refused 25006 — 2026-09-05
+
+Six sightings on real clusters: `SELECT 1` succeeds, the first **write** comes back
+
+```text
+ERROR 25006: cannot execute INSERT in a read-only transaction: this node's schema lease has
+expired and the placement driver is unreachable
+```
+
+and nothing on PD or on the node logs anything. Reads keep working throughout, which is what makes
+it look like a client problem.
+
+### What it is not
+
+The startup path was the first suspicion and it is sound: `attach_pd` fetches the lease
+**synchronously**, fails startup if it cannot, and the client socket opens only afterwards — so a
+fresh connection always finds a lease that has been granted. PD's `SchemaLease` handler is pure
+config with no leader gate, so PD's "no cluster yet" does not refuse it. And `StoreBackend`
+overrides both lease methods rather than inheriting their trait defaults, which was the one reading
+that would have made the evidence below meaningless.
+
+### The mechanism
+
+`LeaseRefresher::run` was one loop doing two jobs:
+
+```rust
+loop { sleep(lease / 3); renew(); report(); }
+```
+
+The renewal is recorded before the report, so *that* renewal is never late — which is what the
+code's own comment claimed, and it was true and not sufficient. **The next sleep did not begin until
+the report returned.** The report is `columnar_wishes`: a transaction opened against the cluster and
+a catalog range scanned across it, whose cost is a region mid-split, a leader that has moved, or a
+store saturated by someone else's load. A report costing more than the remaining two thirds of the
+lease lets it expire — and nothing logs it, because the renewal succeeded and a slow read is not an
+error.
+
+### Confirmed by instrumenting, not by arguing
+
+A temporary log of each round's two halves, then the same six attempts on the real-cluster harness:
+
+```text
+attempt 3:  SLOWROUND  renew_ms=0  report_ms=3879  period_ms=1666   (lease_ms=5000)
+```
+
+`renew_ms=0` — the renewal is instant. `report_ms=3879` — the report is the whole of it. The next
+renewal was due 3879 + 1666 = **5,545 ms** after the last, 545 ms past expiry, and the same attempt
+is the one whose `INSERT` returned 25006. **`ERROR 25006` and `SLOWROUND` appeared in attempt 3 and
+in no other, one for one, neither ever without the other.**
+
+(The script's own summary line first said 6 of 6. `$(grep -c … || echo 0)` yields `"0\n0"` when grep
+matches nothing, and `"0\n0" != "0"`, so every attempt scored as a hit. The per-attempt lines were
+right; the total under them was not. Read the per-item outcomes.)
+
+### The fix
+
+Three parts, none of them a grace period and none of them a wait on the write path:
+
+1. **The renewal loop schedules by deadline**, sleeping until `round_start + period`, so the cost of
+   a renewal comes out of its wait rather than being added to it.
+2. **The report moved to a thread of its own** with its own cadence and one round at a time. Its PD
+   half already carries a transport deadline; its backend half is a cluster read and its duration is
+   **not** bounded — which is exactly why it is no longer allowed near the renewal.
+3. **A renewal landing more than half a lease after the previous one logs a warn** with both
+   durations, in `PdLease::record` so that every path recording a lease is measured. Half rather
+   than the whole, because at the whole the node has already refused a write and the log arrives
+   after the client's error.
+
+### The residual the test found after the fix
+
+With the loop fixed the deterministic test still failed, at **1 lapsed sample in 263** rather than
+166 in 258 — the same 1 every run, so structural. It is the startup round: `refresh()` recorded the
+lease and *then* ran a report that outlasted it, handing the client socket a lease already aged by
+the whole report. That is the field report's "the first renewal has not landed", exactly.
+
+So the startup round now reports **first** and renews **last** — the opposite order to the loop, for
+the opposite reason: nothing is being kept alive across it, and what matters is that the lease be
+fresh when it returns, because the caller opens the socket next.
+
+Worth recording that the test found this and the reasoning did not: the mechanism above explains the
+loop, and the loop was only most of the bug.
+
+### The proof, in three states of the same tree
+
+| tree | lapsed samples, of ~260 | |
+|---|---|---|
+| the loop as it was | 166 / 258, 146 / 246, 165 / 258 | red ×3 |
+| the loop fixed, startup untouched | 1 / 263, 1 / 266, 1 / 257 | still red ×3 |
+| both | **0** | **green ×5**, ~4.5 s |
+
+Red and green were run by **one script that owned the tree for its whole duration** — red three
+times, `git apply` the fix, green three times — because the first attempt at this had me editing
+`pd.rs` while the red proof was still building against it, which would have compiled the fix into
+the runs that were supposed to prove it red.
+
+### The test
+
+`esker-sql/tests/pd_wiring.rs::a_report_slower_than_the_lease_does_not_expire_it`. Deterministic and
+clusterless: the existing `StandInPd` on a socket, the real `PdConn`, `PdLease` and
+`LeaseRefresher`, and a backend given to **the refresher only** whose `begin()` sleeps three
+lease-lengths. Sessions keep the ordinary backend, because what is under test is the renewal's
+cadence and not a slow statement.
+
+It watches `Backend::schema_lease_remaining()` — literally the value the write path turns into
+`25006` — rather than any proxy for it. The slow-report wrapper forwards `schema_lease_remaining`
+and `schema_step_interval` explicitly: both have trait defaults, and a wrapper that inherited them
+would answer "this node may always write" from the very object the test uses to watch a lease lapse.

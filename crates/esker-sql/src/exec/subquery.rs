@@ -624,6 +624,21 @@ pub(super) fn resolve(node: &mut Node, txn: &dyn Txn, tenant: u64) -> Result<()>
     outcome
 }
 
+/// [`resolve`] for one expression rather than a plan — what an `UPDATE`'s `SET` needs.
+///
+/// The assignment is not inside a `Node`, so there is no plan to walk; the rest is the same, and
+/// so is the reason it runs where it does. **An uncorrelated subquery on the right of a `SET` is a
+/// constant of the statement**, so it is run once here, before the first row is written, and not
+/// once per row: `UPDATE a SET n = (SELECT max(n) FROM b)` reads `b` as it was when the statement
+/// began, which is what a real server answers and what stops a statement from reading its own
+/// writes. A correlated one is left for the row evaluator, which has the row.
+pub(super) fn run_in_expr(expr: &mut Expr, txn: &dyn Txn, tenant: u64) -> Result<()> {
+    walk_mut(expr, &mut |expr| match expr {
+        Expr::Subquery(sub) => run_one(sub, txn, tenant),
+        _ => Ok(()),
+    })
+}
+
 /// One subquery, run: its plan drained into the values the expression around it reads.
 fn run_one(sub: &mut SubqueryExpr, txn: &dyn Txn, tenant: u64) -> Result<()> {
     let Some(plan) = sub.plan.as_deref_mut() else {

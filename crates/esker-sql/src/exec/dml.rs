@@ -863,6 +863,39 @@ fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<
     }
 }
 
+/// Plans every subquery on the right of a `SET`, and runs the ones that do not depend on a row.
+///
+/// The `SET` counterpart to [`planned_filter`], and it runs **once per target relation, before the
+/// first row is written** rather than inside the loop. That placement is the behaviour, not an
+/// optimisation: an uncorrelated subquery is a constant of the statement, so
+/// `UPDATE a SET n = (SELECT max(n) FROM b)` reads `b` as it was when the statement began. Planning
+/// it per row would re-read `b` after each write, and where `a` and `b` are the same table that is
+/// a statement reading its own writes — a different answer from the one a real server gives, and a
+/// different answer on every row.
+///
+/// A **correlated** one is planned here and left unrun: its answer is a function of the row, so the
+/// row evaluator runs it through `subquery::run_correlated`, once per row, which is the nested loop
+/// `docs/plans/phase-12-subquery.md` §1 declares as the shape.
+fn plan_assignment_subqueries(
+    executor: &Executor,
+    txn: &dyn Txn,
+    assignments: &mut [(usize, crate::plan::Expr)],
+    scope: &query::Scope<'_>,
+) -> Result<()> {
+    let catalogued = super::Catalogued {
+        exec: executor,
+        txn,
+    };
+    for (_, value) in assignments.iter_mut() {
+        if !super::subquery::contains_subquery(value) {
+            continue;
+        }
+        super::subquery::plan_in_write_filter(value, executor.tenant, txn, &catalogued, scope)?;
+        super::subquery::run_in_expr(value, txn, executor.tenant)?;
+    }
+    Ok(())
+}
+
 /// Which column each value in a `VALUES` tuple is for.
 fn target_columns(table: &TableDef, insert: &Insert) -> Result<Vec<usize>> {
     let Some(names) = &insert.columns else {
@@ -1098,7 +1131,8 @@ pub(super) fn update(
         let entries = scope_entries(&table, &target_name, &chain, &sources);
         let scope = query::Scope::chain(&entries);
         let width = table.columns.len();
-        let assignments = assignment_ordinals(update, &table)?;
+        let mut assignments = assignment_ordinals(update, &table)?;
+        plan_assignment_subqueries(executor, &*txn, &mut assignments, &scope)?;
 
         let rows = target_rows(
             executor,

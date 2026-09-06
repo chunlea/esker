@@ -126,6 +126,15 @@ pub trait Execute {
     /// Runs one statement that is not transaction control.
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome>;
 
+    /// Whether another session has called `pg_terminate_backend` on this one.
+    ///
+    /// **Required rather than defaulted**, unlike the optional capabilities below it. A default of
+    /// `false` reads as "this executor cannot be terminated" and would be indistinguishable from an
+    /// implementor that forgot to override it — and the failure that produces is a session the
+    /// server believes is alive and a client that has been told it is dead. An executor with no
+    /// session registry behind it answers `false` in one line and says so.
+    fn terminated(&self) -> bool;
+
     /// What a statement takes and what it returns, without running it — what `Describe` needs.
     ///
     /// The default answers "no parameters, no rows", which is right for an executor that runs
@@ -800,6 +809,11 @@ mod tests {
     }
 
     impl Execute for Fake {
+        /// Nothing registers this, so nothing can terminate it.
+        fn terminated(&self) -> bool {
+            false
+        }
+
         fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
             self.calls.push(format!("describe {}", parsed.rendered()));
             Ok(Described {

@@ -157,6 +157,15 @@ pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
 /// waits for a server that has gone (`crate::pgwire::server::Connection::run`).
 pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 
+// --- Class 57 — Operator Intervention ---
+
+/// `pg_terminate_backend` ended this connection.
+///
+/// `FATAL` for the same reason as the one above, and reached the same way: the session is told
+/// once and the socket goes. Measured on 19beta1 with `VERBOSITY verbose` —
+/// `FATAL: 57P01: terminating connection due to administrator command`.
+pub const ADMIN_SHUTDOWN: &str = "57P01";
+
 // --- Class 26 — Invalid SQL Statement Name ---
 
 /// `Bind`/`Describe`/`Execute` naming a prepared statement that was never parsed.

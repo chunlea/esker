@@ -745,6 +745,10 @@ struct Idling {
 }
 
 impl Execute for Idling {
+    fn terminated(&self) -> bool {
+        false
+    }
+
     fn execute(
         &mut self,
         _parsed: &esker_sql::parse::Parsed,

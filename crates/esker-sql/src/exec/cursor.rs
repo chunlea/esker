@@ -2744,6 +2744,23 @@ fn catalog_function(
             super::cancel::check()?;
             Datum::Bool(asked)
         }
+        CatalogFunc::PgTerminateBackend => {
+            let Some(pid) = args
+                .first()
+                .and_then(Datum::to_text)
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            else {
+                // Strict, as on a real server: `pg_terminate_backend(NULL)` is NULL.
+                return Ok(Datum::Null);
+            };
+            // **Including this session's own pid**, which a real server allows and one Rails
+            // helper reaches. The connection loop checks the flag again once the statement is
+            // done, so the `t` computed here never reaches the client: PostgreSQL answers that
+            // statement with `FATAL` and closes, and so does this.
+            let asked = crate::session::terminate_pid(pid);
+            super::cancel::check()?;
+            Datum::Bool(asked)
+        }
         // **The transaction's instant**, so two calls in one transaction are equal and their
         // difference is `00:00:00`. It comes from the TSO and never from a clock this node reads.
         //
