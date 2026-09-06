@@ -4293,13 +4293,26 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             expr,
             subquery,
             negated,
-        } => Ok(plan::Expr::Subquery(Box::new(
-            plan::SubqueryExpr::compared(
-                plan::SubqueryKind::In { negated: *negated },
-                lower_expr(expr)?,
-                Box::new(lower_query(subquery)?),
-            ),
-        ))),
+        } => {
+            // **A row on the left**, which is what a composite primary key sends:
+            // `WHERE (shop_id, id) IN (SELECT shop_id, id FROM …)`. It is lowered as a list of
+            // operands rather than as a row *expression* — there is no general row value in this
+            // crate, and one shape does not need one.
+            let operands = match expr.as_ref() {
+                Expr::Tuple(items) => items
+                    .iter()
+                    .map(lower_expr)
+                    .collect::<Result<Vec<_>>>()?,
+                other => vec![lower_expr(other)?],
+            };
+            Ok(plan::Expr::Subquery(Box::new(
+                plan::SubqueryExpr::compared_row(
+                    plan::SubqueryKind::In { negated: *negated },
+                    operands,
+                    Box::new(lower_query(subquery)?),
+                ),
+            )))
+        }
         // `<op> ANY (SELECT …)` -- a **subquery** on the right, which is this phase's and takes
         // every one of the six operators. It is matched before the array arm below because the two
         // share a grammar and nothing else: `= ANY (SELECT …)` is a nested loop over a plan and

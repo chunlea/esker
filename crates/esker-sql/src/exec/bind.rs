@@ -709,7 +709,7 @@ fn walk_predicate(
         // names, which is why [`table_names`] collects a subquery's relations too. Walked as the
         // `SELECT` it is, so every rule above applies inside it without being restated.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &sub.operand {
+            for operand in &sub.operands {
                 walk_predicate(operand, named, tables, seen);
                 // `$1 IN (SELECT n FROM t)` is the operand taking the **subquery's** column
                 // type, which is the one rule here that reads across the boundary rather than
@@ -718,7 +718,9 @@ fn walk_predicate(
                 // column is read the way every other type here is read — through the catalog, by
                 // name — and anything more involved than a column reference keeps the `text`
                 // fallback rather than being guessed at.
-                if let Expr::Parameter(number) = operand.as_ref()
+                // Only for a single operand: a row on the left is compared column by column
+                // and the sub-select's *single* column is not what any of them meets.
+                if let [Expr::Parameter(number)] = sub.operands.as_slice()
                     && let Some(ty) = single_column_type(&sub.select, tables)
                 {
                     seen(*number, ty);
@@ -1131,7 +1133,7 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         // than beside it, so an arm that walked only the sub-`SELECT` would leave `$1 IN (SELECT
         // …)` behind.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &mut sub.operand {
+            for operand in &mut sub.operands {
                 walk_expr_mut(operand, visit);
             }
             walk_select_mut(&mut sub.select, visit);
@@ -1352,7 +1354,7 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         // [`walk_expr_mut`]'s twin arm, and it has to agree with it: one sizes the parameter list
         // and the other fills it, so a shape in one and not the other is a parameter counted and
         // never filled, or filled and never counted.
-        if let Some(operand) = &sub.operand {
+        for operand in &sub.operands {
             descend(operand, visit);
         }
         for_each_in_select(&sub.select, &mut |expr| descend(expr, &mut *visit));

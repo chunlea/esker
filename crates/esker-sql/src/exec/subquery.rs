@@ -519,7 +519,7 @@ fn fold_counts(select: &mut Select, txn: &dyn Txn, tenant: u64) -> Result<()> {
         run_one(sub, txn, tenant)?;
         // `LIMIT NULL` means no limit, which is PostgreSQL's rule and what `Literal::Null`
         // already reaches; anything else is the value the subquery answered with.
-        *slot = Expr::Literal(match value(sub, None)? {
+        *slot = Expr::Literal(match value(sub, &[])? {
             Datum::Null => Literal::Null,
             Datum::Int8(count) => Literal::Integer(count),
             other => Literal::Typed(Box::new(other)),
@@ -555,8 +555,12 @@ fn plan_one(
     // PostgreSQL gives the two cases **different sentences under the same SQLSTATE**: a scalar
     // subquery is `subquery must return only one column` and an `IN`/`ANY`/`ALL` is `subquery has
     // too many columns`. A client that greps the text sees two messages, so this node sends two.
-    if sub.kind.reads_a_value() && planned.columns.len() != 1 {
+    // A row on the left wants that many columns on the right, and PostgreSQL says which way it
+    // is short: `(1,2) IN (SELECT 1)` is `subquery has too few columns` — measured.
+    let wanted = sub.operands.len().max(1);
+    if sub.kind.reads_a_value() && planned.columns.len() != wanted {
         return Err(SqlError::SubqueryColumns(match sub.kind {
+            _ if planned.columns.len() < wanted => "subquery has too few columns",
             // `ARRAY(SELECT a, b)` and `ARRAY(SELECT)` both get the scalar's wording, measured —
             // the second is this error and not a syntax error, which is what says the empty
             // select list is a *column count* of zero rather than a parse failure.
@@ -678,7 +682,7 @@ pub(super) fn run_correlated(
     outer: &[Datum],
     txn: &dyn Txn,
     tenant: u64,
-) -> Result<Vec<Datum>> {
+) -> Result<Vec<Vec<Datum>>> {
     let Some(plan) = sub.plan.as_deref() else {
         return Err(SqlError::Internal(format!(
             "{} reached the row evaluator without a plan",
@@ -788,7 +792,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         // Into the sub-plan, **one level deeper**, and into the operand at this level. The
         // sub-plan's cached `run` is dropped: it was computed for a different outer row.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &mut sub.operand {
+            for operand in &mut sub.operands {
                 substitute_in_expr(operand, outer, depth);
             }
             if let Some(plan) = sub.plan.as_deref_mut() {
@@ -824,7 +828,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
 /// column of it in memory on behalf of a client. The kinds that need fewer rows read fewer —
 /// `EXISTS` stops at one, a scalar at two, because the second row *is* the `21000` and a third
 /// would be read for nobody.
-fn rows_of(plan: &Node, kind: SubqueryKind, txn: &dyn Txn, tenant: u64) -> Result<Vec<Datum>> {
+fn rows_of(plan: &Node, kind: SubqueryKind, txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     let mut cursor = Cursor::open(txn, tenant, crate::exec::cursor::Settings::none(), plan)?;
     let wanted = kind.rows_needed();
     let mut values = Vec::new();
@@ -837,9 +841,9 @@ fn rows_of(plan: &Node, kind: SubqueryKind, txn: &dyn Txn, tenant: u64) -> Resul
             )));
         }
         // `EXISTS` reads no value at all, so a row of a subquery with three columns and a row of
-        // one with none are the same evidence: there was a row. Anything else has exactly one
-        // column by the check in `plan_one`.
-        values.push(row.first().cloned().unwrap_or(Datum::Null));
+        // one with none are the same evidence: there was a row. Every other kind has as many
+        // columns as its left-hand side by the check in `plan_one`.
+        values.push(row);
         if wanted.is_some_and(|wanted| values.len() >= wanted) {
             break;
         }
@@ -852,7 +856,7 @@ fn rows_of(plan: &Node, kind: SubqueryKind, txn: &dyn Txn, tenant: u64) -> Resul
 /// Every rule here is a line of `tests/corpus/pg19_subquery_expr.txt`. The order of the two
 /// guards at the top of the comparing kinds is the trap the capture exists for: **empty is decided
 /// before NULL**, so `NULL IN (SELECT … no rows)` is `false` where `NULL IN (1)` is NULL.
-pub(super) fn value(sub: &SubqueryExpr, operand: Option<Datum>) -> Result<Datum> {
+pub(super) fn value(sub: &SubqueryExpr, operand: &[Datum]) -> Result<Datum> {
     let Some(values) = sub.run.as_deref() else {
         return Err(SqlError::Internal(format!(
             "{} reached the row evaluator without being run",
@@ -870,10 +874,17 @@ pub(super) fn value(sub: &SubqueryExpr, operand: Option<Datum>) -> Result<Datum>
 /// The same, from the rows one run of a correlated sub-plan just produced.
 pub(super) fn value_of(
     kind: SubqueryKind,
-    operand: Option<Datum>,
-    values: &[Datum],
+    operand: &[Datum],
+    values: &[Vec<Datum>],
     element: Option<ColumnType>,
 ) -> Result<Datum> {
+    /// Column 0 of each row, which is the whole of what the single-column kinds read.
+    fn first_column(values: &[Vec<Datum>]) -> Vec<Datum> {
+        values
+            .iter()
+            .map(|row| row.first().cloned().unwrap_or(Datum::Null))
+            .collect()
+    }
     Ok(match kind {
         // **Every row is an element, in the subquery's own order**, and a NULL row is a NULL
         // element rather than an absence — which is what makes `{}`, `{NULL}` and NULL three
@@ -882,7 +893,7 @@ pub(super) fn value_of(
         SubqueryKind::Array => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             element.unwrap_or(ColumnType::Text),
             1,
-            values
+            first_column(values)
                 .iter()
                 .map(|value| match value {
                     Datum::Null => None,
@@ -893,7 +904,7 @@ pub(super) fn value_of(
         // No rows is NULL, one row is the value, and two is an error rather than the first of
         // them. The error is per *execution*, which is why it is raised here and not when the
         // subquery was planned.
-        SubqueryKind::Scalar => match values {
+        SubqueryKind::Scalar => match first_column(values).as_slice() {
             [] => Datum::Null,
             [only] => only.clone(),
             _ => return Err(SqlError::CardinalityViolation),
@@ -930,29 +941,29 @@ pub(super) fn value_of(
 /// 4. with no definite answer, a NULL anywhere makes it unknown — `300 > ALL (100, 200, NULL)` is
 ///    NULL — and a set of definite non-answers is `ALL`'s own value: false for `ANY`, true for
 ///    `ALL`.
-fn quantified(op: BinaryOp, all: bool, operand: Option<Datum>, values: &[Datum]) -> Datum {
+///
+/// **A row on the left is compared column by column**, and the three-valued rule is per row rather
+/// than per value: measured on PostgreSQL 19, `(1,NULL) IN (SELECT 1,2)` is NULL — one column
+/// matches and the other is unknown — while `(1,NULL) IN (SELECT 2,3)` is **false**, because a
+/// definite mismatch in *any* column decides the row whatever else is NULL. A one-column left-hand
+/// side is that rule with one column, which is why there is one implementation.
+fn quantified(op: BinaryOp, all: bool, operand: &[Datum], values: &[Vec<Datum>]) -> Datum {
     if values.is_empty() {
         return Datum::Bool(all);
     }
-    let Some(operand) = operand else {
-        return Datum::Null;
-    };
-    if matches!(operand, Datum::Null) {
+    if operand.is_empty() {
         return Datum::Null;
     }
+    // Rule 2 stays per *value*: a NULL anywhere in the left-hand row can still be decided by a
+    // definite mismatch elsewhere in it, so it is not a short circuit any more — it is the
+    // `None` a column comparison answers below.
     let mut unknown = false;
     for value in values {
-        if matches!(value, Datum::Null) {
-            unknown = true;
-            continue;
-        }
-        let holds = compare(op, &operand, value);
-        if all {
-            if !holds {
-                return Datum::Bool(false);
-            }
-        } else if holds {
-            return Datum::Bool(true);
+        match holds_for_row(op, all, operand, value) {
+            None => unknown = true,
+            Some(true) if !all => return Datum::Bool(true),
+            Some(false) if all => return Datum::Bool(false),
+            Some(_) => {}
         }
     }
     if unknown {
@@ -960,6 +971,40 @@ fn quantified(op: BinaryOp, all: bool, operand: Option<Datum>, values: &[Datum])
     } else {
         Datum::Bool(all)
     }
+}
+
+/// Whether one subquery row satisfies the comparison, or `None` when a NULL leaves it unknown.
+///
+/// For `=` (which is what `IN` is) the row is equal when every column is definitely equal, unequal
+/// when any column is definitely unequal, and unknown otherwise. `<>` — what `NOT IN` is — is the
+/// negation of that, which is why the two are one function and not two.
+fn holds_for_row(op: BinaryOp, all: bool, operand: &[Datum], row: &[Datum]) -> Option<bool> {
+    // **One operand keeps the operator it was given**, and this arm has to come first: the
+    // equality fold below is how a *row* is compared, and running `> ANY (…)` through it reads
+    // "not equal" as "settled" and answers no rows at all. `tests/subquery.rs` said so.
+    if let [left] = operand {
+        let right = row.first().unwrap_or(&Datum::Null);
+        if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
+            return None;
+        }
+        return Some(compare(op, left, right));
+    }
+    let mut unknown = false;
+    for (at, left) in operand.iter().enumerate() {
+        let right = row.get(at).unwrap_or(&Datum::Null);
+        if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
+            unknown = true;
+            continue;
+        }
+        // One definite mismatch settles the row: for `=` it is not equal, and for the `<> ALL`
+        // that `NOT IN` is, it *is* unequal — which is the same fact read from either end.
+        if !compare(BinaryOp::Eq, left, right) {
+            return Some(all);
+        }
+    }
+    // Every column definitely equal, so the row matches — which for `NOT IN`'s `<> ALL` is the
+    // answer `false`.
+    if unknown { None } else { Some(!all) }
 }
 
 /// One comparison, in the ordering everything else in this crate compares by.
@@ -1282,7 +1327,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         // is walked separately once it has one; visiting them here would type them against the
         // outer statement's scope.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &sub.operand {
+            for operand in &sub.operands {
                 walk(operand, visit);
             }
         }
@@ -1380,7 +1425,7 @@ pub(super) fn walk_mut(
             }
         }
         Expr::Subquery(sub) => {
-            if let Some(operand) = &mut sub.operand {
+            for operand in &mut sub.operands {
                 walk_mut(operand, visit)?;
             }
         }

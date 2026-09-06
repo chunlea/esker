@@ -1277,7 +1277,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
         // Only the operand: everything inside the sub-select is resolved against the sub-select's
         // own row, so a position in it is a position in a different row entirely.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &sub.operand {
+            for operand in &sub.operands {
                 collect_columns(operand, into);
             }
         }

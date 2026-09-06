@@ -2350,21 +2350,22 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // has a row and no transaction. What is left here is turning those rows into one value,
         // which is three-valued logic and lives beside the rules it implements.
         Expr::Subquery(sub) => {
-            let operand = match &sub.operand {
-                Some(operand) => Some(evaluate_in(operand, row, env)?),
-                None => None,
-            };
+            let operand = sub
+                .operands
+                .iter()
+                .map(|operand| evaluate_in(operand, row, env))
+                .collect::<Result<Vec<_>>>()?;
             match (sub.correlated, env.txn) {
                 // Uncorrelated: its rows were produced before this cursor was opened, by
                 // `crate::exec::subquery::resolve`.
-                (false, _) => crate::exec::subquery::value(sub, operand)?,
+                (false, _) => crate::exec::subquery::value(sub, &operand)?,
                 // Correlated: a different answer for this row, so it runs now. The nested loop
                 // this makes is the shape, not an accident (`docs/plans/phase-12-subquery.md` §1).
                 (true, Some(txn)) => {
                     let values = crate::exec::subquery::run_correlated(sub, row, txn, env.tenant)?;
                     crate::exec::subquery::value_of(
                         sub.kind,
-                        operand,
+                        &operand,
                         &values,
                         sub.column.as_ref().map(|(_, ty)| *ty),
                     )?

@@ -1658,7 +1658,7 @@ pub(super) fn joined_target_rows(
 fn has_correlated_subquery(select: &Select) -> bool {
     fn in_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::Subquery(sub) => sub.correlated || sub.operand.as_deref().is_some_and(in_expr),
+            Expr::Subquery(sub) => sub.correlated || sub.operands.iter().any(in_expr),
             Expr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
             Expr::Not(inner) => in_expr(inner),
             Expr::IsNull { operand, .. } => in_expr(operand),
@@ -2713,9 +2713,11 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // it, and resolving it again here would type it against a row it will never see.
         Expr::Subquery(sub) => {
             let mut resolved = sub.clone();
-            if let Some(operand) = &sub.operand {
-                resolved.operand = Some(Box::new(subquery_operand(operand, sub, scope)?));
-            }
+            resolved.operands = sub
+                .operands
+                .iter()
+                .map(|operand| subquery_operand(operand, sub, scope))
+                .collect::<Result<Vec<_>>>()?;
             Expr::Subquery(resolved)
         }
         other => other.clone(),

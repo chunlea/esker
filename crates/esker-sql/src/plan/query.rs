@@ -1238,9 +1238,14 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // The sub-plan is **not** printed inside the condition. It is a tree, and a tree rendered
         // on one line is unreadable; what a reader needs here is that there is a subquery and
         // which kind, the way PostgreSQL prints `SubPlan 1` and puts the plan below.
-        Expr::Subquery(sub) => match &sub.operand {
-            Some(operand) => format!("{} {}", render(operand, columns), sub.kind.describe()),
-            None => sub.kind.describe().to_owned(),
+        Expr::Subquery(sub) => match sub.operands.as_slice() {
+            [] => sub.kind.describe().to_owned(),
+            [only] => format!("{} {}", render(only, columns), sub.kind.describe()),
+            // A row on the left prints as one, the way it was written.
+            row => {
+                let columns: Vec<String> = row.iter().map(|expr| render(expr, columns)).collect();
+                format!("({}) {}", columns.join(", "), sub.kind.describe())
+            }
         },
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => match (&call.name, call.value) {

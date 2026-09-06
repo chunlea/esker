@@ -141,9 +141,14 @@ impl SubqueryKind {
 pub struct SubqueryExpr {
     /// Which spelling.
     pub kind: SubqueryKind,
-    /// The left-hand side of `IN`/`ANY`/`ALL`. `None` for a scalar subquery and for `EXISTS`,
+    /// The left-hand side of `IN`/`ANY`/`ALL`. **Empty** for a scalar subquery and for `EXISTS`,
     /// neither of which compares against anything.
-    pub operand: Option<Box<Expr>>,
+    ///
+    /// **A list, because the left-hand side may be a row**: `(a, b) IN (SELECT x, y …)` is what
+    /// `ActiveRecord` sends for a composite primary key, and it compares column by column. One
+    /// operand is the ordinary case and reads as a list of one; there is deliberately no general
+    /// row-value expression, which would be a wide surface for this one shape.
+    pub operands: Vec<Expr>,
     /// The sub-select as written, which is what a nested subquery inside it is planned from.
     pub select: Box<Select>,
     /// The plan built from [`SubqueryExpr::select`], filled by
@@ -164,14 +169,17 @@ pub struct SubqueryExpr {
     /// scope after all does not count (`SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE
     /// b.a_id = id)` is **not** correlated: `id` is `b`'s).
     pub correlated: bool,
-    /// The subquery's answer: its single column, one entry per row — or, for an `EXISTS`, one
-    /// entry per row of any value at all, because only the length is read.
+    /// The subquery's answer: one entry per row, each the whole row.
+    ///
+    /// **Rows and not values**, because the left-hand side may be one: `(a, b) IN (SELECT x, y …)`
+    /// compares column by column. Every other kind reads column 0 and ignores the rest, and an
+    /// `EXISTS` reads only the length.
     ///
     /// Filled by `crate::exec::subquery::resolve` before the cursor opens when the subquery is
     /// uncorrelated, and per outer row when it is not. `None` at the row evaluator is a bug in
     /// this crate and says so rather than answering "no rows" — which for a scalar subquery is a
     /// **NULL**, and a NULL looks like an answer.
-    pub run: Option<Vec<Datum>>,
+    pub run: Option<Vec<Vec<Datum>>>,
 }
 
 /// Two subquery expressions are equal when they were **written** the same.
@@ -183,7 +191,7 @@ pub struct SubqueryExpr {
 /// statements had been planned and the other had not.
 impl PartialEq for SubqueryExpr {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.operand == other.operand && self.select == other.select
+        self.kind == other.kind && self.operands == other.operands && self.select == other.select
     }
 }
 
@@ -193,7 +201,7 @@ impl SubqueryExpr {
     pub fn bare(kind: SubqueryKind, select: Box<Select>) -> Self {
         SubqueryExpr {
             kind,
-            operand: None,
+            operands: Vec::new(),
             select,
             plan: None,
             column: None,
@@ -205,8 +213,14 @@ impl SubqueryExpr {
     /// A subquery with a left-hand side: `IN`, `ANY`, `ALL`.
     #[must_use]
     pub fn compared(kind: SubqueryKind, operand: Expr, select: Box<Select>) -> Self {
+        SubqueryExpr::compared_row(kind, vec![operand], select)
+    }
+
+    /// The same with a **row** on the left: `(a, b) IN (SELECT x, y …)`.
+    #[must_use]
+    pub fn compared_row(kind: SubqueryKind, operands: Vec<Expr>, select: Box<Select>) -> Self {
         SubqueryExpr {
-            operand: Some(Box::new(operand)),
+            operands,
             ..SubqueryExpr::bare(kind, select)
         }
     }
