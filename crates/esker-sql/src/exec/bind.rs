@@ -394,7 +394,13 @@ fn named_relations<'a>(
 /// * the projection is a single `*` or `q.*` — anything computed or renamed publishes a column that
 ///   is not the relation's, and `SELECT a AS b` would otherwise type `b` from `a`;
 /// * no column alias list (`WITH t (x, y) AS …`), which renames every column at once;
-/// * exactly one relation underneath, so there is no ambiguity about which one a name came from.
+/// * and one relation to pass the columns *from*, which is where the two spellings of the
+///   wildcard part company. A bare `*` over a join publishes both relations' columns
+///   concatenated, and "the table underneath" is not a thing — so it needs exactly one relation.
+///   A qualified `a.*` **names** the one it publishes, so a join underneath is no ambiguity at
+///   all. That is `bind_parameter_test.rb`'s statement: `SELECT authors.* FROM authors INNER JOIN
+///   posts …` inside a derived table, whose `authors.id` PostgreSQL types as `bigint` and this
+///   node typed as `text` — measured, `{text,text,bigint}` against `pg_prepared_statements`.
 ///
 /// **It recurses**, because the statement that found this is three deep: `posts_with_tags` over
 /// `posts`, `posts_with_tags_and_truthy` over that, and the `$1` in the third one.
@@ -408,14 +414,17 @@ fn passes_columns_through<'a>(
     let [only] = &derived.select.projection[..] else {
         return None;
     };
-    if !matches!(
-        only,
-        crate::plan::SelectItem::Wildcard | crate::plan::SelectItem::QualifiedWildcard(_)
-    ) {
-        return None;
-    }
-    match named_relations(&derived.select, tables).as_slice() {
-        [(_, def)] => Some(def),
+    let relations = named_relations(&derived.select, tables);
+    match only {
+        crate::plan::SelectItem::Wildcard => match relations.as_slice() {
+            [(_, def)] => Some(*def),
+            _ => None,
+        },
+        crate::plan::SelectItem::QualifiedWildcard(qualifier) => relations
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(qualifier))
+            .map(|(_, def)| def),
+        // Anything computed or renamed publishes a column that is not the relation's.
         _ => None,
     }
 }
