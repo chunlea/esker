@@ -2606,6 +2606,21 @@ pub enum SqlError {
     #[error("prepared statement \"{0}\" does not exist")]
     InvalidSqlStatementName(String),
 
+    /// `DECLARE` naming a cursor this transaction already has: `42P03`, measured on 19.
+    #[error("cursor \"{0}\" already exists")]
+    DuplicateCursor(String),
+
+    /// `FETCH`, `MOVE` or `CLOSE` naming a cursor that is not open: `34000`, measured — and the
+    /// same answer after the transaction that declared one has ended, because a cursor without
+    /// `WITH HOLD` does not outlive it.
+    ///
+    /// **Not [`SqlError::InvalidCursorName`]**, which shares the SQLSTATE and says *portal*. That
+    /// one is the extended protocol's; PostgreSQL spells the two differently because they are
+    /// named by different statements, and a client reading the sentence can tell which it asked
+    /// for.
+    #[error("cursor \"{0}\" does not exist")]
+    UndefinedCursor(String),
+
     /// `PREPARE` naming a statement this session already has.
     ///
     /// Measured on 19beta1: `42P05: prepared statement "h1_notypes" already exists`. The protocol's
@@ -3043,7 +3058,10 @@ impl SqlError {
                 sqlstate::PROTOCOL_VIOLATION
             }
             SqlError::InvalidSqlStatementName(_) => sqlstate::INVALID_SQL_STATEMENT_NAME,
-            SqlError::InvalidCursorName(_) => sqlstate::INVALID_CURSOR_NAME,
+            SqlError::InvalidCursorName(_) | SqlError::UndefinedCursor(_) => {
+                sqlstate::INVALID_CURSOR_NAME
+            }
+            SqlError::DuplicateCursor(_) => sqlstate::DUPLICATE_CURSOR,
             SqlError::InvalidPassword(_) => sqlstate::INVALID_PASSWORD,
             SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
             // `StatementMustRestart` is a signal, not an answer — it reaches a client only if

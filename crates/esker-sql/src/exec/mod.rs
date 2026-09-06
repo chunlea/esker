@@ -31,6 +31,7 @@ pub(crate) mod cancel;
 mod comment;
 mod cursor;
 mod ddl;
+mod declared_cursor;
 mod deferred;
 mod dml;
 pub(crate) mod explain;
@@ -91,6 +92,13 @@ pub struct Executor {
     /// view would need a second code path for the ones it cannot — which is the thing this change
     /// exists to remove.
     identity: crate::session::Backend,
+    /// The cursors this transaction has declared, by name.
+    ///
+    /// **Emptied by `commit` and by `rollback`**, which is the whole of a cursor's lifetime here:
+    /// one without `WITH HOLD` does not outlive its transaction, and `WITH HOLD` is refused by
+    /// name. Both ends are the executor's, so there is one place that forgets them rather than a
+    /// rule every caller follows (`crate::exec::declared_cursor`).
+    cursors: std::collections::BTreeMap<String, declared_cursor::Open>,
     /// What this session has prepared, for `pg_prepared_statements` to report.
     ///
     /// **Handed in rather than kept**: the statements live in the protocol's session
@@ -711,6 +719,7 @@ impl Executor {
             locks,
             session,
             identity,
+            cursors: std::collections::BTreeMap::new(),
             prepared: Vec::new(),
             forget_on_commit: Vec::new(),
             tenant,
@@ -1050,6 +1059,7 @@ impl Executor {
             Statement::Delete(delete) => dml::delete(self, txn, delete),
             Statement::Explain(explain) => self.explain(txn, explain),
             Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
+            Statement::Cursor(cursor) => declared_cursor::run(self, txn, cursor),
             // Handled before a transaction is opened; `execute` never routes one here.
             Statement::Session(_) => Err(SqlError::Internal(
                 "a session statement reached the transaction path".into(),
@@ -1518,6 +1528,11 @@ impl Executor {
     /// block takes. An imported snapshot is local by the same rule: it was imported into *this*
     /// transaction.
     fn end_of_block(&mut self) {
+        // **Both ends of a cursor's life are here**, which is the whole reason the cursors live on
+        // the executor: `commit` and `rollback` are the only two callers of this, so a cursor
+        // cannot survive its transaction by anybody forgetting a line. `WITH HOLD` — the one form
+        // that would survive — is refused by name at lowering.
+        self.cursors.clear();
         self.open_used = false;
         self.block_parameters = None;
         self.block_read_only = false;
@@ -3546,6 +3561,7 @@ impl ExplainSubject {
 
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
+        Statement::Cursor(cursor) => vec![cursor.tag().to_owned()],
         Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
         Statement::Truncate(truncate) => vec![format!("Truncate on {}", truncate.names.join(", "))],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
@@ -3742,6 +3758,14 @@ impl Execute for Executor {
         let statement = parsed.lower()?;
         if let Statement::Session(session) = &statement {
             return self.session_statement(session);
+        }
+        // The mirror of the check below, and it has the same trap for the same reason: a cursor
+        // is transaction-scoped, so a `DECLARE` outside a block could never be read back, and
+        // `self.open` is the only place that still knows whether there is one.
+        if self.open.is_none()
+            && let Some(named) = statement.requires_a_transaction_block()
+        {
+            return Err(SqlError::OutsideTransactionBlock(named));
         }
         // PostgreSQL's `25001`, captured: a concurrent change is *many* transactions, so it cannot
         // be part of one, and a block that could roll it back would be a block that could roll back

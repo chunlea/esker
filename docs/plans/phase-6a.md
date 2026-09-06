@@ -491,7 +491,7 @@ rather than to add the lines a feature happens to need.
 | G23 | two-phase commit | 3 | `PREPARE TRANSACTION 'gid';` | admin / DDL only |
 | G24 | role grants and privileges | 4 | `GRANT alice TO bob WITH ADMIN OPTION;` | admin / DDL only — `CREATE USER` left this row when roles landed; the grants did not |
 | G25 | VACUUM / CLUSTER / CHECKPOINT | 4 | `VACUUM (FULL, ANALYZE, VERBOSE) t;` | admin / DDL only |
-| G26 | cursor MOVE | 1 | `MOVE BACKWARD 1 IN c;` | admin / DDL only |
+| G26 | cursor MOVE | 1 | `MOVE BACKWARD 1 IN c;` | admin / DDL only — **the statement runs now** and the row records only what `sqlparser` still cannot read. It has no `MOVE` keyword at all, and its `FETCH` demands a direction and then a `FROM`/`IN`, so `FETCH c` is a parse error there too: the whole cursor grammar is read by `crate::parse::read_cursor` and the tree the parser returns is thrown away (`tests/cursors.rs`) |
 | G27 | database and system admin | 7 | `ALTER DATABASE d SET work_mem = '8MB';` | admin / DDL only — **`CREATE DATABASE` left this row**: its option list is read now (ADR 0052, `tests/create_database_options.rs`), so the example moved to one still in the group |
 | G28 | extended statistics | 2 | `CREATE STATISTICS st ON a, b FROM t;` | admin / DDL only |
 | G29 | logical replication | 6 | `CREATE PUBLICATION pub FOR TABLE t;` | admin / DDL only |

@@ -266,6 +266,11 @@ pub struct Parsed {
     /// reports: one `Query` message carrying three statements shows all three in `query` while any
     /// of them is running.
     source: String,
+    /// The cursor statement this is, read by [`read_cursor`] because `sqlparser` cannot.
+    ///
+    /// When it is `Some`, the tree above is a placeholder — the source handed to the parser was
+    /// replaced by `SELECT 1`, the same arrangement `refresh` and `raise` use.
+    cursor: Option<CursorRead>,
     /// `CONCURRENTLY` on a `DROP INDEX`, which the parser cannot carry.
     ///
     /// `sqlparser` 0.62.0's `Statement::Drop` has no field for it, so the statement does not parse
@@ -620,6 +625,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
     let namespaced = strip_parameter_namespace(sql, &scanned);
     let sql = namespaced.as_ref().map_or(sql, |(text, _)| text.as_str());
+    // A cursor statement is read whole here; the tree `sqlparser` returns for the placeholder
+    // below is thrown away.
+    let cursor = read_cursor(sql, &scanned);
     let refresh = read_refresh(sql);
     let reset = read_alter_table_reset(sql, &scanned);
     let sql = match (&guarded, &raise, &refresh, &reset) {
@@ -634,6 +642,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         }
         (None, None, None, None) => sql,
     };
+    let sql = if cursor.is_some() { "SELECT 1" } else { sql };
     Ok(parse(sql)?
         .into_iter()
         .map(|statement| {
@@ -644,6 +653,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 class,
                 source: sql.to_owned(),
                 parameter_namespace: namespaced.as_ref().map(|(_, ns)| ns.clone()),
+                cursor: cursor.clone(),
                 concurrently,
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
@@ -665,6 +675,192 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
             }
         })
         .collect())
+}
+
+/// A cursor statement, read here because `sqlparser` can read only one of the four.
+///
+/// **One reader for one grammar.** `MOVE` is not even a keyword in `sqlparser` 0.62; its `FETCH`
+/// demands a direction and then a `FROM` or `IN`, so the `FETCH c` and `FETCH 2 c` a real server
+/// takes are parse errors; `DECLARE` and `CLOSE` it does read. Rewriting the source into the
+/// subset it accepts would mean reading the direction words *here* and then again *there*, which
+/// is the shape that cost this project 4,873 tests once. So the whole statement is read here and
+/// the tree `sqlparser` returns is thrown away, exactly as [`read_refresh`] does for a statement
+/// it cannot read at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CursorRead {
+    /// `DECLARE <name> [options] CURSOR [{WITH|WITHOUT} HOLD] FOR <query>`.
+    Declare {
+        /// The name as written, and whether it was quoted — folded when it is lowered.
+        name: String,
+        /// Whether the name was quoted.
+        quoted: bool,
+        /// `WITH HOLD`, which this node refuses by name: such a cursor outlives its transaction
+        /// and there is nothing here to keep its snapshot alive.
+        hold: bool,
+        /// The query text, parsed where every other query is.
+        query: String,
+    },
+    /// `FETCH …` and `MOVE …`, one grammar with two verbs.
+    Fetch {
+        /// The cursor's name as written.
+        name: String,
+        /// Whether it was quoted.
+        quoted: bool,
+        /// Normalised from PostgreSQL's thirteen spellings.
+        direction: crate::plan::CursorDirection,
+        /// `MOVE`: the same movement, reporting the count and keeping the rows.
+        only_move: bool,
+    },
+    /// `CLOSE <name>`, or `CLOSE ALL` as `None`.
+    Close(Option<(String, bool)>),
+}
+
+/// Reads a whole cursor statement, or `None` when this is not one.
+fn read_cursor(sql: &str, scanned: &Scan<'_>) -> Option<CursorRead> {
+    let [first, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    // From the first *word*, so a leading comment cannot hide the verb — which is exactly what
+    // `/*action:index*/` does to a naive `trim_start`.
+    let body = sql.get(scanned.first_word.clone()?.start..)?;
+    let body = body.trim().trim_end_matches(';').trim_end();
+    if first.eq_ignore_ascii_case("CLOSE") {
+        let rest = strip_leading_word(body, "CLOSE")?;
+        if let Some(tail) = strip_leading_word(rest, "ALL")
+            && tail.trim().is_empty()
+        {
+            return Some(CursorRead::Close(None));
+        }
+        let (name, quoted, tail) = read_identifier(rest)?;
+        return tail
+            .trim()
+            .is_empty()
+            .then_some(CursorRead::Close(Some((name, quoted))));
+    }
+    if first.eq_ignore_ascii_case("DECLARE") {
+        let rest = strip_leading_word(body, "DECLARE")?;
+        let (name, quoted, mut rest) = read_identifier(rest)?;
+        // `BINARY`, `INSENSITIVE`/`ASENSITIVE` and `[NO] SCROLL` in any order, and all of them
+        // accepted and ignored: this node's cursors are read into memory, so every one of them is
+        // scrollable and insensitive whatever was asked for. `NO SCROLL` is therefore an
+        // over-acceptance — a backward `FETCH` works here and is an error on a real server — which
+        // is the direction contract C1 leaves open.
+        loop {
+            let stepped = ["BINARY", "INSENSITIVE", "ASENSITIVE", "SCROLL"]
+                .iter()
+                .find_map(|word| strip_leading_word(rest, word))
+                .or_else(|| {
+                    strip_leading_word(rest, "NO").and_then(|no| strip_leading_word(no, "SCROLL"))
+                });
+            match stepped {
+                Some(tail) => rest = tail,
+                None => break,
+            }
+        }
+        let rest = strip_leading_word(rest, "CURSOR")?;
+        let (hold, rest) = match strip_leading_word(rest, "WITH") {
+            Some(after) => (true, strip_leading_word(after, "HOLD")?),
+            None => match strip_leading_word(rest, "WITHOUT") {
+                Some(after) => (false, strip_leading_word(after, "HOLD")?),
+                None => (false, rest),
+            },
+        };
+        let query = strip_leading_word(rest, "FOR")?.trim();
+        return (!query.is_empty()).then(|| CursorRead::Declare {
+            name,
+            quoted,
+            hold,
+            query: query.to_owned(),
+        });
+    }
+    let only_move = first.eq_ignore_ascii_case("MOVE");
+    if !only_move && !first.eq_ignore_ascii_case("FETCH") {
+        return None;
+    }
+    let rest = strip_leading_word(body, if only_move { "MOVE" } else { "FETCH" })?;
+    let (direction, rest) = read_cursor_direction(rest);
+    // `FROM` and `IN` are noise here: PostgreSQL takes either, or neither.
+    let rest = strip_leading_word(rest, "FROM")
+        .or_else(|| strip_leading_word(rest, "IN"))
+        .unwrap_or(rest);
+    let (name, quoted, tail) = read_identifier(rest)?;
+    tail.trim().is_empty().then_some(CursorRead::Fetch {
+        name,
+        quoted,
+        direction,
+        only_move,
+    })
+}
+
+/// The direction words of a `FETCH` or `MOVE`, and what is left after them.
+///
+/// Thirteen spellings and three movements. No direction at all is `NEXT`, which is why the
+/// fallthrough is `Relative(1)` and not an error: `FETCH c` is the commonest form there is.
+fn read_cursor_direction(rest: &str) -> (crate::plan::CursorDirection, &str) {
+    use crate::plan::CursorDirection;
+
+    for (word, direction) in [
+        ("NEXT", CursorDirection::Relative(1)),
+        ("PRIOR", CursorDirection::Relative(-1)),
+        ("FIRST", CursorDirection::Absolute(1)),
+        // `LAST` is `ABSOLUTE -1`, which is what makes one arm serve both.
+        ("LAST", CursorDirection::Absolute(-1)),
+    ] {
+        if let Some(tail) = strip_leading_word(rest, word) {
+            return (direction, tail);
+        }
+    }
+    for (word, absolute) in [("ABSOLUTE", true), ("RELATIVE", false)] {
+        if let Some(tail) = strip_leading_word(rest, word)
+            && let Some((count, tail)) = read_signed_number(tail)
+        {
+            let direction = if absolute {
+                CursorDirection::Absolute(count)
+            } else {
+                CursorDirection::Relative(count)
+            };
+            return (direction, tail);
+        }
+    }
+    for (word, forward) in [("FORWARD", true), ("BACKWARD", false)] {
+        if let Some(tail) = strip_leading_word(rest, word) {
+            if let Some(after) = strip_leading_word(tail, "ALL") {
+                return (CursorDirection::All(forward), after);
+            }
+            if let Some((count, after)) = read_signed_number(tail) {
+                let step = if forward { count } else { -count };
+                return (CursorDirection::Relative(step), after);
+            }
+            return (
+                CursorDirection::Relative(if forward { 1 } else { -1 }),
+                tail,
+            );
+        }
+    }
+    if let Some(tail) = strip_leading_word(rest, "ALL") {
+        return (CursorDirection::All(true), tail);
+    }
+    if let Some((count, tail)) = read_signed_number(rest) {
+        return (CursorDirection::Relative(count), tail);
+    }
+    (CursorDirection::Relative(1), rest)
+}
+
+/// A signed integer at the front of `text`, and what follows it.
+fn read_signed_number(text: &str) -> Option<(i64, &str)> {
+    let text = text.trim_start();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1, rest.trim_start()),
+        None => (1, text.strip_prefix('+').map_or(text, str::trim_start)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let value: i64 = digits.get(..end)?.parse().ok()?;
+    Some((sign * value, digits.get(end..)?))
 }
 
 /// The language a `DO` block names, when this node does not run it.

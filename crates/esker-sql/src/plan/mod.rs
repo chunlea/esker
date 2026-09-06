@@ -54,7 +54,7 @@ pub use query::{
     SelectItem, SortKey, TableFunction, TableRef, ValuesList,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
-pub use session::{DiscardTarget, SessionStatement};
+pub use session::{CursorDirection, CursorStatement, DiscardTarget, SessionStatement};
 pub use subquery::{Derived, SubqueryExpr, SubqueryKind};
 pub use time_machine::TimeMachineVerb;
 
@@ -170,6 +170,8 @@ pub enum Statement {
     /// `SET`, `SHOW`, `RESET` — the statements that change the session rather than the store.
     /// Run outside any transaction, because one of them replaces the transaction itself.
     Session(SessionStatement),
+    /// `DECLARE`, `FETCH`, `MOVE`, `CLOSE` — a cursor, which lives on the transaction.
+    Cursor(CursorStatement),
     /// A time-machine verb, each spelled as the function call PostgreSQL parses
     /// (`docs/adr/0021-time-machine.md` Decision 3).
     TimeMachine(TimeMachineVerb),
@@ -213,6 +215,8 @@ impl Statement {
                 // catalog state — `crate::parameter` owns them and no cache reads them.
                 | Statement::Raise { .. }
                 | Statement::Session(_)
+                // A cursor reads; `DECLARE` runs its query and the rest walk the rows it read.
+                | Statement::Cursor(_)
                 // Reads of history (`docs/adr/0021-time-machine.md`).
                 | Statement::TimeMachine(_)
         )
@@ -307,7 +311,26 @@ impl Statement {
             | Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(..)
-            | Statement::Session(_) => None,
+            | Statement::Session(_)
+            | Statement::Cursor(_) => None,
+        }
+    }
+
+    /// The statement that may run **only** inside an explicit block, and the words its refusal
+    /// names.
+    ///
+    /// The mirror of [`Statement::refused_in_a_transaction_block`], and it has to be asked in the
+    /// same place for the same reason: `Executor::in_a_transaction` takes the open transaction out
+    /// of the executor before running anything, so a check further down always reads `None`.
+    #[must_use]
+    pub fn requires_a_transaction_block(&self) -> Option<&'static str> {
+        match self {
+            // A cursor without `WITH HOLD` dies with its transaction, so one declared outside a
+            // block could never be read: `25P01 DECLARE CURSOR can only be used in transaction
+            // blocks`, measured. `FETCH`, `MOVE` and `CLOSE` are not refused here — they answer
+            // `34000` for a cursor that is not open, which is what they meet outside a block.
+            Statement::Cursor(CursorStatement::Declare { .. }) => Some("DECLARE CURSOR"),
+            _ => None,
         }
     }
 
@@ -362,6 +385,7 @@ impl Statement {
             Statement::Delete(_) => "DELETE",
             Statement::Explain(..) => "EXPLAIN",
             Statement::Session(session) => session.tag(),
+            Statement::Cursor(cursor) => cursor.tag(),
             Statement::TimeMachine(verb) => verb.tag(),
         }
     }

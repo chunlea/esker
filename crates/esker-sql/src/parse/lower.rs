@@ -88,6 +88,11 @@ impl Parsed {
                 actions: vec![plan::AlterTableAction::SetPersistence(*persistence)],
             }));
         }
+        // The same arrangement: `crate::parse::read_cursor` read the statement and the tree is a
+        // placeholder, because `sqlparser` cannot read three of the four.
+        if let Some(cursor) = &self.cursor {
+            return lower_cursor(cursor);
+        }
         // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
         // statement it is a disguised form of, so the whole lowering is this.
         if let Some((message, severity)) = self.raised() {
@@ -1454,6 +1459,63 @@ fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
         ));
     }
     Err(SqlError::UnrecognizedParameter(name))
+}
+
+/// A cursor statement, from what [`crate::parse::read_cursor`] read out of the source.
+///
+/// The `DECLARE`'s query travels as **text** and is parsed here, through the one parser every
+/// other query goes through — the same arrangement `PREPARE`'s body uses, and for the same
+/// reason: the hand-written reader knows the statement's shape and nothing about expressions.
+fn lower_cursor(read: &crate::parse::CursorRead) -> Result<plan::Statement> {
+    use crate::parse::CursorRead;
+
+    let cursor = match read {
+        CursorRead::Declare {
+            name,
+            quoted,
+            hold,
+            query,
+        } => {
+            // **Refused by name.** A holdable cursor outlives the transaction that made it, which
+            // means keeping its snapshot alive past the commit — there is nothing here that does
+            // that, and answering with a cursor that quietly saw newer rows would be worse than
+            // saying so.
+            if *hold {
+                return Err(SqlError::unsupported("DECLARE ... WITH HOLD"));
+            }
+            let mut statements = crate::parse::parse_statements(query)?;
+            let [_] = statements.as_slice() else {
+                return Err(SqlError::unsupported(
+                    "DECLARE CURSOR FOR more than one statement",
+                ));
+            };
+            let plan::Statement::Select(select) = statements.remove(0).lower()? else {
+                return Err(SqlError::unsupported(
+                    "DECLARE CURSOR FOR a statement that is not a query",
+                ));
+            };
+            plan::CursorStatement::Declare {
+                name: fold_identifier(name, *quoted).0,
+                query: select,
+            }
+        }
+        CursorRead::Fetch {
+            name,
+            quoted,
+            direction,
+            only_move,
+        } => plan::CursorStatement::Fetch {
+            name: fold_identifier(name, *quoted).0,
+            direction: *direction,
+            only_move: *only_move,
+        },
+        CursorRead::Close(named) => plan::CursorStatement::Close(
+            named
+                .as_ref()
+                .map(|(name, quoted)| fold_identifier(name, *quoted).0),
+        ),
+    };
+    Ok(plan::Statement::Cursor(cursor))
 }
 
 /// The three parameter names PostgreSQL's grammar spells with spaces, and no others.
