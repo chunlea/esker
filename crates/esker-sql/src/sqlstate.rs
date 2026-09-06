@@ -166,6 +166,9 @@ pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 /// `FATAL: 57P01: terminating connection due to administrator command`.
 pub const ADMIN_SHUTDOWN: &str = "57P01";
 
+/// `PREPARE` naming a statement the session already has. Measured on 19beta1.
+pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
+
 // --- Class 26 — Invalid SQL Statement Name ---
 
 /// `Bind`/`Describe`/`Execute` naming a prepared statement that was never parsed.

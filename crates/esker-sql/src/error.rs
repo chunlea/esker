@@ -2593,6 +2593,29 @@ pub enum SqlError {
     #[error("prepared statement \"{0}\" does not exist")]
     InvalidSqlStatementName(String),
 
+    /// `PREPARE` naming a statement this session already has.
+    ///
+    /// Measured on 19beta1: `42P05: prepared statement "h1_notypes" already exists`. The protocol's
+    /// `Parse` is *not* this — an unnamed re-`Parse` replaces silently, which is what a client
+    /// pooling one name relies on — so only the SQL-level statement raises it.
+    #[error("prepared statement \"{0}\" already exists")]
+    DuplicatePreparedStatement(String),
+
+    /// `EXECUTE` supplying the wrong number of arguments.
+    ///
+    /// Measured on 19beta1: `42601: wrong number of parameters for prepared statement "h1_types"`
+    /// with `DETAIL: Expected 1 parameters but got 2.` — and the same sentence, not a different
+    /// one, when too few are supplied.
+    #[error("wrong number of parameters for prepared statement \"{name}\"")]
+    WrongParameterCount {
+        /// The statement's name.
+        name: String,
+        /// How many it declared.
+        expected: usize,
+        /// How many `EXECUTE` supplied.
+        got: usize,
+    },
+
     /// A portal name that does not exist.
     #[error("portal \"{0}\" does not exist")]
     InvalidCursorName(String),
@@ -2680,7 +2703,8 @@ impl SqlError {
             | SqlError::SyntaxAtOrNear(_)
             | SqlError::UnrecognizedExplainOption(_)
             | SqlError::NonBooleanOption(_)
-            | SqlError::OptionRequiresParameter(_) => sqlstate::SYNTAX_ERROR,
+            | SqlError::OptionRequiresParameter(_)
+            | SqlError::WrongParameterCount { .. } => sqlstate::SYNTAX_ERROR,
             // A locking clause on a shape that cannot be locked is `0A000` on a real server too —
             // the one place PostgreSQL spends that class on something it will never implement
             // rather than on something it has not implemented yet.
@@ -2981,6 +3005,7 @@ impl SqlError {
             }
             SqlError::LockNotHeld(_) => sqlstate::WARNING,
             SqlError::IdleInTransactionTimeout => sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+            SqlError::DuplicatePreparedStatement(_) => sqlstate::DUPLICATE_PREPARED_STATEMENT,
             SqlError::TerminatedByAdministrator => sqlstate::ADMIN_SHUTDOWN,
             SqlError::ReadOnlyTransaction(_) | SqlError::SchemaLeaseExpired { .. } => {
                 sqlstate::READ_ONLY_SQL_TRANSACTION
@@ -3040,6 +3065,11 @@ impl SqlError {
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
             }
+            // Measured on 19beta1, and the plural is PostgreSQL's own however many there are:
+            // `Expected 1 parameters but got 2.`
+            SqlError::WrongParameterCount {
+                expected, got, ..
+            } => Some(format!("Expected {expected} parameters but got {got}.")),
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
             }

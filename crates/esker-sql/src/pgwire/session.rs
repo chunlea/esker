@@ -280,6 +280,111 @@ impl Session {
         self.status
     }
 
+    /// `PREPARE name [(types)] AS stmt`, into the store the protocol's `Parse` writes to.
+    ///
+    /// **One store, two doors.** `DISCARD ALL` already clears it, and a client that prepares `p`
+    /// over SQL is naming the same thing a `Bind` on the protocol name `p` would — which is what
+    /// PostgreSQL does and the reason this is not a second map beside the first.
+    ///
+    /// The body arrives as **text** from [`crate::parse::StatementClass::Prepare`], because
+    /// `sqlparser` is named nowhere outside the parse module. Re-parsing it here is not a detour:
+    /// it is what lets a `PREPARE` this node cannot run refuse at the `PREPARE`, as a real server
+    /// does.
+    fn prepare_sql(
+        &mut self,
+        name: String,
+        body: String,
+        executor: &mut dyn Execute,
+    ) -> Result<Outcome> {
+        if self.statements.contains_key(&name) {
+            return Err(SqlError::DuplicatePreparedStatement(name));
+        }
+        let mut prepared = parse_statements(&body)?;
+        if prepared.len() != 1 {
+            return Err(SqlError::unsupported("PREPARE of more than one statement"));
+        }
+        let body = prepared.remove(0);
+        // **Analysed here, not at the first `EXECUTE`.** Measured on 19beta1: `PREPARE x AS SELECT
+        // * FROM nope` is `42P01` and a missing column is `42703`, both at the `PREPARE`. A node
+        // that stored the text and failed later would report the mistake against a statement the
+        // user is no longer looking at. `describe` resolves without running; its answer is thrown
+        // away and only its refusal kept.
+        executor.describe(&body, &[])?;
+        self.statements.insert(
+            name,
+            Prepared {
+                parsed: Some(body),
+                param_types: Vec::new(),
+            },
+        );
+        Ok(Outcome::done("PREPARE"))
+    }
+
+    /// `EXECUTE name [(args)]`, running the stored statement with its arguments bound.
+    ///
+    /// **The arguments go in as `Params`, the same way a `Bind`'s do**, so everything the extended
+    /// protocol already does for a `$1` — inferring its type from the column beside it, and the
+    /// assignment cast into that column — happens here without a second implementation.
+    fn execute_sql(
+        &mut self,
+        name: String,
+        args: Option<Vec<Option<String>>>,
+        executor: &mut dyn Execute,
+    ) -> Result<Outcome> {
+        let Some(args) = args else {
+            return Err(SqlError::unsupported(
+                "an EXECUTE argument that is not a literal",
+            ));
+        };
+        let Some(stored) = self.statements.get(&name) else {
+            return Err(SqlError::InvalidSqlStatementName(name));
+        };
+        let Some(body) = stored.parsed.as_ref() else {
+            return Err(SqlError::InvalidSqlStatementName(name));
+        };
+        let wanted = crate::exec::bind::parameter_count(&body.lower()?);
+        if args.len() != wanted {
+            return Err(SqlError::WrongParameterCount {
+                name,
+                expected: wanted,
+                got: args.len(),
+            });
+        }
+        let values: Vec<Option<Vec<u8>>> = args
+            .into_iter()
+            .map(|arg| arg.map(String::into_bytes))
+            .collect();
+        // Cloned out of the store because `execute` takes `&mut dyn Execute` and the borrow of
+        // `self.statements` would otherwise outlive it.
+        let body = body.clone();
+        executor.execute(
+            &body,
+            &Params {
+                values: &values,
+                formats: &[],
+                declared: &[],
+                bound: true,
+            },
+        )
+    }
+
+    /// `DEALLOCATE name` and `DEALLOCATE ALL`.
+    ///
+    /// A name that is not there is `26000`, the same refusal `EXECUTE` gives — measured; `ALL` over
+    /// an empty store is not an error and answers `DEALLOCATE ALL`, its own command tag.
+    fn deallocate_sql(&mut self, name: Option<String>) -> Result<Outcome> {
+        match name {
+            None => {
+                self.statements.clear();
+                Ok(Outcome::done("DEALLOCATE ALL"))
+            }
+            Some(name) => match self.statements.remove(&name) {
+                Some(_) => Ok(Outcome::done("DEALLOCATE")),
+                None => Err(SqlError::InvalidSqlStatementName(name)),
+            },
+        }
+    }
+
     /// Handles one simple-query message, appending every byte of the reply.
     ///
     /// Always ends with exactly one `ReadyForQuery`, whatever happened in between, because that is
@@ -338,6 +443,13 @@ impl Session {
                 }
                 outcome
             }
+            StatementClass::Prepare { name, body } => {
+                self.prepare_sql(name.clone(), body.clone(), executor)
+            }
+            StatementClass::Execute { name, args } => {
+                self.execute_sql(name.clone(), args.clone(), executor)
+            }
+            StatementClass::Deallocate(name) => self.deallocate_sql(name.clone()),
             // A simple query carries no parameters: the protocol has no way to send one, which
             // is why `$1` in a `Query` is `42P02`.
             _ => executor.execute(parsed, &Params::NONE),

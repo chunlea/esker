@@ -1163,6 +1163,22 @@ pub(crate) fn any(statement: &Statement, wanted: impl Fn(&Expr) -> bool) -> bool
     found
 }
 
+/// How many parameters a statement declares — the **highest** `$n` in it, not how many distinct
+/// ones appear.
+///
+/// `SELECT $2` declares two on a real server, and `EXECUTE` supplying one is
+/// `wrong number of parameters`. Counting the distinct placeholders would make that statement take
+/// one argument and put it in the wrong position.
+pub(crate) fn parameter_count(statement: &Statement) -> usize {
+    let mut highest = 0;
+    for_each_expr(statement, &mut |expr| {
+        if let Expr::Parameter(number) = expr {
+            highest = highest.max(*number as usize);
+        }
+    });
+    highest
+}
+
 pub(super) fn has_parameters(statement: &Statement) -> bool {
     let mut found = false;
     for_each_expr(statement, &mut |expr| {
