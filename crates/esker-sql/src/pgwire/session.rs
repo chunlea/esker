@@ -902,7 +902,7 @@ impl Session {
                 outcome
             }
             StatementClass::Prepare { name, body } => {
-                self.prepare_sql(name.clone(), body.clone(), parsed.source(), executor)
+                self.prepare_sql(name.clone(), body.clone(), parsed.text(), executor)
             }
             StatementClass::Execute { name, args } => {
                 self.execute_sql(name.clone(), args.clone(), executor)

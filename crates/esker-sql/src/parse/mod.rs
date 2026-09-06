@@ -265,7 +265,24 @@ pub struct Parsed {
     /// The **whole** input rather than this statement's slice of it, which is what a real server
     /// reports: one `Query` message carrying three statements shows all three in `query` while any
     /// of them is running.
+    ///
+    /// **The client's text, not the parser's.** Several statements are rewritten before
+    /// `sqlparser` sees them — a `DO … RAISE` block, `REFRESH MATERIALIZED VIEW`,
+    /// `ALTER TABLE … RESET` and every cursor statement all become `SELECT 1` — and this used to
+    /// hold the rewrite, so `pg_stat_activity` reported `SELECT 1` for a session running
+    /// something else. A view whose whole job is to say what a session is doing.
     source: String,
+    /// This statement's own slice of `source`, with its semicolon.
+    ///
+    /// **A second answer to "what was sent", because the two views want different ones.** Measured
+    /// on PostgreSQL 19: `PREPARE h1_a AS SELECT 1; PREPARE h1_b AS SELECT 2;` in one query string
+    /// puts `PREPARE h1_a AS SELECT 1;` in `pg_prepared_statements.statement` for the first and
+    /// `PREPARE h1_b AS SELECT 2;` for the second, each with its own semicolon — while
+    /// `pg_stat_activity.query` shows the whole string for both.
+    ///
+    /// Falls back to the whole input when the slices and the parsed statements do not come out
+    /// one for one, which is the only honest answer when the split and the parser disagree.
+    text: String,
     /// The cursor statement this is, read by [`read_cursor`] because `sqlparser` cannot.
     ///
     /// When it is `Some`, the tree above is a placeholder — the source handed to the parser was
@@ -403,6 +420,12 @@ impl Parsed {
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// This statement's own text, which is what `pg_prepared_statements.statement` reports.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// What kind of statement this is.
@@ -573,6 +596,10 @@ impl Parsed {
 /// A simple-query message may carry several statements in one string, which is why this returns a
 /// list and why the session runs them in order and stops at the first failure.
 pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
+    // **Held before anything rewrites it.** `sql` is shadowed a dozen times below by the rewrites
+    // that make a statement `sqlparser` can read; what the client actually sent is this, and it is
+    // what both views report.
+    let original = sql;
     // `parse` does the rewriting; this only has to *notice*, because the keyword it removes is a
     // fact about the statement that the parsed tree cannot carry.
     let scanned = scan(sql);
@@ -643,15 +670,25 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         (None, None, None, None) => sql,
     };
     let sql = if cursor.is_some() { "SELECT 1" } else { sql };
-    Ok(parse(sql)?
+    let parsed = parse(sql)?;
+    // One slice per statement, or none at all: a rewrite that changed how many statements there
+    // are would make the pairing a guess, and the whole input is the honest answer to that.
+    let texts = statement_texts(original);
+    let texts = (texts.len() == parsed.len()).then_some(texts);
+    Ok(parsed
         .into_iter()
-        .map(|statement| {
+        .enumerate()
+        .map(|(at, statement)| {
             // The rewritten source parses as something harmless; what the user wrote is this.
             let class = constraints.clone().unwrap_or_else(|| classify(&statement));
             Parsed {
                 statement,
                 class,
-                source: sql.to_owned(),
+                source: original.to_owned(),
+                text: texts
+                    .as_ref()
+                    .and_then(|texts| texts.get(at))
+                    .map_or_else(|| original.to_owned(), |text| (*text).to_owned()),
                 parameter_namespace: namespaced.as_ref().map(|(_, ns)| ns.clone()),
                 cursor: cursor.clone(),
                 concurrently,
@@ -861,6 +898,52 @@ fn read_signed_number(text: &str) -> Option<(i64, &str)> {
     }
     let value: i64 = digits.get(..end)?.parse().ok()?;
     Some((sign * value, digits.get(end..)?))
+}
+
+/// Each statement's own source text, in order, semicolon included.
+///
+/// **A walk and not a `split(';')`**, for the reason every other reader in this module is one: a
+/// semicolon inside a string, a quoted identifier, a dollar-quoted body or a comment is not a
+/// statement boundary, and the same five helpers that let [`scan`] skip those let this skip them.
+///
+/// Leading whitespace between statements is dropped and the terminator is kept, which is what
+/// PostgreSQL records: the second of two `PREPARE`s reports `PREPARE h1_b AS SELECT 2;` and not
+/// ` PREPARE h1_b AS SELECT 2`.
+fn statement_texts(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut texts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'-' if bytes.get(index + 1) == Some(&b'-') => index = line_comment_end(bytes, index),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => index = block_comment_end(bytes, index),
+            b'\'' => index = single_quote_end(bytes, index),
+            b'"' => index = double_quote_end(bytes, index),
+            // `None` is a `$` that opens nothing — `$1`, or a `$` inside an identifier.
+            b'$' => index = dollar_quote(bytes, index).unwrap_or(index + 1),
+            b';' => {
+                if let Some(text) = sql.get(start..=index) {
+                    let text = text.trim();
+                    if text.len() > 1 {
+                        texts.push(text);
+                    }
+                }
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    // The last statement, when the client wrote no closing semicolon — which is the common case
+    // over the wire, where the terminator is the message length.
+    if let Some(tail) = sql.get(start..) {
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            texts.push(tail);
+        }
+    }
+    texts
 }
 
 /// The language a `DO` block names, when this node does not run it.
