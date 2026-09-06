@@ -1,0 +1,19 @@
+crates/esker-sql/tests/create_in_a_schema.rs
+  s_2d916f5f540186::t_515d375b9096a7 1-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a3636a43c4a47557f6a7ed9248b2843dee111777",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
