@@ -1,0 +1,19 @@
+crates/esker-store/src/peer.rs
+  s_609bbbdbf3c419::t_c952d0b298d1e8 1619,1631,1733,1841,1871,3024,3074
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "156c971a685d8e1b15e7129fb4bcc75c9202ae0c",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
