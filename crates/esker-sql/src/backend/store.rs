@@ -100,6 +100,7 @@ impl StoreBackend {
     fn wrap(&self, inner: Transaction) -> StoreTxn {
         let id = self.locks.lock().map_or(0, |mut locks| locks.next_id());
         StoreTxn {
+            session: 0,
             inner: Some(inner),
             oracle: Arc::clone(&self.oracle),
             locks: Arc::clone(&self.locks),
@@ -186,6 +187,8 @@ struct StoreTxn {
     locks: Arc<std::sync::Mutex<RowLocks>>,
     /// This transaction's identity in that table, which `start_ts` is not.
     id: u64,
+    /// The backend pid of the session that opened it, which `pg_locks.pid` reports.
+    session: u32,
     /// The keys this transaction has locked, so they can all be given back at once.
     held: Vec<Vec<u8>>,
     /// Whether this transaction's reads are recorded for commit-time validation (ADR 0062).
@@ -265,6 +268,11 @@ impl StoreTxn {
 }
 
 impl Txn for StoreTxn {
+    /// See [`Txn::owned_by_session`]: set once, right after the transaction is opened.
+    fn owned_by_session(&mut self, pid: u32) {
+        self.session = pid;
+    }
+
     fn start_ts(&self) -> u64 {
         // A transaction that has ended has no snapshot to report; every caller reaches this
         // through a live one, and zero is a timestamp no oracle hands out.
@@ -316,7 +324,7 @@ impl Txn for StoreTxn {
             // before locks existed at all.
             return Ok(Lock::Taken);
         };
-        let taken = locks.take(key, self.id, start_ts);
+        let taken = locks.take(key, self.id, start_ts, self.session);
         drop(locks);
         if matches!(taken, Lock::Taken) && !self.held.iter().any(|held| held == key) {
             self.held.push(key.to_vec());

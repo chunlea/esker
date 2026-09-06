@@ -276,7 +276,7 @@ impl Drop for Executor {
         if let Some(txn) = self.open.take() {
             let _ = txn.rollback();
         }
-        let Ok(mut txn) = self.backend.begin() else {
+        let Ok(mut txn) = self.begin_txn() else {
             return;
         };
         if let Ok(forgotten) = ddl::drop_temp_schema(self, &mut *txn, &schema) {
@@ -864,9 +864,22 @@ impl Executor {
     /// than only where it was set: retention moves the floor forward under a session that set
     /// `esker.read_as_of` an hour ago, and a snapshot that has fallen out of the window must stop
     /// answering rather than answer approximately.
+    /// A transaction that knows whose session it is, which is every one this executor opens.
+    ///
+    /// **One wrapper rather than two lines at thirteen call sites.** `Backend::begin` takes no
+    /// session — a hundred and ten call sites across the crate say so, and widening it for this
+    /// would be a change to every one of them — so the pid is attached the instant the transaction
+    /// exists. Miss it and every lock that transaction takes reports `0` in `pg_locks.pid`, which
+    /// is what the whole column did until now.
+    fn begin_txn(&self) -> Result<Box<dyn Txn>> {
+        let mut txn = self.backend.begin()?;
+        txn.owned_by_session(self.identity.pid);
+        Ok(txn)
+    }
+
     fn open_txn(&self) -> Result<Box<dyn Txn>> {
         let Some(as_of) = &self.read_as_of else {
-            return self.backend.begin();
+            return self.begin_txn();
         };
         let now = self.backend.now()?;
         time_machine::Window::new(now, as_of.retention_ms).admits(as_of.start_ts)?;
@@ -1193,7 +1206,7 @@ impl Executor {
                     crate::plan::DiscardTarget::All | crate::plan::DiscardTarget::Temp
                 ) && let Some(schema) = self.temp_schema.take()
                 {
-                    let mut txn = self.backend.begin()?;
+                    let mut txn = self.begin_txn()?;
                     match ddl::drop_temp_schema(self, &mut *txn, &schema) {
                         Ok(forgotten) => {
                             txn.commit()?;
@@ -1355,7 +1368,7 @@ impl Executor {
     /// asking anything, which is run 87's first item.
     fn set_session_authorization(&mut self, name: Option<&str>, local: bool) -> Result<Outcome> {
         if let Some(role) = name {
-            let txn = self.backend.begin()?;
+            let txn = self.begin_txn()?;
             let known = crate::catalog::role_by_name(&*txn, role)?.is_some();
             let _ = txn.rollback();
             if !known {
@@ -1482,7 +1495,7 @@ impl Executor {
     /// different structural reason, and the same trade: what it writes is outside the surrounding
     /// block's atomicity, so a `ROLLBACK` does not take it back.
     fn in_its_own_transaction(&self, write: impl FnOnce(&mut dyn Txn) -> Result<()>) -> Result<()> {
-        let mut txn = self.backend.begin()?;
+        let mut txn = self.begin_txn()?;
         if let Err(error) = write(&mut *txn) {
             let _ = txn.rollback();
             return Err(error);
@@ -1515,7 +1528,7 @@ impl Executor {
 
     /// An ordinary transaction at the present, for the side of a diff that is "now".
     pub(crate) fn plain_read(&self) -> Result<Box<dyn Txn>> {
-        self.backend.begin()
+        self.begin_txn()
     }
 
     /// The timestamp a checkpoint names, or `42704`.
@@ -1524,7 +1537,7 @@ impl Executor {
     /// moving to: a name means what the catalog says it means now. Looking it up in the past would
     /// make a checkpoint invisible to the very read it was taken for.
     fn checkpoint_at(&self, name: &str) -> Result<u64> {
-        let txn = self.backend.begin()?;
+        let txn = self.begin_txn()?;
         let found = crate::catalog::checkpoint_at(&*txn, self.tenant, name);
         let _ = txn.rollback();
         found?.ok_or_else(|| SqlError::SnapshotDoesNotExist(name.to_owned()))
@@ -1537,7 +1550,7 @@ impl Executor {
     /// collector has *not yet swept*, which is a fact about now and not about the snapshot being
     /// asked for.
     fn cluster_retention(&self) -> Result<u64> {
-        let txn = self.backend.begin()?;
+        let txn = self.begin_txn()?;
         let retention = crate::catalog::default_retention(&*txn);
         let _ = txn.rollback();
         retention
@@ -1922,7 +1935,7 @@ impl Executor {
         }
         // `is_called` true means the value has been handed out, so the next one is past it.
         let next = if call.is_called { value + 1 } else { value };
-        let mut txn = self.backend.begin()?;
+        let mut txn = self.begin_txn()?;
         crate::catalog::set_sequence_value(
             &mut *txn,
             self.tenant,
@@ -1949,7 +1962,7 @@ impl Executor {
         if ids.is_empty() {
             return Ok(());
         }
-        let txn = self.backend.begin()?;
+        let txn = self.begin_txn()?;
         let mut states = std::collections::BTreeMap::new();
         for id in ids {
             states.insert(id, crate::catalog::sequence_state(&*txn, self.tenant, id)?);
@@ -2143,7 +2156,7 @@ impl Executor {
 
         // No key named. Open a transaction and look: the entries that are now present are the
         // ones this transaction collided with, and the first of those names the constraint.
-        let Ok(txn) = self.backend.begin() else {
+        let Ok(txn) = self.begin_txn() else {
             return error;
         };
         for unique in written.unique_keys.iter().filter(|it| added(it)) {
@@ -2174,7 +2187,7 @@ impl Executor {
             return Ok(i64::try_from(id).unwrap_or(i64::MAX));
         }
 
-        let mut txn = self.backend.begin()?;
+        let mut txn = self.begin_txn()?;
         let first = match crate::catalog::allocate_row_ids(
             &mut *txn,
             self.tenant,
@@ -2265,7 +2278,7 @@ impl Executor {
     /// inherits the same non-transactionality — a rolled-back `TRUNCATE … RESTART IDENTITY` leaves
     /// the sequence restarted, exactly as a rolled-back `INSERT` leaves its value consumed.
     pub(crate) fn restart_sequence(&mut self, sequence_id: u64) -> Result<()> {
-        let mut txn = self.backend.begin()?;
+        let mut txn = self.begin_txn()?;
         crate::catalog::restart_sequence(&mut *txn, self.tenant, sequence_id);
         txn.commit()?;
         self.forget_sequence_block(sequence_id);

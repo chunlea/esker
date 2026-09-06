@@ -35,6 +35,14 @@ pub(crate) struct RowLocks {
     /// Hands out the transaction ids above. Never reused, so an id identifies one transaction for
     /// the life of the process — which is what makes releasing twice safe.
     next_txn: u64,
+    /// `transaction id -> the backend pid of the session that owns it`.
+    ///
+    /// **What makes `pg_locks.pid` name a session.** The table is keyed by transaction, which is
+    /// the right key for holding and for the wait-for graph and the wrong one for a client: what
+    /// it wants to do with a row of `pg_locks` is join it to `pg_stat_activity` or hand it to
+    /// `pg_cancel_backend`, and both take a backend pid. Kept beside the ids rather than widening
+    /// `locks` and `waits_for`, so the graph and its deadlock walk are untouched.
+    sessions: BTreeMap<u64, u32>,
     /// `waiter -> the transaction it is waiting for`, while it waits.
     ///
     /// **The wait-for graph, and a cycle in it is a deadlock.** Without this a wait with no
@@ -55,10 +63,11 @@ pub(crate) struct RowLocks {
 /// every statement on the node — which is the opposite of what a diagnostic is for.
 #[derive(Debug, Default)]
 pub struct LockView {
-    /// `(key, holder transaction id, holder start_ts)` — one per key actually held.
-    pub held: Vec<(Vec<u8>, u64, u64)>,
-    /// `(waiter transaction id, the id it is waiting for)` — one per session currently blocked.
-    pub waiting: Vec<(u64, u64)>,
+    /// `(key, holder transaction id, holder start_ts, holder backend pid)` — one per key held.
+    pub held: Vec<(Vec<u8>, u64, u64, u32)>,
+    /// `(waiter transaction id, the id it waits for, waiter backend pid)` — one per blocked
+    /// session.
+    pub waiting: Vec<(u64, u64, u32)>,
 }
 
 impl RowLocks {
@@ -68,14 +77,24 @@ impl RowLocks {
             held: self
                 .locks
                 .iter()
-                .map(|(key, (holder, start_ts))| (key.clone(), *holder, *start_ts))
+                .map(|(key, (holder, start_ts))| {
+                    (key.clone(), *holder, *start_ts, self.session_of(*holder))
+                })
                 .collect(),
             waiting: self
                 .waits_for
                 .iter()
-                .map(|(waiter, holder)| (*waiter, *holder))
+                .map(|(waiter, holder)| (*waiter, *holder, self.session_of(*waiter)))
                 .collect(),
         }
+    }
+
+    /// The backend pid behind a transaction id, or `0` for one whose session never said.
+    ///
+    /// `0` is not a pid any session has, so a row carrying it is visibly "nobody's" rather than
+    /// quietly somebody's — which is what reporting the *process* id did.
+    fn session_of(&self, id: u64) -> u32 {
+        self.sessions.get(&id).copied().unwrap_or(0)
     }
 
     /// An id for a new transaction. Ids start at 1 and are never reused.
@@ -88,7 +107,10 @@ impl RowLocks {
     ///
     /// Idempotent for the holder: a transaction that locks a key twice gets [`Lock::Taken`] both
     /// times, which is what makes a statement re-run cost nothing.
-    pub(crate) fn take(&mut self, key: &[u8], id: u64, start_ts: u64) -> Lock {
+    pub(crate) fn take(&mut self, key: &[u8], id: u64, start_ts: u64, session: u32) -> Lock {
+        // Recorded on every attempt, granted or not: a waiter has a row in `pg_locks` too, and it
+        // is the row a stuck client is looking for.
+        self.sessions.insert(id, session);
         match self.locks.get(key) {
             Some(&(holder, holder_ts)) if holder != id => {
                 if self.deadlocks(id, holder) {
@@ -128,6 +150,10 @@ impl RowLocks {
     /// from a destructor: a key this transaction no longer holds belongs to somebody else.
     pub(crate) fn release(&mut self, id: u64, held: &[Vec<u8>]) {
         self.waits_for.remove(&id);
+        // The transaction is over, so its row is gone from both maps above and nothing can ask
+        // whose it was. Left behind, this would grow by one entry per transaction for the life of
+        // the process.
+        self.sessions.remove(&id);
         for key in held {
             if self.locks.get(key).map(|(holder, _)| *holder) == Some(id) {
                 self.locks.remove(key);
@@ -173,13 +199,24 @@ mod tests {
     fn a_wait_ends_when_it_stops_waiting() {
         let mut locks = RowLocks::default();
         let (a, b) = (locks.next_id(), locks.next_id());
-        assert!(matches!(locks.take(b"k", a, 10), Lock::Taken));
-        assert!(matches!(locks.take(b"k", b, 20), Lock::Held { .. }));
+        assert!(matches!(locks.take(b"k", a, 10, 101), Lock::Taken));
+        assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Held { .. }));
         assert_eq!(locks.waits_for.get(&b), Some(&a), "b is waiting for a");
+
+        // Both sessions are known while both are in the table, which is what `pg_locks.pid`
+        // reports: the holder's row and the waiter's row name different backends.
+        let view = locks.view();
+        assert_eq!(view.held, vec![(b"k".to_vec(), a, 10, 101)]);
+        assert_eq!(view.waiting, vec![(b, a, 102)]);
 
         // A ends; B takes the key it was waiting for.
         locks.release(a, &[b"k".to_vec()]);
-        assert!(matches!(locks.take(b"k", b, 20), Lock::Taken));
+        assert_eq!(
+            locks.sessions.get(&a),
+            None,
+            "a transaction that ended is not still somebody's"
+        );
+        assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Taken));
         assert!(
             locks.waits_for.is_empty(),
             "b holds the key now and is waiting for nobody: {:?}",
@@ -195,8 +232,8 @@ mod tests {
     fn a_waiter_that_gave_up_holding_nothing_is_forgotten() {
         let mut locks = RowLocks::default();
         let (a, b) = (locks.next_id(), locks.next_id());
-        assert!(matches!(locks.take(b"k", a, 10), Lock::Taken));
-        assert!(matches!(locks.take(b"k", b, 20), Lock::Held { .. }));
+        assert!(matches!(locks.take(b"k", a, 10, 101), Lock::Taken));
+        assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Held { .. }));
 
         locks.release(b, &[]);
         assert!(

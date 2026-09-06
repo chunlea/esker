@@ -234,3 +234,104 @@ fn a_savepoint_does_not_hide_the_lock_the_session_is_holding() {
     node.run("ROLLBACK").unwrap();
     assert!(node.rows(query).is_empty(), "and the block released it");
 }
+
+/// **`pid` names the session that holds the lock**, and it is the number that session reports.
+///
+/// It was `std::process::id()` for every row — the same number for every session, so the column
+/// could not tell two holders apart and a join to `pg_stat_activity.pid` matched nothing. On a
+/// real server the two views agree by definition: `pg_locks.pid` *is* the backend pid, which is
+/// what `pg_backend_pid()` returns and what `pg_cancel_backend` takes.
+///
+/// Found while writing `cross_session_cancel`'s third test, where the readiness check could not
+/// ask "is *this* session waiting" and had to count ungranted rows instead.
+#[test]
+fn each_lock_names_the_session_that_holds_it() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n text)",
+        "INSERT INTO lk VALUES (1, 'a'), (2, 'b')",
+    ]);
+    // **Two rows, not one**: the sessions must not block each other, or the second is a waiter and
+    // this test is about holders.
+    let mut a = pair.session();
+    let mut b = pair.session();
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
+    let b_pid = b.rows("SELECT pg_backend_pid()")[0][0].clone();
+    assert_ne!(a_pid, b_pid, "two sessions are two backends");
+
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+    b.run("BEGIN").unwrap();
+    b.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE").unwrap();
+
+    let mut watcher = pair.session();
+    let held = watcher.rows("SELECT pid FROM pg_locks WHERE granted = true ORDER BY pid");
+    let mut expected = [a_pid.clone(), b_pid.clone()];
+    expected.sort();
+    assert_eq!(
+        held,
+        vec![vec![expected[0].clone()], vec![expected[1].clone()]],
+        "one row per holder, each naming its own session"
+    );
+
+    // And the join a client actually writes: the holder of row 1 is the session that took it.
+    let joined = watcher.rows(&format!(
+        "SELECT count(*) FROM pg_locks WHERE granted = true AND pid = {a_pid}"
+    ));
+    assert_eq!(joined, vec![vec!["1".to_owned()]]);
+
+    a.run("ROLLBACK").unwrap();
+    b.run("ROLLBACK").unwrap();
+}
+
+/// **A waiter's row names the waiting session**, not the holder and not the process.
+#[test]
+fn a_waiter_row_names_the_session_that_is_waiting() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n text)",
+        "INSERT INTO lk VALUES (1, 'a')",
+    ]);
+    let (b_says, hears_b) = channel();
+    let (b_pid_says, hears_b_pid) = channel();
+    let (a_says, hears_a) = channel();
+
+    let sessions = pair.sessions();
+    let waiter = std::thread::spawn(move || {
+        let hears_a = hears_a;
+        let mut node = sessions.session();
+        node.run("BEGIN").unwrap();
+        node.run("SET lock_timeout = '20s'").unwrap();
+        b_pid_says
+            .send(node.rows("SELECT pg_backend_pid()")[0][0].clone())
+            .unwrap();
+        edge(&hears_a, "A holds the row");
+        reached(&b_says, "B is about to block");
+        let _ = node.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE");
+    });
+
+    let mut a = pair.session();
+    let a_pid = a.rows("SELECT pg_backend_pid()")[0][0].clone();
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+    let b_pid = hears_b_pid.recv().expect("B says who it is");
+    reached(&a_says, "A holds the row");
+    edge(&hears_b, "B is about to block");
+
+    let mut watcher = pair.session();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut waiting = Vec::new();
+    while std::time::Instant::now() < deadline {
+        waiting = watcher.rows("SELECT pid FROM pg_locks WHERE granted = false");
+        if !waiting.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        waiting,
+        vec![vec![b_pid.clone()]],
+        "the ungranted row is the waiter's own session, and A is {a_pid}"
+    );
+
+    a.run("ROLLBACK").unwrap();
+    let _ = waiter.join();
+}

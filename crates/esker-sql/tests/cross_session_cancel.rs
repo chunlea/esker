@@ -407,12 +407,12 @@ fn a_cancel_survives_the_lock_coming_free_underneath_it() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut watcher = pair.session();
     while Instant::now() < deadline {
-        // **Not filtered by pid**: `pg_locks.pid` is `std::process::id()` for every row here,
-        // the same number for every session, so it cannot name one — unlike
-        // `pg_stat_activity.pid`, which is the session's. (A real server's are the same number;
-        // this node's are not, which is its own divergence and not this test's subject.) One
-        // waiter exists in this test, so an ungranted row is that one.
-        let waiting = watcher.rows("SELECT count(*) FROM pg_locks WHERE granted = false");
+        // **This session and no other.** `pg_locks.pid` names the session that holds or waits
+        // for the lock, so the readiness check can ask about B rather than counting ungranted
+        // rows and hoping there is only one (`tests/pg_locks.rs`).
+        let waiting = watcher.rows(&format!(
+            "SELECT count(*) FROM pg_locks WHERE pid = {waiter} AND granted = false"
+        ));
         if waiting[0][0] != "0" {
             break;
         }
