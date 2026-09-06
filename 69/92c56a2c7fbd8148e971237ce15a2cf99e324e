@@ -1,0 +1,21 @@
+crates/esker-engine/src/range_del.rs
+  s_2bed4ac2b1c944::t_e051687b74b7ed 208-215,227-236
+crates/esker-engine/tests/range_del.rs
+  s_2bed4ac2b1c944::t_ab2964f3f4f24a 331-428
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6992c56a2c7fbd8148e971237ce15a2cf99e324e",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
