@@ -1,0 +1,19 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_609bbbdbf3c419::t_bec46ad31223f5 4726,4744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b1aa572cc0e53543fb3378821269ed3e9e7c29cd",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
