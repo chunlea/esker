@@ -644,8 +644,9 @@ pub(super) fn matching_rows_as(
 /// * and an **unknown literal** is neither: it takes the other arm's type and then fails to parse
 ///   as it, which is why `SELECT 1 UNION ALL SELECT 'abc'` is `22P02 invalid input syntax for type
 ///   integer` — decided in the lowering, where a literal still is one.
-pub(super) fn append(arms: Vec<Planned>) -> Result<Planned> {
-    let mut arms = arms.into_iter();
+pub(super) fn append(arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>) -> Result<Planned> {
+    let ops: Vec<Option<(crate::plan::SetOp, bool)>> = arms.iter().map(|(op, _)| *op).collect();
+    let mut arms = arms.into_iter().map(|(_, planned)| planned);
     let first = arms
         .next()
         .ok_or_else(|| SqlError::Internal("a set operation with no arms".to_owned()))?;
@@ -676,16 +677,17 @@ pub(super) fn append(arms: Vec<Planned>) -> Result<Planned> {
     // under one column — `pg_typeof` reads the value, and a client binding by the declared type
     // would decode the wrong width. PostgreSQL coerces each arm's target list; this wraps the arms
     // that need it in a projection of casts and leaves the rest untouched.
-    let nodes = nodes
+    let nodes: Vec<Node> = nodes
         .into_iter()
         .zip(arm_types)
         .map(|(node, types)| coerce_arm(node, &types, &columns))
         .collect();
+    let node = combine(nodes, &ops);
     // **No routing, no locks, no junk.** A set operation is not routed to a columnar replica —
     // the arms may name different relations — and a locking clause over one is a syntax error on a
     // real server, so neither field can carry anything a caller would then have to undo.
     Ok(Planned {
-        node: Node::Append { arms: nodes },
+        node,
         columns,
         table: first.table,
         column_names: first.column_names,
@@ -694,6 +696,34 @@ pub(super) fn append(arms: Vec<Planned>) -> Result<Planned> {
         junk: 0,
         limit: None,
     })
+}
+
+/// The arms folded into one node, left to right, which is the associativity SQL has.
+///
+/// `a UNION ALL b UNION c` is `((a ∪all b) ∪ c)`: the `UNION` deduplicates *everything before it*
+/// and not just the arm beside it. So consecutive `ALL`s collect into one [`Node::Append`] — a set
+/// over three scans is one append and not two nested ones — and a deduplicating operator closes
+/// the append it has collected and wraps it.
+fn combine(nodes: Vec<Node>, ops: &[Option<(crate::plan::SetOp, bool)>]) -> Node {
+    let mut pending: Vec<Node> = Vec::new();
+    for (node, op) in nodes.into_iter().zip(ops) {
+        pending.push(node);
+        // The first arm has no operator; every other one either extends the append or closes it.
+        if matches!(op, Some((_, false))) {
+            pending = vec![Node::Distinct {
+                input: Box::new(one_of(pending)),
+            }];
+        }
+    }
+    one_of(pending)
+}
+
+/// One node from what has been collected: the node itself when there is one, an append when more.
+fn one_of(mut nodes: Vec<Node>) -> Node {
+    if nodes.len() == 1 {
+        return nodes.pop().unwrap_or(Node::OneRow);
+    }
+    Node::Append { arms: nodes }
 }
 
 /// One arm's rows as the set's types, or the arm unchanged when it already produces them.

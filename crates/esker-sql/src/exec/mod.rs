@@ -516,6 +516,20 @@ const WAIT_STEP_MS: u64 = 2;
 /// statement that reaches the ceiling is behind a queue that keeps refilling.
 const MAX_STATEMENT_RESTARTS: u32 = 32;
 
+/// Whether this node runs the operator an arm joins on, or names it.
+///
+/// **`UNION` and `UNION ALL` both run**; the other two are refused by name. `INTERSECT` and
+/// `EXCEPT` answer on a real server (`tests/captures/pg19_set_operations.txt` measures both), and
+/// nothing in the suite writes one — they need a materialised side and a multiplicity rule of
+/// their own (`INTERSECT ALL` is `min(count)` per row, `EXCEPT ALL` is the difference), which is a
+/// unit rather than an arm of this one.
+pub(super) fn set_arm_supported(arm: &crate::plan::SetArm) -> Result<()> {
+    if arm.op == crate::plan::SetOp::Union {
+        return Ok(());
+    }
+    Err(SqlError::unsupported(arm.op.name()))
+}
+
 impl Executor {
     /// The table as an `Arc`, for a deferred check that outlives the statement.
     ///
@@ -1999,18 +2013,10 @@ impl Executor {
             set_arms: Vec::new(),
             ..select.clone()
         };
-        let mut planned = vec![self.plan_select(txn, &first)?];
+        let mut planned = vec![(None, self.plan_select(txn, &first)?)];
         for arm in &select.set_arms {
-            // **`UNION ALL` is what commit one is.** The other two operators and the deduplicating
-            // form are named rather than answered as this one, because `UNION` and `UNION ALL`
-            // differ in the rows they return and not in how they are read.
-            if !arm.all {
-                return Err(SqlError::unsupported(arm.op.name()));
-            }
-            if arm.op != crate::plan::SetOp::Union {
-                return Err(SqlError::unsupported(arm.op.name()));
-            }
-            planned.push(self.plan_select(txn, &arm.select)?);
+            set_arm_supported(arm)?;
+            planned.push((Some((arm.op, arm.all)), self.plan_select(txn, &arm.select)?));
         }
         query::append(planned)
     }

@@ -410,12 +410,13 @@ fn plan_set_of(
         set_arms: Vec::new(),
         ..select.clone()
     };
-    let mut planned = vec![plan_select_of(&first, tenant, tables, outer)?];
+    let mut planned = vec![(None, plan_select_of(&first, tenant, tables, outer)?)];
     for arm in &select.set_arms {
-        if !arm.all || arm.op != crate::plan::SetOp::Union {
-            return Err(SqlError::unsupported(arm.op.name()));
-        }
-        planned.push(plan_select_of(&arm.select, tenant, tables, outer)?);
+        crate::exec::set_arm_supported(arm)?;
+        planned.push((
+            Some((arm.op, arm.all)),
+            plan_select_of(&arm.select, tenant, tables, outer)?,
+        ));
     }
     crate::exec::query::append(planned)
 }

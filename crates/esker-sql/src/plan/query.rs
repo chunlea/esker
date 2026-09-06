@@ -680,8 +680,13 @@ pub enum Node {
     /// `-0.0` and `0.0` are one value and so are two `NaN`s — which is what a real server does and
     /// what `Datum`'s own bitwise `PartialEq` deliberately does not.
     Distinct {
-        /// Where the rows come from — always a [`Node::Project`], because `DISTINCT` is over the
-        /// target list and not over the table.
+        /// Where the rows come from.
+        ///
+        /// A [`Node::Project`] for `SELECT DISTINCT`, because that clause is over the target list
+        /// and not over the table — and a [`Node::Append`] for a `UNION`, whose deduplication is
+        /// over the arms' rows and is the same operation on the same whole row. **`NULL` is equal
+        /// to `NULL` for it**, which it is nowhere else in SQL: measured, two `NULL` arms of a
+        /// `UNION` come back as one row.
         input: Box<Node>,
     },
 }

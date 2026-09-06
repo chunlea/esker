@@ -121,11 +121,34 @@ fn the_three_refusals_are_postgresqls_own() {
 }
 
 /// **What is not built yet is refused by name**, so the three commits after this one are visible.
+/// **`UNION` without `ALL` deduplicates**, and `NULL` counts as equal to `NULL` for it.
+#[test]
+fn union_without_all_deduplicates() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(node.rows("SELECT 1 UNION SELECT 1"), vec![vec!["1"]]);
+    // Three arms, and the `UNION` deduplicates everything before it rather than the arm beside
+    // it: `a UNION ALL b UNION c` is `((a ∪all b) ∪ c)`.
+    let rows = node.rows("SELECT 1 UNION ALL SELECT 1 UNION SELECT 2");
+    assert_eq!(rows.len(), 2, "the dedup did not reach the first two arms");
+    assert!(rows.contains(&vec!["1".to_owned()]));
+    assert!(rows.contains(&vec!["2".to_owned()]));
+    // **`NULL` is equal to `NULL` here**, which it is nowhere else: measured, two NULL arms
+    // deduplicate to one row.
+    assert_eq!(
+        node.rows("SELECT NULL::int4 UNION SELECT NULL::int4").len(),
+        1
+    );
+    // And over a table, where the duplicates are rows rather than literals.
+    assert_eq!(
+        node.rows("SELECT i FROM so UNION SELECT i FROM so").len(),
+        2
+    );
+}
+
 #[test]
 fn what_this_commit_does_not_do_is_named() {
     let mut node = parity::Node::new(FIXTURE);
     for statement in [
-        "SELECT 1 UNION SELECT 2",
         "SELECT 1 INTERSECT SELECT 2",
         "SELECT 1 EXCEPT SELECT 2",
         "SELECT 1 UNION ALL SELECT 2 ORDER BY 1",
