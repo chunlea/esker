@@ -27,6 +27,29 @@ use tempfile::TempDir;
 /// columnar learner goes on the healthiest store *without* a peer, so three voters need a fourth.
 const NODES: u64 = 4;
 
+/// What one store's registration buys the wait below.
+///
+/// **Not what the whole start gets, which is the difference between a bound and a rate.** This
+/// file used to give four stores one sixty-second clock; sixty seconds is a claim about how fast
+/// the machine underneath starts five processes, and under a full gate that claim is false —
+/// `.config/nextest.toml` says as much about this crate in particular, "their deadlines are
+/// wall-clock budgets rather than assertions about a state", and this binary takes every runner
+/// slot precisely because it is the one that makes the machine slow. So the wait is spent per
+/// store and starts again each time another registers: a cluster that is still bringing stores up
+/// has not hung, however slowly it is doing it, and a whole budget with nothing new says it has.
+/// The same rule, from the command's side, is `cluster.rs`'s `STORE_START_TIMEOUT`.
+const PER_STORE: Duration = Duration::from_secs(60);
+
+/// The ceiling on any wait in this file, however much progress is being made under it.
+///
+/// It ends a cluster that flaps — stores registering and dropping out for ever — and it is what
+/// the two failure tests below use as their wedge-detector, where there is no progress to measure
+/// and the only question is whether the command ever returns. Generous on purpose: those two
+/// settle in about a second at every load measured, so this is only ever spent on a run that is
+/// already red, and a number small enough to be reached by a busy machine turns a wedge-detector
+/// back into the rate it exists to avoid being.
+const CEILING: Duration = Duration::from_secs(300);
+
 /// Held for the length of each test in this file, so the two never overlap.
 ///
 /// **They cannot share a port space and one of them squats a port on purpose.** `free_port_run`
@@ -129,6 +152,29 @@ fn inspect(pd_dir: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// How many stores `pd inspect` says have registered, or zero before it has said.
+///
+/// The count is the progress signal the wait below is measured against, and it is read from the
+/// line `crates/esker-cli/src/pd.rs` prints as `stores ({n})`. A format change here loses the
+/// signal rather than corrupting it: the success condition is the whole `stores (4)` string, so
+/// a parser that stopped matching would leave the wait to its ceiling and never pass wrongly.
+fn registered_stores(seen: &str) -> u64 {
+    seen.lines()
+        .find_map(|line| line.strip_prefix("stores ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The parser reads the line the tool actually writes, spelled here the way `pd.rs` spells it.
+#[test]
+fn the_store_count_is_read_from_the_line_pd_inspect_prints() {
+    let inspected = "id reserved    1000\n\nstores (3)\n     1  127.0.0.1:1  last beat 0 ms\n";
+    assert_eq!(registered_stores(inspected), 3);
+    assert_eq!(registered_stores("cluster        (not bootstrapped)"), 0);
+    assert_eq!(registered_stores("stores (0)"), 0);
+}
+
 /// Every store the command started registers with the driver it started for them.
 ///
 /// The assertion is `stores (4)` and not "four processes are alive", because a store that is alive
@@ -149,7 +195,7 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     let base_port = free_port_run();
     warm_the_binary();
 
-    let supervisor = Supervisor(
+    let mut supervisor = Supervisor(
         Command::new(env!("CARGO_BIN_EXE_esker-cli"))
             .arg("cluster")
             .arg("start")
@@ -167,23 +213,54 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     );
 
     // Registration is the store's first act after opening, so this is seconds rather than the
-    // minute a *placement* decision takes: nothing here waits on a region heartbeat.
+    // minute a *placement* decision takes: nothing here waits on a region heartbeat. And what it
+    // waits on is a count that only goes up, so that is what it is measured against rather than a
+    // stopwatch — see [`PER_STORE`].
     let pd_dir = data_dir.path().join("pd");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
+    let mut progressed = started;
+    let mut registered = 0;
     let mut seen = String::new();
-    while Instant::now() < deadline {
+    loop {
+        // `cluster start` blocks on a signal when it succeeds, so its exit is a failure and is
+        // the answer. Without this arm a supervisor that died in the first second is polled for
+        // the whole ceiling and then reported as a driver that never saw four stores, which is
+        // the symptom and not the fault.
+        if let Some(status) = supervisor
+            .0
+            .try_wait()
+            .expect("waiting on the cluster command")
+        {
+            panic!(
+                "`esker cluster start --pd` exited with {status} instead of supervising a \
+                 cluster. what the driver had seen by then:\n{seen}"
+            );
+        }
         seen = inspect(&pd_dir);
         if seen.contains(&format!("stores ({NODES})")) {
-            drop(supervisor);
             return;
         }
+        let now = Instant::now();
+        let count = registered_stores(&seen);
+        if count > registered {
+            registered = count;
+            progressed = now;
+        }
+        let stalled = now.duration_since(progressed);
+        assert!(
+            stalled < PER_STORE,
+            "the driver has seen {registered} of {NODES} stores and none for {stalled:?}; \
+             `esker cluster start --pd` announced a cluster it had not started. what it did \
+             see:\n{seen}"
+        );
+        let total = now.duration_since(started);
+        assert!(
+            total < CEILING,
+            "after {total:?} the driver had seen {registered} of {NODES} stores and was still \
+             not settled, so they are registering and dropping out. what it did see:\n{seen}"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
-    drop(supervisor);
-    panic!(
-        "the driver never saw {NODES} stores; `esker cluster start --pd` announced a cluster it \
-         had not started. what it did see:\n{seen}"
-    );
 }
 
 /// A **node** that cannot listen fails the command too, which is the same rule reached from the
@@ -226,9 +303,9 @@ fn a_node_that_cannot_listen_is_a_failure_and_not_a_cluster() {
         .stderr(Stdio::piped());
 
     let mut child = Supervisor(command.spawn().expect("the cluster command starts"));
-    // Sixty seconds is this file's wedge-detector, not the assertion: the command settles in
-    // about a second at every load measured, and the four points are in the doc above.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // [`CEILING`] is this file's wedge-detector, not the assertion: the command settles in about
+    // a second at every load measured, and the four points are in the doc above.
+    let deadline = Instant::now() + CEILING;
     let status = loop {
         match child.0.try_wait().expect("waiting on the cluster command") {
             Some(status) => break status,
@@ -289,7 +366,8 @@ fn a_driver_that_cannot_listen_is_a_failure_and_not_a_cluster() {
         .stderr(Stdio::piped());
 
     let mut child = Supervisor(command.spawn().expect("the cluster command starts"));
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // The wedge-detector again, and generous for the same reason ([`CEILING`]).
+    let deadline = Instant::now() + CEILING;
     let status = loop {
         match child.0.try_wait().expect("waiting on the cluster command") {
             Some(status) => break status,
