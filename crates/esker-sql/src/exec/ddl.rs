@@ -428,7 +428,11 @@ fn resolve_user_type(
     let Some(name) = &column.user_type_name else {
         return Ok((column.ty, None));
     };
-    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+    // Through the `search_path`, so the statement after a `CREATE TYPE` in a schema can name it:
+    // `t.column :current_mood, :mood_in_test_schema` is the next line of the very test that made
+    // the create take a schema at all.
+    let stored = executor.stored_type_name(txn, name)?;
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, &stored)? else {
         // The name is not a type anybody declared, which is where lowering's own refusal has been
         // waiting for a catalog to confirm it. Same `0A000` and same wording as before.
         return Err(SqlError::unsupported(format!("the type {name}")));
