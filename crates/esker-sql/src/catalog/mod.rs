@@ -4723,7 +4723,7 @@ mod tests {
     /// what a store from before 2026-09-05 looks like.
     #[test]
     fn a_database_without_the_marker_is_refused() {
-        let backend = crate::backend::MemoryBackend::new();
+        let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
         // A catalog that exists: the counter is what says DDL has run.
         txn.put(&record::version_key(), &record::encode_counter(7));
@@ -4741,7 +4741,7 @@ mod tests {
     /// And one that carries it opens — as does an empty store, which has nothing to be wrong about.
     #[test]
     fn a_marked_database_and_an_empty_one_both_open() {
-        let backend = crate::backend::MemoryBackend::new();
+        let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
         let catalog = Catalog::new();
         // Nothing written at all: version 0, no marker, no complaint.
