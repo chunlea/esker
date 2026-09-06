@@ -2729,6 +2729,95 @@ fn query_datum(query: Option<crate::value::tsquery::Node>) -> Datum {
     }
 }
 
+/// `date_trunc(unit, value)` and `date_trunc(unit, value, zone)`.
+///
+/// **Which of the three types the value is decides the answer's type**, so this is also where the
+/// zone question is settled: a `timestamptz` is cut in the session's zone, and the three-argument
+/// form cuts in the zone it names instead — including when its value is an unzoned `timestamp`,
+/// which a real server casts to `timestamptz` before doing anything else.
+///
+/// Strict in both arguments, measured: either one NULL is NULL, and the unit is not looked at when
+/// the value is missing.
+fn date_trunc(args: &[Datum], session: Option<&'static crate::value::zone::Zone>) -> Result<Datum> {
+    use crate::value::trunc;
+
+    let (Some(unit), Some(value)) = (args.first(), args.get(1)) else {
+        return Ok(Datum::Null);
+    };
+    let (Datum::Text(spelling), false) = (unit, matches!(value, Datum::Null)) else {
+        return Ok(Datum::Null);
+    };
+
+    // The zone the third argument names, resolved through the same table `SET TimeZone` uses. A
+    // name it does not hold is `22023` — a different sentence from the one `SET` gives, measured.
+    let named = match args.get(2) {
+        None => None,
+        Some(Datum::Null) => return Ok(Datum::Null),
+        Some(zone) => {
+            let name = zone.to_text().unwrap_or_default();
+            Some(
+                crate::value::zone::Zone::shared(&name)
+                    .ok_or(SqlError::TimeZoneNotRecognized(name))?,
+            )
+        }
+    };
+
+    // The type's own name, which both refusals quote.
+    let ty = match (value, named) {
+        (_, Some(_)) | (Datum::TimestampTz(_) | Datum::Date(_), None) => "timestamp with time zone",
+        (Datum::Interval { .. }, None) => "interval",
+        _ => "timestamp without time zone",
+    };
+    let unit = match trunc::lookup(spelling) {
+        trunc::Lookup::Field(unit) => unit,
+        trunc::Lookup::Inapplicable => return Err(trunc::not_supported(spelling, ty, "")),
+        trunc::Lookup::Unknown => return Err(trunc::not_recognized(spelling, ty)),
+    };
+
+    Ok(match value {
+        Datum::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            let (months, days, micros) = trunc::interval(*months, *days, *micros, unit, spelling)?;
+            Datum::Interval {
+                months,
+                days,
+                micros,
+            }
+        }
+        // **A `date` resolves to the `timestamptz` overload**, not the unzoned one, so it is cut
+        // in a zone and comes back zoned. Measured.
+        Datum::Date(days) => Datum::TimestampTz(trunc::timestamptz(
+            i64::from(*days) * 86_400 * 1_000_000,
+            unit,
+            named.or(session),
+        )),
+        Datum::TimestampTz(micros) => {
+            Datum::TimestampTz(trunc::timestamptz(*micros, unit, named.or(session)))
+        }
+        // A `timestamp` under a named zone is that zone's `timestamptz`; without one it is cut
+        // where it is written, and the session's `TimeZone` does not reach it.
+        Datum::Timestamp(micros) => match named {
+            Some(zone) => Datum::TimestampTz(trunc::timestamptz(*micros, unit, Some(zone))),
+            None => Datum::Timestamp(trunc::timestamp(*micros, unit)),
+        },
+        // **A value none of the overloads take is `42883` naming the signature**, which is what a
+        // real server answers at resolution: `date_trunc('day', 42)` is
+        // `function date_trunc(unknown, integer) does not exist`. Answering NULL here instead would
+        // be the worst class of divergence — a value where PostgreSQL raises. The unit is spelled
+        // `unknown` because that is what an unadorned literal resolves to, and a literal is what a
+        // client writes.
+        other => {
+            return Err(SqlError::UndefinedFunctionTypes(format!(
+                "date_trunc(unknown, {})",
+                other.column_type().map_or("text", PgType::name)
+            )));
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one dispatch over the whole catalog-function vocabulary; splitting it would put \
@@ -3296,6 +3385,7 @@ fn catalog_function(
                 _ => Datum::Null,
             }
         }
+        CatalogFunc::DateTrunc => date_trunc(&args, env.settings.rendering.zone)?,
         CatalogFunc::HstoreFetch
         | CatalogFunc::HstoreHasKey
         | CatalogFunc::HstoreContains

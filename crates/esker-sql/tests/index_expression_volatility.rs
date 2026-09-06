@@ -85,8 +85,11 @@ fn a_function_that_is_not_immutable_is_refused_as_postgresql_refuses_it() {
 ///
 /// `date_trunc` is immutable or stable depending on the *argument type* it took —
 /// `date_trunc(text, timestamp)` is `i` and `date_trunc(text, timestamptz)` is `s`, because the
-/// second reads `TimeZone`. This node's rule reads the **argument count**, which cannot tell those
-/// apart, so it refuses both.
+/// second reads `TimeZone`. This node's rule is per *function*, with an argument **count** for the
+/// few whose configuration is optional, and neither can tell those two apart — so `date_trunc` is
+/// outside the immutable list entirely and both spellings are refused. That the zoned one really
+/// does read the session is not a guess here any more: `tests/date_trunc.rs` pins a `month`
+/// truncation that lands in a different month in New York.
 ///
 /// That is a conservative divergence and not a wrong answer: it refuses an index a real server
 /// would build, rather than building one whose key is not a function of the row. Closing it means

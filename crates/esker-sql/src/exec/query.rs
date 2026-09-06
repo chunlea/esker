@@ -4282,6 +4282,23 @@ fn wider_element(left: ColumnType, right: ColumnType) -> ColumnType {
 /// Arguments that share a type keep it — which is how `greatest('a', 'b')` is `text` — and a pair
 /// the promotion has no rule for keeps the first argument's, because the *rows* are still that
 /// type and a refusal here would be this node raising where a real server answers.
+/// The type `date_trunc` answers, which is the type of the value it cut.
+///
+/// **Two of the four arms are not the type they look like.** A `date` argument resolves to the
+/// `timestamptz` overload rather than the unzoned one, and the three-argument form is zoned even
+/// when its value is a plain `timestamp` — a real server casts it before doing anything else.
+/// Measured (`tests/captures/pg19_date_trunc.txt`).
+fn date_trunc_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
+    if args.len() > 2 {
+        return ColumnType::TimestampTz;
+    }
+    match args.get(1).map(|value| expr_type(value, scope)) {
+        Some(Ok(ColumnType::Interval)) => ColumnType::Interval,
+        Some(Ok(ColumnType::TimestampTz | ColumnType::Date)) => ColumnType::TimestampTz,
+        _ => ColumnType::Timestamp,
+    }
+}
+
 fn greatest_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
     let mut found: Option<ColumnType> = None;
     for arg in args {
@@ -4430,6 +4447,14 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // binds against.
         Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreFetch => {
             arrow_fetch(call.func, &call.args, scope).result_type()
+        }
+        // **`date_trunc` answers the type of the value it cut**, and two of the four arms are not
+        // the type they look like: a `date` argument resolves to the `timestamptz` overload, and
+        // so does the three-argument form even when its value is an unzoned `timestamp`. This is
+        // the half of the function that `timestamp_test.rb` reads — `assert_kind_of Time` over the
+        // grouped keys is a String and a failure if the column is described as `text`.
+        Expr::CatalogFunc(call) if call.func == CatalogFunc::DateTrunc => {
+            date_trunc_type(&call.args, scope)
         }
         // **The common type of the arguments**, which is what a real server resolves and what
         // `CatalogFunc::result_type` cannot answer without them. Measured: `int2` beside `int8`

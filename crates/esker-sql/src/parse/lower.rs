@@ -4957,6 +4957,30 @@ fn lower_catalog_function(
     refuse_if(!function.within_group.is_empty(), "WITHIN GROUP")?;
 
     refuse_wrong_arities(function, func.name(), func.arities())?;
+    // **`date_trunc`'s overloads are on the value's type**, and a real server picks between them
+    // at resolution — which is here, where the *written* type of a literal is still visible. An
+    // unadorned `42` is an `integer` to PostgreSQL's resolver and an `int8` to this node's value
+    // layer, so refusing it at evaluation would name `bigint` and quote back a signature the user
+    // did not write. A column falls through as `unknown` and is caught by the value it produces.
+    if func == plan::CatalogFunc::DateTrunc
+        && let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args
+        && let Some(value) = args.get(1)
+    {
+        let named = argument_type_name(value);
+        if !matches!(
+            named.as_str(),
+            "unknown"
+                | "timestamp without time zone"
+                | "timestamp with time zone"
+                | "interval"
+                | "date"
+        ) {
+            return Err(SqlError::UndefinedFunctionTypes(format!(
+                "date_trunc({}, {named})",
+                argument_type_name(&args[0])
+            )));
+        }
+    }
     let empty = Vec::new();
     let args = match &function.args {
         FunctionArguments::List(FunctionArgumentList { args, .. }) => args,

@@ -37,7 +37,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP)",
-            "`CURRENT_TIMESTAMP(p)` and `date_trunc` are two more members of this family and neither is called by statement 738. They are in the corpus so that the day one is needed its answer is already measured; both are refused by name today. `LOCALTIMESTAMP` was in this list until `insert_all` needed it (`tests/values_catalog_function.rs`), which is what the list is for.",
+            "**`CURRENT_TIMESTAMP(p)` is what refuses this now**, and it is the only thing that does: `date_trunc` was the other half until `timestamp_test.rb` needed it, and it answers (`tests/date_trunc.rs`). A statement in this list names one gap or it names none — the reason has to be re-read whenever half of it closes, or the entry goes on passing for a reason that has stopped being true. `LOCALTIMESTAMP` left the same way, for `insert_all` (`tests/values_catalog_function.rs`).",
             "UNMEASURED",
         ),
         (

@@ -1,0 +1,134 @@
+# **`date_trunc`**, from PostgreSQL 19beta1, 2026-09-06.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# Captured in one session inside `BEGIN … ROLLBACK`, in this order, over the fixture in
+# `CORPUS_FIXTURE`. The derivations and the whole synonym table are in
+# `tests/captures/pg19_date_trunc.txt`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The result type is the argument's, and a `date` is not the type it looks like.** A `date`
+#     resolves to the `timestamptz` overload, so `date_trunc('day', DATE '…')` is zoned; so is the
+#     three-argument form even when its value is an unzoned `timestamp`.
+#   * **The session `TimeZone` decides where a `timestamptz` is cut.** The same statement is
+#     `2026-09-05 00:00:00+00` in UTC and `2026-09-06 00:00:00+10` in Sydney, and under
+#     `America/New_York` a `month` truncation of `2026-09-01 02:00:00+00` lands in **August**.
+#   * **`quarter` has no plural and no abbreviation** while every other unit takes at least one
+#     alias: `months`/`mon`/`mons`, `centuries`/`cent`/`c`, `millennia`/`mil` all truncate, and
+#     `quarters` and `q` are refused. `m` is the **minute**.
+#   * **Two error classes.** A unit the table does not hold is `22023 … not recognized`; a unit it
+#     holds that this function cannot apply is `0A000 … not supported` — `timezone` on a timestamp
+#     and `week` on an interval. `epoch` and `dow` are `EXTRACT` fields and land in the *first*
+#     class, which reasoning puts in the second.
+#   * **A decade truncation of a 3-year interval is `00:00:00`**, not an empty interval and not
+#     `0 years`.
+#   * The unit is case-insensitive but **not trimmed**: `' month'` is a refusal.
+SELECT COUNT(*) AS count_all, date_trunc('month', created_at) AS date_trunc_month_created_at FROM dt_topics GROUP BY date_trunc('month', created_at) ORDER BY 2	bigint,timestamp without time zone	1|2026-08-01 00:00:00 ; 2|2026-09-01 00:00:00
+SELECT date_trunc('day', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 00:00:00
+SELECT pg_typeof(date_trunc('day', TIMESTAMP '2026-09-05 14:37:59'))	regtype	timestamp without time zone
+SELECT pg_typeof(date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00'))	regtype	timestamp with time zone
+SELECT pg_typeof(date_trunc('hour', INTERVAL '3 days 04:05:06.789'))	regtype	interval
+SELECT pg_typeof(date_trunc('day', DATE '2026-09-05'))	regtype	timestamp with time zone
+SELECT date_trunc('microseconds', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:59.123456
+SELECT date_trunc('milliseconds', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:59.123
+SELECT date_trunc('second', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:59
+SELECT date_trunc('minute', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:00
+SELECT date_trunc('hour', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:00:00
+SELECT date_trunc('day', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 00:00:00
+SELECT date_trunc('week', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-08-31 00:00:00
+SELECT date_trunc('month', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('quarter', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-07-01 00:00:00
+SELECT date_trunc('year', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-01-01 00:00:00
+SELECT date_trunc('decade', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2020-01-01 00:00:00
+SELECT date_trunc('century', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('millennium', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('century', TIMESTAMP '2000-06-01 00:00:00')	timestamp without time zone	1901-01-01 00:00:00
+SELECT date_trunc('century', TIMESTAMP '2001-06-01 00:00:00')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('millennium', TIMESTAMP '2000-06-01 00:00:00')	timestamp without time zone	1001-01-01 00:00:00
+SELECT date_trunc('week', TIMESTAMP '2026-08-31 00:00:00')	timestamp without time zone	2026-08-31 00:00:00
+SELECT date_trunc('MONTH', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('MoNtH', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('months', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('mon', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('mons', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-01 00:00:00
+SELECT date_trunc('m', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-05 14:37:00
+SELECT date_trunc('d', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-05 00:00:00
+SELECT date_trunc('h', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-05 14:00:00
+SELECT date_trunc('s', TIMESTAMP '2026-09-05 14:37:59.5')	timestamp without time zone	2026-09-05 14:37:59
+SELECT date_trunc('w', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-08-31 00:00:00
+SELECT date_trunc('y', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-01-01 00:00:00
+SELECT date_trunc('c', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('mil', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('dec', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2020-01-01 00:00:00
+SELECT date_trunc('us', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:59.123456
+SELECT date_trunc('ms', TIMESTAMP '2026-09-05 14:37:59.123456')	timestamp without time zone	2026-09-05 14:37:59.123
+SELECT date_trunc('secs', TIMESTAMP '2026-09-05 14:37:59.5')	timestamp without time zone	2026-09-05 14:37:59
+SELECT date_trunc('millennia', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('centuries', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2001-01-01 00:00:00
+SELECT date_trunc('quarters', TIMESTAMP '2026-09-05 14:37:59')	!22023 unit "quarters" not recognized for type timestamp without time zone
+SELECT date_trunc(' month', TIMESTAMP '2026-09-05 14:37:59')	!22023 unit " month" not recognized for type timestamp without time zone
+SELECT date_trunc('fortnight', TIMESTAMP '2026-09-05 14:37:59')	!22023 unit "fortnight" not recognized for type timestamp without time zone
+SELECT date_trunc('fortnight', TIMESTAMPTZ '2026-09-05 14:37:59+00')	!22023 unit "fortnight" not recognized for type timestamp with time zone
+SELECT date_trunc('fortnight', INTERVAL '3 days')	!22023 unit "fortnight" not recognized for type interval
+SELECT date_trunc('epoch', TIMESTAMP '2026-09-05 14:37:59')	!22023 unit "epoch" not recognized for type timestamp without time zone
+SELECT date_trunc('timezone', TIMESTAMP '2026-09-05 14:37:59')	!0A000 unit "timezone" not supported for type timestamp without time zone
+SELECT date_trunc('timezone_hour', TIMESTAMPTZ '2026-09-05 14:37:59+00')	!0A000 unit "timezone_hour" not supported for type timestamp with time zone
+SELECT date_trunc('week', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	!0A000 unit "week" not supported for type interval DETAIL: Months usually have fractional weeks.
+SELECT date_trunc('day', 42)	!42883 function date_trunc(unknown, integer) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT date_trunc('day')	!42883 function date_trunc(unknown) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT date_trunc(NULL, TIMESTAMP '2026-09-05 14:37:59') IS NULL	boolean	t
+SELECT date_trunc('day', NULL::timestamp) IS NULL	boolean	t
+SELECT date_trunc('microseconds', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons 5 days 06:07:08.9
+SELECT date_trunc('second', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons 5 days 06:07:08
+SELECT date_trunc('minute', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons 5 days 06:07:00
+SELECT date_trunc('hour', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons 5 days 06:00:00
+SELECT date_trunc('day', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons 5 days
+SELECT date_trunc('month', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 4 mons
+SELECT date_trunc('quarter', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years 3 mons
+SELECT date_trunc('year', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	3 years
+SELECT date_trunc('decade', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	00:00:00
+SELECT date_trunc('century', INTERVAL '3 years 4 mons 5 days 06:07:08.9')	interval	00:00:00
+SET TimeZone = 'UTC'		-
+SELECT date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00')	timestamp with time zone	2026-09-05 00:00:00+00
+SET TimeZone = 'Australia/Sydney'		-
+SELECT date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00')	timestamp with time zone	2026-09-06 00:00:00+10
+SELECT date_trunc('day', TIMESTAMP '2026-09-05 14:37:59')	timestamp without time zone	2026-09-05 00:00:00
+SET TimeZone = 'America/New_York'		-
+SELECT date_trunc('month', TIMESTAMPTZ '2026-09-01 02:00:00+00')	timestamp with time zone	2026-08-01 00:00:00-04
+SET TimeZone = 'UTC'		-
+SELECT date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00', 'Australia/Sydney')	timestamp with time zone	2026-09-05 14:00:00+00
+SELECT pg_typeof(date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00', 'Australia/Sydney'))	regtype	timestamp with time zone
+SELECT date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00', 'Mars/Olympus')	!22023 time zone "Mars/Olympus" not recognized
+SELECT date_trunc('day', 'infinity'::timestamp)	timestamp without time zone	infinity
+SELECT date_trunc('century', '-infinity'::timestamp)	timestamp without time zone	-infinity
+SELECT date_trunc('day', 'infinity'::timestamptz)	timestamp with time zone	infinity
+SELECT date_trunc('decade', TIMESTAMP '0001-06-01 05:00:00')	timestamp without time zone	0001-01-01 00:00:00 BC
+SELECT date_trunc('century', TIMESTAMP '0001-06-01 05:00:00')	timestamp without time zone	0001-01-01 00:00:00
+SELECT date_trunc('millennium', TIMESTAMP '0001-06-01 05:00:00')	timestamp without time zone	0001-01-01 00:00:00
+SELECT date_trunc('year', TIMESTAMP '0001-06-01 05:00:00 BC')	timestamp without time zone	0001-01-01 00:00:00 BC
+SELECT date_trunc('decade', TIMESTAMP '0001-06-01 05:00:00 BC')	timestamp without time zone	0001-01-01 00:00:00 BC
+SELECT date_trunc('century', TIMESTAMP '0001-06-01 05:00:00 BC')	timestamp without time zone	0100-01-01 00:00:00 BC
+SELECT date_trunc('millennium', TIMESTAMP '0001-06-01 05:00:00 BC')	timestamp without time zone	1000-01-01 00:00:00 BC
+SELECT date_trunc('decade', TIMESTAMP '0055-06-01 05:00:00 BC')	timestamp without time zone	0061-01-01 00:00:00 BC
+SELECT date_trunc('century', TIMESTAMP '0055-06-01 05:00:00 BC')	timestamp without time zone	0100-01-01 00:00:00 BC
+SELECT date_trunc('decade', TIMESTAMP '0100-06-01 05:00:00 BC')	timestamp without time zone	0101-01-01 00:00:00 BC
+SELECT date_trunc('century', TIMESTAMP '0100-06-01 05:00:00 BC')	timestamp without time zone	0100-01-01 00:00:00 BC
+SELECT date_trunc('week', TIMESTAMP '0001-06-01 05:00:00 BC')	timestamp without time zone	0001-05-29 00:00:00 BC
+SELECT date_trunc('milliseconds', INTERVAL '01:02:03.123456')	interval	01:02:03.123
+SELECT date_trunc('hour', INTERVAL '-3 years -4 mons -5 days -06:07:08.9')	interval	-3 years -4 mons -5 days -06:00:00
+SELECT date_trunc('year', INTERVAL '-40 months')	interval	-3 years
+SELECT date_trunc('quarter', INTERVAL '-40 months')	interval	-3 years -3 mons
+SET TimeZone = 'Asia/Beirut'		-
+SELECT date_trunc('day', TIMESTAMPTZ '2026-03-29 10:00:00+03')	timestamp with time zone	2026-03-29 01:00:00+03
+SELECT date_trunc('day', TIMESTAMPTZ '2026-10-25 10:00:00+03')	timestamp with time zone	2026-10-25 00:00:00+02
+SELECT date_trunc('hour', TIMESTAMPTZ '2026-10-24 20:30:00+00')	timestamp with time zone	2026-10-24 23:00:00+03
+SELECT date_trunc('hour', TIMESTAMPTZ '2026-10-24 21:30:00+00')	timestamp with time zone	2026-10-24 23:00:00+02
+SET TimeZone = 'America/Santiago'		-
+SELECT date_trunc('day', TIMESTAMPTZ '2026-09-06 15:00:00+00')	timestamp with time zone	2026-09-06 01:00:00-03
+SET TimeZone = 'America/New_York'		-
+SELECT date_trunc('hour', TIMESTAMPTZ '2026-03-08 07:30:00+00')	timestamp with time zone	2026-03-08 03:00:00-04
+SELECT date_trunc('day', TIMESTAMPTZ '2026-11-01 07:30:00+00')	timestamp with time zone	2026-11-01 00:00:00-04
+SET TimeZone = 'UTC'		-

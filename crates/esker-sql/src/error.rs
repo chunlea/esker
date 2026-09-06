@@ -174,6 +174,39 @@ pub enum SqlError {
     #[error("{0} is not supported")]
     FeatureNotSupported(String),
 
+    /// `date_trunc` with a first argument that is not a field at all.
+    ///
+    /// **The other class is `0A000`** ([`SqlError::DateTruncUnitNotSupported`]), and which one a
+    /// spelling gets is measured rather than reasoned: `epoch` and `dow` are real `EXTRACT` fields
+    /// and land *here*, in the class for units the table does not hold.
+    #[error("unit \"{unit}\" not recognized for type {ty}")]
+    DateTruncUnitNotRecognized {
+        /// The spelling, quoted back exactly as written — untrimmed, so `" month"` shows its space.
+        unit: String,
+        /// `timestamp without time zone`, `timestamp with time zone` or `interval`.
+        ty: String,
+    },
+
+    /// `date_trunc` with a field it knows and cannot apply: the three `timezone` spellings on
+    /// either timestamp, and `week` on an interval.
+    #[error("unit \"{unit}\" not supported for type {ty}")]
+    DateTruncUnitNotSupported {
+        /// The spelling, quoted back.
+        unit: String,
+        /// The type that will not take it.
+        ty: String,
+        /// PostgreSQL's own sentence: `Months usually have fractional weeks.` for the interval,
+        /// and nothing for the `timezone` spellings.
+        detail: String,
+    },
+
+    /// A zone name `date_trunc`'s third argument does not resolve.
+    ///
+    /// Not the message `SET TimeZone` gives for the same name — that one is about a *parameter*
+    /// and quotes the parameter's name. Measured separately.
+    #[error("time zone \"{0}\" not recognized")]
+    TimeZoneNotRecognized(String),
+
     /// A `SET` whose value is a bare `$name` — `SET search_path = $user,public`.
     ///
     /// **`$user` only means anything inside quotes.** PostgreSQL's `search_path` has a magic
@@ -2714,6 +2747,7 @@ impl SqlError {
             SqlError::ViewNotUpdatable { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
+            | SqlError::DateTruncUnitNotSupported { .. }
             | SqlError::DefaultColumnReference
             | SqlError::DefaultSubquery
             | SqlError::DefaultSetReturning
@@ -2936,6 +2970,7 @@ impl SqlError {
             SqlError::TimeZoneDisplacementOutOfRange(_) => {
                 sqlstate::INVALID_TIME_ZONE_DISPLACEMENT_VALUE
             }
+
             SqlError::InvalidHexDigit(_) | SqlError::OddHexDigits => {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
@@ -3067,7 +3102,12 @@ impl SqlError {
             | SqlError::UnrecognizedParameterNamespace(_)
             | SqlError::InvalidFunctionArgument(_)
             | SqlError::UnrecognizedExplainOptionValue { .. }
-            | SqlError::ExplainOptionRequiresAnalyze(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::ExplainOptionRequiresAnalyze(_)
+            // A `date_trunc` unit the table does not hold, and a zone name its third argument
+            // does not resolve. Both measured beside their `0A000` neighbour, which is the unit
+            // the table *does* hold and this function will not apply.
+            | SqlError::DateTruncUnitNotRecognized { .. }
+            | SqlError::TimeZoneNotRecognized(_) => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
@@ -3144,6 +3184,10 @@ impl SqlError {
             } => Some(format!("Expected {expected} parameters but got {got}.")),
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
+            }
+            // Empty for the `timezone` spellings, which carry no DETAIL on a real server.
+            SqlError::DateTruncUnitNotSupported { detail, .. } if !detail.is_empty() => {
+                Some(detail.clone())
             }
             // A trailing separator has no character to point at, so a real server moves the
             // whole of what it knows into the DETAIL. Measured: `'a.'::ltree`.

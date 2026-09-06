@@ -61,6 +61,7 @@ pub mod stopwords;
 pub mod temporal;
 pub mod time;
 mod timestamp;
+pub mod trunc;
 pub mod tsquery;
 pub mod tsvector;
 pub mod uuid;

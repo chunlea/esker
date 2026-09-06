@@ -1121,6 +1121,13 @@ pub enum CatalogFunc {
     /// carries its own type and answers for itself, arrays included: an `ARRAY(SELECT 1)` is an
     /// `integer[]` because that is what the value is.
     PgTypeof,
+    /// `date_trunc(unit, timestamp | timestamptz | interval)`, and the three-argument form
+    /// that names the zone to cut in.
+    ///
+    /// **The result type is the argument's**, so `exec::query::expr_type` answers for it the
+    /// way it does for `greatest`; [`CatalogFunc::result_type`] cannot, because it is given
+    /// no arguments to look at.
+    DateTrunc,
     /// `nlevel(path)`: how many labels the path has, and `0` for the empty one.
     LtreeNlevel,
     /// `ltree2text(path)` and `text2ltree(text)`: the two casts under their function names. The
@@ -1313,6 +1320,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("akeys") => Some(CatalogFunc::HstoreAkeys),
             () if name.eq_ignore_ascii_case("avals") => Some(CatalogFunc::HstoreAvals),
             () if name.eq_ignore_ascii_case("hstore") => Some(CatalogFunc::HstoreBuild),
+            () if name.eq_ignore_ascii_case("date_trunc") => Some(CatalogFunc::DateTrunc),
             () if name.eq_ignore_ascii_case("to_tsvector") => Some(CatalogFunc::ToTsVector),
             () if name.eq_ignore_ascii_case("to_tsquery") => Some(CatalogFunc::ToTsQuery),
             () if name.eq_ignore_ascii_case("plainto_tsquery") => Some(CatalogFunc::PlainToTsQuery),
@@ -1427,6 +1435,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreAkeys => "akeys",
             CatalogFunc::HstoreAvals => "avals",
             CatalogFunc::HstoreBuild => "hstore",
+            CatalogFunc::DateTrunc => "date_trunc",
             CatalogFunc::ToTsVector => "to_tsvector",
             CatalogFunc::ToTsQuery => "to_tsquery",
             CatalogFunc::PlainToTsQuery => "plainto_tsquery",
@@ -1531,7 +1540,9 @@ impl CatalogFunc {
             | CatalogFunc::RangeBuild
             | CatalogFunc::PgGetExpr
             | CatalogFunc::UserRegType
-            | CatalogFunc::TsHeadline => &[2, 3],
+            | CatalogFunc::TsHeadline
+            // `date_trunc`'s third argument names the zone to cut in.
+            | CatalogFunc::DateTrunc => &[2, 3],
 
             CatalogFunc::PgGetIndexdef => &[1, 3],
             // The text-search four take one argument with `default_text_search_config`, or two
@@ -1722,7 +1733,13 @@ impl CatalogFunc {
             CatalogFunc::Now
             | CatalogFunc::StatementTimestamp
             | CatalogFunc::ClockTimestamp => ColumnType::TimestampTz,
-            CatalogFunc::LocalTimestamp => ColumnType::Timestamp,
+            // **`date_trunc` answers its argument's type**, which this function cannot say:
+            // it takes no arguments. `exec::query::expr_type` has an arm above the one that
+            // calls this, exactly as `greatest` does, and that is the answer a client is
+            // told. The unzoned type here is what the two-argument form over a `timestamp`
+            // gives — the shape the suite sends — and is only what a caller that skipped
+            // that arm would see.
+            CatalogFunc::DateTrunc | CatalogFunc::LocalTimestamp => ColumnType::Timestamp,
             CatalogFunc::LocalTime => ColumnType::Time,
             CatalogFunc::CurrentDate => ColumnType::Date,
             CatalogFunc::ConvertTo => ColumnType::Bytea,
