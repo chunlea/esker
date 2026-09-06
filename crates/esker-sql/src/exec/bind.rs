@@ -1359,6 +1359,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         // Oid zero, which is `InvalidOid` and prints as its digits: what stands in is never read,
         // only its type is.
         ColumnType::RegType => crate::value::regtype_of_oid(0),
+        ColumnType::RegClass => crate::value::regclass_of_oid(0),
         ColumnType::RegTypeArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             ColumnType::RegType,
             1,

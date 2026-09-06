@@ -48,6 +48,14 @@ mod tests {
                     name: name.into(),
                 })
                 .boxed(),
+            // The same for a `regclass`, whose name may carry a schema: what resolved it decides
+            // whether it is qualified, so the codec carries the string it was handed.
+            ColumnType::RegClass => (any::<i64>(), "[a-z. ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegClass {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             // Every `f64`, `NaN` included: the round trip is over the bits.
             ColumnType::Point => (any::<f64>(), any::<f64>())

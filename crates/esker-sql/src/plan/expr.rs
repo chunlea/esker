@@ -1600,7 +1600,15 @@ impl CatalogFunc {
             // `ts_rank` answers a `real`, measured with `pg_typeof`.
             CatalogFunc::TsRank => ColumnType::Real,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
-            CatalogFunc::RegClass => ColumnType::Int8,
+            // **`regclass`, not `bigint`** — and the difference is a client's, not a reader's.
+            // `ActiveRecord` reloads its type map when a `RowDescription` carries an oid it does
+            // not know, warns once, and treats the value as a String; three of its tests assert
+            // that reload. Describing this as a `bigint` gave it an oid it knew, so nothing
+            // happened and all three watched the absence
+            // (`tests/captures/pg19_unknown_oid.txt`). The value is the same relation id either
+            // way; what changes is that it now prints as the relation's name, which is what a
+            // real server answers (`tests/captures/pg19_regclass.txt`).
+            CatalogFunc::RegClass => ColumnType::RegClass,
             // **The storage, which is what an enum's value is** (ADR 0050) — and the label
             // the projection form is replaced by is a `text` literal by then, so nothing
             // reads this for that shape.
@@ -2087,6 +2095,11 @@ impl Literal {
                     |_| mismatch(),
                     |oid| Ok(crate::value::regtype_of_oid(oid)),
                 ),
+                // **And an integer is a `regclass`**, on the same measurement one letter along:
+                // `1259::regclass` is `pg_class` and `999999::regclass` is `999999`. The name a
+                // resolvable oid prints is put on the datum where the catalog is, so what is
+                // built here carries the digits.
+                ColumnType::RegClass => Ok(crate::value::regclass_of_oid(*value)),
                 ColumnType::Int8 => Ok(Datum::Int8(*value)),
                 // **A whole number of currency units, not of cents.** `VALUES (123)` into a
                 // money column is `$123.00` on a real server, which is the assignment cast
@@ -2255,7 +2268,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
@@ -2373,7 +2386,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery => mismatch(),
             },
         }
     }

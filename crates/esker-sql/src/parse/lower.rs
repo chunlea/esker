@@ -5791,7 +5791,16 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 ..
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegClass) => {
-            lower_regclass(inner, data_type)
+            // **The `::oid` is a cast now, not a no-op.** It was dropped here while a `regclass`
+            // *was* a `bigint` and the pair meant the same value; a `regclass` is its own type
+            // since it had to be described as 2205, so `'rc'::regclass::oid` has to actually
+            // convert — measured, `'pg_class'::regclass::oid` is `1259` and `::text` of that is
+            // the digits, where `::text` of the `regclass` is the name.
+            Ok(plan::Expr::Cast {
+                operand: Box::new(lower_regclass(inner, data_type)?),
+                to: ColumnType::Oid,
+                typmod: NO_TYPMOD,
+            })
         }
         // `'cb'::regclass`. The text is a **name**, read the way `nextval`'s argument is — so
         // `'"companies"'::regclass`, which is what `ActiveRecord` writes, keeps its case and

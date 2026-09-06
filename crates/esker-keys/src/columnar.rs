@@ -57,6 +57,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         // **Appended, not inserted**: 89 and 90 were the next two free, and every tag already
         // written keeps the number it had ([ADR 0077](../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
         ColumnType::RegType => 89,
+        ColumnType::RegClass => 91,
         ColumnType::RegTypeArray => 90,
         ColumnType::Int8 => 1,
         ColumnType::Text => 2,

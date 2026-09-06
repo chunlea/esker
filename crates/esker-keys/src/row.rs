@@ -148,6 +148,13 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
             varint::put_u64(name.len() as u64, out);
             out.extend_from_slice(name.as_bytes());
         }
+        // **Eight bytes, not four**: a relation's id is an `i64` here, where a real server's oid
+        // is four bytes. The name follows exactly as a `regtype`'s does.
+        Datum::RegClass { oid, name } => {
+            out.extend_from_slice(&oid.to_le_bytes());
+            varint::put_u64(name.len() as u64, out);
+            out.extend_from_slice(name.as_bytes());
+        }
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Sixteen bytes, fixed, so no length precedes them.
         Datum::Uuid(v) => out.extend_from_slice(v),
@@ -457,17 +464,23 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         }
         ColumnType::RegType => {
             let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
-            let (len, consumed) = varint::get_u64(rest)
-                .map_err(|error| corrupt(format!("regtype name length: {error}")))?;
-            let len =
-                usize::try_from(len).map_err(|_| corrupt("column longer than this machine"))?;
-            let (body, rest) = rest[consumed..]
-                .split_at_checked(len)
-                .ok_or_else(|| corrupt(format!("a regtype name of {len} bytes is truncated")))?;
+            let (name, rest) = reg_name(rest, "regtype")?;
             (
                 Datum::RegType {
                     oid: u32::from_le_bytes(*head),
-                    name: text_from_utf8(body)?.into(),
+                    name,
+                },
+                rest,
+            )
+        }
+        // Eight bytes for the oid, then the same name.
+        ColumnType::RegClass => {
+            let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
+            let (name, rest) = reg_name(rest, "regclass")?;
+            (
+                Datum::RegClass {
+                    oid: i64::from_le_bytes(*head),
+                    name,
                 },
                 rest,
             )
@@ -581,6 +594,23 @@ fn text_from_utf8(bytes: &[u8]) -> Result<String> {
     })
 }
 
+/// The length-prefixed name that follows a `reg*` oid in a row.
+///
+/// Shared because the two differ only in the width of the oid before it: four bytes for a
+/// `regtype`, eight for a `regclass`, whose value is a relation id and not a real server's oid.
+fn reg_name<'a>(
+    bytes: &'a [u8],
+    what: &str,
+) -> std::result::Result<(Box<str>, &'a [u8]), RowError> {
+    let (len, consumed) =
+        varint::get_u64(bytes).map_err(|error| corrupt(format!("{what} name length: {error}")))?;
+    let len = usize::try_from(len).map_err(|_| corrupt("column longer than this machine"))?;
+    let (body, rest) = bytes[consumed..]
+        .split_at_checked(len)
+        .ok_or_else(|| corrupt(format!("a {what} name of {len} bytes is truncated")))?;
+    Ok((text_from_utf8(body)?.into(), rest))
+}
+
 fn corrupt(what: impl Into<String>) -> RowError {
     RowError::Corrupt(what.into())
 }
@@ -685,7 +715,11 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         // choose between an order that matches the comparison and one a human would expect. It is
         // refused in `decode_key_column` through `is_index_key`, which is where the error comes
         // from; no column can be declared as one, so nothing reaches this.
-        Datum::Null | Datum::Point { .. } | Datum::Geometry { .. } | Datum::RegType { .. } => {}
+        Datum::Null
+        | Datum::Point { .. }
+        | Datum::Geometry { .. }
+        | Datum::RegType { .. }
+        | Datum::RegClass { .. } => {}
         Datum::Int8(v)
         | Datum::TimestampTz(v)
         | Datum::Timestamp(v)
@@ -1135,6 +1169,7 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Jsonb
             | ColumnType::RegType
             | ColumnType::RegTypeArray
+            | ColumnType::RegClass
             | ColumnType::Xml
             | ColumnType::XmlArray
             // **`ltree[]` is not a key and `ltree` is.** An array key is built out of its
@@ -1181,7 +1216,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
     Ok(match ty {
         // Refused by `is_index_key` above, and refused again here: a type missing from either list
         // is still refused by the other, which is the direction a disagreement has to fail in.
-        ColumnType::RegType | ColumnType::RegTypeArray => return Err(not_a_key()),
+        ColumnType::RegType | ColumnType::RegTypeArray | ColumnType::RegClass => {
+            return Err(not_a_key());
+        }
         ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -2008,6 +2045,15 @@ mod tests {
             // of one type carry different names for one value.
             ColumnType::RegType => (any::<u32>(), "[a-z ]{0,12}")
                 .prop_map(|(oid, name)| Datum::RegType {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
+            // The same, and for the same reason: a `regclass`'s name is qualified or bare
+            // depending on the search path that resolved it, so the codec must carry whatever it
+            // was given rather than a shape it expects.
+            ColumnType::RegClass => (any::<i64>(), "[a-z. ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegClass {
                     oid,
                     name: name.into(),
                 })

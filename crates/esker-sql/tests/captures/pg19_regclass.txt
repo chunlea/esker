@@ -1,0 +1,72 @@
+# **`regclass` is an oid that prints as a relation's name** — PostgreSQL 19beta1, 2026-09-05.
+#
+# The same five questions `tests/captures/pg19_regtype.txt` asked of `regtype`, asked of the type
+# one letter along, because [ADR 0077](../../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)
+# decided the *shape* and nothing about `regclass`. One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe.
+#
+# WHY
+#
+# `postgresql_adapter_test.rb`'s three unknown-OID failures need `'x'::regclass` to be described as
+# oid **2205** rather than as the `bigint` this node declares — `tests/captures/pg19_unknown_oid.txt`
+# has that half. This file is the other half: what the type then has to *be*.
+#
+# ## The five facts, and the first decides the model
+#
+#     'pg_class'::regclass = 1259                    t     it compares against a bare integer
+#     'pg_class'::regclass < 'pg_type'::regclass     f     1259 < 1247 is false...
+#         relname   oid                                    ...where the NAMES sort the other way:
+#         pg_type   1247                                   'pg_class' < 'pg_type' is true
+#         pg_class  1259                                   so the ordering is the OID's
+#         pg_index  2610
+#     'pg_class'::regclass::text                     pg_class
+#     pg_typeof('pg_class'::regclass)                regclass
+#     999999::regclass::text                         999999      an oid naming no relation prints
+#                                                                its digits -- not an error
+#     'nosuchrel'::regclass                          42P01 relation "nosuchrel" does not exist
+#
+# **A `regclass` orders by its oid and not by its name**, exactly as a `regtype` does, and the two
+# relations chosen make that visible rather than assumable: alphabetically `pg_class` comes first
+# and by oid it does not.
+#
+# ## It converts both ways, and through `int8`
+#
+#     'pg_class'::regclass::oid     1259
+#     1259::regclass::text          pg_class
+#     'pg_class'::regclass::int8    1259
+#     1259::int8::regclass::text    pg_class
+#
+# ## The finding no plan had: **the printed name depends on the search path**
+#
+#     CREATE SCHEMA s1; CREATE TABLE s1.t (i int);
+#     's1.t'::regclass::text                          s1.t     search_path = public
+#     SET search_path TO s1, public;
+#     's1.t'::regclass::text                          t        now reachable unqualified
+#     'pg_catalog.pg_class'::regclass::text           pg_class  pg_catalog is always in the path
+#
+# So the output function **qualifies a name only when the relation is not reachable unqualified**.
+# It is the same rule `pg_get_indexdef` and every other name-printing catalog function follows, and
+# it is why ADR 0077's "the name is carried on the datum, resolved where the value is produced"
+# stays sound here: the cast is resolved once per statement, and a statement's search path cannot
+# change under it.
+#
+# ## Every relation-oid catalog column is an `oid` on a real server
+#
+#     pg_attrdef.adrelid      oid          pg_constraint.conrelid  oid
+#     pg_attribute.attrelid   oid          pg_index.indrelid       oid
+#     pg_class.oid            oid
+#
+#     SELECT count(*) > 0 FROM pg_attribute WHERE attrelid = 'pg_class'::regclass   ->  t
+#
+# This node declares all four `bigint`, which is why `WHERE attrelid = 'iv'::regclass` compares at
+# all today: both sides are `bigint`. Retyping only the cast breaks every one of those statements,
+# so the two moves are one unit or two ordered ones — never the cast alone.
+#
+# ## And one field measured beside it
+#
+#     CREATE TYPE feeling AS ENUM ('good','bad');
+#     typname  typlen  typtype  typcategory  typalign  typstorage
+#     feeling  4       e        E            i         p
+#
+# An enum's `typlen` is **4**. `pgwire::message::FieldDescription::of_user_type` sends `-1` on the
+# reasoning that the label is variable-length on the wire; the rendered value is text either way,
+# so nothing decodes differently, but the `RowDescription` claims something a real server does not.

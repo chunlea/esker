@@ -2088,6 +2088,22 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             typmod,
         } => match evaluate_in(operand, row, env)? {
             Datum::Null => Datum::Null,
+            // **A `regclass` to a number is the oid, not a text round trip.** Its text is the
+            // relation's *name*, so the round trip would hand `rc` to an integer parser; a real
+            // server's cast here is a binary coercion between two four-byte values and this one
+            // is between an `i64` and whatever width was asked for.
+            Datum::RegClass { oid, .. }
+                if matches!(
+                    to,
+                    ColumnType::Oid | ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2
+                ) =>
+            {
+                crate::value::assignment_cast(
+                    Datum::Int8(oid),
+                    *to,
+                    crate::value::Rendering::default(),
+                )?
+            }
             value => {
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the
@@ -3037,6 +3053,7 @@ fn catalog_function(
                 for value in &array.values {
                     let oid = match value {
                         Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => u64::from(*oid),
+                        Some(Datum::RegClass { oid, .. }) => oid.unsigned_abs(),
                         Some(Datum::Int8(value)) => u64::try_from(*value).unwrap_or(0),
                         Some(Datum::Int4(value)) => u64::try_from(*value).unwrap_or(0),
                         // An element with no oid to render. `42846`, the class a cast that does
@@ -3308,6 +3325,10 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         // `format_type('integer'::regtype, NULL)` the free coercion a real server makes rather
         // than the string this used to be handed.
         Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
+        // **And a `regclass`**, which is the same model one type along and is already an `i64`:
+        // `'rc'::regclass::text` reaches `regclass_name` with the value the cast produced, and
+        // refusing it here made a statement a real server answers into a `42804`.
+        Some(Datum::RegClass { oid, .. }) => Some(*oid),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
             let ty = crate::value::type_by_name(name)?
@@ -3334,6 +3355,10 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         // `format_type('integer'::regtype, NULL)` the statement a real server answers rather than
         // a type error.
         Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
+        // **And a `regclass`**, which is the same model one type along and is already an `i64`:
+        // `'rc'::regclass::text` reaches `regclass_name` with the value the cast produced, and
+        // refusing it here made a statement a real server answers into a `42804`.
+        Some(Datum::RegClass { oid, .. }) => Some(*oid),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "an oid is an integer, not {other:?}"

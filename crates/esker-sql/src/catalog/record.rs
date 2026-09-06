@@ -320,6 +320,10 @@ const TAG_TSQUERY_ARRAY: u8 = 87;
 /// space is append-only within itself.
 const TAG_REGTYPE: u8 = 88;
 const TAG_REGTYPE_ARRAY: u8 = 89;
+/// `regclass`, the same shape one letter along — **90 here and 91 in `esker_keys::columnar`**,
+/// which keeps the one-below offset the comment above records. Append-only, as that space is:
+/// a tag is a byte on disk and an old reader must refuse a new one rather than guess.
+const TAG_REGCLASS: u8 = 90;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -454,6 +458,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Interval => TAG_INTERVAL,
         ColumnType::Oid => TAG_OID,
         ColumnType::RegType => TAG_REGTYPE,
+        ColumnType::RegClass => TAG_REGCLASS,
         ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
@@ -591,6 +596,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_INTERVAL => ColumnType::Interval,
         TAG_OID => ColumnType::Oid,
         TAG_REGTYPE => ColumnType::RegType,
+        TAG_REGCLASS => ColumnType::RegClass,
         TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,

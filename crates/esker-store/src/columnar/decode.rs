@@ -257,7 +257,7 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::NumRangeArray
         | StoredType::Int8RangeArray
         | StoredType::Point
-        | StoredType::PointArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray => return None,
+        | StoredType::PointArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegClass => return None,
     })
 }
 
@@ -273,6 +273,7 @@ fn value_of(datum: &Datum) -> Value {
         // A regtype joins them, and for the same reason: this vocabulary has no tag for a value
         // whose printed form is a name, so `columnar_type` refuses the column above.
         Datum::RegType { .. }
+        | Datum::RegClass { .. }
         | Datum::Point { .. }
         | Datum::Money(_)
         | Datum::Inet { .. }

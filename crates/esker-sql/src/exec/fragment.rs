@@ -1013,7 +1013,7 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // **Not a columnar type.** A `regtype` cannot be a stored column here (ADR 0077), so the
         // scan never sees one; `None` keeps the filter on the row side rather than inventing a
         // representation for a value the columnar format has no tag for.
-        Row::RegType | Row::RegTypeArray => return None,
+        Row::RegType | Row::RegTypeArray | Row::RegClass => return None,
         Row::Int8 => Col::Int8,
         Row::Time => Col::Time,
         Row::Uuid => Col::Uuid,
@@ -1148,6 +1148,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // A regtype joins them: `column_type` refuses the column, so no fragment is built over
         // one, and this vocabulary has no tag for a value whose printed form is a name.
         | Datum::RegType { .. }
+        | Datum::RegClass { .. }
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),

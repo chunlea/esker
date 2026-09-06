@@ -2945,7 +2945,10 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // **A `regtype` is in the numbers' family**, with `oid`: measured,
             // `'text'::regtype = 25` is true against an uncast integer, so the two compare and a
             // family of its own would make that `42883`. Its array is its own, like every array.
-            ColumnType::RegType => family(ColumnType::Oid),
+            // A `regclass` is in the numbers' family with them, and it is what makes
+            // `WHERE attrelid = 'iv'::regclass` compare at all: measured,
+            // `'pg_class'::regclass = 1259` is true against an uncast integer.
+            ColumnType::RegType | ColumnType::RegClass => family(ColumnType::Oid),
             ColumnType::RegTypeArray => 200,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
@@ -3732,6 +3735,16 @@ fn figure_column_name(expr: &Expr) -> String {
         // `exists`; everything else about a subquery is `?column?`. Measured with `psql`, which a
         // corpus of types and rows cannot record.
         Expr::Subquery(sub) => sub.output_name().unwrap_or("?column?").to_owned(),
+        // **`'x'::regclass` is a column called `regclass`**, and it reaches here as a *literal*
+        // because `Executor::bound` resolves the cast against the catalog before the plan is
+        // built — so by the time a name is figured there is no cast left to read, which is the
+        // gap the doc above declares for a folded literal cast. It is closed for this one type
+        // because the value itself says which type it is: nothing but that cast produces a
+        // `regclass` datum. Measured — a real server names an unaliased cast after its target
+        // type (`tests/captures/pg19_regclass.txt`), and an alias still wins.
+        Expr::Literal(Literal::Typed(datum)) if matches!(**datum, Datum::RegClass { .. }) => {
+            "regclass".to_owned()
+        }
         _ => "?column?".to_owned(),
     }
 }

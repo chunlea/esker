@@ -1893,7 +1893,21 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 100] = [
+pub const CASTS: [(i64, i64, &str, &str); 109] = [
+    // **`regclass`'s nine rows, measured** rather than reasoned: `SELECT castsource, casttarget,
+    // castcontext, castmethod FROM pg_cast WHERE castsource = 2205 OR casttarget = 2205`. Six
+    // types reach a `regclass` implicitly and three leave it — `regclass -> bigint` and
+    // `-> integer` are *assignment* casts where `-> oid` is implicit, which is the asymmetry a
+    // hand-written list would have flattened.
+    (20, 2205, "i", "f"),
+    (21, 2205, "i", "f"),
+    (23, 2205, "i", "b"),
+    (25, 2205, "i", "f"),
+    (26, 2205, "i", "b"),
+    (1043, 2205, "i", "f"),
+    (2205, 20, "a", "f"),
+    (2205, 23, "a", "b"),
+    (2205, 26, "i", "b"),
     (16, 23, "e", "f"),
     (16, 25, "a", "f"),
     (16, 1042, "a", "f"),
@@ -2645,6 +2659,7 @@ fn partitioned_relkind(
 pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::RegType => "regtype",
+        ColumnType::RegClass => "regclass",
         ColumnType::RegTypeArray => "_regtype",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
@@ -2788,6 +2803,7 @@ pub(super) fn typcategory(ty: ColumnType) -> &'static str {
         // A number, and PostgreSQL groups it with them despite being an identifier.
         | ColumnType::Oid
         | ColumnType::RegType
+        | ColumnType::RegClass
         // **And a money**, which a real server puts here too — not in `U` with the extension
         // types and not in a category of its own. Measured.
         | ColumnType::Money => "N",
@@ -2883,6 +2899,7 @@ fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
         ColumnType::RegType => "regtypein",
+        ColumnType::RegClass => "regclassin",
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
         // catalog: `ActiveRecord` decides that a column is an array by comparing this string, and
         // a column it does not know to be an array is what makes it hand a Ruby `Array` to

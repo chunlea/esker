@@ -439,6 +439,20 @@ pub enum ColumnType {
     /// comparison is `25 < 23` and not the names; and `'text'::regtype = 25` is true against an
     /// uncast integer.
     RegType,
+    /// `regclass`: an oid that prints as a **relation's** name, the type
+    /// [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)'s shape one
+    /// letter along.
+    ///
+    /// The same two measurements decide it as decided `regtype`, and both are in
+    /// `tests/captures/pg19_regclass.txt`: `'pg_class'::regclass = 1259` is **t** against an
+    /// uncast integer, and `'pg_class'::regclass < 'pg_type'::regclass` is **f** — 1259 < 1247 is
+    /// false where the *names* sort the other way, so the ordering is the oid's.
+    ///
+    /// It exists because a client has to be told: `ActiveRecord` reloads its type map when a
+    /// `RowDescription` carries an oid it does not know, and this node was describing
+    /// `'x'::regclass` as a `bigint` — an oid it knows — so three of its tests watched nothing
+    /// happen (`tests/captures/pg19_unknown_oid.txt`).
+    RegClass,
     /// `boolean[]`. **The sixteen below are not sixteen features.** Every base type on a real
     /// server has an array type, and `pg_type.typarray` points at it; a `typarray` naming a row
     /// that is not there is worse than a zero, because a client walks the link in both directions
@@ -493,7 +507,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 87] = [
+    pub const ALL: [ColumnType; 88] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -526,6 +540,7 @@ impl ColumnType {
         ColumnType::Interval,
         ColumnType::Oid,
         ColumnType::RegType,
+        ColumnType::RegClass,
         ColumnType::Int8Array,
         ColumnType::Int4Array,
         ColumnType::Int2Array,
@@ -774,6 +789,27 @@ pub enum Datum {
         /// What it prints as.
         name: Box<str>,
     },
+    /// [`ColumnType::RegClass`]: the same, for a **relation**.
+    ///
+    /// The name rides along for the reason a `regtype`'s does — deriving it needs the catalog and
+    /// this crate must not have one — and with one extra wrinkle that is measured: the printed
+    /// name is **search-path dependent**. `'s1.t'::regclass` prints `s1.t` when `s1` is not in the
+    /// path and `t` when it is. Resolving it where the value is produced is what makes that come
+    /// out right: the cast is resolved once per statement, and a statement's search path cannot
+    /// change under it. An oid naming no relation carries its digits, which is what a real server
+    /// prints for one.
+    RegClass {
+        /// The oid, which is the value — **an `i64` where PostgreSQL's is four bytes**.
+        ///
+        /// A relation's identity here is `esker-catalog`'s 64-bit id, and truncating it into a
+        /// `u32` to match the width of a real server's oid is how a value comes to name a
+        /// *different* relation. The declared type is still `regclass` (2205); it is the value
+        /// that is wider, and it stays wider because every column it is compared against —
+        /// `attrelid`, `indrelid`, `conrelid`, `adrelid` — is a `bigint` here for the same reason.
+        oid: i64,
+        /// What it prints as, qualified only when the relation is not reachable unqualified.
+        name: Box<str>,
+    },
     /// One of the four array types: its elements, their shape, and where they are subscripted
     /// from (`crate::array`).
     ///
@@ -863,6 +899,8 @@ impl PartialEq for Datum {
             // a row holding a `regtype`.
             (Datum::Oid(a), Datum::Oid(b))
             | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. }) => a == b,
+            // The same rule with a wider value: a relation's id is 64 bits here.
+            (Datum::RegClass { oid: a, .. }, Datum::RegClass { oid: b, .. }) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
@@ -979,6 +1017,7 @@ impl Datum {
             Datum::Interval { .. } => ColumnType::Interval,
             Datum::Oid(_) => ColumnType::Oid,
             Datum::RegType { .. } => ColumnType::RegType,
+            Datum::RegClass { .. } => ColumnType::RegClass,
             Datum::Numeric(_) => ColumnType::Numeric,
             // The array's own element type decides which of the four it is, so a value always
             // knows what it is without being told.
@@ -1057,6 +1096,19 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
             ColumnType::Oid
         )
         | (ColumnType::Oid, ColumnType::RegType)
+        // A `regclass` beside an `oid`, for the same reason and with the same measurement:
+        // `SELECT count(*) > 0 FROM pg_attribute WHERE attrelid = 'pg_class'::regclass` is `t`.
+        | (ColumnType::RegClass, ColumnType::Oid)
+        | (ColumnType::Oid, ColumnType::RegClass)
+        // **And beside an `int8`, which is temporary and is written down as such.** Every
+        // relation-oid column in this node's catalog — `attrelid`, `adrelid`, `conrelid`,
+        // `indrelid` — is declared `bigint` where a real server declares `oid`
+        // (`tests/captures/pg19_regclass.txt`), and `WHERE attrelid = 'iv'::regclass` is the
+        // commonest statement in the catalog corpora. This pair is what keeps those comparing
+        // while the cast stops being a `bigint`; it goes when those four columns become `oid`,
+        // which is the move ADR 0077 made for `pg_enum.enumtypid` for exactly this reason.
+        | (ColumnType::RegClass, ColumnType::Int8)
+        | (ColumnType::Int8, ColumnType::RegClass)
     )
 }
 

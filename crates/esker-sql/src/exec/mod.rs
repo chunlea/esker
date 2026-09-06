@@ -3091,7 +3091,23 @@ impl Executor {
                 return;
             }
             match self.relation_oid(&mut relations, txn, name) {
-                Ok(oid) => *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(oid)))),
+                Ok(oid) => {
+                    // **The name comes from the same lookup, and this is the seam that has one.**
+                    // A `regclass` prints as the relation's name, qualified only when the relation
+                    // is not reachable unqualified — measured, `'s1.t'::regclass` is `s1.t` out of
+                    // the search path and `t` in it. `relation_named` is exactly that rule, and it
+                    // is the same lookup `to_regclass` answers with, so the two cannot disagree
+                    // about which relation they found.
+                    let printed = self
+                        .relation_named(&mut relations, txn, name)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| oid.to_string());
+                    *expr = Expr::Literal(Literal::Typed(Box::new(Datum::RegClass {
+                        oid,
+                        name: printed.into(),
+                    })));
+                }
                 Err(error) => {
                     failure.get_or_insert(error);
                 }
