@@ -605,10 +605,43 @@ fn type_of(tag: u8) -> Result<ColumnType> {
     })
 }
 
-/// `'m' ++ "sql" ++ 'v'`. One counter, read once per transaction.
+/// The tenant a **cluster-scoped** catalog object bumps the version under.
+///
+/// Roles and databases have no tenant — `role_key` and `database_key` are `'m' ++ "sql" ++ kind ++
+/// name`, deliberately, because a role belongs to the cluster and not to one database. Their DDL
+/// still has to invalidate every tenant's cached catalog, so it bumps this counter and
+/// [`super::Catalog::view_at`] reads it beside the tenant's own.
+///
+/// `u64::MAX` because a real tenant id is allocated upward from a small number, so this can never
+/// collide with one; it is a reserved value and not a tenant that exists.
+pub(crate) const CLUSTER_TENANT: u64 = u64::MAX;
+
+/// `'m' ++ "sql" ++ 'v' ++ tenant`. One counter **per tenant**, read once per transaction.
+///
+/// # Why the tenant is in the key
+///
+/// It was not, and that made this the one catalog key an ordinary reader in one database shared
+/// with a writer in another: tables, names, the id sequence and foreign-key back-references are all
+/// tenant-scoped, so a global counter was where tenant A and tenant B met.
+///
+/// They met badly. A schema load *reads* this key on every statement that resolves a relation, and
+/// every DDL statement *prewrites* it. A DDL in B therefore held a Percolator lock on the key an
+/// ordinary `SELECT` in A had to read, and a read that meets a live lock it cannot clear becomes
+/// `LockNotCleared` and reaches the client as `40001` — a serialization failure in a transaction
+/// that serializes with nothing.
+///
+/// `bump_version`'s own comment argued the global key was worth it because "two concurrent DDL
+/// statements conflict and one of them is told to retry". That is true and stays true: DDL against
+/// DDL *within one tenant* still meets here, which is the serialisation that comment wants. What it
+/// did not cover was a reader in another database, which is not a DDL statement at all.
+///
+/// Under **layout 2** and not a new layout: g1 introduced the marker for exactly this class of
+/// change and layout 2 has not shipped, so this key moves inside it rather than bumping to 3.
 #[must_use]
-pub(super) fn version_key() -> Vec<u8> {
-    prefix::meta_key(&[SQL, &[KIND_VERSION]].concat())
+pub(super) fn version_key(tenant: u64) -> Vec<u8> {
+    let mut suffix = [SQL, &[KIND_VERSION]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    prefix::meta_key(&suffix)
 }
 
 /// `'m' ++ "sql" ++ 'L'`. **One key for the whole store**, holding the catalog's *layout* version.
