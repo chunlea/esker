@@ -218,6 +218,26 @@ bounded thread pool (2 threads *default*) via a `CompactionJob` that is a pure f
 is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` drop MVCC versions below
 the safepoint.
 
+**Two compactions must not touch one file, nor write overlapping ranges into one level.** The pool
+is bounded but not serial, and `Db::compact_range` runs one inline on the caller's thread beside it,
+so both halves of that rule are load-bearing. A plan reserves its **input files** by number and the
+**key range it will write**, per `(column family, output level)`; a plan that cannot have all its
+inputs, or whose range overlaps a running plan's range in the same level, is dropped rather than
+queued — the picker produces it again in a moment against a version that has moved on. The range
+claimed is the union of the plan's inputs in *user*-key order, which is the widest its outputs can
+be. Two compactions into different levels never contend, which is what keeps the pool parallel; two
+into the same level are ordered, which for `L0 → L1` means one at a time — where `LevelDB` and
+`RocksDB` also arrive.
+
+The inputs alone are not sufficient, and this section used to imply they were: L0 files legitimately
+overlap each other, so two `L0 → L1` plans can hold disjoint input sets and still write overlapping
+ranges into L1, at which point L1 stops partitioning the key space. Measured at 1 in 20 attempts
+with a concurrent writer and 0 in 20 without
+([ADR 0079](adr/0079-compaction-concurrency-reserves-the-output-range.md)). `version::builder`'s
+`check_disjoint` still validates each level as a version is built, but it is the backstop rather
+than the first line — it turns the race into a failed operation on a legal workload instead of a
+corrupt level, which is what the reservation exists to prevent reaching at all.
+
 **Range deletions.** `DeleteRange` is real ([ADR 0017](adr/0017-range-tombstones.md)). A range
 tombstone `[begin, end)` is stored *beside* the sorted run rather than in it — a list in the
 memtable, a block in the tables a flush writes — because it hides keys the run has never seen. A key
