@@ -2601,6 +2601,19 @@ pub enum SqlError {
     #[error("prepared statement \"{0}\" already exists")]
     DuplicatePreparedStatement(String),
 
+    /// A prepared statement whose result row type changed under it.
+    ///
+    /// Measured on PostgreSQL 19: `0A000: cached plan must not change result type`, with no DETAIL
+    /// and no HINT. `ActiveRecord` maps the sentence to `PreparedStatementCacheExpired`,
+    /// deallocates the statement and retries — so the words are load-bearing and not a paraphrase.
+    ///
+    /// **Not `FeatureNotSupported`, though it shares the SQLSTATE.** That variant carries contract
+    /// C2 — a statement this node can parse and will not run — and this is a statement it ran
+    /// happily a moment ago and must now refuse. Filing it there would enter it in the refusal
+    /// register as a feature nobody is missing.
+    #[error("cached plan must not change result type")]
+    CachedPlanMustNotChangeResultType,
+
     /// `EXECUTE` supplying the wrong number of arguments.
     ///
     /// Measured on 19beta1: `42601: wrong number of parameters for prepared statement "h1_types"`
@@ -2670,7 +2683,8 @@ impl SqlError {
             // `0A000` on something it will never implement rather than on something it has not
             // implemented yet.
             | SqlError::LockingNotAllowedWith { .. }
-            | SqlError::LockingNullableSide(_) => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::LockingNullableSide(_)
+            | SqlError::CachedPlanMustNotChangeResultType => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,

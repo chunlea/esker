@@ -335,10 +335,11 @@ impl Session {
         // **Analysed here, not at the first `EXECUTE`.** Measured on 19beta1: `PREPARE x AS SELECT
         // * FROM nope` is `42P01` and a missing column is `42703`, both at the `PREPARE`. A node
         // that stored the text and failed later would report the mistake against a statement the
-        // user is no longer looking at. `describe` resolves without running; its answer is thrown
-        // away and only its refusal kept.
-        // The answer is kept rather than thrown away: it is what `pg_prepared_statements`
-        // reports for this statement, and it is already paid for.
+        // user is no longer looking at. `describe` resolves without running.
+        //
+        // Its answer is **kept**, and twice over: it is what `pg_prepared_statements` reports for
+        // this statement, and it is the row shape every later `EXECUTE` is compared against
+        // ([`revalidate`]).
         let described = executor.describe(&body, &[])?;
         self.statements.insert(
             name,
@@ -375,6 +376,7 @@ impl Session {
         let Some(body) = stored.parsed.as_ref() else {
             return Err(SqlError::InvalidSqlStatementName(name));
         };
+        let baseline = stored.described.clone();
         let wanted = crate::exec::bind::parameter_count(&body.lower()?);
         if args.len() != wanted {
             return Err(SqlError::WrongParameterCount {
@@ -390,6 +392,7 @@ impl Session {
         // Cloned out of the store because `execute` takes `&mut dyn Execute` and the borrow of
         // `self.statements` would otherwise outlive it.
         let body = body.clone();
+        revalidate(&body, baseline.as_ref(), &[], executor)?;
         executor.execute(
             &body,
             &Params {
@@ -790,15 +793,23 @@ impl Session {
             StatementClass::Savepoint(name) => self.savepoint(name, executor),
             StatementClass::RollbackTo(name) => self.rollback_to(name, executor),
             StatementClass::Release(name) => self.release(name, executor),
-            _ => executor.execute(
+            _ => revalidate(
                 &parsed,
-                &Params {
-                    values: &open.params,
-                    formats: &open.formats,
-                    declared: &prepared.param_types,
-                    bound: true,
-                },
-            ),
+                prepared.described.as_ref(),
+                &prepared.param_types,
+                executor,
+            )
+            .and_then(|()| {
+                executor.execute(
+                    &parsed,
+                    &Params {
+                        values: &open.params,
+                        formats: &open.formats,
+                        declared: &prepared.param_types,
+                        bound: true,
+                    },
+                )
+            }),
         };
         // Same rule as the simple query path: what the statement remarked on goes out before what
         // it produced.
@@ -967,6 +978,66 @@ impl Session {
         if error.aborts_transaction() && self.status == TransactionStatus::InTransaction {
             self.status = TransactionStatus::Failed;
         }
+    }
+}
+
+/// Refuses a statement whose result row type has changed since it was described.
+///
+/// **PostgreSQL revalidates a cached plan before every execution**, and a statement whose rows no
+/// longer have the shape the client was told about is `0A000 cached plan must not change result
+/// type` rather than a surprise. `ActiveRecord` maps that sentence to
+/// `PreparedStatementCacheExpired`, deallocates and retries; a node that answered with the new
+/// shape instead would hand the adapter rows its column list does not match, silently.
+///
+/// Two orderings measured on PostgreSQL 19 and reproduced here:
+///
+/// * **The analysis error wins.** `SELECT b FROM t` after `DROP COLUMN b` is `42703`, and a
+///   dropped table is `42P01` — not the cached-plan sentence. That falls out of comparing second:
+///   there is nothing to compare when the statement no longer resolves.
+/// * **It does not heal.** Every execution re-runs this, so the statement stays refused until it
+///   is prepared again, which is exactly what the adapter's handler does.
+///
+/// A statement with no baseline is let through: this node analyses a `Parse` when something asks
+/// rather than when it arrives, so a wire statement nobody has described has no shape to compare.
+/// Every driver that reads rows sends the `Describe` first, and SQL `PREPARE` always has one.
+fn revalidate(
+    parsed: &Parsed,
+    baseline: Option<&Described>,
+    declared: &[u32],
+    executor: &mut dyn Execute,
+) -> Result<()> {
+    let Some(baseline) = baseline else {
+        return Ok(());
+    };
+    let now = executor.describe(parsed, declared)?;
+    if same_row_type(baseline.fields.as_deref(), now.fields.as_deref()) {
+        Ok(())
+    } else {
+        Err(SqlError::CachedPlanMustNotChangeResultType)
+    }
+}
+
+/// Whether two row shapes are the same one, by PostgreSQL's rule.
+///
+/// Name, type **and type modifier**, each measured rather than assumed: `RENAME COLUMN b TO bb`
+/// refuses, so a name is part of the type; `ALTER COLUMN a TYPE bigint` refuses; and `varchar(10)`
+/// widened to `varchar(20)` refuses, which is the one a comparison over type OIDs alone would let
+/// through. PostgreSQL's fourth field is the collation and this node has none.
+///
+/// A statement that returns no rows compared against one that does is a change, which is what the
+/// `Option` arms say: `SELECT` becoming `NoData` is not something a client can be handed quietly.
+fn same_row_type(before: Option<&[FieldDescription]>, after: Option<&[FieldDescription]>) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(before), Some(after)) => {
+            before.len() == after.len()
+                && before.iter().zip(after).all(|(before, after)| {
+                    before.name == after.name
+                        && before.type_oid == after.type_oid
+                        && before.type_modifier == after.type_modifier
+                })
+        }
+        _ => false,
     }
 }
 
