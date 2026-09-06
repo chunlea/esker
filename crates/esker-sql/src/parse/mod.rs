@@ -36,6 +36,7 @@
 //! ADR 0014 exists to prevent.
 
 pub(crate) mod lower;
+pub(crate) mod set_operation;
 pub(crate) use lower::DATABASE_NAME;
 
 use sqlparser::ast::{ObjectType, Statement};

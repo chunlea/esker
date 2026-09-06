@@ -1972,7 +1972,53 @@ impl Executor {
     }
 
     /// Resolves the tables a `SELECT` names and plans against them.
+    /// A set operation: every arm planned, their types unified, and the rows appended in order.
+    ///
+    /// **The arms are planned through `plan_select` itself**, one each, because an arm is a select
+    /// and may name a different table, a derived table or a subquery — resolving that is what this
+    /// function does and there is no second copy of it.
+    ///
+    /// The unification is the whole of the type work
+    /// (`tests/captures/pg19_set_operations.txt`): the *names* come from the first arm and the
+    /// *types* from every arm, so `SELECT i FROM t UNION ALL SELECT n FROM t` is a column called
+    /// `i` of type `numeric`.
+    fn plan_set_operation(
+        &self,
+        txn: &dyn Txn,
+        select: &crate::plan::Select,
+    ) -> Result<query::Planned> {
+        // The set's own clauses are not the first arm's; they are applied over the result, and
+        // until they are, a statement that writes one is refused by name rather than ignored.
+        if !select.order_by.is_empty() {
+            return Err(SqlError::unsupported("ORDER BY over a set operation"));
+        }
+        if select.limit.is_some() || select.offset.is_some() {
+            return Err(SqlError::unsupported("LIMIT over a set operation"));
+        }
+        let first = crate::plan::Select {
+            set_arms: Vec::new(),
+            ..select.clone()
+        };
+        let mut planned = vec![self.plan_select(txn, &first)?];
+        for arm in &select.set_arms {
+            // **`UNION ALL` is what commit one is.** The other two operators and the deduplicating
+            // form are named rather than answered as this one, because `UNION` and `UNION ALL`
+            // differ in the rows they return and not in how they are read.
+            if !arm.all {
+                return Err(SqlError::unsupported(arm.op.name()));
+            }
+            if arm.op != crate::plan::SetOp::Union {
+                return Err(SqlError::unsupported(arm.op.name()));
+            }
+            planned.push(self.plan_select(txn, &arm.select)?);
+        }
+        query::append(planned)
+    }
+
     fn plan_select(&self, txn: &dyn Txn, select: &crate::plan::Select) -> Result<query::Planned> {
+        if !select.set_arms.is_empty() {
+            return self.plan_set_operation(txn, select);
+        }
         // **A view becomes the derived table it stands for, before anything else looks at the
         // statement.** `FROM v` is `FROM (<definition>) AS v`, which is the rewrite
         // `crate::plan::cte` performs for a `WITH` item — the text comes from the catalog instead.

@@ -96,6 +96,17 @@ enum Kind<'a> {
     One(bool),
     /// Rows that came from nowhere: a `pg_catalog` relation, computed rather than read.
     Rows(std::vec::IntoIter<Vec<Datum>>),
+    /// A set operation's arms, drained one after another.
+    ///
+    /// **It streams**, which is what makes `UNION ALL` cost what its arms cost: the arms are
+    /// opened lazily, one at a time, so a set over two scans never holds both. `at` is the arm
+    /// being drained and the plans behind it are opened as it reaches them.
+    Append {
+        /// The arms still to open, in the order written.
+        rest: std::vec::IntoIter<Node>,
+        /// The arm being drained, or `None` before the first is opened.
+        current: Option<Box<Cursor<'a>>>,
+    },
     /// A key range, read a chunk at a time.
     Scan {
         columns: RowSchema,
@@ -477,6 +488,13 @@ impl<'a> Cursor<'a> {
                     materialized,
                 }
             }
+            // **Lazily**: only the arms are taken here, and the first is opened on the first
+            // pull. Opening them all would read every arm's first chunk before a client has asked
+            // for one row.
+            Node::Append { arms } => Kind::Append {
+                rest: arms.clone().into_iter(),
+                current: None,
+            },
             Node::Filter { input, predicate } => Kind::Filter {
                 input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 predicate: predicate.clone(),
@@ -562,6 +580,8 @@ impl<'a> Cursor<'a> {
             settings: self.settings,
             catalog: Some(&self.catalog),
         };
+        // The same three, for the one arm that opens a cursor of its own as it goes.
+        let (txn, tenant, settings) = (self.txn, self.tenant, self.settings);
         match &mut self.kind {
             Kind::One(used) => Ok(if std::mem::replace(used, true) {
                 None
@@ -748,6 +768,20 @@ impl<'a> Cursor<'a> {
                 }
             },
 
+            Kind::Append { rest, current } => {
+                loop {
+                    if let Some(arm) = current.as_mut()
+                        && let Some(row) = arm.next()?
+                    {
+                        return Ok(Some(row));
+                    }
+                    // The arm is exhausted, or there is none yet: open the next one.
+                    let Some(next) = rest.next() else {
+                        return Ok(None);
+                    };
+                    *current = Some(Box::new(Cursor::open(txn, tenant, settings, &next)?));
+                }
+            }
             Kind::Filter { input, predicate } => {
                 while let Some(row) = input.next()? {
                     // NULL is not true. That is the whole of three-valued logic in a `WHERE`: only

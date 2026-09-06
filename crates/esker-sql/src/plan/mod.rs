@@ -51,7 +51,7 @@ pub use expr::{
 };
 pub use query::{
     AggregateSpec, Join, JoinKind, LockStrength, LockWait, Locking, Node, OrderItem, Probe, Select,
-    SelectItem, SortKey, TableFunction, TableRef, ValuesList,
+    SelectItem, SetArm, SetOp, SortKey, TableFunction, TableRef, ValuesList,
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::{CursorDirection, CursorStatement, DiscardTarget, SessionStatement};

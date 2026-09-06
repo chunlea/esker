@@ -6859,6 +6859,26 @@ fn merge_limits(inner: Option<LimitClause>, outer: Option<LimitClause>) -> Optio
     clippy::too_many_lines,
     reason = "most of it is the refusal list, which is the point: one line per clause not honoured"
 )]
+/// One arm of a set operation, lowered.
+///
+/// A **parenthesised** arm is a query and may carry its own `ORDER BY` or `LIMIT` — measured, and
+/// the bare form of either before `UNION` is `42601` there — so it goes through [`lower_query`]
+/// whole. Any other arm is lowered through the same function on a *copy of the outer query with
+/// the set's clauses cleared*, which is what keeps this out of that function's body: one arm is a
+/// query with one clause different, not a second lowering to write.
+fn lower_set_arm(template: &Query, body: &SetExpr) -> Result<plan::Select> {
+    if let SetExpr::Query(inner) = body {
+        return lower_query(inner);
+    }
+    let mut arm = template.clone();
+    arm.body = Box::new(body.clone());
+    // The set's, not the arm's — every one of them measured on the oracle.
+    arm.with = None;
+    arm.order_by = None;
+    arm.limit_clause = None;
+    lower_query(&arm)
+}
+
 fn lower_query(query: &Query) -> Result<plan::Select> {
     refuse_if(query.fetch.is_some(), "FETCH FIRST")?;
     refuse_if(query.for_clause.is_some(), "FOR XML/JSON")?;
@@ -6883,6 +6903,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
                 // `VALUES` names no relation, so there is nothing a locking clause could hold —
                 // and PostgreSQL agrees: `VALUES (1) FOR UPDATE` is a syntax error there.
                 locking: Vec::new(),
+                set_arms: Vec::new(),
                 projection: vec![plan::SelectItem::Wildcard],
                 from: Some(plan::TableRef {
                     values: Some(Box::new(lower_values(values, &[], "")?)),
@@ -6904,11 +6925,28 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
                 ctes: Vec::new(),
             });
         }
-        // `UNION`, `TABLE t` after the rewrite -- each is its own feature.
-        return Err(SqlError::unsupported(match query.body.as_ref() {
-            SetExpr::SetOperation { op, .. } => format!("{op}"),
-            other => format!("the query body {other}"),
-        }));
+        // **A set operation is arms, and the clauses outside them are the set's.** Flattened in
+        // `crate::parse::set_operation` — a file of its own, so that this stays one line — and
+        // then given the outer `ORDER BY`, `LIMIT`, `OFFSET` and `WITH`, which belong to the whole
+        // set on a real server and are already the first arm's fields.
+        if matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
+            let arm = |body: &SetExpr| lower_set_arm(query, body);
+            let set = super::set_operation::lower(query.body.as_ref(), &arm)?;
+            let (limit, offset) = lower_limit_offset(query)?;
+            let mut set = plan::Select {
+                order_by: lower_order_by(query)?,
+                limit,
+                offset,
+                ..set
+            };
+            lower_with(query.with.as_ref(), &mut set)?;
+            return Ok(set);
+        }
+        // `TABLE t` after the rewrite -- its own feature.
+        return Err(SqlError::unsupported(format!(
+            "the query body {}",
+            query.body
+        )));
     };
 
     // `DISTINCT` this node runs; `DISTINCT ON` is a different clause with a different answer --
@@ -7092,6 +7130,7 @@ fn lower_query(query: &Query) -> Result<plan::Select> {
         limit,
         offset,
         locking: lower_locking(&query.locks)?,
+        set_arms: Vec::new(),
     };
     // **After the statement is lowered, because the rules are about the lowered shape**: whether
     // there is a `DISTINCT`, a `GROUP BY`, an aggregate in the target list, a nullable join side,

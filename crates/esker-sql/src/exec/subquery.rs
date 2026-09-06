@@ -388,12 +388,51 @@ fn plan_derived(
 }
 
 /// Plans one sub-`SELECT` against the tables it names. Shared by a subquery and a derived table.
+/// The arms of a set operation reached through a derived table, planned and unified.
+///
+/// The twin of `Executor::plan_set_operation`, and deliberately a twin rather than a shared
+/// function: the two differ only in how they resolve a relation, and that resolution is what each
+/// of them *is*. What they must not differ in is the unification, and they do not — both end at
+/// `crate::exec::query::append`.
+fn plan_set_of(
+    select: &Select,
+    tenant: u64,
+    tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
+) -> Result<crate::exec::query::Planned> {
+    if !select.order_by.is_empty() {
+        return Err(SqlError::unsupported("ORDER BY over a set operation"));
+    }
+    if select.limit.is_some() || select.offset.is_some() {
+        return Err(SqlError::unsupported("LIMIT over a set operation"));
+    }
+    let first = Select {
+        set_arms: Vec::new(),
+        ..select.clone()
+    };
+    let mut planned = vec![plan_select_of(&first, tenant, tables, outer)?];
+    for arm in &select.set_arms {
+        if !arm.all || arm.op != crate::plan::SetOp::Union {
+            return Err(SqlError::unsupported(arm.op.name()));
+        }
+        planned.push(plan_select_of(&arm.select, tenant, tables, outer)?);
+    }
+    crate::exec::query::append(planned)
+}
+
 fn plan_select_of(
     select: &Select,
     tenant: u64,
     tables: &dyn Tables,
     outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<crate::exec::query::Planned> {
+    // **A set operation inside a derived table**, which is where `with_test.rb` puts one: a CTE is
+    // a derived table here, so `WITH t AS (SELECT … UNION ALL SELECT …)` reaches this function and
+    // not the executor's. The arms are planned through this same function — each is a select that
+    // may name its own table — and unified by the one rule both planners share.
+    if !select.set_arms.is_empty() {
+        return plan_set_of(select, tenant, tables, outer);
+    }
     let table = match &select.from {
         // A derived table inside a derived table: its own pass has already run, so the relation it
         // looks like is there to be borrowed.
@@ -1060,6 +1099,13 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
                 visit(arg);
             }
         }
+        // Every arm, because a correlated reference can be in any of them: `WHERE o.x = ANY
+        // (SELECT a FROM t UNION ALL SELECT o.y)` names the outer row from the second.
+        Node::Append { arms } => {
+            for arm in arms {
+                for_each_node_expr(arm, visit);
+            }
+        }
         Node::Filter { input, predicate } => {
             visit(predicate);
             for_each_node_expr(input, visit);
@@ -1138,6 +1184,12 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
         Node::TableFunction { call, .. } => {
             for arg in &mut call.args {
                 visit(arg);
+            }
+        }
+        // Every arm, for the reason the immutable walk gives.
+        Node::Append { arms } => {
+            for arm in arms {
+                for_each_node_expr_mut(arm, visit);
             }
         }
         Node::Filter { input, predicate } => {

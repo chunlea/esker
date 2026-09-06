@@ -515,7 +515,7 @@ impl<'a> Scope<'a> {
 }
 
 /// A planned query, with everything the executor needs to describe its output before running it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct OutputColumn {
     /// The name a client is told, which is the alias where there is one.
     pub(super) name: String,
@@ -629,6 +629,127 @@ pub(super) fn matching_rows_as(
 /// Turns a lowered `SELECT` into a plan against a table.
 ///
 /// `table` is `None` for `SELECT 1`, which has no table and one row.
+/// Every arm's plan appended, with one output column list unified across them.
+///
+/// **The names are the first arm's and the types are every arm's**, which is measured and is two
+/// rules rather than one: `SELECT i FROM t UNION ALL SELECT n FROM t` is a column called `i` of
+/// type `numeric` (`tests/captures/pg19_set_operations.txt`).
+///
+/// Three refusals, each PostgreSQL's own:
+///
+/// * a different number of columns is `42601 each UNION query must have the same number of
+///   columns` — the grammar's error, not a typing one;
+/// * two typed columns with no common type are `UNION types text and integer cannot be matched`,
+///   naming them in the arms' order;
+/// * and an **unknown literal** is neither: it takes the other arm's type and then fails to parse
+///   as it, which is why `SELECT 1 UNION ALL SELECT 'abc'` is `22P02 invalid input syntax for type
+///   integer` — decided in the lowering, where a literal still is one.
+pub(super) fn append(arms: Vec<Planned>) -> Result<Planned> {
+    let mut arms = arms.into_iter();
+    let first = arms
+        .next()
+        .ok_or_else(|| SqlError::Internal("a set operation with no arms".to_owned()))?;
+    let mut columns = first.columns.clone();
+    let mut arm_types = vec![first.columns.iter().map(|c| c.ty).collect::<Vec<_>>()];
+    let mut nodes = vec![first.node];
+    for arm in arms {
+        if arm.columns.len() != columns.len() {
+            return Err(SqlError::SetOperationArity);
+        }
+        for (at, column) in arm.columns.iter().enumerate() {
+            columns[at].ty = unify(columns[at].ty, column.ty)?;
+            // A typmod survives only where both arms agree on it, the way a `CASE`'s does: a
+            // `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server.
+            if columns[at].typmod != column.typmod {
+                columns[at].typmod = crate::value::NO_TYPMOD;
+            }
+            // And a user-defined type only where both arms are the same one.
+            if columns[at].user_type != column.user_type {
+                columns[at].user_type = None;
+            }
+        }
+        arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
+        nodes.push(arm.node);
+    }
+    // **Unifying the declared type is only half of it: the values have to follow.** An arm that
+    // produced an `int4` where the set is a `bigint` would answer rows of two different types
+    // under one column — `pg_typeof` reads the value, and a client binding by the declared type
+    // would decode the wrong width. PostgreSQL coerces each arm's target list; this wraps the arms
+    // that need it in a projection of casts and leaves the rest untouched.
+    let nodes = nodes
+        .into_iter()
+        .zip(arm_types)
+        .map(|(node, types)| coerce_arm(node, &types, &columns))
+        .collect();
+    // **No routing, no locks, no junk.** A set operation is not routed to a columnar replica —
+    // the arms may name different relations — and a locking clause over one is a syntax error on a
+    // real server, so neither field can carry anything a caller would then have to undo.
+    Ok(Planned {
+        node: Node::Append { arms: nodes },
+        columns,
+        table: first.table,
+        column_names: first.column_names,
+        engine: None,
+        locks: Vec::new(),
+        junk: 0,
+        limit: None,
+    })
+}
+
+/// One arm's rows as the set's types, or the arm unchanged when it already produces them.
+///
+/// A projection of casts, which is what PostgreSQL puts in each arm's target list. The `Ordinal`
+/// carries the arm's *own* type, because that is what the value in the row is; the cast is what
+/// makes it the set's.
+fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node {
+    if arm.iter().zip(columns).all(|(from, to)| *from == to.ty) {
+        return node;
+    }
+    let exprs = arm
+        .iter()
+        .zip(columns)
+        .enumerate()
+        .map(|(at, (from, to))| {
+            let operand = Expr::Ordinal {
+                at,
+                ty: *from,
+                typmod: crate::value::NO_TYPMOD,
+            };
+            if *from == to.ty {
+                operand
+            } else {
+                Expr::Cast {
+                    operand: Box::new(operand),
+                    to: to.ty,
+                    typmod: crate::value::NO_TYPMOD,
+                }
+            }
+        })
+        .collect();
+    Node::Project {
+        input: Box::new(node),
+        exprs,
+    }
+}
+
+/// The two types of one output column, unified.
+///
+/// The rule is the promotion arithmetic already makes, for the reason `greatest`'s is: a set
+/// operation's column has one declared type and one set of values, and two rules would let them
+/// disagree. Measured: `int4` beside `int8` is `bigint`, an integer beside a `numeric` is
+/// `numeric`, and `text` beside `integer` is the refusal a real server gives.
+fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
+    if left == right {
+        return Ok(left);
+    }
+    crate::value::arith::result_type(crate::plan::ArithOp::Add, left, right).map_err(|_| {
+        SqlError::SetOperationTypes {
+            left: left.name(),
+            right: right.name(),
+        }
+    })
+}
+
 pub(super) fn plan(
     select: &Select,
     tenant: u64,
@@ -1192,6 +1313,7 @@ pub(super) fn returning_columns_over(
     let select = Select {
         // A synthetic `SELECT` for a `RETURNING` list: nothing asked to lock anything.
         locking: Vec::new(),
+        set_arms: Vec::new(),
         from,
         ctes: Vec::new(),
         joins: joins.to_vec(),

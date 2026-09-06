@@ -238,6 +238,44 @@ pub struct Locking {
     pub wait: LockWait,
 }
 
+/// One arm of a set operation after the first, and the operator that joins it on.
+///
+/// The operator belongs to the *arm* rather than to the set, because a chain may mix them:
+/// `a UNION ALL b EXCEPT c` is `(a UNION ALL b) EXCEPT c`, left-associative, so each arm carries
+/// how it joins the result of everything before it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetArm {
+    /// How this arm joins what precedes it.
+    pub op: SetOp,
+    /// Whether duplicates are kept. `UNION ALL` keeps them; `UNION` does not.
+    pub all: bool,
+    /// The arm itself, lowered as its own select.
+    pub select: Select,
+}
+
+/// The three set operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION`: the rows of both.
+    Union,
+    /// `INTERSECT`: the rows in both.
+    Intersect,
+    /// `EXCEPT`: the rows of the first that are not in the second.
+    Except,
+}
+
+impl SetOp {
+    /// The keyword, for a message that names what was not supported.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        }
+    }
+}
+
 /// `SELECT`, as written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
@@ -285,6 +323,21 @@ pub struct Select {
     /// client never sees — and the executor takes a row lock per row before it answers. See
     /// [`Locking`].
     pub locking: Vec<Locking>,
+    /// The **other arms of a set operation**, when this select is the first of one.
+    ///
+    /// Empty for an ordinary `SELECT`, which is every statement that is not a `UNION`. A set
+    /// operation is this select with more arms after it rather than a wrapper around them, and
+    /// that is not only economy: `ORDER BY`, `LIMIT` and `OFFSET` written after the last arm
+    /// belong to the **whole set** on a real server, and they are already this struct's fields.
+    /// So the first arm carries the set's clauses, exactly as the grammar does.
+    ///
+    /// The names a client is told come from the first arm and the types from unifying every arm —
+    /// `SELECT i FROM t UNION ALL SELECT n FROM t` is a column called `i` of type `numeric`
+    /// ([`tests/captures/pg19_set_operations.txt`]). Both halves of that are the planner's, in
+    /// `exec::query`, because the types need a scope and lowering has none.
+    ///
+    /// [`tests/captures/pg19_set_operations.txt`]: ../../../tests/captures/pg19_set_operations.txt
+    pub set_arms: Vec<SetArm>,
 }
 
 /// One item in a target list.
@@ -579,6 +632,19 @@ pub enum Node {
         /// NULL) and a **grouped** one is no rows at all. Measured, both ways.
         grouped: bool,
     },
+    /// **Every arm's rows, in the order the arms were written** — a `UNION ALL`.
+    ///
+    /// It streams: an arm is drained and then the next one is opened, so a set operation over two
+    /// scans costs what the two scans cost and nothing is materialised. That is what `UNION ALL`
+    /// is; the deduplicating forms need a [`Node::Distinct`] above this one, which is where the
+    /// memory bound already lives.
+    ///
+    /// The arms' output columns are unified before the plan is built (`exec::query::append`), so
+    /// every arm here produces a row of the same width and the same types.
+    Append {
+        /// The arms, in the order written. At least two, or the planner would not have built one.
+        arms: Vec<Node>,
+    },
     /// An aggregate evaluated on columnar replicas, one fragment per region, finished here.
     ///
     /// **It stands exactly where a [`Node::Aggregate`] stood**, and produces exactly the row that
@@ -728,6 +794,9 @@ impl Node {
                 None => vec![outer],
             },
             Node::Columnar(columnar) => vec![&mut columnar.fallback],
+            // **Every arm**, and this is the node the doc above is about: a pass that missed one
+            // would hide a sequence read in the second arm of a `UNION ALL`.
+            Node::Append { arms } => arms.iter_mut().collect(),
             Node::OneRow
             | Node::Values { .. }
             | Node::SequenceRead { .. }
@@ -927,6 +996,17 @@ impl Node {
             // The one node with two sides. The outer subtree is printed as a child; the inner
             // side has no subtree of its own, so its access path is the `extra` line -- which is
             // exactly the thing a user reads an `EXPLAIN` of a join to find out.
+            // **`Append`, with the first arm below it and the rest counted.** PostgreSQL prints
+            // every arm indented under an `Append`; this renderer returns *one* child node and one
+            // block of extra text, which is the shape a join needed and no more. Showing the
+            // arms in full means giving it N children, which is a change to every node's arm and
+            // is not this unit's — so the count is printed rather than a plan that looks like one
+            // arm is the whole set.
+            Node::Append { arms } => (
+                "Append".to_owned(),
+                arms.first(),
+                (arms.len() > 1).then(|| format!("Arms: {}", arms.len())),
+            ),
             Node::NestedLoop {
                 outer,
                 inner_table,

@@ -2428,6 +2428,28 @@ pub enum SqlError {
     #[error("snapshot \"{0}\" does not exist")]
     SnapshotDoesNotExist(String),
 
+    /// `SELECT 1, 2 UNION ALL SELECT 3`: the arms of a set operation are not the same width.
+    ///
+    /// **`42601`, the grammar's code**, not a typing one — measured, and it is the sentence a real
+    /// server gives whichever operator is written: `each UNION query must have the same number of
+    /// columns`.
+    #[error("each UNION query must have the same number of columns")]
+    SetOperationArity,
+
+    /// Two arms of a set operation whose columns have no common type.
+    ///
+    /// Measured, and **the names are in the arms' order**: `SELECT t … UNION ALL SELECT i …` is
+    /// `UNION types text and integer cannot be matched` and the reverse says `integer and text`.
+    /// An *unknown literal* never reaches here — it takes the other arm's type and fails to parse
+    /// as it, which is `22P02` and a different sentence.
+    #[error("UNION types {left} and {right} cannot be matched")]
+    SetOperationTypes {
+        /// The first arm's type, named as a client would write it.
+        left: &'static str,
+        /// The later arm's.
+        right: &'static str,
+    },
+
     /// A function argument a real server refuses with `22023` and a sentence of its own.
     ///
     /// `split_part(text, sep, 0)` is `field position must not be zero` and
@@ -2722,6 +2744,9 @@ impl SqlError {
             SqlError::SubqueryColumns(_)
             | SqlError::Syntax { .. }
             | SqlError::DoubledClause(_)
+            // **The grammar's, not the type system's** — measured: a set operation whose arms are
+            // different widths is `42601` where two arms with no common type are `42804`.
+            | SqlError::SetOperationArity
             // PostgreSQL's type-name grammar, refusing in the same class as its statement
             // grammar: `'timestamp(-1)'::regtype` and `''::regtype` are both `42601`.
             | SqlError::TypeNameSyntax(_)
@@ -2917,6 +2942,7 @@ impl SqlError {
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
             SqlError::DatatypeMismatch(_)
             | SqlError::NonBooleanArgument { .. }
+            | SqlError::SetOperationTypes { .. }
             | SqlError::DatatypeMismatchInColumn { .. } => {
                 sqlstate::DATATYPE_MISMATCH
             }
