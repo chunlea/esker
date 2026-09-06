@@ -1,0 +1,38 @@
+# **A call inside a call** — PostgreSQL 19beta1, 2026-09-06. One `BEGIN … ROLLBACK`.
+#
+# `unsafe_raw_sql_test.rb` sends `length(trim(title))` twice:
+#
+#     Post.order("author_id, length(trim(title))").pluck(:id)
+#     Post.pluck("length(trim(title))")
+#
+# ## What the triage said, and what was actually true
+#
+# Run 103's triage recorded this as a nesting bug: "`length(trim(title))` refused as *the
+# expression TRIM(title) is not supported* while `trim(title)` alone works — the refusal is in the
+# nesting path, not TRIM."
+#
+# **`trim(title)` did not work alone.** The message is `lower_expr`'s catch-all, which prints the
+# expression it could not lower — and that is the **innermost** one, so a report written from the
+# message blames the argument and acquits the call wrapped around it. The gap was `TRIM`, and it
+# closed in `ba9cdcc2` (GREATEST, LEAST and TRIM's three forms) with no nesting work at all:
+# `lower_expr` recurses through its operands, so a call inside a call costs whatever the inner call
+# costs and nothing more.
+#
+# Nothing was fixed for this item. `tests/nested_function.rs` exists because nothing tested it, and
+# a gap that closed as a side effect of another unit is the kind that reopens without anyone
+# noticing.
+#
+# ## Measured over (1,2,'  bb  '), (2,1,' a '), (3,1,'ccc')
+#
+#     SELECT id FROM nposts ORDER BY author_id, length(trim(title))     2, 3, 1
+#     SELECT length(trim(title)) FROM nposts ORDER BY 1                 1, 2, 3     integer
+#     SELECT trim(title) FROM nposts ORDER BY 1                         a, bb, ccc
+#     SELECT upper(trim(title)) FROM nposts ORDER BY 1                  A, BB, CCC
+#     SELECT trim(upper(title)) FROM nposts ORDER BY 1                  A, BB, CCC
+#     SELECT length(trim(both ' ' from title)) FROM nposts ORDER BY 1   1, 2, 3
+#     SELECT length(btrim(title)) FROM nposts ORDER BY 1                1, 2, 3
+#     SELECT length(upper(trim(title))) FROM nposts ORDER BY 1          1, 2, 3
+#     SELECT abs(length(trim(title))) FROM nposts ORDER BY 1            1, 2, 3
+#
+# **A `trim` call is named `btrim`**: the column takes the name of the function that ran, not the
+# word the user wrote, so in the suite's statement it is the *outer* call that names the column.
