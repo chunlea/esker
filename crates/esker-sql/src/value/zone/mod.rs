@@ -3,7 +3,7 @@
 //! [ADR 0080](../../../../docs/adr/0080-the-time-zone-table-is-data-the-reader-is-ours.md) settles
 //! where this comes from. **The table is a dependency and the reader is ours**: `jiff-tzdb`
 //! embeds the IANA database as `TZif` bytes and nothing else — one crate, no dependencies of its
-//! own, no build script — and [`tzif`] and [`posix`] read them.
+//! own, no build script — and this module's `tzif` and `posix` read them.
 //!
 //! # A zone is not an offset
 //!
@@ -18,9 +18,10 @@
 //! `jiff-tzdb` ships files written by `zic -b slim`: the transition list stops at the last time
 //! the *rules* changed, and everything after it is the footer's POSIX string. New York's table
 //! ends in 2007, so `'2020-07-01'` — which reads like a table lookup — is answered by
-//! `EST5EDT,M3.2.0,M11.1.0`. [`posix`] is therefore the live path for every present-day instant,
-//! not a fallback for the far future, and `the_footer_is_what_answers_a_present_day_instant` pins
-//! it so that a future release shipping `fat` data cannot move that traffic silently.
+//! `EST5EDT,M3.2.0,M11.1.0`. The `posix` reader is therefore the live path for every present-day
+//! instant, not a fallback for the far future, and the test named
+//! `the_footer_is_what_answers_a_present_day_instant` pins it so that a future release shipping
+//! `fat` data cannot move that traffic silently.
 //!
 //! # Names
 //!

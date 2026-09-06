@@ -302,10 +302,6 @@ enum Reject {
     OutOfRange,
 }
 
-fn parse_iso(body: &str) -> std::result::Result<i64, Reject> {
-    parse_iso_in(body, Zoned::Applied)
-}
-
 /// Whether a trailing offset in the text moves the instant.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Zoned {
