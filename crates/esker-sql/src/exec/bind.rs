@@ -240,7 +240,7 @@ fn walk(
                     }
                 }
             }
-            let named = under_own_names(tables);
+            let named = update_relations(update, tables);
             for predicate in update
                 .filter
                 .iter()
@@ -425,12 +425,58 @@ fn passes_columns_through<'a>(
             .find(|(name, _)| name.eq_ignore_ascii_case(qualifier))
             .map(|(_, def)| def),
         // Anything computed or renamed publishes a column that is not the relation's.
-        _ => None,
+        crate::plan::SelectItem::Expr { .. } => None,
     }
 }
 
+/// An `UPDATE`'s relations, each under the name its predicates use.
+///
+/// **The target may be aliased, and the same table may be in the `FROM` as well.** That pair is
+/// `has_many_associations_test`'s statement and it is why every relation under its own name is not
+/// enough:
+///
+/// ```sql
+/// UPDATE "posts" "__active_record_update_alias" SET "author_id" = $1
+///   FROM "posts" INNER JOIN "categorizations" ON …
+///  WHERE "posts"."type" = $3 AND "posts"."author_id" = $4 AND "posts"."id" = $5
+///    AND "posts"."id" = "__active_record_update_alias"."id"
+/// ```
+///
+/// `posts` there is the **`FROM`** relation, and the target answers only to its alias. Naming both
+/// `posts` made the lookup ambiguous and every `posts.`-qualified bind fell back to `text`:
+/// measured `{bigint,boolean,text,text,text}` against PostgreSQL 19's
+/// `{bigint,boolean,text,bigint,bigint}`, which is the `bigint = text` the suite reports.
+///
+/// `tables` arrives in [`table_names`]'s order — the target, then the `FROM` chain — so the names
+/// are zipped onto it positionally, which is the same thing `returning_fields` relies on.
+fn update_relations<'a>(
+    update: &crate::plan::Update,
+    tables: &'a [std::sync::Arc<TableDef>],
+) -> Vec<Named<'a>> {
+    let target = update
+        .alias
+        .clone()
+        .unwrap_or_else(|| bare(&update.table).to_owned());
+    let names = std::iter::once(target).chain(
+        update
+            .from
+            .iter()
+            .chain(update.joins.iter().map(|join| &join.table))
+            .map(|entry| {
+                entry
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| bare(&entry.name).to_owned())
+            }),
+    );
+    names
+        .zip(tables.iter())
+        .map(|(name, def)| (name, def.as_ref()))
+        .collect()
+}
+
 /// Every relation under its own name, for the statements that have no `FROM` list to read aliases
-/// from — an `UPDATE`'s or a `DELETE`'s predicates.
+/// from — a `DELETE`'s predicates, and an `UPDATE`'s assignments.
 fn under_own_names(tables: &[std::sync::Arc<TableDef>]) -> Vec<Named<'_>> {
     tables
         .iter()
