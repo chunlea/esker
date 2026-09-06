@@ -1,0 +1,19 @@
+docs/DESIGN.md
+  s_609bbbdbf3c419::t_b0d6e9c5a6b4b9 1025-1040
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0a3d131a6f76c2d9287e98ca590462a2e8ca86ca",
+  "prompts": {},
+  "sessions": {
+    "s_609bbbdbf3c419": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1766f4ef-2780-4277-830a-7ac43470ee58",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
