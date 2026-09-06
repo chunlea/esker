@@ -1,0 +1,23 @@
+crates/esker-store/src/peer.rs
+  s_2d916f5f540186::t_d9d56e5a7b8ce9 32-35,1630-1633,1666-1755,1770,1832-1909
+crates/esker-store/src/server.rs
+  s_2d916f5f540186::t_a46b7284cbffcf 1102-1111
+docs/adr/0081-the-tick-driver-catches-up.md
+  s_2d916f5f540186::t_4498898906d459 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "56d99e106de0ad7061c2fb5ed1123e89fbeb0bac",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
