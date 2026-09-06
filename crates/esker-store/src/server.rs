@@ -1099,10 +1099,16 @@ impl Store {
     /// Starts the task that reports to the placement driver.
     ///
     /// The schedule itself counts ticks and reads no clock ([`crate::heartbeat`]); this is the
-    /// edge that turns a `tokio` interval into those ticks — the same shape as a peer's ticker,
-    /// and for the same reason. A tick that is late because the process was busy is skipped
-    /// rather than replayed: `MissedTickBehavior::Delay` would make a stalled store send a burst
-    /// of identical heartbeats the moment it recovered.
+    /// edge that turns a `tokio` interval into those ticks. A round that is late because the
+    /// process was busy is **skipped rather than replayed**: `MissedTickBehavior::Burst` — the
+    /// default, and the one that replays — would make a stalled store send a run of identical
+    /// heartbeats the moment it recovered, and the next round carries the same content anyway.
+    ///
+    /// **Not the same shape as a peer's ticker, and this comment used to say it was.** A report
+    /// and a clock want opposite policies: dropping a missed report costs nothing, while dropping
+    /// a missed raft tick is elapsed time the cluster never counts. The peer's ticker therefore
+    /// catches up on what it slept through and this deliberately does not
+    /// ([`crate::peer::drive_ticks`], [ADR 0081](../../../docs/adr/0081-the-tick-driver-catches-up.md)).
     ///
     /// The round itself runs on a **blocking thread**. [`PdClient`] is synchronous, like
     /// everything else in this store that is not the network edge, so a round that ran on the

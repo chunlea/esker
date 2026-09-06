@@ -29,6 +29,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// The tick driver's own arithmetic. `Instant` is a duration since a local event and orders
+// nothing, so this is not a clock entering consensus: the core still learns time only through
+// `tick()` (`CLAUDE.md` invariant 4, and `drive_ticks` says why at length).
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use esker_engine::{WriteBatch, WriteOptions};
@@ -1623,16 +1627,10 @@ impl RaftPeer {
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let peer = Arc::clone(self);
-        runtime.spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                if peer.tick().await.is_err() {
-                    return;
-                }
-            }
-        })
+        runtime.spawn(drive_ticks(interval, TICK_CATCH_UP_CAP, move || {
+            let peer = Arc::clone(&peer);
+            async move { peer.tick().await.is_ok() }
+        }))
     }
 
     /// Takes this region off its worker and waits until it is gone, failing everything
@@ -1665,6 +1663,96 @@ impl Drop for RaftPeer {
 /// Re-exported so a caller can name the configuration a peer bootstraps with.
 pub type PeerConfState = ConfState;
 
+/// The most ticks one wake may deliver, in election timeouts.
+///
+/// One. A peer starved for longer than an election timeout has already lost whatever lease it had,
+/// and replaying every owed tick would have all of them campaign the instant the box recovered.
+/// Delivering the cap gets each peer to its timeout and no further; the randomised timeout does the
+/// rest, which is what it is for.
+const TICK_CATCH_UP_CAP: u32 = 40;
+
+/// How many ticks `elapsed` owes at `interval`, and whether the cap swallowed any.
+///
+/// Pure, so the rule can be asserted without a runtime, a peer or a clock.
+fn ticks_owed(elapsed: Duration, interval: Duration, cap: u32) -> (u32, u32) {
+    if interval.is_zero() {
+        return (1, 0);
+    }
+    let owed = u32::try_from(elapsed.as_nanos() / interval.as_nanos()).unwrap_or(u32::MAX);
+    (owed.min(cap), owed.saturating_sub(cap))
+}
+
+/// One wake of the driver: how many ticks to deliver, how many the cap swallowed, and `last`
+/// moved on.
+///
+/// Split out of the loop because it is the whole of the decision and the loop is the whole of the
+/// I/O — this way the rule is asserted on every machine at every load, rather than only on one busy
+/// enough to starve a real ticker.
+///
+/// Under the cap, `last` advances by **what was delivered** rather than to `now`, so a wake that
+/// was half an interval late carries that half into the next one instead of rounding it away a tick
+/// at a time. At the cap the debt is forgiven — `last` jumps to `now` — because banking it would
+/// have the following wake deliver a second cap's worth for time that has already gone.
+fn wake(last: &mut Instant, now: Instant, interval: Duration, cap: u32) -> (u32, u32) {
+    let (owed, dropped) = ticks_owed(now.duration_since(*last), interval, cap);
+    if dropped > 0 {
+        *last = now;
+    } else {
+        *last += interval * owed;
+    }
+    (owed, dropped)
+}
+
+/// Drives `sink` once per elapsed `interval`, **catching up** on the ticks a starved runtime missed.
+///
+/// # Why this is not `ticker.tick().await` and a single call
+///
+/// It was, with `MissedTickBehavior::Delay`, and that loses time. `esker-raft` counts the election
+/// timeout in ticks — `CLAUDE.md` invariant 4, time enters the core only through `tick()` — so a
+/// tick that is never delivered is elapsed time the cluster never learns about. Under a loaded box
+/// the ticker task is scheduled late, `Delay` drops every interval it slept through, and
+/// `election_elapsed` grows slower than the world: the timeout stretches with the starvation and a
+/// region can sit with **every peer a follower that has not counted high enough**, for as long as
+/// the load lasts. Three sightings across three crates, ninety seconds at fourteen threads
+/// (`docs/plans/debt-c7.md` §24).
+///
+/// So the driver reads a monotonic clock on each wake and delivers the ticks owed since the last
+/// one. The **core still reads no clock**, which is the invariant: this is the driver telling it
+/// how much time passed, in the only unit it accepts.
+///
+/// Capped at [`TICK_CATCH_UP_CAP`], and the remainder is dropped rather than banked — with a warn
+/// naming what was swallowed, because a peer owed more than a cap's worth is a peer whose box
+/// stopped scheduling it, and that is worth a line in the log whatever the election does next.
+async fn drive_ticks<S, F>(interval: Duration, cap: u32, mut sink: S)
+where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = bool>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    // Still `Delay`: the catch-up is this function's job now, and `Burst` would have the timer
+    // queue fire repeatedly underneath a loop that is already counting for itself.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = Instant::now();
+    loop {
+        ticker.tick().await;
+        let (owed, dropped) = wake(&mut last, Instant::now(), interval, cap);
+        if dropped > 0 {
+            tracing::warn!(
+                owed = owed + dropped,
+                delivered = owed,
+                dropped,
+                interval_ms = interval.as_millis(),
+                "this peer was not scheduled for more than a full catch-up of raft ticks"
+            );
+        }
+        for _ in 0..owed.max(1) {
+            if !sink().await {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1679,7 +1767,7 @@ mod tests {
 
     use super::{
         Applied, DiscardTransport, LogCompaction, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer,
-        RaftTransport,
+        RaftTransport, ticks_owed, wake,
     };
     use crate::apply::Command;
     use crate::driver::DriverPool;
@@ -1739,6 +1827,84 @@ mod tests {
             Arc::new(DriverPool::new(1).unwrap()),
         )
         .unwrap()
+    }
+
+    /// The rule the driver counts by, stated exactly and with no clock in sight.
+    #[test]
+    fn ticks_owed_is_elapsed_over_interval_capped() {
+        let ms = std::time::Duration::from_millis;
+        // Nothing elapsed, nothing owed -- the caller is what turns this into the one tick a
+        // punctual wake still delivers.
+        assert_eq!(ticks_owed(ms(0), ms(10), 40), (0, 0));
+        assert_eq!(ticks_owed(ms(10), ms(10), 40), (1, 0));
+        // The remainder is not owed yet; it carries, which is what stops a slow drift downwards.
+        assert_eq!(ticks_owed(ms(19), ms(10), 40), (1, 0));
+        assert_eq!(ticks_owed(ms(200), ms(10), 40), (20, 0));
+        // Past the cap the excess is reported rather than delivered.
+        assert_eq!(ticks_owed(ms(1_000), ms(10), 40), (40, 60));
+        // A zero interval is a caller's mistake and must not divide by zero.
+        assert_eq!(ticks_owed(ms(5), ms(0), 40), (1, 0));
+    }
+
+    /// **A driver not scheduled for twenty intervals owes twenty ticks, and carries the change.**
+    ///
+    /// `esker-raft` counts the election timeout in ticks, so a tick never delivered is elapsed time
+    /// the cluster never learns about: under load the ticker task is scheduled late, the intervals
+    /// it slept through are gone, and `election_elapsed` grows slower than the world. The region
+    /// then sits with every peer a follower that has not counted high enough -- ninety seconds of
+    /// it, three sightings across three crates (`docs/plans/debt-c7.md` §24).
+    ///
+    /// **`cap = 1` is the old driver**, exactly: at most one tick per wake however long the wake
+    /// was. The first assertion below is therefore the defect, stated as a fact rather than
+    /// described, and the second is the fix.
+    ///
+    /// Pure: a scripted sequence of instants rather than a real starved runtime, so it asserts the
+    /// arithmetic on every machine at every load instead of only on a busy one.
+    #[test]
+    fn a_driver_starved_for_twenty_intervals_owes_twenty_ticks() {
+        let interval = std::time::Duration::from_millis(10);
+        let start = std::time::Instant::now();
+
+        // The old driver: one tick for twenty intervals of elapsed time, and nineteen ticks of the
+        // cluster's clock quietly gone.
+        let mut last = start;
+        let (delivered, dropped) = wake(&mut last, start + interval * 20, interval, 1);
+        assert_eq!(
+            (delivered, dropped),
+            (1, 19),
+            "one-per-wake is what lost the time; if this arm ever reads (20, 0) the comparison \
+             below has stopped being a comparison"
+        );
+
+        // The driver as it is now.
+        let mut last = start;
+        let (delivered, dropped) = wake(&mut last, start + interval * 20, interval, 40);
+        assert_eq!((delivered, dropped), (20, 0));
+        assert_eq!(
+            last,
+            start + interval * 20,
+            "the bookkeeping must advance by what was delivered"
+        );
+
+        // **The remainder carries.** Waking a millisecond and a half late, twenty times, is two
+        // whole ticks of drift if each wake rounds its change away.
+        let mut last = start;
+        let (delivered, _) = wake(&mut last, start + interval + interval / 2, interval, 40);
+        assert_eq!(delivered, 1);
+        let (delivered, _) = wake(&mut last, start + interval * 2 + interval / 2, interval, 40);
+        assert_eq!(delivered, 1);
+        assert_eq!(
+            last,
+            start + interval * 2,
+            "the half-interval was not thrown away"
+        );
+
+        // Past the cap the debt is forgiven rather than banked: `last` jumps to now, so the next
+        // wake does not deliver a second cap's worth for time that has already gone.
+        let mut last = start;
+        let (delivered, dropped) = wake(&mut last, start + interval * 100, interval, 40);
+        assert_eq!((delivered, dropped), (40, 60));
+        assert_eq!(last, start + interval * 100);
     }
 
     /// A transport that checks the driver contract at the only moment it can be checked: when a
