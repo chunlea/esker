@@ -162,6 +162,16 @@ pub struct Leadership {
     /// already has it at the end of every drive; this is one clone per drive against a channel
     /// round trip per request.
     pub conf: esker_raft::ConfState,
+    /// How far this member's own log has been applied. `0` means **nothing**, which is not the
+    /// same as an empty configuration.
+    ///
+    /// [`Leadership::conf`] cannot tell those apart on its own: a member's log is *seeded* with
+    /// the member list it was opened with ([`PdLogStorage::open`]), so a joiner that has caught up
+    /// on nothing still has a conf naming every member a voter. Reporting that as the membership
+    /// it sees says a joiner is configured before anything has reached it — three sightings of
+    /// `failover.rs`'s `a_membership_report_says_which_member_is_still_catching_up`, all under
+    /// load, because the race is against this member's own driver publishing for the first time.
+    pub applied: Index,
 }
 
 impl Leadership {
@@ -175,6 +185,7 @@ impl Leadership {
             office_term: 0,
             office_now_ms: 0,
             conf: esker_raft::ConfState::default(),
+            applied: 0,
         }
     }
 }
@@ -595,6 +606,9 @@ impl PdCore {
         leadership.term = status.term;
         leadership.leader = status.leader;
         leadership.conf = status.conf;
+        // Beside the conf and from the same drive, so a reader cannot see one without the other:
+        // the conf alone cannot say whether it was applied or merely seeded.
+        leadership.applied = self.node.storage().applied_index();
         // Serving requires *both*: leading now, and having applied this term's barrier.
         leadership.serving = leading && leadership.office_term == status.term;
     }
