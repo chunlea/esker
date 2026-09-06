@@ -1428,6 +1428,12 @@ fn lower_set(set: &sqlparser::ast::Set) -> Result<plan::Statement> {
 /// A `SHOW` of an unknown parameter is *not* contract C2's `0A000`: the statement is one this node
 /// executes, and what is missing is the parameter, which is the condition PostgreSQL reports.
 fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
+    // **The names PostgreSQL spells with spaces come first**, because after the join below they
+    // are indistinguishable from a namespaced one: `SHOW TIME ZONE` and `SHOW esker.read_as_of`
+    // are both two idents and the AST does not record which separator was written.
+    if let Some(statement) = lower_multi_word_show(variable) {
+        return Ok(statement);
+    }
     // `SHOW esker.read_as_of` arrives as two idents, because the parser splits on the dot.
     let name = variable
         .iter()
@@ -1448,6 +1454,46 @@ fn lower_show(variable: &[Ident]) -> Result<plan::Statement> {
         ));
     }
     Err(SqlError::UnrecognizedParameter(name))
+}
+
+/// The three parameter names PostgreSQL's grammar spells with spaces, and no others.
+///
+/// **A closed set copied from the grammar, not a rule inferred from a shape.** Measured on
+/// PostgreSQL 19: `SHOW TIME ZONE`, `SHOW TRANSACTION ISOLATION LEVEL` and
+/// `SHOW SESSION AUTHORIZATION` are three productions of their own, while `SHOW TRANSACTION READ
+/// ONLY` and `SHOW NOSUCH THING` are `42601` — so "two words means spaces" is not a rule a real
+/// server has, and reading one into the parser would accept statements PostgreSQL refuses.
+///
+/// Each answers under PostgreSQL's own spelling of the parameter rather than the user's, which is
+/// what makes `SHOW TIME ZONE` and `SHOW timezone` name the same column.
+fn lower_multi_word_show(variable: &[Ident]) -> Option<plan::Statement> {
+    let words: Vec<String> = variable
+        .iter()
+        .map(|ident| ident.value.to_ascii_uppercase())
+        .collect();
+    let name = match words
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["TIME", "ZONE"] => "timezone",
+        ["TRANSACTION", "ISOLATION", "LEVEL"] => "transaction_isolation",
+        // **`sqlparser` eats the `SESSION` keyword and drops it**, so this arrives as the single
+        // ident `AUTHORIZATION` and is indistinguishable from a bare `SHOW AUTHORIZATION`. That
+        // one is `42601` on a real server, so taking the word accepts a statement PostgreSQL
+        // refuses — an over-acceptance, which is the direction contract C1 leaves open, and the
+        // alternative is refusing the form the suite actually sends.
+        ["AUTHORIZATION"] | ["SESSION_AUTHORIZATION"] => {
+            return Some(plan::Statement::Session(
+                plan::SessionStatement::ShowSessionAuthorization,
+            ));
+        }
+        _ => return None,
+    };
+    Some(plan::Statement::Session(
+        plan::SessionStatement::ShowParameter(name.to_owned()),
+    ))
 }
 
 /// `RESET <parameter>` — `SET <parameter> = DEFAULT` by another name, and PostgreSQL treats them

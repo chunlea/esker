@@ -86,6 +86,13 @@ pub enum SessionStatement {
     },
     /// `SHOW <parameter>`, for one of the same.
     ShowParameter(String),
+    /// `SHOW SESSION AUTHORIZATION`, or the one-word GUC spelling of it.
+    ///
+    /// **Not a [`SessionStatement::ShowParameter`], deliberately.** The value lives on the
+    /// executor (`SET SESSION AUTHORIZATION` writes it) and not in the parameter map, and adding
+    /// it to that map would open a second door — a generic `SET session_authorization = 'bob'`
+    /// writing the map while the field it is supposed to be kept nothing. One state, one door.
+    ShowSessionAuthorization,
 }
 
 impl SessionStatement {
@@ -113,7 +120,9 @@ impl SessionStatement {
                 DiscardTarget::Sequences => "DISCARD SEQUENCES",
                 DiscardTarget::Temp => "DISCARD TEMP",
             },
-            SessionStatement::ShowReadAsOf | SessionStatement::ShowParameter(_) => "SHOW",
+            SessionStatement::ShowReadAsOf
+            | SessionStatement::ShowParameter(_)
+            | SessionStatement::ShowSessionAuthorization => "SHOW",
         }
     }
 }

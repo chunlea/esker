@@ -1077,6 +1077,24 @@ impl Executor {
                 self.set_read_as_of(value.as_deref(), *local)?;
                 Ok(Outcome::done("SET"))
             }
+            // **Read off the executor, not out of the parameter map**: `SET SESSION
+            // AUTHORIZATION` writes the field, and a session that has not used it is acting as
+            // the role it connected as. Measured on PostgreSQL 19: the column is
+            // `session_authorization` and the value is the role, for both spellings.
+            SessionStatement::ShowSessionAuthorization => Ok(Outcome::Rows {
+                fields: vec![FieldDescription::computed(
+                    "session_authorization",
+                    ColumnType::Text,
+                )],
+                rows: vec![vec![Some(
+                    self.authorization
+                        .as_deref()
+                        .unwrap_or(&self.user)
+                        .to_owned()
+                        .into_bytes(),
+                )]],
+                tag: "SHOW".to_owned(),
+            }),
             SessionStatement::ShowReadAsOf => Ok(Outcome::Rows {
                 fields: vec![FieldDescription::computed(
                     time_machine::READ_AS_OF,
