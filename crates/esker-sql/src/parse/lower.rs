@@ -77,6 +77,28 @@ impl Parsed {
         })
     }
 
+    /// Puts back what `sqlparser` could not hold in an `ON CONFLICT` clause: the index predicate,
+    /// and the expression each target placeholder stands for
+    /// (`crate::parse::strip_on_conflict_target`).
+    fn apply_conflict_shim(&self, lowered: &mut plan::Statement) {
+        let plan::Statement::Insert(insert) = lowered else {
+            return;
+        };
+        let Some(on_conflict) = insert.on_conflict.as_mut() else {
+            return;
+        };
+        if let Some(predicate) = self.conflict_predicate() {
+            on_conflict.predicate = Some(predicate.to_owned());
+        }
+        for key in &mut on_conflict.target {
+            if let plan::ConflictKey::Column(name) = key
+                && let Some(expression) = self.conflict_expression(name)
+            {
+                *key = plan::ConflictKey::Expression(expression.to_owned());
+            }
+        }
+    }
+
     fn lower_inline(&self) -> Result<plan::Statement> {
         // **Built here, not parsed.** `ALTER TABLE … SET { LOGGED | UNLOGGED }` was rewritten to a
         // placeholder because the parser has no `LOGGED` keyword, so the statement is reconstructed
@@ -193,6 +215,7 @@ impl Parsed {
                 *not_null = self.domain_not_null();
             }
         }
+        self.apply_conflict_shim(&mut lowered);
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }
@@ -3491,9 +3514,16 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
     };
     let target = match &conflict.conflict_target {
         None => Vec::new(),
+        // Every entry arrives as an identifier, because that is all the parser's target can hold.
+        // An entry that was an *expression* is a placeholder here and becomes one again in
+        // `lower_inline`, where `Parsed` is in scope to say which.
         Some(ConflictTarget::Columns(columns)) => columns
             .iter()
-            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .map(|name| {
+                plan::ConflictKey::Column(
+                    fold_identifier(&name.value, name.quote_style.is_some()).0,
+                )
+            })
             .collect(),
         // A constraint by name is a different inference: it names the constraint rather than
         // asking PostgreSQL to find one, and nothing captured it.
@@ -3533,7 +3563,13 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
             )
         }
     };
-    Ok(plan::OnConflict { target, action })
+    // The predicate is not in the tree — `sqlparser` stops at the keyword — and is attached where
+    // `Parsed` is in scope (`parse::Parsed::conflict_predicate`, applied in `lower_inline`).
+    Ok(plan::OnConflict {
+        target,
+        predicate: None,
+        action,
+    })
 }
 
 /// An expression, as far as phase 6a's `VALUES` needs one.

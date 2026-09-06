@@ -41,13 +41,38 @@ pub struct Insert {
 /// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET …`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflict {
-    /// The arbiter columns, or **empty** for a bare `ON CONFLICT`, which takes any unique index.
+    /// The arbiter key, or **empty** for a bare `ON CONFLICT`, which takes any unique index.
     ///
-    /// A *column* list and not an index name: PostgreSQL infers the index from it, so a list that
-    /// matches no unique index is `42P10` rather than a name that does not resolve.
-    pub target: Vec<String>,
+    /// A *key* and not an index name: PostgreSQL infers the index from it, so a list that matches
+    /// no unique index is `42P10` rather than a name that does not resolve.
+    pub target: Vec<ConflictKey>,
+    /// `ON CONFLICT (…) WHERE <predicate>`: the index predicate, as the statement wrote it.
+    ///
+    /// **It selects a partial index and nothing else.** PostgreSQL infers an index whose predicate
+    /// is *implied by* this one; this crate has no implication machinery (`catalog::IndexDef`'s
+    /// own doc says so), so the match is on the text, which is the honest subset of that rule and
+    /// is what `ActiveRecord` sends — `insert_all(unique_by: :index_name)` repeats the index's
+    /// `where:` verbatim. `None` means the statement wrote no predicate, which infers only an
+    /// index that has none.
+    pub predicate: Option<String>,
     /// What to do with a row that conflicts.
     pub action: ConflictAction,
+}
+
+/// One entry of an `ON CONFLICT` target: a column, or an expression over the row.
+///
+/// **The same two shapes an index's key has** (`catalog::KeyPart`), because inference is the
+/// question "is this key that index's key". `ON CONFLICT (lower(external_id))` names an index
+/// created `ON books ((lower(external_id)))`, and `sqlparser` 0.62.0's target is a `Vec<Ident>`
+/// with nowhere to put the call — so an expression entry reaches here through
+/// `crate::parse::strip_on_conflict_target`, which replaces it with a placeholder identifier and
+/// carries the text beside it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictKey {
+    /// A column of the target table, folded the way every identifier is.
+    Column(String),
+    /// An expression, as the statement wrote it.
+    Expression(String),
 }
 
 /// The two halves of `ON CONFLICT`.

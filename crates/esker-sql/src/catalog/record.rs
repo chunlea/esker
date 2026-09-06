@@ -144,6 +144,10 @@ const TYPE_KIND_DOMAIN: u8 = 4;
 const SQL: &[u8] = b"sql";
 
 const KIND_VERSION: u8 = b'v';
+/// **Upper case on purpose.** Every other kind is a lower-case letter, so this byte cannot be one
+/// of them and the key it makes cannot be a name key — which is a `KIND_NAME` key with a tenant
+/// and a name after it.
+const KIND_LAYOUT: u8 = b'L';
 const KIND_NEXT_ID: u8 = b's';
 const KIND_TABLE: u8 = b't';
 const KIND_NAME: u8 = b'n';
@@ -605,6 +609,46 @@ fn type_of(tag: u8) -> Result<ColumnType> {
 #[must_use]
 pub(super) fn version_key() -> Vec<u8> {
     prefix::meta_key(&[SQL, &[KIND_VERSION]].concat())
+}
+
+/// `'m' ++ "sql" ++ 'L'`. **One key for the whole store**, holding the catalog's *layout* version.
+///
+/// Not a record-content version. [`CATALOG_FORMAT_VERSION`] says how the bytes of one record are
+/// laid out and every reader tolerates the older shapes; this says how the catalog's **keys** are
+/// arranged, which no reader can tolerate two of at once — a key that is not where it is looked
+/// for is not an old shape, it is an object that has vanished.
+#[must_use]
+pub(super) fn layout_key() -> Vec<u8> {
+    prefix::meta_key(&[SQL, &[KIND_LAYOUT]].concat())
+}
+
+/// How the catalog's **keys** are arranged. Bumped when a key moves, never when a record grows.
+///
+/// | version | what changed |
+/// |---|---|
+/// | 1 | everything before the marker existed: an index's name record was keyed on its bare name |
+/// | 2 | an index's name record is keyed by its schema ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)) |
+///
+/// There is no upgrade path by decision: existing databases are disposable, so an older one is
+/// refused with a sentence naming the change rather than read into a catalog whose indexes are
+/// invisible.
+pub(crate) const CATALOG_LAYOUT_VERSION: u8 = 2;
+
+/// The marker record: the layout version and nothing else.
+#[must_use]
+pub(super) fn encode_layout() -> Vec<u8> {
+    vec![CATALOG_LAYOUT_VERSION]
+}
+
+/// The layout version a marker record holds.
+pub(super) fn decode_layout(bytes: &[u8]) -> Result<u8> {
+    match bytes {
+        [version] => Ok(*version),
+        other => Err(corrupt(format!(
+            "a catalog layout marker is one byte, not {}",
+            other.len()
+        ))),
+    }
 }
 
 /// `'m' ++ "sql" ++ 's' ++ tenant`. Table and index ids come from one sequence per tenant, so no
