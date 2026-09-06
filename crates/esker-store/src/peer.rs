@@ -1616,10 +1616,7 @@ impl RaftPeer {
 
     /// Drives the clock. **This is the only place a wall clock touches consensus**: the core
     /// counts ticks and never reads one (`CLAUDE.md` invariant 4).
-    pub fn spawn_ticker(
-        self: &Arc<Self>,
-        interval: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_ticker(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         self.spawn_ticker_on(&tokio::runtime::Handle::current(), interval)
     }
 
@@ -1631,7 +1628,7 @@ impl RaftPeer {
     pub fn spawn_ticker_on(
         self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
-        interval: std::time::Duration,
+        interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         let peer = Arc::clone(self);
         runtime.spawn(drive_ticks(interval, TICK_CATCH_UP_CAP, move || {
@@ -1733,7 +1730,7 @@ fn wake(last: &mut Instant, now: Instant, interval: Duration, cap: u32) -> (u32,
 async fn drive_ticks<S, F>(interval: Duration, cap: u32, mut sink: S)
 where
     S: FnMut() -> F,
-    F: std::future::Future<Output = bool>,
+    F: Future<Output = bool>,
 {
     let mut ticker = tokio::time::interval(interval);
     // Still `Delay`: the catch-up is this function's job now, and `Burst` would have the timer
@@ -1841,7 +1838,7 @@ mod tests {
     /// The rule the driver counts by, stated exactly and with no clock in sight.
     #[test]
     fn ticks_owed_is_elapsed_over_interval_capped() {
-        let ms = std::time::Duration::from_millis;
+        let ms = Duration::from_millis;
         // Nothing elapsed, nothing owed -- the caller is what turns this into the one tick a
         // punctual wake still delivers.
         assert_eq!(ticks_owed(ms(0), ms(10), 40), (0, 0));
@@ -1871,7 +1868,7 @@ mod tests {
     /// arithmetic on every machine at every load instead of only on a busy one.
     #[test]
     fn a_driver_starved_for_twenty_intervals_owes_twenty_ticks() {
-        let interval = std::time::Duration::from_millis(10);
+        let interval = Duration::from_millis(10);
         let start = tokio::time::Instant::now();
 
         // The old driver: one tick for twenty intervals of elapsed time, and nineteen ticks of the
@@ -3024,7 +3021,7 @@ mod tests {
 
         depose(&peer).await;
 
-        let error = tokio::time::timeout(std::time::Duration::from_secs(10), proposing)
+        let error = tokio::time::timeout(Duration::from_secs(10), proposing)
             .await
             .expect("the proposal must be answered rather than left waiting for ever")
             .expect("the proposing task")
@@ -3074,7 +3071,7 @@ mod tests {
         // What `fetch_snapshot` does before it writes a byte.
         peer.stop();
 
-        let error = tokio::time::timeout(std::time::Duration::from_secs(10), proposing)
+        let error = tokio::time::timeout(Duration::from_secs(10), proposing)
             .await
             .expect("the proposal must be answered rather than left waiting for ever")
             .expect("the proposing task")
