@@ -259,13 +259,13 @@ impl FieldDescription {
     /// `-1` exactly as it is for `text`. A client reads the oid, asks the catalog what it is, and
     /// gets `typtype = 'e'` — which is how `ActiveRecord` decides a column is an enum (ADR 0050).
     #[must_use]
-    pub fn of_user_type(name: impl Into<String>, oid: u32) -> Self {
+    pub fn of_user_type(name: impl Into<String>, oid: u32, type_size: i16) -> Self {
         FieldDescription {
             name: name.into(),
             table_oid: 0,
             column_id: 0,
             type_oid: oid,
-            type_size: -1,
+            type_size,
             type_modifier: crate::value::NO_TYPMOD,
             format: 0,
         }

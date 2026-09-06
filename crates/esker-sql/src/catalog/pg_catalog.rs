@@ -2390,7 +2390,7 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
             // `schema_test.rb` creates `schema_1.text` — a domain reported in `public` would be a
             // *wrong* row rather than a missing one.
             Datum::Int8(namespace_oid(&schemas, super::split_qualified(&def.name).0)),
-            Datum::Int2(-1),
+            Datum::Int2(def.kind.typlen()),
             Datum::Text(def.kind.typcategory().to_owned()),
             Datum::Int8(oid + 1),
             // **A composite owns a `pg_class` row and the other two do not.** It is how its

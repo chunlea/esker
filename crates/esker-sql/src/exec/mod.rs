@@ -1620,6 +1620,7 @@ impl Executor {
                 Some(def) => FieldDescription::of_user_type(
                     column.name.clone(),
                     u32::try_from(def.oid).unwrap_or(0),
+                    def.kind.typlen(),
                 ),
                 None => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
             })

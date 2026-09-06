@@ -1058,6 +1058,21 @@ impl TypeKind {
             TypeKind::Domain { base, .. } => pg_catalog::typcategory(*base),
         }
     }
+
+    /// `pg_type.typlen`: how many bytes the value is, or `-1` for a varlena.
+    ///
+    /// **An enum is 4**, measured on 19beta1 — it is an oid there, whatever it is stored as here —
+    /// and this node reported `-1` for every user type alike, in `pg_type` and in the
+    /// `RowDescription` both. A range and a composite really are varlenas; a domain is its base
+    /// type's, the way its category is.
+    #[must_use]
+    pub fn typlen(&self) -> i16 {
+        match self {
+            TypeKind::Range { .. } | TypeKind::Composite { .. } => -1,
+            TypeKind::Enum { .. } => 4,
+            TypeKind::Domain { base, .. } => crate::value::PgType::type_len(*base),
+        }
+    }
 }
 
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
@@ -4123,12 +4138,28 @@ pub fn allocate_row_ids(txn: &mut dyn Txn, tenant: u64, table_id: u64, count: u6
     Ok(next)
 }
 
-/// Takes the next relation id for a tenant. Ids start at 1, so 0 is never a real relation.
+/// The first id this node hands out, which is **PostgreSQL's `FirstNormalObjectId`**.
+///
+/// A user object's oid is 16384 or above on a real server; everything below that is a built-in,
+/// and `pg_type`'s built-ins run from 16 (`bool`) to 13744. This node used to start at 1, and the
+/// consequence was not cosmetic: **the sixteenth type a database created got oid 16, which every
+/// client's type map already holds as `bool`, and the twenty-third got 23, which is `int4`.**
+/// `ActiveRecord` casts a value through the type its map names for the oid the wire carries, and
+/// `Type::Integer.cast("sad")` is `nil` — which is exactly what `enum_test.rb` reported for an
+/// enum whose label came back intact (`tests/enum_read_back.rs`). A wrong oid is not a wrong
+/// number here, it is a value decoded as the wrong type.
+///
+/// Measured: `CREATE TYPE` on 19beta1 gives 140563, and `SELECT min(oid), max(oid) FROM pg_type
+/// WHERE oid < 16384` is 16 and 13744.
+pub const FIRST_USER_ID: u64 = 16_384;
+
+/// Takes the next relation id for a tenant. Ids start at [`FIRST_USER_ID`], so 0 is never a real
+/// relation and no id can be mistaken for a built-in's oid.
 pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
     let key = record::next_id_key(tenant);
     let next = match txn.get(&key)? {
         Some(bytes) => record::decode_counter(&bytes)?,
-        None => 1,
+        None => FIRST_USER_ID,
     };
     let after = next
         .checked_add(1)
