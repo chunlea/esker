@@ -1,0 +1,39 @@
+crates/esker-sql/src/error.rs
+  s_e5c0c6e78b5662::t_91a52187f97671 177-209,2750,2973,3105-3110,3188-3191
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_0b4c8a073acc38 2732-2820,3388
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_91a4da55eaf9db 4285-4301,4451-4458
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_5432c9c0718897 1124-1130,1323,1438,1543-1545,1736-1742
+crates/esker-sql/src/value/trunc.rs
+  s_e5c0c6e78b5662::t_dd77e9d993f72a 1-276
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_87e48461fdda57 4960-4983
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_3f24e641a25c63 64
+crates/esker-sql/tests/corpus/pg19_date_trunc.txt
+  s_e5c0c6e78b5662::t_1c837cfdb51082 1-134
+crates/esker-sql/tests/date_trunc.rs
+  s_e5c0c6e78b5662::t_64de83dd518c74 1-301
+crates/esker-sql/tests/index_expression_volatility.rs
+  s_e5c0c6e78b5662::t_dca27cc13a9dbc 88-92
+crates/esker-sql/tests/scalar_functions.rs
+  s_e5c0c6e78b5662::t_7ce143ba5c4634 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ffa895e02a1230282846acd9611d14a901ce7b87",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
