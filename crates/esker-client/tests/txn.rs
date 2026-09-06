@@ -1057,7 +1057,11 @@ fn a_lock_inside_its_lease_is_waited_for_rather_than_settled() {
 
     let txn = client.begin().unwrap();
     match txn.get(b"k").unwrap_err() {
-        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, LIVE_TS),
+        // The key comes back with the transaction that held it: a caller told only "a lock did
+        // not clear" cannot say *what* it waited on, and one blocked key looks like any other.
+        Error::LockNotCleared { start_ts, key } => {
+            assert_eq!((start_ts, key.as_ref()), (LIVE_TS, b"k".as_slice()));
+        }
         other => panic!("expected LockNotCleared, got {other:?}"),
     }
 
@@ -1438,7 +1442,9 @@ fn a_lock_that_never_clears_is_bounded() {
     let txn = client.begin().unwrap();
 
     match txn.get(b"k").unwrap_err() {
-        Error::LockNotCleared { start_ts } => assert_eq!(start_ts, DEAD_TS),
+        Error::LockNotCleared { start_ts, key } => {
+            assert_eq!((start_ts, key.as_ref()), (DEAD_TS, b"k".as_slice()));
+        }
         other => panic!("expected LockNotCleared, got {other:?}"),
     }
     // Four reads of `k` and three resolutions: the budget counts resolutions, and the last

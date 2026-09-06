@@ -534,9 +534,13 @@ fn translate(error: ClientError) -> SqlError {
             message: format!("a commit at {commit_ts} beat this transaction at {start_ts}"),
             key: key.map(|key| key.to_vec()),
         },
-        ClientError::LockNotCleared { start_ts } => SqlError::SerializationFailure {
+        // **The key travels.** `40001` reaching a client as "a lock could not be cleared" and
+        // nothing more is what made a cross-database DDL hotspot need a census rather than a log
+        // line: an operator could not tell a wait on the catalog's version counter from a wait on
+        // any row. `TxnConflict` above has always carried its key; this now does too.
+        ClientError::LockNotCleared { start_ts, key } => SqlError::SerializationFailure {
             message: format!("a lock from the transaction at {start_ts} could not be cleared"),
-            key: None,
+            key: Some(key.to_vec()),
         },
         error @ ClientError::AmbiguousResult { .. } => SqlError::OutcomeUnknown(error.to_string()),
         error @ (ClientError::RetriesExhausted { .. }

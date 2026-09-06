@@ -126,6 +126,15 @@ pub enum Error {
     LockNotCleared {
         /// The transaction holding it.
         start_ts: u64,
+        /// **Which key was locked.** Carried for the same reason [`Error::TxnConflict`] carries
+        /// its own: the caller above may need to tell one blocked key from another, and it
+        /// cannot if the error names only the transaction.
+        ///
+        /// Every construction site has it — a `LockInfo` carries the key it describes — so
+        /// unlike `TxnConflict`'s this is never `None`. It reaches a client as the key in
+        /// `40001`'s message, which is the difference between "a lock did not clear" and
+        /// knowing that what was waited on was the catalog's version counter.
+        key: Bytes,
     },
 
     /// A historical read named a timestamp the collector has already passed
