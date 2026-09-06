@@ -2543,7 +2543,10 @@ pub fn replace_table(
     // corruption. Run 50's regression was that same shape one object over.
     if !previous.primary_key_name.is_empty() && previous.primary_key_name != table.primary_key_name
     {
-        txn.delete(&record::name_key(tenant, &previous.primary_key_name));
+        txn.delete(&record::name_key(
+            tenant,
+            &owned_name(previous, &previous.primary_key_name),
+        ));
     }
     // **Reconciled by name, not by id.** An index that was *renamed* keeps its id, so an
     // id-keyed comparison saw it as still present and left the old name record behind — two names
@@ -2553,13 +2556,19 @@ pub fn replace_table(
     // name.
     for index in &previous.indexes {
         if !table.indexes.iter().any(|kept| kept.name == index.name) {
-            txn.delete(&record::name_key(tenant, &index.name));
+            txn.delete(&record::name_key(
+                tenant,
+                &owned_name(previous, &index.name),
+            ));
         }
     }
     for index in &table.indexes {
         if !previous.indexes.iter().any(|had| had.id == index.id)
-            && txn.get(&record::name_key(tenant, &index.name))?.is_some()
+            && txn
+                .get(&record::name_key(tenant, &owned_name(table, &index.name)))?
+                .is_some()
         {
+            // **The bare name in the message**, the way every `42P07` names what the user wrote.
             return Err(SqlError::DuplicateTable(index.name.clone()));
         }
     }
@@ -2588,10 +2597,13 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // and cannot be wrong: a relation id is never reused, so nothing can ever read it again.
     txn.delete(&record::name_key(tenant, &table.name));
     if !table.primary_key_name.is_empty() {
-        txn.delete(&record::name_key(tenant, &table.primary_key_name));
+        txn.delete(&record::name_key(
+            tenant,
+            &owned_name(table, &table.primary_key_name),
+        ));
     }
     for index in &table.indexes {
-        txn.delete(&record::name_key(tenant, &index.name));
+        txn.delete(&record::name_key(tenant, &owned_name(table, &index.name)));
     }
     bump_version(txn)
 }
@@ -2612,13 +2624,13 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     // int8); CREATE INDEX t_pkey ON t (a);` succeeds on a real server.
     if !table.primary_key_name.is_empty() {
         txn.put(
-            &record::name_key(tenant, &table.primary_key_name),
+            &record::name_key(tenant, &owned_name(table, &table.primary_key_name)),
             &record::encode_relation(&Relation::PrimaryKey { table_id: table.id }),
         );
     }
     for index in &table.indexes {
         txn.put(
-            &record::name_key(tenant, &index.name),
+            &record::name_key(tenant, &owned_name(table, &index.name)),
             &record::encode_relation(&Relation::Index {
                 table_id: table.id,
                 index_id: index.id,
@@ -3606,6 +3618,31 @@ pub fn qualify(schema: &str, name: &str) -> String {
         return name.to_owned();
     }
     format!("{schema}{SCHEMA_SEPARATOR}{name}")
+}
+
+/// The name-record key an **index or a primary key** holds: its own bare name, in its table's
+/// schema.
+///
+/// An index's [`IndexDef::name`] stays bare — every renderer prints it, `pg_class.relname` is it,
+/// and `pg_get_indexdef` would have to unqualify it again — so the schema is applied here, where
+/// the key is built, and nowhere else. A table's name record is keyed on its own qualified name;
+/// this is the same rule for the relations a table owns.
+///
+/// Before this, every index in a database shared one namespace: `my.schema.articles_pkey`
+/// collided with `public.articles_pkey`, which is what `SchemaWithDotsTest` met
+/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+#[must_use]
+pub(crate) fn owned_name(table: &TableDef, name: &str) -> String {
+    // **A derived name arrives qualified already.** `plan::make_object_name` spends its 63-byte
+    // budget on the identifier and re-qualifies, so `s.t`'s primary key is stored `s\0t_pkey`
+    // while a user-given `CREATE INDEX ix ON s.t` is stored bare. Qualifying the first again put
+    // two separators in the key and `pg_class.relname` read back `s\0t_pkey` — caught by probing
+    // the catalog rather than by reading the writer, which is why this guard is here and not a
+    // comment saying it cannot happen.
+    if name.contains(SCHEMA_SEPARATOR) {
+        return name.to_owned();
+    }
+    qualify(split_qualified(&table.name).0, name)
 }
 
 /// The schema and the bare name out of a stored one.

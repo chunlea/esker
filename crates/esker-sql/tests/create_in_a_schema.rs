@@ -38,16 +38,19 @@
 //! seed-dependent one (8 of 12, against 12 of 12 for the other test), which points at what the
 //! previous test left behind rather than at the statement itself.
 //!
-//! **[836] does reproduce, and its fix is not a small one.** `ALTER INDEX … RENAME TO` checks
-//! `catalog::name_exists` on the bare target name — and an index's name record *is* bare, in every
-//! schema: `write_table`, `replace_table` and `drop_table` all key an index's and a primary key's
-//! name record on `IndexDef::name` alone, where a table's is keyed on its qualified name. So index
-//! names share one namespace across every schema on this node, and the collision the suite meets
-//! is real *in that model*. Making it legal means schema-scoping those name records, which changes
-//! a **key layout** rather than a record's contents — every existing index's name record would be
-//! orphaned by a build that looked it up qualified. That is a decision above a lane
-//! (`CLAUDE.md`, "Ask before doing"), and the red test that goes with the fix is written and
-//! waiting rather than committed here.
+//! **[836] does reproduce, and closing it was a decision rather than a lane's call.** An index's
+//! name record was keyed on `IndexDef::name` alone where a table's is keyed on its qualified name,
+//! so index names shared one namespace across every schema and the collision the suite meets was
+//! real *in that model*. Schema-scoping those keys changes a **key layout** rather than a record's
+//! contents, which is why it went to the user: schema-scoped keys, no fallback read and no
+//! migration, existing databases disposable
+//! ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)). The test
+//! that was written and held back now sits below.
+//!
+//! The format bump that ADR asks for is **not** in this commit and the ADR says why: the constant
+//! that refuses old bytes is the floor for every record kind without one of its own, so raising it
+//! also turns away version-14 sequence records that this change does not touch. Until it lands, an
+//! old database is misread rather than refused.
 //!
 //! It is tempting to read `my.schema` as the cause — a name with a dot in it, a stored name that
 //! is `schema ++ NUL ++ name`, a `search_path` parser that might split on the wrong character. It
@@ -107,6 +110,26 @@ fn a_create_collides_only_within_its_own_schema() {
     }
 }
 
+/// **[836]**: an index rename collides only within the index's own schema, and the renamed index
+/// stays there.
+#[test]
+fn an_index_rename_collides_only_within_its_own_schema() {
+    for schema in ["g1sd.dotted", "g1sd_plain"] {
+        let mut node = node(schema);
+        node.run("ALTER INDEX g1sd_posts_pkey RENAME TO g1sd_articles_pkey")
+            .unwrap_or_else(|error| panic!("in {schema}: {error}"));
+        let seen = relations(&mut node);
+        assert!(
+            seen.contains(&format!("{schema}|g1sd_articles_pkey|i")),
+            "in {schema}: {seen:?}"
+        );
+        assert!(
+            seen.contains(&"public|g1sd_articles_pkey|i".to_owned()),
+            "public's index is untouched, in {schema}: {seen:?}"
+        );
+    }
+}
+
 /// **The collision check is still real** — the half a fix must not lose. Inside the *same* schema
 /// both statements are refused, with PostgreSQL's own code and text.
 #[test]
@@ -119,6 +142,12 @@ fn a_collision_inside_the_same_schema_is_still_refused() {
             node.answer("CREATE TABLE g1sd_articles (id bigserial primary key)")
                 .to_string(),
             "!42P07 relation \"g1sd_articles\" already exists",
+            "in {schema}"
+        );
+        assert_eq!(
+            node.answer("ALTER INDEX g1sd_posts_pkey RENAME TO g1sd_articles_pkey")
+                .to_string(),
+            "!42P07 relation \"g1sd_articles_pkey\" already exists",
             "in {schema}"
         );
     }

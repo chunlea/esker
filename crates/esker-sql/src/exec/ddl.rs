@@ -2923,7 +2923,18 @@ pub(super) fn alter_index_rename(
     rename: &plan::AlterIndexRename,
 ) -> Result<Outcome> {
     let done = Ok(Outcome::done("ALTER INDEX"));
-    if catalog::name_exists(&*txn, executor.tenant, &rename.to)? {
+    // **The collision is looked for in the index's own schema**, which is the schema the name it
+    // is being renamed *from* resolves in. A bare check asked `public`, so renaming an index
+    // inside a schema to a name `public` already held was `42P07` — `SchemaWithDotsTest`'s
+    // `ALTER INDEX "posts_pkey" RENAME TO "articles_pkey"`, where `articles_pkey` is a suite
+    // fixture's key that is always there.
+    //
+    // The source is resolved first and only to learn its schema; a name that resolves to nothing
+    // comes back unchanged, so the check falls back to exactly what it asked before and the
+    // `42P01` below still wins for a source that is not there.
+    let from = executor.resolve_unqualified(&*txn, &rename.name)?;
+    let target = catalog::qualify(catalog::split_qualified(&from).0, &rename.to);
+    if catalog::name_exists(&*txn, executor.tenant, &target)? {
         return Err(SqlError::DuplicateTable(rename.to.clone()));
     }
     let Some(relation) = existing_relation(executor, txn, &rename.name)? else {
@@ -2950,13 +2961,19 @@ pub(super) fn alter_index_rename(
     };
     let table = executor.table_by_id(txn, table_id)?;
     let mut updated = (*table).clone();
-    if updated.primary_key_name == rename.name {
+    // **Compared bare to bare.** A *derived* name is stored qualified — `plan::make_object_name`
+    // spends its byte budget on the identifier and re-qualifies, so `s.t`'s key is `s\0t_pkey` —
+    // while a name the user gave is stored as they wrote it. The statement names one index either
+    // way, so the schema is taken off both sides and the comparison is between identifiers.
+    let wanted = catalog::split_qualified(&from).1.to_owned();
+    let matches = |name: &str| catalog::split_qualified(name).1 == wanted;
+    if matches(&updated.primary_key_name) && !updated.primary_key_name.is_empty() {
         updated.primary_key_name.clear();
         updated.primary_key_name.push_str(&rename.to);
     } else if let Some(index) = updated
         .indexes
         .iter_mut()
-        .find(|index| index.name == rename.name)
+        .find(|index| matches(&index.name))
     {
         index.name.clear();
         index.name.push_str(&rename.to);
