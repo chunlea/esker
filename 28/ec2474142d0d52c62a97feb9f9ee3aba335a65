@@ -1,0 +1,19 @@
+docs/plans/cross-node-deadlock.md
+  s_6f7019c05b578b::t_2d623717f7ac21 48-90,123-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "28ec2474142d0d52c62a97feb9f9ee3aba335a65",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
