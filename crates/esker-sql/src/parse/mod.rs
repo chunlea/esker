@@ -2501,7 +2501,22 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         return Ok(out);
     }
 
-    let rewritten = rewrite_synonym(sql, &scanned)
+    // **`UNLOGGED` and an inline `EXCLUDE` compose; the chain below does not.** `or_else` takes the
+    // *first* rewrite that matches, which is right for alternatives — no statement is both a
+    // `CREATE DATABASE` and a `CREATE DOMAIN` — and wrong for these two, because
+    // `CREATE UNLOGGED TABLE … (…, EXCLUDE …)` is both. The keyword came off, the clause stayed,
+    // and the parser stopped on what was left: `Expected: PRIMARY, UNIQUE, FOREIGN, or CHECK,
+    // found: EXCLUDE`, which is `postgresql_specific_schema.rb`'s `test_exclusion_constraints` and
+    // the whole of `hstore_test`'s failure. The same statement **without** `UNLOGGED` had always
+    // worked, which is what said the clause reader was fine and the composition was not.
+    //
+    // The second strip re-scans, because the first moved every offset after the keyword.
+    let unlogged_with_exclude = strip_unlogged(sql, &scanned).and_then(|kept| {
+        let rescanned = scan(&kept);
+        strip_exclude_constraints(&kept, &rescanned).map(|(kept, _)| kept)
+    });
+    let rewritten = unlogged_with_exclude
+        .or_else(|| rewrite_synonym(sql, &scanned))
         .or_else(|| rewrite_reset_authorization(sql, &scanned))
         .or_else(|| rewrite_user_as_role(sql, &scanned))
         .or_else(|| strip_drop_index_concurrently(sql, &scanned))
