@@ -1,0 +1,51 @@
+crates/esker-sql/tests/captures/pg19_regclass.txt
+  s_e5c0c6e78b5662::t_51a88f9bf9d82d 1-72
+crates/esker-keys/src/columnar.rs
+  s_e5c0c6e78b5662::t_ac44fdcbf48748 60
+crates/esker-keys/src/row.rs
+  s_e5c0c6e78b5662::t_705fcf3a14671a 151-157,467,471-483,597-613,718-722,1172,1219-1221,2052-2060
+crates/esker-keys/src/value.rs
+  s_e5c0c6e78b5662::t_d312d41a938221 442-455,510,543,792-812,902-903,1020,1099-1111
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_6fe672ec2eb42d 1896-1910,2662,2806,2902
+crates/esker-sql/src/catalog/record.rs
+  s_e5c0c6e78b5662::t_76f1a719383aa8 323-326,461,599
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_730778a8691795 1362
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_52587ee5910010 2091-2106,3056,3328-3331,3358-3361
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_d848710b6531fd 1016,1151
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_ddda7a7fef3522 3094-3110
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_7842290a2836eb 2948-2951,3738-3747
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_a76038c315014f 5794-5803
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_d220153d0ae4dc 1603-1611,2098-2102,2271,2389
+crates/esker-sql/src/row.rs
+  s_e5c0c6e78b5662::t_9aa9c66d32682d 51-58
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_57dd4ca643d6d7 1067-1078,1152-1154,1404,1511,1711,1725-1726,1849,1930-1939,2117,2206-2212,2531-2541,2674
+crates/esker-sql/tests/regclass.rs
+  s_e5c0c6e78b5662::t_245367c93a54e2 1-95
+crates/esker-store/src/columnar/decode.rs
+  s_e5c0c6e78b5662::t_2e8f8ecfc9e5f5 260,276
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "558179e4b7fbed703487ca7d0f4c4af0ea4460d1",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
