@@ -1,0 +1,78 @@
+# **Set operations: `UNION ALL`'s typing, and where an `ORDER BY` may stand** — PostgreSQL
+# 19beta1, 2026-09-05. One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe.
+#
+# `with_test.rb` sends `WITH … AS (SELECT … UNION ALL (SELECT …) UNION ALL SELECT …) SELECT …`
+# and a `WITH RECURSIVE` whose body is a `UNION ALL`. Nothing here is built: a set operation is
+# `0A000` naming the operator (`parse::lower`). This is what it has to become.
+#
+# ## Cross-arm type unification
+#
+#     SELECT 1        UNION ALL SELECT 2.5           numeric      int + numeric
+#     SELECT 1::int4  UNION ALL SELECT 2::int8       bigint       the wider integer
+#     SELECT 'lit'    UNION ALL SELECT t FROM …      text         an unknown literal takes the
+#                                                                 other arm's type
+#     SELECT NULL     UNION ALL SELECT 1             integer      and so does a bare NULL
+#     SELECT NULL     UNION ALL SELECT NULL          text         both unknown, so text
+#
+# **A literal that cannot be read as the resolved type fails as that type**, not as a mismatch:
+#
+#     SELECT 1 UNION ALL SELECT 'abc'
+#         22P02 invalid input syntax for type integer: "abc"
+#
+# — the same rule `GREATEST(1, 'a')` follows. A **column** of the wrong type is the other error:
+#
+#     SELECT t FROM so_b UNION ALL SELECT i FROM so_b
+#         UNION types text and integer cannot be matched
+#     SELECT i FROM so_b UNION ALL SELECT t FROM so_b
+#         UNION types integer and text cannot be matched      <- the names follow the arms' order
+#
+# And a different number of columns is the grammar's:
+#
+#     SELECT 1, 2 UNION ALL SELECT 3
+#         42601 each UNION query must have the same number of columns
+#
+# ## The names come from the first arm, and only from it
+#
+#     SELECT 1 AS first_name UNION ALL SELECT 2 AS second_name     ->  column `first_name`
+#     SELECT i FROM so_a UNION ALL SELECT n FROM so_a              ->  column `i`, type numeric
+#
+# The second is both rules at once: the **name** is the first arm's and the **type** is the
+# unification, so a column can be called `i` and be a `numeric` because the other arm made it one.
+#
+# ## Arms concatenate in order, and three of them flatten
+#
+#     SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3               ->  1, 2, 3
+#     SELECT i FROM so_a UNION ALL (SELECT i FROM so_a) UNION ALL SELECT 9
+#                                                                 ->  1, 2, 1, 2, 9
+#
+# ## Where an `ORDER BY` or a `LIMIT` may stand — h1's question, measured
+#
+#     (SELECT 1) UNION ALL SELECT 2                    ok
+#     SELECT 1 UNION ALL (SELECT 2)                    ok
+#     (SELECT 1 ORDER BY 1) UNION ALL SELECT 2         ok      inside the parentheses
+#     (SELECT 1 LIMIT 1) UNION ALL SELECT 2            ok      likewise
+#     SELECT 1 UNION ALL SELECT 2 ORDER BY 1 DESC      2, 1    outside, over the whole set
+#
+#     SELECT 1 ORDER BY 1 UNION ALL SELECT 2           42601 syntax error at or near "UNION"
+#     SELECT 1 LIMIT 1 UNION ALL SELECT 2              42601 syntax error at or near "UNION"
+#
+# **So the parentheses are the rule and not a style**: an arm may carry its own `ORDER BY` or
+# `LIMIT` only inside them, and an unparenthesised one before `UNION` is a syntax error rather
+# than a clause that binds to the set.
+#
+# ## What an outer `ORDER BY` may name
+#
+#     SELECT i AS c FROM so_b UNION ALL SELECT 2 ORDER BY c      ok, the output name
+#     SELECT i    FROM so_b UNION ALL SELECT 2 ORDER BY 1 DESC   ok, the ordinal
+#     SELECT i AS c FROM so_b UNION ALL SELECT 2 ORDER BY i      column "i" does not exist
+#
+# The last is the sharp one: **the underlying column is not visible**, only the set's output name.
+#
+#     SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1               ->  2
+#
+# ## Dedup, for the commit after (measured now so the two are one capture)
+#
+#     SELECT 1 UNION SELECT 1 UNION SELECT 2         ->  1, 2      duplicates collapse
+#     SELECT NULL::int UNION SELECT NULL::int        ->  one row   NULL is equal to NULL here
+#     SELECT 1 INTERSECT SELECT 1                    ->  1
+#     SELECT 1 EXCEPT SELECT 2                       ->  1
