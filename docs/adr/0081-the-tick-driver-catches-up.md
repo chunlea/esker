@@ -96,9 +96,13 @@ right for what they do. The comment above the region-heartbeat schedule claimed 
 was "the same shape, for the same reason"; it no longer is, and the comment says so — it also named
 `Delay` as the variant that replays, where it is `Burst`.
 
-**Testable without a busy machine.** The rule and its bookkeeping are pure functions
-(`ticks_owed`, `wake`) with unit tests that assert the old one-per-wake behaviour as the failing
-arm, so the defect is stated as a fact rather than described.
+**Testable without a busy machine**, at both levels. The rule and its bookkeeping are pure
+functions (`ticks_owed`, `wake`) with unit tests that assert the old one-per-wake behaviour as the
+failing arm, so the defect is stated as a fact rather than described. The **loop** is tested under
+`tokio`'s paused clock, which required enabling tokio's `test-util` feature in `esker-store`'s
+**dev**-dependencies: a feature of a crate already in the runtime graph, so nothing joins it and
+`deny.toml`'s crate budget is untouched. A test that waited for a real busy machine to starve the
+driver would be asserting the scheduler's mood instead of the driver's rule.
 
 ## What is not settled
 

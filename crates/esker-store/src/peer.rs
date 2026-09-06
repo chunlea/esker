@@ -32,7 +32,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // The tick driver's own arithmetic. `Instant` is a duration since a local event and orders
 // nothing, so this is not a clock entering consensus: the core still learns time only through
 // `tick()` (`CLAUDE.md` invariant 4, and `drive_ticks` says why at length).
-use std::time::{Duration, Instant};
+//
+// **`tokio`'s `Instant`, not `std`'s**, and the difference is the whole of whether the driver can
+// be tested: under `tokio::time::pause` the mocked clock advances and `std::time::Instant::now()`
+// does not, so a driver reading `std` would compute nothing elapsed however far a test advanced
+// the clock — and the paused test would pass by delivering its one punctual tick, for the wrong
+// reason. Outside a paused runtime this *is* `std::time::Instant::now()`.
+use std::time::Duration;
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use esker_engine::{WriteBatch, WriteOptions};
@@ -1765,9 +1772,11 @@ mod tests {
     use esker_proto::{ProtoError, Region};
     use esker_raft::{ConfState, LogStorage, Message, Role};
 
+    use std::time::Duration;
+
     use super::{
         Applied, DiscardTransport, LogCompaction, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer,
-        RaftTransport, ticks_owed, wake,
+        RaftTransport, TICK_CATCH_UP_CAP, ticks_owed, wake,
     };
     use crate::apply::Command;
     use crate::driver::DriverPool;
@@ -1863,7 +1872,7 @@ mod tests {
     #[test]
     fn a_driver_starved_for_twenty_intervals_owes_twenty_ticks() {
         let interval = std::time::Duration::from_millis(10);
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
 
         // The old driver: one tick for twenty intervals of elapsed time, and nineteen ticks of the
         // cluster's clock quietly gone.
@@ -1905,6 +1914,116 @@ mod tests {
         let (delivered, dropped) = wake(&mut last, start + interval * 100, interval, 40);
         assert_eq!((delivered, dropped), (40, 60));
         assert_eq!(last, start + interval * 100);
+    }
+
+    /// **The driver itself, starved on a clock a test controls.**
+    ///
+    /// The test above proves the *rule*; this proves the *loop* obeys it — that the elapsed time is
+    /// read where it should be, that the ticks reach the sink, and that the cap says so when it
+    /// bites. Under `tokio::time::pause` the clock moves only when the test moves it, so "starved
+    /// for two hundred intervals" is a fact rather than a wait on a busy machine.
+    ///
+    /// Note the driver reads `tokio::time::Instant`, not `std`'s: `std`'s does not move under a
+    /// paused clock, and a driver reading it would deliver its one punctual tick here and look
+    /// correct while being exactly as broken as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_starved_loop_delivers_what_it_slept_through_and_warns_when_it_caps() {
+        const INTERVAL: Duration = Duration::from_millis(10);
+
+        /// Runs the driver, lets it take its first punctual tick, then advances `intervals` of
+        /// clock with nothing polling it, and answers how many ticks the next wake delivered.
+        async fn starved_by(intervals: u32, cap: u32) -> u32 {
+            let counted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let sink = Arc::clone(&counted);
+            let driver = tokio::spawn(super::drive_ticks(INTERVAL, cap, move || {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            }));
+            // `interval` fires once immediately; let that land so it is not counted as catch-up.
+            tokio::task::yield_now().await;
+            let punctual = counted.load(Ordering::Relaxed);
+
+            tokio::time::advance(INTERVAL * intervals).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            driver.abort();
+            counted.load(Ordering::Relaxed) - punctual
+        }
+
+        // Under the cap: every interval slept through is delivered.
+        assert_eq!(
+            starved_by(20, TICK_CATCH_UP_CAP).await,
+            20,
+            "the driver slept through twenty intervals and owes twenty ticks; anything less is \
+             elapsed time `esker-raft` never counts, and the election timeout stretches with it"
+        );
+
+        // `cap = 1` is the old driver, exactly, and it is the defect: one tick for twenty
+        // intervals of elapsed time.
+        assert_eq!(
+            starved_by(20, 1).await,
+            1,
+            "the one-per-wake driver is what this test exists to be a comparison against"
+        );
+
+        // Past the cap: exactly the cap, and no more -- **and it says so**, because a peer owed
+        // more than a cap is a peer whose box stopped scheduling it, and that is the only place
+        // that fact is ever written down.
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let delivered = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Captured(Arc::clone(&captured)))
+                .with_max_level(tracing::Level::WARN)
+                // Without this the fields arrive as `owed\u{1b}[0m\u{1b}[2m=\u{1b}[0m200` and an
+                // assertion on `owed=200` fails against a warn that is perfectly correct.
+                .with_ansi(false)
+                .finish();
+            // The runtime is current-thread, so the driver task runs on this thread and sees this
+            // thread's subscriber.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            starved_by(200, TICK_CATCH_UP_CAP).await
+        };
+        assert_eq!(
+            delivered, TICK_CATCH_UP_CAP,
+            "a peer starved past a whole election timeout gets the cap and not a replay"
+        );
+        let warned = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            warned.contains("owed=200") && warned.contains("delivered=40"),
+            "the cap must name what it swallowed -- two hundred owed, forty delivered -- and the \
+             warn said: {warned:?}"
+        );
+    }
+
+    /// A `MakeWriter` that keeps what was logged, so a test can assert on a `warn` rather than on
+    /// the effect of one.
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// A transport that checks the driver contract at the only moment it can be checked: when a
