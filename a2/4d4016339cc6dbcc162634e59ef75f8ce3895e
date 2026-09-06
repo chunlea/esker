@@ -1,0 +1,25 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_36ac415e47a730 2186-2189,4183-4226,4234,4709-4757
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_3e2acdace36f71 147-150,614-653
+crates/esker-sql/tests/create_in_a_schema.rs
+  s_6f7019c05b578b::t_e8c320ee74584f 50-53
+docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md
+  s_6f7019c05b578b::t_3844826934ef72 52-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a24d4016339cc6dbcc162634e59ef75f8ce3895e",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
