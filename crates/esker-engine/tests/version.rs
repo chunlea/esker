@@ -639,3 +639,73 @@ fn obsolete_files_keeps_live_logs_and_foreign_files() {
         "the engine does not delete files it did not create"
     );
 }
+
+/// **The manifest record's own field decoding, which a byte flip never reaches.**
+///
+/// `a_corrupt_manifest_record_is_an_error` flips a byte inside a record and asserts corruption —
+/// and what refuses it is the record **CRC**, not `VersionEdit::decode`. So every refusal the
+/// decoder makes for itself, an unknown tag and a field that runs off the end, sits behind a
+/// checksum no file-level test can get past. A decoder whose own errors are unreachable from the
+/// test suite is a decoder that is not tested at all.
+///
+/// So these bytes go straight to it, as a record with an intact checksum would arrive after
+/// replay: every one is an error value and never a panic (`CLAUDE.md` invariants 2 and 9).
+#[test]
+fn every_malformed_version_edit_is_an_error_and_never_a_panic() {
+    // Tag 8 is `ADD_FILE`, whose fields are: cf, level, number, size, smallest, largest, and two
+    // sequence numbers. Truncating between any two of them is a record that passed its checksum
+    // and still cannot be understood — a short write that was faithfully recorded.
+    //
+    // **Every literal below is under 128 on purpose.** A byte with the top bit set is a LEB128
+    // continuation, so `vec![200]` is not "tag two hundred" — it is a varint that runs off the end,
+    // and it is refused as one whatever the tag table says. Three cases here were written that way
+    // and passed against a decoder with its unknown-tag refusal deleted, which is how they were
+    // caught: a case that cannot fail against the broken code is not testing what it is named for.
+    let add_file_prefix = vec![8u8, 0, 0, 1];
+
+    for (what, bytes) in [
+        ("a tag this build does not know", vec![100u8]),
+        ("a tag with nothing behind it", vec![8u8]),
+        (
+            "an add-file truncated after its level",
+            add_file_prefix.clone(),
+        ),
+        ("an add-file truncated inside its key", {
+            let mut out = add_file_prefix.clone();
+            out.extend_from_slice(&[9, 100]); // file number, size
+            out.push(100); // a smallest key claiming a hundred bytes
+            out.extend_from_slice(b"only-nine");
+            out
+        }),
+        ("a file location this build does not know", {
+            // Tag 9 is `FILE_LOCATION`: cf, level, number, then the location enum.
+            vec![9u8, 0, 0, 1, 100]
+        }),
+        ("a comparator name running past the end", {
+            let mut out = vec![1u8]; // COMPARATOR
+            out.push(100); // claiming a hundred bytes of name
+            out.extend_from_slice(b"short");
+            out
+        }),
+    ] {
+        let outcome = VersionEdit::decode(&bytes);
+        assert!(
+            outcome.is_err(),
+            "{what} decoded into {:?}; a record that passed its checksum and is still malformed \
+             is exactly what this decoder exists to refuse",
+            outcome.ok()
+        );
+    }
+
+    // And the control: a record this build *does* understand still round-trips, so the assertions
+    // above are about malformed input rather than about a decoder that refuses everything.
+    let mut edit = VersionEdit::new();
+    edit.log_number = Some(7);
+    let encoded = edit.encode();
+    assert_eq!(
+        VersionEdit::decode(&encoded)
+            .expect("a well-formed edit decodes")
+            .log_number,
+        Some(7)
+    );
+}
