@@ -49,16 +49,28 @@ answer for the wrong index for ever. A migration is code that runs once, against
   `s\0t_pkey`. `owned_name` is therefore idempotent — a name that already carries a separator is
   used as it is — and `ALTER INDEX … RENAME` compares **bare to bare**. Making `IndexDef::name`
   uniformly bare would be tidier and is four derivation sites' worth of change; it is not done here.
-* **The format bump this decision asked for is NOT in the commit that carries the rest**, and the
-  reason is a finding rather than a shortfall. Raising `OLDEST_TABLE_VERSION` is the mechanism that
-  refuses old bytes with a clear sentence — `catalog format version 36 is not 37..=37` — but that
-  constant is the floor for `Reader::new`, which **every record kind without a floor of its own
-  uses**. Raising it to 37 also refuses version-14 *sequence* records, whose layout this decision
-  does not touch, and inverts the claim of nine `a_version_N_table_record_still_decodes` goldens.
-  Refusing an old database is right; doing it by raising a shared record floor is not obviously the
-  way, and the alternative — a database-level marker checked once at open — is a design question
-  rather than a lane's improvisation. Sized and handed back: nine goldens whose claim inverts, one
-  sequence test that should not be affected at all, and the choice of mechanism.
-* Until that lands, **an old database is misread rather than refused**: its flat index keys are
-  invisible to a qualified reader, so an index would not be found by `DROP INDEX` and its name
-  record would outlive its object.
+* **An old database is refused by a layout marker, not by a record floor**, and the difference is
+  the point. `CATALOG_FORMAT_VERSION` says how the bytes of one record are laid out and every
+  reader tolerates the older shapes on purpose — nine `a_version_N_table_record_still_decodes`
+  goldens are that promise written down. Raising `OLDEST_TABLE_VERSION` to refuse old data would
+  have inverted all nine *and* turned away version-14 **sequence** records, whose layout this
+  decision does not touch, because that constant is the floor for `Reader::new` and so for every
+  record kind without a floor of its own. Tried, measured, reverted.
+
+  The marker is its own thing: `record::layout_key()` — `'m' ++ "sql" ++ 'L'`, one key for the
+  whole store, upper case where every other kind byte is lower case so it cannot be a name key —
+  holding `CATALOG_LAYOUT_VERSION`, which is **2** for schema-scoped index names and **1** for
+  everything before it. `bump_version` stamps it, so the first DDL a store ever runs marks it;
+  `Catalog::view_at` reads it once per transaction, beside the counter it already reads, and
+  refuses anything that is not the current version with
+
+  ```text
+  catalog layout 1 is older than 2: index names became schema-scoped on 2026-09-05;
+  this database predates that and must be recreated
+  ```
+
+  An **absent** marker over a catalog that has run DDL *is* layout 1, which is what makes that
+  sentence true rather than approximate; absent over an empty store is not an old database and is
+  not refused. There is no upgrade path, by the same decision that made old data disposable.
+* Record-content versions are untouched: `CATALOG_FORMAT_VERSION` stays 36, the sequence floor
+  stays, and the nine goldens still say what they said.

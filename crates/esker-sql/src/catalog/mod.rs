@@ -2183,6 +2183,10 @@ impl Catalog {
             // No DDL has ever run. Version 0 is the empty catalog.
             None => 0,
         };
+        // **Once per transaction, beside the counter it already reads.** Every catalog view comes
+        // through here, so this is where a database whose keys this build cannot read is turned
+        // away — before a single name is looked up in the wrong place.
+        refuse_an_older_layout(txn, version)?;
         Ok(View {
             catalog: cached.then_some(self),
             txn,
@@ -4176,6 +4180,50 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
     Ok(next)
 }
 
+/// Refuses a database whose catalog **keys** are arranged the way an older build arranged them.
+///
+/// The marker is written by the first `bump_version` a store ever runs, so:
+///
+/// * **absent and version 0** — nothing has ever been written. There is no old data to misread,
+///   and the first DDL stamps it.
+/// * **absent and version > 0** — a catalog exists and predates the marker, which is layout 1.
+/// * **anything but the current version** — refused, whether older or newer. A newer one means a
+///   build that knows something this one does not, and guessing is what this is here to stop.
+///
+/// The sentence names the change and says what to do, because there is nothing else to be done:
+/// existing databases are disposable by the user's decision, and there is no upgrade path
+/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
+    let held = match txn.get(&record::layout_key())? {
+        Some(bytes) => record::decode_layout(&bytes)?,
+        None if version == 0 => return Ok(()),
+        // An unmarked catalog **is** layout 1, which is what makes the sentence below true rather
+        // than approximate.
+        None => 1,
+    };
+    if held == record::CATALOG_LAYOUT_VERSION {
+        return Ok(());
+    }
+    Err(SqlError::DataCorrupted(format!(
+        "catalog layout {held} is older than {}: index names became schema-scoped on 2026-09-05; \
+         this database predates that and must be recreated",
+        record::CATALOG_LAYOUT_VERSION
+    )))
+}
+
+/// Stamps the store with the layout this build writes, if it is not stamped already.
+///
+/// Called from [`bump_version`], which every DDL statement runs — so the first statement to write
+/// anything is the one that marks the store, and a store that has written nothing carries no
+/// marker and needs none.
+fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
+    let key = record::layout_key();
+    if txn.get(&key)?.is_none() {
+        txn.put(&key, &record::encode_layout());
+    }
+    Ok(())
+}
+
 /// Moves the catalog version forward, which is what makes every node's cache notice.
 ///
 /// Every DDL statement writes this one key, so two concurrent DDL statements conflict and one of
@@ -4183,6 +4231,7 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
 /// DDL is rare and a catalog that two statements changed at once is a catalog nobody can reason
 /// about.
 pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
+    stamp_layout(txn)?;
     let key = record::version_key();
     let current = match txn.get(&key)? {
         Some(bytes) => record::decode_counter(&bytes)?,
@@ -4655,6 +4704,55 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// **The layout marker, byte for byte.** One key for the whole store and one byte in it, so
+    /// the golden is short — and it is here for the reason every other golden is: a marker whose
+    /// bytes moved without anyone noticing would refuse every database at once.
+    #[test]
+    fn the_layout_marker_is_one_byte() {
+        assert_eq!(record::encode_layout(), decode_hex("02"));
+        assert_eq!(record::decode_layout(&record::encode_layout()).unwrap(), 2);
+        assert!(record::decode_layout(&[]).is_err());
+        assert!(record::decode_layout(&[2, 2]).is_err());
+    }
+
+    /// **A database written before the marker is refused, and the sentence says what to do.**
+    ///
+    /// The catalog here has run DDL — version is not 0 — and carries no marker, which is exactly
+    /// what a store from before 2026-09-05 looks like.
+    #[test]
+    fn a_database_without_the_marker_is_refused() {
+        let backend = crate::backend::MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        // A catalog that exists: the counter is what says DDL has run.
+        txn.put(&record::version_key(), &record::encode_counter(7));
+        let catalog = Catalog::new();
+        let refused = catalog.view(&*txn, 1).unwrap_err().to_string();
+        assert!(
+            refused.contains(
+                "catalog layout 1 is older than 2: index names became schema-scoped on \
+                 2026-09-05; this database predates that and must be recreated"
+            ),
+            "{refused}"
+        );
+    }
+
+    /// And one that carries it opens — as does an empty store, which has nothing to be wrong about.
+    #[test]
+    fn a_marked_database_and_an_empty_one_both_open() {
+        let backend = crate::backend::MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        let catalog = Catalog::new();
+        // Nothing written at all: version 0, no marker, no complaint.
+        catalog.view(&*txn, 1).unwrap();
+        // And a real catalog, stamped the way `bump_version` stamps one.
+        super::bump_version(&mut *txn).unwrap();
+        catalog.view(&*txn, 1).unwrap();
+        assert_eq!(
+            txn.get(&record::layout_key()).unwrap().as_deref(),
+            Some(&record::encode_layout()[..])
+        );
     }
 
     /// A key part's order survives the record, which is what a schema dump reads back.

@@ -47,10 +47,10 @@
 //! ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)). The test
 //! that was written and held back now sits below.
 //!
-//! The format bump that ADR asks for is **not** in this commit and the ADR says why: the constant
-//! that refuses old bytes is the floor for every record kind without one of its own, so raising it
-//! also turns away version-14 sequence records that this change does not touch. Until it lands, an
-//! old database is misread rather than refused.
+//! An older database is refused rather than misread, by a **layout marker** of its own rather than
+//! by a record floor: raising the floor would have turned away version-14 sequence records this
+//! change does not touch and inverted nine goldens that promise old table records still decode.
+//! `catalog layout 1 is older than 2 …` is the sentence, and the ADR carries the mechanism.
 //!
 //! It is tempting to read `my.schema` as the cause — a name with a dot in it, a stored name that
 //! is `schema ++ NUL ++ name`, a `search_path` parser that might split on the wrong character. It
