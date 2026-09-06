@@ -45,6 +45,8 @@ pub mod pg_catalog;
 pub mod pg_constraint;
 pub mod pg_index;
 pub mod pg_relations;
+pub use quote::quote_identifier;
+mod quote;
 mod record;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -23,7 +23,7 @@
 //! ```
 //!
 //! That note is about a *constraint's* index following a rename, not about an index inventing a
-//! constraint. The plain `ADD CONSTRAINT … UNIQUE (position)` already worked here; only the
+//! constraint. The plain `ADD CONSTRAINT … UNIQUE ("position")` already worked here; only the
 //! `USING INDEX` spelling was refused.
 //!
 //! **The three answers the capture gave**, which are what this file pins:
@@ -41,15 +41,14 @@
 //!
 //! And the two refusals, with their SQLSTATEs read off the server rather than guessed:
 //!
-//! **One difference in the printed definition, and it is an older declared divergence.**
-//! PostgreSQL writes `UNIQUE ("position")` and this node writes `UNIQUE (position)`: `position` is
-//! one of PostgreSQL's *reserved* words and it quotes those, which
-//! `catalog::pg_index::quote_identifier` records as deliberately not approximated — `sqlparser`'s
+//! **The one difference in the printed definition is closed, and this file is where it was
+//! booked.** PostgreSQL writes `UNIQUE ("position")` — `position` is a keyword it quotes — and
+//! this node wrote `UNIQUE (position)`, declared rather than approximated because `sqlparser`'s
 //! keyword lists are a different set and would quote `name` and `value`, which a real server
-//! leaves bare. It reaches nothing here: `ActiveRecord` reads `constraintdef` only to test
-//! `start_with?("UNIQUE NULLS NOT DISTINCT")`, so both Rails tests are unaffected. The assertions
-//! below carry **this node's** text, so that closing the divergence reddens them (ADR 0031 rule 2)
-//! rather than leaving a wrong expectation green.
+//! leaves bare. The list is **measured** now (`catalog::quote`, 165 words straight out of
+//! `pg_get_keywords()`), so the assertions below carry PostgreSQL's text. They were written to go
+//! red when the divergence closed rather than to stay green on a wrong expectation, and that is
+//! exactly what they did.
 //!
 //! ```text
 //! USING INDEX nosuchindex   42704  index "nosuchindex" does not exist
@@ -111,7 +110,7 @@ fn the_constraint_is_attached_to_the_named_index() {
             "u".to_owned(),
             "t".to_owned(),
             "f".to_owned(),
-            "UNIQUE (position) DEFERRABLE".to_owned(),
+            "UNIQUE (\"position\") DEFERRABLE".to_owned(),
         ]],
         "exactly one, deferrable and not deferred"
     );
@@ -150,7 +149,7 @@ fn without_the_clause_it_is_not_deferrable() {
             "u".to_owned(),
             "f".to_owned(),
             "f".to_owned(),
-            "UNIQUE (position)".to_owned(),
+            "UNIQUE (\"position\")".to_owned(),
         ]]
     );
 }
@@ -169,7 +168,7 @@ fn the_same_name_is_not_a_rename() {
             "u".to_owned(),
             "f".to_owned(),
             "f".to_owned(),
-            "UNIQUE (position)".to_owned(),
+            "UNIQUE (\"position\")".to_owned(),
         ]]
     );
     assert_eq!(
@@ -226,7 +225,7 @@ fn the_query_activerecord_actually_sends() {
             "unique_constraint".to_owned(),
             "t".to_owned(),
             "f".to_owned(),
-            "UNIQUE (position) DEFERRABLE".to_owned(),
+            "UNIQUE (\"position\") DEFERRABLE".to_owned(),
             "{position}".to_owned(),
         ]]
     );

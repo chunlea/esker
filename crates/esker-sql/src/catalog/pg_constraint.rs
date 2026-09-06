@@ -388,7 +388,8 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         .into_iter()
         .find(|(_, at)| pg_relations::attnum_of(table, *at) == attnum)
     {
-        Some((name, _)) => Datum::Text(format!("NOT NULL {name}")),
+        // Measured: `NOT NULL "position"` and `NOT NULL plain` — this one is quoted too.
+        Some((name, _)) => Datum::Text(format!("NOT NULL {}", super::quote_identifier(name))),
         None => Datum::Null,
     }
 }
@@ -668,7 +669,10 @@ fn foreign_key_definition(
     key: &crate::catalog::ForeignKeyDef,
 ) -> String {
     let parent = table_of(relations, key.parent);
-    let parent_name = parent.map_or("?", |parent| parent.name.as_str());
+    let parent_name = parent.map_or_else(
+        || "?".to_owned(),
+        |parent| super::quote_identifier(super::split_qualified(&parent.name).1),
+    );
     let parent_columns = parent.map_or_else(String::new, |parent| {
         column_list(parent, &key.parent_columns)
     });
@@ -702,7 +706,8 @@ fn foreign_key_definition(
 fn column_list(table: &TableDef, ordinals: &[usize]) -> String {
     ordinals
         .iter()
-        .filter_map(|at| table.columns.get(*at).map(|column| column.name.as_str()))
+        .filter_map(|at| table.columns.get(*at))
+        .map(|column| super::quote_identifier(&column.name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -717,10 +722,11 @@ fn table_of(relations: &Relations, table_id: u64) -> Option<&TableDef> {
 
 /// `PRIMARY KEY (a, b)`, as `pg_get_constraintdef` writes it.
 fn primary_key_definition(table: &TableDef) -> String {
-    let columns: Vec<&str> = table
+    let columns: Vec<String> = table
         .primary_key
         .iter()
-        .filter_map(|at| table.columns.get(*at).map(|column| column.name.as_str()))
+        .filter_map(|at| table.columns.get(*at))
+        .map(|column| super::quote_identifier(&column.name))
         .collect();
     format!("PRIMARY KEY ({})", columns.join(", "))
 }
