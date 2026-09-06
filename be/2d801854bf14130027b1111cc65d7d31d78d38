@@ -1,0 +1,19 @@
+crates/esker-columnar/tests/fragment_golden.rs
+  s_2bed4ac2b1c944::t_9d6cb06936b548 18,356-397
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "be2d801854bf14130027b1111cc65d7d31d78d38",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
