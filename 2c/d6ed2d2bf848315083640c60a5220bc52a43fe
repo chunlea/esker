@@ -1,0 +1,19 @@
+crates/esker-sql/tests/captures/pg19_unknown_oid.txt
+  s_2d916f5f540186::t_382b6c5e0c0800 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2cd6ed2d2bf848315083640c60a5220bc52a43fe",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
