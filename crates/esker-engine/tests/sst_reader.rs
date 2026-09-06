@@ -453,3 +453,69 @@ fn truncation_is_detected() {
         }
     }
 }
+
+/// **A block handle read off disk is a length, and a length from a damaged file is untrusted.**
+///
+/// The footer carries three of them — index, filter, properties — as plain varints, so a damaged
+/// tail produces handles that are perfectly well-formed and point anywhere at all. The reader
+/// refuses one that does not fit in the file rather than sizing an allocation from it or slicing
+/// past the end (`CLAUDE.md` invariants 2 and 9), and until now nothing asked it to: the footer's
+/// own magic and version had tests, and the numbers behind them did not.
+///
+/// Hand-built rather than truncated. Truncation loses the footer and is caught by the magic, which
+/// is a different refusal in a different place; this leaves the footer intact and valid and moves
+/// only the index handle, so what is under test is the bounds check and nothing else.
+#[test]
+fn a_block_handle_pointing_past_the_file_is_refused() {
+    use esker_engine::sst::footer::{BlockHandle, Footer};
+
+    // The footer is fixed-width and its size is private, so this is what the reader itself does:
+    // take the tail, and let `Footer::decode` say whether it is one.
+    const FOOTER_SIZE: usize = 48;
+
+    let fs = MemFileSystem::new();
+    let open = |name: &str| {
+        TableReader::open(
+            fs.open(Path::new(name)).unwrap(),
+            1,
+            TableOptions::default(),
+            None,
+        )
+    };
+    let mut builder = TableBuilder::new(
+        TableOptions::default(),
+        fs.create(Path::new("/good.sst")).unwrap(),
+    );
+    builder.add(b"k", b"v").unwrap();
+    builder.finish().unwrap();
+
+    let good = fs.contents("/good.sst").unwrap();
+    let split = good.len() - FOOTER_SIZE;
+    let footer = Footer::decode(&good[split..]).expect("the table this test damages must be good");
+
+    // Everything as written, except an index block that begins a megabyte past the end of a
+    // file of a few hundred bytes.
+    let moved = Footer {
+        index: BlockHandle {
+            offset: good.len() as u64 + 1_048_576,
+            size: footer.index.size,
+        },
+        ..footer
+    };
+    let mut damaged = good[..split].to_vec();
+    damaged.extend_from_slice(&moved.encode().expect("a footer of three handles encodes"));
+    assert_eq!(
+        damaged.len(),
+        good.len(),
+        "the footer is fixed-width, so damaging it must not change the file's length"
+    );
+
+    fs.install("/moved-index.sst", damaged).unwrap();
+    let error = open("/moved-index.sst")
+        .err()
+        .expect("a table whose index block is outside the file must not open");
+    assert!(
+        error.is_corruption(),
+        "a handle past the end of the file is corruption, not an I/O error or a panic: {error}"
+    );
+}
