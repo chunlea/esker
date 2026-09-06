@@ -1517,10 +1517,6 @@ impl CatalogFunc {
             | CatalogFunc::TsRank
             | CatalogFunc::SetWeight
             | CatalogFunc::StrPos => &[2],
-            // One argument trims whitespace, two trim a set of characters.
-            CatalogFunc::Btrim | CatalogFunc::Ltrim | CatalogFunc::Rtrim => &[1, 2],
-            // Variadic like `concat`, and one argument is legal: `GREATEST(1)` is `1`.
-            CatalogFunc::Greatest | CatalogFunc::Least => &CONCAT_ARITIES,
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
             // `pg_get_expr`'s two really are two forms as well.
             // `tsrange(a, b)` and `tsrange(a, b, '[]')` — two shapes of one name, and
@@ -1540,7 +1536,11 @@ impl CatalogFunc {
             CatalogFunc::PgGetIndexdef => &[1, 3],
             // The text-search four take one argument with `default_text_search_config`, or two
             // naming the configuration.
-            CatalogFunc::PgGetConstraintdef
+            // One argument trims whitespace, two trim a set of characters.
+            CatalogFunc::Btrim
+            | CatalogFunc::Ltrim
+            | CatalogFunc::Rtrim
+            | CatalogFunc::PgGetConstraintdef
             | CatalogFunc::PgGetViewdef
             | CatalogFunc::ToTsVector
             | CatalogFunc::ToTsQuery
@@ -1589,7 +1589,8 @@ impl CatalogFunc {
             | CatalogFunc::PgBackendPid => &[0],
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
-            CatalogFunc::Concat => &CONCAT_ARITIES,
+            // Variadic, and one argument is legal: `GREATEST(1)` is `1`.
+            CatalogFunc::Concat | CatalogFunc::Greatest | CatalogFunc::Least => &CONCAT_ARITIES,
             CatalogFunc::SplitPart | CatalogFunc::Replace => &[3],
         }
     }

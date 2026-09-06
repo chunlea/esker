@@ -138,7 +138,12 @@ pub fn type_of_oid(oid: i64) -> Option<ColumnType> {
 /// `'10000000000'::bigint` here, because reaching `numeric` needs a `numeric`. The digits inside
 /// the quotes — the half every client parses — are identical.
 #[must_use]
-pub fn constant_expression(value: &Datum, ty: ColumnType, rendering: Rendering) -> String {
+pub fn constant_expression(
+    value: &Datum,
+    ty: ColumnType,
+    typmod: i32,
+    rendering: Rendering,
+) -> String {
     // A boolean prints as the word, where its *output function* writes one character. The two are
     // different functions and this is the one that a `::text` cast and a stored default share.
     if let Datum::Bool(flag) = value {
@@ -178,6 +183,21 @@ pub fn constant_expression(value: &Datum, ty: ColumnType, rendering: Rendering) 
         None if ty == ColumnType::VarBit => {
             format!("'{}'::bit varying", text.replace('\'', "''"))
         }
+        // **`interval` is the one type whose cast carries its typmod**, and it is measured
+        // rather than reasoned: an `interval(3)` column's default reads `'3 years'::interval(3)`
+        // where a `numeric(6,2)` is a bare `1.5`, a `varchar(3)` is `::character varying`, a
+        // `timestamp(1)` is `::timestamp without time zone` and an `interval(3)[]` drops it again
+        // (`tests/captures/pg19_typmod_default.txt`).
+        //
+        // It is the same exception the value has: `interval` is the only type whose stored default
+        // is *folded* through its typmod, which the rounding unit measured — `varchar(3) DEFAULT
+        // 'abcdef'` is accepted and `22001` at the first insert. A typmod that changes the value
+        // is one the deparsed cast has to carry, and one that only bounds it is not.
+        None if ty == ColumnType::Interval => format!(
+            "'{}'::{}",
+            text.replace('\'', "''"),
+            value::format_type(ty, typmod)
+        ),
         None => format!(
             "'{}'::{}",
             text.replace('\'', "''"),

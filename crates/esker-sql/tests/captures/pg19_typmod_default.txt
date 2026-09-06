@@ -1,0 +1,46 @@
+# **Which typmods a rendered default carries** — PostgreSQL 19beta1, 2026-09-05.
+#
+# r1 filed a small divergence: an `interval(3)` column's default reads `'3 years'::interval` here
+# and `'3 years'::interval(3)` there. The question a fix needs answering is not that one row but
+# **which types do it**, so one table declares every typmod-bearing type at once and
+# `pg_get_expr` is read off all of them.
+#
+#     column type        format_type                       pg_get_expr(adbin, adrelid)
+#     interval(3)        interval(3)                       '3 years'::interval(3)     <- carries it
+#     interval           interval                          '3 years'::interval
+#     numeric(6,2)       numeric(6,2)                      1.5                        <- no cast
+#     numeric            numeric                           1.5
+#     varchar(3)         character varying(3)              'ab'::character varying    <- bare
+#     varchar            character varying                 'ab'::character varying
+#     timestamp(1)       timestamp(1) without time zone    '…'::timestamp without time zone
+#     timestamp          timestamp without time zone       '…'::timestamp without time zone
+#     time(2)            time(2) without time zone         '…'::time without time zone
+#     timestamptz(4)     timestamp(4) with time zone       '…'::timestamp with time zone
+#     char(5)            character(5)                      'ab'::bpchar               <- internal name
+#     bit(4)             bit(4)                            '1010'::"bit"              <- quoted
+#     varbit(5)          bit varying(5)                    '101'::bit varying
+#     interval(3)[]      interval(3)[]                     '{00:00:04.5}'::interval[] <- drops it
+#
+# **`interval` is the only one.** Every other typmod-bearing type writes the base name that
+# `format_type(oid, -1)` gives, and a `numeric` writes no cast at all because a numeric constant
+# prints unquoted.
+#
+# ## Why it is the one, which is worth knowing rather than memorising
+#
+# `interval` is also the only type whose stored default is **folded through** its typmod — measured
+# in the rounding unit: `interval(3) DEFAULT 'PT4.5S'` stores a value rounded to three places,
+# where `varchar(3) DEFAULT 'abcdef'` is accepted at `CREATE TABLE` and `22001` at the first
+# insert. A typmod that changes the *value* is one the deparsed cast has to carry; one that only
+# bounds it is not. The two measurements agree, and neither was guessable from the other.
+#
+# ## Two rows that need the right input to mean anything
+#
+# `bit(4) DEFAULT B'1010'` and `varbit(5) DEFAULT B'101'` **both** render `::"bit"`, because a
+# `B'…'` literal is a `bit` and `pg_get_expr` deparses the expression's own type. With a *string*
+# default the columns differ as they should:
+#
+#     varbit(5) DEFAULT '101'    ->  '101'::bit varying
+#     bit(4)    DEFAULT '1010'   ->  '1010'::"bit"
+#
+# So a probe that used bit literals for both would have "measured" that `varbit` renders as `bit`
+# and been wrong about the column rather than about the literal.

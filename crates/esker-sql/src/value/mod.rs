@@ -1151,13 +1151,14 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::RegType => 2211,
         // No `_regclass` here: an array of a regclass is not a type this node offers, so the
         // link is a zero rather than a pointer at a `pg_type` row that is not there.
-        ColumnType::RegClass => 0,
-        // Neither vector has an array type on a real server either.
-        ColumnType::Int2Vector | ColumnType::OidVector => 0,
+        // Neither a `regclass` nor either vector has an array type on a real server.
         // There is no array of an array: an array type is a constructor over a *scalar* here, so
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
         // `typarray` holds for a type that has no array.
-        ColumnType::Int8Array
+        ColumnType::RegClass
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector
+        | ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
@@ -2460,7 +2461,13 @@ impl PgDatum for Datum {
             // PostgreSQL compares bit by bit and then by length; `'0'` below `'1'` and a prefix
             // below what extends it is exactly that.
             (Datum::Bit { bits: a, .. }, Datum::Bit { bits: b, .. }) => a.as_bytes().cmp(b.as_bytes()),
-            (Datum::Int8(a), Datum::Int8(b))
+            // **A `regclass` is an `i64` too**, and it compares with an `int8` in both
+            // directions: every relation-oid column in this node's catalog is a `bigint`, so
+            // `WHERE attrelid = 'iv'::regclass` is exactly this pair.
+            (
+                Datum::Int8(a) | Datum::RegClass { oid: a, .. },
+                Datum::Int8(b) | Datum::RegClass { oid: b, .. },
+            )
             // Plain integer order, and only against another `time`: this type compares with
             // nothing else, so there is no promotion arm to write beside it.
             | (Datum::Time(a), Datum::Time(b))
@@ -2545,15 +2552,6 @@ impl PgDatum for Datum {
             (Datum::Int8(a), Datum::Oid(b) | Datum::RegType { oid: b, .. }) => {
                 a.cmp(&i64::from(*b))
             }
-            // **A `regclass` is one of them too, and its value is already an `i64`** — a relation's
-            // id here is 64 bits where a real server's oid is 32. Without these arms two
-            // *different* relations compared equal, because the pair fell through to the variant
-            // rank they share with the integers: exactly the bug the comment above records the
-            // `time` unit shipping, met again one type later and caught by
-            // `two_spellings_of_one_relation_are_equal`.
-            (Datum::RegClass { oid: a, .. }, Datum::RegClass { oid: b, .. })
-            | (Datum::RegClass { oid: a, .. }, Datum::Int8(b))
-            | (Datum::Int8(a), Datum::RegClass { oid: b, .. }) => a.cmp(b),
             (Datum::RegClass { oid: a, .. }, Datum::Oid(b)) => a.cmp(&i64::from(*b)),
             (Datum::Oid(a), Datum::RegClass { oid: b, .. }) => i64::from(*a).cmp(b),
             (Datum::Oid(a), Datum::Int4(b)) => i64::from(*a).cmp(&i64::from(*b)),

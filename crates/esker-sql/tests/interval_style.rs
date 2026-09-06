@@ -309,7 +309,7 @@ fn a_column_default_prints_under_the_session_style() {
         node.rows(DEFAULTS),
         [
             ["'3 years'::interval".to_owned()],
-            ["'00:00:01.235'::interval".to_owned()]
+            ["'00:00:01.235'::interval(3)".to_owned()]
         ]
     );
     node.run("SET intervalstyle = 'iso_8601'").unwrap();
@@ -317,7 +317,7 @@ fn a_column_default_prints_under_the_session_style() {
         node.rows(DEFAULTS),
         [
             ["'P3Y'::interval".to_owned()],
-            ["'PT1.235S'::interval".to_owned()]
+            ["'PT1.235S'::interval(3)".to_owned()]
         ]
     );
     // `information_schema.columns` reads the same expression and must not disagree with it.
@@ -328,37 +328,7 @@ fn a_column_default_prints_under_the_session_style() {
         ),
         [
             ["'P3Y'::interval".to_owned()],
-            ["'PT1.235S'::interval".to_owned()]
+            ["'PT1.235S'::interval(3)".to_owned()]
         ]
-    );
-}
-
-/// **The cast a stored default names carries the typmod for an `interval` and for nothing else.**
-///
-/// `constant_expression`'s doc states as a general rule that the cast is "the column's type written
-/// bare — no length and no precision", and every other parameterised type obeys it. Measured by g1,
-/// one table, under `iso_8601`:
-///
-/// ```text
-/// e interval(3)  DEFAULT 'PT4.5S'        'PT4.5S'::interval(3)       <- carries it
-/// l varchar(5)   DEFAULT 'ab'            'ab'::character varying     <- bare
-/// o time(2)      DEFAULT '01:02:03.456'  '01:02:03.456'::time without time zone
-/// ```
-///
-/// This node writes it bare for all of them, so the value below is **its own** with PostgreSQL's in
-/// the message. `ActiveRecord` reads only the quoted half — `extract_value_from_default` — so the
-/// dump is unaffected; what it costs is a client that re-parses the whole expression.
-#[test]
-fn a_default_s_cast_drops_the_interval_precision() {
-    let mut node = parity::Node::new(&["CREATE TABLE ivp (a interval(3) DEFAULT 'PT4.5S')"]);
-    node.run("SET intervalstyle = 'iso_8601'").unwrap();
-    assert_eq!(
-        node.rows(
-            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'ivp'::regclass"
-        ),
-        [["'PT4.5S'::interval".to_owned()]],
-        "PostgreSQL 19beta1 answers 'PT4.5S'::interval(3): the typmod survives in an interval's \
-         default cast where varchar(5) and time(2) both print theirs bare. When \
-         constant_expression takes the typmod, delete this test rather than editing it."
     );
 }

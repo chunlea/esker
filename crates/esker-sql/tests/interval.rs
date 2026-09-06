@@ -46,7 +46,8 @@ const ARITHMETIC: &str = "`plan::BinaryOp` is Eq/NotEq/Lt/LtEq/Gt/GtEq/And/Or, a
 const FUNCTIONS: &str = "A function this node does not implement for any type, named rather than \
      answered: `justify_days`/`justify_hours`/`justify_interval` are the three that do the \
      carrying this type deliberately does not, `age` builds an interval from two instants, \
-     `extract` and `greatest`/`least` are general, and `pg_typeof` reads the catalog.";
+     `extract` is general, and `pg_typeof` reads the catalog. **`greatest`/`least` left this \
+     list**: they are built, and answer an interval like any other ordered type.";
 
 /// The `bpchar` explicit-cast truncation, recorded a third time.
 const BPCHAR: &str = "An explicit cast to `character(n)` truncates on a real server and raises \
@@ -192,12 +193,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT '1 day'::interval = 1",
             LITERAL,
             "pg19_interval.txt:123",
-        ),
-        (
-            "SELECT greatest('1 day'::interval, '2 days'::interval), least('1 \
-             day'::interval, '2 days'::interval)",
-            FUNCTIONS,
-            "pg19_interval.txt:124",
         ),
     ],
 };

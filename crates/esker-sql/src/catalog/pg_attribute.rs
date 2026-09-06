@@ -539,7 +539,10 @@ pub fn default_expression(
         return Some(format!("'{label}'::{}", def.name));
     }
     Some(super::def_functions::constant_expression(
-        value, column.ty, rendering,
+        value,
+        column.ty,
+        column.typmod,
+        rendering,
     ))
 }
 

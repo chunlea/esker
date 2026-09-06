@@ -871,7 +871,10 @@ impl PartialEq for Datum {
             // the `numeric` two arms up.
             (Datum::Money(a), Datum::Money(b))
             | (Datum::Timestamp(a), Datum::Timestamp(b))
-            | (Datum::Time(a), Datum::Time(b)) => a == b,
+            | (Datum::Time(a), Datum::Time(b))
+            // **A `regclass`'s value is an `i64` too**, and it joins them rather than repeating
+            // their body: a relation's id is 64 bits here where a real server's oid is four.
+            | (Datum::RegClass { oid: a, .. }, Datum::RegClass { oid: b, .. }) => a == b,
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
             // **Representation equality, flag included**, which is not the SQL comparison: an
             // `inet` and a `cidr` holding the same address are equal on a real server and are two
@@ -914,8 +917,6 @@ impl PartialEq for Datum {
             // a row holding a `regtype`.
             (Datum::Oid(a), Datum::Oid(b))
             | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. }) => a == b,
-            // The same rule with a wider value: a relation's id is 64 bits here.
-            (Datum::RegClass { oid: a, .. }, Datum::RegClass { oid: b, .. }) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
@@ -1113,17 +1114,16 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
         | (ColumnType::Oid, ColumnType::RegType)
         // A `regclass` beside an `oid`, for the same reason and with the same measurement:
         // `SELECT count(*) > 0 FROM pg_attribute WHERE attrelid = 'pg_class'::regclass` is `t`.
-        | (ColumnType::RegClass, ColumnType::Oid)
-        | (ColumnType::Oid, ColumnType::RegClass)
+        //
         // **And beside an `int8`, which is temporary and is written down as such.** Every
         // relation-oid column in this node's catalog — `attrelid`, `adrelid`, `conrelid`,
         // `indrelid` — is declared `bigint` where a real server declares `oid`
         // (`tests/captures/pg19_regclass.txt`), and `WHERE attrelid = 'iv'::regclass` is the
-        // commonest statement in the catalog corpora. This pair is what keeps those comparing
+        // commonest statement in the catalog corpora. That pair is what keeps those comparing
         // while the cast stops being a `bigint`; it goes when those four columns become `oid`,
         // which is the move ADR 0077 made for `pg_enum.enumtypid` for exactly this reason.
-        | (ColumnType::RegClass, ColumnType::Int8)
-        | (ColumnType::Int8, ColumnType::RegClass)
+        | (ColumnType::RegClass, ColumnType::Oid | ColumnType::Int8)
+        | (ColumnType::Oid | ColumnType::Int8, ColumnType::RegClass)
     )
 }
 

@@ -1360,8 +1360,6 @@ fn placeholder(ty: ColumnType) -> Datum {
         // only its type is.
         ColumnType::RegType => crate::value::regtype_of_oid(0),
         ColumnType::RegClass => crate::value::regclass_of_oid(0),
-        // Text's representation: an empty vector is an empty string.
-        ColumnType::Int2Vector | ColumnType::OidVector => Datum::Text(String::new()),
         ColumnType::RegTypeArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             ColumnType::RegType,
             1,
@@ -1463,9 +1461,14 @@ fn placeholder(ty: ColumnType) -> Datum {
         ColumnType::Int2 => Datum::Int2(0),
         // The empty hstore is the empty string too, and it is a real value rather than a NULL —
         // see `crate::value::hstore`.
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Hstore => {
-            Datum::Text(String::new())
-        }
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Bpchar
+        | ColumnType::Hstore
+        // The two vectors share text's representation: an empty one is an empty string.
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector
+        | ColumnType::Xml => Datum::Text(String::new()),
         ColumnType::Citext => Datum::Citext(String::new()),
         ColumnType::TsVector => Datum::TsVector(String::new()),
         ColumnType::TsQuery => Datum::TsQuery(String::new()),
@@ -1487,7 +1490,6 @@ fn placeholder(ty: ColumnType) -> Datum {
         // The empty string *is* well-formed XML content, so an `xml` placeholder can be the
         // smallest thing there is. It only ever stands in for a type while a `Describe` is
         // answered.
-        ColumnType::Xml => Datum::Text(String::new()),
         // The empty path, which is a value: zero labels, and never read — only its type is.
         ColumnType::Ltree => Datum::Ltree(String::new()),
         // `*`, which matches every path — never read, only its type is.

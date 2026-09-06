@@ -2916,7 +2916,7 @@ fn catalog_function(
         // measured. One argument trims whitespace, which is what a bare `TRIM(x)` means.
         CatalogFunc::Btrim | CatalogFunc::Ltrim | CatalogFunc::Rtrim => {
             match (args.first(), args.get(1)) {
-                (Some(Datum::Null), _) | (_, Some(Datum::Null)) => Datum::Null,
+                (Some(Datum::Null) | None, _) | (_, Some(Datum::Null)) => Datum::Null,
                 (Some(value), set) => {
                     let Some(text) = value.to_text() else {
                         return Ok(Datum::Null);
@@ -2935,7 +2935,6 @@ fn catalog_function(
                     };
                     Datum::Text(cut(&text))
                 }
-                (None, _) => Datum::Null,
             }
         }
         // **Not strict**: a NULL argument is skipped, and the answer is NULL only when every one
@@ -3365,7 +3364,8 @@ fn catalog_function(
 fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
     Ok(match arg {
         None | Some(Datum::Null) => None,
-        Some(Datum::Int8(oid)) => Some(*oid),
+        // A `regclass` is an `i64` already, so it joins the `int8` arm rather than repeating it.
+        Some(Datum::Int8(oid) | Datum::RegClass { oid, .. }) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
         // **And a real `oid`**, which is what `'integer'::regtype::oid` folds to now: the two
@@ -3374,10 +3374,6 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         // `format_type('integer'::regtype, NULL)` the free coercion a real server makes rather
         // than the string this used to be handed.
         Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
-        // **And a `regclass`**, which is the same model one type along and is already an `i64`:
-        // `'rc'::regclass::text` reaches `regclass_name` with the value the cast produced, and
-        // refusing it here made a statement a real server answers into a `42804`.
-        Some(Datum::RegClass { oid, .. }) => Some(*oid),
         Some(Datum::Text(name)) => {
             use crate::value::PgType as _;
             let ty = crate::value::type_by_name(name)?
@@ -3396,7 +3392,8 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
 fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
     Ok(match arg {
         None | Some(Datum::Null) => None,
-        Some(Datum::Int8(oid)) => Some(*oid),
+        // A `regclass` is an `i64` already, so it joins the `int8` arm rather than repeating it.
+        Some(Datum::Int8(oid) | Datum::RegClass { oid, .. }) => Some(*oid),
         Some(Datum::Int4(oid)) => Some(i64::from(*oid)),
         Some(Datum::Int2(oid)) => Some(i64::from(*oid)),
         // An `oid` is what a catalog column really holds; `23::oid::regtype` sends one. **A
@@ -3404,10 +3401,6 @@ fn oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
         // `format_type('integer'::regtype, NULL)` the statement a real server answers rather than
         // a type error.
         Some(Datum::Oid(oid) | Datum::RegType { oid, .. }) => Some(i64::from(*oid)),
-        // **And a `regclass`**, which is the same model one type along and is already an `i64`:
-        // `'rc'::regclass::text` reaches `regclass_name` with the value the cast produced, and
-        // refusing it here made a statement a real server answers into a `42804`.
-        Some(Datum::RegClass { oid, .. }) => Some(*oid),
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "an oid is an integer, not {other:?}"
