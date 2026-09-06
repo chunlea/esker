@@ -1,0 +1,23 @@
+crates/esker-store/Cargo.toml
+  s_6f7019c05b578b::t_8410593e0f080c 64-69
+crates/esker-store/src/peer.rs
+  s_6f7019c05b578b::t_e2efb7b4667321 35-42,1775-1776,1779,1875,1919-2028
+docs/adr/0081-the-tick-driver-catches-up.md
+  s_6f7019c05b578b::t_d3d5d73c21128b 99-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c893cba28fc81d8e255ac6ec753cd06ac5e6782b",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
