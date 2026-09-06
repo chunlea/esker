@@ -1022,6 +1022,22 @@ is in its first sentence.
   at the end of the record, or beside the item it belongs to when the reader already walks that
   list — and a version is claimed by the lane that takes it, out loud, because two lanes have
   collided on the number twice.
+  **A node's authority to write is a lease from PD, and its cadence is a deadline rather than a
+  delay** ([ADR 0028](adr/0028-the-schema-lease.md)). The refresher renews at a third of the lease
+  — derived from PD's number, never configured, so a lost round trip still leaves two attempts —
+  and sleeps until `round_start + period`, so what a renewal costs comes out of the wait instead of
+  being added to it. The columnar report keeps its **own thread and its own cadence**: its PD half
+  carries a deadline but its backend half is a cluster read whose duration is unbounded, and while
+  the two shared a loop a slow report made the next renewal late. Measured on a real cluster:
+  `renew_ms=0`, `report_ms=3879` against a `period_ms=1666` on a 5 s lease, putting the next
+  renewal 5,545 ms after the last — the node's first `INSERT` came back `25006` while `SELECT 1`
+  kept working, which is why an expired write lease presents as a client problem. The two halves
+  have different failure semantics, which is the reason they are apart: a lost report is repaired
+  by the next one, because `columnar_wishes` is a full assertion and not a delta (ADR 0022
+  decision 5), and a lost renewal stops this node writing. Every recorded lease is measured, the
+  startup grant included — a renewal landing more than half a lease after the previous one logs a
+  warning with both durations. Half rather than the whole, because at the whole the client already
+  has the error.
   **The DDL surface is wider than the planner's**, and three decisions in it are worth following
   from here: a dropped column keeps its slot because a row is decoded by position
   ([ADR 0051](adr/0051-a-dropped-column-keeps-its-slot.md)); `DO` is two recognised templates and
