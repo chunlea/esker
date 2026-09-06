@@ -262,6 +262,12 @@ pub struct Parsed {
     /// arrangement `exclude` uses for a clause the parser cannot read
     /// ([`strip_create_database_options`]).
     database_options: Vec<Opt>,
+    /// `ON CONFLICT (…) WHERE <predicate>`: the predicate, as written.
+    ///
+    /// It names the **partial index** the statement wants inferred, and `sqlparser` 0.62.0 stops
+    /// at the keyword ([`strip_on_conflict_predicate`]), so like every other fact in this block it
+    /// comes off the source and is re-attached where the statement is lowered.
+    conflict_predicate: Option<String>,
     /// Whether `CREATE TABLE` was written `CREATE UNLOGGED TABLE`.
     ///
     /// `sqlparser` 0.62.0 reads `TEMP`/`TEMPORARY` before `TABLE` and not `UNLOGGED`, so the word
@@ -375,6 +381,12 @@ impl Parsed {
     #[must_use]
     pub fn class(&self) -> &StatementClass {
         &self.class
+    }
+
+    /// The `WHERE` predicate of an `ON CONFLICT` target, or `None` when the clause had none.
+    #[must_use]
+    pub fn conflict_predicate(&self) -> Option<&str> {
+        self.conflict_predicate.as_deref()
     }
 
     /// Whether the `CREATE TABLE` said `UNLOGGED`.
@@ -588,6 +600,10 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let sql = with_data_rewrite
         .as_ref()
         .map_or(sql, |(text, _)| text.as_str());
+    // `ON CONFLICT (…) WHERE …` — the predicate comes off and travels on `Parsed`, because the
+    // parser expects `DO` there and its tree has nowhere to put one.
+    let conflict = strip_on_conflict_predicate(sql, &scanned);
+    let sql = conflict.as_ref().map_or(sql, |(text, _)| text.as_str());
     // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
     let namespaced = strip_parameter_namespace(sql, &scanned);
     let sql = namespaced.as_ref().map_or(sql, |(text, _)| text.as_str());
@@ -619,6 +635,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
                 unlogged,
+                conflict_predicate: conflict.as_ref().map(|(_, predicate)| predicate.clone()),
                 do_guarded: guarded.is_some(),
                 raise: raise.clone(),
                 virtual_generated: virtual_rewrite
@@ -880,6 +897,111 @@ fn strip_with_data(sql: &str, scanned: &Scan<'_>) -> Option<(String, bool)> {
     for (suffix, data) in [(" WITH NO DATA", false), (" WITH DATA", true)] {
         if let Some(kept) = upper.strip_suffix(suffix) {
             return Some((trimmed.get(..kept.len())?.to_owned(), data));
+        }
+    }
+    None
+}
+
+/// Cuts the `WHERE <predicate>` out of `ON CONFLICT (…) WHERE <predicate> DO …`, returning the
+/// statement without it and the predicate as written.
+///
+/// **A `sqlparser` 0.62.0 gap shim, for one production of one grammar.** PostgreSQL's `INSERT` is
+///
+/// ```text
+/// ON CONFLICT [ ( index_column_name [, …] ) [ WHERE index_predicate ] ] DO { NOTHING | UPDATE … }
+/// ```
+///
+/// and `sqlparser` expects `DO` immediately after the target list — `expect_keyword_is(Keyword::DO)`,
+/// `parser/mod.rs:18005` — so the clause is `Expected: DO, found: WHERE`. Its `OnConflict` has no
+/// field to hold a predicate either, so there is nothing a lowering could recover from the tree:
+/// the text has to come off here and travel on [`Parsed::conflict_predicate`]. `0.62.0` is the
+/// latest release, so this is not a version away.
+///
+/// **The boundary is unambiguous**, which is what makes a text shim honest here: the predicate
+/// sits between the target's closing parenthesis and the `DO` that must follow it, and a `DO`
+/// inside the predicate can only be a quoted identifier or a string — both of which this walk
+/// steps over, as every other shim in this file does.
+///
+/// `ON CONFLICT ON CONSTRAINT c` has no parenthesis after `CONFLICT` and is left alone;
+/// `lower_on_conflict` refuses it by name.
+fn strip_on_conflict_predicate(sql: &str, scanned: &Scan<'_>) -> Option<(String, String)> {
+    if !contains_words(&scanned.words, &["ON", "CONFLICT"]) {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let open = on_conflict_target(bytes)?;
+    let after_target = balanced_end(bytes, open)?;
+    let where_at = skip_blank(bytes, after_target);
+    let after_where = eat_word(bytes, where_at, "WHERE")?;
+    let do_at = do_keyword(bytes, after_where)?;
+    let predicate = sql.get(after_where..do_at)?.trim();
+    if predicate.is_empty() {
+        return None;
+    }
+    let predicate = predicate.to_owned();
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(sql.get(..where_at)?);
+    rewritten.push(' ');
+    rewritten.push_str(sql.get(do_at..)?);
+    Some((rewritten, predicate))
+}
+
+/// The `(` that opens an `ON CONFLICT` target list, at the statement's own bracket level.
+///
+/// Depth is tracked because an `ON` inside a parenthesised subquery is a join's, not a conflict
+/// clause's, and quoted spans are stepped over because a column may be called `"on conflict"`.
+fn on_conflict_target(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    let mut depth = 0_usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => at = single_quote_end(bytes, at),
+            b'"' => at = double_quote_end(bytes, at),
+            b'-' if bytes.get(at + 1) == Some(&b'-') => at = line_comment_end(bytes, at),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => at = block_comment_end(bytes, at),
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                at += 1;
+            }
+            _ if depth == 0 => {
+                if let Some(after_on) = eat_word(bytes, at, "ON")
+                    && let Some(after_conflict) =
+                        eat_word(bytes, skip_blank(bytes, after_on), "CONFLICT")
+                {
+                    let open = skip_blank(bytes, after_conflict);
+                    return (bytes.get(open) == Some(&b'(')).then_some(open);
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The offset of the `DO` that closes an `ON CONFLICT` clause, from just after its predicate.
+fn do_keyword(bytes: &[u8], mut at: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => at = single_quote_end(bytes, at),
+            b'"' => at = double_quote_end(bytes, at),
+            b'-' if bytes.get(at + 1) == Some(&b'-') => at = line_comment_end(bytes, at),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => at = block_comment_end(bytes, at),
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                at += 1;
+            }
+            _ if depth == 0 && eat_word(bytes, at, "DO").is_some() => return Some(at),
+            _ => at += 1,
         }
     }
     None

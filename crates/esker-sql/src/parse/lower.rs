@@ -193,6 +193,17 @@ impl Parsed {
                 *not_null = self.domain_not_null();
             }
         }
+        // `ON CONFLICT (…) WHERE …`: the predicate the parser could not hold
+        // (`crate::parse::strip_on_conflict_predicate`).
+        if let Some(predicate) = self.conflict_predicate() {
+            let on_conflict = match &mut lowered {
+                plan::Statement::Insert(insert) => insert.on_conflict.as_mut(),
+                _ => None,
+            };
+            if let Some(on_conflict) = on_conflict {
+                on_conflict.predicate = Some(predicate.to_owned());
+            }
+        }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }
@@ -3533,7 +3544,13 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
             )
         }
     };
-    Ok(plan::OnConflict { target, action })
+    // The predicate is not in the tree — `sqlparser` stops at the keyword — and is attached where
+    // `Parsed` is in scope (`parse::Parsed::conflict_predicate`, applied in `lower_inline`).
+    Ok(plan::OnConflict {
+        target,
+        predicate: None,
+        action,
+    })
 }
 
 /// An expression, as far as phase 6a's `VALUES` needs one.

@@ -1330,6 +1330,66 @@ fn resolve_conflict(
 /// the statement draws no `nextval`, and a node that checked them after building the proposed row
 /// would leave the counter three higher over the capture's three probes. The inference itself is
 /// re-done per row against the *partition* the row routes to, whose indexes mirror these.
+/// Whether an index is the one an `ON CONFLICT` names, as far as its **predicate** goes.
+///
+/// PostgreSQL infers an index whose predicate is *implied by* the one the statement wrote — so
+/// `WHERE a > 5` may select an index `WHERE a > 0`. There is no implication machinery in this
+/// crate (`catalog::IndexDef::predicate` says so, and says why), so this is equality of the text
+/// after the two differences one predicate's two spellings actually have: the parentheses
+/// `ActiveRecord` wraps the clause in, and runs of whitespace. That is the **honest subset** of
+/// PostgreSQL's rule — every index it infers here is one a real server would infer, and the ones
+/// it misses are refused with `42P10` rather than answered wrongly.
+///
+/// A statement with no predicate infers only an index with none, which is what keeps a bare
+/// `ON CONFLICT` off a partial index — the rule that was here before and is still right.
+fn predicate_matches(index: &crate::catalog::IndexDef, wanted: Option<&str>) -> bool {
+    match (index.predicate.as_deref(), wanted) {
+        (None, None) => true,
+        (Some(held), Some(wanted)) => same_predicate(held, wanted),
+        _ => false,
+    }
+}
+
+/// Two predicates that differ only by an enclosing pair of parentheses and by whitespace.
+///
+/// **Case is kept.** A quoted identifier's case is meaningful, and folding it would make
+/// `WHERE "Published" IS NOT NULL` match an index on a different column.
+fn same_predicate(left: &str, right: &str) -> bool {
+    fn normalise(text: &str) -> String {
+        let trimmed = text.trim();
+        // One layer, and only when that pair is the outermost one: `(a) AND (b)` keeps its
+        // parentheses, because stripping them there would leave `a) AND (b`.
+        let inner = trimmed
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|inner| enclosed(inner))
+            .unwrap_or(trimmed);
+        inner.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    normalise(left) == normalise(right)
+}
+
+/// Whether a parenthesis never closes past the start of `text` — the test for "the pair around
+/// this was the outermost one".
+fn enclosed(text: &str) -> bool {
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    for byte in text.bytes() {
+        match byte {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 fn validate_on_conflict(table: &TableDef, on_conflict: &crate::plan::OnConflict) -> Result<()> {
     let wanted: Vec<usize> = on_conflict
         .target
@@ -1340,12 +1400,14 @@ fn validate_on_conflict(table: &TableDef, on_conflict: &crate::plan::OnConflict)
                 .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
+    // **A primary key has no predicate**, so a statement that wrote one cannot mean it.
     let primary = !table.primary_key.is_empty()
         && table.row_id().is_none()
+        && on_conflict.predicate.is_none()
         && (wanted.is_empty() || same_key(&wanted, &table.primary_key));
     let indexed = table.indexes.iter().any(|index| {
         index.unique
-            && index.predicate.is_none()
+            && predicate_matches(index, on_conflict.predicate.as_deref())
             && index
                 .key_columns()
                 .is_some_and(|columns| wanted.is_empty() || same_key(&wanted, &columns))
@@ -1387,9 +1449,11 @@ struct Conflicting {
 /// takes any unique index and stops at the first that collides — which is what `insert_all`
 /// without a `unique_by` sends.
 ///
-/// A **partial** index is never inferred: PostgreSQL matches one only when the statement repeats
-/// its predicate, and that spelling does not parse here (`lower_on_conflict`). Leaving it out is
-/// what makes a bare target over a partial index the `42P10` a real server gives it too.
+/// A **partial** index is inferred only when the statement repeats its predicate —
+/// `ON CONFLICT (isbn) WHERE (published_on IS NOT NULL)`, which `insert_all(unique_by:)` sends and
+/// which reaches the plan through `parse::strip_on_conflict_predicate`. A bare target over a
+/// partial index stays the `42P10` a real server gives it, which is what
+/// `upsert_all_does_not_perform_an_upsert_if_a_partial_index_doesnt_apply` is about.
 fn conflicting_row(
     executor: &Executor,
     txn: &dyn Txn,
@@ -1411,6 +1475,7 @@ fn conflicting_row(
     // and answers with the row it found rather than with a pointer to one.
     if !table.primary_key.is_empty()
         && table.row_id().is_none()
+        && on_conflict.predicate.is_none()
         && (wanted.is_empty() || same_key(&wanted, &table.primary_key))
     {
         inferred += 1;
@@ -1431,8 +1496,10 @@ fn conflicting_row(
         let Some(columns) = index.key_columns() else {
             continue;
         };
-        // A partial index is not inferable; see above.
-        if index.predicate.is_some() || !(wanted.is_empty() || same_key(&wanted, &columns)) {
+        // A partial index is inferred **only** when the statement repeats its predicate; see above.
+        if !predicate_matches(index, on_conflict.predicate.as_deref())
+            || !(wanted.is_empty() || same_key(&wanted, &columns))
+        {
             continue;
         }
         inferred += 1;

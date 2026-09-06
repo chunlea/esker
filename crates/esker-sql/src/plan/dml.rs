@@ -46,6 +46,15 @@ pub struct OnConflict {
     /// A *column* list and not an index name: PostgreSQL infers the index from it, so a list that
     /// matches no unique index is `42P10` rather than a name that does not resolve.
     pub target: Vec<String>,
+    /// `ON CONFLICT (…) WHERE <predicate>`: the index predicate, as the statement wrote it.
+    ///
+    /// **It selects a partial index and nothing else.** PostgreSQL infers an index whose predicate
+    /// is *implied by* this one; this crate has no implication machinery (`catalog::IndexDef`'s
+    /// own doc says so), so the match is on the text, which is the honest subset of that rule and
+    /// is what `ActiveRecord` sends — `insert_all(unique_by: :index_name)` repeats the index's
+    /// `where:` verbatim. `None` means the statement wrote no predicate, which infers only an
+    /// index that has none.
+    pub predicate: Option<String>,
     /// What to do with a row that conflicts.
     pub action: ConflictAction,
 }
