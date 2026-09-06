@@ -28,6 +28,13 @@ pub struct Backend {
     pub key: u32,
     /// Set by a cancellation, read by `crate::exec::cancel` between units of work.
     pub cancel: Arc<AtomicBool>,
+    /// Set by `pg_terminate_backend`, read by the connection loop before it handles a message.
+    ///
+    /// **Separate from `cancel` because they end different things.** A cancellation stops the
+    /// statement and leaves the session; this ends the session, so a client that catches `57014`
+    /// and carries on is right to, and one that meets `57P01` has no connection left to carry on
+    /// with. Sharing one flag would make the first indistinguishable from the second.
+    pub terminate: Arc<AtomicBool>,
     /// What this session is doing, for `pg_stat_activity` to report.
     pub activity: Arc<Mutex<Activity>>,
 }
@@ -144,6 +151,7 @@ pub fn register() -> Backend {
         pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
         key: fresh_key(),
         cancel: Arc::new(AtomicBool::new(false)),
+        terminate: Arc::new(AtomicBool::new(false)),
         activity: Arc::new(Mutex::new(Activity::default())),
     };
     if let Ok(mut live) = backends().lock() {
@@ -215,6 +223,29 @@ pub fn cancel_pid(pid: u32) -> bool {
     match live.get(&pid) {
         Some(backend) => {
             backend.cancel.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ends the session at `pid`, for `pg_terminate_backend()`.
+///
+/// **Sets a flag; it does not close a socket.** The connection loop reads it before it handles the
+/// victim's next message and ends the connection there, which is the only thread that owns that
+/// stream. PostgreSQL signals the backend and closes even while it sits idle — the difference is
+/// the wait, and it is invisible to a client that goes on to use the connection.
+///
+/// False for a pid nobody holds, matching `cancel_pid`. PostgreSQL also emits a `WARNING` saying
+/// the pid is not a backend process, which the caller adds: this function has no session to add it
+/// to.
+pub fn terminate_pid(pid: u32) -> bool {
+    let Ok(live) = backends().lock() else {
+        return false;
+    };
+    match live.get(&pid) {
+        Some(backend) => {
+            backend.terminate.store(true, Ordering::Relaxed);
             true
         }
         None => false,

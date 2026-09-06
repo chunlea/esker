@@ -348,14 +348,21 @@ fn the_shapes_this_phase_does_not_run_name_themselves() {
     );
 }
 
-/// The three clauses of a writing statement that still refuse a subquery, each naming itself.
+/// The two clauses of a writing statement that still refuse a subquery, each naming itself.
 ///
 /// **The `WHERE` is no longer one of them**, and the two entries that stood at the top of this
 /// list are gone: `delete_all` and `update_all` on a relation carrying a `LIMIT` or a `JOIN` send
 /// `IN (subquery)` there — 39 tests across 9 files — so the write path plans and runs its filter's
 /// subqueries (`crate::exec::dml::collect`), and `tests/write_in_subquery.rs` is the capture.
 ///
-/// The three below have no such pass yet, and the refusal is what stands between them and the row
+/// **Nor is the `SET`.** A third entry stood here — `UPDATE sq_a SET k = (SELECT max(v) FROM
+/// sq_b)` — and went the same way: `crate::exec::dml::plan_assignment_subqueries` plans each
+/// assignment's subqueries once per target relation before the first row is written, and
+/// `tests/update_set_subquery.rs` is the capture. The uncorrelated ones run there, so an
+/// assignment reads the rows as the statement found them; a correlated one is left for the row
+/// evaluator, which has the row.
+///
+/// The two below have no such pass yet, and the refusal is what stands between them and the row
 /// evaluator: a subquery arriving there with no plan behind it answers `XX000 internal error` — a
 /// code that says *this server has a bug* about a statement a real server runs. `0A000` naming the
 /// construct and the clause is what `docs/plans/phase-12-subquery.md` §4 promises instead.
@@ -364,10 +371,6 @@ fn a_subquery_in_a_statement_that_writes_names_itself() {
     let mut node = parity::Node::new(FIXTURE);
 
     for (statement, named) in [
-        (
-            "UPDATE sq_a SET k = (SELECT max(v) FROM sq_b)",
-            "a scalar subquery in an UPDATE assignment",
-        ),
         (
             "UPDATE sq_a SET k = 1 RETURNING (SELECT count(*) FROM sq_b)",
             "a scalar subquery in a RETURNING list",

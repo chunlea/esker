@@ -317,7 +317,30 @@ fn named_relations<'a>(
         .iter()
         .chain(select.joins.iter().map(|join| &join.table))
     {
-        if entry.derived.is_some() || entry.values.is_some() || entry.function.is_some() {
+        if let Some(derived) = &entry.derived {
+            // **A CTE is a derived table by the time this runs** — `plan::cte::inline` rewrites the
+            // `WITH` list at lowering — so a column of a CTE reaches here with no `TableDef` behind
+            // it and nothing typed the `$n` beside it: `WITH t AS (SELECT * FROM posts)
+            // SELECT id FROM t WHERE tags_count > $1` was
+            // `42883 operator does not exist: integer > text` (`with_test.rb`, two tests).
+            //
+            // **Only a derived table that re-projects one relation's columns unchanged**, which is
+            // the case that is safe to answer: a bare `*` keeps every name and type of the relation
+            // under it, so the outer name can stand for that relation. A projection that computes,
+            // renames, or draws on two relations does not, and it is skipped exactly as before
+            // rather than guessed at — `SELECT a AS b` would otherwise type `b` as `a`.
+            if let Some(inner) = passes_columns_through(derived, tables) {
+                named.push((
+                    entry
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| bare(&entry.name).to_owned()),
+                    inner,
+                ));
+            }
+            continue;
+        }
+        if entry.values.is_some() || entry.function.is_some() {
             continue;
         }
         // **Both sides are compared at the same qualification**, which is the half that was
@@ -350,6 +373,41 @@ fn named_relations<'a>(
         ));
     }
     named
+}
+
+/// The one relation a derived table re-projects unchanged, if that is all it does.
+///
+/// `WITH t AS (SELECT * FROM posts)` publishes `posts`'s columns under `t`, with the same names and
+/// the same types, so a `$n` compared with one of them can be typed from `posts`. That is the whole
+/// of what this answers, and the conditions are what keep it true:
+///
+/// * the projection is a single `*` or `q.*` — anything computed or renamed publishes a column that
+///   is not the relation's, and `SELECT a AS b` would otherwise type `b` from `a`;
+/// * no column alias list (`WITH t (x, y) AS …`), which renames every column at once;
+/// * exactly one relation underneath, so there is no ambiguity about which one a name came from.
+///
+/// **It recurses**, because the statement that found this is three deep: `posts_with_tags` over
+/// `posts`, `posts_with_tags_and_truthy` over that, and the `$1` in the third one.
+fn passes_columns_through<'a>(
+    derived: &crate::plan::Derived,
+    tables: &'a [std::sync::Arc<TableDef>],
+) -> Option<&'a TableDef> {
+    if !derived.columns.is_empty() {
+        return None;
+    }
+    let [only] = &derived.select.projection[..] else {
+        return None;
+    };
+    if !matches!(
+        only,
+        crate::plan::SelectItem::Wildcard | crate::plan::SelectItem::QualifiedWildcard(_)
+    ) {
+        return None;
+    }
+    match named_relations(&derived.select, tables).as_slice() {
+        [(_, def)] => Some(def),
+        _ => None,
+    }
 }
 
 /// Every relation under its own name, for the statements that have no `FROM` list to read aliases

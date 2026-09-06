@@ -122,10 +122,12 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
 
 impl<S> Drop for Connection<S> {
     /// **Forgets this session however the connection ends**, which is why it is a destructor and
-    /// not a line at each `return`: the run loop leaves by six routes — `Terminate`, the client
-    /// vanishing, an idle-in-transaction timeout, a failed startup, an I/O error — and a registry
-    /// that leaked one entry per dropped connection would grow for the life of the process and
-    /// hand out pids that answer for nobody.
+    /// not a line at each `return`: the run loop leaves by many routes — `Terminate`, the client
+    /// vanishing, an idle-in-transaction timeout, `pg_terminate_backend` (twice: before a message
+    /// is handled, and after one that terminated this session itself), a failed startup, an I/O
+    /// error — and a registry that leaked one entry per dropped connection would grow for the life
+    /// of the process and hand out pids that answer for nobody. The count is deliberately not
+    /// given here: it was "six" and two more arrived.
     fn drop(&mut self) {
         if let Some(backend) = &self.backend {
             crate::session::deregister(backend.pid);
@@ -294,6 +296,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 work.executor.release_advisory_locks();
                 return Ok(());
             };
+            // **`pg_terminate_backend` ends the session, and this is where it lands.** The flag is
+            // set by another connection's thread; this one owns the socket, so the close happens
+            // here and before the message is handled — a terminated backend runs nothing else,
+            // which is what makes it a termination rather than a very rude cancellation.
+            //
+            // The unwinding is the idle-in-transaction path's, for the same reason and on the same
+            // pool: an open block is given back before the socket goes, so nothing it wrote is
+            // left half-open behind a connection nobody can reach.
+            if work.executor.terminated() {
+                let mut ending = work;
+                tokio::task::spawn_blocking(move || {
+                    let _ = ending.executor.rollback();
+                    ending.executor.release_advisory_locks();
+                })
+                .await
+                .map_err(std::io::Error::other)?;
+                self.send_error(&SqlError::TerminatedByAdministrator)
+                    .await?;
+                return Ok(());
+            }
             let message = match decode(tag, &body) {
                 Ok(message) => message,
                 Err(error) => {
@@ -323,6 +345,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             })
             .await
             .map_err(std::io::Error::other)?;
+            // **A session may terminate itself**, and then its own answer must not be sent:
+            // `SELECT pg_terminate_backend(pg_backend_pid())` on PostgreSQL replies `FATAL` and
+            // closes — the `t` the function computed never reaches the client. The check before
+            // the message is handled cannot see this one, because the flag is set *by* the
+            // statement being handled.
+            //
+            // It also tightens the cross-session case: a victim terminated while its statement was
+            // running is told so when that statement ends, rather than answering once more first.
+            if work.executor.terminated() {
+                let mut ending = work;
+                tokio::task::spawn_blocking(move || {
+                    let _ = ending.executor.rollback();
+                    ending.executor.release_advisory_locks();
+                })
+                .await
+                .map_err(std::io::Error::other)?;
+                self.send_error(&SqlError::TerminatedByAdministrator)
+                    .await?;
+                return Ok(());
+            }
             if !work.out.is_empty() {
                 self.stream.write_all(&work.out).await?;
                 self.stream.flush().await?;
@@ -736,6 +778,11 @@ const _: Option<&dyn Backend> = None;
 pub struct NotYetExecuting;
 
 impl Execute for NotYetExecuting {
+    /// There is no session yet, so there is nothing to terminate.
+    fn terminated(&self) -> bool {
+        false
+    }
+
     fn execute(
         &mut self,
         parsed: &crate::parse::Parsed,
