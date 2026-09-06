@@ -1546,7 +1546,7 @@ fn lower_multi_word_show(variable: &[Ident]) -> Option<plan::Statement> {
         // one is `42601` on a real server, so taking the word accepts a statement PostgreSQL
         // refuses — an over-acceptance, which is the direction contract C1 leaves open, and the
         // alternative is refusing the form the suite actually sends.
-        ["AUTHORIZATION"] | ["SESSION_AUTHORIZATION"] => {
+        ["AUTHORIZATION" | "SESSION_AUTHORIZATION"] => {
             return Some(plan::Statement::Session(
                 plan::SessionStatement::ShowSessionAuthorization,
             ));
@@ -6762,10 +6762,10 @@ fn lower_parenthesised(outer: &Query, inner: &Query) -> Result<plan::Select> {
     }
     let mut merged = inner.clone();
     if outer.with.is_some() {
-        merged.with = outer.with.clone();
+        merged.with.clone_from(&outer.with);
     }
     if outer.order_by.is_some() {
-        merged.order_by = outer.order_by.clone();
+        merged.order_by.clone_from(&outer.order_by);
     }
     merged.limit_clause = merge_limits(inner.limit_clause.clone(), outer.limit_clause.clone());
     // **Concatenated rather than chosen**: two `FOR UPDATE`s are legal and merge on a real server,

@@ -221,8 +221,6 @@ fn walk(
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             walk_select(query, tables, seen);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => walk_select(select, tables, seen),
         Statement::Update(update) => {
@@ -293,6 +291,9 @@ fn walk(
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }
@@ -866,8 +867,6 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             walk_select_mut(query, visit);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => walk_select_mut(select, visit),
         Statement::Update(update) => {
@@ -928,6 +927,9 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }
@@ -1093,8 +1095,6 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
             collect_table_names(query, &mut names);
             names
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and no table.
-        Statement::Cursor(_) => Vec::new(),
         Statement::Select(select) => {
             let mut names = Vec::new();
             collect_table_names(select, &mut names);
@@ -1172,6 +1172,9 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         // to resolve names against: the checkpoint verbs take a name that is their own, and a
         // `DIFF`'s table is resolved where it is scanned, in its own snapshot.
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => Vec::new(),
     }
 }
@@ -1230,8 +1233,6 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             for_each_in_select(query, &mut each);
         }
-        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all.
-        Statement::Cursor(_) => {}
 
         Statement::Select(select) => for_each_in_select(select, &mut each),
         Statement::Update(update) => {
@@ -1283,6 +1284,9 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::AlterType(_)
         | Statement::AlterTable(_)
         | Statement::Session(_)
+        // `FETCH`, `MOVE` and `CLOSE` name a cursor and carry no expression at all; a
+        // `DECLARE`'s query is walked by the arm above.
+        | Statement::Cursor(_)
         | Statement::TimeMachine(_) => {}
     }
 }

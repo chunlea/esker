@@ -320,14 +320,14 @@ impl Session {
     fn prepare_sql(
         &mut self,
         name: String,
-        body: String,
+        body: &str,
         source: &str,
         executor: &mut dyn Execute,
     ) -> Result<Outcome> {
         if self.statements.contains_key(&name) {
             return Err(SqlError::DuplicatePreparedStatement(name));
         }
-        let mut prepared = parse_statements(&body)?;
+        let mut prepared = parse_statements(body)?;
         if prepared.len() != 1 {
             return Err(SqlError::unsupported("PREPARE of more than one statement"));
         }
@@ -902,7 +902,7 @@ impl Session {
                 outcome
             }
             StatementClass::Prepare { name, body } => {
-                self.prepare_sql(name.clone(), body.clone(), parsed.text(), executor)
+                self.prepare_sql(name.clone(), body, parsed.text(), executor)
             }
             StatementClass::Execute { name, args } => {
                 self.execute_sql(name.clone(), args.clone(), executor)
