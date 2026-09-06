@@ -91,6 +91,14 @@ pub struct Executor {
     /// view would need a second code path for the ones it cannot — which is the thing this change
     /// exists to remove.
     identity: crate::session::Backend,
+    /// What this session has prepared, for `pg_prepared_statements` to report.
+    ///
+    /// **Handed in rather than kept**: the statements live in the protocol's session
+    /// ([`crate::pgwire::session::Session`]), which rebuilds this list immediately before every
+    /// statement runs ([`crate::pgwire::session::Execute::remember_prepared`]). An executor with
+    /// no protocol above it — a `Pair`, a corpus replay — has an empty one, and a session that
+    /// has prepared nothing has an empty one too, which is the same answer for the same reason.
+    prepared: Vec<crate::session::PreparedStatement>,
     /// Blocks of sequences this transaction dropped, to forget **if** it commits.
     forget_on_commit: Vec<u64>,
     /// The role this session authenticated as, which `serving_user` sets.
@@ -703,6 +711,7 @@ impl Executor {
             locks,
             session,
             identity,
+            prepared: Vec::new(),
             forget_on_commit: Vec::new(),
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
@@ -1251,10 +1260,11 @@ impl Executor {
     ///
     /// The path is resolved by the caller because resolving it reads the catalog and needs a
     /// transaction; everything else here is session state and is read from the parameters.
-    fn settings<'a>(&self, search_path: &'a [String]) -> cursor::Settings<'a> {
+    fn settings<'a>(&'a self, search_path: &'a [String]) -> cursor::Settings<'a> {
         cursor::Settings {
             search_path,
             interval_style: self.interval_style(),
+            prepared: &self.prepared,
         }
     }
 
@@ -3661,6 +3671,10 @@ fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
 }
 
 impl Execute for Executor {
+    fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
+        self.prepared = statements;
+    }
+
     fn terminated(&self) -> bool {
         self.identity
             .terminate

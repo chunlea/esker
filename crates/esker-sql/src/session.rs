@@ -60,6 +60,38 @@ pub struct Activity {
     pub in_transaction: bool,
 }
 
+/// One row of `pg_prepared_statements`: a statement this session has named.
+///
+/// **Here rather than under `pgwire`, for the reason the module header gives**: a catalog view
+/// reports these, and a catalog that had to name the wire module to describe a session would be
+/// the wrong way round. The protocol still owns the *store* —
+/// [`crate::pgwire::session::Session`] holds the parsed statements — and what travels here is
+/// only what the view prints, rebuilt from that one store each time a statement runs so the two
+/// cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStatement {
+    /// The name it was given: a `PREPARE`'s, or the one a `Parse` message carried.
+    pub name: String,
+    /// The text the client sent, verbatim.
+    ///
+    /// Measured on PostgreSQL 19: a SQL `PREPARE` reports **the whole `PREPARE …` statement** —
+    /// semicolon and line breaks included, exactly as it arrived — while a protocol-level `Parse`
+    /// reports only the query string it carried. The same plan therefore prints two different
+    /// strings depending on which door made it, and that is the point of the column.
+    pub statement: String,
+    /// One type OID per parameter. Empty on a statement that takes none, which prints `{}`.
+    pub parameters: Vec<u32>,
+    /// One type OID per result column, or `None` for a statement that returns no rows.
+    ///
+    /// `None` is PostgreSQL's NULL here rather than an empty array — measured: an `INSERT` with no
+    /// `RETURNING` has a NULL `result_types` beside a `{integer}` `parameter_types`, so the two
+    /// columns spell "nothing" differently and a client reading `result_types IS NULL` is asking
+    /// whether the statement returns rows at all.
+    pub results: Option<Vec<u32>>,
+    /// Whether SQL `PREPARE` made it, as against the protocol's `Parse`.
+    pub from_sql: bool,
+}
+
 impl Backend {
     /// Records whether this session is inside an open transaction block.
     pub fn in_transaction(&self, open: bool) {

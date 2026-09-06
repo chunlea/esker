@@ -28,58 +28,24 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // loud rather than assuming it in the code. ADR 0054 built the tables, and the harness
         // failed this test on three entries that had started agreeing — which is the whole point
         // of writing an absence down. `DISCARD TEMP` now drops what it names.
-        // SQL-level `PREPARE` is a named refusal — the extended protocol's named statements are a
-        // different thing and *are* cleared by `DISCARD ALL`, which `discarding_all_clears_the_\
-        // session` asserts directly because no corpus statement can reach them.
-        (
-            "PREPARE dsc_plan AS SELECT $1::int + 1",
-            "`0A000 PREPARE is not supported`: this node's prepared statements are the wire \
-             protocol's, not SQL's. `DISCARD ALL` does clear those — see the test below.",
-            "pg19_discard_all.txt:38",
-        ),
-        (
-            "PREPARE dsc_plan2 AS SELECT 1",
-            "The same.",
-            "pg19_discard_all.txt:69",
-        ),
-        (
-            "PREPARE dsc_plan3 AS SELECT 1",
-            "The same.",
-            "pg19_discard_all.txt:75",
-        ),
-        (
-            "DEALLOCATE ALL",
-            "The same: nothing SQL-level to deallocate.",
-            "pg19_discard_all.txt:70",
-        ),
-        (
-            "SELECT 'r', name FROM pg_prepared_statements WHERE name = 'dsc_plan'",
-            "`42P01`: no `pg_prepared_statements`, for the same reason as `pg_locks` — its rows \
-             are session state and this node's catalog views read the store.",
-            "pg19_discard_all.txt:39",
-        ),
-        (
-            "SELECT 'r', count(*) FROM pg_prepared_statements WHERE name = 'dsc_plan'",
-            "The same.",
-            "pg19_discard_all.txt:51",
-        ),
-        (
-            "SELECT 'r', count(*) FROM pg_prepared_statements",
-            "The same.",
-            "pg19_discard_all.txt:71",
-        ),
-        (
-            "SELECT count(*) FROM pg_prepared_statements",
-            "The same.",
-            "pg19_discard_all.txt:93",
-        ),
+        //
+        // **Eight more went the same way**, and they are the reason to write an absence down
+        // rather than assume it: the four SQL prepared-statement statements and the four reads of
+        // `pg_prepared_statements`. SQL `PREPARE` was a named refusal and the view did not exist,
+        // so this file recorded both — and when the statements landed, rule 2 failed this test and
+        // named all eight rather than letting a stale list quietly under-claim the node. What the
+        // corpus proves now is the whole sequence: `DISCARD PLANS` and `DISCARD TEMP` leave a
+        // prepared statement alone, `DEALLOCATE ALL` and `DISCARD ALL` clear it, and the view
+        // counts it either way.
         // **`pg_locks` exists now and answers `0` correctly**, so the two lines that count zero
         // advisory locks have been deleted from this list — they agree. What is left is the two
         // that count a lock *while it is held*, and they diverge for a reason worth naming: the
         // view reports **row** locks, which live in the node's lock table, and an advisory lock is
         // **session** state. A catalog view is handed a transaction and a tenant, not a session,
-        // so the advisory table cannot be reached from here — the same wall `pg_prepared_statements`
-        // is behind, and the same one `pg_stat_activity` reports one row because of.
+        // so the advisory table cannot be reached from here. `pg_prepared_statements` was behind
+        // that same wall until this unit and is the way through it: its rows are handed down from
+        // the session before each statement runs, which is what an advisory-lock row would need
+        // too.
         (
             "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001",
             "`0` here and `1` on the oracle: the lock is taken and released correctly (asserted in \
@@ -144,12 +110,13 @@ fn every_discard_answer_is_postgresql_19_s() {
 /// **What the corpus cannot reach: the state that lives on the *session* rather than the
 /// executor.**
 ///
-/// A prepared statement here is the wire protocol's, not SQL's — `PREPARE` is a named refusal, so
-/// no statement in the corpus can make one, and `pg_prepared_statements` does not exist to read it
-/// back. `DISCARD ALL` still has to clear them, because that is the whole point of the statement:
-/// `postgresql_adapter.rb:392` sends it when a connection goes back to the pool, and a pooled
-/// connection that kept the last borrower's named statements would answer the next one's `Bind`
-/// with the wrong SQL.
+/// A **protocol-level** prepared statement — one a `Parse` message named — is what no corpus
+/// statement can reach: `psql` sends `Query`, so a capture has no `Parse` in it. SQL `PREPARE` and
+/// `pg_prepared_statements` are both real now and the corpus above covers them; this is the other
+/// door to the same store. `DISCARD ALL` has to clear it, because that is the whole point of the
+/// statement: `postgresql_adapter.rb:392` sends it when a connection goes back to the pool, and a
+/// pooled connection that kept the last borrower's named statements would answer the next one's
+/// `Bind` with the wrong SQL.
 ///
 /// The advisory lock is asserted here for the same reason — `pg_locks` is a declared divergence,
 /// so the release is invisible to the corpus and provable only by taking the lock again.

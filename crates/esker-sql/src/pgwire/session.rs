@@ -135,6 +135,20 @@ pub trait Execute {
     /// session registry behind it answers `false` in one line and says so.
     fn terminated(&self) -> bool;
 
+    /// Hands the executor this session's prepared statements, for `pg_prepared_statements`.
+    ///
+    /// Called immediately before every statement runs, and passing the whole list each time is
+    /// deliberate: the store lives in [`Session`] and this is a *copy* of it, so the only way the
+    /// two cannot disagree is for the copy to be rebuilt at the moment it can be read. An
+    /// executor that keeps its own tally, updated as statements come and go, is the arrangement
+    /// that drifts.
+    ///
+    /// **Required rather than defaulted**, for `terminated`'s reason and one of its own: an
+    /// implementor that silently did nothing would answer every read of the view with no rows,
+    /// which is indistinguishable from a session that has prepared nothing. An executor with no
+    /// catalog behind it discards the list in one line and says so.
+    fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>);
+
     /// What a statement takes and what it returns, without running it — what `Describe` needs.
     ///
     /// The default answers "no parameters, no rows", which is right for an executor that runs
@@ -239,6 +253,19 @@ struct Prepared {
     parsed: Option<Parsed>,
     /// Parameter type OIDs as the client declared them in `Parse`.
     param_types: Vec<u32>,
+    /// The text `pg_prepared_statements.statement` reports, verbatim as the client sent it.
+    source: String,
+    /// Whether SQL `PREPARE` made it, as against the protocol's `Parse`.
+    from_sql: bool,
+    /// What analysis last answered for it: the parameter types it resolved and the row shape.
+    ///
+    /// **Filled when the statement is prepared or described, never when it is merely parsed.** A
+    /// SQL `PREPARE` is analysed at once — a missing relation is `42P01` there, measured — so its
+    /// types are known before it can be run. A `Parse` is not analysed until something asks, so a
+    /// wire statement nobody has described reports the OIDs the client declared and no result
+    /// types at all. Analysing every `Parse` to fill a view would be a change to when errors are
+    /// raised, which is a behaviour change and not a view.
+    described: Option<Described>,
 }
 
 /// A prepared statement with its parameters bound, ready to run.
@@ -294,6 +321,7 @@ impl Session {
         &mut self,
         name: String,
         body: String,
+        source: &str,
         executor: &mut dyn Execute,
     ) -> Result<Outcome> {
         if self.statements.contains_key(&name) {
@@ -309,12 +337,17 @@ impl Session {
         // that stored the text and failed later would report the mistake against a statement the
         // user is no longer looking at. `describe` resolves without running; its answer is thrown
         // away and only its refusal kept.
-        executor.describe(&body, &[])?;
+        // The answer is kept rather than thrown away: it is what `pg_prepared_statements`
+        // reports for this statement, and it is already paid for.
+        let described = executor.describe(&body, &[])?;
         self.statements.insert(
             name,
             Prepared {
                 parsed: Some(body),
                 param_types: Vec::new(),
+                source: source.to_owned(),
+                from_sql: true,
+                described: Some(described),
             },
         );
         Ok(Outcome::done("PREPARE"))
@@ -430,29 +463,9 @@ impl Session {
             StatementClass::Savepoint(name) => self.savepoint(name, executor),
             StatementClass::RollbackTo(name) => self.rollback_to(name, executor),
             StatementClass::Release(name) => self.release(name, executor),
-            // **`DISCARD ALL` clears what the session owns before the executor clears its own.**
-            // Prepared statements and portals live here and nowhere else, so an executor arm alone
-            // would reset the parameters and the locks and leave a pooled connection holding the
-            // statements of whoever had it last. The `25001` for running it inside a block is the
-            // executor's, beside `CREATE DATABASE`'s.
-            StatementClass::DiscardAll => {
-                let outcome = executor.execute(parsed, &Params::NONE);
-                if outcome.is_ok() {
-                    self.statements.clear();
-                    self.portals.clear();
-                }
-                outcome
-            }
-            StatementClass::Prepare { name, body } => {
-                self.prepare_sql(name.clone(), body.clone(), executor)
-            }
-            StatementClass::Execute { name, args } => {
-                self.execute_sql(name.clone(), args.clone(), executor)
-            }
-            StatementClass::Deallocate(name) => self.deallocate_sql(name.clone()),
             // A simple query carries no parameters: the protocol has no way to send one, which
             // is why `$1` in a `Query` is `42P02`.
-            _ => executor.execute(parsed, &Params::NONE),
+            _ => self.run_statement(parsed, executor),
         };
 
         // Notices come before whatever the statement produced, error or not: a `CREATE TABLE IF
@@ -652,6 +665,11 @@ impl Session {
             Prepared {
                 parsed,
                 param_types: param_types.to_vec(),
+                // The query string alone, with no `PREPARE` around it — which is what a real
+                // server reports for a statement the protocol named (measured, `\parse`).
+                source: sql.to_owned(),
+                from_sql: false,
+                described: None,
             },
         );
         Backend::ParseComplete.encode(out);
@@ -708,6 +726,22 @@ impl Session {
                 Err(error) => return self.extended_failure(&error, out),
             },
         };
+        // **Kept, because this is where a statement the protocol named gets its types.** A
+        // `Parse` is not analysed, so until a `Describe` arrives `pg_prepared_statements` has
+        // only the OIDs the client declared to report for it; from here it has the resolved ones,
+        // which is what a real server has had since the `Parse`.
+        let named = match target {
+            Target::Statement => Some(name.to_owned()),
+            Target::Portal => self
+                .portals
+                .get(name)
+                .map(|portal| portal.statement.clone()),
+        };
+        if let Some(named) = named
+            && let Some(stored) = self.statements.get_mut(&named)
+        {
+            stored.described = Some(described.clone());
+        }
         if target == Target::Statement {
             // Inferred, not merely echoed back: a client that declares nothing is told what the
             // statement actually needs, which is what PostgreSQL answers and what a driver builds
@@ -728,6 +762,9 @@ impl Session {
         executor: &mut dyn Execute,
         out: &mut Vec<u8>,
     ) {
+        // The extended protocol's door to the same thing `run_one` does for a simple query: a
+        // `SELECT … FROM pg_prepared_statements` arrives here when a client binds it.
+        self.hand_prepared_to(executor);
         let Some(open) = self.portals.get(portal).cloned() else {
             return self.extended_failure(&SqlError::InvalidCursorName(portal.to_owned()), out);
         };
@@ -821,6 +858,81 @@ impl Session {
         Backend::ReadyForQuery(self.status).encode(out);
     }
 
+    /// One statement that is not transaction control, through the session's own store first.
+    ///
+    /// **Public, and the reason is that there must not be two of these.** Four statement classes
+    /// have their whole effect on state that lives here and nowhere else — the three SQL
+    /// prepared-statement statements and `DISCARD ALL` — so an executor arm alone would leave a
+    /// pooled connection holding the statements of whoever had it last. The corpus harness
+    /// (`tests/parity_harness`) drives an `Executor` directly and mirrors this dispatch by hand;
+    /// before this existed it had no arm for the three, so a `PREPARE` in a captured session
+    /// answered `0A000` from a node that supports it and the corpus recorded a divergence that
+    /// only the harness had.
+    ///
+    /// Every statement passes through here, including the ones it hands straight on, because the
+    /// one it hands on may be the `SELECT … FROM pg_prepared_statements` that reads what the
+    /// others wrote.
+    pub fn run_statement(
+        &mut self,
+        parsed: &Parsed,
+        executor: &mut dyn Execute,
+    ) -> Result<Outcome> {
+        self.hand_prepared_to(executor);
+        match parsed.class() {
+            // **The executor clears its own first, and only a `DISCARD ALL` that succeeded
+            // clears this.** The `25001` for running it inside a block is the executor's, beside
+            // `CREATE DATABASE`'s, and a refused statement must leave the store alone.
+            StatementClass::DiscardAll => {
+                let outcome = executor.execute(parsed, &Params::NONE);
+                if outcome.is_ok() {
+                    self.statements.clear();
+                    self.portals.clear();
+                }
+                outcome
+            }
+            StatementClass::Prepare { name, body } => {
+                self.prepare_sql(name.clone(), body.clone(), parsed.source(), executor)
+            }
+            StatementClass::Execute { name, args } => {
+                self.execute_sql(name.clone(), args.clone(), executor)
+            }
+            StatementClass::Deallocate(name) => self.deallocate_sql(name.clone()),
+            _ => executor.execute(parsed, &Params::NONE),
+        }
+    }
+
+    /// Hands the executor what `pg_prepared_statements` should report, and does it now.
+    ///
+    /// **Rebuilt per statement rather than kept in step.** The store here is the only one; this
+    /// is a copy taken at the one moment it can be read, which is the difference between a copy
+    /// and a mirror. Two statements' worth of names is a handful of small strings, and a session
+    /// with a thousand prepared statements has a thousand of them either way.
+    fn hand_prepared_to(&self, executor: &mut dyn Execute) {
+        executor.remember_prepared(
+            self.statements
+                .iter()
+                .map(|(name, prepared)| crate::session::PreparedStatement {
+                    name: name.clone(),
+                    statement: prepared.source.clone(),
+                    // The resolved types where analysis has happened, and the client's own
+                    // declaration where it has not — never an invented empty list, because `{}`
+                    // is what a statement that genuinely takes no parameters prints.
+                    parameters: prepared.described.as_ref().map_or_else(
+                        || prepared.param_types.clone(),
+                        |described| described.parameters.clone(),
+                    ),
+                    results: prepared.described.as_ref().and_then(|described| {
+                        described
+                            .fields
+                            .as_ref()
+                            .map(|fields| fields.iter().map(|field| field.type_oid).collect())
+                    }),
+                    from_sql: prepared.from_sql,
+                })
+                .collect(),
+        );
+    }
+
     fn prepared_for(&self, target: Target, name: &str) -> Result<&Prepared> {
         match target {
             Target::Statement => self
@@ -901,6 +1013,12 @@ mod tests {
         fail_commit: Option<SqlError>,
         /// What the session asked for, in order.
         calls: Vec<String>,
+        /// The statements the session last handed down, for `pg_prepared_statements`.
+        ///
+        /// **The last list, not every list.** It arrives before every statement, so appending
+        /// them to `calls` would bury what those assertions are about; keeping the latest is what
+        /// a reader of the view would see.
+        prepared: Vec<crate::session::PreparedStatement>,
     }
 
     impl Fake {
@@ -924,6 +1042,10 @@ mod tests {
         /// Nothing registers this, so nothing can terminate it.
         fn terminated(&self) -> bool {
             false
+        }
+
+        fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
+            self.prepared = statements;
         }
 
         fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {

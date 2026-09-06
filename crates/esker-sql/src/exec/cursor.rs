@@ -56,6 +56,11 @@ pub(super) struct Settings<'a> {
     pub(super) search_path: &'a [String],
     /// How an `interval` is rendered for a client.
     pub(super) interval_style: crate::value::IntervalStyle,
+    /// What this session has prepared, which is the whole of `pg_prepared_statements`.
+    ///
+    /// The third, and the one the note above predicted: it is session state with no other way in,
+    /// and the view over it is read by a plan like any other.
+    pub(super) prepared: &'a [crate::session::PreparedStatement],
 }
 
 impl Settings<'_> {
@@ -64,6 +69,7 @@ impl Settings<'_> {
         Settings {
             search_path: &[],
             interval_style: crate::value::IntervalStyle::Postgres,
+            prepared: &[],
         }
     }
 }
@@ -310,7 +316,7 @@ fn inner_side(
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
-        return view.rows_of(txn, tenant, settings.interval_style);
+        return view.rows_of(txn, tenant, settings.interval_style, settings.prepared);
     }
     if !matches!(probe, Probe::Materialize) {
         return Ok(Vec::new());
@@ -369,7 +375,7 @@ impl<'a> Cursor<'a> {
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
             Node::CatalogView { view, .. } => Kind::Rows(
-                view.rows_of(txn, tenant, settings.interval_style)?
+                view.rows_of(txn, tenant, settings.interval_style, settings.prepared)?
                     .into_iter(),
             ),
             // Rows written into the statement, evaluated here for the same reason a catalog view's
