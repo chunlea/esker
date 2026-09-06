@@ -195,13 +195,18 @@ impl Parsed {
         }
         // `ON CONFLICT (…) WHERE …`: the predicate the parser could not hold
         // (`crate::parse::strip_on_conflict_predicate`).
-        if let Some(predicate) = self.conflict_predicate() {
-            let on_conflict = match &mut lowered {
-                plan::Statement::Insert(insert) => insert.on_conflict.as_mut(),
-                _ => None,
-            };
-            if let Some(on_conflict) = on_conflict {
+        if let plan::Statement::Insert(insert) = &mut lowered
+            && let Some(on_conflict) = insert.on_conflict.as_mut()
+        {
+            if let Some(predicate) = self.conflict_predicate() {
                 on_conflict.predicate = Some(predicate.to_owned());
+            }
+            for key in &mut on_conflict.target {
+                if let plan::ConflictKey::Column(name) = key
+                    && let Some(expression) = self.conflict_expression(name)
+                {
+                    *key = plan::ConflictKey::Expression(expression.to_owned());
+                }
             }
         }
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
@@ -3502,9 +3507,16 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
     };
     let target = match &conflict.conflict_target {
         None => Vec::new(),
+        // Every entry arrives as an identifier, because that is all the parser's target can hold.
+        // An entry that was an *expression* is a placeholder here and becomes one again in
+        // `lower_inline`, where `Parsed` is in scope to say which.
         Some(ConflictTarget::Columns(columns)) => columns
             .iter()
-            .map(|name| fold_identifier(&name.value, name.quote_style.is_some()).0)
+            .map(|name| {
+                plan::ConflictKey::Column(
+                    fold_identifier(&name.value, name.quote_style.is_some()).0,
+                )
+            })
             .collect(),
         // A constraint by name is a different inference: it names the constraint rather than
         // asking PostgreSQL to find one, and nothing captured it.

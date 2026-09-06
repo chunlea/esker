@@ -262,12 +262,13 @@ pub struct Parsed {
     /// arrangement `exclude` uses for a clause the parser cannot read
     /// ([`strip_create_database_options`]).
     database_options: Vec<Opt>,
-    /// `ON CONFLICT (…) WHERE <predicate>`: the predicate, as written.
+    /// What [`strip_on_conflict_target`] took out of an `ON CONFLICT` clause: the `WHERE`
+    /// predicate that names a partial index, and the expression entries of the target list.
     ///
-    /// It names the **partial index** the statement wants inferred, and `sqlparser` 0.62.0 stops
-    /// at the keyword ([`strip_on_conflict_predicate`]), so like every other fact in this block it
-    /// comes off the source and is re-attached where the statement is lowered.
-    conflict_predicate: Option<String>,
+    /// `sqlparser` 0.62.0 can hold neither — it expects `DO` where the predicate starts, and its
+    /// target list is a `Vec<Ident>` — so like every other fact in this block they come off the
+    /// source and are re-attached where the statement is lowered.
+    conflict: ConflictShim,
     /// Whether `CREATE TABLE` was written `CREATE UNLOGGED TABLE`.
     ///
     /// `sqlparser` 0.62.0 reads `TEMP`/`TEMPORARY` before `TABLE` and not `UNLOGGED`, so the word
@@ -386,7 +387,17 @@ impl Parsed {
     /// The `WHERE` predicate of an `ON CONFLICT` target, or `None` when the clause had none.
     #[must_use]
     pub fn conflict_predicate(&self) -> Option<&str> {
-        self.conflict_predicate.as_deref()
+        self.conflict.predicate.as_deref()
+    }
+
+    /// The expression each target placeholder stands for, keyed by the placeholder.
+    #[must_use]
+    pub fn conflict_expression(&self, placeholder: &str) -> Option<&str> {
+        self.conflict
+            .expressions
+            .iter()
+            .find(|(name, _)| name == placeholder)
+            .map(|(_, expression)| expression.as_str())
     }
 
     /// Whether the `CREATE TABLE` said `UNLOGGED`.
@@ -602,7 +613,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
         .map_or(sql, |(text, _)| text.as_str());
     // `ON CONFLICT (…) WHERE …` — the predicate comes off and travels on `Parsed`, because the
     // parser expects `DO` there and its tree has nowhere to put one.
-    let conflict = strip_on_conflict_predicate(sql, &scanned);
+    let conflict = strip_on_conflict_target(sql, &scanned);
     let sql = conflict.as_ref().map_or(sql, |(text, _)| text.as_str());
     // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
     let namespaced = strip_parameter_namespace(sql, &scanned);
@@ -635,7 +646,10 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
                 unlogged,
-                conflict_predicate: conflict.as_ref().map(|(_, predicate)| predicate.clone()),
+                conflict: conflict
+                    .as_ref()
+                    .map(|(_, shim)| shim.clone())
+                    .unwrap_or_default(),
                 do_guarded: guarded.is_some(),
                 raise: raise.clone(),
                 virtual_generated: virtual_rewrite
@@ -902,8 +916,8 @@ fn strip_with_data(sql: &str, scanned: &Scan<'_>) -> Option<(String, bool)> {
     None
 }
 
-/// Cuts the `WHERE <predicate>` out of `ON CONFLICT (…) WHERE <predicate> DO …`, returning the
-/// statement without it and the predicate as written.
+/// Rewrites `ON CONFLICT (<target>) [WHERE <predicate>] DO …` into the subset `sqlparser`
+/// 0.62.0 can read, returning what was taken out beside it.
 ///
 /// **A `sqlparser` 0.62.0 gap shim, for one production of one grammar.** PostgreSQL's `INSERT` is
 ///
@@ -924,26 +938,135 @@ fn strip_with_data(sql: &str, scanned: &Scan<'_>) -> Option<(String, bool)> {
 ///
 /// `ON CONFLICT ON CONSTRAINT c` has no parenthesis after `CONFLICT` and is left alone;
 /// `lower_on_conflict` refuses it by name.
-fn strip_on_conflict_predicate(sql: &str, scanned: &Scan<'_>) -> Option<(String, String)> {
+fn strip_on_conflict_target(sql: &str, scanned: &Scan<'_>) -> Option<(String, ConflictShim)> {
     if !contains_words(&scanned.words, &["ON", "CONFLICT"]) {
         return None;
     }
     let bytes = sql.as_bytes();
     let open = on_conflict_target(bytes)?;
     let after_target = balanced_end(bytes, open)?;
+    // **The target list first**, because rewriting it moves every offset after it.
+    let inner = sql.get(open + 1..after_target - 1)?;
+    let mut expressions: Vec<(String, String)> = Vec::new();
+    let entries: Vec<String> = split_top_level(inner)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.trim();
+            if is_plain_identifier(entry) {
+                return entry.to_owned();
+            }
+            let placeholder = free_placeholder(sql, expressions.len());
+            expressions.push((placeholder.clone(), entry.to_owned()));
+            format!("\"{placeholder}\"")
+        })
+        .collect();
+    let target_rewritten = !expressions.is_empty();
+    let target = format!("({})", entries.join(", "));
+
+    // **Then the predicate**, whose `WHERE` sits between the target's `)` and the `DO`.
     let where_at = skip_blank(bytes, after_target);
-    let after_where = eat_word(bytes, where_at, "WHERE")?;
-    let do_at = do_keyword(bytes, after_where)?;
-    let predicate = sql.get(after_where..do_at)?.trim();
-    if predicate.is_empty() {
+    let predicate = match eat_word(bytes, where_at, "WHERE") {
+        Some(after_where) => {
+            let do_at = do_keyword(bytes, after_where)?;
+            let text = sql.get(after_where..do_at)?.trim();
+            (!text.is_empty()).then(|| (text.to_owned(), where_at, do_at))
+        }
+        None => None,
+    };
+    if !target_rewritten && predicate.is_none() {
         return None;
     }
-    let predicate = predicate.to_owned();
     let mut rewritten = String::with_capacity(sql.len());
-    rewritten.push_str(sql.get(..where_at)?);
-    rewritten.push(' ');
-    rewritten.push_str(sql.get(do_at..)?);
-    Some((rewritten, predicate))
+    rewritten.push_str(sql.get(..open)?);
+    rewritten.push_str(&target);
+    match &predicate {
+        // The predicate's span goes, and the target's replacement stands in for the old one.
+        Some((_, where_at, do_at)) => {
+            rewritten.push_str(sql.get(after_target..*where_at)?);
+            rewritten.push(' ');
+            rewritten.push_str(sql.get(*do_at..)?);
+        }
+        None => rewritten.push_str(sql.get(after_target..)?),
+    }
+    Some((
+        rewritten,
+        ConflictShim {
+            predicate: predicate.map(|(text, _, _)| text),
+            expressions,
+        },
+    ))
+}
+
+/// What [`strip_on_conflict_target`] took out of an `ON CONFLICT` clause.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConflictShim {
+    /// The `WHERE` predicate, as written.
+    pub(crate) predicate: Option<String>,
+    /// Each target entry that was **not** a plain identifier, as `(placeholder, expression)`.
+    ///
+    /// The side table is keyed by the placeholder because that is what comes back out of the
+    /// parser: the entry is replaced by a quoted identifier of that name so the list still parses
+    /// as `Vec<Ident>`, and the lowering turns it back into the expression it stands for.
+    pub(crate) expressions: Vec<(String, String)>,
+}
+
+/// A name for an expression entry that appears **nowhere** in the statement, so it cannot be
+/// mistaken for a column the user wrote.
+///
+/// Collision-proofing by construction is not possible — a delimited identifier may hold any
+/// character but `"` — so it is done by *checking*: the candidate is bumped until the source does
+/// not contain it. One pass over the source per entry, and the entries are counted in fingers.
+fn free_placeholder(sql: &str, from: usize) -> String {
+    let mut at = from;
+    loop {
+        let candidate = format!("esker_on_conflict_expr_{at}");
+        if !sql.contains(&candidate) {
+            return candidate;
+        }
+        at += 1;
+    }
+}
+
+/// Whether a target entry is a bare word or one delimited pair and nothing else — the only two
+/// shapes `sqlparser`'s `Vec<Ident>` can carry.
+fn is_plain_identifier(entry: &str) -> bool {
+    let bytes = entry.as_bytes();
+    match bytes.first() {
+        Some(b'"') => double_quote_end(bytes, 0) == bytes.len(),
+        Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_' => bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$'),
+        _ => false,
+    }
+}
+
+/// A comma-separated list split at its **own** bracket level, with quoted spans stepped over.
+fn split_top_level(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut parts = Vec::new();
+    let (mut at, mut start, mut depth) = (0, 0, 0_usize);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => at = single_quote_end(bytes, at),
+            b'"' => at = double_quote_end(bytes, at),
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                at += 1;
+            }
+            b',' if depth == 0 => {
+                parts.push(&inner[start..at]);
+                at += 1;
+                start = at;
+            }
+            _ => at += 1,
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
 }
 
 /// The `(` that opens an `ON CONFLICT` target list, at the statement's own bracket level.

@@ -1391,26 +1391,19 @@ fn enclosed(text: &str) -> bool {
 }
 
 fn validate_on_conflict(table: &TableDef, on_conflict: &crate::plan::OnConflict) -> Result<()> {
-    let wanted: Vec<usize> = on_conflict
-        .target
-        .iter()
-        .map(|name| {
-            table
-                .column(name)
-                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // **A primary key has no predicate**, so a statement that wrote one cannot mean it.
+    let wanted = column_target(table, &on_conflict.target)?;
+    // **A primary key has no predicate and no expression part**, so a statement that wrote either
+    // cannot mean it.
     let primary = !table.primary_key.is_empty()
         && table.row_id().is_none()
         && on_conflict.predicate.is_none()
-        && (wanted.is_empty() || same_key(&wanted, &table.primary_key));
+        && wanted
+            .as_ref()
+            .is_some_and(|wanted| wanted.is_empty() || same_key(wanted, &table.primary_key));
     let indexed = table.indexes.iter().any(|index| {
         index.unique
             && predicate_matches(index, on_conflict.predicate.as_deref())
-            && index
-                .key_columns()
-                .is_some_and(|columns| wanted.is_empty() || same_key(&wanted, &columns))
+            && same_target(table, &on_conflict.target, index)
     });
     if !primary && !indexed {
         return Err(SqlError::NoUniqueForOnConflict);
@@ -1461,22 +1454,16 @@ fn conflicting_row(
     on_conflict: &crate::plan::OnConflict,
     row: &[Datum],
 ) -> Result<Option<Conflicting>> {
-    let wanted: Vec<usize> = on_conflict
-        .target
-        .iter()
-        .map(|name| {
-            table
-                .column(name)
-                .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let wanted = column_target(table, &on_conflict.target)?;
     let mut inferred = 0;
     // The primary key is a unique index whose entry **is** the row, so it is tried the same way
     // and answers with the row it found rather than with a pointer to one.
     if !table.primary_key.is_empty()
         && table.row_id().is_none()
         && on_conflict.predicate.is_none()
-        && (wanted.is_empty() || same_key(&wanted, &table.primary_key))
+        && wanted
+            .as_ref()
+            .is_some_and(|wanted| wanted.is_empty() || same_key(wanted, &table.primary_key))
     {
         inferred += 1;
         let values: Vec<Datum> = table
@@ -1493,12 +1480,9 @@ fn conflicting_row(
         }
     }
     for index in table.indexes.iter().filter(|index| index.unique) {
-        let Some(columns) = index.key_columns() else {
-            continue;
-        };
         // A partial index is inferred **only** when the statement repeats its predicate; see above.
         if !predicate_matches(index, on_conflict.predicate.as_deref())
-            || !(wanted.is_empty() || same_key(&wanted, &columns))
+            || !same_target(table, &on_conflict.target, index)
         {
             continue;
         }
@@ -1529,6 +1513,62 @@ fn conflicting_row(
         return Err(SqlError::NoUniqueForOnConflict);
     }
     Ok(None)
+}
+
+/// The target as column positions, or `None` when any entry is an **expression** — which only an
+/// index with an expression key part can answer, and which the primary key never can.
+///
+/// A column name that is not one is `42703` here, before anything is drawn, exactly as before.
+fn column_target(
+    table: &TableDef,
+    target: &[crate::plan::ConflictKey],
+) -> Result<Option<Vec<usize>>> {
+    let mut out = Vec::with_capacity(target.len());
+    for key in target {
+        match key {
+            crate::plan::ConflictKey::Column(name) => out.push(
+                table
+                    .column(name)
+                    .ok_or_else(|| SqlError::UndefinedColumn(name.clone()))?,
+            ),
+            crate::plan::ConflictKey::Expression(_) => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Whether a conflict target is exactly this index's key, **as a set**.
+///
+/// The two shapes line up one for one: a column entry answers a `KeyPart::Column` of the same
+/// position, an expression entry a `KeyPart::Expression` whose text is the same one — compared the
+/// way a predicate is (`same_predicate`), because `ON CONFLICT (lower(external_id))` and
+/// `ON books ((lower(external_id)))` differ by the parentheses the index's own grammar requires.
+///
+/// An empty target is a bare `ON CONFLICT`, which takes any unique index — including one keyed on
+/// an expression, which is what a real server does.
+fn same_target(
+    table: &TableDef,
+    target: &[crate::plan::ConflictKey],
+    index: &crate::catalog::IndexDef,
+) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    if target.len() != index.keys.len() {
+        return false;
+    }
+    target.iter().all(|key| {
+        index.keys.iter().any(|part| match (key, &part.part) {
+            (crate::plan::ConflictKey::Column(name), crate::catalog::KeyPart::Column(at)) => {
+                table.column(name) == Some(*at)
+            }
+            (
+                crate::plan::ConflictKey::Expression(written),
+                crate::catalog::KeyPart::Expression { expr, .. },
+            ) => same_predicate(written, expr),
+            _ => false,
+        })
+    })
 }
 
 /// Whether a conflict target names exactly one index's key columns, in any order.
