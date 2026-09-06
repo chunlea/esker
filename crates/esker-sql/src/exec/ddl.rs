@@ -1300,6 +1300,8 @@ struct TypeChange<'a> {
     typmod: i32,
     /// The type a `USING` casts the column to, when the statement wrote one.
     using: Option<ColumnType>,
+    /// A `USING` that is not a cast: the expression, evaluated once per row.
+    using_expr: Option<&'a plan::Expr>,
     /// The collation the statement named, or `None` to take the new type's own.
     collation: Option<&'a str>,
 }
@@ -1315,6 +1317,7 @@ fn set_column_type(
         ty,
         typmod,
         using,
+        using_expr,
         collation,
     } = change;
     let at = updated
@@ -1329,9 +1332,16 @@ fn set_column_type(
     // and that type has to reach the column's new one on its own — which is why
     // `TYPE character varying USING s::text` works and is not the same statement as
     // `TYPE character varying` alone.
-    let allowed = match using {
-        None => converts_implicitly(from, ty),
-        Some(cast_to) => converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty),
+    // **An arbitrary `USING` is checked per row and not here**, because its type is not knowable
+    // before it runs: `string_to_array(snippets, ',')` answers `text[]` whatever `snippets` is.
+    // PostgreSQL is the same — a `USING` whose result does not fit raises on the row it does not
+    // fit on, which is why the pre-flight below is skipped rather than approximated.
+    let allowed = match (using, using_expr) {
+        (_, Some(_)) => true,
+        (None, None) => converts_implicitly(from, ty),
+        (Some(cast_to), None) => {
+            converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty)
+        }
     };
     if !allowed {
         return Err(SqlError::CannotCastColumnAutomatically {
@@ -1374,6 +1384,8 @@ fn set_column_type(
         Some(value) => Some(convert_datum(from, ty, value)?),
         None => None,
     };
+    // Kept before the column moves, for the `USING` expression's scope below.
+    let before = updated.clone();
     updated.columns[at].ty = ty;
     updated.columns[at].typmod = typmod;
     // **Assigned and not merged.** A statement with no `COLLATE` gives the column its new type's
@@ -1383,11 +1395,28 @@ fn set_column_type(
     updated.columns[at].default = default;
     updated.columns[at].missing = missing;
     let types = updated.column_types();
+    // **Resolved against the table as it was**, so the expression's column references have the
+    // types the rows still carry: `snippets` is a `varchar` inside
+    // `string_to_array(snippets, ',')`, and resolving it against the new `text[]` column would
+    // type the argument as the answer.
+    let resolved = match using_expr {
+        Some(expr) => Some(
+            super::query::resolve(expr, &super::query::Scope::single(&before))
+                .map_err(|error| SqlError::Internal(format!("the USING expression: {error}")))?,
+        ),
+        None => None,
+    };
     for (key, mut row) in rows {
         // The typmod is applied per row and not compared once: `varchar(5)` over a nineteen
         // character value is `22001`, and which row raises it depends on the data. `fit_to_typmod`
         // is the same function an `INSERT` uses, so a rounded `timestamp(6)` rounds identically.
-        row[at] = crate::value::fit_to_typmod(convert_datum(from, ty, &row[at])?, ty, typmod)?;
+        let value = match &resolved {
+            // **The expression sees the whole row**, not only the column being retyped — a `USING`
+            // may name any column of the table, which is the half a per-value conversion cannot do.
+            Some(resolved) => super::cursor::evaluate_in_txn(resolved, &row, &*txn)?,
+            None => convert_datum(from, ty, &row[at])?,
+        };
+        row[at] = crate::value::fit_to_typmod(value, ty, typmod)?;
         txn.put(&key, &crate::row::encode_row(&types, &row)?);
     }
     Ok(())
@@ -5681,6 +5710,7 @@ pub(super) fn alter_table(
             ty,
             typmod,
             using,
+            using_expr,
             collation,
         } = action
         {
@@ -5693,6 +5723,7 @@ pub(super) fn alter_table(
                     ty: *ty,
                     typmod: *typmod,
                     using: *using,
+                    using_expr: using_expr.as_ref(),
                     collation: collation.as_deref(),
                 },
             )?;

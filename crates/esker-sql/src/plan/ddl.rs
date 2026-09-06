@@ -1310,6 +1310,17 @@ pub enum AlterTableAction {
         /// s::text` casts to `text` and lands in `varchar`, which PostgreSQL takes because the
         /// second hop is an assignment cast — so both hops are checked rather than one.
         using: Option<ColumnType>,
+        /// A `USING` that is **not** a cast of the column: the expression itself, evaluated once
+        /// per row in place of the implicit conversion.
+        ///
+        /// `ALTER COLUMN snippets TYPE text[] USING string_to_array(snippets, ',')` is the shape
+        /// `array_test.rb` sends, and it is the general case — PostgreSQL takes any expression over
+        /// the row and writes what it answers. The cast form above stays its own field because it
+        /// is what the *pre-flight* check reads: a cast's target type can be checked before a row
+        /// is touched, and an arbitrary expression's cannot.
+        ///
+        /// At most one of the two is set.
+        using_expr: Option<super::Expr>,
         /// The collation the statement named, or `None` to keep the type's own.
         ///
         /// **`None` clears one that was there**, which is PostgreSQL's rule and not a shortcut:

@@ -2797,6 +2797,59 @@ fn catalog_function(
         // `split_part(text, sep, n)`. Measured on 19beta1, and the edges are the specification:
         // past the end is `''` and not NULL, a negative `n` counts from the end, an empty
         // separator gives the whole string back, and `n = 0` is an error rather than an answer.
+        // `string_to_array(text, delimiter [, null_string])`. Measured on 19beta1, and **four of
+        // its five edges are nothing a guess would produce**:
+        //
+        // ```text
+        // ('a,b,c', ',')      {a,b,c}      ('', ',')        {}     -- empty, not one empty element
+        // ('single', ',')     {single}     (NULL, ',')      NULL
+        // ('abc', '')         {abc}        -- an empty delimiter does not split at all
+        // ('a,b', NULL)       {a,",",b}    -- a NULL delimiter splits into single characters
+        // ('a,,b', ',')       {a,"",b}     -- an empty field is kept
+        // ('axxbxxc', 'xx')   {a,b,c}      -- the delimiter is a string, not a character
+        // ('a,b,NULL', ',', 'NULL')        {a,b,NULL}  -- the third argument names the NULL text
+        // ```
+        CatalogFunc::StringToArray => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(text)), Some(delimiter)) => {
+                let null_string = match args.get(2) {
+                    Some(Datum::Text(null_string)) => Some(null_string.as_str()),
+                    _ => None,
+                };
+                let fields: Vec<String> = match delimiter {
+                    // A NULL delimiter splits into characters — measured, and the one edge that
+                    // reads as a mistake until the server is asked.
+                    Datum::Null => text.chars().map(|c| c.to_string()).collect(),
+                    Datum::Text(delimiter) if delimiter.is_empty() => {
+                        if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![text.clone()]
+                        }
+                    }
+                    Datum::Text(delimiter) => {
+                        if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            text.split(delimiter.as_str()).map(str::to_owned).collect()
+                        }
+                    }
+                    _ => return Ok(Datum::Null),
+                };
+                let elements: Vec<Option<Datum>> = fields
+                    .into_iter()
+                    .map(|field| match null_string {
+                        Some(null_string) if field == null_string => None,
+                        _ => Some(Datum::Text(field)),
+                    })
+                    .collect();
+                Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                    ColumnType::Text,
+                    1,
+                    elements,
+                ))
+            }
+            _ => Datum::Null,
+        },
         CatalogFunc::SplitPart => match (args.first(), args.get(1), args.get(2)) {
             (Some(Datum::Text(text)), Some(Datum::Text(sep)), Some(position)) => {
                 let Some(n) = whole_number(Some(position)) else {

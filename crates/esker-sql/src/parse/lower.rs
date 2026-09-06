@@ -2791,15 +2791,14 @@ fn lower_alter_table(
                         "ALTER TABLE ... ALTER COLUMN ... TYPE {name}"
                     )));
                 }
-                let using = match using {
-                    None => None,
+                // **A cast of the column, or any other expression.** The first is checked before
+                // a row is touched — its target type is known — and the second is evaluated per
+                // row, which is what PostgreSQL does with either.
+                let (using, using_expr) = match using {
+                    None => (None, None),
                     Some(expr) => match using_cast_target(expr, &ident(column_name)) {
-                        Some(cast_to) => Some(lower_column_type(cast_to)?.0),
-                        None => {
-                            return Err(SqlError::unsupported(format!(
-                                "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING {expr}"
-                            )));
-                        }
+                        Some(cast_to) => (Some(lower_column_type(cast_to)?.0), None),
+                        None => (None, Some(lower_expr(expr)?)),
                     },
                 };
                 actions.push(plan::AlterTableAction::SetColumnType {
@@ -2807,6 +2806,7 @@ fn lower_alter_table(
                     ty,
                     typmod,
                     using,
+                    using_expr,
                     // Filled in by `Parsed::lower`, which is where the clause the parser could not
                     // read arrives (`crate::parse::strip_alter_column_collation`).
                     collation: None,
