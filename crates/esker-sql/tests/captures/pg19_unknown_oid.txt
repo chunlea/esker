@@ -1,0 +1,79 @@
+# **The OID a `RowDescription` carries, and the three tests that watch a client not learn it** —
+# PostgreSQL 19beta1, 2026-09-05.
+#
+# WHY THIS WAS CAPTURED
+#
+# `postgresql_adapter_test.rb` has three failures with one mechanism, and the mechanism is that
+# **nothing happens**:
+#
+#     test_reload_type_map_for_newly_defined_types  Expected nil to be an OID::Enum
+#     test_only_reload_type_map_once_for_every_unrecognized_type  Expected: 2  Actual: 1
+#     test_only_warn_on_first_encounter_of_unrecognized_oid
+#       Expected /unknown OID \d+: failed to recognize type of 'regclass'/ to match ""
+#
+# `ActiveRecord` keeps a map from type OID to decoder. When a `RowDescription` carries an OID the
+# map does not have, it **warns once**, **reloads the map from `pg_type`**, and treats the value as
+# a String. All three tests assert that reload — a query count of 2 instead of 1, a warning on
+# stderr, an `OID::Enum` appearing where there was none. A server that sends an OID the client
+# already knows produces none of it, which is what this node does.
+#
+# ## The statements, and what a real server describes them as
+#
+#     select 'pg_catalog.pg_class'::regclass
+#         column name  regclass          <- the target type's name, for an unaliased cast
+#         type         regclass          oid 2205, typlen 4, typtype 'b', typcategory 'N'
+#         value        pg_class          <- the relation's NAME, not its oid
+#
+#     SELECT NULL::anyarray
+#         column name  anyarray
+#         type         anyarray          oid 2277, typlen -1, typtype 'p' (pseudo), category 'P'
+#
+#     CREATE TYPE feeling AS ENUM ('good', 'bad');
+#     SELECT 'good'::feeling
+#         column name  feeling           <- the type's name again, and it is a *user* type
+#         type         feeling           a user oid (> 16383), typlen 4, typtype 'e', category 'E'
+#     SELECT 'good'::feeling AS given_a_name
+#         column name  given_a_name      <- an alias wins, as everywhere
+#
+#     CREATE TABLE f (id int, mood feeling);
+#     SELECT id, mood FROM f
+#         id    integer
+#         mood  feeling                  <- a column of the type describes as the type
+#
+# ## What this node sends instead, and where it is decided
+#
+# `plan::expr::CatalogFunc::RegClass`'s result type is **`ColumnType::Int8`**
+# (`plan/expr.rs`), so `'x'::regclass` is described as `bigint`, oid **20** — an OID
+# `ActiveRecord` knows perfectly well. No unknown OID, no warning, no reload, three failures.
+# The doc two hundred lines above it says so in passing: *"`'x'::regclass` a `bigint`, which is
+# what `Self::result_type` [says]"*.
+#
+# The **name** is already right: an unaliased `CatalogFunc` is named after the function, and
+# `RegClass`'s name is `regclass`, which is what a real server calls the column too.
+#
+# ## The three oids, and the shape each needs
+#
+#     regclass   2205   a `ColumnType` of its own, the shape ADR 0077 gave `regtype` (2206):
+#                       an oid that prints as a name. The printing already exists —
+#                       `CatalogFunc::RegClassName` is the per-row inverse `foreign_keys()` uses.
+#     anyarray   2277   a **pseudo-type**; `NULL::anyarray` is the only way a client sees it, and
+#                       `typlen` is -1 where every `reg*` type is 4.
+#     <enum>     user   `FieldDescription::of_user_type` already sends the type's own oid, so this
+#                       one may already be right — measure it before changing anything.
+#
+# ## One thing to check while there: `typlen` for an enum
+#
+# `FieldDescription::of_user_type` sends `type_size: -1` with the comment *"an enum is an `int2`
+# in the row and a variable-length label on the wire, so the length is `-1` exactly as it is for
+# `text`"*. A real server says **4** — `pg_type.typlen` for an enum is 4, because an enum is a
+# four-byte oid there. The rendered value is text either way, so nothing decodes differently; it
+# is a measured difference in what the `RowDescription` claims and it is one field.
+#
+# ## The other statement in the same test
+#
+# `test_only_reload_type_map_once_for_every_unrecognized_type` runs the regclass select **twice**
+# and asserts 2 queries then 1 — so the reload must happen on the first encounter and **not** on
+# the second. That is the client's own bookkeeping and needs nothing from the server beyond
+# sending the same unknown oid both times.
+#
+# Every probe above ran inside one `BEGIN … ROLLBACK` with a `SAVEPOINT` per probe.
