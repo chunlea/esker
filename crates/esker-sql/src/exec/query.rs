@@ -680,7 +680,8 @@ pub(super) fn plan_under(
         (Some(join), ..) => join.on.clone(),
         _ => None,
     };
-    let left_join = only_join.is_some_and(|join| join.kind == crate::plan::JoinKind::Left);
+    let join_kind = only_join.map_or(crate::plan::JoinKind::Inner, |join| join.kind);
+    let left_join = join_kind != crate::plan::JoinKind::Inner;
 
     // A **derived** side never drives the choice. `drive_from` swaps in order to reach a probe on
     // the inner table's key, and a derived table has none -- so a swap could only move the plan
@@ -775,7 +776,8 @@ pub(super) fn plan_under(
         node = join_node(
             node,
             condition.as_ref(),
-            left_join,
+            join_kind,
+            named_table.map_or(0, |(table, _)| table.row_schema().len()),
             &scope,
             inner,
             inner_function
@@ -1356,30 +1358,10 @@ fn plan_chain(
     // reference to one further right an "undefined column" rather than a silent NULL.
     for at in 0..entries.len() - 1 {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
-        let inner = entries[at + 1].0;
         // A reordered chain is a comma list: every join inner, every `ON` absent, and no entry a
         // function or a derived table — so the step needs nothing from `select.joins`, whose order
         // no longer matches.
-        node = if reordered {
-            join_node(node, None, false, &scope, inner, None)?
-        } else {
-            let join = &select.joins[at];
-            let left_join = join.kind == crate::plan::JoinKind::Left;
-            // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
-            // everything up to and including the outer side of this join.
-            let left = Scope::chain(&entries[..=at]).under(enclosing);
-            let inner_function = source_function(Some(&join.table), inner, &left)?;
-            join_node(
-                node,
-                join.on.as_ref(),
-                left_join,
-                &scope,
-                inner,
-                inner_function
-                    .as_ref()
-                    .or_else(|| join.table.derived_plan()),
-            )?
-        };
+        node = chain_step(node, select, &entries, at, reordered, enclosing, &scope)?;
         // **Not below an outer join.** A `WHERE` conjunct applied before the NULL extension would
         // throw away the rows a `LEFT JOIN` exists to keep, which is the one rewrite of this kind
         // that changes an answer rather than a cost. Once a chain has taken an outer join, nothing
@@ -1650,7 +1632,8 @@ pub(super) fn joined_target_rows(
         node = join_node(
             node,
             join.on.as_ref(),
-            join.kind == crate::plan::JoinKind::Left,
+            join.kind,
+            width_of(&entries[..=at]),
             &scope,
             inner,
             inner_source.as_ref().or_else(|| join.table.derived_plan()),
@@ -1846,21 +1829,77 @@ fn for_each_column(expr: &Expr, visit: &mut impl FnMut(Option<&str>, &str)) {
 /// Anything else materialises the inner table and pairs every outer row with all of it, which is
 /// always correct and, for a large inner table, always slow. `EXPLAIN` says which, because that is
 /// the difference a user changes their schema over.
+/// One step of a join chain: the node to this point, joined to the entry on its right.
+///
+/// Lifted out of `plan_chain` for its length, and it is a clean seam: everything it needs is the
+/// step's index into `entries` and whether the chain was reordered.
+fn chain_step(
+    node: Node,
+    select: &Select,
+    entries: &[(&TableDef, String)],
+    at: usize,
+    reordered: bool,
+    enclosing: Option<&Scope<'_>>,
+    scope: &Scope<'_>,
+) -> Result<Node> {
+    let inner = entries[at + 1].0;
+    let outer_columns = width_of(&entries[..=at]);
+    if reordered {
+        return join_node(
+            node,
+            None,
+            crate::plan::JoinKind::Inner,
+            outer_columns,
+            scope,
+            inner,
+            None,
+        );
+    }
+    let join = &select.joins[at];
+    // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
+    // everything up to and including the outer side of this join.
+    let left = Scope::chain(&entries[..=at]).under(enclosing);
+    let inner_function = source_function(Some(&join.table), inner, &left)?;
+    join_node(
+        node,
+        join.on.as_ref(),
+        join.kind,
+        outer_columns,
+        scope,
+        inner,
+        inner_function
+            .as_ref()
+            .or_else(|| join.table.derived_plan()),
+    )
+}
+
+/// How wide the rows to a join's left are — what an inner row kept by a `FULL JOIN` is extended
+/// with, and the one thing a full join cannot learn from an outer row because it may have none.
+fn width_of(entries: &[(&TableDef, String)]) -> usize {
+    entries.iter().map(|(def, _)| def.row_schema().len()).sum()
+}
+
 fn join_node(
     outer: Node,
     on: Option<&Expr>,
-    left_join: bool,
+    kind: crate::plan::JoinKind,
+    outer_columns: usize,
     scope: &Scope<'_>,
     inner: &TableDef,
     inner_plan: Option<&Node>,
 ) -> Result<Node> {
+    // **A full join reads its inner side into memory whatever the `ON` says.** A probe answers
+    // "which inner row matches this outer row" and nothing else; a full join also has to answer
+    // "which inner rows matched *nobody*", and that question is only answerable against a set the
+    // node holds. So the probe is given up here rather than in `probe_for`, which is about cost.
+    let full = kind == crate::plan::JoinKind::Full;
     // A computed relation has no primary key and no index, so there is nothing to probe with and
     // the inner side is read once into memory like any other unindexed join. Decided here rather
     // than left to `probe_for`, so that a view can never be reached through a key. A **derived
     // table** is the same case for the same reason: its rows come from a plan.
     let inner_view = pg_catalog::view_of(inner);
     let probe = on
-        .filter(|_| inner_view.is_none() && inner_plan.is_none())
+        .filter(|_| !full && inner_view.is_none() && inner_plan.is_none())
         .and_then(|on| probe_for(on, scope, inner))
         .unwrap_or(crate::plan::Probe::Materialize);
     // A probe answers the equality exactly, so the condition it came from is not re-checked. A
@@ -1875,7 +1914,9 @@ fn join_node(
     };
     Ok(Node::NestedLoop {
         outer: Box::new(outer),
-        left_join,
+        left_join: kind != crate::plan::JoinKind::Inner,
+        keep_right: full,
+        outer_columns,
         inner_table_id: inner.id,
         inner_view,
         inner_table: inner.name.clone(),

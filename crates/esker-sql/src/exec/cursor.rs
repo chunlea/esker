@@ -156,6 +156,20 @@ enum Kind<'a> {
         lateral: Option<Box<crate::plan::TableFunction>>,
         outer: Box<Cursor<'a>>,
         left_join: bool,
+        /// A `FULL JOIN`'s other half: an inner row no outer row matched is emitted after the
+        /// outer side ends, with every outer column NULL.
+        keep_right: bool,
+        /// How many NULLs such a row is extended with. Carried rather than learned from an outer
+        /// row, because a full join over an **empty** outer side still returns every inner row and
+        /// there is no row to learn from.
+        outer_columns: usize,
+        /// Which materialised inner rows have been paired with something.
+        ///
+        /// Empty unless `keep_right`: a left or inner join never asks, and the answer costs a bit
+        /// per inner row. Written where a pair is kept, read once when the outer side ends.
+        matched_inner: Vec<bool>,
+        /// How far the drain has got through `matched_inner`, once the outer side is done.
+        draining: Option<usize>,
         inner_table_id: u64,
         inner_columns: RowSchema,
         probe: Probe,
@@ -431,6 +445,8 @@ impl<'a> Cursor<'a> {
             Node::NestedLoop {
                 outer,
                 left_join,
+                keep_right,
+                outer_columns,
                 inner_table_id,
                 inner_view,
                 inner_plan,
@@ -461,6 +477,14 @@ impl<'a> Cursor<'a> {
                     },
                     outer: Box::new(Cursor::open(txn, tenant, settings, outer)?),
                     left_join: *left_join,
+                    keep_right: *keep_right,
+                    outer_columns: *outer_columns,
+                    matched_inner: if *keep_right {
+                        vec![false; materialized.len()]
+                    } else {
+                        Vec::new()
+                    },
+                    draining: None,
                     inner_table_id: *inner_table_id,
                     inner_columns: inner_columns.clone(),
                     probe: probe.clone(),
@@ -631,6 +655,10 @@ impl<'a> Cursor<'a> {
                 lateral,
                 outer,
                 left_join,
+                keep_right,
+                outer_columns,
+                matched_inner,
+                draining,
                 inner_table_id,
                 inner_columns,
                 probe,
@@ -642,8 +670,29 @@ impl<'a> Cursor<'a> {
                 buckets_built,
                 candidates,
             } => loop {
+                // The outer side is finished and this is a full join: what is left is every
+                // inner row nobody paired with, each in front of a row of NULLs.
+                if let Some(at) = draining {
+                    while let Some(seen) = matched_inner.get(*at) {
+                        let inner = materialized.get(*at).cloned();
+                        let unpaired = !*seen;
+                        *at += 1;
+                        if let Some(inner) = inner
+                            && unpaired
+                        {
+                            let mut joined = vec![Datum::Null; *outer_columns];
+                            joined.extend(inner);
+                            return Ok(Some(joined));
+                        }
+                    }
+                    return Ok(None);
+                }
                 let Some((row, position)) = current else {
                     let Some(next) = outer.next()? else {
+                        if *keep_right {
+                            *draining = Some(0);
+                            continue;
+                        }
                         return Ok(None);
                     };
                     // The `ON`'s ordinals split at the outer row's width, which this is the first
@@ -742,6 +791,10 @@ impl<'a> Cursor<'a> {
                         };
                         if keep {
                             *matched = true;
+                            // The index into `materialized`, which is what the drain reads back.
+                            if let Some(seen) = at.and_then(|at| matched_inner.get_mut(at)) {
+                                *seen = true;
+                            }
                             return Ok(Some(joined));
                         }
                     }

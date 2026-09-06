@@ -33,6 +33,14 @@ use crate::value::{ColumnType, Datum};
 pub enum JoinKind {
     /// `JOIN` / `INNER JOIN`: the pair, or nothing.
     Inner,
+    /// `FULL [OUTER] JOIN`: the pair, or **either** side alone with the other's columns NULL.
+    ///
+    /// The union of the two null-extensions, which is why it needs what a left join does not: the
+    /// inner side has to be read into memory and remembered, because an inner row's fate is not
+    /// known until every outer row has been tried against it. Measured on PostgreSQL 19 —
+    /// `FULL JOIN … ON false` over two rows and two rows is **four** rows, all extended, and a
+    /// `WHERE` above it still filters them.
+    Full,
     /// `LEFT [OUTER] JOIN`: the pair, or the left row with **every** right column NULL.
     ///
     /// The one that must not drop rows, and the reason the `ON` and the `WHERE` cannot be merged:
@@ -523,6 +531,17 @@ pub enum Node {
         /// is kept, and an outer row that kept none is NULL-extended; a condition in the `WHERE`
         /// runs over the already-extended row and can remove it.
         left_join: bool,
+        /// Whether an **inner** row that no outer row matched survives, with every outer column
+        /// NULL. Set only by a `FULL JOIN`, and always with `left_join` — the two extensions
+        /// together are what a full join is.
+        keep_right: bool,
+        /// How wide the outer side is, so an inner row kept by `keep_right` can be extended with
+        /// the right number of NULLs.
+        ///
+        /// **Carried rather than learned from a row**, because the case that needs it is the one
+        /// with no rows to learn from: a full join whose outer side is empty still returns every
+        /// inner row.
+        outer_columns: usize,
         /// The left side, pulled once.
         outer: Box<Node>,
         /// The inner table, or a reserved id when the inner side is a catalog view.

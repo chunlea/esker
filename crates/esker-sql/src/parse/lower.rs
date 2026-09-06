@@ -7153,12 +7153,23 @@ fn lower_join(join: &sqlparser::ast::Join) -> Result<plan::Join> {
         JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
             (plan::JoinKind::Left, Some(constraint))
         }
+        JoinOperator::FullOuter(constraint) => {
+            // **`USING` is refused on a full join, and only on a full join.** A `USING` column is
+            // merged into one, and for an inner or left join the left side's value is always the
+            // right answer — equal by the condition, or NULL only where the right row is missing.
+            // A full join has the third case the merge has no answer for: the row where the *left*
+            // is missing, whose merged value is the right's. PostgreSQL spells that `COALESCE`;
+            // taking the left value here would answer NULL for every row kept by the new half.
+            if matches!(constraint, JoinConstraint::Using(_)) {
+                return Err(SqlError::unsupported("a FULL JOIN with USING"));
+            }
+            (plan::JoinKind::Full, Some(constraint))
+        }
         // Each of these keeps rows an inner join drops, so running one as an inner join would
         // silently return fewer rows than the user asked for -- the worst thing a join can do.
         other => {
             return Err(SqlError::unsupported(match other {
                 JoinOperator::Right(_) | JoinOperator::RightOuter(_) => "a RIGHT JOIN",
-                JoinOperator::FullOuter(_) => "a FULL JOIN",
                 JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => "a SEMI JOIN",
                 JoinOperator::LeftAnti(_) | JoinOperator::Anti(_) => "an ANTI JOIN",
                 JoinOperator::CrossApply | JoinOperator::OuterApply => "APPLY",

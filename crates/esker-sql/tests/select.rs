@@ -427,7 +427,9 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
         // keep rows the *left* side does not have still do not: running a `RIGHT` as a `LEFT`
         // would answer with the same rows in the wrong places.
         ("SELECT * FROM s1 RIGHT JOIN s2 ON true", "RIGHT JOIN"),
-        ("SELECT * FROM s1 FULL JOIN s2 ON true", "FULL JOIN"),
+        // `FULL JOIN` left this list when it landed: it runs now, and
+        // `tests/full_outer_join.rs` is where its behaviour is pinned. `NATURAL JOIN` below it
+        // is still refused, and for a different reason — it has no `ON` to read at all.
         ("SELECT * FROM s1 NATURAL JOIN s2", "NATURAL JOIN"),
         (
             "SELECT id FROM s1 JOIN s1 AS b USING (id) JOIN s1 AS c USING (id)",
