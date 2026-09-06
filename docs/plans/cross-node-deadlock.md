@@ -45,19 +45,49 @@ TTL that "a live client extends by heartbeat". **No such client exists**: there 
 sender anywhere outside `esker-txn` and `esker-store`, which hold the handler for an RPC nobody
 sends. A lock's TTL is therefore fixed at prewrite and always lapses.
 
-That leaves one fork, and it decides the severity:
+That leaves the question the whole debt rests on: **can a cross-node cycle be built at all?**
 
-* **If nothing extends a lease** — what the grep says — then in a two-node cycle the older lock
-  lapses first, its waiter rolls that owner back, and **one transaction dies while the other
-  proceeds**. Accidentally the right shape, with the wrong SQLSTATE, after a TTL-length stall, and
-  with the victim chosen by prewrite order rather than by anything principled.
-* **If a heartbeat is ever added** — which the TTL exists for — neither lock ever becomes
-  settleable, both budgets run out, and **both transactions die with `40001`** where PostgreSQL
-  kills exactly one with `40P01`.
+## It appears not to be reachable, and the reason is in two places
 
-Settling it is a ~40-line probe on the existing cluster harness (below), and it is the first thing
-to run. It does not change the sizing: a detector is needed either way, and the second branch
-arrives the day somebody adds the heartbeat the TTL was designed for.
+**Locks are taken in ascending key order.** A transaction's write buffer is a `BTreeMap`, its
+primary is `self.buffer.keys().next()` — the *smallest* key it writes — and `commit` prewrites the
+primary alone and first, then the secondaries from the same map, which yields them sorted. Two
+transactions writing overlapping key sets therefore acquire in the same total order, and a
+wait-for chain that only ever ascends cannot return to where it started. That is the classic
+ordered-locking argument, and here it falls out of the data structure rather than being imposed.
+
+**And a prewrite never waits while holding.** `prewrite_or_roll_back` answers a definite failure —
+`KeyIsLocked` among them — by calling `undo`, which rolls back the primary and every key already
+placed, and returns the error. A prewriting transaction therefore holds all of its locks or none
+of them; it does not sit on some and wait for the rest. A cycle needs "holds X, waits for Y" on
+both sides, and nobody is in that state.
+
+Either reason alone prevents a cycle. The lock-resolution loop that *does* wait runs on the
+**read** path — a get or a scan meeting somebody's lock — and a reader holds no locks, so it can
+wait and cannot be waited for.
+
+Worked through concretely, with two SQL nodes and the classic opposite-order shape:
+
+```text
+A: BEGIN; UPDATE row1   -- node A's row lock only; no Percolator lock yet
+B: BEGIN; UPDATE row2   -- node B's row lock only
+A: UPDATE row2          -- B's lock is on B's node table, invisible; A buffers it
+B: UPDATE row1          -- likewise
+A: COMMIT               -- prewrites row1 then row2
+B: COMMIT               -- prewrites row1 then row2
+```
+
+Whoever reaches `row1` first takes it; the other meets the lock, undoes what it placed, and fails.
+One transaction dies with `40001`, the other commits. No cycle, no hang, and the right number of
+victims — with the wrong SQLSTATE only in the sense that PostgreSQL would never have called this a
+deadlock either.
+
+**This is a code-read argument, not a measurement**, and it is the one thing here that should be
+pinned by a test rather than by prose. The test to write is not the one the brief asks for: it is
+*"two nodes commit overlapping key sets in opposite application order, and exactly one wins while
+neither hangs"* — a regression test for the ordering property, which is what would break if the
+primary were ever chosen by insertion order instead of by minimum key. The ordering property
+itself belongs in `esker-client`'s own tests, beside the code that guarantees it.
 
 ## The harness, corrected
 
@@ -90,7 +120,15 @@ so that criterion does not choose between them.
 (2) is the one to build: no format change, no Raft change, and the graph lives where the debt
 record already put it.
 
-## Sizing — not a day
+## Sizing — and the answer changed while it was being written
+
+**Nothing to build, most likely.** If the two reasons above hold, debt #4 is not "large", it is
+*not reachable*, and the work is a test that says so plus a correction to three records. That is
+half a day.
+
+If a cycle can be built after all — the ordering argument is only as good as `primary()` staying
+the minimum key, and a future batched or reordered prewrite would break it — then what follows is
+the sizing for building the detector, and it is not a day:
 
 * `esker-proto`: two PD RPCs, hand-rolled framing both ways, round-trip tests. **A wire change, so
   an ADR.**
