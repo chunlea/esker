@@ -871,13 +871,6 @@ impl Executor {
         }
     }
 
-    /// Opens a transaction at whatever snapshot this session reads at.
-    ///
-    /// The one place `begin` and `begin_at` are chosen between, so that no statement can be
-    /// written in a way that reads the present by accident. The window is checked **here** rather
-    /// than only where it was set: retention moves the floor forward under a session that set
-    /// `esker.read_as_of` an hour ago, and a snapshot that has fallen out of the window must stop
-    /// answering rather than answer approximately.
     /// A transaction that knows whose session it is, which is every one this executor opens.
     ///
     /// **One wrapper rather than two lines at thirteen call sites.** `Backend::begin` takes no
@@ -891,6 +884,13 @@ impl Executor {
         Ok(txn)
     }
 
+    /// Opens a transaction at whatever snapshot this session reads at.
+    ///
+    /// The one place `begin` and `begin_at` are chosen between, so that no statement can be
+    /// written in a way that reads the present by accident. The window is checked **here** rather
+    /// than only where it was set: retention moves the floor forward under a session that set
+    /// `esker.read_as_of` an hour ago, and a snapshot that has fallen out of the window must stop
+    /// answering rather than answer approximately.
     fn open_txn(&self) -> Result<Box<dyn Txn>> {
         let Some(as_of) = &self.read_as_of else {
             return self.begin_txn();
