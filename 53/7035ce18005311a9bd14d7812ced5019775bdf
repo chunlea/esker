@@ -1,0 +1,25 @@
+crates/esker-sql/tests/captures/pg19_view_debts.txt
+  s_c99f71abc0fb31::t_dba65141ee0ec7 46-52,77-80
+crates/esker-sql/tests/corpus/pg19_view_debts.txt
+  s_c99f71abc0fb31::t_d6603e69c05156 77-80
+crates/esker-sql/tests/greatest_trim.rs
+  s_c99f71abc0fb31::t_4f782b9f85a722 124,131-136,143-148
+crates/esker-sql/tests/view_debts.rs
+  s_c99f71abc0fb31::t_ad26d68a685d74 36,41,46,51,56,61,66,76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "537035ce18005311a9bd14d7812ced5019775bdf",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
