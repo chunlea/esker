@@ -149,3 +149,55 @@ fn string_to_array_answers_what_postgresql_answers() {
         ]]
     );
 }
+
+/// **The result takes the assignment cast into the column.** `USING length(snippets)` is an
+/// `int4` result into a `bigint` column: a real server casts it as it would assign it, and this
+/// node refused the row as a codec mismatch. Measured: 5, 0, NULL, 6, and the column is `bigint`.
+#[test]
+fn the_using_result_takes_the_assignment_cast_into_the_column() {
+    let mut node = parity::Node::new(FIXTURE);
+    node.run("ALTER TABLE g1u_t ALTER COLUMN snippets TYPE bigint USING length(snippets)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT id, snippets FROM g1u_t ORDER BY id"),
+        [["1", "5"], ["2", "0"], ["3", "\\N"], ["4", "6"]]
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 'g1u_t'::regclass AND attname = 'snippets'"
+        ),
+        [["bigint"]]
+    );
+}
+
+/// **A result with no cast to the column is `42804`, in PostgreSQL's sentence** — not the row
+/// codec's mismatch — and it carries the HINT a client is told to act on. Measured, hint included.
+#[test]
+fn a_using_result_with_no_cast_is_42804() {
+    let mut node = parity::Node::new(FIXTURE);
+    let error = node
+        .run("ALTER TABLE g1u_t ALTER COLUMN snippets TYPE integer USING snippets || 'x'")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42804", "{error}");
+    assert_eq!(
+        error.to_string(),
+        "result of USING clause for column \"snippets\" cannot be cast automatically to type integer"
+    );
+    assert_eq!(
+        error.hint().as_deref(),
+        Some("You might need to add an explicit cast.")
+    );
+}
+
+/// **A column the `USING` does not have is the user's `42703`**, not an internal error about
+/// "the USING expression". Measured.
+#[test]
+fn a_column_the_using_does_not_have_is_42703() {
+    let mut node = parity::Node::new(FIXTURE);
+    let error = node
+        .run("ALTER TABLE g1u_t ALTER COLUMN snippets TYPE text USING nosuch")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42703", "{error}");
+    assert_eq!(error.to_string(), "column \"nosuch\" does not exist");
+}

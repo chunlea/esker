@@ -1138,6 +1138,22 @@ pub enum SqlError {
         target: String,
     },
 
+    /// The same statement whose `USING` produced a value the column has no assignment cast for:
+    /// `42804`, in PostgreSQL's own sentence, with the HINT that names the way out.
+    ///
+    /// `ALTER COLUMN c TYPE integer USING c || 'x'` is a `text` result and no cast to `integer`;
+    /// measured, hint included. A result the column *can* take by assignment is cast rather than
+    /// refused, which is what `USING length(c)` into a `bigint` relies on.
+    #[error(
+        "result of USING clause for column \"{column}\" cannot be cast automatically to type {target}"
+    )]
+    UsingResultCannotBeCast {
+        /// The column being converted.
+        column: String,
+        /// The target type, spelled the way `format_type` spells it.
+        target: String,
+    },
+
     /// A `UNIQUE` index that cannot be **built**, because the rows already there break it: `23505`.
     ///
     /// **A different sentence from the one an `INSERT` gets**, and deliberately: nothing was
@@ -2905,6 +2921,7 @@ impl SqlError {
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. }
             | SqlError::CannotCastColumnAutomatically { .. }
+            | SqlError::UsingResultCannotBeCast { .. }
             | SqlError::CannotCastDefaultAutomatically { .. }
             // **`42804` and not the `42704` its two neighbours get**: the class exists and the
             // *type* is what it will not take. Measured beside them.
@@ -3401,6 +3418,10 @@ impl SqlError {
             }
             // PostgreSQL's own, and the reason this error is worth more than a refusal:
             // `change_column` reads the sentence and re-sends the statement with that `USING`.
+            // PostgreSQL's own, word for word.
+            SqlError::UsingResultCannotBeCast { .. } => {
+                Some("You might need to add an explicit cast.".to_owned())
+            }
             SqlError::CannotCastColumnAutomatically { using, .. } => {
                 Some(format!("You might need to specify \"USING {using}\"."))
             }

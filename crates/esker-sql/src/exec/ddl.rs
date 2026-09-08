@@ -1401,8 +1401,8 @@ fn set_column_type(
     // type the argument as the answer.
     let resolved = match using_expr {
         Some(expr) => Some(
-            super::query::resolve(expr, &super::query::Scope::single(&before))
-                .map_err(|error| SqlError::Internal(format!("the USING expression: {error}")))?,
+            // Its own error, not an internal one: `USING nosuch` is the user's `42703`, measured.
+            super::query::resolve(expr, &super::query::Scope::single(&before))?,
         ),
         None => None,
     };
@@ -1413,13 +1413,45 @@ fn set_column_type(
         let value = match &resolved {
             // **The expression sees the whole row**, not only the column being retyped — a `USING`
             // may name any column of the table, which is the half a per-value conversion cannot do.
-            Some(resolved) => super::cursor::evaluate_in_txn(resolved, &row, &*txn)?,
+            Some(resolved) => using_result_into(
+                super::cursor::evaluate_in_txn(resolved, &row, &*txn)?,
+                column,
+                ty,
+                &target,
+                executor.rendering(),
+            )?,
             None => convert_datum(from, ty, &row[at])?,
         };
         row[at] = crate::value::fit_to_typmod(value, ty, typmod)?;
         txn.put(&key, &crate::row::encode_row(&types, &row)?);
     }
     Ok(())
+}
+
+/// The evaluated `USING` value as the column's own — the assignment cast a real server applies to
+/// the result — or the `42804` it raises for a result it cannot cast on its own.
+///
+/// `ALTER COLUMN c TYPE bigint USING length(c)` is an `int4` result into a `bigint` column, which
+/// used to reach `encode_row` and be refused as a codec mismatch; `… TYPE integer USING c || 'x'`
+/// is a `text` result with no cast to `integer`, which is `42804 result of USING clause for column
+/// "c" cannot be cast automatically to type integer` on a real server, HINT included. Both measured.
+fn using_result_into(
+    value: Datum,
+    column: &str,
+    ty: ColumnType,
+    target: &str,
+    rendering: crate::value::Rendering,
+) -> Result<Datum> {
+    if value.fits(ty) {
+        return Ok(value);
+    }
+    if crate::value::has_assignment_cast(value.column_type(), ty) {
+        return crate::value::assignment_cast(value, ty, rendering);
+    }
+    Err(SqlError::UsingResultCannotBeCast {
+        column: column.to_owned(),
+        target: target.to_owned(),
+    })
 }
 
 /// `ALTER TABLE … VALIDATE CONSTRAINT <name>` — the second half of `NOT VALID`.
