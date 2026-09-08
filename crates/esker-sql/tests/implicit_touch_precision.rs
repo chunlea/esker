@@ -37,26 +37,31 @@ fn fraction(printed: &str) -> String {
         .map_or_else(String::new, |(_, tail)| tail.to_owned())
 }
 
-/// **What a single-node test can and cannot see here, which is the finding.**
+/// **A single-node test can see the precision now, and this is the assertion that says so.**
 ///
-/// `MemoryBackend::begin` takes its `start_ts` from `versions.clock` — a **logical counter**, not
-/// a wall clock — so `CURRENT_TIMESTAMP` in every single-node test in this crate is the PostgreSQL
-/// epoch with no sub-second part at all. A hundred reads give a hundred identical instants.
-///
-/// That is why no test in this repository could have caught a precision defect in the implicit
-/// touch, and it is why this file asserts the **conversion** rather than the end-to-end value: a
-/// test that failed here would be reporting the harness's clock, not the product's.
+/// `MemoryBackend`'s oracle used to be a logical counter with a frozen physical half, so
+/// `CURRENT_TIMESTAMP` in every single-node test was one instant with no sub-second part — which
+/// is why this file asserts the *conversion* below rather than the end-to-end value, and why this
+/// test once asserted the counter. The oracle follows the wall clock since `037f57a3`
+/// (`Versions::mark`, `tests/wall_clock.rs`), so the shape `insert_all_test.rb` reads — a
+/// sub-second part on the touched column — is reachable here: a millisecond is a thousandth of a
+/// second, and twenty reads without one would be a clock that had stopped.
 #[test]
-fn a_single_node_test_reads_a_counter_and_not_a_clock() {
+fn a_single_node_test_reads_a_clock_with_sub_second_precision() {
     let mut node = parity::Node::new(FIXTURE);
-    let first = node.rows("SELECT CURRENT_TIMESTAMP");
-    let again = node.rows("SELECT CURRENT_TIMESTAMP");
-    assert_eq!(
-        fraction(&first[0][0]),
-        "",
-        "the memory backend grew a sub-second clock; this file's reasoning needs revisiting"
+    let reads: Vec<String> = (0..20)
+        .map(|_| node.rows("SELECT CURRENT_TIMESTAMP")[0][0].clone())
+        .collect();
+    assert!(
+        reads.iter().any(|printed| !fraction(printed).is_empty()),
+        "twenty reads of CURRENT_TIMESTAMP and not one sub-second part: the oracle is a counter \
+         again, and this file's reasoning needs revisiting: {reads:?}"
     );
-    assert_eq!(first, again, "two reads of a counter differed");
+    // And it is a clock: a decimal fraction without trailing zeros orders as its value does, so
+    // the printed instants never go backwards between two reads.
+    for pair in reads.windows(2) {
+        assert!(pair[0] <= pair[1], "{} then {}", pair[0], pair[1]);
+    }
 }
 
 /// **The conversion the real path depends on**, which is a product function and is deterministic.

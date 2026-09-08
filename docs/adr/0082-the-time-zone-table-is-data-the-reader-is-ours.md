@@ -1,4 +1,4 @@
-# 0080 — the time-zone table is a dependency, the reader is ours
+# 0082 — the time-zone table is a dependency, the reader is ours
 
 **Status**: accepted · **Date**: 2026-09-05
 

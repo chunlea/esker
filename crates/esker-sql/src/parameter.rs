@@ -91,7 +91,7 @@ pub enum Values {
     /// and `SHOW TimeZone` then answers `America/New_York` rather than what was typed
     /// (`tests/captures/pg19_time_zone.txt`).
     ///
-    /// Until ADR 0080 this was [`Values::Free`] plus a refusal in [`Parameter::honour`] for any
+    /// Until ADR 0082 this was [`Values::Free`] plus a refusal in [`Parameter::honour`] for any
     /// name that did not mean UTC, and that refusal's list of UTC spellings had **three names a
     /// real server rejects** in it — `universal`, `zulu` and `z` are not in the installed table
     /// and are `22023` there, where this node was accepting them. Answering where PostgreSQL
@@ -510,7 +510,7 @@ impl Parameter {
             // PostgreSQL's own answer, with PostgreSQL's own sentence. This crate's string lexer
             // is standard-conforming and cannot be made otherwise by a setting.
             ("standard_conforming_strings", "off") => Err(SqlError::NonStandardStringLiterals),
-            // **`TimeZone` was refused by name here until ADR 0080**, because a `timestamptz` was
+            // **`TimeZone` was refused by name here until ADR 0082**, because a `timestamptz` was
             // printed in UTC and nowhere else and a zone honoured in `SHOW` and ignored in every
             // row would be a setting that lies. The zone now reaches the renderer through
             // `crate::value::Rendering`, so there is nothing left to refuse: a name that does not

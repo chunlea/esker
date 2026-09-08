@@ -1,6 +1,6 @@
 //! `SET TIME ZONE` with a name, and the three things that then change.
 //!
-//! ADR 0080 gave this node the IANA table. Before it, every zone that was not a spelling of UTC
+//! ADR 0082 gave this node the IANA table. Before it, every zone that was not a spelling of UTC
 //! was `0A000` — the honest answer while a `timestamptz` printed in UTC and nowhere else, because
 //! a setting honoured in `SHOW` and ignored in every row is a setting that lies.
 //!

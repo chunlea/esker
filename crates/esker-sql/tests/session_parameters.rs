@@ -80,7 +80,7 @@ fn client_min_messages_actually_suppresses_a_notice() {
 ///
 /// It was written for `search_path` and `TimeZone`, both of which were then refused by name.
 /// `search_path` left with the namespace unit: an entry naming no schema is now *skipped*, which
-/// is what a real server does with it. **`TimeZone` left with ADR 0080**, and the refusal it is
+/// is what a real server does with it. **`TimeZone` left with ADR 0082**, and the refusal it is
 /// replaced by is a different one — a zone this node cannot resolve is `22023` with PostgreSQL's
 /// own sentence, where a zone it can is simply meant.
 #[test]

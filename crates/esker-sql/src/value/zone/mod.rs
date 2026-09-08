@@ -1,6 +1,6 @@
 //! A named time zone: the offset from UTC at an instant, and what that offset is called.
 //!
-//! [ADR 0080](../../../../docs/adr/0080-the-time-zone-table-is-data-the-reader-is-ours.md) settles
+//! [ADR 0082](../../../../docs/adr/0082-the-time-zone-table-is-data-the-reader-is-ours.md) settles
 //! where this comes from. **The table is a dependency and the reader is ours**: `jiff-tzdb`
 //! embeds the IANA database as `TZif` bytes and nothing else — one crate, no dependencies of its
 //! own, no build script — and this module's `tzif` and `posix` read them.

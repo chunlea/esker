@@ -1,7 +1,7 @@
 //! Reading a `TZif` file — the IANA database's on-disk form, RFC 8536.
 //!
 //! The bytes come from `jiff-tzdb`, which is the whole of what
-//! [ADR 0080](../../../../../docs/adr/0080-the-time-zone-table-is-data-the-reader-is-ours.md) buys:
+//! [ADR 0082](../../../../../docs/adr/0082-the-time-zone-table-is-data-the-reader-is-ours.md) buys:
 //! a zone name is a legislative history and nothing here can derive it. **The reading is ours**,
 //! because a `TZif` file is a magic, a version, six counts and five arrays — the shape CLAUDE.md
 //! puts on the in-house list beside every other format this repository frames itself.

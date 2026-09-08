@@ -21,7 +21,7 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # `psm`, which compiles assembly through `cc`, and both are banned. esker-sql/src/parse/ owns
 # the stack-depth guard that feature would otherwise have provided.
 sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
-# --- the time-zone table, and only the table (docs/adr/0080-*.md, accepted 2026-09-05) ---
+# --- the time-zone table, and only the table (docs/adr/0082-*.md, accepted 2026-09-05) ---
 # The IANA database as TZif bytes, with no dependencies of its own, no build script and no
 # `serde`. Three items and no more: `get(name) -> Option<(&str, &[u8])>`, `available()` and a
 # `VERSION` static naming the release, so an update is a version bump and `SHOW` can say which

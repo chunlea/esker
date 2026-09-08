@@ -34,7 +34,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              other line about this parameter agrees.",
             "pg19_set_parameters.txt:56",
         ),
-        // **Surfaced by ADR 0080, and older than it.** `SET TimeZone` earlier in this corpus was
+        // **Surfaced by ADR 0082, and older than it.** `SET TimeZone` earlier in this corpus was
         // a refusal that aborted the transaction and swallowed the forty-four statements after it;
         // the zone table answers it now, and this is the first of those to disagree. `SET LOCAL`
         // is refused by name here for every parameter (`tests/session_parameters.rs`), which is

@@ -1325,7 +1325,7 @@ impl Executor {
     /// `OID::Interval#cast_value` rescues a parse failure by returning `nil`, so a server that
     /// answers the wrong dialect hands the client no value and no error. Two `interval_test.rb`
     /// failures were that and nothing else (`tests/interval_style.rs`). `TimeZone` was the
-    /// other, refused by name until this node had a zone table (ADR 0080).
+    /// other, refused by name until this node had a zone table (ADR 0082).
     ///
     /// A zone that does not resolve cannot reach here: `SET` refuses it with `22023`, so the
     /// stored value is always a name the table has.
