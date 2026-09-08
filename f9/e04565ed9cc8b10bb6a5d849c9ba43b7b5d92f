@@ -1,11 +1,15 @@
 crates/esker-sql/src/parse/lower.rs
   s_c99f71abc0fb31::t_99080e2f66542b 6860-6866,6868-6885,6901,6904,6906,6909-6910,6964-6980
+  s_c99f71abc0fb31::t_127994904b1da4 6860-6866,6868,6871-6885,6901,6904,6906,6909-6910
 crates/esker-sql/src/parse/mod.rs
   s_c99f71abc0fb31::t_c8a073f5c6ba26 2785-2802
+  s_c99f71abc0fb31::t_9930d62090942f 2785-2802
 crates/esker-sql/src/parse/set_operation.rs
   s_c99f71abc0fb31::t_9966322b56a940 37-45,50-67
+  s_c99f71abc0fb31::t_083a1e4c9b9a17 37-45,50-67
 crates/esker-sql/tests/lowering_depth.rs
   s_c99f71abc0fb31::t_53c32c5fac65c0 90-107,112-113,324,353-374
+  s_c99f71abc0fb31::t_fff30cb5a7c646 90-107,112-113,324,353-374
 ---
 {
   "schema_version": "authorship/3.0.0",
