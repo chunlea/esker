@@ -1,0 +1,23 @@
+crates/esker-engine/tests/range_del.rs
+  s_c99f71abc0fb31::t_530c7f646ccc64 348-349,351,353
+crates/esker-engine/tests/sst_reader.rs
+  s_c99f71abc0fb31::t_ae8a6fd369f113 515
+crates/esker-sql/src/catalog/mod.rs
+  s_c99f71abc0fb31::t_4a318be3d3db2c 4255,4257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "acde35b838acbe1b839bed54a46222dab0bcf38c",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
