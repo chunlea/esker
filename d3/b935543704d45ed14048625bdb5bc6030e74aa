@@ -1,0 +1,25 @@
+CLAUDE.md
+  s_c99f71abc0fb31::t_e46404bf5ff705 100-101
+docs/DESIGN.md
+  s_c99f71abc0fb31::t_dcbaa53d9b604d 640-644,773-775,1050-1054,1097
+docs/adr/0003-dependencies.md
+  s_c99f71abc0fb31::t_1f714071693ad9 30
+docs/adr/0060-a-using-clause-is-a-licence-not-an-expression.md
+  s_c99f71abc0fb31::t_63a3e9ab8596d6 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d3b935543704d45ed14048625bdb5bc6030e74aa",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
