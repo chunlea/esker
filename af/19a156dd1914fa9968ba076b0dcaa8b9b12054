@@ -1,13 +1,21 @@
 crates/esker-keys/src/row.rs
   s_c99f71abc0fb31::t_698800067d8c37 114-126,2543-2590
+  s_c99f71abc0fb31::t_027aaea9add5e9 114-126,2543-2590
+  s_c99f71abc0fb31::t_8d73b05809b9d9 114-126,2543-2590
 crates/esker-sql/src/exec/assign.rs
   s_c99f71abc0fb31::t_297a333d4d57bf 63-69
+  s_c99f71abc0fb31::t_317202b54dc785 63-69
+  s_c99f71abc0fb31::t_0ee5f7d29f0aae 63-68
 crates/esker-sql/src/plan/expr.rs
   s_c99f71abc0fb31::t_e2cfa857c34486 2354-2369
+  s_c99f71abc0fb31::t_f63f5db33a88e7 2354-2369
 crates/esker-sql/src/value/mod.rs
   s_c99f71abc0fb31::t_051ebdd67153f9 328-350,546-552
+  s_c99f71abc0fb31::t_a24b59dafee8e8 328-350,546-552
 crates/esker-sql/tests/regclass_into_a_column.rs
   s_c99f71abc0fb31::t_08e39f7ed35921 1-80
+  s_c99f71abc0fb31::t_0b3f54a6f36c65 1-80
+  s_c99f71abc0fb31::t_d1dafbd065afce 1-76,78-80
 ---
 {
   "schema_version": "authorship/3.0.0",
