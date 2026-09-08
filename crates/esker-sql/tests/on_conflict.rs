@@ -277,3 +277,33 @@ fn the_set_sees_both_the_existing_row_and_the_proposed_one() {
     .unwrap();
     assert_eq!(node.rows("SELECT name FROM books"), [["x"]]);
 }
+
+/// **The shim is one statement's.** The `WHERE` of an `ON CONFLICT (…) WHERE …` comes off the
+/// text before the parser sees it and travels on the parsed statement — on *every* statement the
+/// message produced, so a second `INSERT … ON CONFLICT` in the same message inherited the first
+/// one's predicate and a bare target over a partial index was inferred where a real server says
+/// `42P10`. A message carrying two `ON CONFLICT`s with a shim in play is refused by name; one at a
+/// time, which is all `ActiveRecord` sends, is unchanged.
+#[test]
+fn a_message_with_two_on_conflicts_and_a_shim_is_refused_by_name() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE oc2 (isbn text, published_on date)",
+        "CREATE UNIQUE INDEX oc2_isbn ON oc2 (isbn) WHERE published_on IS NOT NULL",
+    ]);
+    node.run(
+        "INSERT INTO oc2 VALUES ('a', NULL) ON CONFLICT (isbn) WHERE (published_on IS NOT NULL) \
+         DO NOTHING",
+    )
+    .unwrap();
+    let error = node
+        .run(
+            "INSERT INTO oc2 VALUES ('b', NULL) ON CONFLICT (isbn) WHERE (published_on IS NOT NULL) \
+             DO NOTHING; INSERT INTO oc2 VALUES ('c', NULL) ON CONFLICT (isbn) DO NOTHING",
+        )
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "0A000", "{error}");
+    assert!(
+        error.to_string().contains("more than one ON CONFLICT"),
+        "{error}"
+    );
+}

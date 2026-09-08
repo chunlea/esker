@@ -682,6 +682,18 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     // `ON CONFLICT (…) WHERE …` — the predicate comes off and travels on `Parsed`, because the
     // parser expects `DO` there and its tree has nowhere to put one.
     let conflict = strip_on_conflict_target(sql, &scanned);
+    // **The shim is one statement's, and the message may hold two.** It rewrites the first
+    // `ON CONFLICT (…)` in the text and would be attached to every statement the text produces —
+    // a second `INSERT … ON CONFLICT` in the same simple-query message would inherit the first's
+    // predicate and expressions, and a bare target over a partial index would be inferred where a
+    // real server says `42P10`. `ActiveRecord` sends one statement per message; a message that
+    // does not is refused by name rather than answered for the wrong statement.
+    if conflict.is_some() && count_word_pairs(&scanned.words, "ON", "CONFLICT") > 1 {
+        return Err(SqlError::unsupported(
+            "ON CONFLICT with a WHERE or an expression target in a message of more than one \
+             ON CONFLICT",
+        ));
+    }
     let sql = conflict.as_ref().map_or(sql, |(text, _)| text.as_str());
     // The namespace comes off before `sqlparser` sees the statement; it cannot read the dot.
     let namespaced = strip_parameter_namespace(sql, &scanned);
@@ -3499,6 +3511,14 @@ fn starts_with_words(words: &[&str], pattern: &[&str]) -> bool {
             .iter()
             .zip(pattern)
             .all(|(word, expected)| word_matches(word, expected))
+}
+
+/// How many times `first` is immediately followed by `second` in `words`, case-insensitively.
+fn count_word_pairs(words: &[&str], first: &str, second: &str) -> usize {
+    words
+        .windows(2)
+        .filter(|pair| word_matches(pair[0], first) && word_matches(pair[1], second))
+        .count()
 }
 
 fn contains_words(words: &[&str], pattern: &[&str]) -> bool {
