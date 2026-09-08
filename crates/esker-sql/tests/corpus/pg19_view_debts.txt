@@ -43,8 +43,6 @@ CREATE VIEW v_over_view AS SELECT id, a FROM v_plain;		-
 SELECT table_name, is_updatable, is_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;	name,character varying(3),character varying(3)	v_distinct|NO|NO ; v_expr|YES|YES ; v_group|NO|NO ; v_join|NO|NO ; v_limit|NO|NO ; v_over_view|YES|YES ; v_plain|YES|YES ; v_star|YES|YES ; v_union|NO|NO ; v_where|YES|YES
 
 -- ------------------------------------------------- pg_get_viewdef, both forms		-
-# (the seven answers below were empty in the capture and are PostgreSQL 19's first lines, replayed 2026-09-07: a
-#  multi-line cell is recorded as its first line, as every capture does)
 SELECT pg_get_viewdef('v_plain'::regclass);	text	 SELECT id,
 SELECT pg_get_viewdef('v_where'::regclass);	text	 SELECT id,
 SELECT pg_get_viewdef('v_expr'::regclass);	text	 SELECT id,
@@ -76,3 +74,7 @@ SELECT count(*) FROM information_schema.views WHERE table_schema = 'public';	big
 
 ROLLBACK;		-
 SELECT count(*) FROM pg_class WHERE relname LIKE 'v\_%' OR relname LIKE 'vb%';	bigint	0
+#
+# Lines 46-52 held no answer when this was captured (the transaction had aborted at line 40 on this node, so
+# they were never compared); they hold PostgreSQL 19's first lines since a replay on 2026-09-07 — a multi-line
+# cell is recorded as its first line, as every capture does.

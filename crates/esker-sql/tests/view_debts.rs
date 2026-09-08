@@ -33,37 +33,37 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT pg_get_viewdef('v_plain'::regclass);",
             VIEWDEF,
-            "pg19_view_debts.txt:48",
+            "pg19_view_debts.txt:46",
         ),
         (
             "SELECT pg_get_viewdef('v_where'::regclass);",
             VIEWDEF,
-            "pg19_view_debts.txt:49",
+            "pg19_view_debts.txt:47",
         ),
         (
             "SELECT pg_get_viewdef('v_expr'::regclass);",
             VIEWDEF,
-            "pg19_view_debts.txt:50",
+            "pg19_view_debts.txt:48",
         ),
         (
             "SELECT pg_get_viewdef('v_group'::regclass);",
             VIEWDEF,
-            "pg19_view_debts.txt:51",
+            "pg19_view_debts.txt:49",
         ),
         (
             "SELECT pg_get_viewdef('v_join'::regclass);",
             VIEWDEF,
-            "pg19_view_debts.txt:52",
+            "pg19_view_debts.txt:50",
         ),
         (
             "SELECT pg_get_viewdef('v_plain'::regclass, true);",
             VIEWDEF,
-            "pg19_view_debts.txt:53",
+            "pg19_view_debts.txt:51",
         ),
         (
             "SELECT definition FROM pg_views WHERE viewname = 'v_where';",
             VIEWDEF,
-            "pg19_view_debts.txt:54",
+            "pg19_view_debts.txt:52",
         ),
         // **A `NOTICE` per view is what `DROP … CASCADE` answers**, and this replay compares result
         // sets: the notices are there — `a_cascade_walks_the_whole_chain` reads them, and the
@@ -73,7 +73,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "DROP TABLE vb CASCADE;",
             "a `NOTICE` per dropped view, which the replay does not compare",
-            "pg19_view_debts.txt:74",
+            "pg19_view_debts.txt:72",
         ),
     ],
 };

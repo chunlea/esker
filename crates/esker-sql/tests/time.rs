@@ -68,8 +68,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
         "SELECT date_part('minute', '12:34:56'::time)",
         "SELECT '12:34:56'::time = '12:34:56'::timetz",
-        "SELECT greatest('12:00:00'::time, '13:00:00'::time), least('12:00:00'::time, \
-         '13:00:00'::time)",
         "SELECT '12:34:56'::timetz, '12:34:56+02'::timetz, '12:34:56+02'::timetz::text",
     ],
     answers: &[

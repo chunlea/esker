@@ -121,24 +121,31 @@ fn trim_has_three_forms_and_a_default() {
     );
 }
 
-/// **A side with no characters at all is `sqlparser`'s gap, not this node's.**
+/// **A side with no characters at all is `sqlparser`'s gap, and it is named as one.**
 ///
 /// `TRIM(BOTH FROM '  x  ')` is `x` on 19beta1 — the whitespace default with the side written out
 /// — and `sqlparser` 0.62 will not parse it: it expects the characters before `FROM` and reports
 /// `Expected: ), found: '  x  '`. The lowering handles the form the moment the parser produces it
 /// (`trim_what` is already an `Option`), so nothing here has to change when it does.
 ///
-/// Recorded rather than worked around: rewriting the text before parsing is how a keyword ends up
-/// in a refusal table taking the blame for a gap somewhere else. Nothing in the suite writes this
-/// form — `insert_all_test.rb` sends `TRIM(title)`.
+/// Not worked around — rewriting the text before parsing is how a keyword ends up in a refusal
+/// table taking the blame for a gap somewhere else — and not a `42601` either, because a statement
+/// PostgreSQL accepts is never a syntax error here (`tests/syntax_corpus.rs`): the refusal table
+/// has a row for exactly this shape, `TRIM(BOTH FROM ...)`, so the answer is an `0A000` naming
+/// what is missing. Nothing in the suite writes this form — `insert_all_test.rb` sends
+/// `TRIM(title)`.
 #[test]
 fn a_side_with_no_characters_is_the_parsers_gap() {
     let mut node = parity::Node::new(FIXTURE);
     let error = node.run("SELECT TRIM(BOTH FROM '  x  ')").unwrap_err();
     assert_eq!(
         error.sqlstate(),
-        sqlstate::SYNTAX_ERROR,
-        "PostgreSQL answers `x` here"
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "PostgreSQL answers `x` here, and this node names the gap: {error}"
+    );
+    assert!(
+        error.to_string().contains("TRIM(BOTH FROM ...)"),
+        "the refusal names the shape and not just a keyword: {error}"
     );
 }
 
