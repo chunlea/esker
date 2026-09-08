@@ -5898,20 +5898,25 @@ mod tests {
         assert_eq!(loser.sqlstate(), sqlstate::SERIALIZATION_FAILURE);
     }
 
-    /// Ids are unique across tables and indexes alike, so a debug dump can never confuse the two.
+    /// Ids are unique across tables and indexes alike, so a debug dump can never confuse the two —
+    /// and they start at [`super::FIRST_USER_ID`], so none can be mistaken for a built-in's oid either.
     #[test]
-    fn relation_ids_come_from_one_sequence_and_start_at_one() {
+    fn relation_ids_come_from_one_sequence_and_start_where_postgresqls_do() {
         let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
-        assert_eq!(allocate_id(&mut *txn, 1).unwrap(), 1);
-        assert_eq!(allocate_id(&mut *txn, 1).unwrap(), 2);
-        assert_eq!(allocate_id(&mut *txn, 2).unwrap(), 1, "per tenant");
+        assert_eq!(allocate_id(&mut *txn, 1).unwrap(), super::FIRST_USER_ID);
+        assert_eq!(allocate_id(&mut *txn, 1).unwrap(), super::FIRST_USER_ID + 1);
+        assert_eq!(
+            allocate_id(&mut *txn, 2).unwrap(),
+            super::FIRST_USER_ID,
+            "per tenant"
+        );
         txn.commit().unwrap();
 
         let mut next = backend.begin().unwrap();
         assert_eq!(
             allocate_id(&mut *next, 1).unwrap(),
-            3,
+            super::FIRST_USER_ID + 2,
             "and it survives a commit"
         );
     }

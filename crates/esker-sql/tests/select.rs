@@ -435,7 +435,6 @@ fn an_expression_we_do_not_evaluate_is_refused_by_name() {
             "SELECT id FROM s1 JOIN s1 AS b USING (id) JOIN s1 AS c USING (id)",
             "USING in a chain of more than one JOIN",
         ),
-        ("SELECT * FROM s1 UNION SELECT * FROM s1", "UNION"),
     ] {
         let error = node.run(sql).unwrap_err();
         assert_eq!(

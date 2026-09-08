@@ -100,11 +100,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_numeric.txt:130",
         ),
         (
-            "SELECT greatest(1.5::numeric, 2.5::numeric), least(1.5::numeric, 2.5::numeric)",
-            "`greatest`/`least` are `0A000` naming themselves, for every type.",
-            "pg19_numeric.txt:133",
-        ),
-        (
             "SELECT 2::numeric ^ 10, 2::numeric ^ 0.5",
             "**`^` over two exact values has a scale rule of its own** — `2 ^ 10` is \
              `1024.0000000000000` and `10 ^ 100` is a bare integer, so the rule is about the \

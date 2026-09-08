@@ -1102,6 +1102,10 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
                 | ColumnType::Jsonb
                 | ColumnType::Xml
                 | ColumnType::LQuery
+                // **The two catalog vectors are their text**: space-separated numbers, which is
+                // what `decode_row` hands back for one and all the column holds.
+                | ColumnType::Int2Vector
+                | ColumnType::OidVector
         )
         // **A `regtype` fits an `oid` column and the reverse**, which is ADR 0042's rule met in
         // full: the two share a representation *and* a comparison — the oid, in both directions —

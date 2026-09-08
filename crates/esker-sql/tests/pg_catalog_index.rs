@@ -15,16 +15,15 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `indexrelid` and `indrelid` are `oid`s and `indkey` is an `int2vector` on a real server; this
-    // node has neither type, so they are `bigint` and `text`. `indnatts` is an `int2` on both.
+    // `indexrelid` and `indrelid` are `oid`s on a real server and `bigint` here. `indkey` is an
+    // `int2vector` on both now, and the two lines that read only it left this list; the ones
+    // below still name a relation. `indnatts` is an `int2` on both.
     // Every *value* is identical — the harness only reaches this list when the rows agree — and
     // `indkey`'s characters are the ones `ActiveRecord` splits on.
     types: &[
         "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey, x.indnatts, x.indisvalid, x.indpred IS NULL, x.indexprs IS NULL, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ia'::regclass ORDER BY i.relname",
         "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ic'::regclass ORDER BY i.relname",
         "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ib'::regclass ORDER BY i.relname",
-        "SELECT indkey FROM pg_index WHERE indexrelid = 'ia_yz_idx'::regclass",
-        "SELECT indkey FROM pg_index WHERE indexrelid = 'ic_pkey'::regclass",
         "SELECT c.relname FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class c ON d.indexrelid = c.oid WHERE c.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' ORDER BY c.relname",
         "SELECT DISTINCT i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' AND n.nspname = 'public' ORDER BY i.relname",
         "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",

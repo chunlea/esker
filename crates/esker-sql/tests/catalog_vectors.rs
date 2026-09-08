@@ -19,7 +19,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // server says `int2vector` or `smallint`: `indkey` is text here, so its elements are too. The
     // `conkey` half of the same file is not in this list any more, which is the unit.
     types: &[
-        "SELECT 'r', indkey, indoption FROM pg_index WHERE indexrelid = 'vt_ab'::regclass",
         "SELECT 'r', indkey[0], indkey[1], array_length(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass",
         "SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) ORDER BY a.attname",
         "SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = c.conkey[1]",

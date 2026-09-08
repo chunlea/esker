@@ -84,8 +84,10 @@ fn pg_type_reports_the_three_kinds_and_the_array_type_each_one_made() {
              typname IN ('floatrange','full_address','custom_time_format') ORDER BY typname",
             &mut node
         ),
+        // An enum is **four bytes** on a real server — `typlen` 4, `typbyval` t, measured — where
+        // the range and the composite are varlena.
         vec![
-            "custom_time_format|e|E|-1|f".to_owned(),
+            "custom_time_format|e|E|4|f".to_owned(),
             "floatrange|r|R|-1|f".to_owned(),
             "full_address|c|C|-1|t".to_owned(),
         ]

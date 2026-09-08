@@ -148,6 +148,13 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
                 | ColumnType::RegType
                 | ColumnType::RegTypeArray
+                // A `regclass` is not one for `regtype`'s reason — an oid that prints as a name —
+                // and `is_index_key` in `esker_keys::row` refuses it, with the decoder agreeing.
+                | ColumnType::RegClass
+                // **The two catalog vectors are stored as their text and are never keys**: `indkey`
+                // is what they exist for, and no index is built over an index's own column list.
+                | ColumnType::Int2Vector
+                | ColumnType::OidVector
         ) {
             assert!(
                 !types_seen.contains(&ty),

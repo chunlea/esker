@@ -158,12 +158,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_time.txt:106",
         ),
         (
-            "SELECT greatest('12:00:00'::time, '13:00:00'::time), least('12:00:00'::time, \
-             '13:00:00'::time)",
-            FUNCTIONS,
-            "pg19_time.txt:107",
-        ),
-        (
             "SELECT '12:34:56'::timetz, '12:34:56+02'::timetz, '12:34:56+02'::timetz::text",
             TIMETZ,
             "pg19_time.txt:109",

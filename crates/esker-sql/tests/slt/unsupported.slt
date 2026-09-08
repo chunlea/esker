@@ -13,9 +13,6 @@ CREATE TABLE t (id int8 PRIMARY KEY, a int8, b text)
 statement error (0A000)
 SELECT c FROM t AS x (c)
 
-statement error (0A000)
-SELECT * FROM t UNION SELECT * FROM t
-
 # `GROUP BY`, `HAVING`, `DISTINCT` and the five aggregates run now (phase 9 unit 1,
 # tests/slt/aggregate.slt). What sits next to them still does not, and each still names itself.
 statement error (0A000)

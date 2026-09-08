@@ -1174,6 +1174,9 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegType
             | ColumnType::RegTypeArray
             | ColumnType::RegClass
+            // The two catalog vectors, which `decode_key_column` refuses below.
+            | ColumnType::Int2Vector
+            | ColumnType::OidVector
             | ColumnType::Xml
             | ColumnType::XmlArray
             // **`ltree[]` is not a key and `ltree` is.** An array key is built out of its
@@ -2477,9 +2480,6 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Round trip: whatever goes into a row comes back out of it, for any mixture of types
-        /// and any placement of NULLs.
-        #[test]
         /// Every row survives every number of columns appended after it was written, which is
         /// the property `ALTER TABLE ADD COLUMN` rests on. The appended types are arbitrary:
         /// nothing of them is read, because the padding is NULL whatever they are.
@@ -2506,6 +2506,8 @@ mod tests {
             proptest::prop_assert_eq!(decode_row(&RowSchema::nullable(widened.clone()), &row).unwrap(), expected);
         }
 
+        /// Round trip: whatever goes into a row comes back out of it, for any mixture of types
+        /// and any placement of NULLs.
         #[test]
         fn any_row_survives_encode_and_decode((types, rows) in schema_and_rows(0..12, 1)) {
             let values = &rows[0];
