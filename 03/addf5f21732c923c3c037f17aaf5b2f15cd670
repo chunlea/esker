@@ -1,13 +1,23 @@
 crates/esker-sql/src/catalog/pg_catalog.rs
   s_c99f71abc0fb31::t_cdd6a5aa094ff5 2897
+  s_c99f71abc0fb31::t_399fcfc2f012b7 2897
+  s_c99f71abc0fb31::t_b95e3b5f013742 2897
 crates/esker-sql/src/error.rs
   s_c99f71abc0fb31::t_f255c7c60c4344 2486-2499,2977-2979
+  s_c99f71abc0fb31::t_fb28409c5902cd 2486-2499,2977-2979
+  s_c99f71abc0fb31::t_473a530c400619 2486-2499,2977-2979
 crates/esker-sql/src/exec/query.rs
   s_c99f71abc0fb31::t_99bd5924d39a87 678-692,852,854-870,872,876-881,884-943
+  s_c99f71abc0fb31::t_612745a15882a7 678-692,852,854-870,872,876-881,884-943
+  s_c99f71abc0fb31::t_bac5a933bea5d7 678-692,852,854-870,872,876-881,884-943
 crates/esker-sql/tests/captures/pg19_union_types.txt
   s_c99f71abc0fb31::t_d887395140e448 1-326
+  s_c99f71abc0fb31::t_7b80be89b1dc18 1-326
+  s_c99f71abc0fb31::t_d77868473e6350 1-326
 crates/esker-sql/tests/set_operation.rs
   s_c99f71abc0fb31::t_6746295186d594 288-376
+  s_c99f71abc0fb31::t_125ec9d92f9ea1 288-376
+  s_c99f71abc0fb31::t_f4fe46918a4b38 288-292,299-302,303-317,319-370,371-376
 ---
 {
   "schema_version": "authorship/3.0.0",
