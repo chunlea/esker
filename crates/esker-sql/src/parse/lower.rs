@@ -6802,14 +6802,28 @@ fn refuse_unlockable_shape(select: &plan::Select) -> Result<()> {
             clause: "aggregate functions",
         });
     }
-    // **The nullable side is the one a `LEFT JOIN` may fill with NULLs**, which is the inner side
-    // of every join this node builds. Locking the other side is legal, so what decides it is which
-    // relation the clause names rather than the join itself.
+    // **The nullable side is the one an outer join may fill with NULLs**: a `LEFT JOIN`'s inner
+    // side, and — a `FULL JOIN` having two — every relation in the statement once one is present,
+    // the `FROM` table included. Locking the other side of a `LEFT JOIN` is legal, so what decides
+    // it there is which relation the clause names rather than the join itself. Measured: `FOR
+    // UPDATE` and `FOR UPDATE OF <either side>` over a full join are both refused, with the same
+    // sentence as the left join's.
+    let has_full = select
+        .joins
+        .iter()
+        .any(|join| join.kind == plan::JoinKind::Full);
     let nullable: Vec<&str> = select
         .joins
         .iter()
-        .filter(|join| join.kind == plan::JoinKind::Left)
+        .filter(|join| has_full || join.kind == plan::JoinKind::Left)
         .map(|join| join.table.referred_as())
+        .chain(
+            select
+                .from
+                .as_ref()
+                .filter(|_| has_full)
+                .map(plan::TableRef::referred_as),
+        )
         .collect();
     for lock in &select.locking {
         // A clause with no `OF` locks every relation, so any nullable one is enough to refuse it;

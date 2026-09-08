@@ -192,3 +192,25 @@ fn a_where_on_the_outer_table_is_not_pushed_below_a_full_join_in_a_chain() {
         vec![vec!["orphan".to_owned()]]
     );
 }
+
+/// **A `FULL JOIN` has two nullable sides**, so a locking clause over one is refused whichever
+/// relation it names — with the sentence the `LEFT JOIN` case already had. Measured: `FOR UPDATE`
+/// and `FOR UPDATE OF pets` are both `0A000 FOR UPDATE cannot be applied to the nullable side of
+/// an outer join`.
+#[test]
+fn for_update_over_a_full_join_is_refused_on_either_side() {
+    let mut node = parity::Node::new(FIXTURE);
+    for sql in [
+        "SELECT * FROM pets FULL JOIN toys ON toys.pet_id = pets.id FOR UPDATE",
+        "SELECT * FROM pets FULL JOIN toys ON toys.pet_id = pets.id FOR UPDATE OF pets",
+        "SELECT * FROM pets FULL JOIN toys ON toys.pet_id = pets.id FOR UPDATE OF toys",
+    ] {
+        let error = node.run(sql).unwrap_err();
+        assert_eq!(error.sqlstate(), "0A000", "{sql}");
+        assert_eq!(
+            error.to_string(),
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+            "{sql}"
+        );
+    }
+}
