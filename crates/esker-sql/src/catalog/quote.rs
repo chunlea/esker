@@ -31,7 +31,7 @@
 /// This was declared as a divergence rather than approximated, and the reason was sound: a
 /// keyword list taken from `sqlparser` is a different set and would quote `name` and `value`,
 /// which a real server leaves bare. The answer is not to guess but to measure —
-/// [`QUOTED_KEYWORDS`] is `SELECT word FROM pg_get_keywords() WHERE quote_ident(word) <> word`,
+/// `QUOTED_KEYWORDS` is `SELECT word FROM pg_get_keywords() WHERE quote_ident(word) <> word`,
 /// which is every keyword whose `catcode` is not `U`: the 78 reserved, the 23 reserved that may
 /// still name a type or function, and the 64 unreserved that may not. The other 346 keywords are
 /// left bare, `name` and `value` among them.
