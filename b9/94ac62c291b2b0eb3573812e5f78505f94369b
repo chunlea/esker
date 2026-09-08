@@ -1,7 +1,11 @@
 crates/esker-sql/src/exec/query.rs
   s_c99f71abc0fb31::t_06ee183bc12fcf 1575-1584,1588-1590,1605-1608
+  s_c99f71abc0fb31::t_59e82e2ad20a85 1575-1584,1588-1590,1605-1608
+  s_c99f71abc0fb31::t_a58e0c258a1383 1575-1584,1588-1590,1605-1608
 crates/esker-sql/tests/full_outer_join.rs
   s_c99f71abc0fb31::t_c170a014130f22 161-194
+  s_c99f71abc0fb31::t_1ac19caa66d16c 161-194
+  s_c99f71abc0fb31::t_fe08440d7b0f4f 161-194
 ---
 {
   "schema_version": "authorship/3.0.0",
