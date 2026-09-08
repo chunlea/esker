@@ -2993,10 +2993,16 @@ pub fn classify(statement: &Statement) -> StatementClass {
             parameters,
             ..
         } => StatementClass::Execute {
-            name: crate::catalog::fold_identifier(
-                &name.0.last().map(ToString::to_string).unwrap_or_default(),
-                false,
-            )
+            // The identifier itself, not its rendering: `Display` for an `ObjectNamePart` writes
+            // the quotes back, so `EXECUTE "Q"` looked up `"q"` — quotes included — and answered
+            // `26000` for a statement `PREPARE "Q"` had just made. Folded exactly as `PREPARE`
+            // folds its name above, which is what makes the two meet.
+            name: match name.0.last() {
+                Some(sqlparser::ast::ObjectNamePart::Identifier(ident)) => {
+                    crate::catalog::fold_identifier(&ident.value, ident.quote_style.is_some())
+                }
+                _ => crate::catalog::fold_identifier("", false),
+            }
             .0,
             // `collect` over `Option` turns one unreadable argument into no list at all, and
             // the session refuses by name rather than running with a hole in it.

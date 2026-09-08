@@ -265,3 +265,19 @@ fn discard_all_clears_a_sql_prepared_statement() {
         "the statement store DISCARD ALL clears is the one PREPARE writes to"
     );
 }
+
+/// **A quoted name is looked up as written.** `Display` for the parser's name part writes the
+/// quotes back, so `EXECUTE "Q"` once looked up `"q"` — quotes and all — and answered `26000` for
+/// the statement `PREPARE "Q"` had just made. Measured: `7`, and the unquoted `q` is the one that
+/// does not exist.
+#[test]
+fn a_quoted_name_is_looked_up_as_written() {
+    let mut c = Client::new();
+    assert_eq!(c.ask("PREPARE \"Q\" AS SELECT 7"), "");
+    assert_eq!(c.ask("EXECUTE \"Q\""), "7");
+    let refused = c.ask("EXECUTE q");
+    assert!(
+        refused.contains("prepared statement \"q\" does not exist"),
+        "{refused}"
+    );
+}
