@@ -205,6 +205,14 @@ impl RangeTombstones {
         out
     }
 
+    /// The fewest bytes one encoded tombstone can occupy: an empty `begin`, an empty `end` and a
+    /// one-byte sequence number, each a single LEB128 byte.
+    ///
+    /// Only ever used to refuse an impossible count before it becomes an allocation. Such an entry
+    /// would itself be refused a moment later — `begin` is not below `end` — which is why this is a
+    /// floor on the *encoding* and not a claim about valid tombstones.
+    const MIN_ENCODED_ENTRY: usize = 3;
+
     /// Reads a block payload, refusing anything this format does not define.
     ///
     /// These bytes come off disk, so every malformed shape is an error and never a panic
@@ -216,9 +224,16 @@ impl RangeTombstones {
         let count = cursor.varint("count")?;
         let count = usize::try_from(count)
             .map_err(|_| corrupt(format!("range tombstone count {count} overflows")))?;
-        // A count is not an allocation request: each entry costs at least three bytes, so a
-        // count the payload could not hold is corruption caught before the `Vec` is sized.
-        if count > payload.len() {
+        // A count is not an allocation request: each entry costs **at least three bytes** — an
+        // empty `begin`, an empty `end` and a one-byte sequence number — so a count the payload
+        // could not hold is corruption caught before the `Vec` is sized.
+        //
+        // Divided by that three, and it is what the sentence above always claimed. Comparing the
+        // count against the payload's whole length accepts one three times too large, so a
+        // megabyte of damage could ask for three megabytes of `RangeTombstone` before the first
+        // short read refused it. The bound is not the difference between working and panicking; it
+        // is the difference between a bad block costing its own size and costing a multiple of it.
+        if count > payload.len() / Self::MIN_ENCODED_ENTRY {
             return Err(corrupt(format!(
                 "range tombstone count {count} cannot fit in {} bytes",
                 payload.len()

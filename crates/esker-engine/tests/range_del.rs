@@ -328,3 +328,103 @@ fn a_discharge_drops_the_covered_keys_rather_than_hiding_them() {
     }
     assert_eq!(get(&db, b"c"), Some(vec![b'c', 2]));
 }
+
+// -- the decoder, as untrusted input ---------------------------------------------------------
+
+/// `RangeTombstones::decode`'s doc lists six shapes it refuses. Nothing tested any of them, and a
+/// bound with no test is a bound that regresses in silence — these bytes come off **disk**, so
+/// every one of the six is an error value and never a panic (`CLAUDE.md` invariants 2 and 9).
+///
+/// Hand-built rather than mutated from a good block: a fuzzer finds shapes nobody predicted, and
+/// this is the complement — the shapes the decoder *says* it refuses, each written out so that the
+/// claim and the code cannot drift apart.
+#[test]
+fn every_malformed_range_tombstone_block_is_an_error_and_never_a_panic() {
+    use esker_engine::dbformat::BytewiseComparator;
+    use esker_engine::range_del::RangeTombstones;
+
+    let cmp = BytewiseComparator;
+    // `count ++ (begin_len ++ begin ++ end_len ++ end ++ seqno)*`, all LEB128.
+    // The lengths are one-byte varints here because every key in this test is shorter than 128
+    // bytes, which `try_from` states rather than a cast assuming.
+    let one = |begin: &[u8], end: &[u8], seqno: u8| {
+        let mut out = vec![1u8, u8::try_from(begin.len()).unwrap()];
+        out.extend_from_slice(begin);
+        out.push(u8::try_from(end.len()).unwrap());
+        out.extend_from_slice(end);
+        out.push(seqno);
+        out
+    };
+
+    // The shape the rest are damage to: it must decode, or the cases below prove nothing.
+    let good = one(b"a", b"b", 7);
+    assert!(
+        RangeTombstones::decode(&good, &cmp).is_ok(),
+        "the control block does not decode, so every assertion below is about the wrong thing"
+    );
+
+    for (what, payload) in [
+        ("an empty payload", Vec::new()),
+        ("a count with no entries behind it", vec![4u8]),
+        // Truncated part way through the second field of the only entry.
+        ("a truncated entry", vec![1u8, 1, b'a', 3, b'x']),
+        // `begin` == `end` covers nothing; `begin` > `end` is inverted.
+        ("an empty range", one(b"a", b"a", 1)),
+        ("an inverted range", one(b"z", b"a", 1)),
+        // A sequence number above the 56-bit ceiling, as ten 0xFF continuation bytes.
+        ("a sequence number past the ceiling", {
+            let mut out = vec![1u8, 1, b'a', 1, b'b'];
+            out.extend_from_slice(&[0xFF; 9]);
+            out.push(0x01);
+            out
+        }),
+        // Two entries, the second not above the first: the block is sorted, so this is damage.
+        ("entries out of order", {
+            let mut out = vec![2u8];
+            out.extend_from_slice(&one(b"c", b"d", 1)[1..]);
+            out.extend_from_slice(&one(b"a", b"b", 1)[1..]);
+            out
+        }),
+        ("a trailing byte", {
+            let mut out = good.clone();
+            out.push(0);
+            out
+        }),
+    ] {
+        let outcome = RangeTombstones::decode(&payload, &cmp);
+        assert!(
+            outcome.is_err(),
+            "{what} decoded successfully into {:?}; these bytes come off disk and this shape is \
+             one the decoder's own doc says it refuses",
+            outcome.ok()
+        );
+    }
+}
+
+/// **A count is refused as a count, not discovered later as a short read.**
+///
+/// Separate from the block above because it is the one case where *which* error comes back is the
+/// whole point. Each encoded entry costs at least three bytes, so a count above a third of the
+/// payload is impossible — but comparing it against the payload's whole length instead accepts one
+/// three times too large, and the decoder then sizes a `Vec` for it and only refuses on the first
+/// short read. The difference is not working against panicking; it is a damaged block costing its
+/// own size against costing a multiple of it.
+///
+/// Thirty bytes claiming twenty entries is inside the loose bound and outside the true one, so
+/// this case tells them apart where a wildly impossible count cannot.
+#[test]
+fn an_impossible_count_is_refused_before_it_becomes_an_allocation() {
+    use esker_engine::dbformat::BytewiseComparator;
+    use esker_engine::range_del::RangeTombstones;
+
+    let mut payload = vec![20u8];
+    payload.extend_from_slice(&[0u8; 29]);
+    let error = RangeTombstones::decode(&payload, &BytewiseComparator)
+        .expect_err("twenty entries cannot fit in thirty bytes");
+    let text = error.to_string();
+    assert!(
+        text.contains("cannot fit"),
+        "a count of twenty in thirty bytes was refused as {text:?}; anything but the count rule \
+         means the count was believed long enough to size a `Vec` from it"
+    );
+}

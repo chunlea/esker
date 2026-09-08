@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use esker_proto::TransportConfig;
 
+use crate::readiness::Budget;
+
 /// The lowest port a cluster uses; node `i` listens on `base + i - 1`.
 pub(crate) const DEFAULT_BASE_PORT: u16 = 20_160;
 
@@ -415,11 +417,19 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Between two readiness probes. A round trip is the cost, so this polls rather than spins.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long the stores have to answer before this gives up on them.
+/// How long the stores have to answer, **each of them, from the last one that did**.
 ///
 /// Generous, because a store opens a database and — with `--pd` — registers with the driver
 /// before it binds, and both are slower on a cold cache under load. Bounded, because a start
 /// that never returns and never says why is worse than one that gives up with a name in it.
+///
+/// **Per store rather than for the set**, which is the difference between a bound and a rate.
+/// One sixty-second clock for four stores is a claim about how fast this machine starts four
+/// processes, and under a full gate that claim is false — `esker-cli::cluster_start` has gone red
+/// here having watched three of its four come up. [`Budget`] spends this on each store and starts
+/// it again whenever one arrives, with `60 s x stores` as the ceiling for a set that never
+/// settles. [`PD_START_TIMEOUT`] is left alone: one driver is one thing waited on, and there is
+/// no progress inside it to measure.
 const STORE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the supervisor looks at its children while waiting for ctrl-C.
@@ -521,17 +531,27 @@ fn ask_the_driver(address: &str) -> Result<(), String> {
 /// A store that answers `Admin::Regions` has opened its engine, registered with the driver if
 /// there is one, and is serving. That is the event "started" was always meant to name, and it is
 /// waited for here rather than timed.
+///
+/// # `within` is what one store gets, not what the set gets
+///
+/// It used to be one clock for all of them, which made the wait a claim about how fast this
+/// machine starts four processes rather than about whether they started. [`Budget`] spends it per
+/// store and starts it again each time one answers, so a start that is still bringing stores up is
+/// not cut off; the ceiling underneath is what ends a set that never settles. The failure names
+/// which limit it hit and how many stores had answered by then, because "did not answer within
+/// 60s" was the same sentence for a store that never opened and for a machine that was busy.
 fn wait_until_the_stores_answer(
     children: &mut [(u64, Child)],
     launched: &[Node],
     within: Duration,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + within;
     let mut waiting: Vec<(u64, String)> = launched
         .iter()
         .filter(|node| node.id != 0)
         .map(|node| (node.id, node.address.clone()))
         .collect();
+    let stores = waiting.len();
+    let mut budget = Budget::new(std::time::Instant::now(), within, stores);
     loop {
         // A child that has exited is the precise answer and it is available at once. Without this
         // arm a store that cannot open would spend the whole budget failing to connect, and the
@@ -539,15 +559,24 @@ fn wait_until_the_stores_answer(
         if let Some(died) = first_child_that_died(children) {
             return Err(died);
         }
+        let before = waiting.len();
         waiting.retain(|(_, address)| ask_a_store(address).is_err());
         if waiting.is_empty() {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        // The probes themselves are what takes the time, so the clock is read after them and the
+        // same reading decides both. A store that answered in this round is progress even though
+        // others in it did not: what the budget is for is telling a slow start from a stuck one.
+        let now = std::time::Instant::now();
+        if waiting.len() < before {
+            budget.progress(now);
+        }
+        if let Some(spent) = budget.spent(now) {
             let (id, address) = &waiting[0];
             return Err(format!(
-                "{} did not answer on {address} within {within:?}",
-                what(*id)
+                "{} did not answer on {address}: {spent} ({} of {stores} answered)",
+                what(*id),
+                stores - waiting.len(),
             ));
         }
         std::thread::sleep(PROBE_INTERVAL);

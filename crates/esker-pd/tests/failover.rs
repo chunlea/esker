@@ -1171,6 +1171,65 @@ fn a_member_killed_mid_change_comes_back_knowing_who_joined() {
 /// reports everyone as unconfigured, itself included, because its configuration comes from its own
 /// log and the group's snapshot has not reached it yet — which is an honest answer rather than a
 /// gap ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+/// **A joiner is not configured just because its driver has published.**
+///
+/// A member's log is *seeded* with the member list it was opened with, so its conf names everyone a
+/// voter from birth. `membership()` used to read that conf alone, which made "am I configured?" a
+/// race against this member's own driver publishing for the first time: the test above passed only
+/// while the test thread won it, which alone it always does and under a loaded gate it did not --
+/// three sightings, none in fifteen runs alone.
+///
+/// This settles the joiner **first**, so the driver has certainly published and the race is over
+/// with the losing side up. Deterministic where the sighting was one-in-many, and red against the
+/// report as it was.
+#[test]
+fn a_joiner_that_has_applied_nothing_is_unconfigured_however_its_log_was_seeded() {
+    use esker_proto::PdRole;
+
+    let mut group = Group::of_three(1_700_000_000_000);
+    let leader = group.elect();
+    group
+        .run("bootstrapping", || {
+            group.at(leader).bootstrap(1, "127.0.0.1:20160")
+        })
+        .unwrap();
+
+    let joiner = group.admit(4, "127.0.0.1:32382");
+    // The whole difference from the test above: let the joiner's own driver run. Nothing has been
+    // sent to it -- no member has ticked since it was admitted -- so everything it could publish
+    // is what it was born with.
+    joiner.settle().unwrap();
+    assert_eq!(
+        joiner.applied_index(),
+        0,
+        "this test is only about a member that has applied nothing"
+    );
+
+    let seen = joiner.membership();
+    assert!(
+        seen.members.iter().all(|m| m.role == PdRole::Unconfigured),
+        "a joiner that has applied nothing reported {:?}; those roles are its seeded conf, not \
+         anything the group told it",
+        seen.members
+    );
+
+    // And the seed is not being hidden for ever: once it has applied, the report is the conf.
+    group.until("finishing the add", || {
+        group.at(leader).add_member(4, "127.0.0.1:32382")
+    });
+    group.settle();
+    assert!(
+        joiner.applied_index() > 0,
+        "the joiner never applied anything, so the second half of this test proves nothing"
+    );
+    let seen = joiner.membership();
+    assert!(
+        seen.members.iter().any(|m| m.role != PdRole::Unconfigured),
+        "a joiner that has caught up still reports nothing configured: {:?}",
+        seen.members
+    );
+}
+
 #[test]
 fn a_membership_report_says_which_member_is_still_catching_up() {
     use esker_proto::PdRole;
@@ -1188,8 +1247,11 @@ fn a_membership_report_says_which_member_is_still_catching_up() {
     let seen = joiner.membership();
     assert!(
         seen.members.iter().all(|m| m.role == PdRole::Unconfigured),
-        "a member that has not caught up claimed to be configured: {:?}",
-        seen.members
+        "a member that has not caught up claimed to be configured: {:?}; it has applied {} \
+         entries, so roles other than Unconfigured here came from the conf its log was SEEDED \
+         with rather than from anything the group sent",
+        seen.members,
+        joiner.applied_index(),
     );
 
     // One step, and the group can see which of the four is not a voter yet.
