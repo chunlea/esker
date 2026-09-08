@@ -1059,6 +1059,7 @@ impl Transaction {
             if round == self.max_lock_resolutions {
                 return Err(Error::LockNotCleared {
                     start_ts: locks[0].start_ts,
+                    key: locks[0].key.clone(),
                 });
             }
             // The same rule on the prewrite path: the last look waits the lease out, so a
@@ -1293,6 +1294,7 @@ impl Transaction {
             // means the caller skipped the resolution, which is a bug in this crate.
             TxnStatus::Locked(lock) => Err(Error::LockNotCleared {
                 start_ts: lock.start_ts,
+                key: lock.key.clone(),
             }),
         }
     }
@@ -1330,6 +1332,7 @@ impl Transaction {
             if attempt == self.max_lock_resolutions {
                 return Err(Error::LockNotCleared {
                     start_ts: lock.start_ts,
+                    key: lock.key.clone(),
                 });
             }
             // **The last look waits out the lease rather than one more backoff step.**

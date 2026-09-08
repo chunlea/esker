@@ -15,22 +15,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // here, with the same characters in it. The row agrees — `bigint`, both.
     types: &["SELECT 'r', pg_typeof(id) FROM \"books\" LIMIT 1"],
     answers: &[
-        (
-            "INSERT INTO \"parts\" (\"a\",\"b\") VALUES (1, 2) ON CONFLICT (\"a\") WHERE \"b\" IS NOT NULL DO UPDATE SET \"b\"=excluded.\"b\"",
-            "A **C1 parser gap**: PostgreSQL infers a *partial* unique index only when the \
-             statement repeats its predicate, and `sqlparser` 0.62.0\u{2019}s \
-             `ConflictTarget::Columns` is a bare `Vec<Ident>` with nowhere to put one — so the \
-             arbiter\u{2019}s `WHERE` is a syntax error before the lowering is reached. The \
-             consequence is that a partial index can never be inferred here, which is why the bare \
-             target over one is `42P10` on both servers and agrees",
-            "pg19_on_conflict.txt:137",
-        ),
-        (
-            "SELECT \'r\', a, b FROM \"parts\" ORDER BY id",
-            "The row the statement above would have updated, one line later: it did not run here, \
-             so `b` is still `1`. A follow-on of the parser gap and not a divergence of its own",
-            "pg19_on_conflict.txt:138",
-        ),
+        // **Two more entries stood here and are deleted** (ADR 0031, rule 2). They were the
+        // partial-index arbiter — `ON CONFLICT ("a") WHERE "b" IS NOT NULL DO UPDATE …` at
+        // `pg19_on_conflict.txt:137` and the `SELECT` one line later that read the row it would
+        // have updated. The entry called it a C1 parser gap, which it was: `sqlparser` 0.62.0
+        // expects `DO` after the target list and its `ConflictTarget::Columns` has nowhere to put
+        // a predicate. The clause now comes off the source before the parse
+        // (`parse::strip_on_conflict_predicate`) and selects the index it names, so both
+        // statements answer what a real server answers and the harness said so before this comment
+        // was written.
         // **A third entry stood here and is deleted** (ADR 0031, rule 2): the `upsert_all`
         // template's `IS NOT DISTINCT FROM` was an operator this node did not have, so the
         // statement was refused by name and the `SELECT` after it was swallowed by the aborted

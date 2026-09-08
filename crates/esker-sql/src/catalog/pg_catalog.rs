@@ -1339,10 +1339,20 @@ pub(super) fn namespace_oid(schemas: &[(String, u64)], schema: &str) -> i64 {
 /// A **property of the build, not of the tenant**: it says what a `CREATE EXTENSION` can succeed
 /// at, and every other name is `0A000 … is not available` with PostgreSQL's own HINT.
 ///
-/// **Exactly the ones `postgresql_specific_schema.rb` needs in order to load**, and no more. The
-/// versions are the oracle's own (`pgcrypto` 1.4, `uuid-ossp` 1.1), and `plpgsql` is
-/// [`PRE_INSTALLED`] rather than merely available, which is what every PostgreSQL database
-/// reports for it.
+/// **Seven, by the user's decision of 2026-09-05**: `uuid-ossp`, `pgcrypto`, `plpgsql`, `hstore`,
+/// `citext`, `ltree` and `pg_trgm`. Anything else — `postgres_fdw` above all, which is ten of the
+/// suite's `CREATE EXTENSION` failures on its own and every one of them in `foreign_table_test.rb`
+/// — is refused by name until the user says otherwise.
+///
+/// The comment here used to read *"exactly the ones `postgresql_specific_schema.rb` needs in order
+/// to load, and no more"*, which was true when it was written and then quietly stopped being: the
+/// list grew past that file twice. It is a **ruling** rather than a derivation, so it is written as
+/// one, and the next entry needs the same ruling rather than an argument from what some schema
+/// happens to load.
+///
+/// The versions are the oracle's own (`pgcrypto` 1.4, `uuid-ossp` 1.1, `ltree` 1.3 where the two
+/// string extensions are at 1.8), and `plpgsql` is [`PRE_INSTALLED`] rather than merely available,
+/// which is what every PostgreSQL database reports for it.
 ///
 /// **Installing one does not bring the functions it carries.** `uuid_generate_v4()` and
 /// `gen_random_uuid()` are still `42883` naming themselves — the statement's job is to let the

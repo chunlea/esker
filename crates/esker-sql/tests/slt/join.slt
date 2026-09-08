@@ -143,14 +143,23 @@ SELECT o.id, c.name FROM o LEFT JOIN c ON o.cid = c.id ORDER BY o.id
 13	NULL
 14	NULL
 
-# The joins that keep rows the *left* side does not have are still refused by name, never
-# approximated: running a RIGHT JOIN as a LEFT one would answer with the same rows in the wrong
-# places, which is worse than refusing.
+# A RIGHT JOIN is still refused by name, never approximated: running one as a LEFT join would
+# answer with the same rows in the wrong places, which is worse than refusing.
 statement error (0A000)
 SELECT o.id FROM o RIGHT JOIN c ON o.cid = c.id
 
-statement error (0A000)
-SELECT o.id FROM o FULL JOIN c ON o.cid = c.id
+# A FULL JOIN runs. It is the LEFT join above plus the rows of `c` that no order points at —
+# customer 3, whom nobody ordered from — and that last row is the half a LEFT join cannot produce.
+# Replayed against a real PostgreSQL 19.
+query IT
+SELECT o.id, c.name FROM o FULL JOIN c ON o.cid = c.id ORDER BY o.id NULLS LAST, c.name
+----
+10	ann
+11	ann
+12	bob
+13	NULL
+14	NULL
+NULL	cid
 
 statement error (0A000)
 SELECT o.id FROM o NATURAL JOIN c

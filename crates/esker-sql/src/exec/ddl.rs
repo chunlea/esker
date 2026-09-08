@@ -428,7 +428,11 @@ fn resolve_user_type(
     let Some(name) = &column.user_type_name else {
         return Ok((column.ty, None));
     };
-    let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
+    // Through the `search_path`, so the statement after a `CREATE TYPE` in a schema can name it:
+    // `t.column :current_mood, :mood_in_test_schema` is the next line of the very test that made
+    // the create take a schema at all.
+    let stored = executor.stored_type_name(txn, name)?;
+    let Some(def) = catalog::type_by_name(txn, executor.tenant, &stored)? else {
         // The name is not a type anybody declared, which is where lowering's own refusal has been
         // waiting for a catalog to confirm it. Same `0A000` and same wording as before.
         return Err(SqlError::unsupported(format!("the type {name}")));
@@ -1296,6 +1300,8 @@ struct TypeChange<'a> {
     typmod: i32,
     /// The type a `USING` casts the column to, when the statement wrote one.
     using: Option<ColumnType>,
+    /// A `USING` that is not a cast: the expression, evaluated once per row.
+    using_expr: Option<&'a plan::Expr>,
     /// The collation the statement named, or `None` to take the new type's own.
     collation: Option<&'a str>,
 }
@@ -1311,6 +1317,7 @@ fn set_column_type(
         ty,
         typmod,
         using,
+        using_expr,
         collation,
     } = change;
     let at = updated
@@ -1325,9 +1332,16 @@ fn set_column_type(
     // and that type has to reach the column's new one on its own — which is why
     // `TYPE character varying USING s::text` works and is not the same statement as
     // `TYPE character varying` alone.
-    let allowed = match using {
-        None => converts_implicitly(from, ty),
-        Some(cast_to) => converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty),
+    // **An arbitrary `USING` is checked per row and not here**, because its type is not knowable
+    // before it runs: `string_to_array(snippets, ',')` answers `text[]` whatever `snippets` is.
+    // PostgreSQL is the same — a `USING` whose result does not fit raises on the row it does not
+    // fit on, which is why the pre-flight below is skipped rather than approximated.
+    let allowed = match (using, using_expr) {
+        (_, Some(_)) => true,
+        (None, None) => converts_implicitly(from, ty),
+        (Some(cast_to), None) => {
+            converts_with_using(from, cast_to) && converts_implicitly(cast_to, ty)
+        }
     };
     if !allowed {
         return Err(SqlError::CannotCastColumnAutomatically {
@@ -1370,6 +1384,8 @@ fn set_column_type(
         Some(value) => Some(convert_datum(from, ty, value)?),
         None => None,
     };
+    // Kept before the column moves, for the `USING` expression's scope below.
+    let before = updated.clone();
     updated.columns[at].ty = ty;
     updated.columns[at].typmod = typmod;
     // **Assigned and not merged.** A statement with no `COLLATE` gives the column its new type's
@@ -1379,11 +1395,28 @@ fn set_column_type(
     updated.columns[at].default = default;
     updated.columns[at].missing = missing;
     let types = updated.column_types();
+    // **Resolved against the table as it was**, so the expression's column references have the
+    // types the rows still carry: `snippets` is a `varchar` inside
+    // `string_to_array(snippets, ',')`, and resolving it against the new `text[]` column would
+    // type the argument as the answer.
+    let resolved = match using_expr {
+        Some(expr) => Some(
+            super::query::resolve(expr, &super::query::Scope::single(&before))
+                .map_err(|error| SqlError::Internal(format!("the USING expression: {error}")))?,
+        ),
+        None => None,
+    };
     for (key, mut row) in rows {
         // The typmod is applied per row and not compared once: `varchar(5)` over a nineteen
         // character value is `22001`, and which row raises it depends on the data. `fit_to_typmod`
         // is the same function an `INSERT` uses, so a rounded `timestamp(6)` rounds identically.
-        row[at] = crate::value::fit_to_typmod(convert_datum(from, ty, &row[at])?, ty, typmod)?;
+        let value = match &resolved {
+            // **The expression sees the whole row**, not only the column being retyped — a `USING`
+            // may name any column of the table, which is the half a per-value conversion cannot do.
+            Some(resolved) => super::cursor::evaluate_in_txn(resolved, &row, &*txn)?,
+            None => convert_datum(from, ty, &row[at])?,
+        };
+        row[at] = crate::value::fit_to_typmod(value, ty, typmod)?;
         txn.put(&key, &crate::row::encode_row(&types, &row)?);
     }
     Ok(())
@@ -2919,7 +2952,18 @@ pub(super) fn alter_index_rename(
     rename: &plan::AlterIndexRename,
 ) -> Result<Outcome> {
     let done = Ok(Outcome::done("ALTER INDEX"));
-    if catalog::name_exists(&*txn, executor.tenant, &rename.to)? {
+    // **The collision is looked for in the index's own schema**, which is the schema the name it
+    // is being renamed *from* resolves in. A bare check asked `public`, so renaming an index
+    // inside a schema to a name `public` already held was `42P07` — `SchemaWithDotsTest`'s
+    // `ALTER INDEX "posts_pkey" RENAME TO "articles_pkey"`, where `articles_pkey` is a suite
+    // fixture's key that is always there.
+    //
+    // The source is resolved first and only to learn its schema; a name that resolves to nothing
+    // comes back unchanged, so the check falls back to exactly what it asked before and the
+    // `42P01` below still wins for a source that is not there.
+    let from = executor.resolve_unqualified(&*txn, &rename.name)?;
+    let target = catalog::qualify(catalog::split_qualified(&from).0, &rename.to);
+    if catalog::name_exists(&*txn, executor.tenant, &target)? {
         return Err(SqlError::DuplicateTable(rename.to.clone()));
     }
     let Some(relation) = existing_relation(executor, txn, &rename.name)? else {
@@ -2946,13 +2990,19 @@ pub(super) fn alter_index_rename(
     };
     let table = executor.table_by_id(txn, table_id)?;
     let mut updated = (*table).clone();
-    if updated.primary_key_name == rename.name {
+    // **Compared bare to bare.** A *derived* name is stored qualified — `plan::make_object_name`
+    // spends its byte budget on the identifier and re-qualifies, so `s.t`'s key is `s\0t_pkey` —
+    // while a name the user gave is stored as they wrote it. The statement names one index either
+    // way, so the schema is taken off both sides and the comparison is between identifiers.
+    let wanted = catalog::split_qualified(&from).1.to_owned();
+    let matches = |name: &str| catalog::split_qualified(name).1 == wanted;
+    if matches(&updated.primary_key_name) && !updated.primary_key_name.is_empty() {
         updated.primary_key_name.clear();
         updated.primary_key_name.push_str(&rename.to);
     } else if let Some(index) = updated
         .indexes
         .iter_mut()
-        .find(|index| index.name == rename.name)
+        .find(|index| matches(&index.name))
     {
         index.name.clear();
         index.name.push_str(&rename.to);
@@ -5660,6 +5710,7 @@ pub(super) fn alter_table(
             ty,
             typmod,
             using,
+            using_expr,
             collation,
         } = action
         {
@@ -5672,6 +5723,7 @@ pub(super) fn alter_table(
                     ty: *ty,
                     typmod: *typmod,
                     using: *using,
+                    using_expr: using_expr.as_ref(),
                     collation: collation.as_deref(),
                 },
             )?;

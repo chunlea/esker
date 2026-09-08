@@ -218,6 +218,26 @@ bounded thread pool (2 threads *default*) via a `CompactionJob` that is a pure f
 is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` drop MVCC versions below
 the safepoint.
 
+**Two compactions must not touch one file, nor write overlapping ranges into one level.** The pool
+is bounded but not serial, and `Db::compact_range` runs one inline on the caller's thread beside it,
+so both halves of that rule are load-bearing. A plan reserves its **input files** by number and the
+**key range it will write**, per `(column family, output level)`; a plan that cannot have all its
+inputs, or whose range overlaps a running plan's range in the same level, is dropped rather than
+queued — the picker produces it again in a moment against a version that has moved on. The range
+claimed is the union of the plan's inputs in *user*-key order, which is the widest its outputs can
+be. Two compactions into different levels never contend, which is what keeps the pool parallel; two
+into the same level are ordered, which for `L0 → L1` means one at a time — where `LevelDB` and
+`RocksDB` also arrive.
+
+The inputs alone are not sufficient, and this section used to imply they were: L0 files legitimately
+overlap each other, so two `L0 → L1` plans can hold disjoint input sets and still write overlapping
+ranges into L1, at which point L1 stops partitioning the key space. Measured at 1 in 20 attempts
+with a concurrent writer and 0 in 20 without
+([ADR 0079](adr/0079-compaction-concurrency-reserves-the-output-range.md)). `version::builder`'s
+`check_disjoint` still validates each level as a version is built, but it is the backstop rather
+than the first line — it turns the race into a failed operation on a legal workload instead of a
+corrupt level, which is what the reservation exists to prevent reaching at all.
+
 **Range deletions.** `DeleteRange` is real ([ADR 0017](adr/0017-range-tombstones.md)). A range
 tombstone `[begin, end)` is stored *beside* the sorted run rather than in it — a list in the
 memtable, a block in the tables a flush writes — because it hides keys the run has never seen. A key
@@ -1002,6 +1022,22 @@ is in its first sentence.
   at the end of the record, or beside the item it belongs to when the reader already walks that
   list — and a version is claimed by the lane that takes it, out loud, because two lanes have
   collided on the number twice.
+  **A node's authority to write is a lease from PD, and its cadence is a deadline rather than a
+  delay** ([ADR 0028](adr/0028-the-schema-lease.md)). The refresher renews at a third of the lease
+  — derived from PD's number, never configured, so a lost round trip still leaves two attempts —
+  and sleeps until `round_start + period`, so what a renewal costs comes out of the wait instead of
+  being added to it. The columnar report keeps its **own thread and its own cadence**: its PD half
+  carries a deadline but its backend half is a cluster read whose duration is unbounded, and while
+  the two shared a loop a slow report made the next renewal late. Measured on a real cluster:
+  `renew_ms=0`, `report_ms=3879` against a `period_ms=1666` on a 5 s lease, putting the next
+  renewal 5,545 ms after the last — the node's first `INSERT` came back `25006` while `SELECT 1`
+  kept working, which is why an expired write lease presents as a client problem. The two halves
+  have different failure semantics, which is the reason they are apart: a lost report is repaired
+  by the next one, because `columnar_wishes` is a full assertion and not a delta (ADR 0022
+  decision 5), and a lost renewal stops this node writing. Every recorded lease is measured, the
+  startup grant included — a renewal landing more than half a lease after the previous one logs a
+  warning with both durations. Half rather than the whole, because at the whole the client already
+  has the error.
   **The DDL surface is wider than the planner's**, and three decisions in it are worth following
   from here: a dropped column keeps its slot because a row is decoded by position
   ([ADR 0051](adr/0051-a-dropped-column-keeps-its-slot.md)); `DO` is two recognised templates and

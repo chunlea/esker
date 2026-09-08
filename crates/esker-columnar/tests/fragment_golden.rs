@@ -15,7 +15,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use esker_base::crc32c;
-use esker_columnar::fragment::{codec, expr::CompareOp};
+use esker_columnar::fragment::{MAX_EXPR_DEPTH, codec, expr::CompareOp};
 use esker_columnar::{Aggregate, Expr, Fragment, KeyRange, Output, TableRef, Value};
 use proptest::prelude::*;
 
@@ -350,6 +350,48 @@ fn a_deeply_nested_filter_is_refused_rather_than_overflowing_the_stack() {
     assert!(bytes.len() < 6_000, "5000 NOTs is a small message");
     let error = codec::decode(&bytes).unwrap_err();
     assert!(error.is_refused(), "{error}");
+    assert!(error.to_string().contains("nested past"), "{error}");
+}
+
+/// **The bound at its edge, so the constant is load-bearing.**
+///
+/// The test above proves a filter thousands deep is refused, which no off-by-one could make pass.
+/// This is the pair either side of the line: a filter at exactly [`MAX_EXPR_DEPTH`] round-trips,
+/// and one node deeper is refused. Without it, `depth > MAX` and `depth >= MAX` are the same test
+/// result, and the difference between them is a whole level of nesting a planner may legitimately
+/// write.
+///
+/// It is also what keeps the *encoder* safe. `put_expr` recurses without a bound of its own, and
+/// the argument that this is fine is entirely that nothing deeper can exist in the process: the
+/// decoder is the only way an expression arrives from the wire, and it refuses past this line.
+/// That argument is only as good as the line being where it is claimed to be.
+#[test]
+fn the_depth_bound_is_exact_at_its_edge() {
+    // `decode` enters `take_expr` at depth 1 and refuses once `depth > MAX_EXPR_DEPTH`, so the
+    // deepest tree it accepts is `MAX_EXPR_DEPTH` nodes: a column, wrapped MAX - 1 times.
+    let nest = |levels: usize| {
+        let mut expr = Expr::Column(0);
+        for _ in 0..levels {
+            expr = Expr::Not(Box::new(expr));
+        }
+        let mut fragment = Fragment::scan(TableRef::default(), vec![0]);
+        fragment.filter = Some(expr);
+        codec::decode(&codec::encode(&fragment))
+    };
+
+    let deepest = nest(MAX_EXPR_DEPTH - 1);
+    assert!(
+        deepest.is_ok(),
+        "a filter of exactly MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH}) nodes must decode; the bound is a \
+         limit on nesting, not one node short of it: {:?}",
+        deepest.err()
+    );
+
+    let error = nest(MAX_EXPR_DEPTH).unwrap_err();
+    assert!(
+        error.is_refused(),
+        "one node past the bound must be a refusal and never a panic (invariant 9): {error}"
+    );
     assert!(error.to_string().contains("nested past"), "{error}");
 }
 

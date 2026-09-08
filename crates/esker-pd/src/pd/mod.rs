@@ -637,11 +637,25 @@ impl Pd {
                 .map(|member| PdMemberInfo {
                     id: member.id,
                     address: member.address.clone(),
-                    // **As this member sees it.** The configuration comes from its own log, so a
-                    // member that has not caught up answers `Unconfigured` for everyone — which is
-                    // what a joiner honestly is until the group's snapshot reaches it, and is the
-                    // one report an operator debugging a join actually needs.
-                    role: if office.conf.voters.contains(&member.id) {
+                    // **As this member sees it, and only once it has seen anything.**
+                    //
+                    // A member's log is *seeded* with the member list it was opened with
+                    // (`PdLogStorage::open`), so its conf names every member a voter from birth —
+                    // before a single entry has reached it. Reading the conf alone therefore
+                    // reports a joiner as configured the moment its own driver publishes for the
+                    // first time, which is a race against nothing but the scheduler: three
+                    // sightings of `failover.rs`'s
+                    // `a_membership_report_says_which_member_is_still_catching_up`, all under a
+                    // loaded gate, none in fifteen runs alone.
+                    //
+                    // *Configured* and *caught up* are two facts, and the seed only carries one of
+                    // them. A member that has applied nothing has caught up on nothing, whatever
+                    // its log was seeded with — which is what a joiner honestly is until the
+                    // group's entries reach it, and is the one report an operator debugging a join
+                    // actually needs.
+                    role: if office.applied == 0 {
+                        PdRole::Unconfigured
+                    } else if office.conf.voters.contains(&member.id) {
                         PdRole::Voter
                     } else if office.conf.learners.contains(&member.id) {
                         PdRole::Learner
@@ -651,6 +665,15 @@ impl Pd {
                 })
                 .collect(),
         }
+    }
+
+    /// How far this member's own log has been applied; `0` means nothing has.
+    ///
+    /// Published by the driver beside the configuration, and the fact that tells a **seeded** conf
+    /// from a caught-up one — see [`Pd::membership`], which is the reason this is not private.
+    #[must_use]
+    pub fn applied_index(&self) -> esker_raft::Index {
+        self.driver.leadership().applied
     }
 
     /// One step of adding `id` at `address` to this group. Call again until it answers `true`.

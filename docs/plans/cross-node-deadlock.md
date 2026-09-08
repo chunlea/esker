@@ -82,12 +82,22 @@ One transaction dies with `40001`, the other commits. No cycle, no hang, and the
 victims — with the wrong SQLSTATE only in the sense that PostgreSQL would never have called this a
 deadlock either.
 
-**This is a code-read argument, not a measurement**, and it is the one thing here that should be
-pinned by a test rather than by prose. The test to write is not the one the brief asks for: it is
-*"two nodes commit overlapping key sets in opposite application order, and exactly one wins while
-neither hangs"* — a regression test for the ordering property, which is what would break if the
-primary were ever chosen by insertion order instead of by minimum key. The ordering property
-itself belongs in `esker-client`'s own tests, beside the code that guarantees it.
+**It is pinned by a test now**, in `esker-client/tests/prewrite_ordering.rs`, beside the code that
+guarantees it: two nodes over two regions commit the same two keys in opposite application order
+and exactly one wins, and a second test asserts the primary is the smallest key of the write set
+whatever order it was written in.
+
+**Both were shown red first**, by making `primary()` depend on the transaction rather than on the
+key set — which is what an insertion-ordered buffer would do. That is worth recording, because the
+first shape of the two-node test did not detect it reliably: with the lock-resolution budget at its
+default the cycle became a **four-second stall that usually resolved to one winner anyway**, so
+"exactly one wins" passed most of the time and the only real signal was the clock. A test whose
+detector is a stopwatch goes flaky under a loaded gate.
+
+Setting `with_max_lock_resolutions(0)` removes the clock from it entirely: a transaction that meets
+a lock fails at once instead of waiting it out, so one winner means the acquisition order is total
+rather than that one side out-waited the other. **8 of 8 red under the broken ordering, 8 of 8
+green under the real one**, in a tenth of a second each.
 
 ## The harness, corrected
 

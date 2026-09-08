@@ -609,14 +609,16 @@ impl Aggregation {
             // A subquery is a constant of the outer row, so the sub-plan is passed through — but
             // its **operand** is an expression of that row like any other, and
             // `HAVING max(k) IN (SELECT …)` needs the `max(k)` rewritten into the aggregated row.
-            Expr::Subquery(sub) => match &sub.operand {
-                None => expr.clone(),
-                Some(operand) => {
-                    let mut rewritten = sub.clone();
-                    rewritten.operand = Some(Box::new(self.rewrite(operand, scope)?));
-                    Expr::Subquery(rewritten)
-                }
-            },
+            Expr::Subquery(sub) if sub.operands.is_empty() => expr.clone(),
+            Expr::Subquery(sub) => {
+                let mut rewritten = sub.clone();
+                rewritten.operands = sub
+                    .operands
+                    .iter()
+                    .map(|operand| self.rewrite(operand, scope))
+                    .collect::<Result<Vec<_>>>()?;
+                Expr::Subquery(rewritten)
+            }
             other => other.clone(),
         })
     }
@@ -850,7 +852,7 @@ fn walk<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         // `42803` because the aggregate is in the `WHERE`, while `WHERE id IN (SELECT count(*) …)`
         // is an ordinary statement whose aggregate belongs to a different query.
         Expr::Subquery(sub) => {
-            if let Some(operand) = &sub.operand {
+            for operand in &sub.operands {
                 walk(operand, visit);
             }
         }

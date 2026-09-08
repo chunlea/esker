@@ -167,6 +167,20 @@ enum Kind<'a> {
         lateral: Option<Box<crate::plan::TableFunction>>,
         outer: Box<Cursor<'a>>,
         left_join: bool,
+        /// A `FULL JOIN`'s other half: an inner row no outer row matched is emitted after the
+        /// outer side ends, with every outer column NULL.
+        keep_right: bool,
+        /// How many NULLs such a row is extended with. Carried rather than learned from an outer
+        /// row, because a full join over an **empty** outer side still returns every inner row and
+        /// there is no row to learn from.
+        outer_columns: usize,
+        /// Which materialised inner rows have been paired with something.
+        ///
+        /// Empty unless `keep_right`: a left or inner join never asks, and the answer costs a bit
+        /// per inner row. Written where a pair is kept, read once when the outer side ends.
+        matched_inner: Vec<bool>,
+        /// How far the drain has got through `matched_inner`, once the outer side is done.
+        draining: Option<usize>,
         inner_table_id: u64,
         inner_columns: RowSchema,
         probe: Probe,
@@ -442,6 +456,8 @@ impl<'a> Cursor<'a> {
             Node::NestedLoop {
                 outer,
                 left_join,
+                keep_right,
+                outer_columns,
                 inner_table_id,
                 inner_view,
                 inner_plan,
@@ -472,6 +488,14 @@ impl<'a> Cursor<'a> {
                     },
                     outer: Box::new(Cursor::open(txn, tenant, settings, outer)?),
                     left_join: *left_join,
+                    keep_right: *keep_right,
+                    outer_columns: *outer_columns,
+                    matched_inner: if *keep_right {
+                        vec![false; materialized.len()]
+                    } else {
+                        Vec::new()
+                    },
+                    draining: None,
                     inner_table_id: *inner_table_id,
                     inner_columns: inner_columns.clone(),
                     probe: probe.clone(),
@@ -651,6 +675,10 @@ impl<'a> Cursor<'a> {
                 lateral,
                 outer,
                 left_join,
+                keep_right,
+                outer_columns,
+                matched_inner,
+                draining,
                 inner_table_id,
                 inner_columns,
                 probe,
@@ -662,8 +690,29 @@ impl<'a> Cursor<'a> {
                 buckets_built,
                 candidates,
             } => loop {
+                // The outer side is finished and this is a full join: what is left is every
+                // inner row nobody paired with, each in front of a row of NULLs.
+                if let Some(at) = draining {
+                    while let Some(seen) = matched_inner.get(*at) {
+                        let inner = materialized.get(*at).cloned();
+                        let unpaired = !*seen;
+                        *at += 1;
+                        if let Some(inner) = inner
+                            && unpaired
+                        {
+                            let mut joined = vec![Datum::Null; *outer_columns];
+                            joined.extend(inner);
+                            return Ok(Some(joined));
+                        }
+                    }
+                    return Ok(None);
+                }
                 let Some((row, position)) = current else {
                     let Some(next) = outer.next()? else {
+                        if *keep_right {
+                            *draining = Some(0);
+                            continue;
+                        }
                         return Ok(None);
                     };
                     // The `ON`'s ordinals split at the outer row's width, which this is the first
@@ -762,6 +811,10 @@ impl<'a> Cursor<'a> {
                         };
                         if keep {
                             *matched = true;
+                            // The index into `materialized`, which is what the drain reads back.
+                            if let Some(seen) = at.and_then(|at| matched_inner.get_mut(at)) {
+                                *seen = true;
+                            }
                             return Ok(Some(joined));
                         }
                     }
@@ -2356,21 +2409,22 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // has a row and no transaction. What is left here is turning those rows into one value,
         // which is three-valued logic and lives beside the rules it implements.
         Expr::Subquery(sub) => {
-            let operand = match &sub.operand {
-                Some(operand) => Some(evaluate_in(operand, row, env)?),
-                None => None,
-            };
+            let operand = sub
+                .operands
+                .iter()
+                .map(|operand| evaluate_in(operand, row, env))
+                .collect::<Result<Vec<_>>>()?;
             match (sub.correlated, env.txn) {
                 // Uncorrelated: its rows were produced before this cursor was opened, by
                 // `crate::exec::subquery::resolve`.
-                (false, _) => crate::exec::subquery::value(sub, operand)?,
+                (false, _) => crate::exec::subquery::value(sub, &operand)?,
                 // Correlated: a different answer for this row, so it runs now. The nested loop
                 // this makes is the shape, not an accident (`docs/plans/phase-12-subquery.md` §1).
                 (true, Some(txn)) => {
                     let values = crate::exec::subquery::run_correlated(sub, row, txn, env.tenant)?;
                     crate::exec::subquery::value_of(
                         sub.kind,
-                        operand,
+                        &operand,
                         &values,
                         sub.column.as_ref().map(|(_, ty)| *ty),
                     )?
@@ -2951,6 +3005,59 @@ fn catalog_function(
         // `split_part(text, sep, n)`. Measured on 19beta1, and the edges are the specification:
         // past the end is `''` and not NULL, a negative `n` counts from the end, an empty
         // separator gives the whole string back, and `n = 0` is an error rather than an answer.
+        // `string_to_array(text, delimiter [, null_string])`. Measured on 19beta1, and **four of
+        // its five edges are nothing a guess would produce**:
+        //
+        // ```text
+        // ('a,b,c', ',')      {a,b,c}      ('', ',')        {}     -- empty, not one empty element
+        // ('single', ',')     {single}     (NULL, ',')      NULL
+        // ('abc', '')         {abc}        -- an empty delimiter does not split at all
+        // ('a,b', NULL)       {a,",",b}    -- a NULL delimiter splits into single characters
+        // ('a,,b', ',')       {a,"",b}     -- an empty field is kept
+        // ('axxbxxc', 'xx')   {a,b,c}      -- the delimiter is a string, not a character
+        // ('a,b,NULL', ',', 'NULL')        {a,b,NULL}  -- the third argument names the NULL text
+        // ```
+        CatalogFunc::StringToArray => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(text)), Some(delimiter)) => {
+                let null_string = match args.get(2) {
+                    Some(Datum::Text(null_string)) => Some(null_string.as_str()),
+                    _ => None,
+                };
+                let fields: Vec<String> = match delimiter {
+                    // A NULL delimiter splits into characters — measured, and the one edge that
+                    // reads as a mistake until the server is asked.
+                    Datum::Null => text.chars().map(|c| c.to_string()).collect(),
+                    Datum::Text(delimiter) if delimiter.is_empty() => {
+                        if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![text.clone()]
+                        }
+                    }
+                    Datum::Text(delimiter) => {
+                        if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            text.split(delimiter.as_str()).map(str::to_owned).collect()
+                        }
+                    }
+                    _ => return Ok(Datum::Null),
+                };
+                let elements: Vec<Option<Datum>> = fields
+                    .into_iter()
+                    .map(|field| match null_string {
+                        Some(null_string) if field == null_string => None,
+                        _ => Some(Datum::Text(field)),
+                    })
+                    .collect();
+                Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                    ColumnType::Text,
+                    1,
+                    elements,
+                ))
+            }
+            _ => Datum::Null,
+        },
         CatalogFunc::SplitPart => match (args.first(), args.get(1), args.get(2)) {
             (Some(Datum::Text(text)), Some(Datum::Text(sep)), Some(position)) => {
                 let Some(n) = whole_number(Some(position)) else {
@@ -3176,14 +3283,19 @@ fn catalog_function(
                 .and_then(|oid| env.relations().ok()?.view_definition(oid))
                 .map_or(Datum::Null, |text| Datum::Text(text.to_owned())),
         },
-        CatalogFunc::PgGetIndexdef if matches!(args.get(1), Some(Datum::Null)) => Datum::Null,
+        // **`pg_get_constraintdef` shares this guard**, being strict in its `pretty` flag the same
+        // way: `pg_get_constraintdef(oid, NULL)` is NULL and `pg_get_constraintdef(oid)` is the
+        // definition. Measured on both.
+        CatalogFunc::PgGetIndexdef | CatalogFunc::PgGetConstraintdef
+            if matches!(args.get(1), Some(Datum::Null)) =>
+        {
+            Datum::Null
+        }
         CatalogFunc::PgGetIndexdef => crate::catalog::pg_index::index_definition(
             env.relations()?,
             oid_argument(args.first())?,
             column_argument(args.get(1))?,
         ),
-        // The `pretty` flag changes nothing this node prints: it re-wraps a long `CHECK`
-        // expression on a real server, and there are no `CHECK` constraints here.
         // **The inverse of `'x'::regclass`, and per row.** An oid that names nothing is not an
         // error: it prints the number back, and oid 0 prints `-`, PostgreSQL's rendering of
         // `InvalidOid`. Measured, both — raising here would break a `LEFT JOIN` that legitimately
@@ -3307,6 +3419,7 @@ fn catalog_function(
         CatalogFunc::PgGetConstraintdef => crate::catalog::pg_constraint::constraint_definition(
             env.relations()?,
             oid_argument(args.first())?,
+            pretty_argument(args.get(1))?,
         ),
         // **Nothing found is NULL and never an error** — an uncommented object, an attnum out of
         // range, a negative one, an oid that names nothing, an unknown catalog name and a NULL
@@ -3567,6 +3680,23 @@ fn column_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
         Some(other) => {
             return Err(SqlError::DatatypeMismatch(format!(
                 "a column number is an integer, not {other:?}"
+            )));
+        }
+    })
+}
+
+/// `pg_get_constraintdef`'s optional `pretty` flag.
+///
+/// **Absent is `false`**, measured: the one-argument form and `pretty => false` are the same
+/// string for every contype. A NULL is answered before this is called, the function being strict
+/// in both arguments.
+fn pretty_argument(arg: Option<&Datum>) -> Result<bool> {
+    Ok(match arg {
+        None | Some(Datum::Null) => false,
+        Some(Datum::Bool(pretty)) => *pretty,
+        Some(other) => {
+            return Err(SqlError::DatatypeMismatch(format!(
+                "a pretty flag is a boolean, not {other:?}"
             )));
         }
     })

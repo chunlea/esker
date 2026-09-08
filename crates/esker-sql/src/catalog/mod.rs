@@ -45,6 +45,8 @@ pub mod pg_catalog;
 pub mod pg_constraint;
 pub mod pg_index;
 pub mod pg_relations;
+pub use quote::quote_identifier;
+mod quote;
 mod record;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2191,11 +2193,27 @@ impl Catalog {
     }
 
     fn view_at<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, cached: bool) -> Result<View<'a>> {
-        let version = match txn.get(&record::version_key())? {
-            Some(bytes) => record::decode_counter(&bytes)?,
-            // No DDL has ever run. Version 0 is the empty catalog.
-            None => 0,
+        // **Two counters, and the sum is the version.** This tenant's own, which its DDL bumps,
+        // and the cluster's, which role and database DDL bumps because those objects belong to no
+        // tenant. Reading both keeps invalidation exactly as wide as it was when there was one
+        // global counter; reading only the tenant's would leave a cached view stale across a
+        // `CREATE ROLE`.
+        //
+        // The sum rather than a pair because callers compare versions for *inequality* only —
+        // "has anything changed" — and either counter moving changes it.
+        let counter = |key: &[u8]| -> Result<u64> {
+            Ok(match txn.get(key)? {
+                Some(bytes) => record::decode_counter(&bytes)?,
+                // No DDL has ever run. Version 0 is the empty catalog.
+                None => 0,
+            })
         };
+        let version = counter(&record::version_key(tenant))?
+            .saturating_add(counter(&record::version_key(record::CLUSTER_TENANT))?);
+        // **Once per transaction, beside the counter it already reads.** Every catalog view comes
+        // through here, so this is where a database whose keys this build cannot read is turned
+        // away — before a single name is looked up in the wrong place.
+        refuse_an_older_layout(txn, version)?;
         Ok(View {
             catalog: cached.then_some(self),
             txn,
@@ -2517,7 +2535,7 @@ pub fn create_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<
         }
     }
     write_table(txn, tenant, table)?;
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// Rewrites a table that already exists — `CREATE INDEX` and `DROP INDEX` — and bumps the version.
@@ -2556,7 +2574,10 @@ pub fn replace_table(
     // corruption. Run 50's regression was that same shape one object over.
     if !previous.primary_key_name.is_empty() && previous.primary_key_name != table.primary_key_name
     {
-        txn.delete(&record::name_key(tenant, &previous.primary_key_name));
+        txn.delete(&record::name_key(
+            tenant,
+            &owned_name(previous, &previous.primary_key_name),
+        ));
     }
     // **Reconciled by name, not by id.** An index that was *renamed* keeps its id, so an
     // id-keyed comparison saw it as still present and left the old name record behind — two names
@@ -2566,18 +2587,24 @@ pub fn replace_table(
     // name.
     for index in &previous.indexes {
         if !table.indexes.iter().any(|kept| kept.name == index.name) {
-            txn.delete(&record::name_key(tenant, &index.name));
+            txn.delete(&record::name_key(
+                tenant,
+                &owned_name(previous, &index.name),
+            ));
         }
     }
     for index in &table.indexes {
         if !previous.indexes.iter().any(|had| had.id == index.id)
-            && txn.get(&record::name_key(tenant, &index.name))?.is_some()
+            && txn
+                .get(&record::name_key(tenant, &owned_name(table, &index.name)))?
+                .is_some()
         {
+            // **The bare name in the message**, the way every `42P07` names what the user wrote.
             return Err(SqlError::DuplicateTable(index.name.clone()));
         }
     }
     write_table(txn, tenant, table)?;
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// Removes a table, its name and its indexes' names, and bumps the version. The table's *rows* are
@@ -2601,12 +2628,15 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // and cannot be wrong: a relation id is never reused, so nothing can ever read it again.
     txn.delete(&record::name_key(tenant, &table.name));
     if !table.primary_key_name.is_empty() {
-        txn.delete(&record::name_key(tenant, &table.primary_key_name));
+        txn.delete(&record::name_key(
+            tenant,
+            &owned_name(table, &table.primary_key_name),
+        ));
     }
     for index in &table.indexes {
-        txn.delete(&record::name_key(tenant, &index.name));
+        txn.delete(&record::name_key(tenant, &owned_name(table, &index.name)));
     }
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
@@ -2625,13 +2655,13 @@ fn write_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     // int8); CREATE INDEX t_pkey ON t (a);` succeeds on a real server.
     if !table.primary_key_name.is_empty() {
         txn.put(
-            &record::name_key(tenant, &table.primary_key_name),
+            &record::name_key(tenant, &owned_name(table, &table.primary_key_name)),
             &record::encode_relation(&Relation::PrimaryKey { table_id: table.id }),
         );
     }
     for index in &table.indexes {
         txn.put(
-            &record::name_key(tenant, &index.name),
+            &record::name_key(tenant, &owned_name(table, &index.name)),
             &record::encode_relation(&Relation::Index {
                 table_id: table.id,
                 index_id: index.id,
@@ -3013,7 +3043,7 @@ pub fn create_sequence(txn: &mut dyn Txn, tenant: u64, sequence: &SequenceDef) -
     // resolve to and the cache is keyed by this counter; a `CREATE TABLE` bumped it on the way out
     // through `write_table`, and a sequence no column owns writes no table record at all, so
     // nothing bumped it and `nextval` on the sequence just created answered `42P01`.
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// Overwrites one sequence's record in place, keeping its name entry as it is.
@@ -3062,7 +3092,7 @@ pub fn rename_sequence(
             sequence_id: renamed.id,
         }),
     );
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// `pg_get_triggerdef(oid)` — a trigger's `CREATE TRIGGER`, re-printed.
@@ -3121,7 +3151,7 @@ pub fn write_function(txn: &mut dyn Txn, tenant: u64, function: &FunctionDef) ->
         &record::function_key(tenant, &function.name),
         &record::encode_function(function),
     );
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// One function by name, or `None`.
@@ -3175,13 +3205,13 @@ pub fn create_schema(txn: &mut dyn Txn, tenant: u64, name: &str, id: u64) -> Res
         &record::schema_key(tenant, name),
         &record::encode_schema(id),
     );
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// Removes one. The caller has already decided what depends on it.
 pub fn drop_schema(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
     txn.delete(&record::schema_key(tenant, name));
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// The tenant a cluster that has never been told about databases is served as.
@@ -3329,7 +3359,7 @@ pub fn create_role(txn: &mut dyn Txn, name: &str, flags: RoleFlags) -> Result<()
     };
     txn.put(&record::next_role_key(), &record::encode_schema(next + 1));
     txn.put(&record::role_key(name), &record::encode_role(next, flags));
-    bump_version(txn)
+    bump_version(txn, record::CLUSTER_TENANT)
 }
 
 /// Forgets one. `42704` — the sentence PostgreSQL uses — if it is not there.
@@ -3338,7 +3368,7 @@ pub fn drop_role(txn: &mut dyn Txn, name: &str) -> Result<()> {
         return Err(SqlError::UndefinedRole(name.to_owned()));
     }
     txn.delete(&record::role_key(name));
-    bump_version(txn)
+    bump_version(txn, record::CLUSTER_TENANT)
 }
 
 /// Where role oids begin, clear of every reserved relation id.
@@ -3363,7 +3393,7 @@ pub fn create_database(txn: &mut dyn Txn, name: &str, id: u64) -> Result<()> {
         }
     }
     txn.put(&record::database_key(name), &record::encode_database(id));
-    bump_version(txn)
+    bump_version(txn, record::CLUSTER_TENANT)
 }
 
 /// Removes one from the directory **and everything the tenant it is held**.
@@ -3385,7 +3415,12 @@ pub fn drop_database(txn: &mut dyn Txn, name: &str, tenant: u64) -> Result<()> {
         }
     }
     txn.delete(&record::database_key(name));
-    bump_version(txn)
+    // **The cluster's counter, not the tenant's.** The sweep above has just removed every key of
+    // this tenant, and its version key is one of them — bumping it here would write the dropped
+    // tenant back into existence, one key deep, which `dropping_a_database_takes_the_tenants_rows_with_it`
+    // catches. Dropping a database also changes the directory every session reads, so the cluster
+    // counter is the right one on its own terms and not merely the safe one.
+    bump_version(txn, record::CLUSTER_TENANT)
 }
 
 /// Takes the next database id, which is the next **tenant** id: two databases sharing one would
@@ -3586,14 +3621,14 @@ pub fn create_view(txn: &mut dyn Txn, tenant: u64, view: &ViewDef) -> Result<()>
         &record::name_key(tenant, &view.name),
         &record::encode_relation(&Relation::View { view_id: view.id }),
     );
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// Removes one, and the name it held.
 pub fn drop_view(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
     txn.delete(&record::view_key(tenant, name));
     txn.delete(&record::name_key(tenant, name));
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// The one schema every tenant has.
@@ -3619,6 +3654,31 @@ pub fn qualify(schema: &str, name: &str) -> String {
         return name.to_owned();
     }
     format!("{schema}{SCHEMA_SEPARATOR}{name}")
+}
+
+/// The name-record key an **index or a primary key** holds: its own bare name, in its table's
+/// schema.
+///
+/// An index's [`IndexDef::name`] stays bare — every renderer prints it, `pg_class.relname` is it,
+/// and `pg_get_indexdef` would have to unqualify it again — so the schema is applied here, where
+/// the key is built, and nowhere else. A table's name record is keyed on its own qualified name;
+/// this is the same rule for the relations a table owns.
+///
+/// Before this, every index in a database shared one namespace: `my.schema.articles_pkey`
+/// collided with `public.articles_pkey`, which is what `SchemaWithDotsTest` met
+/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+#[must_use]
+pub(crate) fn owned_name(table: &TableDef, name: &str) -> String {
+    // **A derived name arrives qualified already.** `plan::make_object_name` spends its 63-byte
+    // budget on the identifier and re-qualifies, so `s.t`'s primary key is stored `s\0t_pkey`
+    // while a user-given `CREATE INDEX ix ON s.t` is stored bare. Qualifying the first again put
+    // two separators in the key and `pg_class.relname` read back `s\0t_pkey` — caught by probing
+    // the catalog rather than by reading the writer, which is why this guard is here and not a
+    // comment saying it cannot happen.
+    if name.contains(SCHEMA_SEPARATOR) {
+        return name.to_owned();
+    }
+    qualify(split_qualified(&table.name).0, name)
 }
 
 /// The schema and the bare name out of a stored one.
@@ -3882,7 +3942,7 @@ pub fn functions(txn: &dyn Txn, tenant: u64) -> Result<Vec<FunctionDef>> {
 /// Removes one function.
 pub fn drop_function(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
     txn.delete(&record::function_key(tenant, name));
-    bump_version(txn)
+    bump_version(txn, tenant)
 }
 
 /// One sequence by the pair its name resolves to, read straight from its record.
@@ -4168,14 +4228,68 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
     Ok(next)
 }
 
+/// Refuses a database whose catalog **keys** are arranged the way an older build arranged them.
+///
+/// The marker is written by the first `bump_version` a store ever runs, so:
+///
+/// * **absent and version 0** — nothing has ever been written. There is no old data to misread,
+///   and the first DDL stamps it.
+/// * **absent and version > 0** — a catalog exists and predates the marker, which is layout 1.
+/// * **anything but the current version** — refused, whether older or newer. A newer one means a
+///   build that knows something this one does not, and guessing is what this is here to stop.
+///
+/// The sentence names the change and says what to do, because there is nothing else to be done:
+/// existing databases are disposable by the user's decision, and there is no upgrade path
+/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
+    let held = match txn.get(&record::layout_key())? {
+        Some(bytes) => record::decode_layout(&bytes)?,
+        None if version == 0 => return Ok(()),
+        // An unmarked catalog **is** layout 1, which is what makes the sentence below true rather
+        // than approximate.
+        None => 1,
+    };
+    if held == record::CATALOG_LAYOUT_VERSION {
+        return Ok(());
+    }
+    Err(SqlError::DataCorrupted(format!(
+        "catalog layout {held} is older than {}: index names became schema-scoped on 2026-09-05; \
+         this database predates that and must be recreated",
+        record::CATALOG_LAYOUT_VERSION
+    )))
+}
+
+/// Stamps the store with the layout this build writes, if it is not stamped already.
+///
+/// Called from [`bump_version`], which every DDL statement runs — so the first statement to write
+/// anything is the one that marks the store, and a store that has written nothing carries no
+/// marker and needs none.
+fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
+    let key = record::layout_key();
+    if txn.get(&key)?.is_none() {
+        txn.put(&key, &record::encode_layout());
+    }
+    Ok(())
+}
+
 /// Moves the catalog version forward, which is what makes every node's cache notice.
 ///
-/// Every DDL statement writes this one key, so two concurrent DDL statements conflict and one of
-/// them is told to retry. That is the intended serialisation and not a bottleneck worth removing:
-/// DDL is rare and a catalog that two statements changed at once is a catalog nobody can reason
-/// about.
-pub fn bump_version(txn: &mut dyn Txn) -> Result<()> {
-    let key = record::version_key();
+/// Every DDL statement writes **its tenant's** key, so two concurrent DDL statements *in one
+/// database* conflict and one of them is told to retry. That is the intended serialisation and not
+/// a bottleneck worth removing: DDL is rare and a catalog that two statements changed at once is a
+/// catalog nobody can reason about.
+///
+/// It used to be one key for the whole cluster, and that made the serialisation far wider than the
+/// sentence above claims: a schema load *reads* this key on every statement that resolves a
+/// relation, so a DDL in database B held a Percolator lock on the key an ordinary `SELECT` in
+/// database A had to read, and A was told `40001` for a conflict with a transaction it shares
+/// nothing with (`record::version_key`).
+///
+/// Cluster-scoped objects — roles, databases — pass `record::CLUSTER_TENANT`, which every view
+/// reads beside its own.
+pub fn bump_version(txn: &mut dyn Txn, tenant: u64) -> Result<()> {
+    stamp_layout(txn)?;
+    let key = record::version_key(tenant);
     let current = match txn.get(&key)? {
         Some(bytes) => record::decode_counter(&bytes)?,
         None => 0,
@@ -4481,7 +4595,7 @@ mod tests {
             record::schema_key(7, "s"),
             record::name_key(7, "t"),
             record::table_key(7, 1),
-            record::version_key(),
+            record::version_key(7),
             function,
         ] {
             assert!(
@@ -4647,6 +4761,121 @@ mod tests {
             "01",
         ));
         assert_eq!(record::decode_table(&v2).unwrap(), accounts(7));
+    }
+
+    /// **The layout marker, byte for byte.** One key for the whole store and one byte in it, so
+    /// the golden is short — and it is here for the reason every other golden is: a marker whose
+    /// bytes moved without anyone noticing would refuse every database at once.
+    #[test]
+    fn the_layout_marker_is_one_byte() {
+        assert_eq!(record::encode_layout(), decode_hex("02"));
+        assert_eq!(record::decode_layout(&record::encode_layout()).unwrap(), 2);
+        assert!(record::decode_layout(&[]).is_err());
+        assert!(record::decode_layout(&[2, 2]).is_err());
+    }
+
+    /// **A database written before the marker is refused, and the sentence says what to do.**
+    ///
+    /// The catalog here has run DDL — version is not 0 — and carries no marker, which is exactly
+    /// what a store from before 2026-09-05 looks like.
+    /// **A DDL in one database must not touch what another database reads.**
+    ///
+    /// The catalog version was one key for the whole cluster, and a schema load reads it on every
+    /// statement that resolves a relation. So a `CREATE TABLE` in database B took a Percolator lock
+    /// on the key an ordinary `SELECT` in database A had to read, and A was told `40001` — a
+    /// serialization failure against a transaction it shares nothing with.
+    ///
+    /// This asserts the **cause** rather than the symptom: that B's DDL leaves A's counter alone.
+    /// The symptom needs two real stores and a lock held open, which no in-memory backend has; the
+    /// cause is what the fix changes, and it is exactly why the lock can no longer be met.
+    #[test]
+    fn a_ddl_in_one_tenant_does_not_move_another_tenants_catalog_version() {
+        const A: u64 = 1;
+        const B: u64 = 2;
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+
+        let version_of = |txn: &dyn crate::backend::Txn, tenant: u64| -> u64 {
+            match txn.get(&record::version_key(tenant)).unwrap() {
+                Some(bytes) => record::decode_counter(&bytes).unwrap(),
+                None => 0,
+            }
+        };
+
+        // A does its own DDL, so it has a counter to be left alone.
+        super::bump_version(&mut *txn, A).unwrap();
+        let a_before = version_of(&*txn, A);
+        assert_eq!(a_before, 1, "A's own DDL moves A's counter");
+
+        // B does three, which under one global counter moved A's version three times.
+        for _ in 0..3 {
+            super::bump_version(&mut *txn, B).unwrap();
+        }
+
+        assert_eq!(
+            version_of(&*txn, A),
+            a_before,
+            "a DDL in database B moved database A's catalog version; A reads that key on every \
+             statement that resolves a relation, so B's lock on it is what A meets"
+        );
+        assert_eq!(version_of(&*txn, B), 3, "B's own DDL moves B's counter");
+    }
+
+    /// Cluster-scoped DDL still reaches every tenant, which is the half the split must not lose.
+    ///
+    /// Roles and databases belong to no tenant — `role_key` and `database_key` carry no tenant id —
+    /// so their DDL bumps [`record::CLUSTER_TENANT`] and every view reads that counter beside its
+    /// own. Without this the split would trade a cross-database stall for a stale catalog, which is
+    /// the worse of the two.
+    #[test]
+    fn a_cluster_scoped_ddl_is_still_visible_to_every_tenant() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        let catalog = Catalog::new();
+
+        let before = catalog.view_uncached(&*txn, 1).unwrap().version();
+        super::bump_version(&mut *txn, record::CLUSTER_TENANT).unwrap();
+        let after = catalog.view_uncached(&*txn, 1).unwrap().version();
+
+        assert!(
+            after > before,
+            "a role or database change left tenant 1's view at version {before}, so a cached \
+             catalog would not notice it"
+        );
+    }
+
+    #[test]
+    fn a_database_without_the_marker_is_refused() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        // A catalog that exists: the counter is what says DDL has run.
+        txn.put(&record::version_key(1), &record::encode_counter(7));
+        let catalog = Catalog::new();
+        let refused = catalog.view(&*txn, 1).unwrap_err().to_string();
+        assert!(
+            refused.contains(
+                "catalog layout 1 is older than 2: index names became schema-scoped on \
+                 2026-09-05; this database predates that and must be recreated"
+            ),
+            "{refused}"
+        );
+    }
+
+    /// And one that carries it opens — as does an empty store, which has nothing to be wrong about.
+    #[test]
+    fn a_marked_database_and_an_empty_one_both_open() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        let catalog = Catalog::new();
+        // Nothing written at all: version 0, no marker, no complaint.
+        catalog.view(&*txn, 1).unwrap();
+        // And a real catalog, stamped the way `bump_version` stamps one.
+        super::bump_version(&mut *txn, 1).unwrap();
+        catalog.view(&*txn, 1).unwrap();
+        assert_eq!(
+            txn.get(&record::layout_key()).unwrap().as_deref(),
+            Some(&record::encode_layout()[..])
+        );
     }
 
     /// A key part's order survives the record, which is what a schema dump reads back.

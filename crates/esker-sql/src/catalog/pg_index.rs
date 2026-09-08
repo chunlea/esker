@@ -134,32 +134,6 @@ pub fn index_definition(relations: &Relations, oid: Option<i64>, column: Option<
 /// NULL` comes back `WHERE (published_on IS NOT NULL)` and `WHERE (a > 10)` comes back
 /// `WHERE (a > 10)`, one pair either way. Measured; and it matters beyond looks, because
 /// `ActiveRecord` recovers a partial index's predicate by scanning this string.
-/// An identifier as PostgreSQL's `quote_ident` writes it into a definition.
-///
-/// **Quoted unless it is already what it would parse back as**: a leading letter or underscore,
-/// then letters, digits, underscores and `$`, all lower case. `"Quoted"` and `"Col A"` get their
-/// quotes and `plain` does not — measured on 19beta1, in both the whole definition and the
-/// per-column form. It matters beyond looks: `ActiveRecord` recovers an index's columns by
-/// reading this string, and a mixed-case name written bare comes back as a different name.
-///
-/// **A reserved keyword is quoted too and is not quoted here** — `"select"` as a column name is
-/// measured and diverges. PostgreSQL quotes its *reserved* words, which is a specific list this
-/// node does not carry; `sqlparser`'s keyword lists are a different set and using one would quote
-/// `name` and `value`, which a real server leaves bare. Declared rather than approximated.
-fn quote_identifier(name: &str) -> String {
-    let bare = name
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_lowercase() || first == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
-    if bare {
-        return name.to_owned();
-    }
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 fn definition(
     relation: &RelationRow,
     table: &TableDef,
@@ -170,7 +144,7 @@ fn definition(
     let mut out = format!(
         "CREATE {}INDEX {} ON {}{}{} USING {} ({})",
         if key.unique { "UNIQUE " } else { "" },
-        quote_identifier(&relation.name),
+        super::quote_identifier(&relation.name),
         // **`ON ONLY` for an index on a partitioned table** — the word `ONLY` in the definition of
         // the index that covers *every* partition, which reads backwards and is what a real server
         // prints. It says the index relation itself holds no entries: the partitions' own indexes
@@ -188,7 +162,7 @@ fn definition(
         } else {
             String::new()
         },
-        quote_identifier(super::split_qualified(&table.name).1),
+        super::quote_identifier(super::split_qualified(&table.name).1),
         key.method,
         parts.join(", ")
     );
@@ -200,7 +174,7 @@ fn definition(
             .include
             .iter()
             .filter_map(|&at| table.columns.get(at))
-            .map(|column| quote_identifier(&column.name))
+            .map(|column| super::quote_identifier(&column.name))
             .collect();
         out.push_str(" INCLUDE (");
         out.push_str(&printed.join(", "));
@@ -331,7 +305,7 @@ impl Key<'_> {
                     KeyPart::Column(at) => table
                         .columns
                         .get(*at)
-                        .map(|column| quote_identifier(&column.name))
+                        .map(|column| super::quote_identifier(&column.name))
                         .unwrap_or_default(),
                     KeyPart::Expression { expr, shape, .. } => shape.listed(expr),
                 };
@@ -359,7 +333,7 @@ impl Key<'_> {
             table
                 .columns
                 .get(at)
-                .map(|column| quote_identifier(&column.name))
+                .map(|column| super::quote_identifier(&column.name))
                 .unwrap_or_default()
         };
         self.keys

@@ -18,6 +18,7 @@ mod cluster;
 mod manifest_dump;
 mod pd;
 mod raw;
+mod readiness;
 mod reconcile;
 mod region;
 mod rpc_tls;

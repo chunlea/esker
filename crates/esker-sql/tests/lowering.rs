@@ -210,13 +210,10 @@ fn every_unimplemented_alter_table_action_is_refused_by_name() {
         ),
         // `ADD COLUMN ... PRIMARY KEY` left this list with the `bigserial` above it, and so did
         // `ADD CONSTRAINT ... PRIMARY KEY`.
-        // `ALTER COLUMN a TYPE text` was here. It converts now, so what stays refused is the
-        // `USING` that asks for a **computation** rather than a conversion — the boundary the unit
-        // draws, and the one worth guarding (ADR 0031 rule 2).
-        (
-            "ALTER TABLE t ALTER COLUMN a TYPE text[] USING string_to_array(a, ',')",
-            "ALTER TABLE ... ALTER COLUMN ... TYPE ... USING",
-        ),
+        // `ALTER COLUMN a TYPE text` was here, and then the `USING` that asks for a **computation**
+        // rather than a conversion was — both convert now (`tests/alter_column_type.rs`,
+        // `tests/alter_column_type_using.rs`). Rule 2 named this entry when the evaluator landed,
+        // which is what the entry was for.
         // Still refused, and this is the one that keeps the `ADD CONSTRAINT` arm honest now that
         // `UNIQUE`, `FOREIGN KEY`, `CHECK` and `PRIMARY KEY` are all through it: a kind it cannot
         // build must still name itself rather than fall through.

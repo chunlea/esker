@@ -39,8 +39,10 @@ mod parity;
 
 const FIXTURE: &[&str] = &[
     "CREATE TABLE authors (id bigserial primary key, name varchar(255))",
-    "CREATE TABLE posts (id bigserial primary key, author_id bigint, title varchar(255))",
-    "CREATE TABLE categorizations (id bigserial primary key, post_id bigint, author_id bigint)",
+    "CREATE TABLE posts (id bigserial primary key, author_id bigint, title varchar(255), \
+     type varchar(255))",
+    "CREATE TABLE categorizations (id bigserial primary key, post_id bigint, author_id bigint, \
+     special boolean)",
 ];
 
 /// The types this node resolved for a statement's parameters, read the way the oracle was read.
@@ -86,6 +88,31 @@ fn a_bind_in_a_joined_update_is_typed_by_the_column_it_writes() {
              AND \"categorizations\".\"author_id\" = $2"
         ),
         "{bigint,bigint}"
+    );
+}
+
+/// **The statement the suite actually sends**, from r1's capture — not a reconstruction.
+///
+/// The difference from the shape above is what makes it fail: the same table appears **twice**,
+/// once as the `UPDATE`'s aliased target and once in the `FROM`, and the failing binds are the two
+/// compared with the `FROM` side's columns. Measured on PostgreSQL 19:
+/// `{bigint,boolean,text,bigint,bigint}` — `$3` is `text` for the `varchar` reason this file's
+/// header gives, and `$4` and `$5` are the `bigint`s the node was resolving to `text`.
+#[test]
+fn the_suites_own_joined_update_types_the_binds_on_the_from_side() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        parameter_types(
+            &mut node,
+            "u2",
+            "UPDATE \"posts\" \"__active_record_update_alias\" SET \"author_id\" = $1 \
+             FROM \"posts\" INNER JOIN \"categorizations\" \
+             ON \"categorizations\".\"post_id\" = \"posts\".\"id\" \
+             WHERE \"categorizations\".\"special\" = $2 AND \"posts\".\"type\" = $3 \
+             AND \"posts\".\"author_id\" = $4 AND \"posts\".\"id\" = $5 \
+             AND \"posts\".\"id\" = \"__active_record_update_alias\".\"id\""
+        ),
+        "{bigint,boolean,\"character varying\",bigint,bigint}"
     );
 }
 
