@@ -1,0 +1,326 @@
+# **What type a set operation's column has** — PostgreSQL 19, 2026-09-07, one `BEGIN … ROLLBACK`.
+#
+# Read through `\gdesc`, not `pg_typeof(...) LIMIT 1`: a `UNION ALL` in a `FROM` is flattened and
+# `pg_typeof` then reports each branch's own type, which is how the first probe of this said
+# `integer` for `int8 UNION ALL real`.
+#
+# The rule (`select_common_type`): two categories cannot be matched (42804); a preferred type stays;
+# otherwise the later type is taken only when the earlier casts to it implicitly and not the reverse —
+# so `varchar` beside `text` stays `character varying`, and `text` beside `varchar` is `text`. Then
+# every arm must reach the chosen type implicitly, or it is 42846 naming that arm.
+#
+# ---- the probes, as sen
+# \set ON_ERROR_ROLLBACK on
+# \set VERBOSITY terse
+# BEGIN;
+# \echo === varchar/tex
+# SELECT 'a'::varchar(5) AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === text/varchar
+# SELECT 'a'::text AS n UNION ALL SELECT 'b'::varchar(5) \gdesc
+# \echo === bpchar/tex
+# SELECT 'a'::char(2) AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === bpchar/varchar
+# SELECT 'a'::char(2) AS n UNION ALL SELECT 'b'::varchar \gdesc
+# \echo === varchar/bpchar
+# SELECT 'a'::varchar AS n UNION ALL SELECT 'b'::char(2) \gdesc
+# \echo === varchar(3)/varchar(5)
+# SELECT 'abc'::varchar(3) AS n UNION ALL SELECT 'b'::varchar(5) \gdesc
+# \echo === text/unknown
+# SELECT 'a'::text AS n UNION ALL SELECT 'b' \gdesc
+# \echo === unknown/unknown
+# SELECT 'a' AS n UNION ALL SELECT 'b' \gdesc
+# \echo === int4/unknown
+# SELECT 1::int4 AS n UNION ALL SELECT '2' \gdesc
+# \echo === name/tex
+# SELECT 'a'::name AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === date/timestamp
+# SELECT '2020-01-01'::date AS n UNION ALL SELECT '2020-01-01 10:00'::timestamp \gdesc
+# \echo === timestamp/date
+# SELECT '2020-01-01 10:00'::timestamp AS n UNION ALL SELECT '2020-01-01'::date \gdesc
+# \echo === date/timestamptz
+# SELECT '2020-01-01'::date AS n UNION ALL SELECT '2020-01-01 10:00+00'::timestamptz \gdesc
+# \echo === timestamp/timestamptz
+# SELECT '2020-01-01 10:00'::timestamp AS n UNION ALL SELECT '2020-01-01 10:00+00'::timestamptz \gdesc
+# \echo === timestamptz/timestamp
+# SELECT '2020-01-01 10:00+00'::timestamptz AS n UNION ALL SELECT '2020-01-01 10:00'::timestamp \gdesc
+# \echo === time/timetz
+# SELECT '10:00'::time AS n UNION ALL SELECT '10:00+00'::timetz \gdesc
+# \echo === time/interval
+# SELECT '10:00'::time AS n UNION ALL SELECT '1 hour'::interval \gdesc
+# \echo === real/double
+# SELECT 1::real AS n UNION ALL SELECT 2::float8 \gdesc
+# \echo === int8/real
+# SELECT 1::int8 AS n UNION ALL SELECT 2::real \gdesc
+# \echo === real/int8
+# SELECT 1::real AS n UNION ALL SELECT 2::int8 \gdesc
+# \echo === numeric/real
+# SELECT 1::numeric AS n UNION ALL SELECT 2::real \gdesc
+# \echo === int2/int8
+# SELECT 1::int2 AS n UNION ALL SELECT 2::int8 \gdesc
+# \echo === int2/numeric
+# SELECT 1::int2 AS n UNION ALL SELECT 2::numeric \gdesc
+# \echo === int8/numeric
+# SELECT 1::int8 AS n UNION ALL SELECT 2::numeric \gdesc
+# \echo === int4/bool
+# SELECT 1::int4 AS n UNION ALL SELECT true \gdesc
+# \echo === uuid/tex
+# SELECT gen_random_uuid() AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === json/jsonb
+# SELECT '1'::json AS n UNION ALL SELECT '2'::jsonb \gdesc
+# \echo === jsonb/json
+# SELECT '1'::jsonb AS n UNION ALL SELECT '2'::json \gdesc
+# \echo === inet/cidr
+# SELECT '10.0.0.1'::inet AS n UNION ALL SELECT '10.0.0.0/8'::cidr \gdesc
+# \echo === cidr/ine
+# SELECT '10.0.0.0/8'::cidr AS n UNION ALL SELECT '10.0.0.1'::inet \gdesc
+# \echo === oid/int8
+# SELECT 1::oid AS n UNION ALL SELECT 2::int8 \gdesc
+# \echo === int8/oid
+# SELECT 1::int8 AS n UNION ALL SELECT 2::oid \gdesc
+# \echo === regclass/int8
+# SELECT 'pg_class'::regclass AS n UNION ALL SELECT 2::int8 \gdesc
+# \echo === regclass/oid
+# SELECT 'pg_class'::regclass AS n UNION ALL SELECT 2::oid \gdesc
+# \echo === bool/tex
+# SELECT true AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === date/tex
+# SELECT '2020-01-01'::date AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === NULL/int4
+# SELECT NULL AS n UNION ALL SELECT 2::int4 \gdesc
+# \echo === NULL/NULL
+# SELECT NULL AS n UNION ALL SELECT NULL \gdesc
+# \echo === text[]/varchar[]
+# SELECT ARRAY['a']::text[] AS n UNION ALL SELECT ARRAY['b']::varchar[] \gdesc
+# \echo === int4[]/int8[]
+# SELECT ARRAY[1]::int4[] AS n UNION ALL SELECT ARRAY[2]::int8[] \gdesc
+# \echo === money/numeric
+# SELECT 1::money AS n UNION ALL SELECT 2::numeric \gdesc
+# \echo === int4/tex
+# SELECT 1::int4 AS n UNION ALL SELECT 'b'::text \gdesc
+# \echo === int4/money
+# SELECT 1::int4 AS n UNION ALL SELECT 2::money \gdesc
+# \echo === interval/tex
+# SELECT '1 h'::interval AS n UNION ALL SELECT 'x'::text \gdesc
+# ROLLBACK;
+#
+# ---- what psql printed
+=== varchar/tex
+ Column |       Type
+--------+-------------------
+ n      | character varying
+(1 row)
+
+=== text/varchar
+ Column | Type
+--------+------
+ n      | tex
+(1 row)
+
+=== bpchar/tex
+ Column |  Type
+--------+--------
+ n      | bpchar
+(1 row)
+
+=== bpchar/varchar
+ Column |  Type
+--------+--------
+ n      | bpchar
+(1 row)
+
+=== varchar/bpchar
+ Column |       Type
+--------+-------------------
+ n      | character varying
+(1 row)
+
+=== varchar(3)/varchar(5)
+ Column |       Type
+--------+-------------------
+ n      | character varying
+(1 row)
+
+=== text/unknown
+ Column | Type
+--------+------
+ n      | tex
+(1 row)
+
+=== unknown/unknown
+ Column | Type
+--------+------
+ n      | tex
+(1 row)
+
+=== int4/unknown
+ Column |  Type
+--------+---------
+ n      | integer
+(1 row)
+
+=== name/tex
+ Column | Type
+--------+------
+ n      | name
+(1 row)
+
+=== date/timestamp
+ Column |            Type
+--------+-----------------------------
+ n      | timestamp without time zone
+(1 row)
+
+=== timestamp/date
+ Column |            Type
+--------+-----------------------------
+ n      | timestamp without time zone
+(1 row)
+
+=== date/timestamptz
+ Column |           Type
+--------+--------------------------
+ n      | timestamp with time zone
+(1 row)
+
+=== timestamp/timestamptz
+ Column |           Type
+--------+--------------------------
+ n      | timestamp with time zone
+(1 row)
+
+=== timestamptz/timestamp
+ Column |           Type
+--------+--------------------------
+ n      | timestamp with time zone
+(1 row)
+
+=== time/timetz
+ Column |        Type
+--------+---------------------
+ n      | time with time zone
+(1 row)
+
+=== time/interval
+=== real/double
+ Column |       Type
+--------+------------------
+ n      | double precision
+(1 row)
+
+=== int8/real
+ Column | Type
+--------+------
+ n      | real
+(1 row)
+
+=== real/int8
+ Column | Type
+--------+------
+ n      | real
+(1 row)
+
+=== numeric/real
+psql:<stdin>:37: ERROR:  UNION types time without time zone and interval cannot be matched at character 44
+ Column | Type
+--------+------
+ n      | real
+(1 row)
+
+=== int2/int8
+ Column |  Type
+--------+--------
+ n      | bigin
+(1 row)
+
+=== int2/numeric
+ Column |  Type
+--------+---------
+ n      | numeric
+(1 row)
+
+=== int8/numeric
+ Column |  Type
+--------+---------
+ n      | numeric
+(1 row)
+
+=== int4/bool
+psql:<stdin>:53: ERROR:  UNION types integer and boolean cannot be matched at character 38
+=== uuid/tex
+psql:<stdin>:55: ERROR:  UNION types uuid and text cannot be matched at character 48
+=== json/jsonb
+psql:<stdin>:57: ERROR:  UNION could not convert type jsonb to json at character 40
+psql:<stdin>:59: ERROR:  UNION could not convert type json to jsonb at character 41
+=== jsonb/json
+=== inet/cidr
+ Column | Type
+--------+------
+ n      | ine
+(1 row)
+
+=== cidr/ine
+ Column | Type
+--------+------
+ n      | ine
+(1 row)
+
+=== oid/int8
+ Column | Type
+--------+------
+ n      | oid
+(1 row)
+
+=== int8/oid
+ Column | Type
+--------+------
+ n      | oid
+(1 row)
+
+=== regclass/int8
+psql:<stdin>:73: ERROR:  UNION types boolean and text cannot be matched at character 35
+psql:<stdin>:75: ERROR:  UNION types date and text cannot be matched at character 49
+ Column |   Type
+--------+----------
+ n      | regclass
+(1 row)
+
+=== regclass/oid
+ Column |   Type
+--------+----------
+ n      | regclass
+(1 row)
+
+=== bool/tex
+=== date/tex
+=== NULL/int4
+ Column |  Type
+--------+---------
+ n      | integer
+(1 row)
+
+=== NULL/NULL
+ Column | Type
+--------+------
+ n      | tex
+(1 row)
+
+=== text[]/varchar[]
+ Column |  Type
+--------+--------
+ n      | text[]
+(1 row)
+
+=== int4[]/int8[]
+ Column |   Type
+--------+----------
+ n      | bigint[]
+(1 row)
+
+psql:<stdin>:85: ERROR:  UNION could not convert type numeric to money at character 39
+=== money/numeric
+=== int4/tex
+psql:<stdin>:87: ERROR:  UNION types integer and text cannot be matched at character 38
+=== int4/money
+psql:<stdin>:89: ERROR:  UNION could not convert type money to integer at character 38
+psql:<stdin>:91: ERROR:  UNION types interval and text cannot be matched at character 46
+=== interval/tex

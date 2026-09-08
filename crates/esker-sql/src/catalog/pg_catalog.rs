@@ -2894,7 +2894,7 @@ fn typtype(ty: ColumnType) -> &'static str {
 /// what a reader would guess: `bytea` is `U` (user-defined) and not `S` (string), a `uuid` is `U`
 /// too, and all three datetime types are `D` while an `interval` is `T`. An exhaustive match, so
 /// a type added here has to answer instead of inheriting somebody else's letter.
-pub(super) fn typcategory(ty: ColumnType) -> &'static str {
+pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
     match ty {
         // A `regtype` sits in the `N` group below beside the `oid` it is, and its array in `A`
         // with every other array — which is the point of the model (ADR 0077) rather than an

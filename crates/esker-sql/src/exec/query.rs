@@ -675,6 +675,21 @@ pub(super) fn append(
         arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
         nodes.push(arm.node);
     }
+    // **Every arm has to reach the type the set settled on, by an implicit cast**: agreeing on a
+    // category is not enough. `money` beside `numeric` is one category with no implicit cast either
+    // way, which a real server refuses as `42846 UNION could not convert type numeric to money` —
+    // a different sentence from the categories' `42804`, measured beside it.
+    for types in &arm_types {
+        for (at, from) in types.iter().enumerate() {
+            let to = columns[at].ty;
+            if !reaches_implicitly(*from, to) {
+                return Err(SqlError::SetOperationCannotConvert {
+                    from: from.name(),
+                    to: to.name(),
+                });
+            }
+        }
+    }
     // **Unifying the declared type is only half of it: the values have to follow.** An arm that
     // produced an `int4` where the set is a `bigint` would answer rows of two different types
     // under one column — `pg_typeof` reads the value, and a client binding by the declared type
@@ -834,22 +849,98 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
     }
 }
 
-/// The two types of one output column, unified.
+/// The two types of one output column, unified the way `select_common_type` unifies them.
 ///
-/// The rule is the promotion arithmetic already makes, for the reason `greatest`'s is: a set
-/// operation's column has one declared type and one set of values, and two rules would let them
-/// disagree. Measured: `int4` beside `int8` is `bigint`, an integer beside a `numeric` is
-/// `numeric`, and `text` beside `integer` is the refusal a real server gives.
+/// **Not the arithmetic promotion**, which is what this folded through before and which refused
+/// `varchar` beside `text` as "cannot be matched" and made `int8` beside `real` a `double`.
+/// Measured on PostgreSQL 19 (`tests/captures/pg19_union_types.txt`) the rule is three questions,
+/// in order:
+///
+/// * two **categories** cannot be matched — `integer` and `text`, `date` and `text`, `time` and
+///   `interval` are all `42804`;
+/// * a **preferred** type stays — `text`, `float8`, `oid`, `timestamptz`, `interval`, `inet`,
+///   `bool`, `varbit` — so `text` beside anything in its category is `text`;
+/// * otherwise the later type is taken only when the earlier one casts to it implicitly **and not
+///   the other way**. `int2` beside `int8` is `bigint` and `date` beside `timestamp` is
+///   `timestamp`; `varchar` beside `text` stays **`character varying`**, because those two cast
+///   each other implicitly and the first arm wins — the row a reader guesses wrong.
+///
+/// Whether every arm can then *reach* the chosen type is [`reaches_implicitly`]'s question, asked
+/// in [`append`] once the type is known: `money` beside `numeric` and `json` beside `jsonb` agree
+/// on a category and have no implicit cast, which is `42846` there and not `42804`.
 fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
+    use esker_keys::array::ArrayValue;
     if left == right {
         return Ok(left);
     }
-    crate::value::arith::result_type(crate::plan::ArithOp::Add, left, right).map_err(|_| {
-        SqlError::SetOperationTypes {
+    // An array's common type is its elements': `int4[]` beside `int8[]` is `bigint[]`.
+    if let (Some(l), Some(r)) = (ArrayValue::element_of(left), ArrayValue::element_of(right)) {
+        return Ok(ArrayValue::array_of(unify(l, r)?).unwrap_or(left));
+    }
+    if pg_catalog::typcategory(left) != pg_catalog::typcategory(right) {
+        return Err(SqlError::SetOperationTypes {
             left: left.name(),
             right: right.name(),
-        }
-    })
+        });
+    }
+    if is_preferred(left) {
+        return Ok(left);
+    }
+    if implicit_cast(left, right) && !implicit_cast(right, left) {
+        return Ok(right);
+    }
+    Ok(left)
+}
+
+/// `pg_type.typispreferred`, measured on PostgreSQL 19: one per category, and `oid` beside
+/// `float8` in the numbers.
+fn is_preferred(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Bool
+            | ColumnType::TimestampTz
+            | ColumnType::Inet
+            | ColumnType::Double
+            | ColumnType::Oid
+            | ColumnType::Text
+            | ColumnType::Interval
+            | ColumnType::VarBit
+    )
+}
+
+/// Whether `pg_cast` holds an **implicit** cast from one type to the other — read from the table
+/// `pg_cast` itself is served from, so the two cannot disagree.
+fn implicit_cast(from: ColumnType, to: ColumnType) -> bool {
+    use crate::value::PgType as _;
+    let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
+    pg_catalog::CASTS
+        .iter()
+        .any(|(source, target, context, _)| *source == from && *target == to && *context == "i")
+}
+
+/// Whether an arm's value can be handed to the set's column: the same type, an implicit cast,
+/// an array of either, or a number beside a number — which the promotion table vouches for where
+/// the cast table has no row.
+fn reaches_implicitly(from: ColumnType, to: ColumnType) -> bool {
+    use esker_keys::array::ArrayValue;
+    if from == to || implicit_cast(from, to) {
+        return true;
+    }
+    if let (Some(f), Some(t)) = (ArrayValue::element_of(from), ArrayValue::element_of(to)) {
+        return reaches_implicitly(f, t);
+    }
+    let number = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Int2
+                | ColumnType::Int4
+                | ColumnType::Int8
+                | ColumnType::Real
+                | ColumnType::Double
+                | ColumnType::Numeric
+        )
+    };
+    number(from) && number(to)
 }
 
 pub(super) fn plan(

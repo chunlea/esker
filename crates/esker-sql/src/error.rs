@@ -2483,6 +2483,20 @@ pub enum SqlError {
         right: &'static str,
     },
 
+    /// Two arms of a set operation in one category with no implicit cast between them.
+    ///
+    /// A different sentence and a different code from [`SqlError::SetOperationTypes`], measured:
+    /// `money` beside `numeric` is `42846 UNION could not convert type numeric to money`, and
+    /// `json` beside `jsonb` the same — one category, no implicit cast in either direction, and
+    /// the type it *could not convert* is the later arm's.
+    #[error("UNION could not convert type {from} to {to}")]
+    SetOperationCannotConvert {
+        /// The arm's type, named as a client would write it.
+        from: &'static str,
+        /// The type the set settled on.
+        to: &'static str,
+    },
+
     /// A function argument a real server refuses with `22023` and a sentence of its own.
     ///
     /// `split_part(text, sep, 0)` is `field position must not be zero` and
@@ -2960,7 +2974,9 @@ impl SqlError {
             }
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
-            SqlError::CannotCast { .. } => sqlstate::CANNOT_COERCE,
+            SqlError::CannotCast { .. } | SqlError::SetOperationCannotConvert { .. } => {
+                sqlstate::CANNOT_COERCE
+            }
             SqlError::DatetimeFieldOutOfRange { .. }
             | SqlError::IntervalOutOfRange
             | SqlError::DatetimeOutOfRange { .. }

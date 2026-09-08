@@ -285,3 +285,92 @@ fn a_cte_outside_the_set_is_visible_from_every_arm() {
         vec![vec!["1"], vec!["1"], vec!["2"]]
     );
 }
+
+/// **The common type is `select_common_type`'s, and it is not the arithmetic promotion.**
+///
+/// Measured on PostgreSQL 19 through `\gdesc` (`tests/captures/pg19_union_types.txt`) — through
+/// `\gdesc` and not `pg_typeof`, because a `UNION ALL` in a `FROM` is flattened and `pg_typeof`
+/// then reports each branch's own type. Two rows a reader guesses wrong: `int8` beside `real` is
+/// `real` (not `double precision`, which the promotion table would say), and `int8` beside `oid`
+/// is `oid`. The capture's string rows — `varchar` beside `text` stays `character varying`,
+/// because the two cast each other implicitly and the first arm wins — are in the rule and not
+/// in this test: a cast to `varchar`, `bpchar`, `json` or `jsonb` in a bare target list is typed
+/// `text` by this node, so there is no arm of those types to unify here yet.
+#[test]
+fn the_common_type_is_postgresqls_own() {
+    let mut node = parity::Node::new(FIXTURE);
+    for (sql, oid) in [
+        (
+            "SELECT '2020-01-01'::date UNION ALL SELECT '2020-01-01 10:00'::timestamp",
+            1114,
+        ),
+        (
+            "SELECT '2020-01-01 10:00'::timestamp UNION ALL SELECT '2020-01-01 10:00+00'::timestamptz",
+            1184,
+        ),
+        (
+            "SELECT '2020-01-01 10:00+00'::timestamptz UNION ALL SELECT '2020-01-01 10:00'::timestamp",
+            1184,
+        ),
+        ("SELECT 1::int2 UNION ALL SELECT 2::int8", 20),
+        ("SELECT 1::int8 UNION ALL SELECT 2::real", 700),
+        ("SELECT 1::numeric UNION ALL SELECT 2::real", 700),
+        ("SELECT 1::int8 UNION ALL SELECT '2'::oid", 26),
+        ("SELECT 'so'::regclass UNION ALL SELECT 2::int8", 2205),
+        (
+            "SELECT ARRAY[1]::int4[] UNION ALL SELECT ARRAY[2]::int8[]",
+            1016,
+        ),
+    ] {
+        match node.run(sql).unwrap() {
+            esker_sql::pgwire::session::Outcome::Rows { fields, .. } => {
+                assert_eq!(fields[0].type_oid, oid, "{sql}");
+            }
+            other @ esker_sql::pgwire::session::Outcome::Done { .. } => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// Two refusals with two codes, both in PostgreSQL's words: categories that cannot be matched
+/// (`42804`), and one category with no implicit cast between its two types (`42846`, which
+/// names the arm it could not convert and the type the set settled on).
+#[test]
+fn the_two_refusals_are_told_apart() {
+    let mut node = parity::Node::new(FIXTURE);
+    for (sql, code, message) in [
+        (
+            "SELECT 1::int4 UNION ALL SELECT 'b'::text",
+            "42804",
+            "UNION types integer and text cannot be matched",
+        ),
+        (
+            "SELECT 1::int4 UNION ALL SELECT true",
+            "42804",
+            "UNION types integer and boolean cannot be matched",
+        ),
+        (
+            "SELECT '2020-01-01'::date UNION ALL SELECT 'b'::text",
+            "42804",
+            "UNION types date and text cannot be matched",
+        ),
+        (
+            "SELECT '10:00'::time UNION ALL SELECT '1 hour'::interval",
+            "42804",
+            "UNION types time without time zone and interval cannot be matched",
+        ),
+        (
+            "SELECT 1::money UNION ALL SELECT 2::numeric",
+            "42846",
+            "UNION could not convert type numeric to money",
+        ),
+        (
+            "SELECT 1::int4 UNION ALL SELECT 2::money",
+            "42846",
+            "UNION could not convert type money to integer",
+        ),
+    ] {
+        let error = node.run(sql).unwrap_err();
+        assert_eq!(error.sqlstate(), code, "{sql}");
+        assert_eq!(error.to_string(), message, "{sql}");
+    }
+}
