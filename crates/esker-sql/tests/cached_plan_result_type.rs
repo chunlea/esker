@@ -280,3 +280,63 @@ fn a_dropped_table_under_a_prepared_statement_is_reported_as_a_missing_relation(
         "ERROR relation \"t\" does not exist"
     );
 }
+
+/// **The shape libpq actually sends**, which `run` above does not: `PQsendQueryGuts` puts a
+/// `Describe` of the portal between every `Bind` and `Execute`, and the `pg` gem — so `ActiveRecord`
+/// — goes through it. A `Describe` that replaced the baseline with the new shape would have the
+/// `Execute` compare that shape with itself, and the adapter would receive rows its column list
+/// does not match with no error anywhere. The refusal has to come out of the `Describe` or the
+/// `Execute`, and it must not heal on the next round trip.
+#[test]
+fn the_describe_libpq_sends_between_bind_and_execute_does_not_heal_the_baseline() {
+    let mut client = Client::new();
+    assert_eq!(client.parse("w3", "SELECT * FROM t"), "");
+    client.describe("w3");
+    let bind = |client: &mut Client| {
+        client.send(&Frontend::Bind {
+            portal: "w3".to_owned(),
+            statement: "w3".to_owned(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        })
+    };
+    let describe_portal = |client: &mut Client| {
+        client.send(&Frontend::Describe {
+            target: Target::Portal,
+            name: "w3".to_owned(),
+        })
+    };
+    let execute = |client: &mut Client| {
+        client.send(&Frontend::Execute {
+            portal: "w3".to_owned(),
+            max_rows: 0,
+        })
+    };
+    assert_eq!(bind(&mut client), "");
+    assert_eq!(describe_portal(&mut client), "");
+    assert_eq!(execute(&mut client), "1\t2");
+
+    assert_eq!(client.ask("ALTER TABLE t ADD COLUMN c int"), "");
+    assert_eq!(bind(&mut client), "");
+    assert_eq!(
+        describe_portal(&mut client),
+        "ERROR cached plan must not change result type",
+        "the Describe of the portal is where libpq meets the changed shape"
+    );
+    // Twice over, because the baseline must not have been replaced by the refused shape. libpq
+    // ends the failed round trip with a `Sync` before the next `Bind`, and so does this.
+    client.send(&Frontend::Sync);
+    assert_eq!(bind(&mut client), "");
+    assert_eq!(
+        describe_portal(&mut client),
+        "ERROR cached plan must not change result type"
+    );
+    // And a `Describe` of the statement itself says the same, which is what PostgreSQL answers
+    // for `exec_describe_statement_message` after the `ALTER`.
+    client.send(&Frontend::Sync);
+    assert_eq!(
+        client.describe("w3"),
+        "ERROR cached plan must not change result type"
+    );
+}

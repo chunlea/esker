@@ -740,10 +740,27 @@ impl Session {
                 .get(name)
                 .map(|portal| portal.statement.clone()),
         };
-        if let Some(named) = named
-            && let Some(stored) = self.statements.get_mut(&named)
-        {
-            stored.described = Some(described.clone());
+        if let Some(named) = named {
+            // **Compared before it is kept, never merely replaced.** libpq sends a `Describe` of
+            // the portal between every `Bind` and `Execute` — `PQsendQueryGuts` has no other shape
+            // — so a baseline that a `Describe` overwrote would be compared with itself one message
+            // later and the statement would answer rows in a shape the client was never told
+            // about. PostgreSQL raises the refusal at `Bind`, where it revalidates the cached plan;
+            // here it is one message later on the same round trip, and the baseline stays what it
+            // was, so the refusal does not heal until the statement is prepared again.
+            let changed = self
+                .statements
+                .get(&named)
+                .and_then(|stored| stored.described.as_ref())
+                .is_some_and(|baseline| {
+                    !same_row_type(baseline.fields.as_deref(), described.fields.as_deref())
+                });
+            if changed {
+                return self.extended_failure(&SqlError::CachedPlanMustNotChangeResultType, out);
+            }
+            if let Some(stored) = self.statements.get_mut(&named) {
+                stored.described = Some(described.clone());
+            }
         }
         if target == Target::Statement {
             // Inferred, not merely echoed back: a client that declares nothing is told what the
