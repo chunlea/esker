@@ -1,0 +1,21 @@
+crates/esker-sql/src/plan/cte.rs
+  s_c99f71abc0fb31::t_1860753498cd67 150-157
+crates/esker-sql/tests/set_operation.rs
+  s_c99f71abc0fb31::t_323eaac5d264f8 256-287
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "292748b96e16290ea7e3e11d4938ae336fffd40b",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
