@@ -167,6 +167,12 @@ pub enum StatementClass {
     Prepare {
         /// The name it is stored under.
         name: String,
+        /// The parameter types the statement declared, as oids and in order — `PREPARE p (int,
+        /// text)` — or empty when it declared none and every `$n` is typed from its context. A
+        /// declared type this node does not have is `0`, the extended protocol's "infer it", rather
+        /// than a refusal here: `classify` cannot fail, and inference is what the statement gets
+        /// for that parameter.
+        types: Vec<u32>,
         /// The statement it prepares, rendered back to SQL.
         ///
         /// **Text rather than the parsed body**, because `sqlparser` is named nowhere outside this
@@ -3007,9 +3013,20 @@ pub fn classify(statement: &Statement) -> StatementClass {
             object_type: sqlparser::ast::DiscardObject::ALL,
         } => StatementClass::DiscardAll,
         Statement::Prepare {
-            name, statement, ..
+            name,
+            data_types,
+            statement,
         } => StatementClass::Prepare {
             name: crate::catalog::fold_identifier(&name.value, name.quote_style.is_some()).0,
+            types: data_types
+                .iter()
+                .map(|data_type| {
+                    lower::lower_type(data_type).map_or(0, |(ty, _)| {
+                        use crate::value::PgType as _;
+                        ty.oid()
+                    })
+                })
+                .collect(),
             body: statement.to_string(),
         },
         // A bare `EXECUTE` with no name is `sqlparser` accepting another dialect's spelling; it has

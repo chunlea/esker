@@ -7921,7 +7921,7 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
     serial_identity(data_type).is_some()
 }
 
-fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
+pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     // **A quoted type name is a type name.** `'101'::"bit"`, `'101'::"varchar"` and `'1'::"int4"`
     // are all ordinary casts on a real server — the quotes say "this is an identifier", not "this

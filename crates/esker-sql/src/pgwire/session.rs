@@ -321,6 +321,7 @@ impl Session {
         &mut self,
         name: String,
         body: &str,
+        declared: &[u32],
         source: &str,
         executor: &mut dyn Execute,
     ) -> Result<Outcome> {
@@ -340,12 +341,16 @@ impl Session {
         // Its answer is **kept**, and twice over: it is what `pg_prepared_statements` reports for
         // this statement, and it is the row shape every later `EXECUTE` is compared against
         // ([`revalidate`]).
-        let described = executor.describe(&body, &[])?;
+        // **With the types the statement declared**, which is what `PREPARE p (int) AS SELECT $1`
+        // is for: a parameter typed only by its declaration is `integer` on a real server, and
+        // `pg_prepared_statements.parameter_types` says so. Measured, `{integer}` and
+        // `{bigint,text}`. An undeclared one is inferred from its context, as before.
+        let described = executor.describe(&body, declared)?;
         self.statements.insert(
             name,
             Prepared {
                 parsed: Some(body),
-                param_types: Vec::new(),
+                param_types: declared.to_vec(),
                 source: source.to_owned(),
                 from_sql: true,
                 described: Some(described),
@@ -377,6 +382,10 @@ impl Session {
             return Err(SqlError::InvalidSqlStatementName(name));
         };
         let baseline = stored.described.clone();
+        // The declared types reach the revalidation and the execution both: without them a
+        // `PREPARE p (int) AS SELECT $1` was re-described as `text` here and refused against its
+        // own baseline as a changed result type.
+        let declared = stored.param_types.clone();
         let wanted = crate::exec::bind::parameter_count(&body.lower()?);
         if args.len() != wanted {
             return Err(SqlError::WrongParameterCount {
@@ -392,13 +401,13 @@ impl Session {
         // Cloned out of the store because `execute` takes `&mut dyn Execute` and the borrow of
         // `self.statements` would otherwise outlive it.
         let body = body.clone();
-        revalidate(&body, baseline.as_ref(), &[], executor)?;
+        revalidate(&body, baseline.as_ref(), &declared, executor)?;
         executor.execute(
             &body,
             &Params {
                 values: &values,
                 formats: &[],
-                declared: &[],
+                declared: &declared,
                 bound: true,
             },
         )
@@ -918,8 +927,8 @@ impl Session {
                 }
                 outcome
             }
-            StatementClass::Prepare { name, body } => {
-                self.prepare_sql(name.clone(), body, parsed.text(), executor)
+            StatementClass::Prepare { name, body, types } => {
+                self.prepare_sql(name.clone(), body, types, parsed.text(), executor)
             }
             StatementClass::Execute { name, args } => {
                 self.execute_sql(name.clone(), args.clone(), executor)

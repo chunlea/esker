@@ -281,3 +281,26 @@ fn a_quoted_name_is_looked_up_as_written() {
         "{refused}"
     );
 }
+
+/// **The declared types are kept.** `PREPARE p (int) AS SELECT $1` types its parameter from the
+/// declaration and nothing else — the list used to be dropped, so the statement was typed as if
+/// nothing had been declared. Measured: `5`, `{integer}`; `42`, `yx`, `{bigint,text}`.
+#[test]
+fn the_declared_types_are_the_parameters_types() {
+    let mut c = Client::new();
+    assert_eq!(c.ask("PREPARE pq (int) AS SELECT $1"), "");
+    assert_eq!(c.ask("EXECUTE pq(5)"), "5");
+    assert_eq!(
+        c.ask("SELECT parameter_types FROM pg_prepared_statements WHERE name = 'pq'"),
+        "{integer}"
+    );
+    assert_eq!(
+        c.ask("PREPARE pq2 (bigint, text) AS SELECT $1 + 1, $2 || 'x'"),
+        ""
+    );
+    assert_eq!(c.ask("EXECUTE pq2(41, 'y')"), "42\tyx");
+    assert_eq!(
+        c.ask("SELECT parameter_types FROM pg_prepared_statements WHERE name = 'pq2'"),
+        "{bigint,text}"
+    );
+}
