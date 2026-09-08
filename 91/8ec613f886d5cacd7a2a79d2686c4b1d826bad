@@ -1,0 +1,28 @@
+crates/esker-sql/src/exec/assign.rs
+  h_44076b318daf9c 77
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 170-176
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 6869-6870,6964-6980
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 2354-2369
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 328-350,546-552
+crates/esker-sql/tests/cached_plan_result_type.rs
+  h_44076b318daf9c 327-329,337
+crates/esker-sql/tests/regclass_into_a_column.rs
+  h_44076b318daf9c 77
+crates/esker-sql/tests/set_operation.rs
+  h_44076b318daf9c 293-298,318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "918ec613f886d5cacd7a2a79d2686c4b1d826bad",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
