@@ -2658,6 +2658,29 @@ impl Executor {
         Ok(name.to_owned())
     }
 
+    /// The stored name a **written type name** names — the type half of
+    /// [`Self::resolve_unqualified`], and the same rule.
+    ///
+    /// A name that wrote a schema is that schema's and nothing else's; a bare one takes each
+    /// schema on the path in order and the first that has it wins. Measured on 19beta1: with
+    /// `g1ts_a, public` and the same type name in both, a column declared of the bare name takes
+    /// `g1ts_a`'s, and `DROP TYPE` drops `g1ts_a`'s while `public`'s survives.
+    ///
+    /// A name found nowhere comes back **unchanged**, so the refusal quotes the bare name the user
+    /// wrote rather than a schema they did not — the rule a relation's resolution already follows.
+    pub(crate) fn stored_type_name(&self, txn: &dyn Txn, written: &str) -> Result<String> {
+        if written.contains(crate::catalog::SCHEMA_SEPARATOR) {
+            return Ok(written.to_owned());
+        }
+        for schema in self.resolution_path(txn)? {
+            let candidate = crate::catalog::qualify(&schema, written);
+            if crate::catalog::type_by_name(txn, self.tenant, &candidate)?.is_some() {
+                return Ok(candidate);
+            }
+        }
+        Ok(written.to_owned())
+    }
+
     /// The schema a `CREATE` with no qualifier puts its relation in: the **first** entry of the
     /// path that resolves, and `public` when none does.
     ///

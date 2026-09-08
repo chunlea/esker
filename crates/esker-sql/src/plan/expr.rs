@@ -781,6 +781,7 @@ impl CatalogFuncCall {
             // The three string functions, `i` on a real server — measured with the rest of the
             // family rather than assumed, since `concat` next door is `STABLE`.
             | CatalogFunc::SplitPart
+            | CatalogFunc::StringToArray
             | CatalogFunc::StrPos
             | CatalogFunc::Substr
             | CatalogFunc::Substring => true,
@@ -1189,6 +1190,9 @@ pub enum CatalogFunc {
     /// than NULL, `-1` is the last field, an empty separator gives the whole string back, and
     /// **`n = 0` is an error** — `22023 field position must not be zero`, not an empty answer.
     SplitPart,
+    /// `string_to_array(text, delimiter [, null_string])` — the splitter
+    /// `ALTER COLUMN … TYPE text[] USING string_to_array(…)` is written with.
+    StringToArray,
     /// `strpos(haystack, needle)`: the 1-based position of the first match, `0` for none.
     ///
     /// An empty needle is `1`, measured — it matches at the start rather than nowhere.
@@ -1315,6 +1319,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
             () if name.eq_ignore_ascii_case("split_part") => Some(CatalogFunc::SplitPart),
+            () if name.eq_ignore_ascii_case("string_to_array") => Some(CatalogFunc::StringToArray),
             () if name.eq_ignore_ascii_case("strpos") => Some(CatalogFunc::StrPos),
             () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
             () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
@@ -1436,6 +1441,7 @@ impl CatalogFunc {
             CatalogFunc::Random => "random",
             CatalogFunc::Concat => "concat",
             CatalogFunc::SplitPart => "split_part",
+            CatalogFunc::StringToArray => "string_to_array",
             CatalogFunc::StrPos => "strpos",
             CatalogFunc::Substr => "substr",
             CatalogFunc::Substring => "substring",
@@ -1495,6 +1501,9 @@ impl CatalogFunc {
             | CatalogFunc::RangeBuild
             | CatalogFunc::PgGetExpr
             | CatalogFunc::UserRegType
+            // `string_to_array(text, delimiter)` and the form that names a `null_string`, which is
+            // the same pair of arities and so the same arm.
+            | CatalogFunc::StringToArray
             | CatalogFunc::TsHeadline => &[2, 3],
 
             CatalogFunc::PgGetIndexdef => &[1, 3],
@@ -1644,7 +1653,9 @@ impl CatalogFunc {
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.
-            CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals => ColumnType::TextArray,
+            CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals | CatalogFunc::StringToArray => {
+                ColumnType::TextArray
+            }
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
             // `->` keeps the document type and `->>` is text — measured,
             // `pg_typeof(payload->'b')` is `jsonb` and `pg_typeof(payload->>'b')` is `text`.

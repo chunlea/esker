@@ -42,7 +42,7 @@ pub use ddl::{
     UniqueUsingIndex, choose_relation_name, foreign_key_name, index_name, index_name_addition,
     make_object_name, primary_key_name, sequence_name, unique_constraint_name,
 };
-pub use dml::{ConflictAction, Delete, Insert, OnConflict, Returning, Update};
+pub use dml::{ConflictAction, ConflictKey, Delete, Insert, OnConflict, Returning, Update};
 pub use explain::{Explain, ExplainFormat, PlanNode};
 pub use expr::{
     AdvisoryCall, AggregateCall, AggregateFunc, ArithOp, BinaryOp, CaseBranch, CatalogFunc,

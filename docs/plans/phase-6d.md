@@ -264,10 +264,28 @@ timestamps from PD. `tests/real_backend.rs` uses the token form for exactly this
 **The fake's clock was wrong in a way that would have made the tests prove nothing.**
 `MemoryBackend`'s clock was a counter starting at zero, which is the same defect: every version in
 the first millisecond of 1970. A test written against it would have passed on data no cluster
-produces. It now starts at a plausible instant and advances the *logical* half per commit, with
-`MemoryBackend::advance_ms` for a test that needs its versions in different milliseconds — which is
-what a read *as of an instant* requires, because that timestamp has its logical bits zeroed by
-design.
+produces. It was given a plausible starting instant and advanced the *logical* half per commit,
+with `MemoryBackend::advance_ms` for a test that needs its versions in different milliseconds —
+which is what a read *as of an instant* requires, because that timestamp has its logical bits
+zeroed by design.
+
+**That fix was half of one, and the other half took eleven days to surface (2026-09-05).** A
+hardcoded start is a *frozen* clock: the physical half never moved, so every timestamp a process
+handed out named one millisecond — 2026-08-30 14:00:00 UTC — for the life of that process. Between
+two versions that is invisible, and every test here compares versions to each other. Against a
+*client's* clock it is a lie, and the scoreboard node runs this backend: `ActiveRecord`'s
+`fixtures_test#test_insert_with_default_function` inserts a row whose column defaults to
+`CURRENT_TIMESTAMP` and asserts it is within 1.1 s of `Time.now`, and it was six days out — the
+failure's delta, 530448.150242 s, is that constant to the second. The triage read it as a `DEFAULT`
+folded at `CREATE TABLE`; nothing folds it.
+
+`Versions::mark` now follows `esker_pd::tso`'s own rule, `max(last, clock)`: the physical half
+tracks the wall clock, the logical half carries several commits inside one millisecond, and the
+mark keeps the sequence monotone across a clock that stands still or jumps backwards.
+`advance_ms` became a **persistent offset** rather than a bump on the mark, because a bump would be
+swallowed the moment the clock caught up and a test asking for two milliseconds would pass or fail
+on how fast the machine was. Reading the clock here does not break `CLAUDE.md` invariant 6: this
+type *is* the oracle's stand-in, and reading it is what an oracle is for.
 
 **ADR 0021's `42704` for a bad snapshot id was half the answer.** A second capture found two
 conditions where the ADR named one: `22023 invalid snapshot identifier` for a string that cannot be

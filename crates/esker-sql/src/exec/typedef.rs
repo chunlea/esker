@@ -27,9 +27,28 @@ pub(super) fn create(
     txn: &mut dyn Txn,
     create: &CreateType,
 ) -> Result<Outcome> {
+    // **A type takes a schema, the way a relation does.** An unqualified name goes in the first
+    // schema of the `search_path` (`Executor::creation_schema`) and not in `public`, which is what
+    // `enum_test.rb` asks for: an enum created under `search_path = test_schema` is
+    // `test_schema.mood_in_test_schema`, and the dumper prints the schema it reads back.
+    let wrote_a_schema = create.name.contains(catalog::SCHEMA_SEPARATOR);
+    let (schema, bare) = catalog::split_qualified(&create.name);
+    let (schema, bare) = (schema.to_owned(), bare.to_owned());
+    let schema = if wrote_a_schema {
+        schema
+    } else {
+        executor.creation_schema(&*txn)?
+    };
+    // A schema that is not there is `3F000` before anything else is looked at — the same class and
+    // the same sentence `CREATE TABLE nosuchschema.t` gives, rather than a type that quietly lands
+    // in `public`.
+    if !catalog::schema_exists(&*txn, executor.tenant, &schema)? {
+        return Err(SqlError::UndefinedSchema(schema));
+    }
+    let stored = catalog::qualify(&schema, &bare);
     // **One namespace for types and relations**, which is what makes the shared oid space honest:
     // a name that is already a table is `42710` here exactly as a duplicate type is.
-    if catalog::type_by_name(txn, executor.tenant, &create.name)?.is_some() {
+    if catalog::type_by_name(txn, executor.tenant, &stored)?.is_some() {
         // **The `DO` block's guard, and the whole of what it does.** `create_enum` asks `pg_type`
         // first and skips the `CREATE` when the type is there, so the second run is a success that
         // changes nothing — the labels of the *first* run survive even when the second names
@@ -37,7 +56,10 @@ pub(super) fn create(
         if create.if_not_exists {
             return Ok(Outcome::done("DO"));
         }
-        return Err(SqlError::DuplicateType(create.name.clone()));
+        // **The bare name, though the statement may have written a schema.** Measured:
+        // `CREATE TYPE g1e_a.g1e_mood` over an existing one is `42710 type "g1e_mood" already
+        // exists`, with the schema outside the quotes.
+        return Err(SqlError::DuplicateType(bare));
     }
     // **A range's subtype has to be ordered**, because ordering the bounds is what a range is:
     // `CREATE TYPE r AS RANGE (subtype = point)` is `42704 data type point has no default
@@ -73,7 +95,7 @@ pub(super) fn create(
         txn,
         executor.tenant,
         &TypeDef {
-            name: create.name.clone(),
+            name: stored,
             oid,
             kind: create.kind.clone(),
         },
@@ -98,7 +120,8 @@ pub(super) fn alter(
     txn: &mut dyn Txn,
     alter: &AlterType,
 ) -> Result<Outcome> {
-    let Some(def) = catalog::type_by_name(txn, executor.tenant, &alter.name)? else {
+    let stored = executor.stored_type_name(&*txn, &alter.name)?;
+    let Some(def) = catalog::type_by_name(&*txn, executor.tenant, &stored)? else {
         return Err(SqlError::UndefinedType(alter.name.clone()));
     };
     match &alter.action {
@@ -358,7 +381,10 @@ fn drop_columns_of_type(executor: &mut Executor, txn: &mut dyn Txn, name: &str) 
 /// `DROP TYPE [IF EXISTS] <name> [, …]`.
 pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) -> Result<Outcome> {
     for name in &drop.names {
-        if catalog::type_by_name(txn, executor.tenant, name)?.is_none() {
+        // Resolved once, and every step below takes the stored name: with `g1ts_a, public` and the
+        // name in both, `DROP TYPE g1ts_shadow` drops `g1ts_a`'s and leaves `public`'s. Measured.
+        let stored = executor.stored_type_name(&*txn, name)?;
+        if catalog::type_by_name(&*txn, executor.tenant, &stored)?.is_none() {
             if drop.if_exists {
                 executor.notice(SqlError::DoesNotExistSkipping {
                     kind: "type",
@@ -372,11 +398,11 @@ pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) 
         // one. It used to refuse either way, which meant `DROP DOMAIN d CASCADE` answered with
         // the hint telling you to write the clause you had just written.
         if drop.cascade {
-            drop_columns_of_type(executor, txn, name)?;
+            drop_columns_of_type(executor, txn, &stored)?;
         } else {
-            refuse_if_a_column_depends(executor, txn, name)?;
+            refuse_if_a_column_depends(executor, txn, &stored)?;
         }
-        catalog::drop_type(txn, executor.tenant, name);
+        catalog::drop_type(txn, executor.tenant, &stored);
     }
     Ok(Outcome::done("DROP TYPE"))
 }

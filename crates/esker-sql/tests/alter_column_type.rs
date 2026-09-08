@@ -20,26 +20,17 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // **A refusal by name, and the boundary this unit draws on purpose.**
+    // **An entry stood here and is deleted** (ADR 0031, rule 2). It declared
+    // `ALTER COLUMN "snippets" TYPE text[] USING string_to_array("snippets", ',')` a `0A000`,
+    // because "a `USING` that computes rather than converts needs a per-row evaluator this node
+    // does not have" — true when it was written, and the reason the entry was right to refuse
+    // rather than to run the type change and ignore the expression.
     //
-    // `USING CAST(c AS t)` and `USING c::t` say "convert this column to that type", which is the
-    // conversion the statement already names — so they license it and nothing has to be evaluated.
-    // `USING string_to_array(c, ',')` asks for a **computation** over each row, and this crate has
-    // no per-row expression evaluator to run one with (`crate::parse::lower_cast`: "a cast of a
-    // column has to happen per row and this node has no expression-level cast to do it with").
-    //
-    // Running the type change and ignoring the expression would be the wrong-answer shape: the
-    // column would end up `text[]` with every row holding a one-element array of the whole string
-    // rather than the split one. So it is `0A000` naming the expression, which is contract C2, and
-    // it costs one test in `array_test.rb`.
-    answers: &[(
-        "ALTER TABLE \"pg_arrays\" ALTER COLUMN \"snippets\" TYPE text[] USING \
-             string_to_array(\"snippets\", \',\'), ALTER COLUMN \"snippets\" SET DEFAULT \'{}\';",
-        "`0A000` naming the expression: a `USING` that computes rather than converts needs a \
-             per-row evaluator this node does not have, and ignoring it would silently store a \
-             different value in every row.",
-        "pg19_alter_column_type.txt:120",
-    )],
+    // The evaluator is there now: the expression is lowered, resolved against the table **as it
+    // was**, and evaluated once per row (`exec::ddl::set_column_type`), and `string_to_array` is a
+    // function this node has. The statement answers what a real server answers, and the harness
+    // said so before this comment was written.
+    answers: &[],
 };
 
 #[test]
