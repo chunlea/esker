@@ -2,8 +2,10 @@ crates/esker-sql/src/exec/subquery.rs
   s_c99f71abc0fb31::t_eb43126b89ee70 170-176
 crates/esker-sql/src/plan/cte.rs
   s_c99f71abc0fb31::t_435488a6794dd9 150-157
+  s_c99f71abc0fb31::t_0714ee2dae2da8 150-157
 crates/esker-sql/tests/set_operation.rs
   s_c99f71abc0fb31::t_5dde9f1ca3178a 256-287
+  s_c99f71abc0fb31::t_ef4403804c3e83 256-287
 ---
 {
   "schema_version": "authorship/3.0.0",
