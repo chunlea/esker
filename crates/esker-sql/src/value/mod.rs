@@ -325,6 +325,29 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     })
 }
 
+/// A `regclass` or `regtype` bound for an integer or `oid` column, as the number the column stores.
+///
+/// `Datum::fits` says a `regclass` is one representation with an `int8` and an `oid`, which is true
+/// of the *comparison* and false of the *bytes*: the row codec writes the datum's own shape — the
+/// number and then its name — into a column the catalog says holds the number alone, and the next
+/// read of that row refuses it as corruption. So the name comes off here, on every write path
+/// (`exec::assign::into_column` and `plan::Literal::assign` both), before any `fits` shortcut can
+/// hand the datum through unchanged; `esker_keys::row::encode_row` refuses one that still carries
+/// it, as the second line of defence. Any other datum passes untouched.
+pub fn stored_shape(value: Datum, ty: ColumnType, rendering: Rendering) -> Result<Datum> {
+    match (value, ty) {
+        (
+            Datum::RegClass { oid, .. },
+            ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2 | ColumnType::Oid,
+        ) => assignment_cast(Datum::Int8(oid), ty, rendering),
+        (Datum::RegType { oid, .. }, ColumnType::Oid) => Ok(Datum::Oid(oid)),
+        (Datum::RegType { oid, .. }, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2) => {
+            assignment_cast(Datum::Int8(i64::from(oid)), ty, rendering)
+        }
+        (value, _) => Ok(value),
+    }
+}
+
 /// One value as another type's, in **assignment context** — PostgreSQL's assignment cast.
 ///
 /// **Three callers, one rule.** A column `DEFAULT` (`exec::dml::assign_default`, which is where
@@ -520,6 +543,13 @@ pub fn has_assignment_cast(from: Option<ColumnType>, to: ColumnType) -> bool {
         (from, to),
         (ColumnType::Json, ColumnType::Jsonb)
             | (ColumnType::Jsonb, ColumnType::Json)
+            // **A `regclass` or `regtype` into an integer or `oid` column** — `castcontext = 'a'` for
+            // the integers and `'i'` for `oid` on a real server; `stored_shape` is what makes the
+            // value (the number, its name gone).
+            | (
+                ColumnType::RegClass | ColumnType::RegType,
+                ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Oid
+            )
             // **An instant into a `date` column**, which a real server takes at `castcontext = 'a'`
             // — `INSERT INTO t (d) VALUES (now())` is the calendar day *here*. Refused until ADR
             // 0080, because taking it while every instant printed in UTC would have stored the

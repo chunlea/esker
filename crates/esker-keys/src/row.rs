@@ -111,6 +111,19 @@ pub fn encode_row(types: &[ColumnType], values: &[Datum]) -> Result<Vec<u8>> {
                 "column {index} is {ty:?} and was given {value:?}"
             )));
         }
+        // **A `regclass` or `regtype` fits an `oid` or `int8` column for comparison, and its bytes
+        // do not**: the datum carries a name after its number, and a column of the plain type reads
+        // the number alone. The assignment cast above this crate turns it into the plain number; a
+        // datum that still carries the name here is a bug above, and it is refused rather than
+        // written as a row the next read would report as corruption.
+        if matches!(value, Datum::RegClass { .. } | Datum::RegType { .. })
+            && value.column_type() != Some(*ty)
+        {
+            return Err(RowError::Mismatch(format!(
+                "column {index} is {ty:?} and was given {value:?}, whose bytes carry a name that \
+                 column cannot hold"
+            )));
+        }
         encode_column(value, &mut out);
     }
     Ok(out)
@@ -2525,5 +2538,53 @@ mod tests {
             let _ = decode_row(&RowSchema::nullable(types.to_vec()), &bytes);
             let _ = decode_key_columns(&types, &bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod reg_shape_tests {
+    use super::*;
+
+    /// **A `regclass` fits an `int8` column and must not be written into one.** `fits` is the
+    /// comparison rule; the bytes are the datum's own — a number and then a name — and a column
+    /// of the plain type reads the number alone, so a row written this way is refused by the next
+    /// `decode_row` as "bytes after the last column". The encoder refuses it first.
+    #[test]
+    fn a_reg_datum_is_refused_by_a_column_of_its_plain_type() {
+        let regclass = Datum::RegClass {
+            oid: 16_384,
+            name: "t".into(),
+        };
+        let regtype = Datum::RegType {
+            oid: 25,
+            name: "text".into(),
+        };
+        for (ty, value) in [
+            (ColumnType::Int8, regclass.clone()),
+            (ColumnType::Oid, regclass.clone()),
+            (ColumnType::Oid, regtype.clone()),
+        ] {
+            assert!(
+                encode_row(&[ty], std::slice::from_ref(&value)).is_err(),
+                "{value:?} was written into a {ty:?} column"
+            );
+        }
+        // And the plain number the assignment cast produces is what such a column takes.
+        let bytes = encode_row(&[ColumnType::Int8], &[Datum::Int8(16_384)]).unwrap();
+        let schema = RowSchema {
+            types: vec![ColumnType::Int8],
+            missing: vec![None],
+        };
+        assert_eq!(
+            decode_row(&schema, &bytes).unwrap(),
+            vec![Datum::Int8(16_384)]
+        );
+        // A column of the datum's own type keeps it whole, name included.
+        let bytes = encode_row(&[ColumnType::RegClass], std::slice::from_ref(&regclass)).unwrap();
+        let schema = RowSchema {
+            types: vec![ColumnType::RegClass],
+            missing: vec![None],
+        };
+        assert_eq!(decode_row(&schema, &bytes).unwrap(), vec![regclass]);
     }
 }

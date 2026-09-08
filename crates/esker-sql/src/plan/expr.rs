@@ -2351,6 +2351,22 @@ impl Literal {
             },
 
             // Already resolved. It fits the column it was resolved against and nothing else.
+            // **A `regclass` or `regtype` into an integer or `oid` column is the number it is**,
+            // taken before `fits` can hand the name-carrying datum through: the same rule as
+            // `into_column`'s, because this is the other write path (`crate::value::stored_shape`).
+            Literal::Typed(value)
+                if matches!(**value, Datum::RegClass { .. } | Datum::RegType { .. })
+                    && matches!(
+                        ty,
+                        ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Oid
+                    ) =>
+            {
+                crate::value::stored_shape(
+                    (**value).clone(),
+                    ty,
+                    crate::value::Rendering::default(),
+                )
+            }
             Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
             // **An `ARRAY[…]`'s element type is settled by the column**, the way an integer
             // literal's is one level down. `ARRAY[1,2,3]` is `integer[]` on a real server and

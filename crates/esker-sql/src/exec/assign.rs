@@ -60,6 +60,13 @@ pub(super) fn into_column(
             _ => {}
         }
     }
+    // **A `regclass` or `regtype` is stored as the number it is.** `fits` says a `regclass` is one
+    // representation with an `int8` and an `oid`, which is true of the *comparison* and false of the
+    // *bytes*: the row codec writes the datum's own shape — the number and then its name — into a
+    // column the catalog says holds the number alone, and the next read of that row refuses it as
+    // corruption. So the name comes off here, before the shortcut below can hand the datum through
+    // unchanged; `encode_row` refuses one that still carries it, as the second line of defence.
+    let value = crate::value::stored_shape(value, column.ty, rendering)?;
     if value.fits(column.ty) {
         return Ok(value);
     }
