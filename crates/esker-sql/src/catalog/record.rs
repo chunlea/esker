@@ -658,6 +658,15 @@ pub(super) fn version_key(tenant: u64) -> Vec<u8> {
     prefix::meta_key(&suffix)
 }
 
+/// `'m' ++ "sql" ++ 'v'` with no tenant: the one counter every store wrote before the version
+/// key became per tenant (layout 2). **Read for one purpose only** — telling a pre-marker
+/// database from an empty store in `refuse_an_older_layout` — because a build that reads only the
+/// per-tenant keys sees version 0 on such a store and would otherwise open it as if it were new.
+#[must_use]
+pub(super) fn legacy_version_key() -> Vec<u8> {
+    prefix::meta_key(&[SQL, &[KIND_VERSION]].concat())
+}
+
 /// `'m' ++ "sql" ++ 'L'`. **One key for the whole store**, holding the catalog's *layout* version.
 ///
 /// Not a record-content version. [`CATALOG_FORMAT_VERSION`] says how the bytes of one record are

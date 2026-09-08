@@ -4244,7 +4244,14 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
 fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
     let held = match txn.get(&record::layout_key())? {
         Some(bytes) => record::decode_layout(&bytes)?,
-        None if version == 0 => return Ok(()),
+        // **Absent, and nothing ever written** — not the two counters this build reads, the
+        // tenant's and the cluster's, and not the one counter every store wrote before the key
+        // became per tenant. That last one is what a pre-marker database holds, and a reader that
+        // looked only at the new keys saw version 0 on it and opened a layout-1 store as if it were
+        // new: the misread this marker exists to prevent.
+        None if version == 0 && txn.get(&record::legacy_version_key())?.is_none() => {
+            return Ok(());
+        }
         // An unmarked catalog **is** layout 1, which is what makes the sentence below true rather
         // than approximate.
         None => 1,
@@ -4252,11 +4259,22 @@ fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
     if held == record::CATALOG_LAYOUT_VERSION {
         return Ok(());
     }
-    Err(SqlError::DataCorrupted(format!(
-        "catalog layout {held} is older than {}: index names became schema-scoped on 2026-09-05; \
-         this database predates that and must be recreated",
-        record::CATALOG_LAYOUT_VERSION
-    )))
+    // Two sentences, because a marker this build has never heard of is not an old database.
+    Err(SqlError::DataCorrupted(
+        if held < record::CATALOG_LAYOUT_VERSION {
+            format!(
+                "catalog layout {held} is older than {}: index names became schema-scoped on \
+             2026-09-05; this database predates that and must be recreated",
+                record::CATALOG_LAYOUT_VERSION
+            )
+        } else {
+            format!(
+                "catalog layout {held} is newer than {}: this database was written by a later build \
+             than this one",
+                record::CATALOG_LAYOUT_VERSION
+            )
+        },
+    ))
 }
 
 /// Stamps the store with the layout this build writes, if it is not stamped already.
@@ -4774,10 +4792,6 @@ mod tests {
         assert!(record::decode_layout(&[2, 2]).is_err());
     }
 
-    /// **A database written before the marker is refused, and the sentence says what to do.**
-    ///
-    /// The catalog here has run DDL — version is not 0 — and carries no marker, which is exactly
-    /// what a store from before 2026-09-05 looks like.
     /// **A DDL in one database must not touch what another database reads.**
     ///
     /// The catalog version was one key for the whole cluster, and a schema load reads it on every
@@ -4844,6 +4858,10 @@ mod tests {
         );
     }
 
+    /// **A database written before the marker is refused, and the sentence says what to do.**
+    ///
+    /// The catalog here has run DDL — version is not 0 — and carries no marker, which is exactly
+    /// what a store from before 2026-09-05 looks like.
     #[test]
     fn a_database_without_the_marker_is_refused() {
         let backend = MemoryBackend::new();
@@ -4859,6 +4877,36 @@ mod tests {
             ),
             "{refused}"
         );
+    }
+
+    /// **A store from before 2026-09-05 holds the one counter this build no longer reads.** The
+    /// version key became per tenant under layout 2, so a reader that looked only at the new keys
+    /// saw version 0 on such a store, took the "nothing ever written" arm and opened a layout-1
+    /// database as if it were new — the misread the marker exists to prevent. The legacy key is
+    /// the evidence that DDL ran, and it is refused with the same sentence.
+    #[test]
+    fn a_database_with_the_legacy_counter_and_no_marker_is_refused() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        txn.put(&record::legacy_version_key(), &record::encode_counter(7));
+        let catalog = Catalog::new();
+        let refused = catalog.view(&*txn, 1).unwrap_err().to_string();
+        assert!(
+            refused.contains("catalog layout 1 is older than 2"),
+            "{refused}"
+        );
+    }
+
+    /// A marker **newer** than this build is refused too, and says so rather than calling it old.
+    #[test]
+    fn a_newer_layout_marker_is_refused_as_newer() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        txn.put(&record::layout_key(), &[record::CATALOG_LAYOUT_VERSION + 1]);
+        let catalog = Catalog::new();
+        let refused = catalog.view(&*txn, 1).unwrap_err().to_string();
+        assert!(refused.contains("is newer than"), "{refused}");
+        assert!(!refused.contains("older"), "{refused}");
     }
 
     /// And one that carries it opens — as does an empty store, which has nothing to be wrong about.
