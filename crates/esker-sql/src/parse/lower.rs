@@ -1537,6 +1537,8 @@ fn lower_cursor(read: &crate::parse::CursorRead) -> Result<plan::Statement> {
                 .as_ref()
                 .map(|(name, quoted)| fold_identifier(name, *quoted).0),
         ),
+        // A count past an `int4` is the grammar's syntax error, at the digits: `42601`, measured.
+        CursorRead::Malformed { at } => return Err(SqlError::SyntaxAtOrNear(at.clone())),
     };
     Ok(plan::Statement::Cursor(cursor))
 }

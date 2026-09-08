@@ -782,6 +782,12 @@ pub(crate) enum CursorRead {
     },
     /// `CLOSE <name>`, or `CLOSE ALL` as `None`.
     Close(Option<(String, bool)>),
+    /// A `FETCH`/`MOVE` whose count the grammar refuses — past an `int4` — carrying the digits
+    /// PostgreSQL's `syntax error at or near` names.
+    Malformed {
+        /// The digits as written, without their sign.
+        at: String,
+    },
 }
 
 /// Reads a whole cursor statement, or `None` when this is not one.
@@ -847,7 +853,12 @@ fn read_cursor(sql: &str, scanned: &Scan<'_>) -> Option<CursorRead> {
         return None;
     }
     let rest = strip_leading_word(body, if only_move { "MOVE" } else { "FETCH" })?;
-    let (direction, rest) = read_cursor_direction(rest);
+    // A count the grammar refuses is a syntax error the lowering raises, not a statement for
+    // `sqlparser` to read into a refusal by name.
+    let (direction, rest) = match read_cursor_direction(rest) {
+        Ok(read) => read,
+        Err(at) => return Some(CursorRead::Malformed { at }),
+    };
     // `FROM` and `IN` are noise here: PostgreSQL takes either, or neither.
     let rest = strip_leading_word(rest, "FROM")
         .or_else(|| strip_leading_word(rest, "IN"))
@@ -865,7 +876,7 @@ fn read_cursor(sql: &str, scanned: &Scan<'_>) -> Option<CursorRead> {
 ///
 /// Thirteen spellings and three movements. No direction at all is `NEXT`, which is why the
 /// fallthrough is `Relative(1)` and not an error: `FETCH c` is the commonest form there is.
-fn read_cursor_direction(rest: &str) -> (plan::CursorDirection, &str) {
+fn read_cursor_direction(rest: &str) -> std::result::Result<(plan::CursorDirection, &str), String> {
     use plan::CursorDirection;
 
     for (word, direction) in [
@@ -876,47 +887,54 @@ fn read_cursor_direction(rest: &str) -> (plan::CursorDirection, &str) {
         ("LAST", CursorDirection::Absolute(-1)),
     ] {
         if let Some(tail) = strip_leading_word(rest, word) {
-            return (direction, tail);
+            return Ok((direction, tail));
         }
     }
     for (word, absolute) in [("ABSOLUTE", true), ("RELATIVE", false)] {
         if let Some(tail) = strip_leading_word(rest, word)
-            && let Some((count, tail)) = read_signed_number(tail)
+            && let Some((count, tail)) = read_signed_number(tail)?
         {
             let direction = if absolute {
                 CursorDirection::Absolute(count)
             } else {
                 CursorDirection::Relative(count)
             };
-            return (direction, tail);
+            return Ok((direction, tail));
         }
     }
     for (word, forward) in [("FORWARD", true), ("BACKWARD", false)] {
         if let Some(tail) = strip_leading_word(rest, word) {
             if let Some(after) = strip_leading_word(tail, "ALL") {
-                return (CursorDirection::All(forward), after);
+                return Ok((CursorDirection::All(forward), after));
             }
-            if let Some((count, after)) = read_signed_number(tail) {
+            if let Some((count, after)) = read_signed_number(tail)? {
                 let step = if forward { count } else { -count };
-                return (CursorDirection::Relative(step), after);
+                return Ok((CursorDirection::Relative(step), after));
             }
-            return (
+            return Ok((
                 CursorDirection::Relative(if forward { 1 } else { -1 }),
                 tail,
-            );
+            ));
         }
     }
     if let Some(tail) = strip_leading_word(rest, "ALL") {
-        return (CursorDirection::All(true), tail);
+        return Ok((CursorDirection::All(true), tail));
     }
-    if let Some((count, tail)) = read_signed_number(rest) {
-        return (CursorDirection::Relative(count), tail);
+    if let Some((count, tail)) = read_signed_number(rest)? {
+        return Ok((CursorDirection::Relative(count), tail));
     }
-    (CursorDirection::Relative(1), rest)
+    Ok((CursorDirection::Relative(1), rest))
 }
 
-/// A signed integer at the front of `text`, and what follows it.
-fn read_signed_number(text: &str) -> Option<(i64, &str)> {
+/// A signed integer at the front of `text`, and what follows it: `Ok(None)` when there is no
+/// number there, `Err(digits)` when there is one and it does not fit an `int4`.
+///
+/// **Bounded to an `int4`**, because that is the grammar's: `fetch_args` takes a `SignedIconst`,
+/// and a count past it is a syntax error on a real server — `FETCH FORWARD 2147483648` is `42601`
+/// at the number, and so is `ABSOLUTE -2147483648`, the sign being its own token; both measured.
+/// Admitting the whole `i64` let `FETCH FORWARD 9223372036854775807` through to `self.at + step`,
+/// which overflows once the cursor has moved at all.
+fn read_signed_number(text: &str) -> std::result::Result<Option<(i64, &str)>, String> {
     let text = text.trim_start();
     let (sign, digits) = match text.strip_prefix('-') {
         Some(rest) => (-1, rest.trim_start()),
@@ -926,10 +944,18 @@ fn read_signed_number(text: &str) -> Option<(i64, &str)> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(digits.len());
     if end == 0 {
-        return None;
+        return Ok(None);
     }
-    let value: i64 = digits.get(..end)?.parse().ok()?;
-    Some((sign * value, digits.get(end..)?))
+    let Some(run) = digits.get(..end) else {
+        return Ok(None);
+    };
+    let Ok(value) = run.parse::<i32>() else {
+        return Err(run.to_owned());
+    };
+    Ok(Some((
+        sign * i64::from(value),
+        digits.get(end..).unwrap_or(""),
+    )))
 }
 
 /// Each statement's own source text, in order, semicolon included.

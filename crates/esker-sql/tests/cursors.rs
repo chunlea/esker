@@ -262,3 +262,35 @@ fn closing_a_cursor_that_is_not_there_names_it() {
         "!cursor \"nosuch\" does not exist"
     );
 }
+
+/// **A count is an `int4`, as the grammar's `SignedIconst` is.** Past it a real server answers
+/// `42601` at the number (measured: `FETCH FORWARD 2147483648` is a syntax error), and the node
+/// used to admit the whole `i64` and overflow `self.at + step` on the next move.
+#[test]
+fn a_count_past_int4_is_a_syntax_error_and_the_limit_itself_is_a_count() {
+    let mut node = node();
+    // Each in its own block: a syntax error aborts the transaction it is in, there as here.
+    for count in ["2147483648", "9223372036854775807"] {
+        node.run("BEGIN").unwrap();
+        node.run("DECLARE c CURSOR FOR SELECT id FROM cu ORDER BY id")
+            .unwrap();
+        let error = node
+            .run(&format!("FETCH FORWARD {count} FROM c"))
+            .unwrap_err();
+        assert_eq!(error.sqlstate(), "42601", "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("syntax error at or near \"{count}\"")
+        );
+        node.run("ROLLBACK").unwrap();
+    }
+    node.run("BEGIN").unwrap();
+    node.run("DECLARE c CURSOR FOR SELECT id FROM cu ORDER BY id")
+        .unwrap();
+    node.run("FETCH c").unwrap();
+    assert_eq!(
+        node.rows("FETCH FORWARD 2147483647 FROM c"),
+        vec![vec!["2"], vec!["3"], vec!["4"]]
+    );
+    node.run("ROLLBACK").unwrap();
+}
