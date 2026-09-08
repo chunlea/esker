@@ -6857,9 +6857,32 @@ fn refuse_unlockable_shape(select: &plan::Select) -> Result<()> {
 /// silently drop one of each doubled pair to do it.
 ///
 /// Checked in `insertSelectOptions`'s order — `ORDER BY`, `OFFSET`, `LIMIT`, `WITH` — which is the
-/// order the sentences come out in when a statement doubles more than one. Recursion is bounded by
-/// `sqlparser`'s own parser depth limit, so `(((…)))` cannot be made deep enough to overflow here.
+/// order the sentences come out in when a statement doubles more than one.
+///
+/// **A loop over the layers, not a recursion.** The scanner admits `MAX_NESTING_DEPTH` bracket
+/// levels and the parser holds them as nested `Query`s; peeling one per stack frame, with a clone
+/// of what was left at each, put a thousand frames and a quadratic copy on the caller's 2 MiB —
+/// the parser's own recursion limit is four times the scanner's and bounds nothing here. Every
+/// layer is visited by reference and exactly one `Query`, the innermost, is cloned and built up.
 fn lower_parenthesised(outer: &Query, inner: &Query) -> Result<plan::Select> {
+    let mut layers: Vec<&Query> = vec![outer, inner];
+    // `copied` first, so the loop holds a `&Query` and not a borrow of the vector it pushes into.
+    while let Some(SetExpr::Query(next)) = layers.last().copied().map(|query| query.body.as_ref()) {
+        layers.push(next);
+    }
+    // Innermost first: that is the order `gram.y` merges in, and the order the sentences come out.
+    let (innermost, enclosing) = layers
+        .split_last()
+        .map_or((outer, &layers[..]), |(last, rest)| (*last, rest));
+    let mut merged = innermost.clone();
+    for outer in enclosing.iter().rev() {
+        merge_query_clauses(outer, &mut merged)?;
+    }
+    lower_query(&merged)
+}
+
+/// One enclosing layer's clauses merged into the query inside it, or the `42601` a doubled clause is.
+fn merge_query_clauses(outer: &Query, inner: &mut Query) -> Result<()> {
     let (outer_limit, outer_offset) = limit_halves(outer.limit_clause.as_ref());
     let (inner_limit, inner_offset) = limit_halves(inner.limit_clause.as_ref());
     if outer.order_by.is_some() && inner.order_by.is_some() {
@@ -6874,18 +6897,17 @@ fn lower_parenthesised(outer: &Query, inner: &Query) -> Result<plan::Select> {
     if outer.with.is_some() && inner.with.is_some() {
         return Err(SqlError::DoubledClause("WITH"));
     }
-    let mut merged = inner.clone();
     if outer.with.is_some() {
-        merged.with.clone_from(&outer.with);
+        inner.with.clone_from(&outer.with);
     }
     if outer.order_by.is_some() {
-        merged.order_by.clone_from(&outer.order_by);
+        inner.order_by.clone_from(&outer.order_by);
     }
-    merged.limit_clause = merge_limits(inner.limit_clause.clone(), outer.limit_clause.clone());
+    inner.limit_clause = merge_limits(inner.limit_clause.take(), outer.limit_clause.clone());
     // **Concatenated rather than chosen**: two `FOR UPDATE`s are legal and merge on a real server,
     // which is the one clause here that does not collide.
-    merged.locks = [inner.locks.clone(), outer.locks.clone()].concat();
-    lower_query(&merged)
+    inner.locks.extend(outer.locks.iter().cloned());
+    Ok(())
 }
 
 /// Which halves of a `LIMIT`/`OFFSET` are written, `sqlparser` carrying both in one field.
@@ -6939,12 +6961,23 @@ fn lower_set_arm(template: &Query, body: &SetExpr) -> Result<plan::Select> {
     if let SetExpr::Query(inner) = body {
         return lower_query(inner);
     }
-    let mut arm = template.clone();
-    *arm.body = body.clone();
-    // The set's, not the arm's — every one of them measured on the oracle.
-    arm.with = None;
-    arm.order_by = None;
-    arm.limit_clause = None;
+    // **Built field by field, never `template.clone()`**: the template is the whole set, and its
+    // body is the left-leaning tree of every arm — a derived `Clone` walks that tree one frame per
+    // operator, so cloning it once per arm was a thousand nested frames (and a thousand nested
+    // drops) for a chain the scanner admits, on a 2 MiB worker. The set's clauses — `WITH`,
+    // `ORDER BY`, `LIMIT` — are not the arm's, every one of them measured on the oracle.
+    let arm = Query {
+        with: None,
+        body: Box::new(body.clone()),
+        order_by: None,
+        limit_clause: None,
+        fetch: template.fetch.clone(),
+        locks: template.locks.clone(),
+        for_clause: template.for_clause.clone(),
+        settings: template.settings.clone(),
+        format_clause: template.format_clause.clone(),
+        pipe_operators: template.pipe_operators.clone(),
+    };
     lower_query(&arm)
 }
 

@@ -87,10 +87,30 @@ fn row_value(depth: usize) -> String {
     format!("SELECT * FROM t WHERE ({left}) = ({right})")
 }
 
+/// `((((SELECT 1))))`: a **query** in parentheses, which is not an expression in them — the
+/// grammar merges the layers rather than nesting them, and lowering peels them. Deep in the source,
+/// so the scanner sees it; what the scanner admits, lowering has to take on one frame.
+fn query_parens(depth: usize) -> String {
+    format!("{}SELECT 1{}", "(".repeat(depth), ")".repeat(depth))
+}
+
+/// `SELECT 1 UNION ALL SELECT 1 UNION ALL …`: `depth` arms and **no bracket at all**, so the
+/// scanner's count sees nothing and the parser leans the tree left one level per operator. The
+/// fifth shape, and the second that is flat where the scanner looks.
+fn union_chain(depth: usize) -> String {
+    let mut sql = String::from("SELECT 1");
+    for _ in 1..depth {
+        sql.push_str(" UNION ALL SELECT 1");
+    }
+    sql
+}
+
 /// The statement this probe should build, by shape.
 fn statement(depth: usize) -> String {
     match std::env::var(SHAPE).as_deref() {
         Ok("parens") => parens(depth),
+        Ok("query_parens") => query_parens(depth),
+        Ok("union") => union_chain(depth),
         Ok("in") => in_list(depth),
         Ok("row") => row_value(depth),
         _ => or_chain(depth),
@@ -301,7 +321,7 @@ fn a_plan_deeper_than_the_bound_is_refused_rather_than_fatal() {
 fn every_pathological_shape_at_ten_thousand_is_an_answer_and_not_a_crash() {
     const DEEP: usize = 10_000;
 
-    for shape in ["parens", "or", "in", "row"] {
+    for shape in ["parens", "or", "in", "row", "query_parens", "union"] {
         let outcome = run_probe_shaped(DEEP, None, Some(shape));
         let text = outcome.unwrap_or_else(|| {
             panic!(
@@ -328,5 +348,27 @@ fn every_pathological_shape_at_ten_thousand_is_an_answer_and_not_a_crash() {
             });
             println!("{shape} at {DEEP}, executed: {executed}");
         }
+    }
+}
+
+/// **The two shapes that are deep after the scanner has finished counting, at the depth it
+/// admits.** A bracketed query is peeled by `lower_parenthesised` and a set-operation chain is
+/// walked by `set_operation::lower`; both used to recurse once per level on the caller's stack,
+/// which the probe at ten thousand never reached — the scanner refuses first. This is the other
+/// side of that bound: what the scanner admits has to lower, and then run, on a worker's 2 MiB.
+#[test]
+fn the_admissible_depth_of_a_query_paren_and_a_union_chain_lowers_and_runs() {
+    let deepest = esker_sql::parse::MAX_NESTING_DEPTH - 1;
+    for shape in ["query_parens", "union"] {
+        assert_eq!(
+            run_probe_shaped(deepest, None, Some(shape)).as_deref(),
+            Some("LOWERED"),
+            "{shape} at {deepest} did not lower on a worker stack"
+        );
+        assert_eq!(
+            run_probe_shaped(deepest, Some("execute"), Some(shape)).as_deref(),
+            Some("EXECUTED"),
+            "{shape} at {deepest} lowered and then did not run"
+        );
     }
 }

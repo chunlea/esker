@@ -2782,6 +2782,24 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     if scanned.max_depth > MAX_NESTING_DEPTH {
         return Err(SqlError::StatementTooComplex);
     }
+    // **A set-operation chain has no brackets to count.** `a UNION ALL b UNION ALL …` parses as a
+    // tree leaning left one level per operator, and the lowering and the drop of that tree each
+    // cost a frame per level; ten thousand of them is the overflow the bracket count exists to
+    // prevent. So operators are counted where brackets are — from the scanner's own words, which
+    // are never inside a string or a comment — and refused past the same bound with the same
+    // sentence. `UNION` as a column name is counted too, which over-refuses only past a thousand.
+    let set_operators = scanned
+        .words
+        .iter()
+        .filter(|word| {
+            ["UNION", "INTERSECT", "EXCEPT"]
+                .iter()
+                .any(|op| word.eq_ignore_ascii_case(op))
+        })
+        .count();
+    if set_operators > MAX_NESTING_DEPTH {
+        return Err(SqlError::StatementTooComplex);
+    }
 
     // A statement PostgreSQL defines as a synonym for one the parser does know, and one whose
     // *keyword* the parser cannot read. Both are source rewrites for the same reason: the statement

@@ -34,36 +34,37 @@ pub(super) fn lower(
     body: &SetExpr,
     arm: &dyn Fn(&SetExpr) -> Result<plan::Select>,
 ) -> Result<plan::Select> {
-    let mut arms = Vec::new();
-    let first = flatten(body, arm, &mut arms)?;
-    Ok(plan::Select {
-        set_arms: arms,
-        ..first
-    })
-}
-
-/// Walks the left spine, collecting each right-hand arm as it comes back up.
-fn flatten(
-    body: &SetExpr,
-    arm: &dyn Fn(&SetExpr) -> Result<plan::Select>,
-    arms: &mut Vec<plan::SetArm>,
-) -> Result<plan::Select> {
-    let SetExpr::SetOperation {
+    // **The left spine is walked with a loop, not a recursion.** The parser gives
+    // `a UNION ALL b UNION ALL c …` as a tree leaning left one level per operator, and a chain has
+    // no brackets for the scanner to count — so a frame per arm on the caller's stack was a
+    // thousand frames at the depth `crate::parse::parse` admits by operator count. Every
+    // right-hand arm is collected from the outside in and lowered from the inside out, which is
+    // the order the statement wrote them.
+    let mut spine = Vec::new();
+    let mut leftmost = body;
+    while let SetExpr::SetOperation {
         op,
         set_quantifier,
         left,
         right,
-    } = body
-    else {
-        return arm(body);
-    };
-    let first = flatten(left, arm, arms)?;
-    arms.push(plan::SetArm {
-        op: operator(*op)?,
-        all: keeps_duplicates(*set_quantifier, *op)?,
-        select: arm(right)?,
-    });
-    Ok(first)
+    } = leftmost
+    {
+        spine.push((*op, *set_quantifier, right.as_ref()));
+        leftmost = left.as_ref();
+    }
+    let first = arm(leftmost)?;
+    let mut arms = Vec::with_capacity(spine.len());
+    for (op, quantifier, right) in spine.into_iter().rev() {
+        arms.push(plan::SetArm {
+            op: operator(op)?,
+            all: keeps_duplicates(quantifier, op)?,
+            select: arm(right)?,
+        });
+    }
+    Ok(plan::Select {
+        set_arms: arms,
+        ..first
+    })
 }
 
 fn operator(op: SetOperator) -> Result<plan::SetOp> {
