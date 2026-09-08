@@ -104,11 +104,10 @@ ALTER TABLE t ADD COLUMN c int8 UNIQUE
 # (`tests/add_column_primary_key.rs`), and so does `ADD CONSTRAINT ... PRIMARY KEY`. What is still
 # refused is a `serial` added to a table with rows, which PostgreSQL fills from the sequence.
 
-# `ALTER COLUMN a TYPE text` converts now (`tests/alter_column_type.rs`). What is still refused is
-# a `USING` that computes rather than converts: there is no per-row expression evaluator, and
-# running the type change while ignoring the expression would store a different value in every row.
-statement error (0A000)
-ALTER TABLE t ALTER COLUMN a TYPE text[] USING string_to_array(a, ',')
+# `ALTER COLUMN a TYPE text` converts now (`tests/alter_column_type.rs`), and so does a `USING`
+# that computes rather than converts — `USING string_to_array(a, ',')` left this file when the
+# per-row evaluator arrived (`tests/alter_column_type_using.rs`). Nothing of `ALTER COLUMN … TYPE`
+# is refused by name any more; what a `USING` expression cannot do is reported per row.
 
 statement error (0A000)
 ALTER TABLE ONLY t ADD COLUMN c int8
