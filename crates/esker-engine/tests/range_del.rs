@@ -345,10 +345,12 @@ fn every_malformed_range_tombstone_block_is_an_error_and_never_a_panic() {
 
     let cmp = BytewiseComparator;
     // `count ++ (begin_len ++ begin ++ end_len ++ end ++ seqno)*`, all LEB128.
+    // The lengths are one-byte varints here because every key in this test is shorter than 128
+    // bytes, which `try_from` states rather than a cast assuming.
     let one = |begin: &[u8], end: &[u8], seqno: u8| {
-        let mut out = vec![1u8, begin.len() as u8];
+        let mut out = vec![1u8, u8::try_from(begin.len()).unwrap()];
         out.extend_from_slice(begin);
-        out.push(end.len() as u8);
+        out.push(u8::try_from(end.len()).unwrap());
         out.extend_from_slice(end);
         out.push(seqno);
         out

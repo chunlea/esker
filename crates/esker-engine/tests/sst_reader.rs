@@ -512,8 +512,7 @@ fn a_block_handle_pointing_past_the_file_is_refused() {
 
     fs.install("/moved-index.sst", damaged).unwrap();
     let error = open("/moved-index.sst")
-        .err()
-        .expect("a table whose index block is outside the file must not open");
+        .expect_err("a table whose index block is outside the file must not open");
     assert!(
         error.is_corruption(),
         "a handle past the end of the file is corruption, not an I/O error or a panic: {error}"

@@ -4252,9 +4252,9 @@ fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
 /// sentence above claims: a schema load *reads* this key on every statement that resolves a
 /// relation, so a DDL in database B held a Percolator lock on the key an ordinary `SELECT` in
 /// database A had to read, and A was told `40001` for a conflict with a transaction it shares
-/// nothing with ([`record::version_key`]).
+/// nothing with (`record::version_key`).
 ///
-/// Cluster-scoped objects — roles, databases — pass [`record::CLUSTER_TENANT`], which every view
+/// Cluster-scoped objects — roles, databases — pass `record::CLUSTER_TENANT`, which every view
 /// reads beside its own.
 pub fn bump_version(txn: &mut dyn Txn, tenant: u64) -> Result<()> {
     stamp_layout(txn)?;
