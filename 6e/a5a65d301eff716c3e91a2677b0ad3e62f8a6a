@@ -1,0 +1,21 @@
+crates/esker-sql/tests/lowering.rs
+  s_c99f71abc0fb31::t_eb8ff138f7110c 213-216
+crates/esker-sql/tests/slt/unsupported.slt
+  s_c99f71abc0fb31::t_62c47d89539784 107-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6ea5a65d301eff716c3e91a2677b0ad3e62f8a6a",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
