@@ -253,3 +253,35 @@ fn what_this_commit_does_not_do_is_named() {
         );
     }
 }
+
+/// **A `WITH` written outside the set is every arm's**, not the first arm's alone.
+///
+/// The set's `WITH` is lowered onto the set's own `Select`, and CTE inlining walked `from`, the
+/// joins and the subqueries — and not `set_arms`. So `w` was substituted in the first arm and
+/// reached the catalog as a table name in the second: `relation "w" does not exist` for a name the
+/// statement had just defined. Measured on PostgreSQL 19: `1`, `1`.
+#[test]
+fn a_cte_outside_the_set_is_visible_from_every_arm() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows("WITH w AS (SELECT 1 AS n) SELECT n FROM w UNION ALL SELECT n FROM w"),
+        vec![vec!["1"], vec!["1"]]
+    );
+    // The same set inside a derived table, which is the other planner.
+    assert_eq!(
+        node.rows(
+            "SELECT count(*) FROM (WITH w AS (SELECT 1 AS n) SELECT n FROM w UNION ALL \
+             SELECT n FROM w) AS d"
+        ),
+        vec![vec!["2"]]
+    );
+    // And the third arm, which is where a walk that stopped at "the other arm" would have gone
+    // wrong next.
+    assert_eq!(
+        node.rows(
+            "WITH w AS (SELECT 1 AS n) SELECT n FROM w UNION ALL SELECT n FROM w UNION ALL \
+             SELECT n + 1 FROM w ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["1"], vec!["2"]]
+    );
+}

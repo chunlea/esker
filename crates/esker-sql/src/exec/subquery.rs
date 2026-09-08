@@ -167,6 +167,13 @@ pub(super) fn plan_subqueries(
     for cte in &mut select.ctes {
         plan_derived(cte, tenant, txn, tables, outer)?;
     }
+    // **Every arm of a set operation is a statement of its own** — its `FROM` may hold a derived
+    // table or a CTE's inlined body and its expressions a subquery — so each is planned exactly as
+    // the first arm is. Before this, `(WITH w AS … SELECT n FROM w UNION ALL SELECT n FROM w)` as a
+    // derived table reached the planner with the second arm's `w` never given a shape.
+    for arm in &mut select.set_arms {
+        plan_subqueries(&mut arm.select, tenant, txn, tables, outer)?;
+    }
     fold_counts(select, txn, tenant)
 }
 

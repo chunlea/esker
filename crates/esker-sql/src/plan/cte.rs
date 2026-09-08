@@ -147,6 +147,14 @@ fn for_each_from_mut(select: &mut Select, visit: &mut impl FnMut(&mut TableRef))
     for item in &mut select.order_by {
         for_each_subquery_mut(&mut item.expr, visit);
     }
+    // **Every arm of a set operation.** A `WITH` written outside `SELECT … UNION ALL SELECT …`
+    // belongs to the whole set, and the first arm is the set's own `Select` — so a walk that
+    // stopped at `from` substituted the name in the first arm and left `FROM w` in the second to
+    // reach the catalog as `42P01`. The arms are selects like any other, and a set inside a derived
+    // table reaches here through `derived` above for the same reason.
+    for arm in &mut select.set_arms {
+        for_each_from_mut(&mut arm.select, visit);
+    }
 }
 
 /// Into every sub-select an expression holds.
