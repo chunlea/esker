@@ -1,0 +1,25 @@
+crates/esker-sql/src/parse/lower.rs
+  s_c99f71abc0fb31::t_70dd332f2e4cd4 7924
+crates/esker-sql/src/parse/mod.rs
+  s_c99f71abc0fb31::t_9b95dbf608477d 170-175,3016-3018,3021-3029
+crates/esker-sql/src/pgwire/session.rs
+  s_c99f71abc0fb31::t_313e6f3994b537 324,344-348,353,385-388,404,410,930-931
+crates/esker-sql/tests/prepared_sql.rs
+  s_c99f71abc0fb31::t_690eecbcf4ad09 284-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3345ef92ae7a3ccd41f1df67aa63161f454bbbfc",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
