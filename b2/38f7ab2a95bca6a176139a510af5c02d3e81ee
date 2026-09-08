@@ -1,11 +1,15 @@
 CLAUDE.md
   s_c99f71abc0fb31::t_c500cbd1d4ce4d 100-101
+  s_c99f71abc0fb31::t_3123a61038c9f7 100-101
 docs/DESIGN.md
   s_c99f71abc0fb31::t_3ed309ccb6275f 640-644,773-775,1050-1054,1097
+  s_c99f71abc0fb31::t_4496beb4a48993 640-644,773-775,1050-1054,1097
 docs/adr/0003-dependencies.md
   s_c99f71abc0fb31::t_5b2e14670def7e 30
+  s_c99f71abc0fb31::t_17bd0189a404dd 30
 docs/adr/0060-a-using-clause-is-a-licence-not-an-expression.md
   s_c99f71abc0fb31::t_aeb39c4e63d926 3
+  s_c99f71abc0fb31::t_1bb1683b6f32c3 3
 ---
 {
   "schema_version": "authorship/3.0.0",
