@@ -97,7 +97,8 @@ list to stop being bought.
 
 Runtime allowlist (each already justified in `docs/adr/0003-dependencies.md`; add to it only via ADR):
 `tokio` (network runtime only), `bytes`, `thiserror`, `tracing` + `tracing-subscriber`, `lz4_flex`
-(pure-Rust LZ4, the only compression). The list once ended with `crossbeam-skiplist` — "the one
+(pure-Rust LZ4, the only compression), `jiff-tzdb` (the IANA zone table as bytes and nothing else —
+the TZif reader is ours; ADR 0082). The list once ended with `crossbeam-skiplist` — "the one
 piece of concurrent unsafe code we buy rather than write" — and ADR 0041 replaced it, so
 **every piece of concurrent code in the engine is now code in this repository with a test in this
 repository**. `tokio` stays the bought concurrency, and only at the network edge. Dev-only

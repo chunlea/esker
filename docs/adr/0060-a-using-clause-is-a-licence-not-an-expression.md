@@ -1,6 +1,6 @@
 # 0060 — A `USING` clause is a licence, not an expression
 
-**Status:** accepted · **Date:** 2026-09-04 · ADR number claimed at `bc7398e8` (0059 was the last).
+**Status:** accepted 2026-09-04, **superseded** 2026-09-07 — a `USING` clause is lowered and evaluated per row now (`crates/esker-sql/src/exec/ddl.rs`, `tests/alter_column_type_using.rs`); the Context below still holds, and a plain cast still takes the shortcut the Decision describes · **Date:** 2026-09-04 · ADR number claimed at `bc7398e8` (0059 was the last).
 
 ## Context
 

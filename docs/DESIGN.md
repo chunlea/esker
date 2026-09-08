@@ -637,8 +637,11 @@ Every rule below is unchanged by replication. **Only the meaning of "persisted" 
 - **TSO:** `ts = physical_ms << 18 | logical`, allocated in batches. PD persists a high-water mark 3 s
   *ahead*, fsynced before any timestamp at or above the old mark leaves, so **every timestamp handed out
   has `physical < mark`**; a restart resumes at `max(clock, mark)` and therefore cannot repeat one even
-  when the wall clock jumps backwards. This is the only place in Esker that reads a wall clock, and it
-  reads it through an injected `Clock` so that a test can make it misbehave.
+  when the wall clock jumps backwards. This is the only place in the cluster that reads a wall clock,
+  and it reads it through an injected `Clock` so that a test can make it misbehave. Its single-process
+  stand-in — `esker-sql`'s `MemoryBackend` oracle, which the scoreboard node runs on — is the one
+  other reader, and applies the same `max(last, clock)` rule to one process (`Versions::mark` in
+  `crates/esker-sql/src/backend/mod.rs`).
 - **Liveness:** a store is down when PD has not heard from it for `max_store_down_time`. The age is on
   **PD's clock** — the last-heartbeat stamp is written when the beat arrives and never taken from the
   store's own report, because comparing wall clocks across nodes is what invariant 6 forbids. A store PD
@@ -767,7 +770,9 @@ Protocol: `start_ts` from TSO → buffered writes on the client → **Prewrite**
 each key checks `write` for commit_ts > start_ts and `lock` for any lock, then writes `lock` +
 `default` atomically) → `commit_ts` from TSO → **Commit** primary (write `write`, delete `lock`, atomic)
 → commit secondaries asynchronously. Readers that hit a lock inspect the primary: rolled forward if the
-primary is committed, rolled back if its TTL expired, else wait/backoff. GC: PD publishes a safepoint;
+primary is committed, rolled back if its TTL expired, else wait/backoff. The TTL is **not** extended in
+practice: `TxnKv::Heartbeat` is an RPC with a handler and no sender (`docs/plans/cross-node-deadlock.md`),
+so a lock outlives a dead holder by at most one TTL. GC: PD publishes a safepoint;
 a `CompactionFilter` drops versions below it (keeping the newest visible one).
 
 ## 9. Wire API (`esker-proto`)
@@ -1042,9 +1047,11 @@ is in its first sentence.
   from here: a dropped column keeps its slot because a row is decoded by position
   ([ADR 0051](adr/0051-a-dropped-column-keeps-its-slot.md)); `DO` is two recognised templates and
   not a PL/pgSQL engine ([ADR 0058](adr/0058-a-do-block-is-two-templates-not-a-language.md)); and a
-  `USING` clause on `ALTER COLUMN … TYPE` is a **licence** rather than an expression to evaluate,
-  because there is no per-row evaluator to run one with
-  ([ADR 0060](adr/0060-a-using-clause-is-a-licence-not-an-expression.md)).
+  `USING` clause on `ALTER COLUMN … TYPE` was a **licence** while there was no per-row evaluator
+  to run one with ([ADR 0060](adr/0060-a-using-clause-is-a-licence-not-an-expression.md)), and is
+  an **expression** now: lowered like any other and evaluated per row against the row as it was
+  before the change (`tests/alter_column_type_using.rs`), with a plain cast still costing what the
+  licence did.
 - **Scale-to-zero:** because SQL nodes are stateless and SSTs can live in object storage, an idle tenant
   costs only its Raft metadata; PD may later hibernate cold regions (ADR).
 - **Multi-tenancy:** tenant id is the first field of every SQL key; RawKV/TxnKV users may adopt the same
@@ -1087,7 +1094,7 @@ is in its first sentence.
 | `max_balance_operators` | 4 moves started at once (finishing a move is never capped) |
 | leader / region spread threshold | 2 (a constant, not a knob — see ADR 0018) |
 | PD operator history | 64 events |
-| txn lock TTL | 3 s (heartbeat-extended) |
+| txn lock TTL | 3 s — the `TxnKv::Heartbeat` that would extend it has no sender (§8), so a dead holder's lock lapses in at most 3 s |
 | transport (`TransportConfig`) | §9 has the table — seven knobs, listed there because each one only means something next to the rule it bounds |
 | store WAL sync mode | `Never` — the engine adds no `fsync` of its own, so each request's `sync` flag decides (§4.2, and `CLAUDE.md` invariant 1's opt-out) |
 

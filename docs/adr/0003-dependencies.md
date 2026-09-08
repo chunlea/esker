@@ -27,6 +27,7 @@ independent mechanisms enforce that.
 | `tracing` | Structured spans per request, carrying region and peer ids. Log lines without those are unusable in a distributed system. | An in-house span-and-event facade. Doable; the collector ecosystem is the reason not to. |
 | `tracing-subscriber` | Turns those spans into output, with `RUST_LOG`-style filtering. | A hand-written subscriber; `tracing` is the trait, this is one implementation. |
 | `lz4_flex` | Pure-Rust LZ4 for SST block compression — the **only** compression codec. `zstd` and `snap` are banned because both are C. | An in-house LZ4 decoder (the format is simple) plus an encoder (harder to make fast). Or no compression, which costs disk. |
+| `jiff-tzdb` | The IANA time-zone table compiled in as bytes, and nothing else: no code of it runs, and the TZif reader over those bytes is ours (`crates/esker-sql/src/value/zone`). `Unlicense OR MIT`, no build script, data only; the user's ruling of 2026-09-05 is in ADR 0082. | Shipping the table ourselves: the same bytes, regenerated on every tzdata release by a script we would then own. |
 
 `crossbeam-skiplist` used to be the last row of that table — "the one piece of concurrent unsafe
 code we buy rather than write" — and it is gone. The memtable is an in-house arena skiplist as of
