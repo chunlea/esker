@@ -18,17 +18,69 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
-    // `UNION` in a view body is refused by name — a query feature, not a view one, and the same
-    // `0A000` a bare `SELECT … UNION …` gets. The two lines that read that view are swallowed with
-    // it; everything the dependency edge is about is measured on the other nine views.
-    answers: &[(
-        "CREATE VIEW v_union AS SELECT id, a FROM vb UNION SELECT id, c FROM vb2;",
-        "`0A000 UNION is not supported`: a set operation is a query feature this node does not \
-         have, so the view cannot be created. Nothing about the dependency edge differs.",
-        "pg19_view_debts.txt:40",
-    )],
+    // `information_schema.views` declares `name` and `character varying(3)`; this node's three
+    // columns are `text` (`catalog/information_schema.rs`), and every value agrees — `v_union`
+    // included, now that a set operation exists to be `NO` about.
+    types: &[
+        "SELECT table_name, is_updatable, is_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;",
+    ],
+    answers: &[
+        // **`pg_get_viewdef` and `pg_views.definition` are the text as written, on one line.** A
+        // real server deparses its own parse tree — one target per line, the `FROM` indented, a
+        // predicate parenthesised — and the capture holds the first line of that, ` SELECT id,`,
+        // where this node answers `SELECT id, a, b FROM vb`. `Relations::view_definition` records
+        // the trade. The dependency edge these lines sit between is measured on every other line.
+        (
+            "SELECT pg_get_viewdef('v_plain'::regclass);",
+            VIEWDEF,
+            "pg19_view_debts.txt:48",
+        ),
+        (
+            "SELECT pg_get_viewdef('v_where'::regclass);",
+            VIEWDEF,
+            "pg19_view_debts.txt:49",
+        ),
+        (
+            "SELECT pg_get_viewdef('v_expr'::regclass);",
+            VIEWDEF,
+            "pg19_view_debts.txt:50",
+        ),
+        (
+            "SELECT pg_get_viewdef('v_group'::regclass);",
+            VIEWDEF,
+            "pg19_view_debts.txt:51",
+        ),
+        (
+            "SELECT pg_get_viewdef('v_join'::regclass);",
+            VIEWDEF,
+            "pg19_view_debts.txt:52",
+        ),
+        (
+            "SELECT pg_get_viewdef('v_plain'::regclass, true);",
+            VIEWDEF,
+            "pg19_view_debts.txt:53",
+        ),
+        (
+            "SELECT definition FROM pg_views WHERE viewname = 'v_where';",
+            VIEWDEF,
+            "pg19_view_debts.txt:54",
+        ),
+        // **A `NOTICE` per view is what `DROP … CASCADE` answers**, and this replay compares result
+        // sets: the notices are there — `a_cascade_walks_the_whole_chain` reads them, and the
+        // `count(*)` on the next line is 0 here as it is there — and the replay cannot see them.
+        // A real server prints them in oid order with an outer view after the inner one it
+        // reads; this node names the outer one first, which is the order it drops them in.
+        (
+            "DROP TABLE vb CASCADE;",
+            "a `NOTICE` per dropped view, which the replay does not compare",
+            "pg19_view_debts.txt:74",
+        ),
+    ],
 };
+
+/// The sentence the seven definition lines share.
+const VIEWDEF: &str = "`pg_get_viewdef` and `pg_views.definition` are the definition as written, on one \
+     line; a real server deparses its parse tree, and the capture holds the first line of that";
 
 #[test]
 fn every_view_dependency_answer_is_postgresql_19_s() {

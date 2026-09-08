@@ -4668,7 +4668,7 @@ fn dependent_relations(
     };
     for view in catalog::views(txn, executor.tenant)? {
         if names_it(&view.definition) {
-            found.push((view.name.clone(), "view"));
+            found.push((view.id, view.name.clone(), "view"));
         }
     }
     let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
@@ -4680,10 +4680,17 @@ fn dependent_relations(
             continue;
         };
         if names_it(&matview.definition) {
-            found.push((table.name.clone(), "materialized view"));
+            found.push((table.id, table.name.clone(), "materialized view"));
         }
     }
-    Ok(found)
+    // **In creation order, because the `DETAIL` names the first dependent found and a real server
+    // finds them by oid.** With ten views over `vb` it says `view v_plain depends on table vb` —
+    // the oldest — where a walk in name order said `v_distinct` (`pg19_view_debts.txt:56`).
+    found.sort_by_key(|(id, _, _)| *id);
+    Ok(found
+        .into_iter()
+        .map(|(_, name, kind)| (name, kind))
+        .collect())
 }
 
 pub(super) fn drop_table(

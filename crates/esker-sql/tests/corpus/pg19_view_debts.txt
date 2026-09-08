@@ -43,13 +43,15 @@ CREATE VIEW v_over_view AS SELECT id, a FROM v_plain;		-
 SELECT table_name, is_updatable, is_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;	name,character varying(3),character varying(3)	v_distinct|NO|NO ; v_expr|YES|YES ; v_group|NO|NO ; v_join|NO|NO ; v_limit|NO|NO ; v_over_view|YES|YES ; v_plain|YES|YES ; v_star|YES|YES ; v_union|NO|NO ; v_where|YES|YES
 
 -- ------------------------------------------------- pg_get_viewdef, both forms		-
-SELECT pg_get_viewdef('v_plain'::regclass);		-
-SELECT pg_get_viewdef('v_where'::regclass);		-
-SELECT pg_get_viewdef('v_expr'::regclass);		-
-SELECT pg_get_viewdef('v_group'::regclass);		-
-SELECT pg_get_viewdef('v_join'::regclass);		-
-SELECT pg_get_viewdef('v_plain'::regclass, true);		-
-SELECT definition FROM pg_views WHERE viewname = 'v_where';	text	-
+# (the seven answers below were empty in the capture and are PostgreSQL 19's first lines, replayed 2026-09-07: a
+#  multi-line cell is recorded as its first line, as every capture does)
+SELECT pg_get_viewdef('v_plain'::regclass);	text	 SELECT id,
+SELECT pg_get_viewdef('v_where'::regclass);	text	 SELECT id,
+SELECT pg_get_viewdef('v_expr'::regclass);	text	 SELECT id,
+SELECT pg_get_viewdef('v_group'::regclass);	text	 SELECT a,
+SELECT pg_get_viewdef('v_join'::regclass);	text	 SELECT vb.id,
+SELECT pg_get_viewdef('v_plain'::regclass, true);	text	 SELECT id,
+SELECT definition FROM pg_views WHERE viewname = 'v_where';	text	 SELECT id,
 
 -- ------------------------------------------------- the dependency edge		-
 SAVEPOINT s1;		-

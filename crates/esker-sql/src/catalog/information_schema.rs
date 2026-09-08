@@ -153,6 +153,9 @@ fn is_automatically_updatable(definition: &str) -> bool {
     };
     select.from.is_some()
         && select.joins.is_empty()
+        // A set operation, now that there is one: `v_union` is `NO` on a real server, and the rule
+        // above said so before the operator existed here.
+        && select.set_arms.is_empty()
         && !select.distinct
         && select.group_by.is_empty()
         && select.having.is_none()

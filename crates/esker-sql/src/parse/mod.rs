@@ -3168,6 +3168,18 @@ const UNSUPPORTED: &[Unsupported] = &[
         &["NULLS", "NOT", "DISTINCT"],
     ),
     u("BETWEEN SYMMETRIC", &[], &["BETWEEN", "SYMMETRIC"]),
+    // **`TRIM`'s three keyword forms run** (`tests/scalar_functions.rs`); the one shape left is the
+    // one `sqlparser` cannot read — a trim specification with **no characters** before the `FROM`,
+    // `TRIM(LEADING FROM b)`, which a real server reads as `ltrim(b)`. The parser takes the `FROM`
+    // for the expression and fails on the operand, and these rows are what turn that `42601` into
+    // the `0A000` a statement PostgreSQL accepts is owed.
+    u("TRIM(LEADING FROM ...)", &[], &["TRIM", "LEADING", "FROM"]),
+    u(
+        "TRIM(TRAILING FROM ...)",
+        &[],
+        &["TRIM", "TRAILING", "FROM"],
+    ),
+    u("TRIM(BOTH FROM ...)", &[], &["TRIM", "BOTH", "FROM"]),
     u(
         "a window frame EXCLUDE clause",
         &[],
