@@ -1,0 +1,14 @@
+crates/esker-sql/tests/set_operation.rs
+  h_44076b318daf9c 329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a4d972f532956fe8f19b5159d1b3a125fe129c0c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
