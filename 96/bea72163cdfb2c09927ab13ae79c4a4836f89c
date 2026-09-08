@@ -1,0 +1,37 @@
+Cargo.toml
+  s_c99f71abc0fb31::t_4cfbedf10db035 24
+crates/esker-sql/src/exec/mod.rs
+  s_c99f71abc0fb31::t_f18265a45e26d8 1328
+crates/esker-sql/src/parameter.rs
+  s_c99f71abc0fb31::t_07bdbc3aa0d735 94,513
+crates/esker-sql/src/value/zone/mod.rs
+  s_c99f71abc0fb31::t_1bc4a3f8831987 3
+crates/esker-sql/src/value/zone/tzif.rs
+  s_c99f71abc0fb31::t_5ee184a5b8005e 4
+crates/esker-sql/tests/implicit_touch_precision.rs
+  s_c99f71abc0fb31::t_21d448a0ab024a 40,42-48,50,52-58,60-64
+crates/esker-sql/tests/session_parameters.rs
+  s_c99f71abc0fb31::t_b0841d8e9a4b47 83
+crates/esker-sql/tests/set_parameters.rs
+  s_c99f71abc0fb31::t_f99b0f0b74480d 37
+crates/esker-sql/tests/time_zone.rs
+  s_c99f71abc0fb31::t_16b8b2cf52108f 3
+docs/adr/0082-the-time-zone-table-is-data-the-reader-is-ours.md
+  s_c99f71abc0fb31::t_e75f8aa5e1a34b 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "96bea72163cdfb2c09927ab13ae79c4a4836f89c",
+  "prompts": {},
+  "sessions": {
+    "s_c99f71abc0fb31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a31f8e2-ccf9-406e-8e33-7b42e39df73d",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
