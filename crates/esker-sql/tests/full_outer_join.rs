@@ -158,3 +158,37 @@ fn a_full_join_with_using_is_refused_by_name() {
             .is_ok()
     );
 }
+
+/// **A `WHERE` on the outer table is not pushed below the full join when the join is one step of
+/// a chain.** The single-join tests above never reach the chain planner, which pushes each table's
+/// own conjuncts into its scan before the joins are built — right below an inner or a left join,
+/// and wrong below a full one: `pets` filtered to `dog` *before* the join leaves `cat`'s toy with
+/// no partner, so it comes out NULL-extended and the conjunct that would have removed it has
+/// already been spent. Measured on PostgreSQL 19: one row, `dog | ball`.
+#[test]
+fn a_where_on_the_outer_table_is_not_pushed_below_a_full_join_in_a_chain() {
+    let mut node = parity::Node::new(FIXTURE);
+    node.run("CREATE TABLE tags (toy_id bigint)").unwrap();
+    node.run("INSERT INTO tags VALUES (10), (11)").unwrap();
+    // A toy of `cat`, which the pushed filter would orphan.
+    node.run("INSERT INTO toys VALUES (12, 2, 'mouse')")
+        .unwrap();
+    node.run("INSERT INTO tags VALUES (12)").unwrap();
+    assert_eq!(
+        rows(
+            &mut node,
+            "SELECT p.name, t.name FROM pets p FULL JOIN toys t ON t.pet_id = p.id \
+             JOIN tags g ON g.toy_id = t.id WHERE p.name = 'dog' ORDER BY t.name"
+        ),
+        vec![vec!["dog".to_owned(), "ball".to_owned()]]
+    );
+    // And the row a full join exists to keep still survives a `WHERE` that asks for it.
+    assert_eq!(
+        rows(
+            &mut node,
+            "SELECT t.name FROM pets p FULL JOIN toys t ON t.pet_id = p.id \
+             JOIN tags g ON g.toy_id = t.id WHERE p.id IS NULL"
+        ),
+        vec![vec!["orphan".to_owned()]]
+    );
+}

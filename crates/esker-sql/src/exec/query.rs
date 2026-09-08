@@ -1572,10 +1572,22 @@ fn plan_chain(
             None => access_path(None, tenant, outer)?,
         }
     };
+    // **Not below a `FULL JOIN`, wherever it sits in the chain.** A conjunct on the first table
+    // pushed into its scan removes rows *before* every join to its right; below an inner or a left
+    // join that is the same answer, because those keep or drop rows by the left side's own
+    // conjunct either way. A full join does not: an inner row whose partner was filtered out is
+    // NULL-extended and kept, and the conjunct that would have removed it has already been spent.
+    // So a chain with a full join anywhere in it pushes nothing, which costs a scan and never a row.
+    let has_full = select
+        .joins
+        .iter()
+        .any(|join| join.kind == crate::plan::JoinKind::Full);
     // The first table's own conjuncts, before a single pair has been built. This is the step that
     // matters most in a comma list: `seq.relkind = 'S'` here is the difference between joining
     // every relation and joining the sequences.
-    node = pushdown(node, &mut pending, &entries[..1], enclosing);
+    if !has_full {
+        node = pushdown(node, &mut pending, &entries[..1], enclosing);
+    }
 
     // Grown one table at a time, so each step's `ON` sees exactly the tables to its left plus the
     // one being joined — which is what makes a reference to a table two steps back resolve, and a
@@ -1590,9 +1602,10 @@ fn plan_chain(
         // throw away the rows a `LEFT JOIN` exists to keep, which is the one rewrite of this kind
         // that changes an answer rather than a cost. Once a chain has taken an outer join, nothing
         // after it is pushed either: the rows above that step are the extended ones.
-        if !select.joins[..=at]
-            .iter()
-            .any(|join| join.kind == crate::plan::JoinKind::Left)
+        if !has_full
+            && !select.joins[..=at]
+                .iter()
+                .any(|join| join.kind != crate::plan::JoinKind::Inner)
         {
             node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing);
         }
