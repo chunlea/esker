@@ -1638,11 +1638,11 @@ deliberately *not* `42501` (`DROP INDEX` is `42809`, `CREATE TABLE` is `42P07`).
   the recommendation on the table is a qualified key with a fallback read of the flat one as
   `public`'s, a `CATALOG_FORMAT_VERSION` bump as the guard, and an ADR.
 * **`AVAILABLE_EXTENSIONS` holds seven entries** — `citext`, `hstore`, `ltree`, `pg_trgm`,
-  `pgcrypto`, `plpgsql`, `uuid-ossp` — and the user's ruling of 2026-09-05 named five. `ltree` and
-  `pg_trgm` are covered by no ruling either way, and the doc comment above the array
-  (*"Exactly the ones `postgresql_specific_schema.rb` needs in order to load, and no more"*) is
-  false whichever way the question goes. Untouched by instruction; the comment gets corrected in
-  the same commit as the answer.
+  `pgcrypto`, `plpgsql`, `uuid-ossp` — and all seven are ruled: the user's ruling of 2026-09-05
+  09:45 named five, and the one of 23:30 the same day kept `ltree` and `pg_trgm`, which came in
+  with their type and opclass implementations. Closed; the doc comment above the array says
+  exactly this (an earlier draft of this entry, written between the two rulings, called the last
+  two unruled).
 
 ### Unattributed until the tapped pass
 
