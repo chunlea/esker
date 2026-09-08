@@ -1,7 +1,11 @@
 crates/esker-sql/src/catalog/mod.rs
   s_c99f71abc0fb31::t_3ee33c9cc07756 4247-4254,4262-4277,4861-4864,4882-4911
+  s_c99f71abc0fb31::t_a777b9fefaf54d 4247-4254,4262-4277,4861-4864,4882-4911
+  s_c99f71abc0fb31::t_280f6c4608a4a2 4247-4254,4262-4277,4861-4864,4882-4911
 crates/esker-sql/src/catalog/record.rs
   s_c99f71abc0fb31::t_157824a03eaa85 661-669
+  s_c99f71abc0fb31::t_c818f949d15916 661-669
+  s_c99f71abc0fb31::t_3c402824844652 661-669
 ---
 {
   "schema_version": "authorship/3.0.0",
