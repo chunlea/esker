@@ -1,0 +1,160 @@
+crates/esker-cli/src/cluster.rs
+  h_44076b318daf9c 30-31,420,425-432,534-542,553-554,562,567-574,577-579
+crates/esker-cli/src/main.rs
+  h_44076b318daf9c 21
+crates/esker-cli/src/readiness.rs
+  h_44076b318daf9c 1-177
+crates/esker-cli/tests/cluster_start.rs
+  h_44076b318daf9c 30-52,155-177,198,216-218,220-222,224-238,243-261,306-308,369-370
+crates/esker-client/src/error.rs
+  h_44076b318daf9c 129-137
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 1062,1297,1335
+crates/esker-client/tests/prewrite_ordering.rs
+  h_44076b318daf9c 1-217
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 1060-1064,1445-1447
+crates/esker-columnar/tests/fragment_golden.rs
+  h_44076b318daf9c 18,356-397
+crates/esker-engine/src/range_del.rs
+  h_44076b318daf9c 208-215,227-236
+crates/esker-engine/tests/range_del.rs
+  h_44076b318daf9c 331-430
+crates/esker-engine/tests/sst_reader.rs
+  h_44076b318daf9c 456-520
+crates/esker-engine/tests/version.rs
+  h_44076b318daf9c 642-711
+crates/esker-pd/src/driver.rs
+  h_44076b318daf9c 165-174,188,609-611
+crates/esker-pd/src/pd/mod.rs
+  h_44076b318daf9c 640-658,670-678
+crates/esker-pd/tests/failover.rs
+  h_44076b318daf9c 1174-1232,1250-1254
+crates/esker-sql/src/backend/mod.rs
+  h_44076b318daf9c 403-407,411-412,414-425,427-433,438,440-450,453-468,543-549,551-555,558,583,630,1067-1071,1197-1205
+crates/esker-sql/src/backend/store.rs
+  h_44076b318daf9c 545-549,551
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 48-49,2196-2209,2211-2216,2538,2577-2580,2590-2593,2598-2600,2602,2607,2631-2634,2637,2639,2658,2664,3046,3095,3154,3208,3214,3362,3371,3396,3418-3423,3624,3631,3659-3683,3945,4231-4274,4277-4292,4598,4766-4880
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 1342-1355
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 317-325,327,354-358,360-364,391-392,672-675,709-710,725,728-729
+crates/esker-sql/src/catalog/pg_index.rs
+  h_44076b318daf9c 147,165,177,308,336
+crates/esker-sql/src/catalog/quote.rs
+  h_44076b318daf9c 1-317
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 147-150,622-653,655-698
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 612-621,855
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 243,428,432-477,479,712,721-723,1136,1357
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 170-183,459-460,491-498,678-681,693-709,712-715,814-817,2412-2416,2420,2427,3008-3060,3286-3293,3422,3688-3704
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 431-435,1303-1304,1320,1335-1344,1387-1388,1398-1408,1413-1419,2955-2966,2993-2999,3005,5713,5726
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 1344-1403,1405-1407,1410-1413,1416-1417,1456-1460,1468,1474-1477,1494-1497,1529-1584
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 1307
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 2723-2745
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 906-907,1002-1003,1588,1859-1860,1885,2056-2105,2109-2110,2115-2119,2126,2141-2143,2940-2944
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 560,596-599,601,723,833,869,882-884,897,915-916,919-925,934,945,982-988,992,995-997,1000-1004,1014-1047,1381,1479
+crates/esker-sql/src/exec/typedef.rs
+  h_44076b318daf9c 30-48,51,59-62,98,123-124,384-387,401,403,405
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 80-101,223,2902-2906,2908-2909,2917,3625-3627,3630-3634,3674-3680,4364-4383,7339-7350
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 317-323,445-460,676-679,726-729,1228-1441,2813-2828
+crates/esker-sql/src/plan/cte.rs
+  h_44076b318daf9c 162
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 1313-1323
+crates/esker-sql/src/plan/dml.rs
+  h_44076b318daf9c 44,46-57,62-77
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 784,1205-1207,1356,1484,1549-1551,1726-1728
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 45
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 36-43,587-597,1326-1333
+crates/esker-sql/src/plan/subquery.rs
+  h_44076b318daf9c 144,146-151,172-176,182,194,204,216-221,223
+crates/esker-sql/tests/alter_column_type.rs
+  h_44076b318daf9c 23-27,29-33
+crates/esker-sql/tests/alter_column_type_using.rs
+  h_44076b318daf9c 1-151
+crates/esker-sql/tests/bind_typing_joins.rs
+  h_44076b318daf9c 42-45,94-118
+crates/esker-sql/tests/bind_typing_matrix.rs
+  h_44076b318daf9c 1-108
+crates/esker-sql/tests/check_constraint_pretty.rs
+  h_44076b318daf9c 1-206
+crates/esker-sql/tests/create_in_a_schema.rs
+  h_44076b318daf9c 1-175
+crates/esker-sql/tests/full_outer_join.rs
+  h_44076b318daf9c 1-160
+crates/esker-sql/tests/inline_exclude_on_an_unlogged_table.rs
+  h_44076b318daf9c 1-133
+crates/esker-sql/tests/lowering.rs
+  h_44076b318daf9c 213-216
+crates/esker-sql/tests/lowering_depth.rs
+  h_44076b318daf9c 33-37,51-99,109,159-162,167-169,266-332
+crates/esker-sql/tests/on_conflict.rs
+  h_44076b318daf9c 18-26
+crates/esker-sql/tests/on_conflict_expression.rs
+  h_44076b318daf9c 1-183
+crates/esker-sql/tests/on_conflict_partial_index.rs
+  h_44076b318daf9c 1-219
+crates/esker-sql/tests/row_value_in_subquery.rs
+  h_44076b318daf9c 1-96
+crates/esker-sql/tests/select.rs
+  h_44076b318daf9c 430-432
+crates/esker-sql/tests/slt/join.slt
+  h_44076b318daf9c 146-147,151-162
+crates/esker-sql/tests/slt/unsupported.slt
+  h_44076b318daf9c 107-110
+crates/esker-sql/tests/type_in_a_schema.rs
+  h_44076b318daf9c 1-228
+crates/esker-sql/tests/unique_constraint_using_index.rs
+  h_44076b318daf9c 26,44-46,48-51,113,152,171,228
+crates/esker-sql/tests/user_decided_divergences.rs
+  h_44076b318daf9c 1-104
+crates/esker-sql/tests/wall_clock.rs
+  h_44076b318daf9c 1-156
+crates/esker-sql/tests/write_in_subquery.rs
+  h_44076b318daf9c 12-15
+crates/esker-store/Cargo.toml
+  h_44076b318daf9c 64-69
+crates/esker-store/src/peer.rs
+  h_44076b318daf9c 32-42,1619,1631,1634-1637,1670-1759,1772-1773,1776,1838-2025,3024,3074
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 1102-1111
+docs/DESIGN.md
+  h_44076b318daf9c 221-240,1025-1040
+docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md
+  h_44076b318daf9c 1-76
+docs/adr/0081-the-tick-driver-catches-up.md
+  h_44076b318daf9c 1-113
+docs/plans/cross-node-deadlock.md
+  h_44076b318daf9c 85-100
+docs/plans/phase-6d.md
+  h_44076b318daf9c 267-288
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1619-1674
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b304ca9d66fbaf969398d9656931e5e27638a14a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
