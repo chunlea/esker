@@ -2843,8 +2843,10 @@ fn date_trunc(args: &[Datum], session: Option<&'static crate::value::zone::Zone>
         }
         // **A `date` resolves to the `timestamptz` overload**, not the unzoned one, so it is cut
         // in a zone and comes back zoned. Measured.
+        // Through `as_micros`, which knows the two infinities: `date_trunc('day', 'infinity'::date)`
+        // is `infinity` on a real server, where the bare multiply overflowed.
         Datum::Date(days) => Datum::TimestampTz(trunc::timestamptz(
-            i64::from(*days) * 86_400 * 1_000_000,
+            crate::value::date::as_micros(*days),
             unit,
             named.or(session),
         )),
@@ -3159,7 +3161,10 @@ fn catalog_function(
                         return Ok(Datum::Null);
                     };
                     let set: Vec<char> = match set {
-                        None => vec![' ', '\t', '\n', '\r', '\x0b', '\x0c'],
+                        // **A space, and nothing else**: `btrim(text)` removes "a space by default"
+                        // and that is the whole default — `length(btrim(E'\t x \n'))` is 5 on a real
+                        // server, measured, where a whitespace class would have said 1.
+                        None => vec![' '],
                         Some(chars) => chars.to_text().unwrap_or_default().chars().collect(),
                     };
                     let cut = |text: &str| -> String {
@@ -3195,7 +3200,34 @@ fn catalog_function(
                     }
                 });
             }
-            best.cloned().unwrap_or(Datum::Null)
+            let Some(best) = best else {
+                return Ok(Datum::Null);
+            };
+            // **The value carries the declared type.** `greatest(3::int4, 2::int8)` is described as
+            // `bigint` (`query::greatest_type`, the same promotion), and used to hand back the
+            // `int4` it chose — text format hid it, `pg_typeof` and a binary-format reader did
+            // not. The winner is cast the way it would be assigned into a column of that type.
+            let promoted = args
+                .iter()
+                .filter(|arg| !matches!(arg, Datum::Null))
+                .filter_map(Datum::column_type)
+                .reduce(|sofar, ty| {
+                    if sofar == ty {
+                        sofar
+                    } else {
+                        crate::value::arith::result_type(crate::plan::ArithOp::Add, sofar, ty)
+                            .unwrap_or(sofar)
+                    }
+                });
+            match promoted {
+                Some(ty)
+                    if best.column_type() != Some(ty)
+                        && crate::value::has_assignment_cast(best.column_type(), ty) =>
+                {
+                    crate::value::assignment_cast(best.clone(), ty, env.settings.rendering)?
+                }
+                _ => best.clone(),
+            }
         }
         CatalogFunc::Concat => Datum::Text(
             args.iter()

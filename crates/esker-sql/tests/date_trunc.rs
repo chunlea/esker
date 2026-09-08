@@ -299,3 +299,17 @@ fn a_null_argument_and_an_unknown_zone() {
         "time zone \"Mars/Olympus\" not recognized"
     );
 }
+
+/// **An infinite date is cut to itself.** `date_trunc('day', 'infinity'::date)` is `infinity` on
+/// a real server; the `date` arm used to multiply the sentinel's day count into microseconds and
+/// overflow.
+#[test]
+fn an_infinite_date_truncates_to_itself() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows(
+            "SELECT date_trunc('day', 'infinity'::date), date_trunc('month', '-infinity'::date)"
+        ),
+        vec![vec!["infinity", "-infinity"]]
+    );
+}

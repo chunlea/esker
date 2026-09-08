@@ -197,3 +197,31 @@ fn the_function_spellings_are_the_same_three() {
         Vec::<Vec<String>>::new()
     );
 }
+
+/// **A bare `trim` strips spaces, and only spaces.** `btrim(text)` removes "a space by default",
+/// and a real server means exactly that: `length(btrim(E'\t x \n'))` is 5 there, measured, where
+/// a whitespace class would answer 1. Written with the control characters themselves, because the
+/// `E'…'` spelling is a literal this node still refuses by name.
+#[test]
+fn a_bare_trim_strips_spaces_only() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows("SELECT length(btrim('\t x \n')), length(ltrim('\tx')), length(rtrim('x\n'))"),
+        vec![vec!["5", "2", "2"]]
+    );
+}
+
+/// **The value carries the declared type.** `greatest(3::int4, 2::int8)` is described as `bigint`
+/// and used to carry the `int4` it picked; `pg_typeof` reads the value and said `integer`.
+/// Measured: `bigint`, `3`, `numeric`, `1.5`.
+#[test]
+fn the_value_carries_the_declared_type() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(greatest(3::int4, 2::int8)), greatest(3::int4, 2::int8), \
+             pg_typeof(least(1.5::numeric, 2::int4)), least(1.5::numeric, 2::int4)"
+        ),
+        vec![vec!["bigint", "3", "numeric", "1.5"]]
+    );
+}
