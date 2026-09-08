@@ -1,7 +1,9 @@
 crates/esker-sql/src/pgwire/session.rs
   s_c99f71abc0fb31::t_90f55953187484 743-763
+  s_c99f71abc0fb31::t_80b0e20b46feef 743-763
 crates/esker-sql/tests/cached_plan_result_type.rs
   s_c99f71abc0fb31::t_6b47a7c1f2c760 283-342
+  s_c99f71abc0fb31::t_d9d847ff808b0e 283-326,330-336,338-342
 ---
 {
   "schema_version": "authorship/3.0.0",
