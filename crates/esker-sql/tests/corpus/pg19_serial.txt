@@ -33,7 +33,9 @@ CREATE TABLE postgresql_serials (id serial primary key, seq serial, serials_id i
 SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) AS default_text FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|integer|nextval('postgresql_serials_id_seq'::regclass) ; r|seq|integer|nextval('postgresql_serials_seq_seq'::regclass) ; r|serials_id|integer|nextval('postgresql_serials_id_seq'::regclass)
 SELECT 'r', a.attname, pg_get_serial_sequence('postgresql_serials', a.attname) AS owned_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|public.postgresql_serials_id_seq ; r|seq|public.postgresql_serials_seq_seq ; r|serials_id|\N
 SELECT 'r', count(*) AS columns_whose_default_mentions_nextval FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'postgresql_serials'::regclass AND pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'		r|3
+SAVEPOINT owns		-
 SELECT 'r', count(*) AS columns_that_OWN_a_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND pg_get_serial_sequence('postgresql_serials', a.attname) IS NOT NULL		r|2
+ROLLBACK TO owns		-
 SELECT 'r', c.relname, c.relkind FROM pg_class c WHERE c.relname LIKE 'postgresql_serials%' ORDER BY c.relname	text,name,"char"	r|postgresql_serials|r ; r|postgresql_serials_id_seq|S ; r|postgresql_serials_pkey|i ; r|postgresql_serials_seq_seq|S
 CREATE TABLE foo_bar (id serial primary key, baz_id serial)		-
 CREATE TABLE foo (id serial primary key, bar_id serial, bar_baz_id bigserial)		-

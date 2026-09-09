@@ -40,7 +40,9 @@ SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin
 SELECT 'r', a.attname, pg_get_serial_sequence('postgresql_serials', a.attname) AS owned_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum		r|id|public.postgresql_serials_id_seq ; r|seq|public.postgresql_serials_seq_seq ; r|serials_id|\N
 SELECT 'r', a.attname, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid WHERE d.refobjid = 'postgresql_serials'::regclass AND d.deptype = 'a' ORDER BY a.attname		r|id|1|a ; r|id|1|a ; r|id|1|a ; r|id|1|a ; r|seq|2|a ; r|seq|2|a ; r|seq|2|a ; r|serials_id|3|a
 SELECT 'r', count(*) AS columns_whose_default_mentions_nextval FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'postgresql_serials'::regclass AND pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'		r|3
+SAVEPOINT owns		-
 SELECT 'r', count(*) AS columns_that_OWN_a_sequence FROM pg_attribute a WHERE a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND pg_get_serial_sequence('postgresql_serials', a.attname) IS NOT NULL		r|2
+ROLLBACK TO owns		-
 # ---- the sequences that table made, and what each is called ----
 SELECT 'r', c.relname, c.relkind FROM pg_class c WHERE c.relname LIKE 'postgresql_serials%' ORDER BY c.relname	text,name,"char"	r|postgresql_serials|r ; r|postgresql_serials_id_seq|S ; r|postgresql_serials_pkey|i ; r|postgresql_serials_seq_seq|S
 # ---- CollidedSequenceNameTest: two columns whose naive name is the same ----

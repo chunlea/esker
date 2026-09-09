@@ -3455,16 +3455,31 @@ fn catalog_function(
             // has to be split the way `::regclass`'s argument is — the table it names may be in
             // any schema, and looking the whole string up finds nothing.
             let stored = crate::catalog::parse_qualified(table);
-            let sequence = relations
+            // **A table that is not there RAISES**, and so does a column that is not — measured on
+            // 19beta1, `relation "zomg" does not exist` and `column "nosuch" of relation "g1z"
+            // does not exist`. Answering NULL for either is what `ActiveRecord` cannot tell from
+            // "this column owns no sequence", which is the real NULL: `default_sequence_name`
+            // rescues the exception and falls back to `<table>_<pk>_seq`, so a node that never
+            // raises never produces the fallback.
+            let Some(def) = relations
                 .by_name(&stored)
                 .and_then(|row| relations.table(row))
-                .and_then(|table| {
-                    let at = table.column(column)?;
-                    table
-                        .sequences
-                        .iter()
-                        .find(|sequence| sequence.column == Some(at))
+            else {
+                return Err(SqlError::UndefinedTable(crate::catalog::written_display(
+                    table,
+                )));
+            };
+            let Some(at) = def.column(column) else {
+                return Err(SqlError::UndefinedColumnInRelation {
+                    column: column.clone(),
+                    relation: crate::catalog::split_qualified(&def.name).1.to_owned(),
                 });
+            };
+            // A column that owns no sequence **is** the NULL this function has.
+            let sequence = def
+                .sequences
+                .iter()
+                .find(|sequence| sequence.column == Some(at));
             match sequence {
                 // **The schema is the table's**, not `public`: a `bigserial` in `s` owns `s.t_id_seq`
                 // there, and the qualified text is what goes back out to `setval`.
