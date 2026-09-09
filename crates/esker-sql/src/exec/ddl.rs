@@ -5083,12 +5083,24 @@ pub(super) fn create_index(
                     refuse_unindexable(&table, &table.columns[at], &create.access_method)?;
                     KeyPart::Column(at)
                 }
+                // **A key that resolves to a bare column is a column key**, however it was
+                // written. `((t)::text)` over a `text` column is `USING btree (t)` on a real
+                // server, with `indkey` naming the column and `indexprs` null — the no-op cast is
+                // not a node (`exec::query::resolve`), so what is left is the column and the
+                // catalog records it as one. The parser already unwraps `((t))`; this is the same
+                // answer one resolution later, and it is the half of group E that no printer
+                // could have reached.
                 plan::KeyPartName::Expression { expr, shape } => {
-                    let (expr, ty) = index_expression(&table, expr)?;
-                    KeyPart::Expression {
-                        expr,
-                        shape: *shape,
-                        ty,
+                    if let Some(at) = index_key_column(&table, expr) {
+                        refuse_unindexable(&table, &table.columns[at], &create.access_method)?;
+                        KeyPart::Column(at)
+                    } else {
+                        let (expr, ty) = index_expression(&table, expr)?;
+                        KeyPart::Expression {
+                            expr,
+                            shape: *shape,
+                            ty,
+                        }
                     }
                 }
             };
@@ -5342,6 +5354,26 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
     Ok((catalog::unparenthesised(&text).to_owned(), ty))
 }
 
+/// The column an index key names, if what it resolves to is a bare one.
+///
+/// `CREATE INDEX ON t (((c)::text))` over a `text` column is a **column** index on a real server,
+/// not an expression index over a cast: the cast is not a node, so the key is the column and
+/// `indkey`, `indexprs` and `pg_get_indexdef` all say so. Measured beside `((c))`, which the
+/// parser already unwraps, and beside `(((v)::text))` over a `varchar`, which stays an expression
+/// because that cast is real.
+///
+/// `None` for anything else, including an expression that does not resolve — the caller's
+/// `index_expression` raises the refusal, and raising it twice from two places is how two
+/// sentences for one cause start.
+fn index_key_column(table: &TableDef, expr: &str) -> Option<usize> {
+    let parsed = crate::parse::parse_stored_expr(expr).ok()?;
+    let scope = crate::exec::query::Scope::single(table);
+    match crate::exec::query::resolve(&parsed, &scope).ok()? {
+        plan::Expr::Ordinal { at, .. } => Some(at),
+        _ => None,
+    }
+}
+
 /// One expression, checked the way an index key is checked and printed the way `pg_get_expr`
 /// prints it — **including its own outermost pair**.
 ///
@@ -5446,15 +5478,24 @@ fn comparison_operand_type(
 /// comparison among them, where PostgreSQL picks a cross-type operator and coerces *nothing*
 /// (debt #23). One rule for one caller is the honest shape here: the productions are the callers
 /// that coerce.
-/// Whether this expression is a **quoted string constant** — the shape PostgreSQL's parser coerces
+/// Whether this expression is an **unknown constant** — the shape PostgreSQL's parser coerces
 /// straight to a cast's target type instead of building a `text` constant under a cast.
 ///
-/// `Literal::String` is one the parser has not typed yet; `Literal::Typed` over a `Datum::Text` is
-/// the same constant after `parse::fold_column_default` gave it a type. Both were written as
-/// `'...'` and both print as one node.
-fn written_as_a_quoted_string(expr: &plan::Expr) -> bool {
+/// Two of them, and they are the two [`crate::exec::query::is_unknown_literal`] names. A quoted
+/// string: `Literal::String` is one the parser has not typed yet and `Literal::Typed` over a
+/// `Datum::Text` is the same constant after `parse::fold_column_default` gave it a type — both
+/// were written `'...'` and both print as one node. And a bare `NULL`, for the same reason.
+fn folded_into_its_cast(expr: &plan::Expr) -> bool {
     match expr {
-        plan::Expr::Literal(plan::Literal::String(_)) => true,
+        // The two unknown constants. **A bare `NULL` is one of them**, and the cast over it is the
+        // same single node a quoted string's is: `(NULL)::text` is `NULL::text` on a real server,
+        // not `(NULL::text)::text`. This node printed the type twice — once from the literal,
+        // which has to name a type because nothing else would, and once from the cast — and group
+        // E is what made that visible: the no-op elision collapses the re-parse of the doubled
+        // form, so `reads_back` refused the whole expression and the written text was kept
+        // instead. A `TypedNull` is *not* here: the user named a type, and `(NULL::integer)::text`
+        // is a cast a real server keeps.
+        plan::Expr::Literal(plan::Literal::String(_) | plan::Literal::Null) => true,
         plan::Expr::Literal(plan::Literal::Typed(value)) => {
             matches!(value.as_ref(), Datum::Text(_))
         }
@@ -6171,9 +6212,10 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             // any case (`a AND b AND c AND d` for either). The census records the one direction
             // this leaves: a mid-chain pair the user wrote is not printed back.
             if matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or) {
-                let chained = |side: &plan::Expr| matches!(side, Expr::Binary { op: inner, .. } if inner == op);
+                let chained =
+                    |side: &Expr| matches!(side, Expr::Binary { op: inner, .. } if inner == op);
                 if chained(left) || chained(right) {
-                    let side = |side: &plan::Expr| {
+                    let side = |side: &Expr| {
                         let text = deparse(side, table, operand);
                         if chained(side) {
                             catalog::unparenthesised(&text).to_owned()
@@ -6268,6 +6310,15 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 format!("{}({argument})", func.name())
             }
         }
+        // **A cast to `text` lands here, so the unknown constant folds here too.** `(NULL)::text`
+        // is `NULL::text` on a real server and this printed `(NULL::text)::text`: the literal
+        // names a type because a bare `NULL` has none to print, and then the cast named it again.
+        // The `Cast` arm below has had this rule for a quoted string all along —
+        // [`folded_into_its_cast`] is now the one predicate for both arms, because `::text` is the
+        // one target that does not reach that arm.
+        Expr::ToText { operand, .. } if folded_into_its_cast(operand) => {
+            deparse_literal_of(operand, ColumnType::Text)
+        }
         Expr::ToText { operand, .. } => format!("{}::text", parenthesise(&sub(operand))),
         // **A cast over an unadorned string literal is *one* node on a real server**, so it prints
         // as one: `'{}'::jsonb` and not `('{}'::text)::jsonb`. The parser coerces an `unknown`
@@ -6278,11 +6329,25 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Only a **bare** string literal: `('a' || 'b')::text` really is a cast over an
         // expression, and a numeric constant under a cast is [`numeric_constant`]'s three forms
         // and debt #24's remaining case.
-        Expr::Cast { operand, to, .. } if written_as_a_quoted_string(operand) => {
+        Expr::Cast { operand, to, .. } if folded_into_its_cast(operand) => {
             deparse_literal_of(operand, *to)
         }
-        Expr::Cast { operand, to, .. } => {
-            format!("{}::{}", parenthesise(&sub(operand)), to.name())
+        // **A cast carries its modifier into its name.** `(v)::character varying(5)` and
+        // `(n)::numeric(10,2)` are what a real server prints, and this arm dropped the parameter
+        // and printed the bare type — so a cast that PostgreSQL *keeps* was printed wrong even
+        // before group E stopped printing the ones it elides. `value::format_type` is the same
+        // renderer `format_type()` and an error message use, so there is one spelling of a
+        // parameterised type in this crate and not two.
+        Expr::Cast {
+            operand,
+            to,
+            typmod,
+        } => {
+            format!(
+                "{}::{}",
+                parenthesise(&sub(operand)),
+                crate::value::format_type(*to, *typmod)
+            )
         }
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
         // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
