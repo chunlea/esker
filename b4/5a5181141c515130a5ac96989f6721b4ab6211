@@ -1,0 +1,23 @@
+docs/DESIGN.md
+  s_2d916f5f540186::t_fb4881d59812e6 12,15-22,1020,1030-1032,1034,1036-1039
+docs/plans/debts-v1.1.md
+  s_2d916f5f540186::t_91eb69f1dff44d 1-94
+docs/plans/debts-v1.md
+  s_2d916f5f540186::t_7d0ad66543d59a 3-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b45a5181141c515130a5ac96989f6721b4ab6211",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
