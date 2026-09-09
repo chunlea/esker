@@ -5443,6 +5443,67 @@ fn normalise_generated(table: &mut TableDef) -> Result<()> {
     Ok(())
 }
 
+/// One numeric constant, in the form `pg_get_expr` prints it.
+///
+/// **Three forms, and the choice is derivable from the value and the type together** — measured on
+/// 19beta1, `tests/corpus/pg19_numeric_literal_deparse.txt`:
+///
+/// ```text
+/// 1                    1                               an integer literal's own type
+/// 1.5                  1.5                             a decimal literal's own type
+/// 1::smallint          (1)::smallint
+/// 1::bigint            (1)::bigint
+/// 1::numeric           (1)::numeric
+/// 1.5::float8          (1.5)::double precision
+/// -1                   '-1'::integer
+/// 9223372036854775807  '9223372036854775807'::bigint
+/// 99999999999999999999999999   '99999999999999999999999999'::numeric
+/// ```
+///
+/// PostgreSQL prints the **node**: `(N)::type` is a cast over a constant of the literal form's own
+/// type, and `'N'::type` is a bare constant whose type is not that form's. This node folds a cast
+/// into the constant, so it has no cast node to read — but it does not need one, because *which
+/// node PostgreSQL had is decidable from the constant alone*:
+///
+/// * an `int8` whose value **fits** `int4` can only have come from a cast, since a literal that
+///   small is an `int4`; one that does **not** fit is what the scanner itself produces, so it is a
+///   bare constant. The same test one type up decides a `numeric`: integral and inside `int8` is a
+///   cast, integral and wider is a literal;
+/// * `smallint`, `real` and `double precision` have **no literal syntax at all**, so a constant of
+///   one always came from a cast;
+/// * a **negative** constant is constant folding having eaten a unary minus, which is a bare
+///   constant by construction.
+///
+/// So the three forms are reachable without the cast node, and the rule is a property of the pair
+/// rather than a guess. The one shape this cannot reproduce is a *negative* constant of a
+/// non-default type — `(-1)::bigint` is `('-1'::integer)::bigint` on a real server, two nodes deep
+/// — and it is declared rather than approximated.
+fn numeric_constant(printed: &str, ty: ColumnType) -> String {
+    let integral = !printed.contains(['.', 'e', 'E']);
+    let negative = printed.starts_with('-');
+    let fits_int4 = integral && printed.parse::<i32>().is_ok();
+    let fits_int8 = integral && printed.parse::<i64>().is_ok();
+
+    // The two canonical literal forms print bare, and nothing else does.
+    let is_literal_form = match ty {
+        ColumnType::Int4 => integral,
+        ColumnType::Numeric => !integral,
+        _ => false,
+    };
+    if is_literal_form && !negative {
+        return printed.to_owned();
+    }
+    // A bare constant of a non-default type: quoted, with the type the scanner would have given
+    // it. Everything else is a cast over a constant of the literal form's type.
+    let bare_constant = negative
+        || (ty == ColumnType::Int8 && !fits_int4)
+        || (ty == ColumnType::Numeric && integral && !fits_int8);
+    if bare_constant {
+        return format!("'{printed}'::{}", ty.name());
+    }
+    format!("({printed})::{}", ty.name())
+}
+
 /// One `DEFAULT`, as `pg_get_expr` prints it — for the shapes where that is not what was written.
 ///
 /// **A default and a generated column are the same `pg_attrdef` row**, printed by the same
@@ -5829,21 +5890,35 @@ fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
         Literal::TypedNull(null) => format!("NULL::{}", null.name()),
         Literal::Null => format!("NULL::{}", ty.name()),
         Literal::Bool(value) => value.to_string(),
-        Literal::Integer(value) => value.to_string(),
-        Literal::Decimal(digits) => digits.clone(),
+        // **The `int4` rung read from the printing end**: an unadorned integer is an `integer` when
+        // it fits one and a `bigint` when it does not (ADR 0087), and that is the type
+        // `numeric_constant` needs to decide which of the three forms PostgreSQL used.
+        Literal::Integer(value) => numeric_constant(
+            &value.to_string(),
+            if i32::try_from(*value).is_ok() {
+                ColumnType::Int4
+            } else {
+                ColumnType::Int8
+            },
+        ),
+        Literal::Decimal(digits) => numeric_constant(digits, ColumnType::Numeric),
         Literal::String(text) => format!("'{}'::{}", text.replace('\'', "''"), ty.name()),
-        // **A number prints bare and everything else prints with its type**, which is
-        // PostgreSQL's `get_const_expr` and is measured: `(rating > 0)` for an integer column,
-        // `(t > 'a'::text)` for a text one and `(d > '2020-01-01'::date)` for a date. The label is
-        // what tells the reader — and the re-parse — which type a quoted constant is; a numeral
-        // says so itself.
+        // **A number prints bare or quoted according to its own type, and everything else prints
+        // with its type**, which is PostgreSQL's `get_const_expr`: `(rating > 0)` for an integer
+        // column, `(t > 'a'::text)` for a text one and `(d > '2020-01-01'::date)` for a date. The
+        // label is what tells the reader — and the re-parse — which type a quoted constant is.
+        // Which numbers are bare is [`numeric_constant`]'s subject.
         Literal::Typed(value) => match value.as_ref() {
             Datum::Bool(flag) => flag.to_string(),
             number @ (Datum::Int8(_)
             | Datum::Int4(_)
             | Datum::Int2(_)
             | Datum::Double(_)
-            | Datum::Real(_)) => number.to_text().unwrap_or_default(),
+            | Datum::Real(_)
+            | Datum::Numeric(_)) => numeric_constant(
+                &number.to_text().unwrap_or_default(),
+                number.column_type().unwrap_or(ty),
+            ),
             other => format!(
                 "'{}'::{}",
                 other.to_text().unwrap_or_default().replace('\'', "''"),
