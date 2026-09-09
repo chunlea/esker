@@ -1,0 +1,21 @@
+crates/esker-cli/tests/cluster_harness/mod.rs
+  s_2d916f5f540186::t_e9191d9902fd67 401-416,421,425
+crates/esker-cli/tests/multi_region_differential.rs
+  s_2d916f5f540186::t_f678f45f475f9b 159-170,172-173,238,241-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "fab5405e55af384037096fec22387a9ce39724ca",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
