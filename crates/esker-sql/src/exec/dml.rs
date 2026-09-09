@@ -1356,10 +1356,26 @@ fn resolve_conflict(
 ///
 /// A statement with no predicate infers only an index with none, which is what keeps a bare
 /// `ON CONFLICT` off a partial index — the rule that was here before and is still right.
-fn predicate_matches(index: &crate::catalog::IndexDef, wanted: Option<&str>) -> bool {
+fn predicate_matches(
+    table: &TableDef,
+    index: &crate::catalog::IndexDef,
+    wanted: Option<&str>,
+) -> bool {
     match (index.predicate.as_deref(), wanted) {
         (None, None) => true,
-        (Some(held), Some(wanted)) => same_predicate(held, wanted),
+        // **Compared as written *and* as stored.** A stored predicate is deparsed at the statement
+        // that writes it (`exec::ddl::normalise_index_predicates`), so it is no longer the text a
+        // client wrote: `WHERE "b" IS NOT NULL` is held as `b IS NOT NULL`, and matching the two
+        // literally cost a working `ON CONFLICT` a `42P10`. So what the statement wrote goes
+        // through the same printer before comparing — and the raw text is still tried, because a
+        // predicate the printer has nothing to say about, or one stored before it existed, has to
+        // keep matching. Two chances to agree and none to disagree: strictly more permissive than
+        // comparing the text alone, which is the safe direction for an inference rule.
+        (Some(held), Some(wanted)) => {
+            same_predicate(held, wanted)
+                || super::ddl::stored_predicate_form(table, wanted)
+                    .is_some_and(|printed| same_predicate(held, &printed))
+        }
         _ => false,
     }
 }
@@ -1416,7 +1432,7 @@ fn validate_on_conflict(table: &TableDef, on_conflict: &crate::plan::OnConflict)
             .is_some_and(|wanted| wanted.is_empty() || same_key(wanted, &table.primary_key));
     let indexed = table.indexes.iter().any(|index| {
         index.unique
-            && predicate_matches(index, on_conflict.predicate.as_deref())
+            && predicate_matches(table, index, on_conflict.predicate.as_deref())
             && same_target(table, &on_conflict.target, index)
     });
     if !primary && !indexed {
@@ -1495,7 +1511,7 @@ fn conflicting_row(
     }
     for index in table.indexes.iter().filter(|index| index.unique) {
         // A partial index is inferred **only** when the statement repeats its predicate; see above.
-        if !predicate_matches(index, on_conflict.predicate.as_deref())
+        if !predicate_matches(table, index, on_conflict.predicate.as_deref())
             || !same_target(table, &on_conflict.target, index)
         {
             continue;

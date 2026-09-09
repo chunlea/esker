@@ -197,3 +197,51 @@ fn an_exclusion_predicate_follows_the_same_rule() {
         [["EXCLUDE USING gist (r WITH &&) WHERE (((n > 0) AND flag))"]]
     );
 }
+
+/// **A predicate is deparsed at the statement that writes it, and `ON CONFLICT` still finds it.**
+///
+/// `docs/plans/debts-v1.1.md` #29: `pg_get_expr(indpred)` prints what is stored, so a predicate
+/// goes through the deparser like every other stored expression — the sixth reader. Two things had
+/// to be true at once, and they are what this test is:
+///
+/// 1. **The predicate really is deparsed.** `btrim(t, 'x') = 'y'` is stored as
+///    `btrim(t, 'x'::text) = 'y'::text`, showing the coercions a real server shows. Measured in
+///    `tests/corpus/pg19_catalog_func_deparse.txt` and `pg19_negative_constant.txt`, whose
+///    `indpred` rows this closed.
+/// 2. **`ON CONFLICT` still infers the index.** The arbiter matches a partial index by its
+///    predicate *text* (`exec::dml::same_predicate`), and once the stored text is deparsed it is
+///    no longer the text a client wrote — `WHERE "b" IS NOT NULL` against `b IS NOT NULL`. The
+///    first attempt at this unit turned a working statement into `42P10` for exactly that reason,
+///    so the arbiter now puts what the statement wrote through the same printer first.
+///
+/// The second assertion is the one that would pass on the wrong mechanism: it also passes if
+/// nothing is deparsed at all. That is what the first is for, and why they are one test.
+#[test]
+fn a_deparsed_predicate_is_still_the_one_on_conflict_names() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g1b_oc (a int8, b int8, t text)",
+        // Written without the coercions, and with the quoting `ActiveRecord` writes.
+        "CREATE UNIQUE INDEX g1b_oc_u ON g1b_oc (a) WHERE btrim(t, 'x') = 'y'",
+        "CREATE UNIQUE INDEX g1b_oc_q ON g1b_oc (b) WHERE b IS NOT NULL",
+    ]);
+    // 1. the coercions are stored, which is what the sixth reader means
+    assert_eq!(
+        node.rows(
+            "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i JOIN pg_class c \
+             ON c.oid = i.indexrelid WHERE c.relname = 'g1b_oc_u'"
+        ),
+        [["(btrim(t, 'x'::text) = 'y'::text)"]]
+    );
+    // 2. and the statement that repeats the predicate as *written* still infers the index
+    for sql in [
+        "INSERT INTO g1b_oc (a, t) VALUES (1, 'y') ON CONFLICT (a) WHERE btrim(t, 'x') = 'y' \
+         DO NOTHING",
+        "INSERT INTO g1b_oc (b) VALUES (2) ON CONFLICT (\"b\") WHERE \"b\" IS NOT NULL DO NOTHING",
+    ] {
+        assert_eq!(
+            node.answer(sql).to_string(),
+            "(a command, no result set)",
+            "{sql}"
+        );
+    }
+}

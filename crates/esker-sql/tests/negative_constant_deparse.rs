@@ -81,18 +81,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `(-1)::bigint` form for both.",
             "pg19_negative_constant.txt:188",
         ),
-        (
-            "SELECT 'r', pg_get_expr(x.indpred, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nn_ixp'::regclass",
-            "**A partial index's predicate is stored as written**, which is the sixth reader of the \
-             deparse rule and the one deliberately not routed through it -- \
-             `docs/plans/debts-v1.1.md` #29, with both obstacles measured there: the reader \
-             re-parenthesises a boolean chain's operands itself, and the `ON CONFLICT` arbiter \
-             matches an index by its predicate text. So `(i8 > ('-1'::integer)::bigint)` there and \
-             `(i8 > (-1)::BIGINT)` here, the expression as written. The `CHECK` two rows up is the \
-             same predicate through a reader that *is* routed, and it agrees -- which is what says \
-             this row is about the reader and not about the constant.",
-            "pg19_negative_constant.txt:201",
-        ),
     ],
 };
 

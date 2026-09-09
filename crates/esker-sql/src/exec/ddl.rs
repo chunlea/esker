@@ -216,6 +216,7 @@ pub(super) fn create_table(
     normalise_generated(&mut table)?;
     normalise_defaults(&mut table);
     normalise_checks(&mut table);
+    normalise_index_predicates(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -5141,6 +5142,17 @@ pub(super) fn create_index(
         comment: None,
     };
 
+    // **The sixth reader, at the statement that writes one.** `pg_get_expr(indpred)` prints what
+    // is stored, so the predicate is deparsed here — before the build and before either of the two
+    // pushes below, so the concurrent path stores the same text as the ordinary one.
+    let mut index = index;
+    if let Some(predicate) = &index.predicate
+        && let Some(text) = deparse_wrapped_predicate(&table, predicate)
+    {
+        index.predicate = Some(text);
+    }
+    let index = index;
+
     if create.concurrently {
         // Declared at `absent` and built by the job: no backfill here, and nothing reads it until
         // the job has taken it all the way to `public`.
@@ -5653,17 +5665,63 @@ fn normalise_defaults(table: &mut TableDef) {
 /// [`catalog::unparenthesised`] is the same helper [`index_expression`] uses, for the same reason
 /// one column over.
 fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
-    // **A top-level `AND`/`OR` chain is left alone, because its reader re-parenthesises it.**
-    // `pg_get_constraintdef` prints each operand of a chain in its own pair
-    // ([`catalog::parenthesised_operands`], measured), so deparsing the chain here would give
-    // every operand a pair and the reader would add a second:
-    // `CHECK (((a > 0)) AND (b > 0))`. What is not deparsed then is the *operands*, which is a
-    // register row and not a silent gap — `tests/check_constraint_pretty.rs` pins the layout that
-    // says so.
-    if catalog::parenthesised_operands(expr) != expr.trim() {
-        return None;
+    // **A top-level `AND`/`OR` chain is deparsed operand by operand**, because its reader
+    // re-parenthesises the operands itself: `pg_get_constraintdef` and `pg_get_expr(indpred)` both
+    // print each operand of a chain in its own pair ([`catalog::parenthesised_operands`],
+    // measured). Deparsing the chain as one expression gave every operand a pair and the reader
+    // added a second — `(((n > 0)) AND flag)`, which `tests/index_deparse.rs` caught — so each
+    // operand is deparsed on its own, stripped of *its* outermost pair, and re-joined with the
+    // keywords the reader will parenthesise around. The split comes from
+    // [`catalog::boolean_chain`], the same scanner the reader uses, so the two cannot disagree
+    // about where an operand ends.
+    //
+    // An operand that does not deparse keeps its written text, which is [`deparse_default`]'s
+    // contract one level down; a chain can therefore be part deparsed and part verbatim, and each
+    // half is right for its own operand.
+    if let Some((operands, separators)) = catalog::boolean_chain(expr) {
+        let mut printed = String::new();
+        for (at, operand) in operands.iter().enumerate() {
+            if at > 0 {
+                printed.push(' ');
+                printed.push_str(separators[at - 1]);
+                printed.push(' ');
+            }
+            match deparse_default(table, operand) {
+                Some(text) => printed.push_str(catalog::unparenthesised(&text)),
+                None => printed.push_str(operand),
+            }
+        }
+        return Some(printed);
     }
     deparse_default(table, expr).map(|text| catalog::unparenthesised(&text).to_owned())
+}
+
+/// [`deparse_wrapped_predicate`] for a caller outside this module: the form a predicate is
+/// **stored** in, so that a comparison against a stored one compares like with like.
+///
+/// `ON CONFLICT` infers a partial index by comparing its predicate as *text*
+/// (`exec::dml::same_predicate`), and once a stored predicate is deparsed, the text a statement
+/// writes is no longer the text the catalog holds — `WHERE "b" IS NOT NULL` against
+/// `b IS NOT NULL`, which cost a working statement a `42P10` the first time this was tried. So the
+/// arbiter puts what the statement wrote through the same printer before comparing. `None` means
+/// the printer has nothing to say about this predicate, and the caller compares the text as
+/// written, which is what it did before.
+pub(super) fn stored_predicate_form(table: &TableDef, expr: &str) -> Option<String> {
+    deparse_wrapped_predicate(table, expr)
+}
+
+/// Every partial index's predicate on this table, printed the way `pg_get_expr(indpred)` prints
+/// one — the sixth reader, and the one `ActiveRecord` reads to dump a `WHERE`.
+fn normalise_index_predicates(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for index in &mut table.indexes {
+        let Some(predicate) = &index.predicate else {
+            continue;
+        };
+        if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
+            index.predicate = Some(text);
+        }
+    }
 }
 
 /// Every `CHECK` on this table, printed the way `pg_get_constraintdef` prints one.
