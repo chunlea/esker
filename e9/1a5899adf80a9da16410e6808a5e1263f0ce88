@@ -1,0 +1,65 @@
+crates/esker-keys/src/array.rs
+  s_6f7019c05b578b::t_933522535b6b8d 90,148
+crates/esker-keys/src/columnar.rs
+  s_6f7019c05b578b::t_154d62e6c0335a 72,270
+crates/esker-keys/src/row.rs
+  s_6f7019c05b578b::t_54c179edea3041 545,1213,1270,2213
+crates/esker-keys/src/value.rs
+  s_6f7019c05b578b::t_aee625280bca40 590-591,607,677
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_7fa0d4bedad46d 2959,3180,3341
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_f942c32aa2f5f6 364-366,525,684
+crates/esker-sql/src/exec/aggregate.rs
+  s_6f7019c05b578b::t_5d49f70e254b45 275-290,1392-1408
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_548ed4a945db11 1494-1498
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_55d03ae0e56eaa 2265-2300,2666-2687,3574-3580,3586,4019-4047
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_e3a5652e99c0c3 1072
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_73ea1fde169b12 3579-3593,3595-3605
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_e4d260101d99b4 3599
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_e6de96dd42b285 5626-5639,5903-5913,5948-6006,6033-6039,6042-6045
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_25200f19f16327 1839-1848,2499,2589,2761
+crates/esker-sql/src/row.rs
+  s_6f7019c05b578b::t_6e432eb18bc130 113
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_a8179cad555d8a 1298-1303,1306,1308,1336,1573,1784,1894,1992,2301,2590,3375
+crates/esker-sql/tests/array_delimiter.rs
+  s_6f7019c05b578b::t_81c0bc5b5d3dc4 150,164-169
+crates/esker-sql/tests/captures/pg19_reg_class.txt
+  s_6f7019c05b578b::t_e6f0c7f6c8b55d 1-141
+crates/esker-sql/tests/corpus/pg19_reg_class.txt
+  s_6f7019c05b578b::t_7722fed785e42e 1-93
+crates/esker-sql/tests/reg_class.rs
+  s_6f7019c05b578b::t_e05b4d86abe058 1-222
+crates/esker-sql/tests/row_order.rs
+  s_6f7019c05b578b::t_5e85e243f5e43b 172
+crates/esker-store/src/columnar/decode.rs
+  s_6f7019c05b578b::t_fbe2714ed90376 273
+docs/DESIGN.md
+  s_6f7019c05b578b::t_f993fe26b2ee9d 1167-1171
+docs/adr/0098-regproc-is-an-oid-that-prints-as-a-function.md
+  s_6f7019c05b578b::t_1eb6b6dbf1ee50 33-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e91a5899adf80a9da16410e6808a5e1263f0ce88",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
