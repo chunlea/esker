@@ -1,0 +1,22 @@
+crates/esker-sql/tests/cross_session_cancel.rs
+  h_44076b318daf9c 4-6,360-381
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 1364-1410
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,74,91-92
+docs/plans/phase-16-mpp.md
+  h_44076b318daf9c 527-580,629-652
+docs/plans/split-region.md
+  h_44076b318daf9c 264-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "46e14edc34040a400d8f7b563f3298ef67ae6325",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
