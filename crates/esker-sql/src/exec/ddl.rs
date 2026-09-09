@@ -5957,6 +5957,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
                         | plan::CatalogFunc::Least
                         | plan::CatalogFunc::NullIf
                         | plan::CatalogFunc::Substring
+                        | plan::CatalogFunc::Mod
                 )
                 || catalog_parameter_types(call.func, call.args.len()).is_some()
         }
@@ -6012,10 +6013,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
     use crate::plan::Expr;
     let sub = |expr: &Expr| deparse(expr, table, ty);
     match expr {
-        Expr::Ordinal { at, .. } => table
-            .columns
-            .get(*at)
-            .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
+        // **A name is quoted the way `quote_ident` quotes it**, which is one call and not a rule
+        // written here: [`catalog::quote_identifier`] carries PostgreSQL 19's own
+        // `pg_get_keywords()` answer. Printing it bare made `CHECK (("primary" > 0))` come back
+        // `CHECK ((primary > 0))`, which is not only a different string — it does not re-parse,
+        // and the index readers only *looked* right because `reads_back` refused the bare form
+        // and the written text survived. `tests/corpus/pg19_quoted_identifier.txt` measures all
+        // five readers, and `value` and `name` are the pair that says this is a measured list
+        // rather than a guess about keywords: both are keywords and both print bare.
+        Expr::Ordinal { at, .. } => table.columns.get(*at).map_or_else(
+            || format!("<column {at}>"),
+            |column| catalog::quote_identifier(&column.name),
+        ),
         Expr::Literal(literal) => deparse_literal(literal, ty),
         Expr::Array { elements, .. } => {
             format!(
@@ -6201,6 +6210,11 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             branches,
             otherwise,
         } => {
+            // **Every part takes its own pair, which is PostgreSQL's *plain* form** —
+            // `WHEN (price IS NOT NULL) THEN (price + 1) ELSE (price * 2)`, measured, and what
+            // `pg_get_expr(indexprs)` gives an index key. The *pretty* form takes none of them,
+            // and that is `catalog::pretty_case`'s job at the one reader that asks for it: the
+            // text is stored once, in this shape, and stripped on the way out.
             let mut text = "\nCASE".to_owned();
             for branch in branches {
                 let _ = write!(
@@ -6222,7 +6236,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Refused before this is reached: `refuse_unless_immutable` rejects every one of them as
         // an index key, and a column reference has been resolved to an `Ordinal` by then. Printed
         // rather than panicked on, because this is a catalog write and not a place to abort.
-        Expr::Column { name, .. } => name.clone(),
+        Expr::Column { name, .. } => catalog::quote_identifier(name),
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
         Expr::CurrentDatabase => "current_database()".to_owned(),
@@ -6342,6 +6356,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 ),
                 None => format!("SUBSTRING({operand} FROM {from})"),
             }
+        }
+        // **`mod` prints as a call and coerces like the operator it is.** `mod(id, 10)` over an
+        // `integer` column is `mod(id, 10)` and over a `bigint` one is `mod(id, (10)::bigint)` —
+        // measured — which is the common-type rule the four productions follow, spelled with a
+        // lower-case name instead of an upper-case one.
+        Expr::CatalogFunc(call) if call.func == plan::CatalogFunc::Mod && call.args.len() == 2 => {
+            let common = production_common_type(&call.args, table, ty);
+            format!(
+                "mod({}, {})",
+                deparse_production_argument(&call.args[0], table, common),
+                deparse_production_argument(&call.args[1], table, common)
+            )
         }
         // **An ordinary call, with its arguments and the coercion each parameter took.** The name
         // is its own, lower-case, quoted where a real server quotes it — `substring` is a reserved

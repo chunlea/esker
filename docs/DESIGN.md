@@ -377,7 +377,11 @@ log replication with batching and flow control (`max_inflight_msgs`), **pre-vote
 leader **ReadIndex**, log compaction and **snapshots** (InstallSnapshot streamed by the store), single-server
 **membership change** (add/remove one voter or learner at a time; joint consensus is an ADR for later),
 **learners**, leadership transfer. The message set folds heartbeats into `AppendEntries` and
-acknowledges a snapshot with `AppendEntriesResponse` — [ADR 0007](adr/0007-raft-message-set.md).
+acknowledges a snapshot with `AppendEntriesResponse` — [ADR 0007](adr/0007-raft-message-set.md). A vote
+is granted only to a candidate **this** configuration calls a voter, which is not the same question
+as whether the candidate thinks it is one — a node promoted in a configuration the voter has not
+applied yet is still a learner here, and granting it would elect a leader the group does not have
+([ADR 0085](adr/0085-a-vote-is-not-granted-to-a-learner.md)).
 
 Determinism rules: no `Instant`, no `rand::thread_rng` — the RNG is injected and seeded, and the node
 id selects its PCG stream so one seed reproduces a whole cluster; no `HashMap` appears in the crate,
@@ -423,7 +427,11 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   *same stores*, both halves' `version` bumps, and both `'m'` records go into the **same batch as
   `apply_index`** — so a crash has both or neither. The child's log starts at index 0 and its group elects
   from scratch; its `conf_state` is the split-time membership, which for a log beginning at index 0 is
-  exactly what `InitialState::conf_state` means. Merge is post-v1.
+  exactly what `InitialState::conf_state` means. **"Elects from scratch" is what it used to do**:
+  the child now starts led by the store that led the parent, which knows at apply time that it is the
+  leader, that the child's membership is the parent's and that the child's log is empty — everything
+  an election would have established ([ADR 0094](adr/0094-a-split-childs-leader-is-the-parents-leader.md)).
+  Merge is post-v1.
   - **What "the region's data" is, for both the size and the boundary.** A region owns a range of
     the *user* key space, and each user key reaches the engine as `'r' ++ key` or as
     `'x' ++ enc(key) ++ !ts` — so a region is one engine range **per physical namespace**, in every
@@ -1027,6 +1035,24 @@ is in its first sentence.
   only thing between a client and a writable one. A view publishes its columns to `pg_attribute`
   too, resolved when it is created rather than at each read. Every one of them is bounded where `Sort` is (`53400`), and none of
   them routes to the columnar engine.
+  **The type surface is a list of decisions, not a lattice**, and each one is an ADR because each
+  was measured against a real server rather than derived: `name` is a stored type whose tag is
+  additive ([ADR 0084](adr/0084-name-is-a-stored-type-and-its-tag-is-additive.md)), `void` is a type
+  and the first pseudo-type in the vocabulary
+  ([ADR 0092](adr/0092-void-is-a-type-and-it-is-the-first-pseudo-type.md)), and the five geometric
+  shapes have their arrays ([ADR 0091](adr/0091-the-five-geometric-shapes-get-their-arrays.md)).
+  A **literal** takes the narrowest type that holds it
+  ([ADR 0087](adr/0087-an-integer-literal-is-the-narrowest-type-that-holds-it.md)) and a decimal one
+  is a `numeric` ([ADR 0089](adr/0089-a-decimal-literal-is-a-numeric.md)); a **folded cast keeps the
+  type it named** ([ADR 0086](adr/0086-a-folded-cast-keeps-the-type-it-named.md)), which is what lets
+  the printer recover the tree it came from; and `pg_typeof` answers the **declared** type rather
+  than reading the datum, because several types share one
+  ([ADR 0093](adr/0093-pg_typeof-is-resolved-against-the-declared-type.md)).
+  **A stored expression is deparsed by the statement that writes it**, once, rather than by each of
+  the six readers that print one
+  ([ADR 0090](adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)) — a
+  generated column, a `DEFAULT`, an index key, a `CHECK`, `pg_get_indexdef` and
+  `pg_get_expr(indexprs)` all read the same text out of the catalog.
   **`pg_catalog` and `information_schema` are computed relations**
   ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)):
   **thirty-nine** views — thirty-two in `pg_catalog` and seven in `information_schema` — over the same `'m'`-space
@@ -1137,6 +1163,11 @@ Joint consensus vs single-server changes only — live for the **store's** group
 issues the changes and might one day want to move two peers together · separate Raft log store ·
 async commit / 1PC · leader leases vs ReadIndex only · secondary-index encoding for composite keys ·
 how much Postgres surface for the first SQL milestone.
+
+*Pending, decided elsewhere and not in this tree yet:* the `"char"` one-byte type
+(ADR 0095), `oid` as its own type rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) are
+b4's, accepted and unlanded at the time of writing — the three families
+`crates/esker-sql/tests/parity_harness/mod.rs`'s standing table still counts.
 
 *Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
 `esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above). **Dynamic PD

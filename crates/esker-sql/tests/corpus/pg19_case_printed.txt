@@ -1,0 +1,47 @@
+# **How a `CASE` is printed back**, in both of `pg_get_constraintdef`'s forms.
+#
+#!escaped
+#
+# Run 108's first new red. `check_constraint_test#test_check_constraints` adds
+# `CHECK (CASE WHEN price IS NOT NULL THEN true ELSE false END)` and asserts the read-back
+# **includes `WHEN price IS NOT NULL`** — unparenthesised. This node answered
+# `WHEN (price IS NOT NULL)`.
+#
+# ## The premise in the report was the wrong way round, and the measurement says why
+#
+# PostgreSQL's **plain** form parenthesises the `WHEN` condition, the `THEN` and the `ELSE`; its
+# **pretty** form parenthesises none of them. Both are below, from one server, one transaction:
+#
+#     plain    CHECK (~CASE~    WHEN (price IS NOT NULL) THEN true~    ELSE false~END)
+#     pretty   CHECK (~CASE~    WHEN price IS NOT NULL THEN true~    ELSE false~END)
+#
+# So the node's answer *is* PostgreSQL's — of the other form. `ActiveRecord` reads
+# `pg_get_constraintdef(oid, true)`, the pretty one, and this node prints one stored text for both
+# forms, varying only the outer pair. A bare column is the one operand pretty and plain agree on
+# (`c5`, `WHEN a THEN`), which is what makes this about the pair and not about the layout.
+#
+# ## What this node can do about it
+#
+# It stores text where a real server stores a tree, so it cannot render two shapes from one. The
+# reader that matters is the pretty one — it is what `ActiveRecord` asks for and what the suite
+# asserts — so the deparser emits the pretty shape and the **plain** read-back is a declared
+# divergence, measured here rather than assumed. `c6` shows the outer pair moving too, which the
+# node's `pretty` branch already handles.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) inside one `BEGIN ... ROLLBACK`. **Written by
+# hand from a `psql -At` reading**, because a `CASE` read-back holds newlines and `sesscap.py`
+# drops every output line beginning with a space (`docs/plans/debts-v1.1.md` #20's second half,
+# r1's). The values carry this format's escape contract, which is what makes a newline expressible
+# at all.
+
+BEGIN		-
+CREATE TABLE g1cs (price integer, a boolean, b boolean)		-
+ALTER TABLE g1cs ADD CONSTRAINT c1 CHECK (CASE WHEN price IS NOT NULL THEN true ELSE false END)		-
+ALTER TABLE g1cs ADD CONSTRAINT c2 CHECK (CASE WHEN price > 0 THEN true ELSE false END)		-
+ALTER TABLE g1cs ADD CONSTRAINT c3 CHECK (CASE WHEN a AND b THEN true ELSE false END)		-
+ALTER TABLE g1cs ADD CONSTRAINT c4 CHECK (CASE WHEN NOT a THEN true ELSE false END)		-
+ALTER TABLE g1cs ADD CONSTRAINT c5 CHECK (CASE WHEN a THEN true ELSE false END)		-
+ALTER TABLE g1cs ADD CONSTRAINT c6 CHECK (CASE WHEN price > 0 THEN price + 1 ELSE price * 2 END > 0)		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1cs'::regclass AND contype = 'c' ORDER BY conname		r|c1|CHECK (\nCASE\n    WHEN (price IS NOT NULL) THEN true\n    ELSE false\nEND) ; r|c2|CHECK (\nCASE\n    WHEN (price > 0) THEN true\n    ELSE false\nEND) ; r|c3|CHECK (\nCASE\n    WHEN (a AND b) THEN true\n    ELSE false\nEND) ; r|c4|CHECK (\nCASE\n    WHEN (NOT a) THEN true\n    ELSE false\nEND) ; r|c5|CHECK (\nCASE\n    WHEN a THEN true\n    ELSE false\nEND) ; r|c6|CHECK ((\nCASE\n    WHEN (price > 0) THEN (price + 1)\n    ELSE (price * 2)\nEND > 0))
+SELECT 'r', conname, pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'g1cs'::regclass AND contype = 'c' ORDER BY conname		r|c1|CHECK (\nCASE\n    WHEN price IS NOT NULL THEN true\n    ELSE false\nEND) ; r|c2|CHECK (\nCASE\n    WHEN price > 0 THEN true\n    ELSE false\nEND) ; r|c3|CHECK (\nCASE\n    WHEN a AND b THEN true\n    ELSE false\nEND) ; r|c4|CHECK (\nCASE\n    WHEN NOT a THEN true\n    ELSE false\nEND) ; r|c5|CHECK (\nCASE\n    WHEN a THEN true\n    ELSE false\nEND) ; r|c6|CHECK (\nCASE\n    WHEN price > 0 THEN price + 1\n    ELSE price * 2\nEND > 0)
+ROLLBACK		-

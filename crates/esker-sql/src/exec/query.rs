@@ -5365,6 +5365,17 @@ fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> 
         // rule rather than written a second time.
         CatalogFunc::Greatest | CatalogFunc::Least => greatest_type(&call.args, scope),
         CatalogFunc::NullIf => nullif_type(&call.args, scope),
+        // The operator's own rule, since it is the operator's own implementation.
+        CatalogFunc::Mod => match (
+            call.args.first().map(|a| expr_type(a, scope)),
+            call.args.get(1).map(|a| expr_type(a, scope)),
+        ) {
+            (Some(Ok(left)), Some(Ok(right))) => {
+                crate::value::arith::result_type(crate::plan::ArithOp::Modulo, left, right)
+                    .unwrap_or(left)
+            }
+            _ => ColumnType::Int8,
+        },
         _ => call.func.result_type(),
     }
 }
