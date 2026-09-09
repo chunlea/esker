@@ -5997,6 +5997,36 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
             // true when it was written and not once the text-search family arrived.
             // `to_tsvector('english', …)` is `IMMUTABLE` on a real server and is exactly what
             // `schema_test.rb` builds a GIN index over.
+            // **A name this crate has never heard of is *named*, not called not-immutable.**
+            // `parse::lower` carries an unknown call out as `CatalogFunc::UserFunc` on purpose —
+            // lowering cannot see the catalog, so the name may be a user function — and the query
+            // path then refuses it `0A000 the function <name>`
+            // (`Executor::inline_user_function`). This guard used to reach it as "a catalog
+            // function that is not immutable" and answer
+            // `42P17 functions in index expression must be marked IMMUTABLE`, which is a true
+            // sentence about a false premise: `md5('a')` is refused here and `md5` appears nowhere
+            // in this crate, so the reason a reader was given named the wrong thing.
+            //
+            // Measured on 19beta1: `md5('a')` is answered (`provolatile = 'i'`) and
+            // `nosuchfn('a')` is `42883 function nosuchfn(unknown) does not exist` with
+            // `DETAIL: There is no function of that name.` — this node's `0A000` for a name it
+            // lacks is the standing C2 convention and `error.rs` states it: "the `0A000` a
+            // function this node has never heard of gets is a different answer for a different
+            // condition". What was wrong was answering neither of the two.
+            //
+            // A **declared** user function lands here too and gets the same refusal, which is
+            // also right: this node cannot evaluate one at all
+            // (`docs/plans/phase-9-rails.md`'s `my_uuid_generator` row), so "not supported" is
+            // the honest answer whatever the function's declared volatility says.
+            Expr::CatalogFunc(call) if call.func == plan::CatalogFunc::UserFunc => {
+                Some(SqlError::unsupported(format!(
+                    "the function {}",
+                    match call.args.first() {
+                        Some(Expr::Literal(plan::Literal::String(name))) => name.as_str(),
+                        _ => "?",
+                    }
+                )))
+            }
             Expr::CatalogFunc(call) if !call.is_immutable() => Some(SqlError::NotImmutableInIndex),
             // A parameter has no value at `CREATE INDEX` time; a real server answers
             // `42P02 there is no parameter $1`, which is what this prints.
