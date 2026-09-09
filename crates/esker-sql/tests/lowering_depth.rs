@@ -48,6 +48,23 @@ fn or_chain(depth: usize) -> String {
     sql
 }
 
+/// `SELECT * FROM t WHERE a + 1 + 1 + … = 0`: no brackets, no boolean chain, and one
+/// `plan::Expr` level per term.
+///
+/// **The shape that still tests the plan bound.** An `OR` chain used to be it, and is not any more:
+/// the lowering folds a boolean chain into a balanced tree, so a thousand `OR`s are a dozen levels.
+/// Arithmetic is not folded that way — it is not associative over the types this node has, where
+/// `a + 1 + 1` and `a + (1 + 1)` can differ — so it stays one level per operator and is what a
+/// guard on `plan::Expr` depth has to catch.
+fn sum_chain(depth: usize) -> String {
+    let mut sql = String::from("SELECT * FROM t WHERE a");
+    for _ in 0..depth {
+        sql.push_str(" + 1");
+    }
+    sql.push_str(" = 0");
+    sql
+}
+
 /// `SELECT ((((… 1 …))))`: deep in the source, and every level a bracket.
 fn parens(depth: usize) -> String {
     let mut sql = String::from("SELECT ");
@@ -113,6 +130,7 @@ fn statement(depth: usize) -> String {
         Ok("union") => union_chain(depth),
         Ok("in") => in_list(depth),
         Ok("row") => row_value(depth),
+        Ok("sum") => sum_chain(depth),
         _ => or_chain(depth),
     }
 }
@@ -275,10 +293,10 @@ fn a_plan_deeper_than_the_bound_is_refused_rather_than_fatal() {
         esker_sql::parse::MAX_PLAN_DEPTH + 1,
         1_000,
     ] {
-        let answer = run_probe_executing(depth);
+        let answer = run_probe_shaped(depth, Some("execute"), Some("sum"));
         assert!(
             answer.is_some(),
-            "the child died executing a {depth}-term OR chain: invariant 9"
+            "the child died executing a {depth}-term arithmetic chain: invariant 9"
         );
         assert_eq!(answer.as_deref(), Some("REFUSED 54001"), "at depth {depth}");
     }
@@ -371,4 +389,34 @@ fn the_admissible_depth_of_a_query_paren_and_a_union_chain_lowers_and_runs() {
             "{shape} at {deepest} lowered and then did not run"
         );
     }
+}
+
+/// **A thousand `OR`s is a chain, not a depth.**
+///
+/// `or_test.rb`'s *too many or*: Active Record ORs 1001 relations into one predicate and counts the
+/// rows. PostgreSQL 19 answers a number — measured, a flat chain of twenty thousand terms is fine
+/// there and so is five thousand levels of brackets — and this node answered `54001 stack depth
+/// limit exceeded`, because `a OR b OR c` parses leaning left and the lowering built one
+/// `plan::Expr` level per term.
+///
+/// The bound it hit is real and stays: [`esker_sql::parse::MAX_PLAN_DEPTH`] is what keeps forty
+/// recursive walks over `plan::Expr` off the end of a `tokio` worker's stack. What was wrong is
+/// that a chain of a thousand *siblings* was being counted as a thousand *generations*.
+#[test]
+fn a_thousand_ors_is_a_chain_and_not_a_depth() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE paragraphs (id bigint primary key, book_id bigint)",
+        "INSERT INTO paragraphs VALUES (1, 1), (2, 4), (3, 9), (4, 17)",
+    ]);
+    // The shape Active Record sends: `id = $1 AND book_id = $2 OR id = $3 AND …`, no brackets
+    // around the pairs, 1001 of them.
+    let terms = (0..1001)
+        .map(|i| format!("id = {i} AND book_id = {}", i * i))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    assert_eq!(
+        node.rows(&format!("SELECT COUNT(*) FROM paragraphs WHERE {terms}")),
+        vec![vec!["3".to_string()]],
+        "rows 1, 2 and 3 match `book_id = id * id`; row 4 does not"
+    );
 }

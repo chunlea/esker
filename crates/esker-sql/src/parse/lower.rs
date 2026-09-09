@@ -3744,6 +3744,74 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
 /// can walk on a worker's stack, because a plan this crate builds and then cannot execute would
 /// only move the crash a layer along. It did, once: guarding lowering alone left a 500-term chain
 /// lowering happily and overflowing in the resolver.
+/// Lowers `a AND b AND …` or `a OR b OR …` **iteratively**, into a tree of about `log2(n)` levels.
+///
+/// The spine is walked with a loop rather than by recursion, so the lowering of a long chain costs
+/// one frame plus the deepest operand rather than one frame per term; the fold that follows is what
+/// keeps every *later* walk over the tree short. See the `And | Or` arm of [`lower_expr`] for why
+/// reshaping a boolean chain is allowed.
+fn lower_boolean_chain(op: &BinaryOperator, left: &Expr, right: &Expr) -> Result<plan::Expr> {
+    let folded = if matches!(op, BinaryOperator::And) {
+        plan::BinaryOp::And
+    } else {
+        plan::BinaryOp::Or
+    };
+    // Right to left down the spine, because that is the way the tree leans; reversed afterwards so
+    // the operands are in the order they were written, which is what a reader of an `EXPLAIN` and
+    // anything matching on the tree expects to see.
+    let mut operands = vec![right];
+    let mut spine = left;
+    while let Expr::BinaryOp {
+        op: inner,
+        left: rest,
+        right: operand,
+    } = spine
+        && inner == op
+    {
+        operands.push(operand);
+        spine = rest;
+    }
+    operands.push(spine);
+    operands.reverse();
+
+    // **Through `lower_condition`, which is what the operand of an `AND` is owed.** An unadorned
+    // string literal in a boolean context is *read* as a boolean rather than refused — `WHERE
+    // 'true' AND true` runs on a real server and `WHERE 'text' AND true` is `22P02 invalid input
+    // syntax for type boolean`, a value error and not a type one. Lowering the operands with plain
+    // `lower_expr` turned both of those into `42804`, which two corpus lines caught at once.
+    let mut level = Vec::with_capacity(operands.len());
+    for operand in operands {
+        level.push(lower_condition(operand, true)?);
+    }
+    balance(folded, level)
+}
+
+/// Folds operands pairwise until one is left: `n` terms become a tree `⌈log2(n)⌉` deep.
+///
+/// An odd operand is carried to the next round rather than paired with a synthetic `true`, which
+/// would be a value the client did not write showing up in an `EXPLAIN`.
+fn balance(op: plan::BinaryOp, mut level: Vec<plan::Expr>) -> Result<plan::Expr> {
+    while level.len() > 1 {
+        let mut folded = Vec::with_capacity(level.len().div_ceil(2));
+        let mut operands = level.into_iter();
+        while let Some(left) = operands.next() {
+            folded.push(match operands.next() {
+                Some(right) => plan::Expr::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                None => left,
+            });
+        }
+        level = folded;
+    }
+    // The caller always passes both sides of a binary operator, so there is at least one.
+    level.pop().ok_or_else(|| {
+        SqlError::Internal("a boolean chain lowered to no operands at all".to_owned())
+    })
+}
+
 const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
 
 thread_local! {
@@ -4113,6 +4181,30 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 ty: None,
             })
         }
+        // **A boolean chain is a row of siblings, not a thousand generations.**
+        //
+        // `a OR b OR c` parses leaning left, so a predicate of *n* terms arrives as a tree *n*
+        // deep. Lowering it one frame per term is what the guard above exists to stop — it was
+        // added when a 500-term chain overflowed the resolver — and the guard then refused
+        // `or_test.rb`'s 1001-relation `.or` chain with `54001`, where PostgreSQL 19 answers a
+        // number. Measured on the oracle: twenty thousand terms flat is fine there, and so is five
+        // thousand levels of brackets, so nothing about this shape is too complex for a server.
+        //
+        // The chain is collected **in a loop** and folded into a balanced tree, so a thousand terms
+        // is a dozen levels rather than a thousand and every one of the forty walks over
+        // `plan::Expr` is short. The depth bound is untouched: what changes is that siblings stop
+        // being counted as generations, which is what they always were.
+        //
+        // Sound because `AND` and `OR` are associative — in three-valued logic too, where `OR`
+        // takes the largest of false < null < true and `AND` the smallest — and because
+        // PostgreSQL defines the evaluation order of a boolean expression's operands as **not
+        // guaranteed**, so no client may depend on the shape either. Nothing prints a
+        // `plan::Expr` back as SQL (`pg_get_expr` reads stored text), so no deparse can see it.
+        Expr::BinaryOp {
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            left,
+            right,
+        } => lower_boolean_chain(op, left, right),
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
                 BinaryOperator::Eq => plan::BinaryOp::Eq,
