@@ -122,6 +122,20 @@ pub enum ColumnType {
     /// this type could not arrive before the typmod did — there is nowhere to pad to without an
     /// `n` ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Bpchar,
+    /// PostgreSQL's `name`: the type its own catalog is written in, and the one string type that
+    /// is **fixed width**.
+    ///
+    /// `typlen` is 64 and positive where every other string type's is -1, and the value is
+    /// truncated to **63** bytes on the way in — the 64th is C's terminator. The truncation is by
+    /// bytes and stops on a character boundary, so `repeat('é',64)::name` is 31 characters and 62
+    /// octets rather than half of a 32nd (measured, `tests/captures/pg19_name_type.txt`).
+    ///
+    /// Stored as its text, like [`ColumnType::Varchar`], and telling itself apart by OID — but
+    /// unlike `varchar` its **collation is C**, so a column of it sorts in byte order and every
+    /// capital precedes every lower-case letter. A memcomparable key is already in byte order
+    /// ([ADR 0076](../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), so that
+    /// ordering is the one this crate gives it for free.
+    Name,
     /// PostgreSQL's `json`: a **validated string**, stored exactly as it was sent. Whitespace,
     /// key order and duplicate keys all survive, because that is all `json` is
     /// ([ADR 0042](../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
@@ -236,6 +250,13 @@ pub enum ColumnType {
     Point,
     /// `point[]`. `geometric_test.rb` declares one (`t.point :array_of_points, array: true`).
     PointArray,
+    /// `box[]`, and **the one array type in all of `pg_type` whose delimiter is not a comma**.
+    ///
+    /// A `box` is written `(x1,y1),(x2,y2)` — commas inside the value — so an array of them
+    /// separates its elements with `;` instead: `{(1,1),(0,0);(3,3),(2,2)}` is two boxes.
+    /// `type_lookup_test.rb` looks this type up by oid precisely to read that delimiter back
+    /// (`tests/array_delimiter.rs`).
+    BoxArray,
     /// PostgreSQL's `money`: **a count of cents in an `i64`**, and nothing else.
     ///
     /// `typlen` is 8 and `typstorage` is `p` — plain, not a varlena — so the range is exactly
@@ -520,13 +541,14 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 90] = [
+    pub const ALL: [ColumnType; 92] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
         ColumnType::Text,
         ColumnType::Varchar,
         ColumnType::Bpchar,
+        ColumnType::Name,
         ColumnType::Json,
         ColumnType::Jsonb,
         ColumnType::Hstore,
@@ -588,6 +610,7 @@ impl ColumnType {
         ColumnType::Int8RangeArray,
         ColumnType::Point,
         ColumnType::PointArray,
+        ColumnType::BoxArray,
         ColumnType::Money,
         ColumnType::MoneyArray,
         ColumnType::Inet,
@@ -1097,6 +1120,10 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
         (
             ColumnType::Text,
             ColumnType::Varchar
+                // **A `name` is its text too**, and truncated before it ever reaches a row: the
+                // 63-byte cut belongs to the cast, where the character boundary is known, so what
+                // arrives here is already a value of the type.
+                | ColumnType::Name
                 | ColumnType::Bpchar
                 | ColumnType::Json
                 | ColumnType::Jsonb

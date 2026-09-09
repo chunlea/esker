@@ -453,6 +453,11 @@ pub(crate) fn typcollation(ty: ColumnType) -> i64 {
         | ColumnType::VarcharArray
         | ColumnType::BpcharArray
         | ColumnType::CitextArray => DEFAULT_COLLATION,
+        // **`name`'s own collation is C**, not the database default: it is the type the catalog
+        // is written in, and a catalog has to sort the same way everywhere. Measured — `pg_type`
+        // reports 950 for it and `information_schema.columns.collation_name` says `C`, where a
+        // `text` column of the same values reports the default.
+        ColumnType::Name => C_COLLATION,
         _ => NO_COLLATION,
     }
 }

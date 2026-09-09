@@ -197,6 +197,10 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::Int2Array
         | StoredType::NumericArray
         | StoredType::TextArray
+        // **Nor is a `name` column**, for that reason and no other: `esker-columnar`'s
+        // `ColumnType` is a separate enum with no tag for it, and `esker_sql`'s
+        // `fragment::column_type` answers the same on the other side of this seam (ADR 0084).
+        | StoredType::Name
         // **An hstore column is not columnar**, the same deliberate gap an array column is: it is
         // text-shaped and `esker-columnar` could hold one, but its own `ColumnType` is a separate
         // enum and teaching it a type is that crate's unit. A table with one routes to the row
@@ -257,7 +261,7 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::NumRangeArray
         | StoredType::Int8RangeArray
         | StoredType::Point
-        | StoredType::PointArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
+        | StoredType::PointArray | StoredType::BoxArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
     })
 }
 

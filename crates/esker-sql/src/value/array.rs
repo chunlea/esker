@@ -31,6 +31,20 @@ use crate::value::{ColumnType, PgDatum as _};
 use esker_keys::array::ArrayValue;
 use esker_keys::value::Datum;
 
+/// What separates two elements of an array of `element`: `pg_type.typdelim`.
+///
+/// **`box` is the only element type whose delimiter is not a comma**, because a `box` is written
+/// `(x1,y1),(x2,y2)` and a comma could not tell two of them apart. Measured by asking a real
+/// server for every array type whose `typdelim <> ','` and getting exactly `_box`
+/// (`tests/array_delimiter.rs`).
+fn delimiter_of(element: ColumnType) -> u8 {
+    if element == ColumnType::Box {
+        b';'
+    } else {
+        b','
+    }
+}
+
 /// `array_in`: a literal read as an array of `element`.
 pub fn from_text(text: &str, element: ColumnType) -> Result<ArrayValue> {
     let malformed = |detail: &str| {
@@ -50,6 +64,7 @@ pub fn from_text(text: &str, element: ColumnType) -> Result<ArrayValue> {
     let mut parser = Parser {
         bytes: body.as_bytes(),
         at: 0,
+        delimiter: delimiter_of(element),
     };
     parser.skip_space();
     if parser.peek() != Some(b'{') {
@@ -92,6 +107,11 @@ fn strip_bounds(body: &str) -> Option<(i32, &str)> {
 struct Parser<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// What separates two elements: `,` for every element type but `box`, whose own values hold
+    /// commas — `{(1,1),(0,0);(3,3),(2,2)}` is two boxes, not eight numbers. It is `pg_type`'s
+    /// `typdelim` of the *element*, which is where a client reads it from too
+    /// (`tests/array_delimiter.rs`).
+    delimiter: u8,
 }
 
 impl Parser<'_> {
@@ -136,7 +156,9 @@ impl Parser<'_> {
                     self.read_braced(element, depth + 1, dims, values, whole)?;
                     let _ = before;
                 }
-                Some(b',') => return malformed("Unexpected \",\" character."),
+                Some(d) if d == self.delimiter => {
+                    return malformed("Unexpected \",\" character.");
+                }
                 Some(_) => {
                     // A scalar element here means this brace holds elements, so nothing deeper
                     // may appear in it — `'{a{b}'` is the `{` character reported by name.
@@ -147,7 +169,7 @@ impl Parser<'_> {
             count += 1;
             self.skip_space();
             match self.peek() {
-                Some(b',') => self.at += 1,
+                Some(d) if d == self.delimiter => self.at += 1,
                 Some(b'}') => {
                     self.at += 1;
                     break;
@@ -216,13 +238,13 @@ impl Parser<'_> {
             }
             // A **quoted** element is never a NULL, which is the whole of `{NULL,"NULL"}`.
             self.skip_space();
-            if !matches!(self.peek(), Some(b',' | b'}') | None) {
+            if !matches!(self.peek(), Some(b'}') | None) && self.peek() != Some(self.delimiter) {
                 return Err(malformed("Incorrectly quoted array element."));
             }
             return Ok(Some(Datum::from_text(element, &text)?));
         }
         let start = self.at;
-        while !matches!(self.peek(), Some(b',' | b'}') | None) {
+        while !matches!(self.peek(), Some(b'}') | None) && self.peek() != Some(self.delimiter) {
             if self.peek() == Some(b'{') {
                 return Err(malformed("Unexpected \"{\" character."));
             }
@@ -279,7 +301,7 @@ fn write_dimension(
     };
     for at in 0..count {
         if at > 0 {
-            out.push(',');
+            out.push(char::from(delimiter_of(value.element)));
         }
         if depth + 1 < dims.len() {
             write_dimension(value, dims, depth + 1, next, rendering, out);
@@ -289,6 +311,7 @@ fn write_dimension(
                     crate::value::to_text_under(element, rendering)
                         .unwrap_or_default()
                         .as_str(),
+                    delimiter_of(value.element),
                 ),
                 // An unquoted `NULL` is how a NULL element prints, which is what makes it read
                 // back as one.
@@ -302,12 +325,12 @@ fn write_dimension(
 }
 
 /// An element, quoted only if printing it bare would not read back as itself.
-fn quoted(text: &str) -> String {
+fn quoted(text: &str, delimiter: u8) -> String {
     let needs = text.is_empty()
         || text.eq_ignore_ascii_case("null")
-        || text
-            .chars()
-            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+        || text.chars().any(|c| {
+            matches!(c, '{' | '}' | '"' | '\\') || c == char::from(delimiter) || c.is_whitespace()
+        });
     if !needs {
         return text.to_owned();
     }

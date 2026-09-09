@@ -1023,6 +1023,11 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         Row::Real => Col::Real,
         Row::Text => Col::Text,
         Row::Varchar => Col::Varchar,
+        // **Not a columnar type.** The columnar format has no `name` tag, and inventing one for a
+        // type whose whole point is a 63-byte catalog identifier would be a representation this
+        // node made up. `None` keeps the filter on the row side, which is the same answer
+        // `regtype` gets two arms above and for the same reason.
+        Row::Name => return None,
         Row::Bpchar => Col::Bpchar,
         Row::Json => Col::Json,
         Row::Jsonb => Col::Jsonb,
@@ -1072,6 +1077,7 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::Int8RangeArray
         | Row::Point
         | Row::PointArray
+        | Row::BoxArray
         // **A money is refused here and is an index key**, which is not a contradiction: the row
         // codec knows it is cents in an `i64` and this vocabulary has no way to carry a *type*
         // that shares its bits with `int8` — `value_to_datum` reads a wire value with no column

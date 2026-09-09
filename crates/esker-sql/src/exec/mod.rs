@@ -1813,6 +1813,9 @@ impl Executor {
                     .collect(),
             );
         }
+        // The same builder the extended protocol uses, which is the point: two copies of this
+        // decision are what let one protocol declare an enum's own oid and the other declare
+        // `int2` for the same column.
         let fields = planned.columns.iter().map(field_of).collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
@@ -4139,34 +4142,37 @@ fn update_returning_fields(
 }
 
 /// A resolved target list as the wire describes it.
-/// **The one place an `OutputColumn` becomes a `RowDescription` field.**
+fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
+    columns.iter().map(field_of).collect()
+}
+
+/// One output column as a client is told about it, and **the only place that is decided**.
 ///
-/// There were three, and two of them dropped the column's user type on the floor: an enum column
-/// went out as `int2` — its *storage* — to every client that prepared, while the simple protocol
-/// sent the enum's own oid. The value on the wire was the label either way, so the bytes were right
-/// and the declared type was wrong, which `ActiveRecord` reads as an integer and turns into `0`.
-/// `psql` and `pg_typeof` cannot see it; only a `Describe` can (`enum · test_enum_mapping`).
+/// It was decided twice. `run_select` built its fields from the declared type and this file's
+/// `described` built them from `OutputColumn::ty`, which for an enum is the *storage* — a
+/// two-byte ordinal (ADR 0050). The simple protocol went through the first and the extended
+/// protocol through the second, so one `SELECT` of one enum column declared the enum's own oid to
+/// `psql` and oid 21 to `ActiveRecord`, which decodes by that oid and turned `"sad"` into `nil`.
 ///
-/// The three questions a column answers are in a fixed order and that order is the whole of this
-/// function: a **user-defined type** is what the client is told (an enum's ordinal is rendered as
-/// its label, ADR 0050); a **pseudo-type** reaches a client here and nowhere else, since the only
-/// value a cast to one takes is NULL; and otherwise the storage type is the answer.
+/// The value was identical down both paths, which is why every corpus in this crate agreed with
+/// the wrong answer for three runs: a corpus replays the simple protocol, and so does `psql`.
+/// `tests/enum_extended_protocol.rs` is the test that can see it, and it asks all three paths.
 fn field_of(column: &query::OutputColumn) -> FieldDescription {
     match (&column.user_type, column.pseudo) {
+        // The type's own oid, and the **rendered** value's width: an enum is an ordinal in the row
+        // and a variable-length label on the wire.
         (Some(def), _) => FieldDescription::of_user_type(
             column.name.clone(),
             u32::try_from(def.oid).unwrap_or(0),
             def.kind.typlen(),
         ),
+        // A pseudo-type reaches a client here and nowhere else: there is no value to render, since
+        // the only one a cast to it accepts is NULL.
         (None, Some(pseudo)) => {
             FieldDescription::of_user_type(column.name.clone(), pseudo.oid, pseudo.type_len)
         }
         (None, None) => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
     }
-}
-
-fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
-    columns.iter().map(field_of).collect()
 }
 
 impl Execute for Executor {
@@ -4708,6 +4714,11 @@ impl Executor {
                     query::plan(select, self.tenant, from.as_deref(), &inner_refs)?
                         .columns
                         .iter()
+                        // **The third copy of this decision, and the one the suite reads.** A
+                        // `Describe` is what `exec_params` and `prepare`+`execute` both send, so
+                        // this is the field an `ActiveRecord` client decodes by; built from
+                        // `column.ty` it declared an enum's *storage* — `int2` — where the simple
+                        // protocol declared the enum. `tests/enum_extended_protocol.rs`.
                         .map(field_of)
                         .collect(),
                 )

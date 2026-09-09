@@ -2829,6 +2829,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2",
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
+        ColumnType::Name => "name",
         ColumnType::Bpchar => "bpchar",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
@@ -2877,6 +2878,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::VarcharRange => "varcharrange",
         ColumnType::Point => "point",
         ColumnType::PointArray => "_point",
+        ColumnType::BoxArray => "_box",
         ColumnType::TstzRangeArray => "_tstzrange",
         ColumnType::Int4RangeArray => "_int4range",
         ColumnType::DateRangeArray => "_daterange",
@@ -2970,7 +2972,11 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Bit | ColumnType::VarBit => "V",
         // **`S` for citext too**, measured: it is a string type to the adapter, which is how it
         // is told apart from hstore's `U` in the boot type-map query.
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => "S",
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Name
+        | ColumnType::Bpchar
+        | ColumnType::Citext => "S",
         ColumnType::Bool => "B",
         ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
             "D"
@@ -3007,7 +3013,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3048,7 +3054,15 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
 /// The `,` was a constant here before, which is a right answer for 77 types and a wrong one for
 /// the seventy-eighth.
 fn typdelim(ty: ColumnType) -> &'static str {
+    // **An array's delimiter is its element's**, which is a rule and not a special case: `_box`
+    // is the only array type in all of `pg_type` whose delimiter is not a comma, and it is one
+    // because `box` is. Measured by asking a real server for every array type whose
+    // `typdelim <> ','` and getting exactly that one row.
+    if let Some(element) = ArrayValue::element_of(ty) {
+        return typdelim(element);
+    }
     match ty {
+        // A `box` is written `(x1,y1),(x2,y2)`, so a comma cannot separate two of them.
         ColumnType::Box => ";",
         _ => ",",
     }
@@ -3080,6 +3094,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
+        | ColumnType::BoxArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
@@ -3110,6 +3125,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2in",
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
+        // Its own input function, and the one that truncates at 63 (`value::truncate_to_name`).
+        ColumnType::Name => "namein",
         ColumnType::Bpchar => "bpcharin",
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",
