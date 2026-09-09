@@ -115,12 +115,21 @@ arm the harness had already reaped are what made this take two nights):
 | rung | without | with |
 |---|---|---|
 | idle | 0 of 4 failed | — |
-| 6 threads | **2 of 5 failed**, 5–66 s | **0 of 8**, 6–10 s |
-| 14 threads | — | **0 of 6**, 5–12 s |
+| 6 threads | **2 of 5 failed**, 5–66 s | **0 of 18**, 6–10 s |
+| 14 threads | — | 0 of 10, 4.1–14.7 s |
+| 40 threads | 0 of 5 | 0 of 10, 3.8–15.5 s |
 
-The **bimodal distribution is gone**, not merely the failures: every run is now the fast one. A race
-made rarer would have left the slow mode behind, and that difference is the argument that the
-mechanism is the one described above and not a neighbour of it.
+At the rung where it reproduces, the **bimodal distribution is gone** and not merely the failures:
+5–66 s becomes 6–10 s, every run the fast one. A race made rarer would have left the slow mode
+behind, and that difference is the argument that the mechanism is the one described above and not a
+neighbour of it.
+
+**It reproduces in a band, not with load generally**, and the last row is why that is written down:
+without the fix, forty threads produced 0 of 5. Heavier load slows the learner's campaigns along
+with everything else. So the rows at 14 and 40 say *no regression under load* and nothing about the
+fix being necessary — the necessity rests on the six-thread rung, on the counters that named the
+mechanism, and on `a_campaigning_voter_still_refuses_a_learner`, which is red without this change
+and green with it in the state machine where nothing is timing at all.
 
 **What it does not change.** Pre-vote stays term-neutral, the leader lease stays as it is, and a
 vote to a voter is decided exactly as before. `Config::pre_vote` and `check_quorum` keep their
