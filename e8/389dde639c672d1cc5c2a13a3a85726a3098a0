@@ -1,0 +1,21 @@
+crates/esker-store/tests/promotion.rs
+  s_2d916f5f540186::t_d346ef3ff96cf4 821-830
+docs/plans/debts-v1.1.md
+  s_2d916f5f540186::t_c6a9956f1fe12c 9-17,54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e8389dde639c672d1cc5c2a13a3a85726a3098a0",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
