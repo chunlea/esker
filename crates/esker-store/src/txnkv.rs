@@ -145,11 +145,17 @@ impl TxnSnapshot for EngineSnapshot<'_> {
     }
 
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> esker_txn::Result<Option<Version>> {
-        // From the newest record downwards, and the first *commit* is the answer: anything at
-        // or below `ts` ends the question, and a rollback marker is stepped past rather than
-        // answered with (ADR 0078).
+        // From the newest record downwards, and the first record that *changed the key* is the
+        // answer: anything at or below `ts` ends the question, a rollback marker is stepped past
+        // rather than answered with (ADR 0078), and so is a `Lock` — a transaction that held the
+        // key and wrote nothing to it left no value for a later writer to be stale against
+        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
         self.walk(user_key, u64::MAX, ts.saturating_add(1), |version| {
-            (version.record.kind != esker_txn::Kind::Rollback).then_some(version)
+            (!matches!(
+                version.record.kind,
+                esker_txn::Kind::Rollback | esker_txn::Kind::Lock
+            ))
+            .then_some(version)
         })
     }
 

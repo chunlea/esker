@@ -1,5 +1,5 @@
 //! Row locks, taken at the statement and given back when the transaction ends
-//! ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+//! ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
 //!
 //! **One mechanism, two backends.** This started inside `MemoryBackend`, where it is what makes
 //! READ COMMITTED testable in-process; the real backend needs the same table for the same reason
@@ -58,8 +58,15 @@ pub(crate) struct RowLocks {
     /// and then looks for a cycle; this looks on every attempt, because the graph is a map of the
     /// sessions currently waiting and walking it is cheaper than the sleep that would precede it.
     ///
-    /// Node-local, which is every deadlock two sessions of one `esker-sql` process can make. A
-    /// cycle across nodes needs a graph both can see — PD's job, and a named follow-on.
+    /// Node-local, which is every deadlock two sessions of one `esker-sql` process can make.
+    ///
+    /// **A second node makes none**, and that is not a missing detector: measured across two nodes
+    /// on 2026-09-09 (`tests/cross_node_deadlock.rs`), the crossed sequence that costs one node a
+    /// `40P01` and one victim commits on both, because the lock below is a row in *this* process's
+    /// map and the other process cannot see it. Nothing waits, so there is no cycle for a graph to
+    /// find. [ADR 0088](../../../../docs/adr/0088-a-row-lock-across-nodes.md) rules the fix: the
+    /// lock becomes a Percolator lock on the row's key, and waiting becomes what it is for every
+    /// other key — two transactions on one key, which the store already arbitrates.
     waits_for: BTreeMap<u64, (u64, Vec<u8>)>,
 }
 
