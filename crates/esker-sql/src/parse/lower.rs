@@ -4877,11 +4877,16 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
     // `lower` and `upper`, the two scalar functions this node has. Both take exactly one
     // argument and a wrong count is `42883` naming the signature, not a badly-called function —
     // `lower()` and `lower('a','b')` are each their own message, measured.
-    // **`mod(x, y)` is `x % y`, not an approximation of it.** PostgreSQL's `%` for `int8` is
+    // **`mod(x, y)` computes `x % y` and prints as `mod`.** PostgreSQL's `%` for `int8` is
     // implemented by `int8mod` — the same C function `mod()` calls — and the two agree on every
-    // sign combination, measured. So the call is rewritten into the arithmetic this crate already
-    // evaluates and tests, rather than given a scalar variant of its own; it is immutable for free
-    // that way, which is what `postgresql_adapter_test.rb`'s expression index needs.
+    // sign combination, measured, so there is one remainder in this crate and the call delegates
+    // to it (`exec::cursor`'s `CatalogFunc::Mod` arm).
+    //
+    // **It used to be rewritten into the arithmetic node outright, and that threw the spelling
+    // away.** `pg_get_indexdef` prints the node the tree holds, so `mod(id, 10)` came back
+    // `id % 10` where a real server prints `mod(id, 10)` — in every form, whole and per column,
+    // plain and pretty, and `postgresql_adapter_test#test_expression_index` asserts that string
+    // exactly. `%` and `mod` are two spellings on a real server too, so they are two nodes here.
     if name == "mod" {
         refuse_wrong_arity(function, "mod", 2)?;
         if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args
@@ -4890,12 +4895,10 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(right)),
             ] = args.as_slice()
         {
-            return Ok(plan::Expr::Arithmetic {
-                op: plan::ArithOp::Modulo,
-                left: Box::new(lower_expr(left)?),
-                right: Box::new(lower_expr(right)?),
-                ty: None,
-            });
+            return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::Mod,
+                args: vec![lower_expr(left)?, lower_expr(right)?],
+            })));
         }
         return Err(SqlError::UndefinedFunction("mod(unknown)".to_owned()));
     }

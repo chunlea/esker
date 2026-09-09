@@ -5946,6 +5946,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
                         | plan::CatalogFunc::Least
                         | plan::CatalogFunc::NullIf
                         | plan::CatalogFunc::Substring
+                        | plan::CatalogFunc::Mod
                 )
                 || catalog_parameter_types(call.func, call.args.len()).is_some()
         }
@@ -6350,6 +6351,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 ),
                 None => format!("SUBSTRING({operand} FROM {from})"),
             }
+        }
+        // **`mod` prints as a call and coerces like the operator it is.** `mod(id, 10)` over an
+        // `integer` column is `mod(id, 10)` and over a `bigint` one is `mod(id, (10)::bigint)` —
+        // measured — which is the common-type rule the four productions follow, spelled with a
+        // lower-case name instead of an upper-case one.
+        Expr::CatalogFunc(call) if call.func == plan::CatalogFunc::Mod && call.args.len() == 2 => {
+            let common = production_common_type(&call.args, table, ty);
+            format!(
+                "mod({}, {})",
+                deparse_production_argument(&call.args[0], table, common),
+                deparse_production_argument(&call.args[1], table, common)
+            )
         }
         // **An ordinary call, with its arguments and the coercion each parameter took.** The name
         // is its own, lower-case, quoted where a real server quotes it — `substring` is a reserved
