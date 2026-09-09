@@ -434,6 +434,69 @@ fn one_peer_per_store(region: &Region) {
     }
 }
 
+/// How long a core and the driver may disagree about a role before it is a fault.
+///
+/// **Watched, not sampled**, which is the rule this file already lives by for learners. The driver
+/// learns of a conf change from the *leader's* region heartbeat, so between a core applying a
+/// promotion and PD hearing about it every core is ahead of the driver — a window, and a normal
+/// one at 20 ms a heartbeat. Two hundred and fifty of them is not.
+const DISAGREEMENT_ALLOWED: Duration = Duration::from_secs(5);
+
+/// **No peer's own core calls itself a voter that `region` calls a learner — for long.**
+///
+/// The placement driver's record is the authority on a role; a core that disagrees with it about
+/// *itself* is what lets a learner campaign at all, since `Raft::campaign` refuses a node that is
+/// not a voter in its own configuration. ADR 0085 stops the campaign from doing damage. This is the
+/// assertion that the state which produces it is not there.
+///
+/// **A window is expected and a state is not.** The driver learns of a conf change from the
+/// leader's region heartbeat, so a core that has applied a promotion is ahead of the driver until
+/// the next one — measured here the first time this was asserted instantly, which caught that
+/// normal window on the second round. What is a fault is the disagreement *lasting*, which is what
+/// `since` is for.
+///
+/// The other direction is not asserted separately: a core behind the driver is the same window seen
+/// from the other end.
+async fn no_core_disagrees_for_long(
+    all: &[&Node],
+    region: &Region,
+    since: &mut BTreeMap<(u64, u64), Instant>,
+) {
+    for node in all {
+        let Some(peer) = node.store.peer_of(region.id) else {
+            continue;
+        };
+        let Ok(conf) = peer.membership().await else {
+            continue;
+        };
+        for recorded in &region.peers {
+            if recorded.store_id != node.store.store_id() {
+                continue;
+            }
+            let a_learner_to_the_driver =
+                matches!(recorded.role, PeerRole::Learner | PeerRole::ColumnarLearner);
+            let key = (region.id, recorded.peer_id);
+            if a_learner_to_the_driver && conf.voters.contains(&recorded.peer_id) {
+                let first = *since.entry(key).or_insert_with(Instant::now);
+                assert!(
+                    first.elapsed() < DISAGREEMENT_ALLOWED,
+                    "region {}: for {:?} the driver has held peer {} on store {} as {:?} while \
+                     that peer's own core has had it among the voters {:?} — the state that lets \
+                     a learner campaign",
+                    region.id,
+                    first.elapsed(),
+                    recorded.peer_id,
+                    node.store.store_id(),
+                    recorded.role,
+                    conf.voters
+                );
+            } else {
+                since.remove(&key);
+            }
+        }
+    }
+}
+
 /// What each store's core believes the membership of `region` is.
 ///
 /// The placement driver's answer is already on the line above it. These two disagreeing is the root
@@ -553,6 +616,7 @@ async fn watch_until_every_learner_votes(
         .filter(|node| node.store.store_id() != 1)
         .collect();
     let mut first_seen: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+    let mut disagreeing: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
     let mut promoted: BTreeSet<(u64, u64)> = BTreeSet::new();
     // Whether the load was still in flight when the cluster started to grow, so that "under
     // load" is checked rather than hoped for. Sampled at the first learner, and at the window's
@@ -573,6 +637,19 @@ async fn watch_until_every_learner_votes(
     loop {
         for region in pd_regions(pd) {
             one_peer_per_store(&region);
+            // **What the driver says and what each core believes have to be the same thing.**
+            //
+            // A peer that has itself among the *voters* while the region record calls it a learner
+            // is the root of the stall [ADR 0085](../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)
+            // contains: `Raft::campaign` refuses a non-voter, so a learner that campaigns is a
+            // learner whose own configuration disagrees, and one such peer kept a region leaderless
+            // for as long as the load lasted. The ADR made that harmless; it did not make it untrue,
+            // and until this is asserted nothing here would notice it happening.
+            //
+            // Checked on every pass rather than at a deadline, because the divergence is a *state*
+            // and not a delay — the fault this test was opened for arrives as a stall, and that is
+            // exactly the thirty-second detour this avoids.
+            no_core_disagrees_for_long(all, &region, &mut disagreeing).await;
             for peer in &region.peers {
                 let id = (region.id, peer.peer_id);
                 if peer.store_id != 1 {
