@@ -305,6 +305,18 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     if typmod == NO_TYPMOD {
         return Ok(value);
     }
+    // **A bit string's cast pads on the right and truncates in silence**, which is the answer
+    // `fit_to_typmod` used to hold for *both* callers: `'10101'::bit(3)` is `101` and `'1'::bit(3)`
+    // is `100`, measured. It is here now, on the cast's side of the seam, so that the write's side
+    // is free to refuse (`debts-v1.1.md` #36).
+    if let Datum::Bit { varying, bits } = &value
+        && matches!(ty, ColumnType::Bit | ColumnType::VarBit)
+    {
+        return Ok(Datum::Bit {
+            varying: *varying,
+            bits: bit::fit(bits, usize::try_from(typmod).ok(), *varying),
+        });
+    }
     let (Datum::Text(text), ColumnType::Varchar | ColumnType::Bpchar) = (&value, ty) else {
         return fit_to_typmod(value, ty, typmod);
     };
@@ -687,16 +699,20 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
             }
             Datum::Array(fitted)
         }
-        // **The cast's rule, which is not the assignment's**, and this function serves both — so
-        // what is here is the one that answers where PostgreSQL answers. A *cast* pads on the
-        // right and truncates in silence (`'101'::bit(8)` is `10100000`, `'101010101'::bit(4)` is
-        // `1010`); an *assignment* refuses either way (`22026` for a `bit(n)`, `22001` for a
-        // `bit varying(n)`). The refusals are declared in `tests/bit_string.rs` rather than
-        // answered, because a refusal where a real server pads would be the worse of the two.
-        (Datum::Bit { varying, bits }, ColumnType::Bit | ColumnType::VarBit) => Datum::Bit {
-            varying: *varying,
-            bits: bit::fit(bits, usize::try_from(typmod).ok(), *varying),
-        },
+        // **The assignment's rule, which is not the cast's.** A *cast* pads on the right and
+        // truncates in silence — that is `truncate_to_typmod`'s arm now — and an *assignment*
+        // refuses either way: `22026 bit string length 5 does not match type bit(3)` for a
+        // `bit(n)`, whose modifier is an exact width and which therefore refuses a value that is
+        // too **short** as well, and `22001 bit string too long for type bit varying(3)` for a
+        // `bit varying(n)`, whose modifier is a maximum. Measured, all four.
+        //
+        // This function held the *cast's* answer for both callers until `debts-v1.1.md` #36, so
+        // five bits went into a `bit(3)` column and came back three — a wrong value rather than a
+        // refusal. `bit::fit_to_column` was written with the right rule and had no caller.
+        (Datum::Bit { bits, .. }, ColumnType::Bit | ColumnType::VarBit) => {
+            bit::fit_to_column(bits, usize::try_from(typmod).ok(), ty == ColumnType::VarBit)?;
+            value.clone()
+        }
         // The declared scale is applied here rather than at the parse, which is what makes one
         // rule serve the cast, the assignment and the `INSERT`: `1.245::numeric(10,2)` and a
         // `1.245` written into a `numeric(10,2)` column are the same rounding.

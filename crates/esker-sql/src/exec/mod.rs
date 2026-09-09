@@ -3499,7 +3499,11 @@ impl Executor {
         // the domain's `CHECK` says about it, until something stores it.
         if let crate::catalog::TypeKind::Domain { base, typmod, .. } = def.kind {
             let value = <Datum as PgDatum>::from_text(base, &text)?;
-            let value = crate::value::fit_to_typmod(value, base, typmod)?;
+            // The cast's rule, which the comment above already argues for: a cast to a domain
+            // is a cast to its base type, and a cast is not an assignment. Measured on a
+            // `varchar(3)` domain — `'abcdef'::d` is `abc`, and the same value *into* a column of
+            // that domain is `22001`.
+            let value = crate::value::truncate_to_typmod(value, base, typmod)?;
             return Ok(Some(if printed {
                 Expr::Literal(Literal::String(
                     PgDatum::to_text(&value).unwrap_or_default(),
