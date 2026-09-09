@@ -573,8 +573,33 @@ fn static_type(expr: &Expr, named: &[Named<'_>]) -> Option<ColumnType> {
         Expr::Arithmetic { left, right, .. } => {
             static_type(left, named).or_else(|| static_type(right, named))
         }
+        // **An aggregate inside a larger expression still types the parameter beside it.**
+        // `(sum(salary) + 0) > $1` is `bigint` on a real server, read off
+        // `pg_prepared_statements.parameter_types` — the arithmetic's type is the aggregate's, so
+        // this arm is what the one above needs to see through.
+        Expr::Aggregate(call) => aggregate_type(call, named),
         _ => None,
     }
+}
+
+/// The type an aggregate call answers with, when this pass can resolve its argument.
+///
+/// The table is [`crate::exec::aggregate::Aggregation::result_type`]'s, not a copy: `sum(int4)` is
+/// `bigint` and `sum(int8)` is `numeric`, and a second opinion about which would put a
+/// `ParameterDescription` on the wire that the executor then disagrees with.
+///
+/// `None` when there is nothing to say — an argument this pass cannot type, or an arity error the
+/// planner is about to refuse — because the fallback for a parameter nobody typed is `text`, and
+/// inventing a type here would be worse than that.
+fn aggregate_type(call: &crate::plan::AggregateCall, named: &[Named<'_>]) -> Option<ColumnType> {
+    let arg = match call.arg() {
+        Some(arg) => Some(static_type(arg, named)?),
+        // `count(*)`, which reads no value at all. Any other call with no argument is a wrong
+        // arity, and `result_type` reads a missing argument as `count(*)`'s.
+        None if call.star => None,
+        None => return None,
+    };
+    super::aggregate::Aggregation::result_type(call.func, arg).ok()
 }
 
 /// A parameter compared against a column takes that column's type. That is the whole of the
@@ -593,54 +618,40 @@ fn walk_predicate(
             if op.is_comparison() || *op == BinaryOp::And || *op == BinaryOp::Or =>
         {
             if op.is_comparison() {
-                // **`count(…) > $1` types `$1` as `bigint`.** `count` is the one aggregate whose
-                // result type is fixed whatever it counts, so this is a fact rather than a guess —
-                // and it is the shape `HAVING count(*) > $1` sends, which is `calculations_test.rb`
-                // twenty times over. Another aggregate's type needs its argument resolved, which
-                // is the planner's job and not this one's; it keeps the `text` fallback.
+                // **A parameter takes the type of whatever is on the other side**, and that is
+                // one rule rather than a list of shapes. `static_type` is what knows the shapes:
+                // a column (through `column_type`, aliases and qualifiers included), a literal,
+                // a `COALESCE`, an arithmetic result, and an aggregate.
+                //
+                // It was three special cases, and the gaps between them were the bug. `count(…)
+                // > $1` was typed because `count`'s result type is fixed whatever it counts;
+                // every other aggregate "needs its argument resolved, which is the planner's job
+                // and not this one's" — but the argument is resolved right here, by the same
+                // lookup that types `WHERE salary > $1`. The cost was `HAVING (sum(salary) > $1)`
+                // answering **zero rows** where a real server answers three: the parameter kept
+                // the `text` fallback and the comparison became a text one
+                // (`tests/having_bind.rs`,
+                // `finder_test#test_find_with_group_and_sanitized_having_method`). `count` is the
+                // one aggregate that cannot show this, which is why it survived as the example,
+                // and `(sum(salary) + 0) > $1` was a second gap one shape further out.
+                //
+                // Measured off `pg_prepared_statements.parameter_types`: `sum(salary) > $1` is
+                // `bigint`, `avg(salary) > $1` is `numeric`, `max(name) > $1` is `text`,
+                // `(sum(salary) + 0) > $1` is `bigint`, and `count(*) > $1` is `bigint` like the
+                // rest rather than as a special case.
+                //
+                // **Only when the other side has a type of its own**, which is why a quoted
+                // string types nothing: `'a' = $1` leaves both `unknown` on a real server too,
+                // and an ambiguous bare column name types nothing rather than the first match —
+                // the planner will refuse the statement anyway, and guessing here would put a
+                // `ParameterDescription` on the wire for a query that is about to fail.
                 match (left.as_ref(), right.as_ref()) {
-                    (Expr::Aggregate(call), Expr::Parameter(number))
-                    | (Expr::Parameter(number), Expr::Aggregate(call))
-                        if call.func == crate::plan::AggregateFunc::Count =>
-                    {
-                        seen(*number, ColumnType::Int8);
-                    }
-                    _ => {}
-                }
-                // **A literal beside a parameter types it too**, and there is no column in
-                // sight: `(1 = $3)` is what `eager_test.rb` sends, and PostgreSQL resolves `$3`
-                // to `integer` from the constant on the other side. Without it the parameter kept
-                // the `text` fallback and five characters of a long statement refused the whole
-                // of it. A quoted string types nothing, which is right: `'a' = $1` leaves both
-                // `unknown` on a real server too.
-                match (left.as_ref(), right.as_ref()) {
-                    (Expr::Literal(literal), Expr::Parameter(number))
-                    | (Expr::Parameter(number), Expr::Literal(literal)) => {
-                        if let Some(ty) = crate::exec::query::literal_type(literal) {
+                    (other, Expr::Parameter(number)) | (Expr::Parameter(number), other) => {
+                        if let Some(ty) = static_type(other, named) {
                             seen(*number, ty);
                         }
                     }
                     _ => {}
-                }
-                let pair = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column { table, name }, Expr::Parameter(number))
-                    | (Expr::Parameter(number), Expr::Column { table, name }) => {
-                        Some((table.as_deref(), name, *number))
-                    }
-                    _ => None,
-                };
-                // Across a join, the column may belong to either table, and a qualifier says
-                // which. An ambiguous bare name types nothing rather than the first match: the
-                // planner will refuse the statement anyway, and guessing a type here would put a
-                // `ParameterDescription` on the wire for a query that is about to fail.
-                // **Through `column_type`, not a second copy of it.** This had the same loop
-                // inlined, and the two then disagreed: a fix to the shared one did nothing here,
-                // which is how a three-part column name went on being typed `text` after the
-                // matching rule had already been corrected. One lookup, one rule.
-                if let Some((qualifier, name, number)) = pair
-                    && let Some(ty) = column_type(named, qualifier, name)
-                {
-                    seen(number, ty);
                 }
             }
             walk_predicate(left, named, tables, seen);

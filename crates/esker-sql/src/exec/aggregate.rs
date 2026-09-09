@@ -135,7 +135,14 @@ impl Aggregation {
     /// either, so `42883` there is **parity**; `avg(bigint)` does exist and is `numeric`, which
     /// this node has no way to be right with, so it is `0A000` naming the type it would need
     /// (`docs/adr/0031-rails-compatibility-is-measured.md`).
-    fn result_type(func: AggregateFunc, arg: Option<ColumnType>) -> Result<ColumnType> {
+    ///
+    /// **Reachable from outside the aggregation** — `crate::exec::query::expr_type` and
+    /// `crate::exec::bind` both ask it — because an aggregate's type is needed *before* the
+    /// aggregation exists. A parameter takes its type from the other side of a comparison, and on
+    /// a real server that includes `sum(salary) > $1` (`tests/having_bind.rs`); a second copy of
+    /// this table living in the type inference is how `sum(int8)` would come to be `bigint` in one
+    /// place and `numeric` in the other.
+    pub(super) fn result_type(func: AggregateFunc, arg: Option<ColumnType>) -> Result<ColumnType> {
         let Some(arg) = arg else {
             // `count(*)`.
             return Ok(ColumnType::Int8);
