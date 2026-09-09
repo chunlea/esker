@@ -4202,6 +4202,23 @@ fn retype(
     {
         return Ok(literal.clone());
     }
+    // **And an integer literal against an integer column, which is the same sentence at every
+    // width.** PostgreSQL picks an operator — `int24gt` for `i2 > 1` — and leaves the constant an
+    // `integer`; narrowing it here built a `smallint` node, and the printed tree said so:
+    // `(i2 > (1)::smallint)` where a real server prints `(i2 > 1)`
+    // (`tests/captures/pg19_numeric_literal_deparse.txt`, `debts-v1.1.md` #23). The **values** are
+    // unaffected — `Datum`'s ordering compares the integer widths against each other — which is
+    // why the only place it showed was a deparse.
+    //
+    // `int4` and `int8` were already right *by accident*: the datum stays an `i64` whatever width
+    // the literal is declared (ADR 0087), so narrowing to either is a no-op and only `smallint`
+    // had a distinct one. Written as the rule rather than as the width, because a fix aimed at
+    // `smallint` would be a fix to the symptom.
+    if matches!(literal, Literal::Integer(_))
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        return Ok(literal.clone());
+    }
     // **And an integer literal wider than the column is compared, not narrowed**, which is the
     // arm above with the widths one step in: PostgreSQL has an `int4 > int8` operator, so
     // `i4 > 9223372036854775807` is answered — `f` for every row — where narrowing the literal to
