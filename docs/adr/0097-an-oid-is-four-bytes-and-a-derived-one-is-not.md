@@ -50,11 +50,38 @@ So a column is judged by what a client may compare it against, not by what this 
 hold: `pg_attrdef.adrelid`'s values all fit and it is a `bigint` all the same, because
 `WHERE adrelid = 'pg_class'::regclass` is a query somebody may write.
 
-**Closing the space is a separate unit**, and it is a change to how an oid is *allocated* rather
-than to how it is declared: five regions carved out of `u32` leave about 19 bits for the table id
-once each keeps 10 for its position, which bounds a tenant at roughly half a million relations
-ever. PostgreSQL solves the same problem by allocating from a wrapping counter and checking for a
-collision, not by deriving. Recorded here so the next reader has the numbers.
+## Options
+
+### Rejected: carve the five regions out of `u32` so every column can be an `oid`
+
+The alternative is to stop deriving oids from a `u64` and make the whole space 32 bits wide, which
+would let all 46 columns be declared. The arithmetic is what rejects it. Five regions need a tag,
+each family needs room for a constraint's position within its table, and the table id takes what is
+left:
+
+```text
+  32 bits  −  3 region  −  10 position  =  19 bits of table id  ≈  524,288 relations
+```
+
+and relation ids are never reused, so that is **half a million relations for the life of a
+tenant**, not at one time. Widening the position field costs table ids one for one. PostgreSQL has
+the same 32-bit space and does not have this problem because it *allocates* an oid from a wrapping
+counter and checks for a collision; deriving one from `(table_id, position)` is what forces the
+width, and switching to allocation means a record per constraint.
+
+Two further costs, and the first is why this is not a lane's call to make:
+
+* the derived oids are **keys**, not just declared types: they appear in the stored catalog's key
+  space and in golden tests that pin what a client reads. Changing them is a format change, which
+  `CLAUDE.md` puts in the "ask before doing" list;
+* nothing measurable is bought. The two client queries that motivated the width —
+  `WHERE dep.classid = 'pg_class'::regclass` and `WHERE i.indrelid = '"pg_type"'::regclass` — are
+  answered by declaring those columns `bigint`, and no suite test distinguishes a `bigint` from an
+  `oid` on the remaining columns.
+
+### Accepted: keep `u64` relation ids and declare the other 43 columns
+
+Which is the Decision above.
 
 ## What `oid` is, measured
 
@@ -82,6 +109,11 @@ collision, not by deriving. Recorded here so the next reader has the numbers.
 
 ## Consequences
 
+* **If every column is ever to be an `oid`, what changes is the allocation and the goldens, not the
+  label.** The declaration is one word per column and this unit has already written the seam that
+  makes the rows follow it; what a future unit would have to build is a record per derived
+  constraint so an oid can be *allocated* rather than computed, and then re-take every golden that
+  pins one. Ruled 2026-09-09: keep `u64` relation ids.
 * **31 declared divergences deleted across 13 files**, all named by the ratchet.
 * **`26::oid` used to be `0A000`.** `cast_operand` accepted a single-quoted string and nothing
   else, so `'26'::oid` answered and the spelling a person writes did not. It now asks
